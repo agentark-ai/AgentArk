@@ -51,7 +51,7 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 llama-cpp-2 = { version = "0.1", optional = true }
 
 # WASM sandbox runtime
-wasmtime = "27"
+wasmtime = "36"
 wasmtime-wasi = "27"
 
 # Docker support
