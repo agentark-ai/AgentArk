@@ -140,7 +140,8 @@ COPY --chown=agent:agent skills /app/skills
 COPY --chown=agent:agent assets /app/assets
 # Copy frontend assets (built in Docker, not from host)
 COPY --from=frontend-builder --chown=agent:agent /app/frontend/dist /app/frontend/dist
-COPY --chown=agent:agent frontend/legacy /app/frontend/legacy
+# frontend/legacy is optional (static fallback assets)
+RUN mkdir -p /app/frontend/legacy && chown agent:agent /app/frontend/legacy
 
 # Copy entrypoint script (fix Windows CRLF line endings)
 COPY --chown=agent:agent docker-entrypoint.sh /app/

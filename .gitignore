@@ -35,5 +35,5 @@ tests/e2e/test-results/
 .vscode/
 *.swp
 *.swo
-remotion*
+/remotion*
 nul
