@@ -392,8 +392,7 @@ fn markdown_to_blocks(text: &str) -> Vec<serde_json::Value> {
         }
 
         // Heading 1
-        if line.starts_with("# ") {
-            let content = &line[2..];
+        if let Some(content) = line.strip_prefix("# ") {
             blocks.push(serde_json::json!({
                 "object": "block",
                 "type": "heading_1",
@@ -409,8 +408,7 @@ fn markdown_to_blocks(text: &str) -> Vec<serde_json::Value> {
         }
 
         // Heading 2
-        if line.starts_with("## ") {
-            let content = &line[3..];
+        if let Some(content) = line.strip_prefix("## ") {
             blocks.push(serde_json::json!({
                 "object": "block",
                 "type": "heading_2",
@@ -426,8 +424,7 @@ fn markdown_to_blocks(text: &str) -> Vec<serde_json::Value> {
         }
 
         // Heading 3
-        if line.starts_with("### ") {
-            let content = &line[4..];
+        if let Some(content) = line.strip_prefix("### ") {
             blocks.push(serde_json::json!({
                 "object": "block",
                 "type": "heading_3",
@@ -483,8 +480,7 @@ fn markdown_to_blocks(text: &str) -> Vec<serde_json::Value> {
         }
 
         // Block quote
-        if line.starts_with("> ") {
-            let content = &line[2..];
+        if let Some(content) = line.strip_prefix("> ") {
             blocks.push(serde_json::json!({
                 "object": "block",
                 "type": "quote",

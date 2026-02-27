@@ -100,6 +100,10 @@ pub struct AgentConfig {
     /// Multi-model pool
     #[serde(default)]
     pub model_pool: ModelPoolConfig,
+    /// Optional model slot ID dedicated for app_deploy planning/generation.
+    /// When unset, app deploy uses the default primary model.
+    #[serde(default)]
+    pub app_deploy_model_id: Option<String>,
     #[serde(default)]
     pub telegram: Option<TelegramConfig>,
     #[serde(default)]
@@ -145,6 +149,7 @@ impl Default for AgentConfig {
             llm: LlmProvider::default(),
             llm_fallback: None,
             model_pool: ModelPoolConfig::default(),
+            app_deploy_model_id: None,
             telegram: None,
             whatsapp: None,
             sandbox: SandboxConfig::default(),
@@ -1047,10 +1052,7 @@ impl SecureConfigManager {
         use rand::RngCore;
         let mut key_bytes = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut key_bytes);
-        base64::engine::Engine::encode(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-            &key_bytes,
-        )
+        base64::engine::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, key_bytes)
     }
 
     fn api_key_info_from_secrets(secrets: &Secrets) -> Option<HttpApiKeyInfo> {

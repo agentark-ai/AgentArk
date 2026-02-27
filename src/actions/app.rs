@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::RwLock;
 
@@ -24,6 +25,9 @@ const PORT_RANGE_END: u16 = 9200;
 const DEFAULT_APP_RUNTIME_IMAGE: &str = "agentark-sandbox:latest";
 const APP_CONTAINER_PREFIX: &str = "agentark-app-";
 const MAX_APP_COMMAND_LEN: usize = 1024;
+const LOCAL_RUNTIME_STDOUT_LOG_FILE: &str = ".agentark_runtime_stdout.log";
+const LOCAL_RUNTIME_STDERR_LOG_FILE: &str = ".agentark_runtime_stderr.log";
+const LOCAL_RUNTIME_LOG_TAIL_BYTES: usize = 4096;
 
 fn default_runtime_image() -> String {
     std::env::var("AGENTARK_APP_IMAGE")
@@ -166,8 +170,64 @@ fn resolve_secret_value(
     let allow_llm_env_passthrough = std::env::var("AGENTARK_ALLOW_LLM_ENV_TO_APPS")
         .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
         .unwrap_or(false);
-    if allow_llm_env_passthrough {
-        llm_env.get(env).cloned()
+    let normalized_env = env.trim().to_ascii_uppercase();
+    let auto_llm_passthrough = matches!(
+        normalized_env.as_str(),
+        "OPENAI_API_KEY"
+            | "OPENROUTER_API_KEY"
+            | "ANTHROPIC_API_KEY"
+            | "OPENAI_BASE_URL"
+            | "OLLAMA_BASE_URL"
+            | "LLM_MODEL"
+            | "LLM_PROVIDER"
+            | "API_KEY"
+            | "LLM_API_KEY"
+            | "MODEL_API_KEY"
+            | "OPENAI_KEY"
+            | "OPENAI_TOKEN"
+            | "OPENROUTER_KEY"
+            | "ANTHROPIC_KEY"
+            | "CLAUDE_API_KEY"
+    );
+    if allow_llm_env_passthrough || auto_llm_passthrough {
+        if let Some(v) = llm_env.get(env) {
+            if !v.trim().is_empty() {
+                return Some(v.clone());
+            }
+        }
+        if let Some(v) = llm_env.get(normalized_env.as_str()) {
+            if !v.trim().is_empty() {
+                return Some(v.clone());
+            }
+        }
+        // Common aliases should map to the active model key.
+        match normalized_env.as_str() {
+            "API_KEY" | "LLM_API_KEY" | "MODEL_API_KEY" | "OPENAI_KEY" | "OPENAI_TOKEN" => llm_env
+                .get("OPENAI_API_KEY")
+                .filter(|v| !v.trim().is_empty())
+                .cloned()
+                .or_else(|| {
+                    llm_env
+                        .get("ANTHROPIC_API_KEY")
+                        .filter(|v| !v.trim().is_empty())
+                        .cloned()
+                })
+                .or_else(|| {
+                    llm_env
+                        .get("OPENROUTER_API_KEY")
+                        .filter(|v| !v.trim().is_empty())
+                        .cloned()
+                }),
+            "OPENROUTER_KEY" => llm_env
+                .get("OPENROUTER_API_KEY")
+                .filter(|v| !v.trim().is_empty())
+                .cloned(),
+            "ANTHROPIC_KEY" | "CLAUDE_API_KEY" => llm_env
+                .get("ANTHROPIC_API_KEY")
+                .filter(|v| !v.trim().is_empty())
+                .cloned(),
+            _ => None,
+        }
     } else {
         None
     }
@@ -220,7 +280,173 @@ fn normalize_mount_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-fn validate_app_command(command: &str, label: &str) -> Result<()> {
+fn command_looks_python_related(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    [
+        "python",
+        "pip",
+        "uvicorn",
+        "gunicorn",
+        "streamlit",
+        "flask",
+        "django",
+        "manage.py",
+        "fastapi",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn local_runtime_stdout_log_path(app_dir: &Path) -> PathBuf {
+    app_dir.join(LOCAL_RUNTIME_STDOUT_LOG_FILE)
+}
+
+fn local_runtime_stderr_log_path(app_dir: &Path) -> PathBuf {
+    app_dir.join(LOCAL_RUNTIME_STDERR_LOG_FILE)
+}
+
+fn prepare_local_runtime_log_files(app_dir: &Path) -> Result<(PathBuf, PathBuf)> {
+    let stdout_path = local_runtime_stdout_log_path(app_dir);
+    let stderr_path = local_runtime_stderr_log_path(app_dir);
+
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&stdout_path)
+        .with_context(|| format!("failed to prepare runtime stdout log at {:?}", stdout_path))?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&stderr_path)
+        .with_context(|| format!("failed to prepare runtime stderr log at {:?}", stderr_path))?;
+
+    Ok((stdout_path, stderr_path))
+}
+
+fn open_local_runtime_log_for_append(path: &Path, label: &str) -> Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open runtime {} log at {:?}", label, path))
+}
+
+async fn read_file_tail(path: &Path, max_bytes: usize) -> String {
+    let Ok(bytes) = tokio::fs::read(path).await else {
+        return String::new();
+    };
+    if bytes.is_empty() {
+        return String::new();
+    }
+    let start = bytes.len().saturating_sub(max_bytes);
+    String::from_utf8_lossy(&bytes[start..]).trim().to_string()
+}
+
+pub async fn read_local_runtime_log_tail(app_dir: &Path, max_bytes: usize) -> String {
+    let stderr_tail = read_file_tail(&local_runtime_stderr_log_path(app_dir), max_bytes).await;
+    let stdout_tail = read_file_tail(&local_runtime_stdout_log_path(app_dir), max_bytes).await;
+    let mut parts = Vec::new();
+    if !stderr_tail.is_empty() {
+        parts.push(format!("stderr:\n{}", stderr_tail));
+    }
+    if !stdout_tail.is_empty() {
+        parts.push(format!("stdout:\n{}", stdout_tail));
+    }
+    parts.join("\n\n")
+}
+
+fn prepend_path_entry(prefix: &Path, existing_path: Option<&str>) -> Option<String> {
+    let mut entries: Vec<PathBuf> = vec![prefix.to_path_buf()];
+    if let Some(existing) = existing_path {
+        entries.extend(std::env::split_paths(existing));
+    } else if let Some(system) = std::env::var_os("PATH") {
+        entries.extend(std::env::split_paths(&system));
+    }
+    std::env::join_paths(entries)
+        .ok()
+        .and_then(|v| v.into_string().ok())
+}
+
+async fn ensure_local_python_venv(app_dir: &Path) -> Result<(PathBuf, PathBuf)> {
+    let venv_dir = app_dir.join(".venv");
+    let bin_dir = if cfg!(windows) {
+        venv_dir.join("Scripts")
+    } else {
+        venv_dir.join("bin")
+    };
+    let python_candidates = if cfg!(windows) {
+        vec![bin_dir.join("python.exe"), bin_dir.join("python")]
+    } else {
+        vec![bin_dir.join("python3"), bin_dir.join("python")]
+    };
+
+    if python_candidates.iter().any(|p| p.exists()) {
+        return Ok((venv_dir, bin_dir));
+    }
+
+    let creators: Vec<(&str, Vec<&str>)> = if cfg!(windows) {
+        vec![
+            ("python", vec!["-m", "venv", ".venv"]),
+            ("py", vec!["-3", "-m", "venv", ".venv"]),
+        ]
+    } else {
+        vec![
+            ("python3", vec!["-m", "venv", ".venv"]),
+            ("python", vec!["-m", "venv", ".venv"]),
+        ]
+    };
+
+    let mut last_error = String::new();
+    for (program, args) in creators {
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .current_dir(app_dir);
+        match tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output()).await {
+            Ok(Ok(output)) if output.status.success() => {
+                if python_candidates.iter().any(|p| p.exists()) {
+                    return Ok((venv_dir, bin_dir));
+                }
+                last_error = "venv command succeeded but Python executable was not found in .venv"
+                    .to_string();
+            }
+            Ok(Ok(output)) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                last_error = if !stderr.trim().is_empty() {
+                    stderr.trim().to_string()
+                } else if !stdout.trim().is_empty() {
+                    stdout.trim().to_string()
+                } else {
+                    format!("{} -m venv exited with status {}", program, output.status)
+                };
+            }
+            Ok(Err(e)) => {
+                last_error = format!("failed to spawn {}: {}", program, e);
+            }
+            Err(_) => {
+                last_error = format!("{} -m venv timed out", program);
+            }
+        }
+    }
+
+    if last_error.is_empty() {
+        last_error = "unknown error creating .venv".to_string();
+    }
+    anyhow::bail!(
+        "failed to prepare local Python virtual environment: {}",
+        last_error
+    );
+}
+
+/// Validate and normalise an app entry command.
+/// If the command contains shell operators (`&&`, `|`, `;`, etc.), wrap it in
+/// `sh -c "..."` so it runs through a shell interpreter inside the sandbox.
+fn validate_app_command(command: &str, label: &str) -> Result<String> {
     let trimmed = command.trim();
     if trimmed.is_empty() {
         anyhow::bail!("{} cannot be empty", label);
@@ -233,20 +459,34 @@ fn validate_app_command(command: &str, label: &str) -> Result<()> {
             MAX_APP_COMMAND_LEN
         );
     }
-    if trimmed.contains('\n') || trimmed.contains('\r') {
-        anyhow::bail!("{} must be a single-line command", label);
+    // Collapse multi-line commands into a single line joined with &&
+    let collapsed = if trimmed.contains('\n') || trimmed.contains('\r') {
+        trimmed
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" && ")
+    } else {
+        trimmed.to_string()
+    };
+    let lowered = collapsed.to_ascii_lowercase();
+    if lowered.starts_with("sh -c ") || lowered.starts_with("bash -c ") {
+        return Ok(collapsed);
     }
 
-    // Reject shell chaining/injection operators. Dynamic apps can still run arbitrary binaries,
-    // but only as a single command with arguments.
-    let blocked_tokens = ["&&", "||", ";", "|", "`", "$(", "<", ">"];
-    if blocked_tokens.iter().any(|tok| trimmed.contains(tok)) {
-        anyhow::bail!(
-            "{} contains blocked shell control operators; provide a single executable command with args",
-            label
-        );
+    let shell_tokens = ["&&", "||", ";", "|", "`", "$(", "<", ">"];
+    if shell_tokens.iter().any(|tok| collapsed.contains(tok)) {
+        // Wrap in sh -c so shell operators work inside the sandbox
+        let escaped = collapsed
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('$', "\\$")
+            .replace('`', "\\`");
+        Ok(format!("sh -c \"{}\"", escaped))
+    } else {
+        Ok(collapsed)
     }
-    Ok(())
 }
 
 fn is_valid_env_key(key: &str) -> bool {
@@ -271,7 +511,10 @@ async fn write_runtime_env_file(
             anyhow::bail!("Invalid env key '{}': use [A-Z0-9_]", k);
         }
         if v.contains('\0') || v.contains('\n') || v.contains('\r') {
-            anyhow::bail!("Env value for '{}' contains unsupported control characters", k);
+            anyhow::bail!(
+                "Env value for '{}' contains unsupported control characters",
+                k
+            );
         }
         ordered.insert(k.clone(), v.clone());
     }
@@ -309,6 +552,424 @@ async fn run_docker(
         .await
         .map_err(|_| anyhow::anyhow!("docker command timed out"))?
         .map_err(|e| anyhow::anyhow!("failed to execute docker: {}", e))
+}
+
+fn split_command_args(command: &str, label: &str) -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escape = false;
+
+    for ch in command.chars() {
+        if escape {
+            current.push(ch);
+            escape = false;
+            continue;
+        }
+        match quote {
+            Some(q) => {
+                if ch == '\\' && q == '"' {
+                    escape = true;
+                } else if ch == q {
+                    quote = None;
+                } else {
+                    current.push(ch);
+                }
+            }
+            None => {
+                if ch == '\'' || ch == '"' {
+                    quote = Some(ch);
+                } else if ch == '\\' {
+                    escape = true;
+                } else if ch.is_whitespace() {
+                    if !current.is_empty() {
+                        out.push(std::mem::take(&mut current));
+                    }
+                } else {
+                    current.push(ch);
+                }
+            }
+        }
+    }
+
+    if escape {
+        anyhow::bail!("{} has a trailing escape character", label);
+    }
+    if quote.is_some() {
+        anyhow::bail!("{} has an unclosed quote", label);
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    if out.is_empty() {
+        anyhow::bail!("{} cannot be empty", label);
+    }
+    Ok(out)
+}
+
+fn command_arg_candidates(args: &[String]) -> Vec<Vec<String>> {
+    if args.is_empty() {
+        return Vec::new();
+    }
+    let program = args[0].trim();
+    if program.is_empty() {
+        return vec![args.to_vec()];
+    }
+    let has_path_hint = program.contains('/') || program.contains('\\');
+    if has_path_hint {
+        return vec![args.to_vec()];
+    }
+
+    let rest: Vec<String> = args.iter().skip(1).cloned().collect();
+    let mut candidates: Vec<Vec<String>> = vec![args.to_vec()];
+    let lowered = program.to_ascii_lowercase();
+
+    let push_program_variant = |list: &mut Vec<Vec<String>>, alt: &str| {
+        let mut variant = Vec::with_capacity(1 + rest.len());
+        variant.push(alt.to_string());
+        variant.extend(rest.iter().cloned());
+        list.push(variant);
+    };
+    let push_module_variant = |list: &mut Vec<Vec<String>>, py: &str, module: &str| {
+        let mut variant = Vec::with_capacity(3 + rest.len());
+        variant.push(py.to_string());
+        variant.push("-m".to_string());
+        variant.push(module.to_string());
+        variant.extend(rest.iter().cloned());
+        list.push(variant);
+    };
+
+    match lowered.as_str() {
+        "python" => {
+            push_program_variant(&mut candidates, "python3");
+            if cfg!(windows) {
+                push_program_variant(&mut candidates, "py");
+            }
+        }
+        "python3" => {
+            push_program_variant(&mut candidates, "python");
+        }
+        "pip" => {
+            push_program_variant(&mut candidates, "pip3");
+            push_module_variant(&mut candidates, "python", "pip");
+            push_module_variant(&mut candidates, "python3", "pip");
+        }
+        "pip3" => {
+            push_program_variant(&mut candidates, "pip");
+            push_module_variant(&mut candidates, "python3", "pip");
+            push_module_variant(&mut candidates, "python", "pip");
+        }
+        "node" => {
+            push_program_variant(&mut candidates, "nodejs");
+        }
+        "nodejs" => {
+            push_program_variant(&mut candidates, "node");
+        }
+        "uvicorn" | "gunicorn" | "streamlit" | "flask" => {
+            push_module_variant(&mut candidates, "python", lowered.as_str());
+            push_module_variant(&mut candidates, "python3", lowered.as_str());
+        }
+        _ => {}
+    }
+
+    let mut deduped: Vec<Vec<String>> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for candidate in candidates {
+        if candidate.is_empty() {
+            continue;
+        }
+        let key = candidate.join("\u{1f}");
+        if seen.insert(key) {
+            deduped.push(candidate);
+        }
+    }
+    deduped
+}
+
+async fn run_local_args_with_fallback(
+    args: &[String],
+    label: &str,
+    cwd: &Path,
+    envs: &HashMap<String, String>,
+    timeout_secs: u64,
+) -> Result<std::process::Output> {
+    let mut attempted: Vec<String> = Vec::new();
+    for candidate in command_arg_candidates(args) {
+        if candidate.is_empty() {
+            continue;
+        }
+        let program = candidate[0].clone();
+        attempted.push(candidate.join(" "));
+        let mut cmd = tokio::process::Command::new(&program);
+        cmd.args(candidate.iter().skip(1))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .current_dir(cwd)
+            .envs(envs);
+
+        let fut = cmd.output();
+        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut).await {
+            Err(_) => anyhow::bail!("{} timed out", label),
+            Ok(Ok(output)) => return Ok(output),
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            Ok(Err(e)) => {
+                anyhow::bail!("failed to execute {} '{}': {}", label, program, e);
+            }
+        }
+    }
+    anyhow::bail!(
+        "failed to execute {}: no executable found (tried: {})",
+        label,
+        attempted.join(" | ")
+    );
+}
+
+async fn spawn_local_process_with_fallback(
+    args: &[String],
+    label: &str,
+    cwd: &Path,
+    envs: &HashMap<String, String>,
+    stdout_log_path: &Path,
+    stderr_log_path: &Path,
+) -> Result<(tokio::process::Child, String)> {
+    let mut attempted: Vec<String> = Vec::new();
+    for candidate in command_arg_candidates(args) {
+        if candidate.is_empty() {
+            continue;
+        }
+        let program = candidate[0].clone();
+        attempted.push(candidate.join(" "));
+        let stdout_log = open_local_runtime_log_for_append(stdout_log_path, "stdout")?;
+        let stderr_log = open_local_runtime_log_for_append(stderr_log_path, "stderr")?;
+        let mut cmd = tokio::process::Command::new(&program);
+        cmd.args(candidate.iter().skip(1))
+            .stdout(Stdio::from(stdout_log))
+            .stderr(Stdio::from(stderr_log))
+            .kill_on_drop(true)
+            .current_dir(cwd)
+            .envs(envs);
+        match cmd.spawn() {
+            Ok(child) => return Ok((child, program)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => anyhow::bail!("failed to execute {} '{}': {}", label, program, e),
+        }
+    }
+    anyhow::bail!(
+        "failed to execute {}: no executable found (tried: {})",
+        label,
+        attempted.join(" | ")
+    )
+}
+
+fn docker_required() -> bool {
+    std::env::var("AGENTARK_APP_REQUIRE_DOCKER")
+        .map(|v| {
+            let normalized = v.trim().to_ascii_lowercase();
+            normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on"
+        })
+        .unwrap_or(false)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimePreference {
+    Local,
+    Container,
+}
+
+impl RuntimePreference {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuntimePreference::Local => "local",
+            RuntimePreference::Container => "container",
+        }
+    }
+}
+
+fn default_runtime_preference() -> RuntimePreference {
+    match std::env::var("AGENTARK_APP_RUNTIME_DEFAULT")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "container" | "docker" => RuntimePreference::Container,
+        _ => RuntimePreference::Local,
+    }
+}
+
+pub fn runtime_preference_from_opt(raw: Option<&str>) -> RuntimePreference {
+    match raw.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "local" | "native" | "process" => RuntimePreference::Local,
+        "container" | "docker" => RuntimePreference::Container,
+        _ => default_runtime_preference(),
+    }
+}
+
+fn with_node_bin_path(app_dir: &Path) -> Option<String> {
+    let node_bin = app_dir.join("node_modules").join(".bin");
+    if !node_bin.exists() {
+        return None;
+    }
+    let mut entries: Vec<std::path::PathBuf> = vec![node_bin];
+    if let Some(existing) = std::env::var_os("PATH") {
+        entries.extend(std::env::split_paths(&existing));
+    }
+    std::env::join_paths(entries)
+        .ok()
+        .and_then(|os| os.into_string().ok())
+}
+
+async fn run_local_command(
+    command: &str,
+    label: &str,
+    cwd: &Path,
+    envs: &HashMap<String, String>,
+    timeout_secs: u64,
+) -> Result<std::process::Output> {
+    let args = split_command_args(command, label)?;
+    run_local_args_with_fallback(&args, label, cwd, envs, timeout_secs).await
+}
+
+fn compact_progress_line(line: &str, max_chars: usize) -> String {
+    let trimmed = line.trim().replace('\r', "");
+    let char_count = trimmed.chars().count();
+    if char_count <= max_chars {
+        return trimmed;
+    }
+    let head = max_chars.saturating_sub(3);
+    format!("{}...", trimmed.chars().take(head).collect::<String>())
+}
+
+async fn run_local_command_with_progress(
+    command: &str,
+    label: &str,
+    cwd: &Path,
+    envs: &HashMap<String, String>,
+    timeout_secs: u64,
+    stream_tx: &Option<Sender<StreamEvent>>,
+    stage: &str,
+) -> Result<std::process::Output> {
+    let args = split_command_args(command, label)?;
+    let mut attempted: Vec<String> = Vec::new();
+    for candidate in command_arg_candidates(&args) {
+        if candidate.is_empty() {
+            continue;
+        }
+        let program = candidate[0].clone();
+        attempted.push(candidate.join(" "));
+        let mut cmd = tokio::process::Command::new(&program);
+        cmd.args(candidate.iter().skip(1))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .current_dir(cwd)
+            .envs(envs);
+
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => anyhow::bail!("failed to execute {} '{}': {}", label, program, e),
+        };
+
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let stdout_tx = stream_tx.clone();
+        let stderr_tx = stream_tx.clone();
+        let stage_stdout = stage.to_string();
+        let stage_stderr = stage.to_string();
+
+        let stdout_task = tokio::spawn(async move {
+            let mut collected = Vec::new();
+            if let Some(stdout) = stdout {
+                let mut lines = tokio::io::BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    collected.extend_from_slice(line.as_bytes());
+                    collected.push(b'\n');
+                    if let Some(tx) = stdout_tx.as_ref() {
+                        let _ = tx
+                            .send(StreamEvent::ToolProgress {
+                                name: "app_deploy".to_string(),
+                                content: format!(
+                                    "{}: {}",
+                                    stage_stdout,
+                                    compact_progress_line(&line, 220)
+                                ),
+                                payload: None,
+                            })
+                            .await;
+                    }
+                }
+            }
+            collected
+        });
+
+        let stderr_task = tokio::spawn(async move {
+            let mut collected = Vec::new();
+            if let Some(stderr) = stderr {
+                let mut lines = tokio::io::BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    collected.extend_from_slice(line.as_bytes());
+                    collected.push(b'\n');
+                    if let Some(tx) = stderr_tx.as_ref() {
+                        let _ = tx
+                            .send(StreamEvent::ToolProgress {
+                                name: "app_deploy".to_string(),
+                                content: format!(
+                                    "{}: {}",
+                                    stage_stderr,
+                                    compact_progress_line(&line, 220)
+                                ),
+                                payload: None,
+                            })
+                            .await;
+                    }
+                }
+            }
+            collected
+        });
+
+        let status =
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), child.wait())
+                .await
+            {
+                Err(_) => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    let _ = stdout_task.await;
+                    let _ = stderr_task.await;
+                    anyhow::bail!("{} timed out", label);
+                }
+                Ok(Ok(status)) => status,
+                Ok(Err(e)) => {
+                    let _ = stdout_task.await;
+                    let _ = stderr_task.await;
+                    anyhow::bail!("failed waiting for {} '{}': {}", label, program, e);
+                }
+            };
+
+        let stdout = stdout_task.await.unwrap_or_default();
+        let stderr = stderr_task.await.unwrap_or_default();
+        return Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        });
+    }
+
+    anyhow::bail!(
+        "failed to execute {}: no executable found (tried: {})",
+        label,
+        attempted.join(" | ")
+    );
 }
 
 async fn cleanup_existing_container(name: &str) {
@@ -381,23 +1042,41 @@ pub async fn launch_dynamic_container(
     let container_name = app_container_name(app_id);
     cleanup_existing_container(&container_name).await;
 
-    validate_app_command(entry_command, "entry_command")?;
-    if let Some(cmd) = install_command {
-        validate_app_command(cmd, "install_command")?;
-    }
+    let entry_cmd = validate_app_command(entry_command, "entry_command")?;
+    let install_cmd = if let Some(cmd) = install_command {
+        Some(validate_app_command(cmd, "install_command")?)
+    } else {
+        None
+    };
+    let uses_python_runtime = command_looks_python_related(&entry_cmd)
+        || install_cmd
+            .as_deref()
+            .map(command_looks_python_related)
+            .unwrap_or(false);
 
     let mut script_parts: Vec<String> = Vec::new();
     script_parts.push("set -e".to_string());
     script_parts.push("export PATH=\"/workspace/node_modules/.bin:$PATH\"".to_string());
     script_parts
         .push("export PYTHONPATH=\"/workspace/_deps${PYTHONPATH:+:$PYTHONPATH}\"".to_string());
-    if let Some(cmd) = install_command {
+    if uses_python_runtime {
+        script_parts.push(
+            "if [ ! -x /workspace/.venv/bin/python ]; then python3 -m venv /workspace/.venv || python -m venv /workspace/.venv || true; fi".to_string(),
+        );
+        script_parts.push(
+            "if [ -x /workspace/.venv/bin/python ]; then . /workspace/.venv/bin/activate; fi"
+                .to_string(),
+        );
+        script_parts.push("export PIP_DISABLE_PIP_VERSION_CHECK=1".to_string());
+        script_parts.push("export PIP_BREAK_SYSTEM_PACKAGES=1".to_string());
+    }
+    if let Some(ref cmd) = install_cmd {
         let trimmed = cmd.trim();
         if !trimmed.is_empty() {
             script_parts.push(trimmed.to_string());
         }
     }
-    script_parts.push(entry_command.trim().to_string());
+    script_parts.push(entry_cmd.trim().to_string());
     let launch_script = script_parts
         .join(" && ")
         .replace("{PORT}", &port.to_string());
@@ -449,13 +1128,317 @@ pub async fn launch_dynamic_container(
     Ok(container_id)
 }
 
-fn emit_progress(stream_tx: &Option<Sender<StreamEvent>>, message: &str) {
-    if let Some(tx) = stream_tx {
-        let _ = tx.try_send(StreamEvent::ToolResult {
-            name: "app_deploy".to_string(),
-            content: message.to_string(),
-        });
+pub async fn launch_dynamic_process(
+    app_id: &str,
+    app_dir: &Path,
+    entry_command: &str,
+    install_command: Option<&str>,
+    port: u16,
+    extra_env: &HashMap<String, String>,
+    stream_tx: Option<Sender<StreamEvent>>,
+) -> Result<tokio::process::Child> {
+    let entry_command = validate_app_command(
+        &entry_command.replace("{PORT}", &port.to_string()),
+        "entry_command",
+    )?;
+
+    let install_command = if let Some(cmd) = install_command {
+        Some(validate_app_command(
+            &cmd.replace("{PORT}", &port.to_string()),
+            "install_command",
+        )?)
+    } else {
+        None
+    };
+
+    let mut runtime_env: HashMap<String, String> = HashMap::new();
+    runtime_env.insert("PORT".to_string(), port.to_string());
+    runtime_env.insert("HOST".to_string(), "0.0.0.0".to_string());
+    runtime_env.extend(extra_env.clone());
+
+    let deps_dir = app_dir.join("_deps");
+    if deps_dir.exists() {
+        let deps = deps_dir.to_string_lossy().to_string();
+        let merged = std::env::var("PYTHONPATH")
+            .map(|existing| {
+                if existing.trim().is_empty() {
+                    deps.clone()
+                } else if cfg!(windows) {
+                    format!("{};{}", deps, existing)
+                } else {
+                    format!("{}:{}", deps, existing)
+                }
+            })
+            .unwrap_or(deps);
+        runtime_env.insert("PYTHONPATH".to_string(), merged);
     }
+
+    if let Some(path) = with_node_bin_path(app_dir) {
+        runtime_env.insert("PATH".to_string(), path);
+    }
+
+    let uses_python_runtime = command_looks_python_related(&entry_command)
+        || install_command
+            .as_deref()
+            .map(command_looks_python_related)
+            .unwrap_or(false);
+    if uses_python_runtime {
+        match ensure_local_python_venv(app_dir).await {
+            Ok((venv_dir, venv_bin_dir)) => {
+                if let Some(merged_path) =
+                    prepend_path_entry(&venv_bin_dir, runtime_env.get("PATH").map(|v| v.as_str()))
+                {
+                    runtime_env.insert("PATH".to_string(), merged_path);
+                }
+                runtime_env.insert(
+                    "VIRTUAL_ENV".to_string(),
+                    venv_dir.to_string_lossy().to_string(),
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Python venv bootstrap unavailable for app {}. Falling back to system Python: {}",
+                    app_id,
+                    err
+                );
+            }
+        }
+        runtime_env.insert("PIP_DISABLE_PIP_VERSION_CHECK".to_string(), "1".to_string());
+        runtime_env.insert("PIP_BREAK_SYSTEM_PACKAGES".to_string(), "1".to_string());
+    }
+
+    if let Some(ref cmd) = install_command {
+        let output = run_local_command_with_progress(
+            cmd,
+            "install_command",
+            app_dir,
+            &runtime_env,
+            600,
+            &stream_tx,
+            "install",
+        )
+        .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let detail = if !stderr.trim().is_empty() {
+                stderr.trim().to_string()
+            } else {
+                stdout.trim().to_string()
+            };
+            anyhow::bail!("install_command failed for app {}: {}", app_id, detail);
+        }
+    }
+
+    let (stdout_log_path, stderr_log_path) = prepare_local_runtime_log_files(app_dir)?;
+    let args = split_command_args(&entry_command, "entry_command")?;
+    let (mut child, _resolved_program) = spawn_local_process_with_fallback(
+        &args,
+        "entry_command",
+        app_dir,
+        &runtime_env,
+        &stdout_log_path,
+        &stderr_log_path,
+    )
+    .await?;
+
+    tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+    if let Some(status) = child
+        .try_wait()
+        .map_err(|e| anyhow::anyhow!("failed to check app {} process status: {}", app_id, e))?
+    {
+        let log_tail = read_local_runtime_log_tail(app_dir, LOCAL_RUNTIME_LOG_TAIL_BYTES).await;
+        if log_tail.is_empty() {
+            anyhow::bail!("app {} exited immediately with status {}", app_id, status);
+        }
+        anyhow::bail!(
+            "app {} exited immediately with status {}. Recent runtime logs:\n{}",
+            app_id,
+            status,
+            log_tail
+        );
+    }
+
+    Ok(child)
+}
+
+pub enum DynamicRuntimeHandle {
+    Container(String),
+    Process(tokio::process::Child),
+}
+
+pub async fn launch_dynamic_runtime(
+    app_id: &str,
+    app_dir: &Path,
+    entry_command: &str,
+    install_command: Option<&str>,
+    port: u16,
+    extra_env: &HashMap<String, String>,
+    runtime_image: Option<&str>,
+    runtime_preference: RuntimePreference,
+    stream_tx: Option<Sender<StreamEvent>>,
+) -> Result<DynamicRuntimeHandle> {
+    if matches!(runtime_preference, RuntimePreference::Local) && !docker_required() {
+        match launch_dynamic_process(
+            app_id,
+            app_dir,
+            entry_command,
+            install_command,
+            port,
+            extra_env,
+            stream_tx.clone(),
+        )
+        .await
+        {
+            Ok(child) => return Ok(DynamicRuntimeHandle::Process(child)),
+            Err(local_err) => {
+                tracing::warn!(
+                    "Local runtime launch unavailable for app {}: {}. Trying container fallback.",
+                    app_id,
+                    local_err
+                );
+                match launch_dynamic_container(
+                    app_id,
+                    app_dir,
+                    entry_command,
+                    install_command,
+                    port,
+                    extra_env,
+                    runtime_image,
+                )
+                .await
+                {
+                    Ok(container_id) => return Ok(DynamicRuntimeHandle::Container(container_id)),
+                    Err(container_err) => {
+                        return Err(anyhow::anyhow!(
+                            "local runtime failed: {} | container fallback failed: {}",
+                            local_err,
+                            container_err
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    match launch_dynamic_container(
+        app_id,
+        app_dir,
+        entry_command,
+        install_command,
+        port,
+        extra_env,
+        runtime_image,
+    )
+    .await
+    {
+        Ok(container_id) => Ok(DynamicRuntimeHandle::Container(container_id)),
+        Err(container_err) => {
+            if docker_required() {
+                return Err(container_err);
+            }
+            tracing::warn!(
+                "Container launch unavailable for app {}: {}. Falling back to local process runtime.",
+                app_id,
+                container_err
+            );
+            match launch_dynamic_process(
+                app_id,
+                app_dir,
+                entry_command,
+                install_command,
+                port,
+                extra_env,
+                stream_tx.clone(),
+            )
+            .await
+            {
+                Ok(child) => Ok(DynamicRuntimeHandle::Process(child)),
+                Err(local_err) => Err(anyhow::anyhow!(
+                    "container runtime failed: {} | local runtime fallback failed: {}",
+                    container_err,
+                    local_err
+                )),
+            }
+        }
+    }
+}
+
+async fn emit_progress(stream_tx: &Option<Sender<StreamEvent>>, message: &str) {
+    if let Some(tx) = stream_tx {
+        let _ = tx
+            .send(StreamEvent::ToolProgress {
+                name: "app_deploy".to_string(),
+                content: message.to_string(),
+                payload: None,
+            })
+            .await;
+    }
+}
+
+async fn emit_file_write_progress(
+    stream_tx: &Option<Sender<StreamEvent>>,
+    filename: &str,
+    line: usize,
+    total_lines: usize,
+    text: &str,
+    done: bool,
+) {
+    if let Some(tx) = stream_tx {
+        let status = if total_lines > 0 {
+            format!("writing {} line {}/{}", filename, line, total_lines)
+        } else {
+            format!("writing {} (empty file)", filename)
+        };
+        let payload = serde_json::json!({
+            "kind": "file_write",
+            "file": filename,
+            "line": line,
+            "total_lines": total_lines,
+            "text": compact_progress_line(text, 240),
+            "done": done,
+        });
+        let _ = tx
+            .send(StreamEvent::ToolProgress {
+                name: "app_deploy".to_string(),
+                content: status,
+                payload: Some(payload),
+            })
+            .await;
+    }
+}
+
+async fn write_file_with_progress(
+    file_path: &Path,
+    filename: &str,
+    content: &str,
+    stream_tx: &Option<Sender<StreamEvent>>,
+) -> Result<()> {
+    let mut file = tokio::fs::File::create(file_path).await?;
+    if content.is_empty() {
+        emit_file_write_progress(stream_tx, filename, 0, 0, "", true).await;
+        file.flush().await?;
+        return Ok(());
+    }
+
+    let segments: Vec<&str> = content.split_inclusive('\n').collect();
+    let total_lines = segments.len();
+    for (idx, segment) in segments.iter().enumerate() {
+        file.write_all(segment.as_bytes()).await?;
+        let line_no = idx + 1;
+        let line_text = segment.trim_end_matches('\n').trim_end_matches('\r');
+        emit_file_write_progress(
+            stream_tx,
+            filename,
+            line_no,
+            total_lines,
+            line_text,
+            line_no >= total_lines,
+        )
+        .await;
+    }
+    file.flush().await?;
+    Ok(())
 }
 
 /// A running app process
@@ -472,6 +1455,8 @@ pub struct RunningApp {
     pub request_count: u64,
     /// Random access key for app authentication
     pub access_key: String,
+    /// Whether access guard/key is enforced.
+    pub access_guard_enabled: bool,
 }
 
 /// Generate a random access key for app authentication
@@ -493,6 +1478,16 @@ pub struct AppHealthSnapshot {
 #[derive(Clone)]
 pub struct AppRegistry {
     apps: Arc<RwLock<HashMap<String, Arc<RwLock<RunningApp>>>>>,
+}
+
+pub struct DynamicAppRegistration {
+    pub title: String,
+    pub app_dir: PathBuf,
+    pub child: Option<tokio::process::Child>,
+    pub container_id: Option<String>,
+    pub port: u16,
+    pub access_key: String,
+    pub access_guard_enabled: bool,
 }
 
 impl AppRegistry {
@@ -539,15 +1534,31 @@ impl AppRegistry {
                 app.container_id = None;
                 app.port = None;
             }
+            let runtime_mode = if app.is_static {
+                "static"
+            } else if app.container_id.is_some() {
+                "isolated_container"
+            } else if app.process.is_some() {
+                "local_process_fallback"
+            } else {
+                "stopped"
+            };
             result.push(serde_json::json!({
                 "id": id,
                 "title": app.title,
                 "port": app.port,
                 "is_static": app.is_static,
                 "running": running,
+                "runtime_mode": runtime_mode,
+                "is_isolated_runtime": app.container_id.is_some(),
                 "created_at": app.created_at.to_rfc3339(),
                 "url": format!("/apps/{}/", id),
-                "access_url": format!("/apps/{}/?key={}", id, app.access_key),
+                "access_url": if app.access_guard_enabled {
+                    format!("/apps/{}/?key={}", id, app.access_key)
+                } else {
+                    format!("/apps/{}/", id)
+                },
+                "access_guard_enabled": app.access_guard_enabled,
             }));
         }
         result
@@ -585,6 +1596,35 @@ impl AppRegistry {
         false
     }
 
+    /// Check runtime liveness for a dynamic app and clear stale runtime handles.
+    pub async fn runtime_is_alive(&self, app_id: &str) -> bool {
+        let app_handle = {
+            let apps = self.apps.read().await;
+            apps.get(app_id).cloned()
+        };
+        let Some(app_handle) = app_handle else {
+            return false;
+        };
+        let mut app = app_handle.write().await;
+        if app.is_static {
+            return true;
+        }
+
+        let mut alive = false;
+        if let Some(container_id) = app.container_id.as_ref() {
+            alive = is_container_running(container_id).await;
+        } else if let Some(child) = app.process.as_mut() {
+            alive = matches!(child.try_wait(), Ok(None));
+        }
+
+        if !alive {
+            app.process = None;
+            app.container_id = None;
+            app.port = None;
+        }
+        alive
+    }
+
     /// Register a static app
     pub async fn register_static(
         &self,
@@ -592,6 +1632,7 @@ impl AppRegistry {
         title: String,
         app_dir: PathBuf,
         access_key: String,
+        access_guard_enabled: bool,
     ) {
         let app = RunningApp {
             title,
@@ -604,6 +1645,7 @@ impl AppRegistry {
             last_accessed: chrono::Utc::now(),
             request_count: 0,
             access_key,
+            access_guard_enabled,
         };
         self.apps
             .write()
@@ -612,27 +1654,19 @@ impl AppRegistry {
     }
 
     /// Register and start a dynamic app
-    pub async fn register_dynamic(
-        &self,
-        id: String,
-        title: String,
-        app_dir: PathBuf,
-        child: Option<tokio::process::Child>,
-        container_id: Option<String>,
-        port: u16,
-        access_key: String,
-    ) {
+    pub async fn register_dynamic(&self, id: String, registration: DynamicAppRegistration) {
         let app = RunningApp {
-            title,
-            port: Some(port),
-            process: child,
-            container_id,
-            app_dir,
+            title: registration.title,
+            port: Some(registration.port),
+            process: registration.child,
+            container_id: registration.container_id,
+            app_dir: registration.app_dir,
             is_static: false,
             created_at: chrono::Utc::now(),
             last_accessed: chrono::Utc::now(),
             request_count: 0,
-            access_key,
+            access_key: registration.access_key,
+            access_guard_enabled: registration.access_guard_enabled,
         };
         self.apps
             .write()
@@ -648,7 +1682,22 @@ impl AppRegistry {
         };
         if let Some(app) = app_handle {
             let app = app.read().await;
+            if !app.access_guard_enabled {
+                return true;
+            }
             return app.access_key == key;
+        }
+        false
+    }
+
+    /// Whether app requires an access key guard.
+    pub async fn access_guard_enabled(&self, app_id: &str) -> bool {
+        let app_handle = {
+            let apps = self.apps.read().await;
+            apps.get(app_id).cloned()
+        };
+        if let Some(app) = app_handle {
+            return app.read().await.access_guard_enabled;
         }
         false
     }
@@ -869,6 +1918,10 @@ impl AppRegistry {
                         .as_ref()
                         .and_then(|m| m.get("runtime_image").and_then(|c| c.as_str()))
                         .map(|s| s.to_string());
+                    let runtime_preference = runtime_preference_from_opt(
+                        meta.as_ref()
+                            .and_then(|m| m.get("runtime_preference").and_then(|c| c.as_str())),
+                    );
                     let required_inputs =
                         meta.as_ref().map(parse_required_inputs).unwrap_or_default();
                     let config_values: HashMap<String, String> = meta
@@ -889,12 +1942,21 @@ impl AppRegistry {
                         })
                         .unwrap_or_default();
 
-                    // Restore or regenerate access key
-                    let access_key = meta
+                    // Legacy apps defaulted to guarded mode, so missing flag => true.
+                    let access_guard_enabled = meta
                         .as_ref()
-                        .and_then(|m| m.get("access_key").and_then(|k| k.as_str()))
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(generate_access_key);
+                        .and_then(|m| m.get("access_guard_enabled").and_then(|v| v.as_bool()))
+                        .unwrap_or(true);
+                    // Restore or regenerate access key only when guard is enabled.
+                    let access_key = if access_guard_enabled {
+                        meta.as_ref()
+                            .and_then(|m| m.get("access_key").and_then(|k| k.as_str()))
+                            .filter(|s| !s.trim().is_empty())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(generate_access_key)
+                    } else {
+                        String::new()
+                    };
 
                     if let Some(entry_cmd) = entry_command {
                         // Dynamic app — restart in isolated container runtime
@@ -927,6 +1989,7 @@ impl AppRegistry {
                                             title,
                                             path,
                                             access_key.clone(),
+                                            access_guard_enabled,
                                         )
                                         .await;
                                         continue;
@@ -940,11 +2003,17 @@ impl AppRegistry {
                                     missing_sensitive,
                                     missing_config
                                 );
-                                self.register_static(id.clone(), title, path, access_key.clone())
-                                    .await;
+                                self.register_static(
+                                    id.clone(),
+                                    title,
+                                    path,
+                                    access_key.clone(),
+                                    access_guard_enabled,
+                                )
+                                .await;
                                 continue;
                             }
-                            match launch_dynamic_container(
+                            match launch_dynamic_runtime(
                                 &id,
                                 &path,
                                 &entry_cmd,
@@ -952,18 +2021,29 @@ impl AppRegistry {
                                 port,
                                 &resolved_env,
                                 runtime_image.as_deref(),
+                                runtime_preference,
+                                None,
                             )
                             .await
                             {
-                                Ok(container_id) => {
+                                Ok(runtime_handle) => {
+                                    let (container_id, child) = match runtime_handle {
+                                        DynamicRuntimeHandle::Container(container_id) => {
+                                            (Some(container_id), None)
+                                        }
+                                        DynamicRuntimeHandle::Process(child) => (None, Some(child)),
+                                    };
                                     self.register_dynamic(
                                         id.clone(),
-                                        title,
-                                        path,
-                                        None,
-                                        Some(container_id),
-                                        port,
-                                        access_key.clone(),
+                                        DynamicAppRegistration {
+                                            title,
+                                            app_dir: path,
+                                            child,
+                                            container_id,
+                                            port,
+                                            access_key: access_key.clone(),
+                                            access_guard_enabled,
+                                        },
                                     )
                                     .await;
                                     tracing::info!("Restarted dynamic app: {}", id);
@@ -976,19 +2056,32 @@ impl AppRegistry {
                                         title,
                                         path,
                                         access_key.clone(),
+                                        access_guard_enabled,
                                     )
                                     .await;
                                 }
                             }
                         } else {
                             tracing::warn!("No available port to restart app {}", id);
-                            self.register_static(id.clone(), title, path, access_key.clone())
-                                .await;
+                            self.register_static(
+                                id.clone(),
+                                title,
+                                path,
+                                access_key.clone(),
+                                access_guard_enabled,
+                            )
+                            .await;
                         }
                     } else {
                         // Static app
-                        self.register_static(id.clone(), title, path, access_key.clone())
-                            .await;
+                        self.register_static(
+                            id.clone(),
+                            title,
+                            path,
+                            access_key.clone(),
+                            access_guard_enabled,
+                        )
+                        .await;
                         tracing::info!("Restored static app: {}", id);
                     }
                 }
@@ -1037,13 +2130,27 @@ pub async fn app_deploy(
         .get("runtime_image")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let runtime_preference =
+        runtime_preference_from_opt(arguments.get("runtime_preference").and_then(|v| v.as_str()));
+    let expose_public = arguments
+        .get("expose_public")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let access_guard_enabled = arguments
+        .get("access_guard")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let required_inputs = parse_required_inputs(arguments);
     let config_values = parse_config_values(arguments);
     let is_static = entry_command.is_none();
 
-    // Generate app ID and access key
+    // Generate app ID and optional access key.
     let app_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-    let access_key = generate_access_key();
+    let access_key = if access_guard_enabled {
+        generate_access_key()
+    } else {
+        String::new()
+    };
     let app_dir = data_dir.join("apps").join(&app_id);
     tokio::fs::create_dir_all(&app_dir).await?;
 
@@ -1060,39 +2167,45 @@ pub async fn app_deploy(
             title,
             if is_static { "static" } else { "dynamic" }
         ),
-    );
-    emit_progress(&stream_tx, "Writing files...");
-
+    )
+    .await;
     // Write all files
     let mut written_files = 0usize;
-    let mut skipped_files = 0usize;
+    let mut written_names: Vec<String> = Vec::new();
     for (filename, content) in files {
         let content_str = content.as_str().unwrap_or_default();
         // Prevent path traversal
         if filename.contains("..") || filename.starts_with('/') || filename.starts_with('\\') {
             tracing::warn!("Skipping file with suspicious path: {}", filename);
-            skipped_files += 1;
             continue;
         }
         let file_path = app_dir.join(filename);
         if let Some(parent) = file_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        tokio::fs::write(&file_path, content_str)
+        let byte_len = content_str.len();
+        write_file_with_progress(&file_path, filename, content_str, &stream_tx)
             .await
             .with_context(|| format!("Failed to write {}", filename))?;
         written_files += 1;
+        written_names.push(filename.to_string());
+        emit_progress(&stream_tx, &format!("wrote {} ({}B)", filename, byte_len)).await;
     }
     if written_files == 0 {
         anyhow::bail!("No valid files were written. Check filenames and try again.");
     }
+    let skipped_files = file_count.saturating_sub(written_files);
     emit_progress(
         &stream_tx,
         &format!(
-            "Files written: {} (skipped: {} out of {})",
-            written_files, skipped_files, file_count
+            "{} / {} files ready (skipped {}): {}",
+            written_files,
+            file_count,
+            skipped_files,
+            written_names.join(", ")
         ),
-    );
+    )
+    .await;
 
     let (resolved_env, missing_sensitive, missing_config) = resolve_required_env_values(
         config_dir,
@@ -1120,11 +2233,14 @@ pub async fn app_deploy(
         "entry_command": entry_command,
         "install_command": install_command,
         "runtime_image": runtime_image.clone(),
+        "runtime_preference": runtime_preference.as_str(),
+        "expose_public": expose_public,
         "required_inputs": required_inputs.clone(),
         "required_secrets": required_secret_keys.clone(),
         "required_env": required_secret_keys.clone(),
         "required_config": required_config_keys.clone(),
         "config_values": config_values.clone(),
+        "access_guard_enabled": access_guard_enabled,
         "access_key": access_key,
         "created_at": chrono::Utc::now().to_rfc3339(),
     });
@@ -1133,7 +2249,7 @@ pub async fn app_deploy(
         serde_json::to_string_pretty(&meta)?,
     )
     .await?;
-    emit_progress(&stream_tx, "Saved app metadata");
+    emit_progress(&stream_tx, "Saved app metadata").await;
 
     if is_static {
         // Static app — just register, served directly by HTTP server
@@ -1143,18 +2259,22 @@ pub async fn app_deploy(
                 title.to_string(),
                 app_dir,
                 access_key.clone(),
+                access_guard_enabled,
             )
             .await;
         let url = format!("/apps/{}/", app_id);
         tracing::info!("Static app deployed at {}", url);
-        emit_progress(&stream_tx, &format!("Static app ready at {}", url));
+        emit_progress(&stream_tx, &format!("Static app ready at {}", url)).await;
         return Ok(serde_json::json!({
             "status": "deployed",
             "type": "static",
             "app_id": app_id,
             "url": url,
             "title": title,
+            "runtime_preference": runtime_preference.as_str(),
+            "expose_public": expose_public,
             "access_key": access_key,
+            "access_guard_enabled": access_guard_enabled,
         })
         .to_string());
     }
@@ -1175,7 +2295,7 @@ pub async fn app_deploy(
             )
         })?,
     };
-    emit_progress(&stream_tx, &format!("Assigned port {}", port));
+    emit_progress(&stream_tx, &format!("Assigned port {}", port)).await;
 
     if !missing_sensitive.is_empty() || !missing_config.is_empty() {
         let mut missing_all = missing_sensitive.clone();
@@ -1184,12 +2304,18 @@ pub async fn app_deploy(
                 missing_all.push(m.clone());
             }
         }
+        let llm_reuse_candidates: Vec<String> = missing_sensitive
+            .iter()
+            .filter(|k| llm_env.get(*k).is_some_and(|v| !v.trim().is_empty()))
+            .cloned()
+            .collect();
         registry
             .register_static(
                 app_id.clone(),
                 title.to_string(),
                 app_dir,
                 access_key.clone(),
+                access_guard_enabled,
             )
             .await;
         emit_progress(
@@ -1198,21 +2324,26 @@ pub async fn app_deploy(
                 "App created but waiting for required inputs: {}",
                 missing_all.join(", ")
             ),
-        );
+        )
+        .await;
         return Ok(serde_json::json!({
             "status": "needs_secrets",
             "type": "dynamic",
             "app_id": app_id,
             "title": title,
             "url": format!("/apps/{}/", app_id),
+            "runtime_preference": runtime_preference.as_str(),
+            "expose_public": expose_public,
             "access_key": access_key,
+            "access_guard_enabled": access_guard_enabled,
             "required_inputs": required_inputs,
             "required_secrets": required_secret_keys.clone(),
             "required_env": required_secret_keys,
             "required_config": required_config_keys,
             "missing_env": missing_sensitive,
             "missing_config": missing_config,
-            "message": "Missing required inputs. For sensitive keys use: set secret KEY=VALUE. For non-sensitive values pass config.{KEY} when deploying/restarting."
+            "llm_reuse_candidates": llm_reuse_candidates,
+            "message": "Missing required inputs. For sensitive keys use: set secret KEY=VALUE (or use current llm key for KEY when offered). For non-sensitive values pass config.{KEY} when deploying/restarting."
         })
         .to_string());
     }
@@ -1223,7 +2354,7 @@ pub async fn app_deploy(
     let effective_install_cmd = if let Some(cmd) = install_command {
         Some(cmd.to_string())
     } else if has_requirements {
-        Some("pip install --target /workspace/_deps -r requirements.txt -q".to_string())
+        Some("pip install --target ./_deps -r requirements.txt -q".to_string())
     } else if has_package_json {
         Some("npm install --omit=dev".to_string())
     } else {
@@ -1231,9 +2362,9 @@ pub async fn app_deploy(
     };
 
     if effective_install_cmd.is_some() {
-        emit_progress(&stream_tx, "Installing dependencies...");
+        emit_progress(&stream_tx, "Installing dependencies...").await;
     } else {
-        emit_progress(&stream_tx, "No dependencies to install");
+        emit_progress(&stream_tx, "No dependencies to install").await;
     }
 
     // Start the server process in isolated container
@@ -1243,9 +2374,9 @@ pub async fn app_deploy(
         app_id,
         port
     );
-    emit_progress(&stream_tx, &format!("Starting server on port {}", port));
+    emit_progress(&stream_tx, &format!("Starting server on port {}", port)).await;
 
-    let container_id = launch_dynamic_container(
+    let runtime_handle = launch_dynamic_runtime(
         &app_id,
         &app_dir,
         entry,
@@ -1253,37 +2384,69 @@ pub async fn app_deploy(
         port,
         &resolved_env,
         runtime_image.as_deref(),
+        runtime_preference,
+        stream_tx.clone(),
     )
     .await?;
-    emit_progress(&stream_tx, "Server container started");
+    let (container_id, child, runtime_label) = match runtime_handle {
+        DynamicRuntimeHandle::Container(container_id) => {
+            emit_progress(&stream_tx, "Server container started").await;
+            (Some(container_id), None, "container")
+        }
+        DynamicRuntimeHandle::Process(child) => {
+            emit_progress(&stream_tx, "Docker unavailable; started local app process").await;
+            (None, Some(child), "local_process")
+        }
+    };
+    let app_dir_for_diagnostics = app_dir.clone();
 
     registry
         .register_dynamic(
             app_id.clone(),
-            title.to_string(),
-            app_dir,
-            None,
-            Some(container_id),
-            port,
-            access_key.clone(),
+            DynamicAppRegistration {
+                title: title.to_string(),
+                app_dir,
+                child,
+                container_id,
+                port,
+                access_key: access_key.clone(),
+                access_guard_enabled,
+            },
         )
         .await;
 
     // Wait briefly for the server to start
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    if !registry.runtime_is_alive(&app_id).await {
+        let log_tail =
+            read_local_runtime_log_tail(&app_dir_for_diagnostics, LOCAL_RUNTIME_LOG_TAIL_BYTES)
+                .await;
+        if log_tail.is_empty() {
+            anyhow::bail!("App {} stopped shortly after launch.", app_id);
+        }
+        anyhow::bail!(
+            "App {} stopped shortly after launch. Recent runtime logs:\n{}",
+            app_id,
+            log_tail
+        );
+    }
 
     let url = format!("/apps/{}/", app_id);
     tracing::info!("Dynamic app deployed at {} (port {})", url, port);
-    emit_progress(&stream_tx, &format!("Dynamic app ready at {}", url));
+    emit_progress(&stream_tx, &format!("Dynamic app ready at {}", url)).await;
 
     Ok(serde_json::json!({
         "status": "deployed",
         "type": "dynamic",
+        "runtime": runtime_label,
         "app_id": app_id,
         "url": url,
         "port": port,
         "title": title,
+        "runtime_preference": runtime_preference.as_str(),
+        "expose_public": expose_public,
         "access_key": access_key,
+        "access_guard_enabled": access_guard_enabled,
     })
     .to_string())
 }

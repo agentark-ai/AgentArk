@@ -20,6 +20,18 @@ pub struct Storage {
     db: DatabaseConnection,
 }
 
+#[derive(Debug, Clone)]
+pub struct NewUserDataItem<'a> {
+    pub kind: &'a str,
+    pub title: &'a str,
+    pub content: &'a str,
+    pub url: Option<&'a str>,
+    pub source_channel: Option<&'a str>,
+    pub conversation_id: Option<&'a str>,
+    pub project_id: Option<&'a str>,
+    pub pinned: bool,
+}
+
 impl Storage {
     fn preference_row_id(key: &str, project_id: Option<&str>) -> String {
         let normalized_key = key.trim().to_ascii_lowercase();
@@ -278,6 +290,25 @@ impl Storage {
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS operational_logs (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                trace_id TEXT,
+                conversation_id TEXT,
+                channel TEXT NOT NULL DEFAULT '',
+                event_type TEXT NOT NULL,
+                success INTEGER NOT NULL DEFAULT 0,
+                outcome TEXT NOT NULL DEFAULT '',
+                tool_name TEXT,
+                latency_ms INTEGER,
+                arguments TEXT,
+                payload TEXT,
+                strategy_version TEXT,
+                policy_version TEXT,
+                prompt_version TEXT,
+                model_slot TEXT
+            );
+
             CREATE TABLE IF NOT EXISTS llm_usage (
                 id TEXT PRIMARY KEY,
                 created_at TEXT NOT NULL,
@@ -345,6 +376,12 @@ impl Storage {
             CREATE INDEX IF NOT EXISTS idx_facts_project_id ON semantic_facts(project_id);
             CREATE INDEX IF NOT EXISTS idx_security_logs_created ON security_logs(created_at);
             CREATE INDEX IF NOT EXISTS idx_security_logs_type ON security_logs(event_type);
+            CREATE INDEX IF NOT EXISTS idx_operational_logs_created ON operational_logs(created_at);
+            CREATE INDEX IF NOT EXISTS idx_operational_logs_event_type ON operational_logs(event_type);
+            CREATE INDEX IF NOT EXISTS idx_operational_logs_tool_name ON operational_logs(tool_name);
+            CREATE INDEX IF NOT EXISTS idx_operational_logs_success ON operational_logs(success);
+            CREATE INDEX IF NOT EXISTS idx_operational_logs_policy_version ON operational_logs(policy_version);
+            CREATE INDEX IF NOT EXISTS idx_operational_logs_strategy_version ON operational_logs(strategy_version);
             CREATE INDEX IF NOT EXISTS idx_llm_usage_created ON llm_usage(created_at);
             CREATE INDEX IF NOT EXISTS idx_llm_usage_model ON llm_usage(model);
             CREATE INDEX IF NOT EXISTS idx_llm_usage_provider ON llm_usage(provider);
@@ -757,9 +794,15 @@ impl Storage {
     }
 
     /// Delete a user preference by key + scope.
-    pub async fn delete_user_preference(&self, key: &str, project_id: Option<&str>) -> Result<bool> {
+    pub async fn delete_user_preference(
+        &self,
+        key: &str,
+        project_id: Option<&str>,
+    ) -> Result<bool> {
         let id = Self::preference_row_id(key, project_id);
-        let result = user_preference::Entity::delete_by_id(id).exec(&self.db).await?;
+        let result = user_preference::Entity::delete_by_id(id)
+            .exec(&self.db)
+            .await?;
         Ok(result.rows_affected > 0)
     }
 
@@ -768,26 +811,22 @@ impl Storage {
     /// Insert a user data item.
     pub async fn create_user_data_item(
         &self,
-        kind: &str,
-        title: &str,
-        content: &str,
-        url: Option<&str>,
-        source_channel: Option<&str>,
-        conversation_id: Option<&str>,
-        project_id: Option<&str>,
-        pinned: bool,
+        item: NewUserDataItem<'_>,
     ) -> Result<user_data_item::Model> {
         let now = chrono::Utc::now().to_rfc3339();
         let model = user_data_item::ActiveModel {
             id: Set(uuid::Uuid::new_v4().to_string()),
-            kind: Set(kind.trim().to_string()),
-            title: Set(title.trim().to_string()),
-            content: Set(content.to_string()),
-            url: Set(url.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())),
-            source_channel: Set(source_channel.map(|v| v.to_string())),
-            conversation_id: Set(conversation_id.map(|v| v.to_string())),
-            project_id: Set(project_id.map(|v| v.to_string())),
-            pinned: Set(pinned),
+            kind: Set(item.kind.trim().to_string()),
+            title: Set(item.title.trim().to_string()),
+            content: Set(item.content.to_string()),
+            url: Set(item
+                .url
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())),
+            source_channel: Set(item.source_channel.map(|v| v.to_string())),
+            conversation_id: Set(item.conversation_id.map(|v| v.to_string())),
+            project_id: Set(item.project_id.map(|v| v.to_string())),
+            pinned: Set(item.pinned),
             created_at: Set(now.clone()),
             updated_at: Set(now),
         }
@@ -831,16 +870,16 @@ impl Storage {
             Ok(model.update(&self.db).await?)
         } else {
             let title = Self::default_link_title(normalized_url);
-            self.create_user_data_item(
-                "link",
-                &title,
-                "Auto-saved link from user chat",
-                Some(normalized_url),
+            self.create_user_data_item(NewUserDataItem {
+                kind: "link",
+                title: &title,
+                content: "Auto-saved link from user chat",
+                url: Some(normalized_url),
                 source_channel,
                 conversation_id,
                 project_id,
-                false,
-            )
+                pinned: false,
+            })
             .await
         }
     }
@@ -853,7 +892,8 @@ impl Storage {
         project_id: Option<&str>,
         kind: Option<&str>,
     ) -> Result<Vec<user_data_item::Model>> {
-        let mut query = user_data_item::Entity::find().order_by_desc(user_data_item::Column::UpdatedAt);
+        let mut query =
+            user_data_item::Entity::find().order_by_desc(user_data_item::Column::UpdatedAt);
         if let Some(pid) = project_id {
             query = query.filter(user_data_item::Column::ProjectId.eq(pid));
         }
@@ -924,7 +964,8 @@ impl Storage {
         offset: u64,
         project_id: Option<&str>,
     ) -> Result<Vec<knowledge_item::Model>> {
-        let mut query = knowledge_item::Entity::find().order_by_desc(knowledge_item::Column::UpdatedAt);
+        let mut query =
+            knowledge_item::Entity::find().order_by_desc(knowledge_item::Column::UpdatedAt);
         if let Some(pid) = project_id {
             query = query.filter(knowledge_item::Column::ProjectId.eq(pid));
         }
@@ -1405,6 +1446,17 @@ impl Storage {
         Ok(msgs)
     }
 
+    /// Returns true when at least one persisted user chat message exists.
+    pub async fn has_user_chat_messages(&self) -> Result<bool> {
+        let exists = message::Entity::find()
+            .filter(message::Column::Role.eq("user"))
+            .limit(1)
+            .one(&self.db)
+            .await?
+            .is_some();
+        Ok(exists)
+    }
+
     // ==================== Projects ====================
 
     /// Create a project
@@ -1632,6 +1684,7 @@ impl Storage {
     // Deduplicate repetitive notifications (same root message) to avoid spamming users/UI.
     // This is separate from retention, which deletes old rows after NOTIFICATION_RETENTION_DAYS.
     const NOTIFICATION_DEDUP_COOLDOWN_DAYS: i64 = 7;
+    const ARKPULSE_NOTIFICATION_WINDOW_HOURS: i64 = 24;
     const NOTIFICATION_PURGE_MIN_INTERVAL_SECS: i64 = 3600;
     const NOTIFICATION_PURGE_LAST_RUN_KEY: &'static str = "notifications_retention_last_purge_v1";
 
@@ -1679,6 +1732,56 @@ impl Storage {
             }
         }
         out.trim().to_string()
+    }
+
+    fn is_arkpulse_notification(source: &str) -> bool {
+        source.trim().eq_ignore_ascii_case("arkpulse")
+    }
+
+    fn arkpulse_recent_cutoff_rfc3339() -> String {
+        (chrono::Utc::now() - chrono::Duration::hours(Self::ARKPULSE_NOTIFICATION_WINDOW_HOURS))
+            .to_rfc3339()
+    }
+
+    fn collapse_recent_arkpulse_notifications(
+        notifications: Vec<notification::Model>,
+    ) -> Vec<notification::Model> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::hours(Self::ARKPULSE_NOTIFICATION_WINDOW_HOURS);
+        let mut kept_recent_arkpulse = false;
+        let mut filtered = Vec::with_capacity(notifications.len());
+
+        for notif in notifications {
+            if !Self::is_arkpulse_notification(&notif.source) {
+                filtered.push(notif);
+                continue;
+            }
+
+            let is_recent = chrono::DateTime::parse_from_rfc3339(&notif.created_at)
+                .map(|dt| dt.with_timezone(&chrono::Utc) >= cutoff)
+                .unwrap_or(true);
+            if !is_recent {
+                filtered.push(notif);
+                continue;
+            }
+
+            if kept_recent_arkpulse {
+                continue;
+            }
+            kept_recent_arkpulse = true;
+            filtered.push(notif);
+        }
+
+        filtered
+    }
+
+    async fn count_recent_arkpulse_notifications(&self, unread_only: bool) -> Result<u64> {
+        let mut query = notification::Entity::find()
+            .filter(notification::Column::Source.eq("arkpulse"))
+            .filter(notification::Column::CreatedAt.gte(Self::arkpulse_recent_cutoff_rfc3339()));
+        if unread_only {
+            query = query.filter(notification::Column::Read.eq(false));
+        }
+        Ok(query.count(&self.db).await?)
     }
 
     async fn maybe_purge_old_notifications(&self) -> Result<()> {
@@ -1732,6 +1835,19 @@ impl Storage {
         let body_clean = notif.body.trim().to_string();
         let level_clean = notif.level.trim().to_string();
         let source_clean = notif.source.trim().to_string();
+
+        if Self::is_arkpulse_notification(&source_clean) {
+            let existing_recent = notification::Entity::find()
+                .filter(notification::Column::Source.eq(source_clean.clone()))
+                .filter(notification::Column::CreatedAt.gte(Self::arkpulse_recent_cutoff_rfc3339()))
+                .order_by_desc(notification::Column::CreatedAt)
+                .limit(1)
+                .one(&self.db)
+                .await?;
+            if existing_recent.is_some() {
+                return Ok(());
+            }
+        }
 
         // Best-effort deduplication to prevent repeated notifications from flooding the DB/UI.
         // Critical/security notifications bypass dedup.
@@ -1792,7 +1908,7 @@ impl Storage {
             query = query.filter(notification::Column::Read.eq(false));
         }
         let notifs = query.limit(limit).offset(offset).all(&self.db).await?;
-        Ok(notifs)
+        Ok(Self::collapse_recent_arkpulse_notifications(notifs))
     }
 
     /// Count notifications
@@ -1804,7 +1920,16 @@ impl Storage {
         if unread_only {
             query = query.filter(notification::Column::Read.eq(false));
         }
-        Ok(query.count(&self.db).await?)
+        let count = query.count(&self.db).await?;
+        let arkpulse_recent = self
+            .count_recent_arkpulse_notifications(unread_only)
+            .await
+            .unwrap_or(0);
+        if arkpulse_recent > 1 {
+            Ok(count.saturating_sub(arkpulse_recent - 1))
+        } else {
+            Ok(count)
+        }
     }
 
     /// Mark notification as read
@@ -1839,6 +1964,61 @@ impl Storage {
         Ok(())
     }
 
+    /// Delete goal-related notifications that reference a specific goal text.
+    pub async fn delete_goal_notifications(&self, goal_text: &str) -> Result<u64> {
+        let trimmed = goal_text.trim();
+        if trimmed.is_empty() {
+            return Ok(0);
+        }
+
+        let source_filter = Condition::any()
+            .add(notification::Column::Source.contains("goal"))
+            .add(notification::Column::Source.eq("autonomy_goal_loop"));
+        let text_filter = Condition::any()
+            .add(notification::Column::Title.contains(trimmed))
+            .add(notification::Column::Body.contains(trimmed));
+
+        let result = notification::Entity::delete_many()
+            .filter(source_filter)
+            .filter(text_filter)
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected)
+    }
+
+    /// Delete app-related notifications that reference a specific app id/title.
+    pub async fn delete_app_notifications(
+        &self,
+        app_id: &str,
+        app_title: Option<&str>,
+    ) -> Result<u64> {
+        let id_trimmed = app_id.trim();
+        if id_trimmed.is_empty() {
+            return Ok(0);
+        }
+
+        let source_filter = Condition::any()
+            .add(notification::Column::Source.contains("app"))
+            .add(notification::Column::Title.contains("App"))
+            .add(notification::Column::Title.contains("app"));
+
+        let mut text_filter = Condition::any()
+            .add(notification::Column::Title.contains(id_trimmed))
+            .add(notification::Column::Body.contains(id_trimmed));
+        if let Some(title) = app_title.map(str::trim).filter(|s| !s.is_empty()) {
+            text_filter = text_filter
+                .add(notification::Column::Title.contains(title))
+                .add(notification::Column::Body.contains(title));
+        }
+
+        let result = notification::Entity::delete_many()
+            .filter(source_filter)
+            .filter(text_filter)
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected)
+    }
+
     /// Count unread notifications
     pub async fn count_unread_notifications(&self) -> Result<u64> {
         if let Err(e) = self.maybe_purge_old_notifications().await {
@@ -1848,7 +2028,12 @@ impl Storage {
             .filter(notification::Column::Read.eq(false))
             .count(&self.db)
             .await?;
-        Ok(count)
+        let arkpulse_recent_unread = self.count_recent_arkpulse_notifications(true).await.unwrap_or(0);
+        if arkpulse_recent_unread > 1 {
+            Ok(count.saturating_sub(arkpulse_recent_unread - 1))
+        } else {
+            Ok(count)
+        }
     }
 
     /// Mark episodes as consolidated
@@ -1954,6 +2139,48 @@ impl Storage {
             .exec(&self.db)
             .await?;
         Ok(result.rows_affected)
+    }
+
+    // ==================== Operational Logs ====================
+
+    /// Insert a structured operational telemetry entry.
+    pub async fn insert_operational_log(&self, log: &operational_log::Model) -> Result<()> {
+        operational_log::ActiveModel {
+            id: Set(log.id.clone()),
+            created_at: Set(log.created_at.clone()),
+            trace_id: Set(log.trace_id.clone()),
+            conversation_id: Set(log.conversation_id.clone()),
+            channel: Set(log.channel.clone()),
+            event_type: Set(log.event_type.clone()),
+            success: Set(log.success),
+            outcome: Set(log.outcome.clone()),
+            tool_name: Set(log.tool_name.clone()),
+            latency_ms: Set(log.latency_ms),
+            arguments: Set(log.arguments.clone()),
+            payload: Set(log.payload.clone()),
+            strategy_version: Set(log.strategy_version.clone()),
+            policy_version: Set(log.policy_version.clone()),
+            prompt_version: Set(log.prompt_version.clone()),
+            model_slot: Set(log.model_slot.clone()),
+        }
+        .insert(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    /// List operational logs by event type (newest first).
+    pub async fn list_operational_logs_by_event(
+        &self,
+        event_type: &str,
+        limit: u64,
+    ) -> Result<Vec<operational_log::Model>> {
+        let rows = operational_log::Entity::find()
+            .filter(operational_log::Column::EventType.eq(event_type.to_string()))
+            .order_by_desc(operational_log::Column::CreatedAt)
+            .limit(limit)
+            .all(&self.db)
+            .await?;
+        Ok(rows)
     }
 
     /// Expire old pending approvals (older than max_age_secs)

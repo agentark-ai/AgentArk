@@ -8,19 +8,15 @@ use super::RuntimeConfig;
 /// Sandbox execution mode
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum SandboxMode {
     /// No sandbox - run directly on host
     Native,
     /// WASM sandbox - lightweight, fast
+    #[default]
     Wasm,
     /// Docker sandbox - full isolation
     Docker,
-}
-
-impl Default for SandboxMode {
-    fn default() -> Self {
-        Self::Wasm
-    }
 }
 
 /// Action execution sandbox

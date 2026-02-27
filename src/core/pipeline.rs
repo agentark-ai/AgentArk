@@ -90,29 +90,21 @@ impl Default for IdempotencyPolicy {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum NodeKind {
+    #[default]
     Action,
     ConnectorRequest,
     SignalConsensus,
 }
 
-impl Default for NodeKind {
-    fn default() -> Self {
-        Self::Action
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum NodeErrorMode {
+    #[default]
     Fail,
     Continue,
-}
-
-impl Default for NodeErrorMode {
-    fn default() -> Self {
-        Self::Fail
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

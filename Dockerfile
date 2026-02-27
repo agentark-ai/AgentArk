@@ -34,6 +34,12 @@ COPY Cargo.toml Cargo.lock ./
 # Create dummy main to cache dependencies
 RUN mkdir src && echo "fn main() {}" > src/main.rs
 
+# Low-memory build: thin LTO + more codegen units to reduce linker peak RAM
+# Full LTO needs 3-4GB+ for wasmtime; thin LTO fits in 2GB RAM + swap
+ENV CARGO_BUILD_JOBS=2
+ENV CARGO_PROFILE_RELEASE_LTO=thin
+ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=4
+
 # Build dependencies with cache mount (survives across docker builds)
 RUN --mount=type=cache,target=/app/target \
     --mount=type=cache,target=/usr/local/cargo/registry \

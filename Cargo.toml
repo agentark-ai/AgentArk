@@ -49,7 +49,7 @@ interprocess = "2"
 teloxide = { version = "0.13", optional = true, features = ["macros"] }
 
 # LLM clients
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
 
 # Local LLM (optional)
 llama-cpp-2 = { version = "0.1", optional = true }
@@ -84,9 +84,6 @@ bincode = "1"
 # Database ORM (SeaORM with SQLite)
 sea-orm = { version = "1", features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros"] }
 
-# Memory & embeddings
-fastembed = "4"
-hnsw_rs = "0.3"
 
 # Time & scheduling
 chrono = { version = "0.4", features = ["serde"] }

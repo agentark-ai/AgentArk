@@ -73,8 +73,7 @@ impl SearchClient {
             }
             SearchBackend::DuckDuckGo => self.search_duckduckgo(query, num_results).await,
             SearchBackend::Playwright { bridge_url } => {
-                self.search_playwright(&bridge_url, query, num_results)
-                    .await
+                self.search_playwright(bridge_url, query, num_results).await
             }
         }
     }

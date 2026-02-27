@@ -20,7 +20,9 @@ fn unique_suffix() -> String {
 }
 
 fn api_key() -> Option<String> {
-    std::env::var("AGENTARK_TEST_API_KEY").ok().filter(|k| !k.is_empty())
+    std::env::var("AGENTARK_TEST_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
 }
 
 fn authed_client() -> reqwest::Client {

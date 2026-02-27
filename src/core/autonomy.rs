@@ -4,15 +4,11 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ConversationScope {
+    #[default]
     PerChannel,
     Global,
-}
-
-impl Default for ConversationScope {
-    fn default() -> Self {
-        Self::PerChannel
-    }
 }
 
 impl ConversationScope {
@@ -208,7 +204,8 @@ impl Default for AutonomySettings {
             pause_mode: default_pause_mode(),
             arkpulse_auth_failures_threshold: default_arkpulse_auth_failures_threshold(),
             arkpulse_rate_limit_hits_threshold: default_arkpulse_rate_limit_hits_threshold(),
-            arkpulse_unauthorized_channel_threshold: default_arkpulse_unauthorized_channel_threshold(),
+            arkpulse_unauthorized_channel_threshold:
+                default_arkpulse_unauthorized_channel_threshold(),
             arkpulse_combined_security_threshold: default_arkpulse_combined_security_threshold(),
         }
     }

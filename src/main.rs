@@ -31,7 +31,7 @@ mod gui;
 use anyhow::Result;
 use clap::Parser;
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
@@ -284,7 +284,7 @@ async fn main() -> Result<()> {
 }
 
 /// CLI-based setup wizard for headless mode
-async fn run_cli_setup(config_dir: &PathBuf, agent: &core::Agent) -> Result<()> {
+async fn run_cli_setup(config_dir: &Path, agent: &core::Agent) -> Result<()> {
     println!();
     println!("═══════════════════════════════════════════════════════════");
     println!("                    SETUP WIZARD");

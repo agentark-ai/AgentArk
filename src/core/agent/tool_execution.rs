@@ -1,5 +1,15 @@
 use super::*;
 
+pub(crate) struct ToolExecutionContext<'a> {
+    pub request_channel: &'a str,
+    pub trace_id: Option<&'a str>,
+    pub conversation_id: Option<&'a str>,
+    pub strategy_version: Option<&'a str>,
+    pub policy_version: Option<&'a str>,
+    pub prompt_version: Option<&'a str>,
+    pub model_slot: Option<&'a str>,
+}
+
 impl Agent {
     fn canonicalize_json_value(value: &serde_json::Value) -> serde_json::Value {
         match value {
@@ -28,6 +38,289 @@ impl Agent {
         let canonical_args = Self::canonicalize_json_value(&call.arguments);
         let args = serde_json::to_string(&canonical_args).unwrap_or_else(|_| "{}".to_string());
         format!("{}:{}", call.name, args)
+    }
+
+    fn find_json_object_bounds(raw: &str) -> Option<(usize, usize)> {
+        let mut depth = 0i32;
+        let mut start: Option<usize> = None;
+        let mut in_string = false;
+        let mut escaped = false;
+
+        for (idx, ch) in raw.char_indices() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if ch == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+
+            match ch {
+                '"' => in_string = true,
+                '{' => {
+                    if depth == 0 {
+                        start = Some(idx);
+                    }
+                    depth += 1;
+                }
+                '}' => {
+                    if depth > 0 {
+                        depth -= 1;
+                        if depth == 0 {
+                            if let Some(s) = start {
+                                return Some((s, idx + ch.len_utf8()));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn parse_json_object_str(raw: &str) -> Option<serde_json::Value> {
+        let mut candidate = raw.trim().to_string();
+        if candidate.is_empty() {
+            return None;
+        }
+
+        for _ in 0..5 {
+            let trimmed = candidate.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                match parsed {
+                    serde_json::Value::Object(_) => return Some(parsed),
+                    serde_json::Value::String(s) => {
+                        candidate = s;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+
+            if let Some((start, end)) = Self::find_json_object_bounds(trimmed) {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&trimmed[start..end])
+                {
+                    if parsed.is_object() {
+                        return Some(parsed);
+                    }
+                }
+            }
+
+            if trimmed.starts_with('"') && trimmed.ends_with('"') {
+                if let Ok(unwrapped) = serde_json::from_str::<String>(trimmed) {
+                    candidate = unwrapped;
+                    continue;
+                }
+            }
+
+            if trimmed.contains("\\\"") {
+                let rebuilt = trimmed.replace("\\\"", "\"");
+                if rebuilt != trimmed {
+                    candidate = rebuilt;
+                    continue;
+                }
+            }
+
+            break;
+        }
+
+        None
+    }
+
+    fn extract_files_object(
+        value: &serde_json::Value,
+    ) -> Option<serde_json::Map<String, serde_json::Value>> {
+        if let Some(obj) = value.as_object() {
+            return Some(obj.clone());
+        }
+
+        if let Some(raw) = value.as_str() {
+            if let Some(parsed) = Self::parse_json_object_str(raw) {
+                return parsed.as_object().cloned();
+            }
+        }
+
+        let rows = value.as_array()?;
+        let mut out = serde_json::Map::new();
+        for row in rows {
+            let Some(item) = row.as_object() else {
+                continue;
+            };
+            let name = item
+                .get("name")
+                .and_then(|v| v.as_str())
+                .or_else(|| item.get("filename").and_then(|v| v.as_str()))
+                .or_else(|| item.get("path").and_then(|v| v.as_str()))
+                .map(|v| v.trim())
+                .unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            let content = item
+                .get("content")
+                .and_then(|v| v.as_str())
+                .or_else(|| item.get("text").and_then(|v| v.as_str()))
+                .or_else(|| item.get("body").and_then(|v| v.as_str()))
+                .unwrap_or("");
+            out.insert(
+                name.to_string(),
+                serde_json::Value::String(content.to_string()),
+            );
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    pub(crate) fn normalize_app_deploy_arguments(
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        let mut nested = if let Some(obj) = arguments.as_object() {
+            if let Some(files_value) = obj.get("files") {
+                if let Some(files_obj) = Self::extract_files_object(files_value) {
+                    let mut normalized = obj.clone();
+                    normalized.insert("files".to_string(), serde_json::Value::Object(files_obj));
+                    return serde_json::Value::Object(normalized);
+                }
+            }
+
+            let mut found: Option<serde_json::Value> = None;
+            for key in [
+                "payload",
+                "arguments",
+                "args",
+                "input",
+                "params",
+                "tool_input",
+                "tool_arguments",
+            ] {
+                if let Some(candidate) = obj.get(key) {
+                    if candidate.is_object() {
+                        found = Some(candidate.clone());
+                        break;
+                    }
+                    if let Some(s) = candidate.as_str() {
+                        if let Some(parsed) = Self::parse_json_object_str(s) {
+                            found = Some(parsed);
+                            break;
+                        }
+                    }
+                }
+            }
+            found
+        } else if let Some(s) = arguments.as_str() {
+            Self::parse_json_object_str(s)
+        } else {
+            None
+        };
+
+        let Some(mut normalized) = nested.take() else {
+            return arguments.clone();
+        };
+
+        if let Some(nested_obj) = normalized.as_object_mut() {
+            if let Some(files_value) = nested_obj.get("files").cloned() {
+                if let Some(files_obj) = Self::extract_files_object(&files_value) {
+                    nested_obj.insert("files".to_string(), serde_json::Value::Object(files_obj));
+                }
+            } else {
+                for alias in ["file_map", "source_files", "project_files", "artifacts"] {
+                    if let Some(alias_value) = nested_obj.get(alias).cloned() {
+                        if let Some(files_obj) = Self::extract_files_object(&alias_value) {
+                            nested_obj
+                                .insert("files".to_string(), serde_json::Value::Object(files_obj));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let (Some(root), Some(nested_obj)) = (arguments.as_object(), normalized.as_object_mut())
+        {
+            for key in [
+                "title",
+                "entry_command",
+                "install_command",
+                "runtime_image",
+                "runtime_preference",
+                "expose_public",
+                "access_guard",
+                "required_inputs",
+                "required_secrets",
+                "required_env",
+                "required_config",
+                "config",
+            ] {
+                if nested_obj.get(key).is_none() {
+                    if let Some(v) = root.get(key) {
+                        nested_obj.insert(key.to_string(), v.clone());
+                    }
+                }
+            }
+        }
+
+        normalized
+    }
+
+    fn summarize_app_deploy_stream_payload(arguments: &serde_json::Value) -> serde_json::Value {
+        let normalized = Self::normalize_app_deploy_arguments(arguments);
+        let Some(obj) = normalized.as_object() else {
+            return normalized;
+        };
+
+        let mut summary = serde_json::Map::new();
+        for key in [
+            "title",
+            "entry_command",
+            "install_command",
+            "runtime_image",
+            "runtime_preference",
+            "expose_public",
+            "access_guard",
+        ] {
+            if let Some(value) = obj.get(key) {
+                summary.insert(key.to_string(), value.clone());
+            }
+        }
+
+        if let Some(files) = obj.get("files").and_then(|v| v.as_object()) {
+            let mut file_names: Vec<String> = files.keys().cloned().collect();
+            file_names.sort_unstable();
+            let total_file_count = file_names.len();
+            let truncated = total_file_count > 120;
+            if truncated {
+                file_names.truncate(120);
+            }
+            let total_bytes: usize = files
+                .values()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.len())
+                .sum();
+
+            summary.insert("file_count".to_string(), serde_json::json!(total_file_count));
+            summary.insert("file_names".to_string(), serde_json::json!(file_names));
+            summary.insert("file_bytes".to_string(), serde_json::json!(total_bytes));
+            if truncated {
+                summary.insert("file_names_truncated".to_string(), serde_json::json!(true));
+            }
+        }
+
+        serde_json::Value::Object(summary)
     }
 
     fn extract_output_route_components(url: &str) -> Option<(String, String)> {
@@ -169,6 +462,34 @@ impl Agent {
         Ok(preview)
     }
 
+    async fn build_app_runtime_failure_hint(&self, app_id: &str) -> Option<String> {
+        if self.app_registry.is_static(app_id).await {
+            return None;
+        }
+        let app_dir = self.app_registry.get_dir(app_id).await?;
+        let current_port = self.app_registry.get_port(app_id).await;
+        let log_tail = crate::actions::app::read_local_runtime_log_tail(&app_dir, 4096).await;
+
+        if current_port.is_none() {
+            if log_tail.is_empty() {
+                return Some(
+                    "Dynamic app runtime is not active (process/container likely exited)."
+                        .to_string(),
+                );
+            }
+            return Some(format!(
+                "Dynamic app runtime is not active. Recent runtime logs:\n{}",
+                log_tail
+            ));
+        }
+
+        if log_tail.is_empty() {
+            None
+        } else {
+            Some(format!("Recent runtime logs:\n{}", log_tail))
+        }
+    }
+
     async fn validate_and_capture_app_preview(
         &self,
         app_url_with_key: &str,
@@ -176,17 +497,32 @@ impl Agent {
         stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
     ) -> Result<(Option<String>, bool, usize, String)> {
         const MAX_APP_VERIFY_ATTEMPTS: usize = 3;
+        let sidecar_available = self.browser_sessions.is_available().await;
+        let integration = if sidecar_available {
+            Some(self.browser_sessions.integration().clone())
+        } else {
+            None
+        };
+        let http_client = Self::build_internal_control_client().ok();
+        let internal_probe_url = if app_url_with_key.starts_with("http://")
+            || app_url_with_key.starts_with("https://")
+        {
+            app_url_with_key.to_string()
+        } else if app_url_with_key.starts_with('/') {
+            format!("{}{}", Self::internal_api_base_url(), app_url_with_key)
+        } else {
+            format!("{}/{}", Self::internal_api_base_url(), app_url_with_key)
+        };
 
-        if !self.browser_sessions.is_available().await {
+        if !sidecar_available && http_client.is_none() {
             return Ok((
                 None,
                 false,
                 0,
-                "Playwright sidecar unavailable (cannot auto-validate preview)".to_string(),
+                "No validation backends available (browser sidecar + HTTP probe unavailable)"
+                    .to_string(),
             ));
         }
-
-        let integration = self.browser_sessions.integration().clone();
         let mut last_error = "Unknown validation error".to_string();
 
         for attempt in 1..=MAX_APP_VERIFY_ATTEMPTS {
@@ -200,10 +536,98 @@ impl Agent {
                 });
             }
 
+            // Primary readiness signal: direct HTTP probe to the deployed app URL.
+            if let Some(client) = &http_client {
+                match client.get(&internal_probe_url).send().await {
+                    Ok(resp) if !resp.status().is_server_error() => {
+                        let status = resp.status();
+                        if let Some(integration) = &integration {
+                            let sidecar_session = match integration.create_session().await {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    return Ok((
+                                        None,
+                                        true,
+                                        attempt,
+                                        format!(
+                                            "HTTP probe passed on attempt {} (status {}, preview unavailable: create_session failed: {})",
+                                            attempt, status, e
+                                        ),
+                                    ));
+                                }
+                            };
+
+                            let preview_result: Result<String> = async {
+                                let _ = integration
+                                    .navigate(&sidecar_session, app_url_with_key)
+                                    .await?;
+                                tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+                                let screenshot = integration.screenshot(&sidecar_session).await?;
+                                if screenshot.is_empty() {
+                                    anyhow::bail!("empty screenshot returned");
+                                }
+                                self.persist_app_preview_screenshot(app_id, &screenshot)
+                                    .await
+                            }
+                            .await;
+
+                            let _ = integration.close_session(&sidecar_session).await;
+                            match preview_result {
+                                Ok(screenshot_url) => {
+                                    return Ok((
+                                        Some(screenshot_url),
+                                        true,
+                                        attempt,
+                                        format!(
+                                            "HTTP probe + screenshot validation passed on attempt {} (status {})",
+                                            attempt, status
+                                        ),
+                                    ));
+                                }
+                                Err(e) => {
+                                    return Ok((
+                                        None,
+                                        true,
+                                        attempt,
+                                        format!(
+                                            "HTTP probe passed on attempt {} (status {}, preview unavailable: {})",
+                                            attempt, status, e
+                                        ),
+                                    ));
+                                }
+                            }
+                        }
+
+                        return Ok((
+                            None,
+                            true,
+                            attempt,
+                            format!(
+                                "HTTP probe passed on attempt {} (status {}, browser sidecar unavailable)",
+                                attempt, status
+                            ),
+                        ));
+                    }
+                    Ok(resp) => {
+                        last_error = format!("HTTP probe failed with status {}", resp.status());
+                    }
+                    Err(e) => {
+                        last_error = format!("HTTP probe request failed: {}", e);
+                    }
+                }
+            }
+
+            // Fallback when HTTP probe is inconclusive: sidecar navigation/content validation.
+            let Some(integration) = &integration else {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                continue;
+            };
+
             let sidecar_session = match integration.create_session().await {
                 Ok(s) => s,
                 Err(e) => {
                     last_error = format!("create_session failed: {}", e);
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     continue;
                 }
             };
@@ -249,6 +673,9 @@ impl Agent {
             }
         }
 
+        if let Some(runtime_hint) = self.build_app_runtime_failure_hint(app_id).await {
+            last_error = format!("{}\n{}", last_error, runtime_hint);
+        }
         Ok((None, false, MAX_APP_VERIFY_ATTEMPTS, last_error))
     }
 
@@ -421,6 +848,141 @@ impl Agent {
             })
     }
 
+    fn internal_api_base_url() -> String {
+        let bind_addr =
+            std::env::var("AGENTARK_BIND").unwrap_or_else(|_| "127.0.0.1:8990".to_string());
+        let tls_enabled = std::env::var("AGENTARK_TLS_CERT")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .is_some()
+            && std::env::var("AGENTARK_TLS_KEY")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .is_some();
+        let scheme = if tls_enabled { "https" } else { "http" };
+        format!("{}://{}", scheme, bind_addr)
+    }
+
+    fn user_facing_local_base_url() -> String {
+        let internal = Self::internal_api_base_url();
+        let Ok(mut parsed) = reqwest::Url::parse(&internal) else {
+            return internal;
+        };
+        if let Some(host) = parsed.host_str() {
+            let normalized = host.trim().to_ascii_lowercase();
+            if normalized == "0.0.0.0" || normalized == "::" || normalized == "127.0.0.1" {
+                let _ = parsed.set_host(Some("localhost"));
+            }
+        }
+        parsed.to_string().trim_end_matches('/').to_string()
+    }
+
+    fn build_internal_control_client() -> Result<reqwest::Client> {
+        Ok(reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .timeout(std::time::Duration::from_secs(5))
+            .build()?)
+    }
+
+    async fn ensure_public_tunnel_base_url(
+        &self,
+        stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+    ) -> Option<String> {
+        if let Some(existing) = self.load_public_base_url().await {
+            return Some(existing);
+        }
+        let client = match Self::build_internal_control_client() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!("Tunnel client init failed: {}", e);
+                return None;
+            }
+        };
+        let base_url = Self::internal_api_base_url();
+
+        let mut start_req = client.post(format!("{}/tunnel/start", base_url));
+        if let Some(key) = self.api_key.as_ref().filter(|k| !k.trim().is_empty()) {
+            start_req = start_req.bearer_auth(key);
+        }
+        match start_req.send().await {
+            Ok(resp) => {
+                if !resp.status().is_success() {
+                    tracing::debug!("Tunnel start request returned {}", resp.status());
+                }
+            }
+            Err(e) => {
+                tracing::debug!("Tunnel start request failed: {}", e);
+                return None;
+            }
+        }
+
+        if let Some(tx) = stream_tx {
+            let _ = tx.try_send(StreamEvent::ToolResult {
+                name: "app_deploy".to_string(),
+                content: "Starting Cloudflare tunnel for public app access...".to_string(),
+            });
+        }
+
+        for _ in 0..10 {
+            let mut status_req = client.get(format!("{}/tunnel/status", base_url));
+            if let Some(key) = self.api_key.as_ref().filter(|k| !k.trim().is_empty()) {
+                status_req = status_req.bearer_auth(key);
+            }
+            if let Ok(resp) = status_req.send().await {
+                if resp.status().is_success() {
+                    if let Ok(payload) = resp.json::<serde_json::Value>().await {
+                        if let Some(url) = payload
+                            .get("url")
+                            .and_then(|v| v.as_str())
+                            .map(|v| v.trim().trim_end_matches('/').to_string())
+                            .filter(|v| !v.is_empty())
+                        {
+                            let _ = self.storage.set("public_base_url", url.as_bytes()).await;
+                            return Some(url);
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+
+        self.load_public_base_url().await
+    }
+
+    fn trigger_arkpulse_refresh(&self, reason: &'static str) {
+        let api_key = self.api_key.clone();
+        let base_url = Self::internal_api_base_url();
+        tokio::spawn(async move {
+            let client = match reqwest::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .timeout(std::time::Duration::from_secs(4))
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::debug!("ArkPulse refresh client init failed: {}", e);
+                    return;
+                }
+            };
+            let mut req = client.post(format!("{}/arkpulse/trigger", base_url));
+            if let Some(key) = api_key.as_ref().filter(|k| !k.trim().is_empty()) {
+                req = req.bearer_auth(key);
+            }
+            match req.send().await {
+                Ok(resp) => {
+                    tracing::debug!(
+                        "ArkPulse refresh trigger after {} returned {}",
+                        reason,
+                        resp.status()
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!("ArkPulse refresh trigger after {} failed: {}", reason, e);
+                }
+            }
+        });
+    }
+
     fn absolutize_public_url(public_base_url: Option<&str>, url: &str) -> String {
         if url.starts_with("http://")
             || url.starts_with("https://")
@@ -451,7 +1013,10 @@ impl Agent {
         aliases.insert("whoop".to_string(), "whoop".to_string());
         aliases.insert("ga4".to_string(), "ga4".to_string());
         aliases.insert("gsc".to_string(), "gsc".to_string());
-        aliases.insert("social_analytics".to_string(), "social_analytics".to_string());
+        aliases.insert(
+            "social_analytics".to_string(),
+            "social_analytics".to_string(),
+        );
         aliases.insert("moltbook".to_string(), "moltbook".to_string());
         aliases
     }
@@ -495,6 +1060,14 @@ impl Agent {
             }
         }
 
+        let enabled_ids: HashSet<String> = self.integrations.enabled_ids().into_iter().collect();
+        for integration_id in &enabled_ids {
+            aliases
+                .entry(integration_id.clone())
+                .or_insert_with(|| integration_id.clone());
+        }
+        aliases.retain(|_, integration_id| enabled_ids.contains(integration_id));
+
         aliases
     }
 
@@ -529,13 +1102,7 @@ impl Agent {
         tool_name: &str,
         aliases: &HashMap<String, String>,
     ) -> Option<String> {
-        if let Some(mapped) = aliases.get(tool_name) {
-            return Some(mapped.clone());
-        }
-        if self.integrations.get(tool_name).is_some() {
-            return Some(tool_name.to_string());
-        }
-        None
+        aliases.get(tool_name).cloned()
     }
 
     pub(crate) async fn execute_integration_tool_call(
@@ -573,8 +1140,13 @@ impl Agent {
         {
             Ok(result) => {
                 if integration_id == "moltbook" {
-                    self.append_moltbook_tool_activity(sub_action, &resolved_args, Some(&result), None)
-                        .await;
+                    self.append_moltbook_tool_activity(
+                        sub_action,
+                        &resolved_args,
+                        Some(&result),
+                        None,
+                    )
+                    .await;
                 }
                 let formatted =
                     serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string());
@@ -627,9 +1199,7 @@ impl Agent {
         }
     }
 
-    fn integration_capability_labels(
-        caps: Vec<crate::integrations::Capability>,
-    ) -> Vec<String> {
+    fn integration_capability_labels(caps: Vec<crate::integrations::Capability>) -> Vec<String> {
         caps.into_iter()
             .map(|cap| match cap {
                 crate::integrations::Capability::Read => "read".to_string(),
@@ -680,21 +1250,25 @@ impl Agent {
     ) {
         let mut existing: HashSet<String> = actions.iter().map(|a| a.name.clone()).collect();
         let integration_aliases = self.load_tool_integration_aliases().await;
+        let enabled_ids: HashSet<String> = integration_aliases.values().cloned().collect();
 
-        for integration_id in self.integrations.ids() {
-            let Some(integration) = self.integrations.get(&integration_id) else {
+        for integration_id in &enabled_ids {
+            let Some(integration) = self.integrations.get(integration_id) else {
                 continue;
             };
-            if existing.insert(integration_id.clone()) {
+            if existing.insert(integration_id.to_string()) {
                 actions.push(self.build_integration_action_def(
-                    &integration_id,
-                    &integration_id,
+                    integration_id,
+                    integration_id,
                     integration,
                 ));
             }
         }
 
         for (tool_name, integration_id) in integration_aliases {
+            if !enabled_ids.contains(&integration_id) {
+                continue;
+            }
             if !existing.insert(tool_name.clone()) {
                 continue;
             }
@@ -830,6 +1404,7 @@ impl Agent {
         if let Some(tx) = stream_tx {
             let _ = tx.try_send(StreamEvent::ToolStart {
                 name: "page_screenshot".to_string(),
+                payload: None,
             });
         }
 
@@ -841,9 +1416,10 @@ impl Agent {
         }
 
         let integration = self.browser_sessions.integration().clone();
-        let session = integration.create_session().await.map_err(|e| {
-            anyhow::anyhow!("Failed to create browser session: {}", e)
-        })?;
+        let session = integration
+            .create_session()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to create browser session: {}", e))?;
 
         let result: Result<String> = async {
             let _ = integration.navigate(&session, &url).await?;
@@ -883,9 +1459,7 @@ impl Agent {
 
         let output = match result {
             Ok(json) => json,
-            Err(e) => {
-                serde_json::json!({"status": "error", "message": e.to_string()}).to_string()
-            }
+            Err(e) => serde_json::json!({"status": "error", "message": e.to_string()}).to_string(),
         };
 
         if let Some(tx) = stream_tx {
@@ -926,6 +1500,7 @@ impl Agent {
         if let Some(tx) = stream_tx {
             let _ = tx.try_send(StreamEvent::ToolStart {
                 name: "compose_report".to_string(),
+                payload: None,
             });
         }
 
@@ -1041,17 +1616,423 @@ impl Agent {
         Ok(output)
     }
 
+    /// Handle self-evolve tool call with policy-first evolution defaults.
+    pub(crate) async fn handle_self_evolve_tool_call(
+        &self,
+        call: &crate::core::llm::ToolCall,
+        stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+    ) -> Result<String> {
+        let request = call
+            .arguments
+            .get("request")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        if request.is_empty() {
+            return Ok(serde_json::json!({
+                "status": "error",
+                "message": "Missing 'request' parameter - describe what should evolve"
+            })
+            .to_string());
+        }
+
+        let mode = call
+            .arguments
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("policy")
+            .trim()
+            .to_ascii_lowercase();
+        let allow_code_writes = call
+            .arguments
+            .get("allow_code_writes")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let apply_promotion = call
+            .arguments
+            .get("apply_promotion")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let canary_rollout_percent = call
+            .arguments
+            .get("canary_rollout_percent")
+            .and_then(|v| v.as_u64())
+            .map(|v| v.clamp(1, 100) as u8)
+            .unwrap_or(20);
+        let canary_min_samples_per_version = call
+            .arguments
+            .get("canary_min_samples_per_version")
+            .and_then(|v| v.as_u64())
+            .map(|v| v.clamp(5, 20_000) as usize)
+            .unwrap_or(25);
+        let canary_min_success_gain = call
+            .arguments
+            .get("canary_min_success_gain")
+            .and_then(|v| v.as_f64())
+            .map(|v| v.clamp(0.0, 0.5))
+            .unwrap_or(0.03);
+        let canary_max_sign_test_p_value = call
+            .arguments
+            .get("canary_max_sign_test_p_value")
+            .and_then(|v| v.as_f64())
+            .map(|v| v.clamp(0.0001, 1.0))
+            .unwrap_or(0.10);
+        let replay_log_limit = call
+            .arguments
+            .get("replay_log_limit")
+            .and_then(|v| v.as_u64())
+            .map(|v| v.clamp(100, 100_000))
+            .unwrap_or(4_000);
+
+        if let Some(tx) = stream_tx {
+            let _ = tx.try_send(StreamEvent::ToolStart {
+                name: "self_evolve".to_string(),
+                payload: None,
+            });
+        }
+
+        tracing::info!(
+            "Self-evolve request mode={} request={}",
+            mode,
+            &request[..request.len().min(100)]
+        );
+
+        let project_root = self.find_project_root();
+        let llm = self.llm.clone();
+
+        match mode.as_str() {
+            "policy" | "strategy" | "policy_strategy" => {
+                let current_policy_raw = self
+                    .storage
+                    .get(crate::core::self_evolve::ROUTING_COMPLEXITY_POLICY_KEY)
+                    .await
+                    .ok()
+                    .flatten();
+                let config = crate::core::self_evolve::PolicyEvolutionConfig {
+                    project_root,
+                    ..Default::default()
+                };
+                let evolve_engine =
+                    crate::core::self_evolve::PolicyEvolutionEngine::new(config, llm);
+                let result = evolve_engine
+                    .evolve_routing_policy(&request, current_policy_raw.as_deref())
+                    .await?;
+
+                let mut promotion_applied = false;
+                let mut canary_state: Option<crate::core::self_evolve::strategy_runtime::CanaryRolloutState> =
+                    None;
+                let mut replay_result: Option<
+                    crate::core::self_evolve::strategy_runtime::ReplayEvaluationResult,
+                > = None;
+                let mut promoted_directly_to_baseline = false;
+                if result.promoted && apply_promotion {
+                    if let Some(policy_json) = result.promoted_policy.as_ref() {
+                        let candidate_serialized = serde_json::to_vec(policy_json)?;
+                        if let Some(existing_baseline) = current_policy_raw.as_ref() {
+                            let _ = self
+                                .storage
+                                .set(
+                                    crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_POLICY_BASELINE_SNAPSHOT_KEY,
+                                    existing_baseline,
+                                )
+                                .await;
+                        }
+                        let baseline_version = self
+                            .storage
+                            .get(
+                                crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_CANARY_STATE_KEY,
+                            )
+                            .await
+                            .ok()
+                            .flatten()
+                            .and_then(|raw| {
+                                serde_json::from_slice::<
+                                    crate::core::self_evolve::strategy_runtime::CanaryRolloutState,
+                                >(&raw)
+                                .ok()
+                                .map(|s| s.baseline_version)
+                            })
+                            .unwrap_or_else(|| "routing-policy-default-v1".to_string());
+                        let candidate_version = format!("routing-candidate-{}", result.lineage_entry_id);
+
+                        self.storage
+                            .set(
+                                crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_POLICY_CANARY_KEY,
+                                &candidate_serialized,
+                            )
+                            .await?;
+                        let state = crate::core::self_evolve::strategy_runtime::CanaryRolloutState {
+                            enabled: true,
+                            baseline_version: baseline_version.clone(),
+                            candidate_version: candidate_version.clone(),
+                            rollout_percent: canary_rollout_percent,
+                            min_samples_per_version: canary_min_samples_per_version,
+                            min_success_gain: canary_min_success_gain,
+                            max_sign_test_p_value: canary_max_sign_test_p_value,
+                            activated_at: Some(chrono::Utc::now().to_rfc3339()),
+                        };
+                        let state_bytes = serde_json::to_vec(&state)?;
+                        self.storage
+                            .set(
+                                crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_CANARY_STATE_KEY,
+                                &state_bytes,
+                            )
+                            .await?;
+                        canary_state = Some(state.clone());
+
+                        if let Ok(logs) = self
+                            .storage
+                            .list_operational_logs_by_event("tool_call", replay_log_limit)
+                            .await
+                        {
+                            let replay_eval =
+                                crate::core::self_evolve::strategy_runtime::evaluate_canary_by_policy_version(
+                                    &logs,
+                                    &state.baseline_version,
+                                    &state.candidate_version,
+                                    state.min_samples_per_version,
+                                    state.min_success_gain,
+                                    state.max_sign_test_p_value,
+                                );
+                            if replay_eval.promote {
+                                self.storage
+                                    .set(
+                                        crate::core::self_evolve::ROUTING_COMPLEXITY_POLICY_KEY,
+                                        &candidate_serialized,
+                                    )
+                                    .await?;
+                                let mut disabled_state = state.clone();
+                                disabled_state.enabled = false;
+                                let disabled_bytes = serde_json::to_vec(&disabled_state)?;
+                                self.storage
+                                    .set(
+                                        crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_CANARY_STATE_KEY,
+                                        &disabled_bytes,
+                                    )
+                                    .await?;
+                                promoted_directly_to_baseline = true;
+                                canary_state = Some(disabled_state);
+                            }
+                            replay_result = Some(replay_eval);
+                        }
+                        promotion_applied = true;
+                    }
+                }
+
+                if let Some(tx) = stream_tx {
+                    let status_msg = if result.promoted {
+                        if promotion_applied {
+                            if promoted_directly_to_baseline {
+                                format!(
+                                    "Policy evolution complete: promoted candidate (gain {:.4}, p={:.4}), replay gate passed, baseline updated immediately",
+                                    result.accuracy_gain, result.p_value
+                                )
+                            } else {
+                                format!(
+                                    "Policy evolution complete: promoted candidate (gain {:.4}, p={:.4}) activated in canary mode ({}%)",
+                                    result.accuracy_gain,
+                                    result.p_value,
+                                    canary_state
+                                        .as_ref()
+                                        .map(|s| s.rollout_percent)
+                                        .unwrap_or(canary_rollout_percent)
+                                )
+                            }
+                        } else {
+                            format!(
+                                "Policy evolution complete: candidate passed promotion gate (gain {:.4}, p={:.4}) but not applied",
+                                result.accuracy_gain, result.p_value
+                            )
+                        }
+                    } else {
+                        format!(
+                            "Policy evolution complete: no promotion ({})",
+                            result.promotion_gate
+                        )
+                    };
+                    let _ = tx.try_send(StreamEvent::ToolResult {
+                        name: "self_evolve".to_string(),
+                        content: status_msg,
+                    });
+                }
+
+                let mut value = serde_json::to_value(&result)?;
+                if let serde_json::Value::Object(obj) = &mut value {
+                    obj.insert("mode".to_string(), serde_json::json!("policy"));
+                    obj.insert(
+                        "promotion_applied".to_string(),
+                        serde_json::json!(promotion_applied),
+                    );
+                    obj.insert(
+                        "apply_promotion_requested".to_string(),
+                        serde_json::json!(apply_promotion),
+                    );
+                    obj.insert(
+                        "promotion_mode".to_string(),
+                        serde_json::json!(if promoted_directly_to_baseline {
+                            "baseline"
+                        } else if promotion_applied {
+                            "canary"
+                        } else {
+                            "none"
+                        }),
+                    );
+                    obj.insert(
+                        "canary_state".to_string(),
+                        serde_json::to_value(&canary_state).unwrap_or(serde_json::Value::Null),
+                    );
+                    obj.insert(
+                        "replay_evaluation".to_string(),
+                        serde_json::to_value(&replay_result).unwrap_or(serde_json::Value::Null),
+                    );
+                }
+                if let Ok(last_bytes) = serde_json::to_vec(&value) {
+                    let _ = self
+                        .storage
+                        .set(
+                            crate::core::self_evolve::strategy_runtime::SELF_EVOLVE_LAST_RESULT_KEY,
+                            &last_bytes,
+                        )
+                        .await;
+                }
+                // Return human-friendly summary instead of raw JSON
+                let summary = if result.success {
+                    if result.promoted {
+                        let mode_label = if promoted_directly_to_baseline {
+                            "applied immediately"
+                        } else if promotion_applied {
+                            "activated in canary mode for gradual rollout"
+                        } else {
+                            "ready but not yet applied"
+                        };
+                        format!(
+                            "Self-evolution completed successfully.\n\n\
+                            I evaluated {} candidate strategies and found an improvement.\n\
+                            - Accuracy improved from {:.0}% to {:.0}% ({} wins, {} losses)\n\
+                            - The improved strategy has been {}\n\n\
+                            Your agent's decision-making is now more accurate.",
+                            result.evaluated_candidates,
+                            result.baseline_accuracy * 100.0,
+                            result.best_candidate_accuracy * 100.0,
+                            result.wins,
+                            result.losses,
+                            mode_label,
+                        )
+                    } else {
+                        format!(
+                            "Self-evolution completed. I evaluated {} candidate strategies \
+                            but none outperformed the current approach (accuracy: {:.0}%). \
+                            No changes were made.",
+                            result.evaluated_candidates,
+                            result.baseline_accuracy * 100.0,
+                        )
+                    }
+                } else {
+                    format!(
+                        "Self-evolution ran but encountered an issue: {}",
+                        result.error.as_deref().unwrap_or("unknown error")
+                    )
+                };
+                Ok(summary)
+            }
+            "code" | "codebase" => {
+                if !allow_code_writes {
+                    return Ok(serde_json::json!({
+                        "status": "blocked",
+                        "mode": "code",
+                        "message": "Code evolution is disabled by default. Re-run self_evolve with mode='code' and allow_code_writes=true after policy evolution is stable."
+                    })
+                    .to_string());
+                }
+
+                let config = crate::core::self_evolve::SelfEvolveConfig {
+                    max_iterations: 25,
+                    max_build_fix_cycles: 5,
+                    project_root,
+                };
+                let evolve_agent = crate::core::self_evolve::SelfEvolveAgent::new(config, llm);
+                let result = evolve_agent.execute(&request).await?;
+
+                if let Some(tx) = stream_tx {
+                    let status_msg = if result.success {
+                        let mut msg = format!(
+                            "Code evolution complete: {} files changed in {} iterations",
+                            result.files_changed.len(),
+                            result.iterations_used
+                        );
+                        if result.push_recommended {
+                            msg.push_str(
+                                ". Local changes are ready; ask the user whether to push to remote.",
+                            );
+                        }
+                        msg
+                    } else {
+                        format!(
+                            "Code evolution failed: {}",
+                            result.error.as_deref().unwrap_or("unknown error")
+                        )
+                    };
+                    let _ = tx.try_send(StreamEvent::ToolResult {
+                        name: "self_evolve".to_string(),
+                        content: status_msg,
+                    });
+                }
+
+                Ok(serde_json::to_string_pretty(&result)?)
+            }
+            _ => Ok(serde_json::json!({
+                "status": "error",
+                "message": format!(
+                    "Unsupported self_evolve mode '{}'. Use mode='policy' (default) or mode='code'.",
+                    mode
+                ),
+            })
+            .to_string()),
+        }
+    }
+    /// Determine the project root (where Cargo.toml lives).
+    fn find_project_root(&self) -> std::path::PathBuf {
+        // In Docker, the app is at /app
+        let app_path = std::path::Path::new("/app");
+        if app_path.join("Cargo.toml").exists() {
+            return app_path.to_path_buf();
+        }
+        // In development, walk up from current dir
+        if let Ok(cwd) = std::env::current_dir() {
+            let mut dir = cwd.as_path();
+            loop {
+                if dir.join("Cargo.toml").exists() {
+                    return dir.to_path_buf();
+                }
+                match dir.parent() {
+                    Some(parent) => dir = parent,
+                    None => break,
+                }
+            }
+        }
+        // Fallback
+        std::path::PathBuf::from(".")
+    }
+
     /// Execute tool calls from LLM response using modular handler dispatch.
     pub(crate) async fn execute_tool_calls(
         &self,
         response: &crate::core::llm::LlmResponse,
         trace_ref: &Arc<RwLock<ExecutionTrace>>,
         stream_tx: Option<tokio::sync::mpsc::Sender<StreamEvent>>,
-        request_channel: &str,
+        ctx: ToolExecutionContext<'_>,
     ) -> Result<String> {
         if response.tool_calls.is_empty() {
             return Ok(response.content.clone());
         }
+        let request_channel = ctx.request_channel;
+        let trace_id = ctx.trace_id;
+        let conversation_id = ctx.conversation_id;
+        let strategy_version = ctx.strategy_version;
+        let policy_version = ctx.policy_version;
+        let prompt_version = ctx.prompt_version;
+        let model_slot = ctx.model_slot;
 
         let public_base_url = self.load_public_base_url().await;
         let integration_aliases = self.load_tool_integration_aliases().await;
@@ -1068,6 +2049,7 @@ impl Agent {
 
         let mut results = Vec::new();
         for call in unique_calls {
+            let call_started = std::time::Instant::now();
             let ctx = ToolHandlerContext {
                 trace_ref,
                 stream_tx: stream_tx.as_ref(),
@@ -1082,15 +2064,97 @@ impl Agent {
                     continue;
                 }
                 tracing::debug!("Tool '{}' handled by '{}'", call.name, handler.id());
-                if let Some(output) = handler.handle(self, call, &ctx).await? {
-                    results.push(output);
-                    handled = true;
-                    break;
+                match handler.handle(self, call, &ctx).await {
+                    Ok(Some(output)) => {
+                        let lowered = output.trim().to_ascii_lowercase();
+                        let blocked = lowered.contains("blocked by safety policy");
+                        let success = !(lowered.starts_with("error ")
+                            || lowered.starts_with("error:")
+                            || blocked);
+                        let outcome = if blocked {
+                            "blocked"
+                        } else if success {
+                            "ok"
+                        } else {
+                            "error_text"
+                        };
+                        let payload = serde_json::json!({
+                            "handler": handler.id(),
+                            "output_preview": safe_truncate(&output, 260),
+                        });
+                        self.log_operational_event(super::operational::OperationalEvent {
+                            event_type: "tool_call",
+                            channel: request_channel,
+                            success,
+                            outcome,
+                            trace_id,
+                            conversation_id,
+                            tool_name: Some(&call.name),
+                            latency_ms: Some(call_started.elapsed().as_millis() as u64),
+                            arguments: Some(&call.arguments),
+                            payload: Some(&payload),
+                            strategy_version,
+                            policy_version,
+                            prompt_version,
+                            model_slot,
+                        })
+                        .await;
+                        results.push(output);
+                        handled = true;
+                        break;
+                    }
+                    Ok(None) => continue,
+                    Err(e) => {
+                        let error_text = e.to_string();
+                        let payload = serde_json::json!({
+                            "handler": handler.id(),
+                            "error": safe_truncate(&error_text, 260),
+                        });
+                        self.log_operational_event(super::operational::OperationalEvent {
+                            event_type: "tool_call",
+                            channel: request_channel,
+                            success: false,
+                            outcome: "handler_error",
+                            trace_id,
+                            conversation_id,
+                            tool_name: Some(&call.name),
+                            latency_ms: Some(call_started.elapsed().as_millis() as u64),
+                            arguments: Some(&call.arguments),
+                            payload: Some(&payload),
+                            strategy_version,
+                            policy_version,
+                            prompt_version,
+                            model_slot,
+                        })
+                        .await;
+                        return Err(e);
+                    }
                 }
             }
 
             if !handled {
                 let msg = format!("No handler registered for tool '{}'", call.name);
+                let payload = serde_json::json!({
+                    "handler": "none",
+                    "output_preview": safe_truncate(&msg, 260),
+                });
+                self.log_operational_event(super::operational::OperationalEvent {
+                    event_type: "tool_call",
+                    channel: request_channel,
+                    success: false,
+                    outcome: "no_handler",
+                    trace_id,
+                    conversation_id,
+                    tool_name: Some(&call.name),
+                    latency_ms: Some(call_started.elapsed().as_millis() as u64),
+                    arguments: Some(&call.arguments),
+                    payload: Some(&payload),
+                    strategy_version,
+                    policy_version,
+                    prompt_version,
+                    model_slot,
+                })
+                .await;
                 if let Some(ref tx) = stream_tx {
                     let _ = tx.try_send(StreamEvent::ToolResult {
                         name: call.name.clone(),
@@ -1125,9 +2189,8 @@ impl Agent {
         let sanitize_stream = |s: &str| -> String { self.sanitize_stream_preview(s) };
         let public_base_url = self.load_public_base_url().await;
         let integration_aliases = self.load_tool_integration_aliases().await;
-        let absolutize_url = |url: &str| -> String {
-            Self::absolutize_public_url(public_base_url.as_deref(), url)
-        };
+        let absolutize_url =
+            |url: &str| -> String { Self::absolutize_public_url(public_base_url.as_deref(), url) };
 
         // Deduplicate repeated tool calls (same name + identical args) so app_deploy
         // and other side-effecting actions do not run twice from merged paths.
@@ -1142,13 +2205,28 @@ impl Agent {
 
         for call in unique_calls {
             if let Some(ref tx) = stream_tx {
+                let payload = if call.name == "app_deploy" {
+                    Some(Self::summarize_app_deploy_stream_payload(&call.arguments))
+                } else {
+                    None
+                };
                 let _ = tx.try_send(StreamEvent::ToolStart {
                     name: call.name.clone(),
+                    payload,
                 });
             }
 
             // Check safety policy
-            if !self.safety.is_allowed(&call.name, &call.arguments).await? {
+            let allowed = if self.should_auto_approve_action(&call.name) {
+                tracing::info!(
+                    "Auto-approving command-like action '{}' for AgentArk",
+                    call.name
+                );
+                true
+            } else {
+                self.safety.is_allowed(&call.name, &call.arguments).await?
+            };
+            if !allowed {
                 let blocked = format!("Tool '{}' blocked by safety policy", call.name);
                 if let Some(ref tx) = stream_tx {
                     let _ = tx.try_send(StreamEvent::ToolResult {
@@ -1629,12 +2707,55 @@ impl Agent {
 
             // Handle app deployment - needs AppRegistry from agent
             if call.name == "app_deploy" {
+                let normalized_args = Self::normalize_app_deploy_arguments(&call.arguments);
                 // Resolve secret placeholders for deployment-time env injection, without mutating
                 // the original tool arguments (so traces stay safe).
-                let resolved_args = self
+                let mut resolved_args = self
                     .runtime
-                    .resolve_secret_placeholders(&call.name, &call.arguments)
-                    .unwrap_or_else(|_| call.arguments.clone());
+                    .resolve_secret_placeholders(&call.name, &normalized_args)
+                    .unwrap_or(normalized_args);
+                if resolved_args
+                    .get("access_guard")
+                    .and_then(|v| v.as_bool())
+                    .is_none()
+                {
+                    let guard_default = self
+                        .storage
+                        .get(
+                            crate::core::self_evolve::strategy_runtime::APP_DEPLOY_ACCESS_GUARD_DEFAULT_KEY,
+                        )
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|raw| String::from_utf8(raw).ok())
+                        .map(|s| s.trim().eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
+                    if let Some(obj) = resolved_args.as_object_mut() {
+                        obj.insert("access_guard".to_string(), serde_json::json!(guard_default));
+                    }
+                }
+                if resolved_args
+                    .get("runtime_preference")
+                    .and_then(|v| v.as_str())
+                    .is_none()
+                {
+                    if let Some(obj) = resolved_args.as_object_mut() {
+                        obj.insert("runtime_preference".to_string(), serde_json::json!("local"));
+                    }
+                }
+                if resolved_args
+                    .get("expose_public")
+                    .and_then(|v| v.as_bool())
+                    .is_none()
+                {
+                    if let Some(obj) = resolved_args.as_object_mut() {
+                        obj.insert("expose_public".to_string(), serde_json::json!(true));
+                    }
+                }
+                let expose_public_requested = resolved_args
+                    .get("expose_public")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
                 let hook_event_id = uuid::Uuid::new_v4().to_string();
                 let hook_hint = action_message_hint(&resolved_args);
                 self.fire_action_hook(
@@ -1646,7 +2767,20 @@ impl Agent {
                     &hook_event_id,
                 )
                 .await;
-                let llm_env = self.config.llm.app_env_vars();
+                let llm_env = self
+                    .model_pool
+                    .get(&self.primary_model_id)
+                    .map(|(slot, _)| slot.provider.app_env_vars())
+                    .filter(|env| {
+                        env.iter().any(|(k, v)| {
+                            if v.trim().is_empty() || v == "[ENCRYPTED]" {
+                                return false;
+                            }
+                            k.ends_with("_API_KEY")
+                                || (k == "LLM_PROVIDER" && v.eq_ignore_ascii_case("ollama"))
+                        })
+                    })
+                    .unwrap_or_else(|| self.config.llm.app_env_vars());
                 match crate::actions::app::app_deploy(
                     &self.config_dir,
                     &self.data_dir,
@@ -1658,6 +2792,7 @@ impl Agent {
                 .await
                 {
                     Ok(result) => {
+                        self.trigger_arkpulse_refresh("app_deploy");
                         self.fire_action_hook(
                             crate::hooks::HookTrigger::PostAction,
                             request_channel,
@@ -1702,15 +2837,50 @@ impl Agent {
                                             .join(", ")
                                     })
                                     .unwrap_or_default();
+                                let llm_reuse_candidates = parsed
+                                    .get("llm_reuse_candidates")
+                                    .and_then(|v| v.as_array())
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .filter_map(|v| v.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    })
+                                    .unwrap_or_default();
+                                let reuse_option = if llm_reuse_candidates.is_empty() {
+                                    "1) Use an existing model key: not available for current missing keys.".to_string()
+                                } else {
+                                    format!(
+                                        "1) Reuse your current model key for: {}.\n   Reply: use current llm key for <KEY>",
+                                        llm_reuse_candidates
+                                    )
+                                };
+                                let public_access_note = if expose_public_requested {
+                                    match self.ensure_public_tunnel_base_url(stream_tx.as_ref()).await {
+                                        Some(base) => {
+                                            format!("\nPublic access URL: {}/apps/{}/", base, app_id)
+                                        }
+                                        None => "\nPublic tunnel URL is pending; I started tunnel setup and will use it once available.".to_string(),
+                                    }
+                                } else {
+                                    String::new()
+                                };
                                 let msg = format!(
-                                    "App '{}' created but waiting on required inputs.\nMissing sensitive keys: {}{}\n\
-                                     For sensitive keys ask user to run: set secret KEY=VALUE.\n\
-                                     For non-sensitive config values, redeploy/restart with config.{{KEY}}=value.\n\
-                                     Then restart app '{}'.",
-                                    title,
-                                    if missing.is_empty() { "none" } else { &missing },
-                                    if missing_config.is_empty() { "".to_string() } else { format!("\nMissing config values: {}", missing_config) },
-                                    app_id
+                                    "App '{}' is ready, but I need your approval/input for credentials before I continue.\n\
+                                      Missing sensitive keys: {}{}\n\n\
+                                      Choose one option:\n\
+                                      {}\n\
+                                     2) Provide your own key securely.\n\
+                                        Reply: set secret <KEY>=<VALUE>\n\n\
+                                      Why I'm asking: credentials are stored encrypted and handled outside model generation to reduce leak risk.\n\
+                                      For non-sensitive config values, redeploy/restart with config.{{KEY}}=value.\n\
+                                      Then restart app '{}'.{}",
+                                     title,
+                                     if missing.is_empty() { "none" } else { &missing },
+                                     if missing_config.is_empty() { "".to_string() } else { format!("\nMissing config values: {}", missing_config) },
+                                     reuse_option,
+                                     app_id,
+                                     public_access_note
                                 );
                                 if let Some(ref tx) = stream_tx {
                                     let _ = tx.try_send(StreamEvent::ToolResult {
@@ -1721,7 +2891,7 @@ impl Agent {
                                 results.push(msg);
                                 continue;
                             }
-                            if let Some(url) = parsed.get("url").and_then(|v| v.as_str()) {
+                            if parsed.get("url").is_some() || parsed.get("app_id").is_some() {
                                 let title = parsed
                                     .get("title")
                                     .and_then(|v| v.as_str())
@@ -1730,18 +2900,52 @@ impl Agent {
                                     .get("type")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("static");
-                                let app_id = parsed
+                                let app_id_raw = parsed
                                     .get("app_id")
                                     .and_then(|v| v.as_str())
-                                    .unwrap_or("app");
+                                    .map(|v| v.trim())
+                                    .unwrap_or("");
+                                let app_id = if app_id_raw.is_empty() {
+                                    "app"
+                                } else {
+                                    app_id_raw
+                                };
                                 let access_key = parsed
                                     .get("access_key")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("");
-                                let url_with_key = if access_key.is_empty() {
-                                    url.to_string()
+                                let access_guard_enabled = parsed
+                                    .get("access_guard_enabled")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(!access_key.is_empty());
+                                let mut url_with_key = parsed
+                                    .get("access_url")
+                                    .and_then(|v| v.as_str())
+                                    .or_else(|| parsed.get("url").and_then(|v| v.as_str()))
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_else(|| {
+                                        if !app_id_raw.is_empty() {
+                                            format!("/apps/{}/", app_id_raw)
+                                        } else {
+                                            "/apps/".to_string()
+                                        }
+                                    });
+                                if access_guard_enabled
+                                    && !access_key.is_empty()
+                                    && !url_with_key.contains("key=")
+                                {
+                                    let separator =
+                                        if url_with_key.contains('?') { '&' } else { '?' };
+                                    url_with_key.push(separator);
+                                    url_with_key.push_str("key=");
+                                    url_with_key.push_str(access_key);
+                                }
+                                let mut public_base_for_app = if expose_public_requested {
+                                    self.ensure_public_tunnel_base_url(stream_tx.as_ref())
+                                        .await
+                                        .or_else(|| public_base_url.clone())
                                 } else {
-                                    format!("{}?key={}", url, access_key)
+                                    public_base_url.clone()
                                 };
 
                                 let (preview_url, verified, verify_attempts, verify_detail) = self
@@ -1754,7 +2958,14 @@ impl Agent {
                                     .unwrap_or_else(|e| {
                                         (None, false, 0, format!("Validation helper error: {}", e))
                                     });
-
+                                if expose_public_requested && public_base_for_app.is_none() {
+                                    public_base_for_app = self.load_public_base_url().await;
+                                }
+                                let local_base_url = Self::user_facing_local_base_url();
+                                let local_access_url = Self::absolutize_public_url(
+                                    Some(local_base_url.as_str()),
+                                    &url_with_key,
+                                );
                                 if let Some(ref tx) = stream_tx {
                                     let _ = tx.try_send(StreamEvent::ToolResult {
                                         name: call.name.clone(),
@@ -1775,20 +2986,81 @@ impl Agent {
                                     });
                                 }
 
-                                let mut app_message = format!(
-                                    "[APP_DEPLOYED]{}\n[/APP_DEPLOYED]\n*{} ({}) deployed and running*",
-                                    url_with_key, title, app_type
-                                );
-                                app_message.push_str(&format!(
-                                    "\nValidation: {} (attempts: {})",
-                                    if verified { "PASSED" } else { "FAILED" },
+                                let mut app_message_lines: Vec<String> = Vec::new();
+                                if verified {
+                                    app_message_lines.push(format!(
+                                        "I have deployed **{}** ({} app), and I validated that it is running.",
+                                        title, app_type
+                                    ));
+                                } else {
+                                    app_message_lines.push(format!(
+                                        "I have deployed **{}** ({} app), but validation has not passed yet.",
+                                        title, app_type
+                                    ));
+                                }
+
+                                if verified {
+                                    app_message_lines.push(format!(
+                                        "- Local: [Open local app]({})",
+                                        local_access_url
+                                    ));
+                                    if let Some(public_base) = public_base_for_app.as_deref() {
+                                        let public_access_url = Self::absolutize_public_url(
+                                            Some(public_base),
+                                            &url_with_key,
+                                        );
+                                        if public_access_url != local_access_url {
+                                            app_message_lines.push(format!(
+                                                "- Public: [Open public app]({})",
+                                                public_access_url
+                                            ));
+                                        }
+                                    } else if expose_public_requested {
+                                        app_message_lines.push(
+                                            "- Public: still pending. I started tunnel setup and it should appear shortly."
+                                                .to_string(),
+                                        );
+                                    }
+                                } else if expose_public_requested {
+                                    app_message_lines.push(
+                                        "- Public: withheld until validation passes.".to_string(),
+                                    );
+                                } else {
+                                    app_message_lines.push(
+                                        "- Access link: withheld until validation passes."
+                                            .to_string(),
+                                    );
+                                }
+
+                                if access_guard_enabled {
+                                    app_message_lines.push(
+                                        "- Access guard: enabled.".to_string(),
+                                    );
+                                } else {
+                                    app_message_lines.push(
+                                        "- Access guard: not enabled.".to_string(),
+                                    );
+                                }
+
+                                app_message_lines.push(format!(
+                                    "- Deployment validation: {} (attempts: {}).",
+                                    if verified { "passed" } else { "failed" },
                                     verify_attempts
                                 ));
-                                app_message
-                                    .push_str(&format!("\nValidation note: {}", verify_detail));
-                                if let Some(preview) = preview_url {
-                                    app_message.push_str(&format!("\n![App Preview]({})", preview));
+                                if !verified && !verify_detail.trim().is_empty() {
+                                    app_message_lines.push(format!(
+                                        "- Validation issue: {}",
+                                        verify_detail.trim()
+                                    ));
                                 }
+
+                                if verified {
+                                    if let Some(preview) = preview_url {
+                                        app_message_lines
+                                            .push(format!("![App Preview]({})", preview));
+                                    }
+                                }
+                                let app_message = app_message_lines.join("\n");
                                 results.push(app_message);
                                 continue;
                             }
@@ -1812,7 +3084,14 @@ impl Agent {
                             &hook_event_id,
                         )
                         .await;
-                        let formatted = format!("Error deploying app: {}", e);
+                        let error_text = e.to_string();
+                        let formatted = if error_text.contains("Missing 'files'")
+                            || error_text.contains("provide an object mapping filename to content")
+                        {
+                            "Error deploying app: app_deploy was called without a valid `files` object. This is a malformed tool payload, not your app code. Retrying the same request should regenerate a valid deploy payload.".to_string()
+                        } else {
+                            format!("Error deploying app: {}", error_text)
+                        };
                         if let Some(ref tx) = stream_tx {
                             let _ = tx.try_send(StreamEvent::ToolResult {
                                 name: call.name.clone(),
@@ -1929,8 +3208,10 @@ impl Agent {
                                     break;
                                 }
                             };
-                            let exit_code =
-                                parsed.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(0);
+                            let exit_code = parsed
+                                .get("exit_code")
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0);
                             let should_retry = exit_code != 0 && !current_code.trim().is_empty();
 
                             if !should_retry {
@@ -2025,8 +3306,8 @@ impl Agent {
                                     let fixed = if fixed.starts_with("```") {
                                         // Strip opening ```lang and closing ```
                                         let lines: Vec<&str> = fixed.lines().collect();
-                                        let start = if lines.first().map_or(false, |l| l.starts_with("```")) { 1 } else { 0 };
-                                        let end = if lines.last().map_or(false, |l| l.trim() == "```") { lines.len() - 1 } else { lines.len() };
+                                        let start = if lines.first().is_some_and(|l| l.starts_with("```")) { 1 } else { 0 };
+                                        let end = if lines.last().is_some_and(|l| l.trim() == "```") { lines.len() - 1 } else { lines.len() };
                                         lines[start..end].join("\n")
                                     } else {
                                         fixed
@@ -2466,6 +3747,58 @@ impl Agent {
                 }
                 Err(e) => {
                     tracing::error!("Action execution error: {}", e);
+                    if call.name == "browse" {
+                        let target = call
+                            .arguments
+                            .get("url")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim();
+                        let query_hint = if target.is_empty() {
+                            call.arguments
+                                .get("query")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .trim()
+                        } else {
+                            target
+                        };
+
+                        if !query_hint.is_empty() {
+                            let fallback_args = serde_json::json!({
+                                "query": query_hint,
+                                "num_results": 5
+                            });
+                            match self
+                                .runtime
+                                .execute_action("web_search", &fallback_args)
+                                .await
+                            {
+                                Ok(search_out) => {
+                                    let healed = format!(
+                                        "Browse failed ({})\n\nSelf-heal fallback: searched the web instead.\n{}",
+                                        e, search_out
+                                    );
+                                    if let Some(ref tx) = stream_tx {
+                                        let _ = tx.try_send(StreamEvent::ToolResult {
+                                            name: call.name.clone(),
+                                            content: "Browse failed; used search fallback"
+                                                .to_string(),
+                                        });
+                                    }
+                                    results.push(healed);
+                                    continue;
+                                }
+                                Err(search_err) => {
+                                    tracing::warn!(
+                                        "Browse self-heal fallback failed for '{}': {}",
+                                        query_hint,
+                                        search_err
+                                    );
+                                }
+                            }
+                        }
+                    }
                     let formatted = format!("Error executing '{}': {}", call.name, e);
                     if let Some(ref tx) = stream_tx {
                         let _ = tx.try_send(StreamEvent::ToolResult {
@@ -2485,8 +3818,6 @@ impl Agent {
             Ok(format!("{}\n\n{}", response.content, results.join("\n")))
         }
     }
-
-
 }
 
 #[cfg(test)]
@@ -2523,7 +3854,10 @@ mod tests {
             }),
         );
 
-        assert_eq!(Agent::tool_call_signature(&a), Agent::tool_call_signature(&b));
+        assert_eq!(
+            Agent::tool_call_signature(&a),
+            Agent::tool_call_signature(&b)
+        );
     }
 
     #[test]
@@ -2531,7 +3865,63 @@ mod tests {
         let a = call("1", "code_execute", json!({ "args": [1, 2, 3] }));
         let b = call("2", "code_execute", json!({ "args": [3, 2, 1] }));
 
-        assert_ne!(Agent::tool_call_signature(&a), Agent::tool_call_signature(&b));
+        assert_ne!(
+            Agent::tool_call_signature(&a),
+            Agent::tool_call_signature(&b)
+        );
+    }
+
+    #[test]
+    fn normalize_app_deploy_arguments_unwraps_double_encoded_payload() {
+        let payload = "\"{\\\"title\\\":\\\"Demo\\\",\\\"files\\\":{\\\"index.html\\\":\\\"<h1>ok</h1>\\\"}}\"";
+        let input = json!({
+            "name": "app_deploy",
+            "payload": payload,
+            "runtime_preference": "local"
+        });
+
+        let normalized = Agent::normalize_app_deploy_arguments(&input);
+        let files = normalized
+            .get("files")
+            .and_then(|v| v.as_object())
+            .expect("files object should be recovered");
+        assert_eq!(
+            files.get("index.html").and_then(|v| v.as_str()),
+            Some("<h1>ok</h1>")
+        );
+        assert_eq!(
+            normalized
+                .get("runtime_preference")
+                .and_then(|v| v.as_str()),
+            Some("local")
+        );
+    }
+
+    #[test]
+    fn normalize_app_deploy_arguments_converts_file_array_to_files_map() {
+        let input = json!({
+            "payload": {
+                "title": "Demo",
+                "project_files": [
+                    { "name": "index.html", "content": "<h1>x</h1>" },
+                    { "name": "app.js", "content": "console.log('ok')" }
+                ]
+            }
+        });
+
+        let normalized = Agent::normalize_app_deploy_arguments(&input);
+        let files = normalized
+            .get("files")
+            .and_then(|v| v.as_object())
+            .expect("files map should be built from project_files");
+        assert_eq!(files.len(), 2);
+        assert_eq!(
+            files.get("index.html").and_then(|v| v.as_str()),
+            Some("<h1>x</h1>")
+        );
+        assert_eq!(
+            files.get("app.js").and_then(|v| v.as_str()),
+            Some("console.log('ok')")
+        );
     }
 }
-

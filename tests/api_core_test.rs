@@ -11,7 +11,9 @@
 const BASE_URL: &str = "http://localhost:8990";
 
 fn api_key() -> Option<String> {
-    std::env::var("AGENTARK_TEST_API_KEY").ok().filter(|k| !k.is_empty())
+    std::env::var("AGENTARK_TEST_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
 }
 
 fn authed_client() -> reqwest::Client {
@@ -285,10 +287,7 @@ async fn test_master_password_status() {
     skip_if_no_auth!();
     let client = authed_client();
     let resp = client
-        .get(&format!(
-            "{}/security/master-password/status",
-            BASE_URL
-        ))
+        .get(&format!("{}/security/master-password/status", BASE_URL))
         .send()
         .await
         .unwrap();
@@ -389,10 +388,7 @@ async fn test_llm_analytics() {
     skip_if_no_auth!();
     let client = authed_client();
     let resp = client
-        .get(&format!(
-            "{}/analytics/llm?range=24h&bucket=hour",
-            BASE_URL
-        ))
+        .get(&format!("{}/analytics/llm?range=24h&bucket=hour", BASE_URL))
         .send()
         .await
         .unwrap();

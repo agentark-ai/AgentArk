@@ -4,7 +4,7 @@
 pub fn global_policy_v2_block() -> &'static str {
     r#"## AgentArk Global Policy v2
 - Security first: prefer least-privilege actions, never expose secrets, and stop on unsafe/unauthorized operations.
-- Uncertainty threshold: if execution intent is present and confidence is below 0.90, ask one concise clarification before acting.
+- Clarification policy: ask one concise clarification only when critical execution details are missing or ambiguous; if the brief is clear and actionable, execute directly.
 - Bounded retries only: any repair/retry loop must declare max attempts before starting, stop at cap, then report last error + next fix.
 - Evidence per action: after each tool/action, provide a compact evidence line (action, intent, key non-secret inputs, observed result).
 - For deployed apps, validate before sharing: open URL, verify unlocked app load, capture preview screenshot, then return link.
@@ -15,7 +15,7 @@ pub fn global_policy_v2_block() -> &'static str {
 pub fn delegated_policy_v2_block() -> &'static str {
     r#"Global Policy v2 (strict):
 - Security-first and no secret leakage.
-- If unsure (<0.90 confidence) on an execution task, ask one clarification.
+- Ask one clarification only for missing or ambiguous execution details.
 - All retries must be bounded with explicit max attempts.
 - Include concise evidence for each action you take."#
 }
@@ -24,7 +24,7 @@ pub fn delegated_policy_v2_block() -> &'static str {
 pub fn router_policy_v2_block() -> &'static str {
     r#"Router Policy v2:
 - For execution intents, route direct unless explicit parallel decomposition is required.
-- Set should_clarify=true when confidence < 0.90 for an execution-intent request.
+- Set should_clarify=true only for ambiguous/underspecified execution requests.
 - Never propose unbounded retry or repair loops."#
 }
 

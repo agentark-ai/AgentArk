@@ -313,7 +313,12 @@ impl Integration for WhatsAppConnector {
     }
 
     fn capabilities(&self) -> Vec<Capability> {
-        vec![Capability::Read, Capability::Write, Capability::Subscribe, Capability::Notify]
+        vec![
+            Capability::Read,
+            Capability::Write,
+            Capability::Subscribe,
+            Capability::Notify,
+        ]
     }
 
     async fn status(&self) -> IntegrationStatus {

@@ -360,7 +360,7 @@ impl SafetyEngine {
                             _ => continue,
                         };
                         context
-                            .set_value(key.clone().into(), eval_value)
+                            .set_value(key.clone(), eval_value)
                             .map_err(|e| anyhow::anyhow!("Failed to set context value: {}", e))?;
                     }
                 }

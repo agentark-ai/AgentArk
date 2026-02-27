@@ -47,6 +47,7 @@ pub enum FindingCategory {
     EncodedPayload,
     EnvironmentAccess,
     CredentialPattern,
+    SupplyChain,
 }
 
 /// A single finding from static analysis
@@ -316,13 +317,38 @@ impl ActionGuard {
                 r"(?i)\b(bash|sh|cmd|powershell)\s*[\(\{-]",
                 8,
             ),
+            (
+                FindingCategory::ShellExecution,
+                r"(?i)\b(subprocess\.(run|popen|call))\s*\([^)]*shell\s*=\s*true",
+                10,
+            ),
+            (
+                FindingCategory::ShellExecution,
+                r"(?i)\b(child_process\.(exec|execsync|spawn|spawnsync|fork))\s*\(",
+                10,
+            ),
             (FindingCategory::ShellExecution, r"(?i)\beval\s*\(", 8),
+            (
+                FindingCategory::ShellExecution,
+                r"(?i)\b(new\s+function|function\s*\(\s*[^\)]*\)\s*\{)",
+                9,
+            ),
             (FindingCategory::ShellExecution, r"(?i)\brm\s+-rf\b", 10),
+            (
+                FindingCategory::ShellExecution,
+                r"(?i)\b(curl|wget)[^\n]{0,200}\|\s*(bash|sh|zsh)\b",
+                10,
+            ),
             // Network access
             (FindingCategory::NetworkAccess, r"(?i)\b(curl|wget)\s+", 5),
             (
                 FindingCategory::NetworkAccess,
                 r"(?i)\b(requests\.get|requests\.post|fetch)\s*\(",
+                5,
+            ),
+            (
+                FindingCategory::NetworkAccess,
+                r"(?i)\b(axios\.(get|post|request)|reqwest::Client::new|http(s)?://)\b",
                 5,
             ),
             (
@@ -356,6 +382,32 @@ impl ActionGuard {
             (
                 FindingCategory::EncodedPayload,
                 r"\\x[0-9a-fA-F]{2}(\\x[0-9a-fA-F]{2}){5,}",
+                8,
+            ),
+            (
+                FindingCategory::EncodedPayload,
+                r"(?i)\b(base64\s+-d|python\s+-c|perl\s+-e|ruby\s+-e)\b",
+                8,
+            ),
+            // Supply-chain / install-time execution surfaces
+            (
+                FindingCategory::SupplyChain,
+                r"(?i)\bpip\s+install\s+.*(git\+|https?://|@)",
+                8,
+            ),
+            (
+                FindingCategory::SupplyChain,
+                r"(?i)\bnpm\s+(i|install)\s+.*(github:|git\+|https?://)",
+                8,
+            ),
+            (
+                FindingCategory::SupplyChain,
+                r"(?i)\byarn\s+add\s+.*(github:|git\+|https?://)",
+                8,
+            ),
+            (
+                FindingCategory::SupplyChain,
+                r"(?i)\bcargo\s+(install|add)\s+.*(--git|https?://)",
                 8,
             ),
             // Environment access
@@ -468,6 +520,18 @@ impl ActionGuard {
         let has_network = findings
             .iter()
             .any(|f| matches!(f.category, FindingCategory::NetworkAccess));
+        let has_shell = findings
+            .iter()
+            .any(|f| matches!(f.category, FindingCategory::ShellExecution));
+        let has_encoded = findings
+            .iter()
+            .any(|f| matches!(f.category, FindingCategory::EncodedPayload));
+        let has_fs_escape = findings
+            .iter()
+            .any(|f| matches!(f.category, FindingCategory::FileSystemEscape));
+        let has_supply_chain = findings
+            .iter()
+            .any(|f| matches!(f.category, FindingCategory::SupplyChain));
         let has_secret_reference = findings.iter().any(|f| {
             matches!(
                 f.category,
@@ -476,11 +540,20 @@ impl ActionGuard {
         });
 
         let total_severity: u32 = findings.iter().map(|f| f.severity).sum();
-        let total_severity = if has_network && has_secret_reference {
+        let mut total_severity = if has_network && has_secret_reference {
             total_severity + 5
         } else {
             total_severity
         };
+        if has_shell && has_network && (has_encoded || has_secret_reference) {
+            total_severity += 12;
+        }
+        if has_shell && has_fs_escape {
+            total_severity += 10;
+        }
+        if has_supply_chain && has_shell && has_network {
+            total_severity += 8;
+        }
         let threat_level = if total_severity >= self.malicious_threshold {
             ThreatLevel::Malicious
         } else if total_severity >= self.suspicious_threshold {
@@ -546,8 +619,35 @@ impl ActionGuard {
                     base_severity
                 }
             }
+            FindingCategory::SupplyChain => {
+                // Installation commands are sometimes expected; keep as strong signal
+                // but avoid auto-escalation unless combined with other risky categories.
+                base_severity.max(6)
+            }
             _ => base_severity,
         }
+    }
+
+    fn has_high_risk_chain(findings: &[AnalysisFinding]) -> bool {
+        let has_shell = findings
+            .iter()
+            .any(|f| matches!(f.category, FindingCategory::ShellExecution));
+        let has_network = findings
+            .iter()
+            .any(|f| matches!(f.category, FindingCategory::NetworkAccess));
+        let has_encoded = findings
+            .iter()
+            .any(|f| matches!(f.category, FindingCategory::EncodedPayload));
+        let has_fs_escape = findings
+            .iter()
+            .any(|f| matches!(f.category, FindingCategory::FileSystemEscape));
+        let has_secret = findings.iter().any(|f| {
+            matches!(
+                f.category,
+                FindingCategory::EnvironmentAccess | FindingCategory::CredentialPattern
+            )
+        });
+        (has_shell && has_network && (has_encoded || has_secret)) || (has_shell && has_fs_escape)
     }
 
     // ─── Pillar 3: Permissions Model ─────────────────────────────────
@@ -579,7 +679,7 @@ impl ActionGuard {
                     .split(',')
                     .map(|s| s.trim().trim_matches(|c: char| c == '"' || c == '\''))
                     .filter(|s| !s.is_empty())
-                    .map(|s| Self::parse_permission(s))
+                    .map(Self::parse_permission)
                     .collect();
             }
         }
@@ -711,11 +811,9 @@ impl ActionGuard {
         let mut risk_score: u32 = 0;
 
         for (re, name) in &self.injection_patterns {
-            if re.is_match(content) {
-                if !matched_patterns.contains(name) {
-                    matched_patterns.push(name.clone());
-                    risk_score += 20;
-                }
+            if re.is_match(content) && !matched_patterns.contains(name) {
+                matched_patterns.push(name.clone());
+                risk_score += 20;
             }
         }
 
@@ -790,6 +888,16 @@ impl ActionGuard {
         // 4. Permission check
         let requested_perms = Self::parse_permissions(frontmatter);
         let permissions_needed = self.check_permissions(action_name, &requested_perms).await;
+        let has_dangerous_requested_permission = requested_perms
+            .iter()
+            .any(|p| Self::permission_risk(p) == PermissionRisk::Dangerous);
+        let has_high_risk_chain = Self::has_high_risk_chain(&static_analysis.findings);
+        if has_high_risk_chain {
+            warnings.push(
+                "High-risk exploit chain detected (shell + network + secret/obfuscation or shell + filesystem escape)."
+                    .to_string(),
+            );
+        }
         if !permissions_needed.is_empty() {
             let perm_names: Vec<String> =
                 permissions_needed.iter().map(|p| p.to_string()).collect();
@@ -799,10 +907,19 @@ impl ActionGuard {
             ));
         }
 
+        let strict_policy_block = has_high_risk_chain && has_dangerous_requested_permission;
+        if strict_policy_block {
+            warnings.push(
+                "Blocked by strict policy: dangerous permissions combined with high-risk exploit-chain patterns."
+                    .to_string(),
+            );
+        }
+
         // Compose verdict
         let allow_load = integrity_ok
             && static_analysis.threat_level != ThreatLevel::Malicious
-            && !injection_scan.should_block;
+            && !injection_scan.should_block
+            && !strict_policy_block;
 
         Ok(ActionSecurityVerdict {
             integrity_ok,

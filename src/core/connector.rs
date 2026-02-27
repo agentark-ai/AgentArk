@@ -8,18 +8,14 @@ use super::pipeline::RetryPolicy;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum HttpMethod {
+    #[default]
     Get,
     Post,
     Put,
     Patch,
     Delete,
-}
-
-impl Default for HttpMethod {
-    fn default() -> Self {
-        Self::Get
-    }
 }
 
 impl HttpMethod {
@@ -36,16 +32,12 @@ impl HttpMethod {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum PaginationMode {
+    #[default]
     None,
     Page,
     Cursor,
-}
-
-impl Default for PaginationMode {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 fn default_page_param() -> String {

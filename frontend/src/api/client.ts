@@ -15,17 +15,60 @@ import type {
   TraceResponse
 } from "../types";
 
+let sessionRefreshInFlight: Promise<void> | null = null;
+
+function isMissingAuthError(status: number, text: string): boolean {
+  if (status !== 401 && status !== 403) return false;
+  const lower = (text || "").toLowerCase();
+  return (
+    lower.includes("missing authorization") ||
+    lower.includes("bearer <api_key>") ||
+    lower.includes("invalid api key") ||
+    lower.includes("api authentication")
+  );
+}
+
+async function refreshUiSessionCookie(): Promise<void> {
+  if (sessionRefreshInFlight) return sessionRefreshInFlight;
+  sessionRefreshInFlight = (async () => {
+    try {
+      await fetch("/ui/v2", {
+        method: "GET",
+        credentials: "include",
+        cache: "no-store",
+        headers: { Accept: "text/html" }
+      });
+    } catch {
+      // best effort only
+    } finally {
+      sessionRefreshInFlight = null;
+    }
+  })();
+  return sessionRefreshInFlight;
+}
+
 export async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, {
-    credentials: "include",
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers || {})
-    },
-    ...init
-  });
+  const doFetch = () =>
+    fetch(path, {
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        ...(init?.headers || {})
+      },
+      ...init
+    });
+  let res = await doFetch();
   if (!res.ok) {
-    const text = await res.text();
+    let text = await res.text();
+    if (isMissingAuthError(res.status, text)) {
+      await refreshUiSessionCookie();
+      res = await doFetch();
+      if (!res.ok) {
+        text = await res.text();
+        throw new Error(text || `Request failed (${res.status})`);
+      }
+      return (await res.json()) as T;
+    }
     throw new Error(text || `Request failed (${res.status})`);
   }
   return (await res.json()) as T;
@@ -33,14 +76,25 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export async function requestForm<T>(path: string, formData: FormData, init?: RequestInit): Promise<T> {
   const headers = { ...(init?.headers || {}) };
-  const res = await fetch(path, {
-    credentials: "include",
-    ...init,
-    headers,
-    body: formData
-  });
+  const doFetch = () =>
+    fetch(path, {
+      credentials: "include",
+      ...init,
+      headers,
+      body: formData
+    });
+  let res = await doFetch();
   if (!res.ok) {
-    const text = await res.text();
+    let text = await res.text();
+    if (isMissingAuthError(res.status, text)) {
+      await refreshUiSessionCookie();
+      res = await doFetch();
+      if (!res.ok) {
+        text = await res.text();
+        throw new Error(text || `Request failed (${res.status})`);
+      }
+      return (await res.json()) as T;
+    }
     throw new Error(text || `Request failed (${res.status})`);
   }
   return (await res.json()) as T;
@@ -57,8 +111,9 @@ type ChatStreamHandlers = {
   onEvent?: (event: string, payload: unknown) => void;
   onToken?: (token: string) => void;
   onThinking?: (step: Record<string, unknown>) => void;
-  onToolStart?: (name: string) => void;
-  onToolResult?: (name: string, content: string) => void;
+  onToolStart?: (name: string, payload?: Record<string, unknown>) => void;
+  onToolProgress?: (name: string, content: string, payload?: Record<string, unknown>) => void;
+  onToolResult?: (name: string, content: string, payload?: Record<string, unknown>) => void;
   onContent?: (payload: Record<string, unknown>) => void;
   onError?: (message: string, payload?: unknown) => void;
   onDone?: () => void;
@@ -82,20 +137,47 @@ function asText(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
+function extractStreamErrorMessage(payloadValue: unknown): string {
+  if (typeof payloadValue === "string") return payloadValue;
+  const obj = asObject(payloadValue);
+  const direct =
+    asText(obj.error) ||
+    asText(obj.message) ||
+    asText(obj.detail) ||
+    "";
+  if (direct) return direct;
+  try {
+    return JSON.stringify(payloadValue);
+  } catch {
+    return "";
+  }
+}
+
 async function streamChat(payload: ChatStreamPayload, handlers: ChatStreamHandlers = {}): Promise<void> {
-  const res = await fetch("/chat/stream", {
-    method: "POST",
-    credentials: "include",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "text/event-stream"
-    },
-    body: JSON.stringify(payload)
-  });
+  const doFetch = () =>
+    fetch("/chat/stream", {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "text/event-stream"
+      },
+      body: JSON.stringify(payload)
+    });
+  let res = await doFetch();
 
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(text || `Request failed (${res.status})`);
+    let text = await res.text();
+    if (isMissingAuthError(res.status, text)) {
+      await refreshUiSessionCookie();
+      res = await doFetch();
+      if (!res.ok) {
+        text = await res.text();
+        throw new Error(text || `Request failed (${res.status})`);
+      }
+    } else {
+      throw new Error(text || `Request failed (${res.status})`);
+    }
   }
 
   if (!res.body) throw new Error("Streaming is not available in this browser session.");
@@ -133,15 +215,23 @@ async function streamChat(payload: ChatStreamPayload, handlers: ChatStreamHandle
       return;
     }
     if (eventName === "tool_start") {
-      const name = asText(asObject(payloadValue).name);
-      if (name) handlers.onToolStart?.(name);
+      const obj = asObject(payloadValue);
+      const name = asText(obj.name);
+      if (name) handlers.onToolStart?.(name, obj);
       return;
     }
     if (eventName === "tool_result") {
       const obj = asObject(payloadValue);
       const name = asText(obj.name);
       const content = asText(obj.content);
-      handlers.onToolResult?.(name, content);
+      handlers.onToolResult?.(name, content, obj);
+      return;
+    }
+    if (eventName === "tool_progress") {
+      const obj = asObject(payloadValue);
+      const name = asText(obj.name);
+      const content = asText(obj.content);
+      handlers.onToolProgress?.(name, content, obj);
       return;
     }
     if (eventName === "content") {
@@ -149,8 +239,7 @@ async function streamChat(payload: ChatStreamPayload, handlers: ChatStreamHandle
       return;
     }
     if (eventName === "error") {
-      const obj = asObject(payloadValue);
-      const message = asText(obj.error) || "Stream failed.";
+      const message = extractStreamErrorMessage(payloadValue) || "Stream failed.";
       handlers.onError?.(message, payloadValue);
       return;
     }
@@ -294,10 +383,12 @@ export const api = {
       method: "POST",
       body: JSON.stringify({})
     }),
-  getLlmAnalytics: (params?: { range?: string; bucket?: "hour" | "day" | "week" | string }) => {
+  getLlmAnalytics: (params?: { range?: string; bucket?: "hour" | "day" | "week" | string; from?: string; to?: string }) => {
     const range = encodeURIComponent(params?.range || "24h");
     const bucket = encodeURIComponent(params?.bucket || "hour");
-    return request<LlmAnalyticsResponse>(`/analytics/llm?range=${range}&bucket=${bucket}`);
+    const from = params?.from ? `&from=${encodeURIComponent(params.from)}` : "";
+    const to = params?.to ? `&to=${encodeURIComponent(params.to)}` : "";
+    return request<LlmAnalyticsResponse>(`/analytics/llm?range=${range}&bucket=${bucket}${from}${to}`);
   },
   executeRecommendedSkill: (action: RecommendedSkill) =>
     request<{ status: string; message?: string; queued?: boolean }>("/autonomy/skills/execute", {

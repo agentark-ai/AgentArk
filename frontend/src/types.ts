@@ -188,6 +188,10 @@ export type SkillImportResponse = {
     }>;
     blocked?: boolean;
     total_severity?: number;
+    risk_score_10?: number;
+    risk_band?: "secure" | "review" | "risky" | string;
+    total_findings?: number;
+    contextual_findings?: number;
   };
 };
 

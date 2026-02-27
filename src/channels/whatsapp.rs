@@ -23,11 +23,7 @@ enum TunnelControlCommand {
 }
 
 fn parse_tunnel_command(text: &str) -> Option<TunnelControlCommand> {
-    let normalized = text
-        .trim()
-        .to_ascii_lowercase()
-        .replace('_', " ")
-        .replace('-', " ");
+    let normalized = text.trim().to_ascii_lowercase().replace(['_', '-'], " ");
     let compact = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
     match compact.as_str() {
         "start tunnel" | "/tunnel start" | "/start_tunnel" => Some(TunnelControlCommand::Start),
@@ -211,9 +207,7 @@ fn parse_set_secret(text: &str) -> Option<(String, String)> {
     // - "set secret KEY=VALUE" (plain text; mainly for parity)
     let trimmed = text.trim();
     let lower = trimmed.to_ascii_lowercase();
-    let rest = if lower.starts_with("/setsecret ") {
-        trimmed[10..].trim() // len("/setsecret ") == 10
-    } else if lower.starts_with("set secret ") {
+    let rest = if lower.starts_with("/setsecret ") || lower.starts_with("set secret ") {
         trimmed[10..].trim() // len("set secret ") == 10
     } else {
         return None;
@@ -245,6 +239,23 @@ fn parse_set_secret(text: &str) -> Option<(String, String)> {
     Some((key.to_string(), value.to_string()))
 }
 
+fn parse_use_current_llm_key(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("/usecurrentkey ") {
+        let key = trimmed[15..].trim();
+        if key.is_empty()
+            || key.chars().any(|c| c.is_whitespace())
+            || key.contains('\n')
+            || key.contains('\r')
+        {
+            return None;
+        }
+        return Some(key.to_string());
+    }
+    crate::core::secrets::parse_use_current_llm_key_command(trimmed)
+}
+
 async fn store_secret_for_chat(agent: &SharedAgent, key: &str, value: &str) -> Result<(), String> {
     let (config_dir, data_dir) = {
         let a = agent.read().await;
@@ -260,6 +271,47 @@ async fn store_secret_for_chat(agent: &SharedAgent, key: &str, value: &str) -> R
     .await
     .map_err(|e| e.to_string())??;
     Ok(())
+}
+
+async fn link_current_llm_key_for_chat(agent: &SharedAgent, key: &str) -> Result<String, String> {
+    let llm_env = {
+        let a = agent.read().await;
+        a.config.llm.app_env_vars()
+    };
+    if let Some(value) = llm_env.get(key).cloned().filter(|v| !v.trim().is_empty()) {
+        store_secret_for_chat(agent, key, &value).await?;
+        return Ok(format!(
+            "Linked '{}' to the current model credential (stored encrypted).",
+            key
+        ));
+    }
+
+    let mut available_keys: Vec<String> = llm_env
+        .iter()
+        .filter_map(|(k, v)| {
+            if v.trim().is_empty() {
+                None
+            } else if k.ends_with("_API_KEY")
+                || k.ends_with("_BASE_URL")
+                || k == "LLM_MODEL"
+                || k == "LLM_PROVIDER"
+            {
+                Some(k.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    available_keys.sort();
+    let available = if available_keys.is_empty() {
+        "none".to_string()
+    } else {
+        available_keys.join(", ")
+    };
+    Err(format!(
+        "I can't map '{}' from current model settings. Available model-backed keys: {}. You can set it manually with: set secret {}=VALUE",
+        key, available, key
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -409,7 +461,7 @@ fn format_for_whatsapp(text: &str) -> String {
                     // Pass through entire code block unchanged.
                     result.push_str(&backticks);
                     let mut consecutive_backticks = 0;
-                    while let Some(ch) = chars.next() {
+                    for ch in chars.by_ref() {
                         result.push(ch);
                         if ch == '`' {
                             consecutive_backticks += 1;
@@ -892,6 +944,86 @@ pub async fn handle_webhook(agent: SharedAgent, body: &serde_json::Value) -> Res
         return Ok("ok".to_string());
     }
 
+    // Secret UX parity for chat channels: handle sensitive commands before LLM processing.
+    let can_store_secret = if !config.allowed_numbers.is_empty() {
+        config.allowed_numbers.iter().any(|n| n == from)
+    } else if config.dm_policy == "pairing" {
+        let approved_key = format!("whatsapp:approved:{}", from);
+        let agent_read = agent.read().await;
+        agent_read
+            .storage
+            .get(&approved_key)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+    } else {
+        false
+    };
+
+    if let Some((key, value)) = parse_set_secret(&text) {
+        if !can_store_secret {
+            send_reply(
+                &config,
+                from,
+                "Refusing to store secrets from this number. Pair/approve first (dm_policy=pairing) or add it to allowed_numbers in Settings.",
+            )
+            .await?;
+            return Ok("ok".to_string());
+        }
+        let reply = match store_secret_for_chat(&agent, &key, &value).await {
+            Ok(()) => {
+                let conversation_id = format!("whatsapp:{}", from);
+                let followup = {
+                    let a = agent.read().await;
+                    a.on_secret_saved_followup(&conversation_id).await
+                };
+                let mut response = format!(
+                    "Saved secret '{}' (stored encrypted). This value was not sent to the LLM.",
+                    key
+                );
+                if let Some(f) = followup {
+                    response.push_str("\n\n");
+                    response.push_str(&f);
+                }
+                response
+            }
+            Err(e) => format!("Failed to store secret: {}", e),
+        };
+        send_reply(&config, from, &reply).await?;
+        return Ok("ok".to_string());
+    }
+
+    if let Some(key) = parse_use_current_llm_key(&text) {
+        if !can_store_secret {
+            send_reply(
+                &config,
+                from,
+                "Refusing to store secrets from this number. Pair/approve first (dm_policy=pairing) or add it to allowed_numbers in Settings.",
+            )
+            .await?;
+            return Ok("ok".to_string());
+        }
+        let reply = match link_current_llm_key_for_chat(&agent, &key).await {
+            Ok(prefix) => {
+                let conversation_id = format!("whatsapp:{}", from);
+                let followup = {
+                    let a = agent.read().await;
+                    a.on_secret_saved_followup(&conversation_id).await
+                };
+                let mut response = prefix;
+                if let Some(f) = followup {
+                    response.push_str("\n\n");
+                    response.push_str(&f);
+                }
+                response
+            }
+            Err(e) => e,
+        };
+        send_reply(&config, from, &reply).await?;
+        return Ok("ok".to_string());
+    }
+
     // ---- Process via agent ----
     let response = {
         let agent_read = agent.read().await;
@@ -1072,6 +1204,7 @@ async fn handle_command(text: &str, agent: &SharedAgent, from: &str) -> String {
                  /help - Show this help message\n\
                  /status - Agent status\n\
                  /skills - List available skills\n\
+                 /run <skill> [query] - Run a custom/bundled skill\n\
                  /tasks - View pending tasks\n\
                  /search <query> - Web search\n\
                  /image <prompt> - Generate an image\n\
@@ -1133,6 +1266,30 @@ async fn handle_command(text: &str, agent: &SharedAgent, from: &str) -> String {
             }
         }
 
+        "/run" => {
+            let rest = args.trim();
+            if rest.is_empty() {
+                "Usage: /run <skill_name> [query]".to_string()
+            } else {
+                let mut parts = rest.splitn(2, char::is_whitespace);
+                let skill_name = parts.next().unwrap_or("").trim();
+                let query = parts.next().unwrap_or("").trim();
+                let prompt = if query.is_empty() {
+                    format!("run {}", skill_name)
+                } else {
+                    format!("run {} {}", skill_name, query)
+                };
+                let agent = agent.read().await;
+                match agent
+                    .process_message(&prompt, "whatsapp", Some(&conversation_id), None)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => format!("Error: {}", e),
+                }
+            }
+        }
+
         "/setsecret" => {
             // Security gate: only allow in "pairing" mode with approval or explicit allowlist.
             // Do not accept secrets in open mode.
@@ -1184,6 +1341,54 @@ async fn handle_command(text: &str, agent: &SharedAgent, from: &str) -> String {
                     response
                 }
                 Err(e) => format!("Failed to store secret: {}", e),
+            }
+        }
+        "/usecurrentkey" => {
+            let (cfg_opt, storage) = {
+                let a = agent.read().await;
+                (a.config.whatsapp.clone(), a.storage.clone())
+            };
+            let Some(cfg) = cfg_opt else {
+                return "WhatsApp channel not configured. Use the web UI instead.".to_string();
+            };
+
+            let allowlisted =
+                !cfg.allowed_numbers.is_empty() && cfg.allowed_numbers.iter().any(|n| n == from);
+            let approved = if cfg.dm_policy == "pairing" {
+                let key = format!("whatsapp:approved:{}", from);
+                storage.get(&key).await.ok().flatten().is_some()
+            } else {
+                false
+            };
+
+            if !allowlisted && !approved {
+                return "Refusing to store secrets from this number. Pair/approve first (dm_policy=pairing) or add it to allowed_numbers in Settings.".to_string();
+            }
+
+            if args.is_empty() {
+                return "Usage: /usecurrentkey KEY\nExample: /usecurrentkey OPENAI_API_KEY"
+                    .to_string();
+            }
+            let input = format!("/usecurrentkey {}", args);
+            let Some(key) = parse_use_current_llm_key(&input) else {
+                return "Invalid syntax. Use: /usecurrentkey KEY".to_string();
+            };
+
+            match link_current_llm_key_for_chat(agent, &key).await {
+                Ok(prefix) => {
+                    let conversation_id = format!("whatsapp:{}", from);
+                    let followup = {
+                        let a = agent.read().await;
+                        a.on_secret_saved_followup(&conversation_id).await
+                    };
+                    let mut response = prefix;
+                    if let Some(f) = followup {
+                        response.push_str("\n\n");
+                        response.push_str(&f);
+                    }
+                    response
+                }
+                Err(e) => e,
             }
         }
 

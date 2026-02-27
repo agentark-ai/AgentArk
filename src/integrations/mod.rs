@@ -28,10 +28,6 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-fn integration_enabled_key(id: &str) -> String {
-    format!("integration_enabled:{}", id)
-}
-
 fn parse_boolish(value: &str) -> Option<bool> {
     let v = value.trim().to_ascii_lowercase();
     if v.is_empty() {
@@ -223,6 +219,44 @@ impl IntegrationManager {
         self.integrations.keys().cloned().collect()
     }
 
+    fn enabled_overrides(&self) -> HashMap<String, bool> {
+        let mut enabled = HashMap::new();
+        let Ok(manager) = crate::core::config::SecureConfigManager::new(&self._config_dir) else {
+            return enabled;
+        };
+        let Ok(secrets) = manager.load_secrets() else {
+            return enabled;
+        };
+        for (key, value) in secrets.custom {
+            let Some(id) = key.strip_prefix("integration_enabled:") else {
+                continue;
+            };
+            if let Some(parsed) = parse_boolish(&value) {
+                enabled.insert(id.to_string(), parsed);
+            }
+        }
+        enabled
+    }
+
+    /// Returns true when an integration is enabled for agent dispatch.
+    /// Missing/invalid flags default to enabled (matching execute-time behavior).
+    pub fn is_enabled(&self, integration_id: &str) -> bool {
+        self.enabled_overrides()
+            .get(integration_id)
+            .copied()
+            .unwrap_or(true)
+    }
+
+    /// List integration IDs that are currently enabled for agent dispatch.
+    pub fn enabled_ids(&self) -> Vec<String> {
+        let overrides = self.enabled_overrides();
+        self.integrations
+            .keys()
+            .filter(|id| overrides.get(id.as_str()).copied().unwrap_or(true))
+            .cloned()
+            .collect()
+    }
+
     /// List all integrations with their status
     pub async fn list(&self) -> Vec<IntegrationInfo> {
         let mut result = Vec::new();
@@ -260,18 +294,11 @@ impl IntegrationManager {
         params: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         // Enforce user enable/disable toggle (stored in encrypted secrets).
-        if let Ok(manager) = crate::core::config::SecureConfigManager::new(&self._config_dir) {
-            if let Ok(Some(v)) = manager.get_custom_secret(&integration_enabled_key(integration_id))
-            {
-                if let Some(enabled) = parse_boolish(&v) {
-                    if !enabled {
-                        return Err(anyhow::anyhow!(
-                            "Integration '{}' is disabled",
-                            integration_id
-                        ));
-                    }
-                }
-            }
+        if !self.is_enabled(integration_id) {
+            return Err(anyhow::anyhow!(
+                "Integration '{}' is disabled",
+                integration_id
+            ));
         }
 
         let integration = self

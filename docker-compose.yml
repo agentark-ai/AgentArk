@@ -1,5 +1,5 @@
 # =============================================================================
-# AgentArk - AI Agent with Automatic Data Persistence
+# AgentArk - AI Agent
 # =============================================================================
 #
 # QUICK START:
@@ -33,8 +33,8 @@ services:
     volumes:
       # === PERSISTENT DATA VOLUMES ===
       # These volumes are managed by Docker and NEVER deleted on rebuild
-      - agentark-data:/app/data      # Database, memories, user skills
-      - agentark-config:/app/config  # Settings, identity keys, API keys
+      - agentark-data:/app/data # Database, memories, user skills
+      - agentark-config:/app/config # Settings, identity keys, API keys
       # No raw Docker socket mount — use docker-socket-proxy instead
     depends_on:
       - docker-socket-proxy
@@ -67,10 +67,10 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '2'
+          cpus: "2"
           memory: 2G
         reservations:
-          cpus: '0.5'
+          cpus: "0.5"
           memory: 512M
 
   # Docker socket proxy: restricts Docker API access to only container management
@@ -105,7 +105,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.5'
+          cpus: "0.5"
           memory: 128M
 
   # Optional: Ollama for local LLM
@@ -124,7 +124,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '4'
+          cpus: "4"
           memory: 8G
 
   # Optional: SearXNG for private search

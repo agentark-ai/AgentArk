@@ -18,11 +18,7 @@ enum TunnelControlCommand {
 }
 
 fn parse_tunnel_command(text: &str) -> Option<TunnelControlCommand> {
-    let normalized = text
-        .trim()
-        .to_ascii_lowercase()
-        .replace('_', " ")
-        .replace('-', " ");
+    let normalized = text.trim().to_ascii_lowercase().replace(['_', '-'], " ");
     let compact = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
     match compact.as_str() {
         "start tunnel" | "/tunnel start" | "/start_tunnel" => Some(TunnelControlCommand::Start),
@@ -137,9 +133,7 @@ fn parse_set_secret(text: &str) -> Option<(String, String)> {
     // - "set secret KEY=VALUE" (plain text)
     let trimmed = text.trim();
     let lower = trimmed.to_ascii_lowercase();
-    let rest = if lower.starts_with("/setsecret ") {
-        trimmed[10..].trim() // len("/setsecret ") == 10
-    } else if lower.starts_with("set secret ") {
+    let rest = if lower.starts_with("/setsecret ") || lower.starts_with("set secret ") {
         trimmed[10..].trim() // len("set secret ") == 10
     } else {
         return None;
@@ -169,6 +163,23 @@ fn parse_set_secret(text: &str) -> Option<(String, String)> {
     Some((key.to_string(), value.to_string()))
 }
 
+fn parse_use_current_llm_key(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("/usecurrentkey ") {
+        let key = trimmed[15..].trim();
+        if key.is_empty()
+            || key.chars().any(|c| c.is_whitespace())
+            || key.contains('\n')
+            || key.contains('\r')
+        {
+            return None;
+        }
+        return Some(key.to_string());
+    }
+    crate::core::secrets::parse_use_current_llm_key_command(trimmed)
+}
+
 async fn store_secret_for_chat(agent: &SharedAgent, key: &str, value: &str) -> Result<(), String> {
     let (config_dir, data_dir) = {
         let a = agent.read().await;
@@ -184,6 +195,47 @@ async fn store_secret_for_chat(agent: &SharedAgent, key: &str, value: &str) -> R
     .await
     .map_err(|e| e.to_string())??;
     Ok(())
+}
+
+async fn link_current_llm_key_for_chat(agent: &SharedAgent, key: &str) -> Result<String, String> {
+    let llm_env = {
+        let a = agent.read().await;
+        a.config.llm.app_env_vars()
+    };
+    if let Some(value) = llm_env.get(key).cloned().filter(|v| !v.trim().is_empty()) {
+        store_secret_for_chat(agent, key, &value).await?;
+        return Ok(format!(
+            "Linked '{}' to the current model credential (stored encrypted).",
+            key
+        ));
+    }
+
+    let mut available_keys: Vec<String> = llm_env
+        .iter()
+        .filter_map(|(k, v)| {
+            if v.trim().is_empty() {
+                None
+            } else if k.ends_with("_API_KEY")
+                || k.ends_with("_BASE_URL")
+                || k == "LLM_MODEL"
+                || k == "LLM_PROVIDER"
+            {
+                Some(k.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    available_keys.sort();
+    let available = if available_keys.is_empty() {
+        "none".to_string()
+    } else {
+        available_keys.join(", ")
+    };
+    Err(format!(
+        "I can't map '{}' from current model settings. Available model-backed keys: {}. You can set it manually with: set secret {}=VALUE",
+        key, available, key
+    ))
 }
 
 /// Split a message into chunks for Telegram (max 4096 chars)
@@ -531,7 +583,10 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
                 if text.starts_with('/') {
                     // Store secrets without engaging the LLM. Only allow in private chats and only
                     // when an allowlist is configured (otherwise the bot could be public).
-                    if text.to_ascii_lowercase().starts_with("/setsecret") {
+                    let lower_text = text.to_ascii_lowercase();
+                    if lower_text.starts_with("/setsecret")
+                        || lower_text.starts_with("/usecurrentkey")
+                    {
                         let allow_set_secret = {
                             let a = agent.read().await;
                             a.config
@@ -567,8 +622,24 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
                                 }
                                 Err(e) => format!("Failed to store secret: {}", e),
                             }
+                        } else if let Some(key) = parse_use_current_llm_key(text) {
+                            match link_current_llm_key_for_chat(&agent, &key).await {
+                                Ok(prefix) => {
+                                    let followup = {
+                                        let a = agent.read().await;
+                                        a.on_secret_saved_followup(&conversation_id).await
+                                    };
+                                    let mut response = prefix;
+                                    if let Some(f) = followup {
+                                        response.push_str("\n\n");
+                                        response.push_str(&f);
+                                    }
+                                    response
+                                }
+                                Err(e) => e,
+                            }
                         } else {
-                            "Usage: /setsecret KEY=VALUE\nExample: /setsecret OPENAI_API_KEY=sk-..."
+                            "Usage:\n/setsecret KEY=VALUE\nExample: /setsecret OPENAI_API_KEY=sk-...\n\nOr reuse your configured model key:\nuse current llm key for OPENAI_API_KEY"
                                 .to_string()
                         };
 
@@ -589,10 +660,7 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
                             .map(|c| !c.allowed_users.is_empty())
                             .unwrap_or(false)
                     };
-                    if msg.chat.is_private()
-                        && allow_set_secret
-                        && text.to_ascii_lowercase().starts_with("set secret ")
-                    {
+                    if msg.chat.is_private() && allow_set_secret {
                         if let Some((key, value)) = parse_set_secret(text) {
                             let conversation_id = format!("telegram:{}", chat_id.0);
                             let reply = match store_secret_for_chat(&agent, &key, &value).await {
@@ -612,6 +680,26 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
                                     response
                                 }
                                 Err(e) => format!("Failed to store secret: {}", e),
+                            };
+                            bot.send_message(chat_id, reply).await?;
+                            return Ok(());
+                        }
+                        if let Some(key) = parse_use_current_llm_key(text) {
+                            let conversation_id = format!("telegram:{}", chat_id.0);
+                            let reply = match link_current_llm_key_for_chat(&agent, &key).await {
+                                Ok(prefix) => {
+                                    let followup = {
+                                        let a = agent.read().await;
+                                        a.on_secret_saved_followup(&conversation_id).await
+                                    };
+                                    let mut response = prefix;
+                                    if let Some(f) = followup {
+                                        response.push_str("\n\n");
+                                        response.push_str(&f);
+                                    }
+                                    response
+                                }
+                                Err(e) => e,
                             };
                             bot.send_message(chat_id, reply).await?;
                             return Ok(());
@@ -773,6 +861,7 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
                 /model <name> - Switch model\n\
                 /settings - View settings\n\
                 /tunnel [start|stop|status] - Manage public UI tunnel\n\
+                /run <skill> [query] - Run a custom/bundled skill\n\
                 /setsecret KEY=VALUE - Store a secret encrypted (private + allowlisted only)\n\
                 /clear - Clear conversation history\n\n\
                 Or just chat with me!",
@@ -1115,22 +1204,25 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
         }
 
         cmd if cmd.starts_with("/run ") => {
-            let action_name = args;
-            if action_name.is_empty() {
-                "Usage: /run <skill_name>".to_string()
+            let rest = args.trim();
+            if rest.is_empty() {
+                "Usage: /run <skill_name> [query]".to_string()
             } else {
-                let agent = agent.read().await;
-                let actions = agent.runtime.list_actions().await.unwrap_or_default();
-                if actions.iter().any(|s| s.name == action_name) {
-                    format!(
-                        "Running skill: {}\n\nSend your query for this skill.",
-                        action_name
-                    )
+                let mut parts = rest.splitn(2, char::is_whitespace);
+                let skill_name = parts.next().unwrap_or("").trim();
+                let query = parts.next().unwrap_or("").trim();
+                let prompt = if query.is_empty() {
+                    format!("run {}", skill_name)
                 } else {
-                    format!(
-                        "Skill '{}' not found. Use /skills to see available.",
-                        action_name
-                    )
+                    format!("run {} {}", skill_name, query)
+                };
+                let agent = agent.read().await;
+                match agent
+                    .process_message(&prompt, "telegram", Some(&conversation_id), None)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => format!("❌ Error: {}", e),
                 }
             }
         }

@@ -509,11 +509,12 @@ impl AgentArkApp {
             ui.horizontal(|ui| {
                 ui.strong("Specialist Agents");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if !self.show_add_agent_form && self.editing_agent_index.is_none() {
-                        if ui.button("+ Add Specialist Agent").clicked() {
-                            self.agent_form = AgentFormState::default();
-                            self.show_add_agent_form = true;
-                        }
+                    if !self.show_add_agent_form
+                        && self.editing_agent_index.is_none()
+                        && ui.button("+ Add Specialist Agent").clicked()
+                    {
+                        self.agent_form = AgentFormState::default();
+                        self.show_add_agent_form = true;
                     }
                 });
             });

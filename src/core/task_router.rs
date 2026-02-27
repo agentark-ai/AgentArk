@@ -160,6 +160,19 @@ pub struct TaskRouter {
     config: TaskRouterConfig,
 }
 
+type SpecialistRegistry = Arc<RwLock<HashMap<super::swarm::AgentId, Arc<SpecialistAgent>>>>;
+
+pub struct TaskRouterExecuteContext<'a> {
+    pub message: &'a str,
+    pub system_prompt: &'a str,
+    pub model_pool: &'a HashMap<String, (ModelSlot, LlmClient)>,
+    pub primary_llm: &'a LlmClient,
+    pub specialists: &'a Option<SpecialistRegistry>,
+    pub memories: &'a [MemoryEntry],
+    pub actions: &'a [ActionDef],
+    pub trace: &'a Arc<RwLock<super::agent::ExecutionTrace>>,
+}
+
 impl TaskRouter {
     pub fn new(config: TaskRouterConfig) -> Self {
         Self { config }
@@ -169,15 +182,16 @@ impl TaskRouter {
     pub async fn execute(
         &self,
         decision: &RoutingDecision,
-        message: &str,
-        system_prompt: &str,
-        model_pool: &HashMap<String, (ModelSlot, LlmClient)>,
-        primary_llm: &LlmClient,
-        specialists: &Option<Arc<RwLock<HashMap<super::swarm::AgentId, Arc<SpecialistAgent>>>>>,
-        memories: &[MemoryEntry],
-        actions: &[ActionDef],
-        trace: &Arc<RwLock<super::agent::ExecutionTrace>>,
+        ctx: TaskRouterExecuteContext<'_>,
     ) -> Result<TaskRouterResult> {
+        let message = ctx.message;
+        let system_prompt = ctx.system_prompt;
+        let model_pool = ctx.model_pool;
+        let primary_llm = ctx.primary_llm;
+        let specialists = ctx.specialists;
+        let memories = ctx.memories;
+        let actions = ctx.actions;
+        let trace = ctx.trace;
         // Simple queries — no delegation
         if !decision.needs_delegation {
             return match decision.complexity {
@@ -379,10 +393,10 @@ impl TaskRouter {
             };
 
             let total = score + type_bonus;
-            if total > self.config.specialist_threshold {
-                if best.as_ref().map_or(true, |(s, _, _)| total > *s) {
-                    best = Some((total, specialist.config().name.clone(), specialist.clone()));
-                }
+            if total > self.config.specialist_threshold
+                && best.as_ref().is_none_or(|(s, _, _)| total > *s)
+            {
+                best = Some((total, specialist.config().name.clone(), specialist.clone()));
             }
         }
 
@@ -399,7 +413,7 @@ impl TaskRouter {
     ) -> LlmClient {
         // 1. Try explicit preferred role from routing decision
         if let Some(role) = spec.resolve_model_role() {
-            for (_, (slot, client)) in model_pool {
+            for (slot, client) in model_pool.values() {
                 if slot.role == role && slot.enabled {
                     return client.clone();
                 }
@@ -413,7 +427,7 @@ impl TaskRouter {
             _ => ModelRole::Primary,
         };
 
-        for (_, (slot, client)) in model_pool {
+        for (slot, client) in model_pool.values() {
             if slot.role == auto_role && slot.enabled {
                 return client.clone();
             }

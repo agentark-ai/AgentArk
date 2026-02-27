@@ -4,6 +4,9 @@ import {
   Badge,
   Box,
   Button,
+  Dialog,
+  DialogContent,
+  DialogTitle,
   Drawer,
   Divider,
   IconButton,
@@ -31,7 +34,9 @@ import FolderRoundedIcon from "@mui/icons-material/FolderRounded";
 import HubRoundedIcon from "@mui/icons-material/HubRounded";
 import MonitorHeartRoundedIcon from "@mui/icons-material/MonitorHeartRounded";
 import SpaceDashboardRoundedIcon from "@mui/icons-material/SpaceDashboardRounded";
+import QueryStatsRoundedIcon from "@mui/icons-material/QueryStatsRounded";
 import SettingsRoundedIcon from "@mui/icons-material/SettingsRounded";
+import CloseRoundedIcon from "@mui/icons-material/CloseRounded";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./api/client";
@@ -43,6 +48,7 @@ import { useUiStore } from "./store/uiStore";
 const REFRESH_MS = 8000;
 const PING_STALE_MS = 30_000;
 const SIDEBAR_COLLAPSED_KEY = "agentark.sidebar.collapsed";
+const NOTIFICATIONS_MUTE_UNTIL_KEY = "agentark.notifications.mute_until_v1";
 
 type ViewKey =
   | "overview"
@@ -58,16 +64,39 @@ type ViewKey =
   | "swarm"
   | "projects"
   | "documents"
+  | "analytics"
   | "settings";
 
-const NAV_ITEMS: Array<{ key: ViewKey; label: string; icon: ReactNode }> = [
-  { key: "overview", label: "Mission Control", icon: <SpaceDashboardRoundedIcon fontSize="small" /> },
-  { key: "chat", label: "Chat", icon: <ChatRoundedIcon fontSize="small" /> },
-  { key: "skills", label: "Skills", icon: <BoltRoundedIcon fontSize="small" /> },
-  { key: "apps", label: "Apps", icon: <AppsRoundedIcon fontSize="small" /> },
-  { key: "goals", label: "Goals", icon: <FlagRoundedIcon fontSize="small" /> },
-  { key: "autonomy", label: "Autonomy", icon: <AutoAwesomeRoundedIcon fontSize="small" /> },
-  { key: "documents", label: "Documents", icon: <DescriptionRoundedIcon fontSize="small" /> },
+type NavItem = { key: ViewKey; label: string; icon: ReactNode };
+type NavGroup = { id: string; label: string; items: NavItem[] };
+
+const NAV_GROUPS: NavGroup[] = [
+  {
+    id: "core",
+    label: "Core",
+    items: [
+      { key: "overview", label: "Mission Control", icon: <SpaceDashboardRoundedIcon fontSize="small" /> },
+      { key: "chat", label: "Chat", icon: <ChatRoundedIcon fontSize="small" /> }
+    ]
+  },
+  {
+    id: "agent",
+    label: "Agent",
+    items: [
+      { key: "skills", label: "Skills", icon: <BoltRoundedIcon fontSize="small" /> },
+      { key: "apps", label: "Apps", icon: <AppsRoundedIcon fontSize="small" /> },
+      { key: "goals", label: "Goals", icon: <FlagRoundedIcon fontSize="small" /> },
+      { key: "autonomy", label: "Autonomy", icon: <AutoAwesomeRoundedIcon fontSize="small" /> }
+    ]
+  },
+  {
+    id: "data",
+    label: "Data",
+    items: [
+      { key: "documents", label: "Documents", icon: <DescriptionRoundedIcon fontSize="small" /> },
+      { key: "analytics", label: "Analytics", icon: <QueryStatsRoundedIcon fontSize="small" /> }
+    ]
+  }
   // { key: "swarm", label: "Swarm", icon: <HubRoundedIcon fontSize="small" /> },
   // { key: "status", label: "Status", icon: <MonitorHeartRoundedIcon fontSize="small" /> },
 ];
@@ -86,6 +115,7 @@ const VIEW_PATH_SEGMENTS: Record<ViewKey, string> = {
   swarm: "swarm",
   projects: "projects",
   documents: "documents",
+  analytics: "analytics",
   settings: "settings"
 };
 
@@ -184,6 +214,7 @@ export default function App() {
   const openNotification = useUiStore((s) => s.openNotification);
   const closeNotification = useUiStore((s) => s.closeNotification);
   const [view, setViewState] = useState<ViewKey>(() => resolveViewFromPath(window.location.pathname).view);
+  const [lastNonSettingsView, setLastNonSettingsView] = useState<ViewKey>("overview");
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
     try {
       return window.localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1";
@@ -212,6 +243,16 @@ export default function App() {
   const [notifAnchorEl, setNotifAnchorEl] = useState<HTMLElement | null>(null);
   const notifListOpen = Boolean(notifAnchorEl);
   const [notifFilter, setNotifFilter] = useState<"all" | "unread" | "errors" | "automation_failures">("all");
+  const [notificationControlNotice, setNotificationControlNotice] = useState<string | null>(null);
+  const [notificationsMuteUntilMs, setNotificationsMuteUntilMs] = useState<number>(() => {
+    try {
+      const raw = window.localStorage.getItem(NOTIFICATIONS_MUTE_UNTIL_KEY);
+      const parsed = raw ? Number(raw) : Number.NaN;
+      return Number.isFinite(parsed) ? parsed : 0;
+    } catch {
+      return 0;
+    }
+  });
 
   const navigateToView = (nextView: ViewKey, replace = false) => {
     const nextPath = viewPath(nextView);
@@ -254,6 +295,12 @@ export default function App() {
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
   }, []);
+
+  useEffect(() => {
+    if (view !== "settings") {
+      setLastNonSettingsView(view);
+    }
+  }, [view]);
 
   useEffect(() => {
     try {
@@ -310,6 +357,7 @@ export default function App() {
     }
     return notifications.filter((n) => isAutomationFailureNotification(n));
   }, [notifications, notifFilter]);
+  const notificationsMuted = notificationsMuteUntilMs > Date.now();
   let selectedNotification: (typeof notifications)[number] | null = null;
   for (const n of notifications) {
     if (n.id === selectedNotificationId) {
@@ -317,6 +365,27 @@ export default function App() {
       break;
     }
   }
+
+  useEffect(() => {
+    try {
+      if (notificationsMuteUntilMs > Date.now()) {
+        window.localStorage.setItem(
+          NOTIFICATIONS_MUTE_UNTIL_KEY,
+          String(notificationsMuteUntilMs)
+        );
+      } else {
+        window.localStorage.removeItem(NOTIFICATIONS_MUTE_UNTIL_KEY);
+      }
+    } catch {
+      // ignore storage failures
+    }
+  }, [notificationsMuteUntilMs]);
+
+  useEffect(() => {
+    if (!notificationControlNotice) return;
+    const t = window.setTimeout(() => setNotificationControlNotice(null), 3500);
+    return () => window.clearTimeout(t);
+  }, [notificationControlNotice]);
 
   const now = Date.now();
   const lastPingAt = serverQ.data?.at ?? 0;
@@ -382,14 +451,50 @@ export default function App() {
     }
   });
 
+  const notificationControlMutation = useMutation({
+    mutationFn: async (command: "stop notifications" | "resume notifications") => {
+      const out = await api.chat({ message: command, channel: "web" });
+      const rec = out as unknown as Record<string, unknown>;
+      const text =
+        (typeof rec.response === "string" ? rec.response : "") ||
+        (typeof rec.message === "string" ? rec.message : "");
+      return { text: text.trim(), command };
+    },
+    onSuccess: async ({ text, command }) => {
+      if (command === "stop notifications") {
+        setNotificationsMuteUntilMs(Date.now() + 24 * 60 * 60 * 1000);
+      } else {
+        setNotificationsMuteUntilMs(0);
+      }
+      setNotificationControlNotice(
+        text || (command === "stop notifications" ? "Alerts paused for 24h." : "Alerts resumed.")
+      );
+      await queryClient.invalidateQueries({ queryKey: ["notifications"] });
+      await queryClient.invalidateQueries({ queryKey: ["notifications-count"] });
+      await queryClient.invalidateQueries({ queryKey: ["autonomy-unread-notifications"] });
+    },
+    onError: (err) => {
+      setNotificationControlNotice(
+        `Alert setting failed: ${err instanceof Error ? err.message : "unknown error"}`
+      );
+    }
+  });
+
+  const closeSettingsModal = () => {
+    const fallback = lastNonSettingsView === "settings" ? "overview" : lastNonSettingsView;
+    navigateToView(fallback, true);
+  };
+
+  const activeView: ViewKey = view === "settings" ? lastNonSettingsView : view;
+
   return (
       <Box className="agi-shell">
         <Box className="bg-orb orb-a" />
         <Box className="bg-orb orb-b" />
       <AppBar position="sticky" elevation={0} color="transparent" className="glass-appbar">
-        <Toolbar>
+        <Toolbar sx={{ minHeight: "var(--appbar-height)", px: 1.25 }}>
           <Stack direction="row" alignItems="center" spacing={0.75} sx={{ flexGrow: 1 }}>
-            <img src="/logo.svg" alt="AgentArk" width={54} height={54} />
+            <img src="/logo.svg" alt="AgentArk" width={42} height={42} />
             <Typography variant="h6">AgentArk Console</Typography>
             <Tooltip title={serverTooltip} arrow>
               <Box
@@ -455,33 +560,45 @@ export default function App() {
             </Tooltip>
           </Stack>
           <List dense>
-            {NAV_ITEMS.map((item) => (
-              <Tooltip
-                key={item.key}
-                title={item.label}
-                placement="right"
-                disableHoverListener={!sidebarCollapsed}
-              >
-                <ListItemButton
-                  selected={view === item.key}
-                  onClick={() => navigateToView(item.key)}
-                  className={`nav-item${sidebarCollapsed ? " collapsed" : ""}`}
-                  data-tour-target={`nav-${item.key}`}
-                >
-                  <ListItemIcon className="nav-item-icon">{item.icon}</ListItemIcon>
-                  <ListItemText
-                    className={`nav-item-text${sidebarCollapsed ? " collapsed" : ""}`}
-                    primary={item.label}
-                    primaryTypographyProps={{ noWrap: true }}
-                  />
-                </ListItemButton>
-              </Tooltip>
+            {NAV_GROUPS.map((group, groupIdx) => (
+              <Box key={group.id} className="nav-group">
+                {!sidebarCollapsed ? (
+                  <Typography variant="overline" className="nav-group-label">
+                    {group.label}
+                  </Typography>
+                ) : null}
+                {group.items.map((item) => (
+                  <Tooltip
+                    key={item.key}
+                    title={item.label}
+                    placement="right"
+                    disableHoverListener={!sidebarCollapsed}
+                  >
+                    <ListItemButton
+                      selected={view === item.key}
+                      onClick={() => navigateToView(item.key)}
+                      className={`nav-item${sidebarCollapsed ? " collapsed" : ""}`}
+                      data-tour-target={`nav-${item.key}`}
+                    >
+                      <ListItemIcon className="nav-item-icon">{item.icon}</ListItemIcon>
+                      <ListItemText
+                        className={`nav-item-text${sidebarCollapsed ? " collapsed" : ""}`}
+                        primary={item.label}
+                        primaryTypographyProps={{ noWrap: true }}
+                      />
+                    </ListItemButton>
+                  </Tooltip>
+                ))}
+                {groupIdx < NAV_GROUPS.length - 1 ? (
+                  <Divider className="nav-group-divider" />
+                ) : null}
+              </Box>
             ))}
           </List>
         </Box>
 
-          <Box className="main-pane">
-            {view === "overview" ? (
+        <Box className="main-pane">
+            {activeView === "overview" ? (
               <OverviewPane
                 navigateToView={navigateToView as (view: string, replace?: boolean) => void}
                 serverStatus={serverQ.data}
@@ -490,13 +607,53 @@ export default function App() {
               />
             ) : (
             <NativeWorkspace
-              view={view as Exclude<ViewKey, "overview">}
+              view={activeView as Exclude<ViewKey, "overview">}
               autoRefresh={autoRefresh}
               showAdvanced={showAdvanced}
             />
           )}
         </Box>
       </Box>
+
+      <Dialog
+        open={view === "settings"}
+        onClose={closeSettingsModal}
+        fullWidth
+        maxWidth={false}
+        PaperProps={{
+          sx: {
+            width: { xs: "96vw", md: "82vw", lg: 1120 },
+            maxWidth: 1120,
+            height: { xs: "92vh", md: "84vh" },
+            maxHeight: "92vh",
+            borderRadius: 3,
+            border: "1px solid rgba(108, 156, 212, 0.16)",
+            background: "linear-gradient(160deg, rgba(9, 21, 39, 0.96), rgba(9, 21, 39, 0.78))",
+            backdropFilter: "blur(18px)",
+            WebkitBackdropFilter: "blur(18px)",
+            overflow: "hidden"
+          }
+        }}
+      >
+        <DialogTitle
+          sx={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            py: 1.2,
+            px: 2,
+            borderBottom: "1px solid rgba(108, 156, 212, 0.16)"
+          }}
+        >
+          <Typography variant="h6">Settings</Typography>
+          <IconButton size="small" onClick={closeSettingsModal} aria-label="Close settings">
+            <CloseRoundedIcon fontSize="small" />
+          </IconButton>
+        </DialogTitle>
+        <DialogContent sx={{ p: 0, height: "100%", overflow: "hidden" }}>
+          <NativeWorkspace view="settings" autoRefresh={autoRefresh} showAdvanced={showAdvanced} />
+        </DialogContent>
+      </Dialog>
 
       <Popover
         open={notifListOpen}
@@ -540,6 +697,33 @@ export default function App() {
               Mark all read
             </Button>
           </Stack>
+          <Stack direction="row" spacing={0.75} sx={{ mt: 0.75, flexWrap: "wrap" }} useFlexGap>
+            <Button
+              size="small"
+              variant={notificationsMuted ? "contained" : "outlined"}
+              disabled={notificationControlMutation.isPending}
+              onClick={() => notificationControlMutation.mutate("stop notifications")}
+            >
+              Snooze 24h
+            </Button>
+            <Button
+              size="small"
+              variant={!notificationsMuted ? "contained" : "outlined"}
+              disabled={notificationControlMutation.isPending}
+              onClick={() => notificationControlMutation.mutate("resume notifications")}
+            >
+              Resume
+            </Button>
+          </Stack>
+          {notificationControlNotice ? (
+            <Typography variant="caption" sx={{ display: "block", mt: 0.6, color: "rgba(195, 221, 252, 0.7)" }}>
+              {notificationControlNotice}
+            </Typography>
+          ) : notificationsMuted ? (
+            <Typography variant="caption" sx={{ display: "block", mt: 0.6, color: "rgba(195, 221, 252, 0.7)" }}>
+              Notifications paused until {new Date(notificationsMuteUntilMs).toLocaleString()}
+            </Typography>
+          ) : null}
           <Stack direction="row" spacing={0.75} sx={{ mt: 0.75, flexWrap: "wrap" }} useFlexGap>
             <Button
               size="small"

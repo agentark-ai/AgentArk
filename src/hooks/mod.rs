@@ -213,7 +213,10 @@ impl HookManager {
                         (0, Some("Webhook URL is missing".to_string()))
                     }
                 } else {
-                    (0, Some(format!("Unsupported hook type: {}", hook_copy.hook_type)))
+                    (
+                        0,
+                        Some(format!("Unsupported hook type: {}", hook_copy.hook_type)),
+                    )
                 };
 
                 let status = if error.is_some() { "failed" } else { "success" };

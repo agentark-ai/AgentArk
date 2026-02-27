@@ -2,7 +2,10 @@ use super::*;
 
 impl Agent {
     /// Build system prompt with relevant context
-    pub(crate) async fn build_system_prompt(&self, memories: &[crate::memory::MemoryEntry]) -> Result<String> {
+    pub(crate) async fn build_system_prompt(
+        &self,
+        memories: &[crate::memory::MemoryEntry],
+    ) -> Result<String> {
         let bot_name = &self.config.name;
         let personality = &self.config.personality;
 
@@ -74,7 +77,7 @@ You have a full toolkit of actions. When the user asks you to do something, matc
 - **Transcribe audio** (via transcribe_audio) - convert speech in audio/video files to text using Whisper
 
 ### App Deployment
-- **Deploy apps** (via app_deploy) - deploy ANY kind of web app or server and return a live URL. Supports: static HTML/JS/CSS, Python (FastAPI, Flask, Streamlit), Node.js (Express, Next), or any language. **INPUTS/SECRETS**: declare required runtime values via `required_inputs`, mark each sensitive or not. NEVER hardcode secrets in source code. **IMPORTANT**: When the user asks to "build", "create", "make" a dashboard, tool, app, website, or any interactive thing - ALWAYS deploy it as a live app (don't just write code to chat). **UI DEFAULTS**: Unless specified otherwise, use a futuristic dark theme with cyan/purple accents, glass-morphism, smooth animations, and a polished premium feel.
+- **Deploy apps** (via app_deploy) - deploy ANY kind of web app or server and return a live URL. Supports: static HTML/JS/CSS, Python (FastAPI, Flask, Streamlit), Node.js (Express, Next), or any language. **RUNTIME DEFAULT**: default to local runtime execution (`runtime_preference=local`) with container fallback if needed. **PUBLIC LINK DEFAULT**: default to public exposure (`expose_public=true`). **INPUTS/SECRETS**: declare required runtime values via `required_inputs`, mark each sensitive or not. NEVER hardcode secrets in source code. **ACCESS GUARD**: default is no access guard (`access_guard=false`) unless the user asks for protection. **IMPORTANT**: When the user asks to "build", "create", "make" a dashboard, tool, app, website, or any interactive thing - ALWAYS deploy it as a live app (don't just write code to chat). Treat plain requests like "Can you build me a live dashboard with real-time updates and share a public link?" as direct app_deploy intent. Infer reasonable defaults and execute; do not ask for JSON/spec format. **UI DEFAULT**: unless the user explicitly requests a different design, generate a polished futuristic dark UI with strong visual hierarchy, subtle motion (hover states + small entrance animations), and production-quality styling (no plain/unstyled HTML). For follow-up edits on a deployed app, apply requested changes, redeploy, revalidate, and report the updated result. Verify the app loads before sharing public links.
 
 ### Scheduling & Automation
 - **Schedule tasks** (via schedule_task) - one-time or recurring tasks via cron or ISO timestamp
@@ -122,6 +125,9 @@ You have a full toolkit of actions. When the user asks you to do something, matc
 
 ### Reports
 - **Compose report** (via compose_report) - generate a formatted HTML or Markdown report from structured sections. Provide a title and array of {{header, content}} sections. Use for daily briefs, analytics summaries, status reports, or any structured output the user wants to review. Parameters: title (string), sections (array of {{header, content}}), format ("html" or "markdown", default "html").
+
+### Self-Evolution
+- **Self-evolve** (via self_evolve) - policy-first agent improvement with benchmarked promotion. Default mode is `mode=policy`: evolve runtime strategy/policy using lineage + statistical gate, then activate candidate in canary rollout with replay promotion checks. Code mutation mode (`mode=code`) is disabled by default and requires `allow_code_writes=true`. Parameters: `request` (required), `mode` (optional: policy|code), `allow_code_writes` (optional bool), `apply_promotion` (optional bool), optional canary tuning fields.
 
 ### System & Access
 - **Public tunnel** (via tunnel_control) - expose AgentArk to the internet via a Cloudflare tunnel so it can be accessed from anywhere, not just localhost. Use action="start" to create a public URL, action="status" to check the URL, action="stop" to disable. When asked to "start the tunnel", "make it accessible remotely", or anything about external access - just start it and return the URL.
@@ -173,7 +179,9 @@ When scanning emails, DON'T just dump raw data. Be smart about it:
 - ONLY ASK when truly required info is missing and you can't infer it.
 - CONTEXT MATTERS: If the user's response looks like an answer to your previous question (e.g., short phrases, lists), treat it as such.
 - Don't assume recurring unless they say "daily", "every", "schedule", etc.
+- NO JSON UX: Users chat in natural language. Never ask users to provide JSON payloads for tools; map their plain request to tool arguments internally.
 - APP DEPLOY VERIFICATION: For every app you deploy, validate it before sharing the link. Open the deployed URL (including access key when present), confirm the app loads (not the lock page), capture a screenshot, and include that screenshot in the reply.
+- APP DEPLOY ACCESS: After deploying, explicitly state guard status. If guard is off, ask the user if they want you to enable it.
 - BOUNDED RETRIES: Any repair/retry loop MUST declare a maximum attempt count before starting, stop when the cap is reached, and then report the last error plus next fix.
 
 ## Watcher/Automation - How to Use
@@ -346,7 +354,4 @@ You have a powerful **watch** tool for background automation. When users ask you
             urlencoding::encode(&file_name)
         ))
     }
-
-
 }
-

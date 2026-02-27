@@ -13,10 +13,11 @@ pub mod parallel;
 pub mod pipeline;
 pub mod prompt_policy;
 pub mod secrets;
+pub mod self_evolve;
 pub mod swarm;
 mod task;
-mod tool_handlers;
 pub mod task_router;
+mod tool_handlers;
 pub mod watcher;
 
 pub use agent::{

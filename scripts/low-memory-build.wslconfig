@@ -1,0 +1,16 @@
+# AgentArk - Low-Memory Build Configuration for Docker Desktop (WSL2)
+#
+# If your PC has limited RAM or you want Docker to use minimal resources,
+# copy this file to your home directory:
+#
+#   Windows:  copy scripts\low-memory-build.wslconfig %USERPROFILE%\.wslconfig
+#   Then:     wsl --shutdown
+#   Then:     Reopen Docker Desktop
+#
+# This limits the entire Docker/WSL2 VM, not just AgentArk.
+# Delete %USERPROFILE%\.wslconfig to restore full resources.
+
+[wsl2]
+memory=2GB
+processors=2
+swap=4GB

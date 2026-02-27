@@ -26,6 +26,87 @@ pub enum LlmProvider {
     },
 }
 
+fn is_codex_cli_base_url(base_url: Option<&str>) -> bool {
+    base_url
+        .map(|v| v.trim().eq_ignore_ascii_case("codex://cli"))
+        .unwrap_or(false)
+}
+
+fn effective_openai_base_url(base_url: Option<&str>) -> &str {
+    match base_url {
+        Some(url) if is_codex_cli_base_url(Some(url)) => "https://api.openai.com/v1",
+        Some(url) => url,
+        None => "https://api.openai.com/v1",
+    }
+}
+
+fn openai_provider_label(base_url: Option<&str>) -> &'static str {
+    if is_codex_cli_base_url(base_url) {
+        "openai-subscription"
+    } else if base_url.unwrap_or("").is_empty() {
+        "openai"
+    } else {
+        "openai-compatible"
+    }
+}
+
+/// Normalize tool JSON Schema for OpenAI-compatible function calling.
+/// OpenAI requires `items` to be present for every array schema.
+fn normalize_openai_tool_schema(schema: &serde_json::Value) -> serde_json::Value {
+    let mut normalized = if schema.is_object() {
+        schema.clone()
+    } else {
+        serde_json::json!({
+            "type": "object",
+            "properties": {}
+        })
+    };
+    normalize_openai_tool_schema_in_place(&mut normalized);
+    normalized
+}
+
+fn normalize_openai_tool_schema_in_place(node: &mut serde_json::Value) {
+    match node {
+        serde_json::Value::Object(map) => {
+            if map.get("type").and_then(|v| v.as_str()) == Some("array")
+                && !map.contains_key("items")
+            {
+                map.insert("items".to_string(), serde_json::json!({}));
+            }
+
+            if let Some(props) = map.get_mut("properties").and_then(|v| v.as_object_mut()) {
+                for (_name, child) in props.iter_mut() {
+                    normalize_openai_tool_schema_in_place(child);
+                }
+            }
+            if let Some(items) = map.get_mut("items") {
+                normalize_openai_tool_schema_in_place(items);
+            }
+            if let Some(additional) = map.get_mut("additionalProperties") {
+                normalize_openai_tool_schema_in_place(additional);
+            }
+            if let Some(defs) = map.get_mut("$defs").and_then(|v| v.as_object_mut()) {
+                for (_name, child) in defs.iter_mut() {
+                    normalize_openai_tool_schema_in_place(child);
+                }
+            }
+            for key in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+                if let Some(arr) = map.get_mut(key).and_then(|v| v.as_array_mut()) {
+                    for child in arr.iter_mut() {
+                        normalize_openai_tool_schema_in_place(child);
+                    }
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for child in arr.iter_mut() {
+                normalize_openai_tool_schema_in_place(child);
+            }
+        }
+        _ => {}
+    }
+}
+
 impl LlmProvider {
     /// Generate environment variables for deployed apps that need LLM access.
     /// Uses standardized OpenAI-compatible env vars so any SDK (openai, langchain, etc.) works.
@@ -42,11 +123,16 @@ impl LlmProvider {
                 model,
                 base_url,
             } => {
-                env.insert("LLM_PROVIDER".into(), "openai".into());
+                env.insert(
+                    "LLM_PROVIDER".into(),
+                    openai_provider_label(base_url.as_deref()).to_string(),
+                );
                 env.insert("OPENAI_API_KEY".into(), api_key.clone());
                 env.insert("LLM_MODEL".into(), model.clone());
                 if let Some(url) = base_url {
-                    env.insert("OPENAI_BASE_URL".into(), url.clone());
+                    if !is_codex_cli_base_url(Some(url.as_str())) {
+                        env.insert("OPENAI_BASE_URL".into(), url.clone());
+                    }
                 }
             }
             LlmProvider::Ollama { base_url, model } => {
@@ -113,6 +199,37 @@ pub struct LlmClient {
     client: reqwest::Client,
 }
 
+struct OpenAiChatParams<'a> {
+    api_key: &'a str,
+    model: &'a str,
+    base_url: Option<&'a str>,
+    system_prompt: &'a str,
+    user_message: &'a str,
+    history: &'a [crate::core::agent::ConversationMessage],
+    actions: &'a [crate::actions::ActionDef],
+}
+
+struct OpenAiStreamParams<'a> {
+    api_key: &'a str,
+    model: &'a str,
+    base_url: Option<&'a str>,
+    system_prompt: &'a str,
+    user_message: &'a str,
+    history: &'a [crate::core::agent::ConversationMessage],
+    actions: &'a [crate::actions::ActionDef],
+    token_tx: Sender<StreamEvent>,
+}
+
+struct AnthropicStreamParams<'a> {
+    api_key: &'a str,
+    model: &'a str,
+    system_prompt: &'a str,
+    user_message: &'a str,
+    history: &'a [crate::core::agent::ConversationMessage],
+    actions: &'a [crate::actions::ActionDef],
+    token_tx: Sender<StreamEvent>,
+}
+
 impl LlmClient {
     /// Get the model name string for this client
     pub fn model_name(&self) -> &str {
@@ -170,13 +287,7 @@ impl LlmClient {
             LlmProvider::Anthropic { model, .. } => ("anthropic", model.as_str()),
             LlmProvider::OpenAI {
                 model, base_url, ..
-            } => {
-                if base_url.is_some() {
-                    ("openai-compatible", model.as_str())
-                } else {
-                    ("openai", model.as_str())
-                }
-            }
+            } => (openai_provider_label(base_url.as_deref()), model.as_str()),
             LlmProvider::Ollama { model, .. } => ("ollama", model.as_str()),
         };
 
@@ -210,15 +321,15 @@ impl LlmClient {
                 model,
                 base_url,
             } => {
-                self.chat_openai_with_history(
+                self.chat_openai_with_history(OpenAiChatParams {
                     api_key,
                     model,
-                    base_url.as_deref(),
+                    base_url: base_url.as_deref(),
                     system_prompt,
                     user_message,
                     history,
                     actions,
-                )
+                })
                 .await
             }
             LlmProvider::Ollama { base_url, model } => {
@@ -407,16 +518,15 @@ impl LlmClient {
         })
     }
 
-    async fn chat_openai_with_history(
-        &self,
-        api_key: &str,
-        model: &str,
-        base_url: Option<&str>,
-        system_prompt: &str,
-        user_message: &str,
-        history: &[crate::core::agent::ConversationMessage],
-        actions: &[crate::actions::ActionDef],
-    ) -> Result<LlmResponse> {
+    async fn chat_openai_with_history(&self, params: OpenAiChatParams<'_>) -> Result<LlmResponse> {
+        let api_key = params.api_key;
+        let model = params.model;
+        let base_url = params.base_url;
+        let system_prompt = params.system_prompt;
+        let user_message = params.user_message;
+        let history = params.history;
+        let actions = params.actions;
+
         #[derive(Serialize)]
         struct OpenAIRequest {
             model: String,
@@ -482,9 +592,17 @@ impl LlmClient {
         }
 
         #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum OpenAIFunctionArguments {
+            String(String),
+            Json(serde_json::Value),
+        }
+
+        #[derive(Deserialize)]
         struct OpenAIFunctionCall {
             name: String,
-            arguments: String,
+            #[serde(default)]
+            arguments: Option<OpenAIFunctionArguments>,
         }
 
         let tools: Vec<OpenAITool> = actions
@@ -494,7 +612,7 @@ impl LlmClient {
                 function: OpenAIFunction {
                     name: s.name.clone(),
                     description: s.description.clone(),
-                    parameters: s.input_schema.clone(),
+                    parameters: normalize_openai_tool_schema(&s.input_schema),
                 },
             })
             .collect();
@@ -528,7 +646,7 @@ impl LlmClient {
             tools,
         };
 
-        let url = base_url.unwrap_or("https://api.openai.com/v1");
+        let url = effective_openai_base_url(base_url);
         let mut req = self
             .client
             .post(format!("{}/chat/completions", url))
@@ -538,7 +656,7 @@ impl LlmClient {
         // OpenRouter app identification headers
         if url.contains("openrouter") {
             req = req
-                .header("HTTP-Referer", "AgentArk")
+                .header("HTTP-Referer", "https://github.com/agentark-ai/AgentArk")
                 .header("X-Title", "AgentArk");
         }
 
@@ -549,7 +667,62 @@ impl LlmClient {
             return Err(anyhow!("OpenAI API error: {}", error));
         }
 
-        let response: OpenAIResponse = response.json().await?;
+        let response_text = response.text().await?;
+        let response_json: serde_json::Value =
+            serde_json::from_str(&response_text).map_err(|e| {
+                let preview: String = response_text.chars().take(380).collect();
+                anyhow!(
+                    "OpenAI-compatible response was not valid JSON: {}. Body preview: {}",
+                    e,
+                    preview
+                )
+            })?;
+        if response_json.get("choices").is_none() {
+            if let Some(err_payload) = response_json.get("error") {
+                return Err(anyhow!(
+                    "OpenAI-compatible API returned an error payload: {}",
+                    err_payload
+                ));
+            }
+            if let Some(text) = response_json
+                .get("output_text")
+                .and_then(|v| v.as_str())
+                .or_else(|| response_json.get("message").and_then(|v| v.as_str()))
+            {
+                let provider_label = openai_provider_label(base_url);
+                let prompt_chars = system_prompt.len()
+                    + user_message.len()
+                    + history.iter().map(|m| m.content.len()).sum::<usize>();
+                let prompt_tokens = estimate_tokens_from_chars(prompt_chars);
+                let completion_tokens = estimate_tokens_from_chars(text.len());
+                return Ok(LlmResponse {
+                    content: text.to_string(),
+                    tool_calls: vec![],
+                    reasoning: None,
+                    usage: Some(LlmTokenUsage {
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens: prompt_tokens + completion_tokens,
+                        estimated: true,
+                    }),
+                    provider: provider_label.to_string(),
+                    model: model.to_string(),
+                });
+            }
+        }
+        let response: OpenAIResponse =
+            serde_json::from_value(response_json.clone()).map_err(|e| {
+                let preview = serde_json::to_string(&response_json)
+                    .unwrap_or_default()
+                    .chars()
+                    .take(380)
+                    .collect::<String>();
+                anyhow!(
+                    "OpenAI-compatible response schema mismatch: {}. Body preview: {}",
+                    e,
+                    preview
+                )
+            })?;
         let choice = response
             .choices
             .into_iter()
@@ -566,18 +739,23 @@ impl LlmClient {
             .map(|tc| ToolCall {
                 id: tc.id,
                 name: tc.function.name,
-                arguments: serde_json::from_str(&tc.function.arguments)
-                    .unwrap_or(serde_json::Value::Null),
+                arguments: match tc.function.arguments {
+                    Some(OpenAIFunctionArguments::String(raw)) => {
+                        let trimmed = raw.trim();
+                        if trimmed.is_empty() {
+                            serde_json::Value::Null
+                        } else {
+                            serde_json::from_str(trimmed)
+                                .unwrap_or_else(|_| serde_json::Value::String(raw))
+                        }
+                    }
+                    Some(OpenAIFunctionArguments::Json(v)) => v,
+                    None => serde_json::Value::Null,
+                },
             })
             .collect();
 
-        let provider_label = if base_url.unwrap_or("").is_empty() {
-            "openai"
-        } else if base_url.unwrap_or("").contains("openrouter") {
-            "openai-compatible"
-        } else {
-            "openai-compatible"
-        };
+        let provider_label = openai_provider_label(base_url);
 
         let prompt_chars = system_prompt.len()
             + user_message.len()
@@ -622,7 +800,7 @@ impl LlmClient {
     ) -> Result<LlmResponse> {
         match &self.provider {
             LlmProvider::Anthropic { api_key, model } => {
-                self.chat_anthropic_with_history_stream(
+                self.chat_anthropic_with_history_stream(AnthropicStreamParams {
                     api_key,
                     model,
                     system_prompt,
@@ -630,7 +808,7 @@ impl LlmClient {
                     history,
                     actions,
                     token_tx,
-                )
+                })
                 .await
             }
             LlmProvider::OpenAI {
@@ -638,16 +816,16 @@ impl LlmClient {
                 model,
                 base_url,
             } => {
-                self.chat_openai_with_history_stream(
+                self.chat_openai_with_history_stream(OpenAiStreamParams {
                     api_key,
                     model,
-                    base_url.as_deref(),
+                    base_url: base_url.as_deref(),
                     system_prompt,
                     user_message,
                     history,
                     actions,
                     token_tx,
-                )
+                })
                 .await
             }
             LlmProvider::Ollama { base_url, model } => {
@@ -926,15 +1104,17 @@ impl LlmClient {
 
     async fn chat_openai_with_history_stream(
         &self,
-        api_key: &str,
-        model: &str,
-        base_url: Option<&str>,
-        system_prompt: &str,
-        user_message: &str,
-        history: &[crate::core::agent::ConversationMessage],
-        actions: &[crate::actions::ActionDef],
-        token_tx: Sender<StreamEvent>,
+        params: OpenAiStreamParams<'_>,
     ) -> Result<LlmResponse> {
+        let api_key = params.api_key;
+        let model = params.model;
+        let base_url = params.base_url;
+        let system_prompt = params.system_prompt;
+        let user_message = params.user_message;
+        let history = params.history;
+        let actions = params.actions;
+        let token_tx = params.token_tx;
+
         use std::collections::HashMap;
 
         #[derive(Serialize)]
@@ -1002,7 +1182,14 @@ impl LlmClient {
             #[serde(default)]
             name: Option<String>,
             #[serde(default)]
-            arguments: Option<String>,
+            arguments: Option<OpenAIStreamFunctionArguments>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum OpenAIStreamFunctionArguments {
+            String(String),
+            Json(serde_json::Value),
         }
 
         #[derive(Default)]
@@ -1010,6 +1197,7 @@ impl LlmClient {
             id: String,
             name: String,
             args: String,
+            last_progress_emit_chars: usize,
         }
 
         let tools: Vec<OpenAITool> = actions
@@ -1019,7 +1207,7 @@ impl LlmClient {
                 function: OpenAIFunction {
                     name: s.name.clone(),
                     description: s.description.clone(),
-                    parameters: s.input_schema.clone(),
+                    parameters: normalize_openai_tool_schema(&s.input_schema),
                 },
             })
             .collect();
@@ -1047,14 +1235,22 @@ impl LlmClient {
             content: user_message.to_string(),
         });
 
+        let url = effective_openai_base_url(base_url);
+        tracing::info!(
+            "LLM stream → {} model={} msgs={} tools={}",
+            url,
+            model,
+            messages.len(),
+            tools.len()
+        );
+
         let request = OpenAIRequest {
             model: model.to_string(),
             messages,
             tools,
             stream: true,
         };
-
-        let url = base_url.unwrap_or("https://api.openai.com/v1");
+        let send_start = std::time::Instant::now();
         let mut req = self
             .client
             .post(format!("{}/chat/completions", url))
@@ -1065,20 +1261,44 @@ impl LlmClient {
         // OpenRouter app identification headers
         if url.contains("openrouter") {
             req = req
-                .header("HTTP-Referer", "AgentArk")
+                .header("HTTP-Referer", "https://github.com/agentark-ai/AgentArk")
                 .header("X-Title", "AgentArk");
         }
 
-        let response = req.json(&request).send().await?;
+        let response = match req.json(&request).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(
+                    "LLM stream send failed after {}ms: {}",
+                    send_start.elapsed().as_millis(),
+                    e
+                );
+                return Err(e.into());
+            }
+        };
 
-        if !response.status().is_success() {
+        let status = response.status();
+        tracing::info!(
+            "LLM stream response status={} after {}ms",
+            status,
+            send_start.elapsed().as_millis()
+        );
+
+        if !status.is_success() {
             let error = response.text().await?;
+            tracing::error!(
+                "LLM stream error status={}: {}",
+                status,
+                &error[..error.len().min(500)]
+            );
             return Err(anyhow!("OpenAI API error: {}", error));
         }
 
         let mut content = String::new();
         let mut reasoning: Option<String> = None;
         let mut tool_builders: HashMap<usize, ToolBuilder> = HashMap::new();
+        let mut first_token = true;
+        const TOOL_ARG_PROGRESS_STEP: usize = 4000;
 
         let mut buffer = String::new();
         let mut done = false;
@@ -1112,6 +1332,13 @@ impl LlmClient {
                     }
                     if let Some(tok) = choice.delta.content {
                         if !tok.is_empty() {
+                            if first_token {
+                                tracing::info!(
+                                    "LLM stream first token after {}ms",
+                                    send_start.elapsed().as_millis()
+                                );
+                                first_token = false;
+                            }
                             content.push_str(&tok);
                             let _ = token_tx.try_send(StreamEvent::Token(tok));
                         }
@@ -1131,7 +1358,45 @@ impl LlmClient {
                                     }
                                 }
                                 if let Some(args) = func.arguments {
-                                    entry.args.push_str(&args);
+                                    match args {
+                                        OpenAIStreamFunctionArguments::String(chunk) => {
+                                            entry.args.push_str(&chunk);
+                                        }
+                                        OpenAIStreamFunctionArguments::Json(value) => {
+                                            if entry.args.is_empty() {
+                                                entry.args = value.to_string();
+                                            }
+                                        }
+                                    }
+                                }
+                                let arg_chars = entry.args.chars().count();
+                                let should_emit_progress = !entry.name.is_empty()
+                                    && arg_chars > 0
+                                    && (entry.last_progress_emit_chars == 0
+                                        || arg_chars
+                                            >= entry.last_progress_emit_chars
+                                                + TOOL_ARG_PROGRESS_STEP);
+                                if should_emit_progress {
+                                    entry.last_progress_emit_chars = arg_chars;
+                                    let progress_msg = if entry.name == "app_deploy" {
+                                        format!(
+                                            "Generating deploy payload... {} chars",
+                                            arg_chars
+                                        )
+                                    } else {
+                                        format!(
+                                            "Generating {} arguments... {} chars",
+                                            entry.name, arg_chars
+                                        )
+                                    };
+                                    let _ = token_tx.try_send(StreamEvent::ToolProgress {
+                                        name: entry.name.clone(),
+                                        content: progress_msg,
+                                        payload: Some(serde_json::json!({
+                                            "kind": "argument_stream",
+                                            "chars": arg_chars,
+                                        })),
+                                    });
                                 }
                             }
                         }
@@ -1145,13 +1410,21 @@ impl LlmClient {
             }
         }
 
+        tracing::info!(
+            "LLM stream done ← {}ms, content={}chars, tool_builders={}",
+            send_start.elapsed().as_millis(),
+            content.len(),
+            tool_builders.len()
+        );
+
         let mut tool_calls: Vec<(usize, ToolCall)> = tool_builders
             .into_iter()
             .map(|(idx, tb)| {
                 let args = if tb.args.trim().is_empty() {
                     serde_json::Value::Null
                 } else {
-                    serde_json::from_str(&tb.args).unwrap_or(serde_json::Value::Null)
+                    serde_json::from_str(&tb.args)
+                        .unwrap_or_else(|_| serde_json::Value::String(tb.args.clone()))
                 };
                 (
                     idx,
@@ -1170,13 +1443,7 @@ impl LlmClient {
         tool_calls.sort_by_key(|(idx, _)| *idx);
         let tool_calls: Vec<ToolCall> = tool_calls.into_iter().map(|(_, tc)| tc).collect();
 
-        let provider_label = if url.contains("openrouter") {
-            "openai-compatible"
-        } else if base_url.is_some() {
-            "openai-compatible"
-        } else {
-            "openai"
-        };
+        let provider_label = openai_provider_label(base_url);
 
         let prompt_chars = system_prompt.len()
             + user_message.len()
@@ -1202,14 +1469,16 @@ impl LlmClient {
 
     async fn chat_anthropic_with_history_stream(
         &self,
-        api_key: &str,
-        model: &str,
-        system_prompt: &str,
-        user_message: &str,
-        history: &[crate::core::agent::ConversationMessage],
-        actions: &[crate::actions::ActionDef],
-        token_tx: Sender<StreamEvent>,
+        params: AnthropicStreamParams<'_>,
     ) -> Result<LlmResponse> {
+        let api_key = params.api_key;
+        let model = params.model;
+        let system_prompt = params.system_prompt;
+        let user_message = params.user_message;
+        let history = params.history;
+        let actions = params.actions;
+        let token_tx = params.token_tx;
+
         use std::collections::HashMap;
 
         #[derive(Serialize)]
@@ -1281,6 +1550,7 @@ impl LlmClient {
             name: String,
             input_json: String,
             input_value: Option<serde_json::Value>,
+            last_progress_emit_chars: usize,
         }
 
         let tools: Vec<AnthropicTool> = actions
@@ -1335,6 +1605,7 @@ impl LlmClient {
 
         let mut content = String::new();
         let mut tool_builders: HashMap<usize, ToolBuilder> = HashMap::new();
+        const TOOL_ARG_PROGRESS_STEP: usize = 4000;
 
         let mut buffer = String::new();
         let mut current_event: Option<String> = None;
@@ -1397,6 +1668,35 @@ impl LlmClient {
                                 if let Some(partial) = parsed.delta.partial_json {
                                     let entry = tool_builders.entry(parsed.index).or_default();
                                     entry.input_json.push_str(&partial);
+                                    let arg_chars = entry.input_json.chars().count();
+                                    let should_emit_progress = !entry.name.is_empty()
+                                        && arg_chars > 0
+                                        && (entry.last_progress_emit_chars == 0
+                                            || arg_chars
+                                                >= entry.last_progress_emit_chars
+                                                    + TOOL_ARG_PROGRESS_STEP);
+                                    if should_emit_progress {
+                                        entry.last_progress_emit_chars = arg_chars;
+                                        let progress_msg = if entry.name == "app_deploy" {
+                                            format!(
+                                                "Generating deploy payload... {} chars",
+                                                arg_chars
+                                            )
+                                        } else {
+                                            format!(
+                                                "Generating {} arguments... {} chars",
+                                                entry.name, arg_chars
+                                            )
+                                        };
+                                        let _ = token_tx.try_send(StreamEvent::ToolProgress {
+                                            name: entry.name.clone(),
+                                            content: progress_msg,
+                                            payload: Some(serde_json::json!({
+                                                "kind": "argument_stream",
+                                                "chars": arg_chars,
+                                            })),
+                                        });
+                                    }
                                 }
                             }
                         }

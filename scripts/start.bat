@@ -26,6 +26,7 @@ if "%1"=="restart" goto restart
 if "%1"=="logs" goto logs
 if "%1"=="update" goto update
 if "%1"=="status" goto status
+if "%1"=="lowmem" goto lowmem
 goto usage
 
 :start
@@ -120,8 +121,35 @@ echo AgentArk Status:
 docker compose ps
 goto end
 
+:lowmem
+echo.
+echo === Low-Memory Build Setup ===
+echo.
+echo This limits Docker Desktop to 2GB RAM + 2 CPUs for building on low-spec machines.
+echo.
+if exist "%USERPROFILE%\.wslconfig" (
+    echo WARNING: %USERPROFILE%\.wslconfig already exists.
+    set /p OVERWRITE="Overwrite? (y/N): "
+    if /i not "!OVERWRITE!"=="y" (
+        echo Cancelled.
+        goto end
+    )
+)
+copy /y "%~dp0low-memory-build.wslconfig" "%USERPROFILE%\.wslconfig" >nul
+echo Installed .wslconfig to %USERPROFILE%\.wslconfig
+echo Restarting WSL2...
+wsl --shutdown
+echo.
+echo Done! Docker Desktop will use 2GB RAM / 2 CPUs / 4GB swap.
+echo Now run: scripts\start.bat
+echo.
+echo To restore full resources later:
+echo   del %USERPROFILE%\.wslconfig
+echo   wsl --shutdown
+goto end
+
 :usage
-echo Usage: scripts\start.bat [start^|tunnel^|stop^|restart^|logs^|update^|status]
+echo Usage: scripts\start.bat [start^|tunnel^|stop^|restart^|logs^|update^|status^|lowmem]
 echo.
 echo   start          Start AgentArk (local access only)
 echo   tunnel         Start with remote access (auto-starts Cloudflare tunnel)
@@ -131,6 +159,7 @@ echo   restart        Restart AgentArk
 echo   logs           View logs
 echo   update         Rebuild and restart (preserves data)
 echo   status         Show running containers
+echo   lowmem         Install low-memory config (2GB RAM / 2 CPUs) for Docker
 goto end
 
 :end

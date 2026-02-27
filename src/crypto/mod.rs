@@ -74,7 +74,7 @@ impl KeyManager {
                     .mode(0o600)
                     .open(keyfile_path)?;
             }
-            std::fs::write(keyfile_path, &key)?;
+            std::fs::write(keyfile_path, key)?;
 
             Ok(Self {
                 key: Zeroizing::new(key),

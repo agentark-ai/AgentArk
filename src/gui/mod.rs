@@ -49,12 +49,8 @@ pub async fn run_setup_wizard(agent: Agent) -> Result<()> {
 
     let app = views::SetupWizard::new(agent);
 
-    eframe::run_native(
-        "AgentArk Setup",
-        options,
-        Box::new(|_cc| Ok(Box::new(app))),
-    )
-    .map_err(|e| anyhow::anyhow!("Setup wizard error: {}", e))?;
+    eframe::run_native("AgentArk Setup", options, Box::new(|_cc| Ok(Box::new(app))))
+        .map_err(|e| anyhow::anyhow!("Setup wizard error: {}", e))?;
 
     Ok(())
 }

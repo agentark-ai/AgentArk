@@ -9,6 +9,7 @@ import {
   Button,
   Checkbox,
   Chip,
+  CircularProgress,
   Dialog,
   DialogActions,
   DialogContent,
@@ -20,6 +21,7 @@ import {
   List,
   ListItem,
   ListItemText,
+  Link,
   Menu,
   MenuItem,
   Stack,
@@ -38,10 +40,18 @@ import {
 } from "@mui/material";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import ArrowDropDownRoundedIcon from "@mui/icons-material/ArrowDropDownRounded";
+import AttachFileRoundedIcon from "@mui/icons-material/AttachFileRounded";
+import ChevronLeftRoundedIcon from "@mui/icons-material/ChevronLeftRounded";
+import ChevronRightRoundedIcon from "@mui/icons-material/ChevronRightRounded";
 import ContentCopyRoundedIcon from "@mui/icons-material/ContentCopyRounded";
 import MoreVertIcon from "@mui/icons-material/MoreVert";
+import ArrowUpwardRoundedIcon from "@mui/icons-material/ArrowUpwardRounded";
+import StopRoundedIcon from "@mui/icons-material/StopRounded";
+import CloseIcon from "@mui/icons-material/Close";
+import FilterListRoundedIcon from "@mui/icons-material/FilterListRounded";
+import SettingsRoundedIcon from "@mui/icons-material/SettingsRounded";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent, type MouseEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent, type MouseEvent, type ReactNode } from "react";
 import ReactECharts from "echarts-for-react";
 import { api } from "../api/client";
 import AgentLogo from "../assets/logo.svg";
@@ -50,12 +60,22 @@ import type { SkillImportResponse, LlmAnalyticsResponse } from "../types";
 import { useUiStore } from "../store/uiStore";
 
 const REFRESH_MS = 8000;
-const IMPORT_SECURITY_FORCE_THRESHOLD = 20;
+const IMPORT_SECURITY_FORCE_RISK_THRESHOLD = 8;
 const DEVELOPER_MODE_STORAGE_KEY = "agentark.developer_mode";
 const DEVELOPER_MODE_EVENT = "agentark:developer-mode-change";
 const OLLAMA_DEFAULT_BASE_URL = "http://localhost:11434";
 const OPENROUTER_DEFAULT_BASE_URL = "https://openrouter.ai/api/v1";
 const SHOW_EXPERIMENTAL_AUTONOMY_TOOLS = false;
+type ImportRiskBand = "secure" | "review" | "risky";
+
+const MODEL_FALLBACKS_BY_PROVIDER: Record<string, string[]> = {
+  openai: ["gpt-5", "gpt-5-mini", "gpt-4.1", "o4-mini", "o3"],
+  "openai-subscription": ["gpt-5", "gpt-5-mini", "gpt-4.1", "o4-mini", "o3"],
+  anthropic: ["claude-opus-4-20250514", "claude-sonnet-4-20250514", "claude-3-7-sonnet-latest", "claude-3-5-haiku-latest"],
+  openrouter: ["openai/gpt-5", "anthropic/claude-sonnet-4", "google/gemini-2.5-pro"],
+  "openai-compatible": [],
+  ollama: [],
+};
 
 function getDeveloperModeEnabled(): boolean {
   if (typeof window === "undefined") return false;
@@ -85,6 +105,13 @@ type RowMenuAction = {
   disabled?: boolean;
   tone?: "default" | "warning" | "error";
   divider?: boolean;
+};
+
+type LiveFileWriteState = {
+  content: string;
+  line: number;
+  totalLines: number;
+  done: boolean;
 };
 
 type TrustApprovalPreset = {
@@ -177,6 +204,7 @@ export type WorkspaceView =
   | "swarm"
   | "trace"
   | "status"
+  | "analytics"
   | "settings";
 
 function isRecord(value: unknown): value is JsonRecord {
@@ -233,6 +261,29 @@ function toBool(value: unknown): boolean {
   return false;
 }
 
+function compactUnknown(value: unknown, maxLen = 2200): string {
+  if (value == null) return "";
+  if (typeof value === "string") return value.trim().slice(0, maxLen);
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  try {
+    const serialized = JSON.stringify(value, null, 2);
+    if (!serialized) return "";
+    if (serialized.length <= maxLen) return serialized;
+    return `${serialized.slice(0, maxLen)}...`;
+  } catch {
+    return "";
+  }
+}
+
+function extractStepDetailText(step: JsonRecord, maxLen = 2200): string {
+  const detail = str(step.detail, "").trim();
+  if (detail) return detail.slice(0, maxLen);
+  const dataText = compactUnknown(step.data, maxLen);
+  if (dataText) return dataText;
+  const titleData = compactUnknown(step.title, maxLen);
+  return titleData;
+}
+
 function formatBytes(value: unknown): string {
   const bytes = num(value, -1);
   if (bytes < 0) return "-";
@@ -253,6 +304,382 @@ function stripAttachmentContextMarker(text: string): string {
   return text
     .replace(/\n\n\[Attached documents indexed for retrieval:[\s\S]*\]$/i, "")
     .trimEnd();
+}
+
+type ChatMarkdownBlock =
+  | { type: "heading"; level: number; text: string }
+  | { type: "code"; language: string; content: string }
+  | { type: "ul"; items: string[] }
+  | { type: "ol"; items: string[] }
+  | { type: "paragraph"; text: string };
+
+function lineStartsMarkdownBlock(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return true;
+  if (/^#{1,6}\s+/.test(trimmed)) return true;
+  if (/^```/.test(trimmed)) return true;
+  if (/^[-*]\s+/.test(trimmed)) return true;
+  if (/^\d+\.\s+/.test(trimmed)) return true;
+  return false;
+}
+
+function isContextualCredentialMatch(matchText: string): boolean {
+  const lower = (matchText || "").toLowerCase();
+  if (!lower) return false;
+  const placeholders = ["your-api-key", "your_api_key", "example", "dummy", "changeme", "replace_me", "test-key", "sample-key"];
+  return lower.includes("$") || lower.includes("${") || placeholders.some((token) => lower.includes(token));
+}
+
+function isContextualImportFinding(finding: JsonRecord): boolean {
+  const category = str(finding.category, "").toLowerCase();
+  if (category === "networkaccess" || category === "environmentaccess") return true;
+  if (category === "credentialpattern") {
+    return isContextualCredentialMatch(str(finding.matched_text, ""));
+  }
+  return false;
+}
+
+function computeImportRiskSummary(security: SkillImportResponse["security"] | null | undefined): {
+  score10: number;
+  band: ImportRiskBand;
+  bandLabel: string;
+  chipColor: "success" | "warning" | "error";
+  rawSeverity: number;
+  totalFindings: number;
+  contextualFindings: number;
+} {
+  if (!security) {
+    return {
+      score10: 0,
+      band: "secure",
+      bandLabel: "Secure",
+      chipColor: "success",
+      rawSeverity: 0,
+      totalFindings: 0,
+      contextualFindings: 0
+    };
+  }
+
+  const findings = Array.isArray(security.findings) ? security.findings : [];
+  const findingRecords = findings.map((item) => asRecord(item));
+  const explicitSeverity = Math.max(0, num(security.total_severity, 0));
+  const summedSeverity = findingRecords.reduce((sum, finding) => sum + Math.max(0, num(finding.severity, 0)), 0);
+  const rawSeverity = explicitSeverity > 0 ? explicitSeverity : summedSeverity;
+  const serverTotalFindings = num(security.total_findings, -1);
+  const serverContextualFindings = num(security.contextual_findings, -1);
+  const totalFindings = serverTotalFindings >= 0 ? serverTotalFindings : findingRecords.length;
+  const contextualFindings =
+    serverContextualFindings >= 0
+      ? Math.min(totalFindings, serverContextualFindings)
+      : findingRecords.filter((finding) => isContextualImportFinding(finding)).length;
+  const contextualRatio = totalFindings > 0 ? contextualFindings / totalFindings : 0;
+
+  const providedRiskScore = num(security.risk_score_10, -1);
+  const providedBand = str(security.risk_band, "").toLowerCase();
+
+  // Base normalization: existing static-analysis severity scale mapped to 0..10.
+  let score = providedRiskScore >= 0 ? Math.min(10, providedRiskScore) : Math.min(10, rawSeverity / 4);
+
+  // Common integration patterns (curl/env refs/placeholders) should count as context, not danger.
+  if (providedRiskScore < 0) {
+    if (contextualRatio >= 0.75) {
+      score *= 0.65;
+    } else if (contextualRatio >= 0.5) {
+      score *= 0.8;
+    }
+  }
+
+  const threatLevel = str(security.threat_level, "").toLowerCase();
+  if (threatLevel === "malicious") {
+    score = Math.max(score, 8.5);
+  } else if (threatLevel === "suspicious") {
+    score = Math.max(score, 5);
+  }
+  if (toBool(security.blocked)) {
+    score = Math.max(score, 8.5);
+  }
+
+  const score10 = Math.max(0, Math.min(10, Math.round(score * 10) / 10));
+  const resolvedBand = providedBand === "secure" || providedBand === "review" || providedBand === "risky"
+    ? (providedBand as ImportRiskBand)
+    : score10 < 5
+    ? "secure"
+    : score10 < 8
+    ? "review"
+    : "risky";
+  if (resolvedBand === "secure") {
+    return {
+      score10,
+      band: "secure",
+      bandLabel: "Secure",
+      chipColor: "success",
+      rawSeverity,
+      totalFindings,
+      contextualFindings
+    };
+  }
+  if (resolvedBand === "review") {
+    return {
+      score10,
+      band: "review",
+      bandLabel: "Needs review",
+      chipColor: "warning",
+      rawSeverity,
+      totalFindings,
+      contextualFindings
+    };
+  }
+  return {
+    score10,
+    band: "risky",
+    bandLabel: "Risky",
+    chipColor: "error",
+    rawSeverity,
+    totalFindings,
+    contextualFindings
+  };
+}
+
+function isUserActionableDoctorFinding(value: unknown): boolean {
+  const row = asRecord(value);
+  if (!Object.prototype.hasOwnProperty.call(row, "user_actionable")) return true;
+  return toBool(row.user_actionable);
+}
+
+function parseChatMarkdown(source: string): ChatMarkdownBlock[] {
+  const text = (source || "").replace(/\r\n/g, "\n");
+  const lines = text.split("\n");
+  const blocks: ChatMarkdownBlock[] = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i] ?? "";
+    const trimmed = line.trim();
+
+    if (!trimmed) {
+      i += 1;
+      continue;
+    }
+
+    const codeFenceMatch = trimmed.match(/^```([A-Za-z0-9_+-]+)?\s*$/);
+    if (codeFenceMatch) {
+      const language = (codeFenceMatch[1] || "").trim().toLowerCase();
+      i += 1;
+      const codeLines: string[] = [];
+      while (i < lines.length && !(lines[i] || "").trim().startsWith("```")) {
+        codeLines.push(lines[i] ?? "");
+        i += 1;
+      }
+      if (i < lines.length && (lines[i] || "").trim().startsWith("```")) i += 1;
+      blocks.push({
+        type: "code",
+        language,
+        content: codeLines.join("\n")
+      });
+      continue;
+    }
+
+    const headingMatch = trimmed.match(/^(#{1,6})\s+(.*)$/);
+    if (headingMatch) {
+      blocks.push({
+        type: "heading",
+        level: headingMatch[1].length,
+        text: headingMatch[2].trim()
+      });
+      i += 1;
+      continue;
+    }
+
+    if (/^[-*]\s+/.test(trimmed)) {
+      const items: string[] = [];
+      while (i < lines.length) {
+        const itemLine = (lines[i] || "").trim();
+        const match = itemLine.match(/^[-*]\s+(.*)$/);
+        if (!match) break;
+        items.push(match[1].trim());
+        i += 1;
+      }
+      blocks.push({ type: "ul", items });
+      continue;
+    }
+
+    if (/^\d+\.\s+/.test(trimmed)) {
+      const items: string[] = [];
+      while (i < lines.length) {
+        const itemLine = (lines[i] || "").trim();
+        const match = itemLine.match(/^\d+\.\s+(.*)$/);
+        if (!match) break;
+        items.push(match[1].trim());
+        i += 1;
+      }
+      blocks.push({ type: "ol", items });
+      continue;
+    }
+
+    const paragraphLines: string[] = [line];
+    i += 1;
+    while (i < lines.length) {
+      const next = lines[i] ?? "";
+      if (!next.trim()) {
+        i += 1;
+        break;
+      }
+      if (lineStartsMarkdownBlock(next)) break;
+      paragraphLines.push(next);
+      i += 1;
+    }
+    blocks.push({ type: "paragraph", text: paragraphLines.join("\n").trim() });
+  }
+
+  return blocks;
+}
+
+function renderInlineMarkdown(text: string): ReactNode[] {
+  const source = text || "";
+  if (!source) return [];
+  const tokenRegex = /(`[^`\n]+`|\*\*[^*]+?\*\*|__[^_]+?__|\*[^*\n]+?\*|_[^_\n]+?_|(?:https?:\/\/[^\s<>()]+)|\[[^\]]+\]\(([^)\s]+)\))/g;
+  const nodes: ReactNode[] = [];
+  let index = 0;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null = null;
+
+  const pushText = (value: string) => {
+    if (!value) return;
+    nodes.push(<span key={`t-${index++}`}>{value}</span>);
+  };
+
+  const splitUrlTrailingPunctuation = (value: string): { href: string; trailing: string } => {
+    let href = value;
+    let trailing = "";
+    while (href.length > 0 && /[.,!?;:)]/.test(href[href.length - 1] || "")) {
+      trailing = `${href[href.length - 1]}${trailing}`;
+      href = href.slice(0, -1);
+    }
+    return { href, trailing };
+  };
+
+  while ((match = tokenRegex.exec(source)) !== null) {
+    const token = match[0];
+    const start = match.index;
+    if (start > lastIndex) pushText(source.slice(lastIndex, start));
+
+    if (token.startsWith("`") && token.endsWith("`")) {
+      nodes.push(
+        <code key={`c-${index++}`} className="chat-md-inline-code">
+          {token.slice(1, -1)}
+        </code>
+      );
+    } else if ((token.startsWith("**") && token.endsWith("**")) || (token.startsWith("__") && token.endsWith("__"))) {
+      nodes.push(<strong key={`b-${index++}`}>{token.slice(2, -2)}</strong>);
+    } else if ((token.startsWith("*") && token.endsWith("*")) || (token.startsWith("_") && token.endsWith("_"))) {
+      nodes.push(<em key={`i-${index++}`}>{token.slice(1, -1)}</em>);
+    } else if (token.startsWith("[")) {
+      const linkMatch = token.match(/^\[([^\]]+)\]\(([^)\s]+)\)$/);
+      if (linkMatch) {
+        const rawHref = linkMatch[2].trim();
+        const safeHref =
+          rawHref.startsWith("http://") ||
+          rawHref.startsWith("https://") ||
+          rawHref.startsWith("/");
+        if (!safeHref) {
+          pushText(token);
+          lastIndex = tokenRegex.lastIndex;
+          continue;
+        }
+        nodes.push(
+          <a
+            key={`l-${index++}`}
+            href={rawHref}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="chat-md-link"
+          >
+            {linkMatch[1]}
+          </a>
+        );
+      } else {
+        pushText(token);
+      }
+    } else if (token.startsWith("http://") || token.startsWith("https://")) {
+      const { href, trailing } = splitUrlTrailingPunctuation(token);
+      nodes.push(
+        <a key={`u-${index++}`} href={href} target="_blank" rel="noopener noreferrer" className="chat-md-link">
+          {href}
+        </a>
+      );
+      if (trailing) pushText(trailing);
+    } else {
+      pushText(token);
+    }
+
+    lastIndex = tokenRegex.lastIndex;
+  }
+
+  if (lastIndex < source.length) pushText(source.slice(lastIndex));
+  return nodes;
+}
+
+function renderMarkdownLineBreaks(text: string): ReactNode[] {
+  const lines = (text || "").split("\n");
+  const out: ReactNode[] = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    out.push(<span key={`line-${i}`}>{renderInlineMarkdown(lines[i] || "")}</span>);
+    if (i < lines.length - 1) out.push(<br key={`br-${i}`} />);
+  }
+  return out;
+}
+
+function renderChatMarkdown(text: string): ReactNode {
+  const blocks = parseChatMarkdown(text || "");
+  if (blocks.length === 0) return null;
+
+  return (
+    <Box className="chat-markdown">
+      {blocks.map((block, idx) => {
+        const key = `${block.type}-${idx}`;
+        if (block.type === "heading") {
+          return (
+            <Typography key={key} className={`chat-md-heading chat-md-h${Math.min(6, Math.max(1, block.level))}`}>
+              {renderInlineMarkdown(block.text)}
+            </Typography>
+          );
+        }
+        if (block.type === "code") {
+          return (
+            <Box key={key} className="chat-md-code-wrap">
+              {block.language ? <div className="chat-md-code-lang">{block.language}</div> : null}
+              <pre className="chat-md-code">
+                <code>{block.content}</code>
+              </pre>
+            </Box>
+          );
+        }
+        if (block.type === "ul" || block.type === "ol") {
+          const ListTag = block.type === "ul" ? "ul" : "ol";
+          return (
+            <Box key={key} component={ListTag} className="chat-md-list">
+              {block.items.map((item, itemIdx) => (
+                <li key={`${key}-item-${itemIdx}`}>{renderInlineMarkdown(item)}</li>
+              ))}
+            </Box>
+          );
+        }
+        return (
+          <Typography key={key} variant="body2" className="chat-md-paragraph">
+            {renderMarkdownLineBreaks(block.text)}
+          </Typography>
+        );
+      })}
+    </Box>
+  );
+}
+
+function extractFirstCodeFence(text: string): string {
+  const source = (text || "").trim();
+  if (!source) return "";
+  const match = source.match(/```[a-zA-Z0-9_+-]*\n([\s\S]*?)```/);
+  if (match && match[1]) return match[1].trim();
+  return "";
 }
 
 const CHAT_ATTACHMENT_EXTENSIONS = new Set([
@@ -730,6 +1157,38 @@ function looksLikeUrl(value: string): boolean {
   return v.startsWith("http://") || v.startsWith("https://");
 }
 
+function extractPreviewImageUrl(text: string): string {
+  const source = text || "";
+  if (!source) return "";
+  const appPreviewMatch = source.match(/!\[App Preview\]\(([^)\s]+)\)/i);
+  if (appPreviewMatch?.[1]) return appPreviewMatch[1].trim();
+  const genericMatch = source.match(/!\[[^\]]*\]\(([^)\s]+)\)/);
+  if (genericMatch?.[1]) return genericMatch[1].trim();
+  return "";
+}
+
+function toAbsoluteAppUrl(pathOrUrl: string, baseOrigin: string): string {
+  const value = (pathOrUrl || "").trim();
+  if (!value) return "";
+  if (looksLikeUrl(value)) return value;
+  const base = (baseOrigin || "").trim().replace(/\/+$/, "");
+  if (!base) return value;
+  if (value.startsWith("/")) return `${base}${value}`;
+  return `${base}/${value}`;
+}
+
+function dedupeLinkTargets(targets: Array<{ label: string; url: string }>): Array<{ label: string; url: string }> {
+  const seen = new Set<string>();
+  const out: Array<{ label: string; url: string }> = [];
+  for (const item of targets) {
+    const url = (item.url || "").trim();
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    out.push({ label: item.label, url });
+  }
+  return out;
+}
+
 function looksLikeUuid(value: string): boolean {
   const v = (value || "").trim();
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
@@ -1004,7 +1463,7 @@ function BulkImportDialog({
         const result = await api.importSkill({ url: item.url, force, model: model.trim() || undefined });
         let statusMessage = result.message || `Imported ${result.name}`;
         if (result.status === "blocked") {
-          statusMessage = result.message || "Blocked by security verification (toggle Force and retry).";
+          statusMessage = result.message || "Blocked by security verification (enable override and retry).";
         } else if (result.status === "needs_secrets") {
           statusMessage = result.message || `Imported ${result.name} (disabled until secrets are configured)`;
         }
@@ -1072,7 +1531,10 @@ https://raw.githubusercontent.com/org/repo/main/skills/my-skill/SKILL.md`}
             value={model}
             onChange={(e) => setModel(e.target.value)}
           />
-          <FormControlLabel control={<Switch checked={force} onChange={(e) => setForce(e.target.checked)} />} label="Force import (skip security checks)" />
+          <FormControlLabel
+            control={<Switch checked={force} onChange={(e) => setForce(e.target.checked)} />}
+            label="Override warnings (import anyway)"
+          />
           {items.length > 0 ? (
             <Stack spacing={0.5}>
               {items.map((it) => (
@@ -1126,19 +1588,13 @@ function ImportUrlDialog({
   const [secretDrafts, setSecretDrafts] = useState<Record<string, { storeAs: string; value: string; useBuiltin: boolean }>>({});
   const [savingSecrets, setSavingSecrets] = useState(false);
   const [secretsSaved, setSecretsSaved] = useState(false);
-  const severityScore = useMemo(() => {
-    if (!importResult?.security) return 0;
-    const explicit = num(importResult.security.total_severity, 0);
-    if (explicit > 0) return explicit;
-    if (!Array.isArray(importResult.security.findings)) return 0;
-    return importResult.security.findings.reduce((sum, finding) => {
-      const f = asRecord(finding);
-      return sum + Math.max(0, num(f.severity, 0));
-    }, 0);
-  }, [importResult]);
+  const importRisk = useMemo(
+    () => computeImportRiskSummary(importResult?.security),
+    [importResult]
+  );
   const securityBlocked = toBool(importResult?.security?.blocked);
   const importRequiresForce =
-    previewReady && !force && (securityBlocked || severityScore >= IMPORT_SECURITY_FORCE_THRESHOLD);
+    previewReady && !force && (securityBlocked || importRisk.score10 >= IMPORT_SECURITY_FORCE_RISK_THRESHOLD);
 
   const buildSecretDraftsFromResult = (result: SkillImportResponse) => {
     const required = result.secrets?.required_env || [];
@@ -1177,7 +1633,7 @@ function ImportUrlDialog({
 
       let message = result.message || (previewOnly ? `Preview ready for ${result.name}` : `Imported ${result.name}`);
       if (result.status === "blocked") {
-        message = result.message || "Blocked by security verification. Toggle Force to override.";
+        message = result.message || "Blocked by security verification. Enable override to continue.";
       } else if (!previewOnly && result.status === "needs_secrets") {
         message = result.message || `Imported ${result.name} (disabled until secrets are configured)`;
       }
@@ -1305,10 +1761,13 @@ function ImportUrlDialog({
               if (event.key === "Enter") event.preventDefault();
             }}
           />
-          <FormControlLabel control={<Switch checked={force} onChange={(event) => setForce(event.target.checked)} />} label="Force import" />
+          <FormControlLabel
+            control={<Switch checked={force} onChange={(event) => setForce(event.target.checked)} />}
+            label="Override all warnings (import anyway)"
+          />
           {importRequiresForce ? (
             <Alert severity="warning">
-              Security severity score {severityScore} exceeds threshold {IMPORT_SECURITY_FORCE_THRESHOLD}. Enable Force import to continue.
+              Risk score {importRisk.score10.toFixed(1)}/10 is in the risky range (threshold {IMPORT_SECURITY_FORCE_RISK_THRESHOLD}/10). Enable override to continue.
             </Alert>
           ) : null}
           {importResult?.security?.warnings?.length ? (
@@ -1322,9 +1781,25 @@ function ImportUrlDialog({
                 Security scan
               </Typography>
               <Stack spacing={1}>
+                <Stack direction="row" spacing={1} alignItems="center" useFlexGap flexWrap="wrap">
+                  <Chip
+                    size="small"
+                    color={importRisk.chipColor}
+                    label={`Risk ${importRisk.score10.toFixed(1)}/10`}
+                  />
+                  <Chip size="small" variant="outlined" color={importRisk.chipColor} label={importRisk.bandLabel} />
+                  <Typography variant="caption" color="text.secondary">
+                    Scale: &lt;5 secure, 5-8 needs review, 8-10 risky
+                  </Typography>
+                </Stack>
                 <Typography variant="body2" color="text.secondary">
-                  Threat level: {str(importResult.security.threat_level, "-")} | Blocked: {boolText(importResult.security.blocked)}
+                  Threat level: {str(importResult.security.threat_level, "-")} | Blocked: {boolText(importResult.security.blocked)} | Raw severity: {importRisk.rawSeverity}
                 </Typography>
+                {importRisk.totalFindings > 0 ? (
+                  <Typography variant="caption" color="text.secondary">
+                    Signals: {importRisk.totalFindings} total, {importRisk.contextualFindings} contextual (common for integration templates: API key refs, env lookups, curl/wget).
+                  </Typography>
+                ) : null}
                 {Array.isArray(importResult.security.findings) && importResult.security.findings.length > 0 ? (
                   <TableContainer className="table-shell">
                     <Table size="small">
@@ -1372,16 +1847,17 @@ function ImportUrlDialog({
                 Per-skill security
               </Typography>
               <TableContainer className="table-shell">
-                <Table size="small">
-                  <TableHead>
-                    <TableRow>
-                      <TableCell>Skill</TableCell>
-                      <TableCell>Status</TableCell>
-                      <TableCell>Threat</TableCell>
-                      <TableCell>Blocked</TableCell>
-                      <TableCell>Warnings</TableCell>
-                      <TableCell>Findings</TableCell>
-                    </TableRow>
+                    <Table size="small">
+                      <TableHead>
+                        <TableRow>
+                          <TableCell>Skill</TableCell>
+                          <TableCell>Status</TableCell>
+                          <TableCell>Risk</TableCell>
+                          <TableCell>Threat</TableCell>
+                          <TableCell>Blocked</TableCell>
+                          <TableCell>Warnings</TableCell>
+                          <TableCell>Findings</TableCell>
+                        </TableRow>
                   </TableHead>
                   <TableBody>
                     {importResult.imported.map((entry, idx) => {
@@ -1389,10 +1865,18 @@ function ImportUrlDialog({
                       const sec = child?.security;
                       const warningsCount = Array.isArray(sec?.warnings) ? sec?.warnings.length : 0;
                       const findingsCount = Array.isArray(sec?.findings) ? sec?.findings.length : 0;
+                      const childRisk = computeImportRiskSummary(sec);
                       return (
                         <TableRow key={`${entry?.url || child?.name || idx}-${idx}`}>
                           <TableCell sx={{ wordBreak: "break-word" }}>{child?.name || "-"}</TableCell>
                           <TableCell>{child?.status || "-"}</TableCell>
+                          <TableCell sx={{ whiteSpace: "nowrap" }}>
+                            <Chip
+                              size="small"
+                              color={childRisk.chipColor}
+                              label={`${childRisk.score10.toFixed(1)}/10`}
+                            />
+                          </TableCell>
                           <TableCell>{str(sec?.threat_level, "-")}</TableCell>
                           <TableCell>{boolText(sec?.blocked)}</TableCell>
                           <TableCell>{warningsCount}</TableCell>
@@ -1768,14 +2252,27 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
   const [chatNotice, setChatNotice] = useState<string | null>(null);
   const [isStreaming, setIsStreaming] = useState(false);
   const [pendingUserMessage, setPendingUserMessage] = useState<string | null>(null);
+  const [failedUserMessage, setFailedUserMessage] = useState<string | null>(null);
   const [streamingResponse, setStreamingResponse] = useState("");
   const [streamingSteps, setStreamingSteps] = useState<JsonRecord[]>([]);
   const [streamTraceOpen, setStreamTraceOpen] = useState(false);
+  const [workspaceOpen, setWorkspaceOpen] = useState(false);
+  const [activityAutoFollow, setActivityAutoFollow] = useState(true);
+  const [secretHelperMode, setSecretHelperMode] = useState<"reuse" | "manual">("reuse");
+  const [secretHelperKey, setSecretHelperKey] = useState("OPENAI_API_KEY");
+  const [secretHelperValue, setSecretHelperValue] = useState("");
+  const [secretHelperBusy, setSecretHelperBusy] = useState(false);
   const [isDragOverChat, setIsDragOverChat] = useState(false);
+  const [deployedFiles, setDeployedFiles] = useState<Array<{ name: string; content: string }>>([]);
+  const [liveFileWrites, setLiveFileWrites] = useState<Record<string, LiveFileWriteState>>({});
+  const [codeViewerOpen, setCodeViewerOpen] = useState(false);
+  const [codeViewerFileIdx, setCodeViewerFileIdx] = useState(0);
+  const [previewDialogOpen, setPreviewDialogOpen] = useState(false);
   const [messageTraceOpen, setMessageTraceOpen] = useState<Record<string, boolean>>({});
   const [traceStepsById, setTraceStepsById] = useState<Record<string, JsonRecord[]>>({});
   const [traceLoadingById, setTraceLoadingById] = useState<Record<string, boolean>>({});
   const [traceErrorById, setTraceErrorById] = useState<Record<string, string>>({});
+  const [lastRunSteps, setLastRunSteps] = useState<JsonRecord[]>([]);
   const [conversationMenuAnchor, setConversationMenuAnchor] = useState<HTMLElement | null>(null);
   const [conversationMenuTarget, setConversationMenuTarget] = useState<JsonRecord | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -1783,6 +2280,8 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
   const threadRef = useRef<HTMLDivElement | null>(null);
   const streamLockRef = useRef(false);
   const recentSendRef = useRef<{ fingerprint: string; at: number } | null>(null);
+  const streamingStepsRef = useRef<JsonRecord[]>([]);
+  const workspaceActivityRef = useRef<HTMLDivElement | null>(null);
 
   const convQ = useQuery({
     queryKey: ["chat-conversations"],
@@ -1821,33 +2320,274 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
   const selectedConversationProjectId = str(selectedConversation?.project_id, "").trim();
   const activeProjectId = selectedConversationProjectId || draftProjectId;
 
+  const toHumanToolName = (name: string): string => {
+    const normalized = (name || "").trim().toLowerCase();
+    if (!normalized) return "Tool";
+    const direct: Record<string, string> = {
+      app_deploy: "App deploy",
+      build_check: "Build check",
+      run_tests: "Test run",
+      lint_check: "Lint check",
+      source_read: "Read files",
+      source_write: "Write files",
+      source_edit: "Edit files",
+      source_list: "List files",
+      source_search: "Search files",
+      frontend_build: "Frontend build",
+      schedule_task: "Schedule task",
+      browse: "Open web page",
+      web_search: "Web search"
+    };
+    if (direct[normalized]) return direct[normalized];
+    return normalized
+      .replace(/[_-]+/g, " ")
+      .replace(/\b\w/g, (ch) => ch.toUpperCase());
+  };
+
+  const toolStartCopy = (name: string): { label: string; detail: string } => {
+    const normalized = (name || "").trim().toLowerCase();
+    const byTool: Record<string, { label: string; detail: string }> = {
+      app_deploy: { label: "Deploying public link", detail: "Starting deployment and publishing access link." },
+      build_check: { label: "Running checks", detail: "Checking compile and build health." },
+      run_tests: { label: "Running checks", detail: "Running tests to validate behavior." },
+      lint_check: { label: "Running checks", detail: "Checking code quality and style." },
+      source_read: { label: "Reading project files", detail: "Reviewing existing code before changes." },
+      source_write: { label: "Creating project files", detail: "Creating or updating project files." },
+      source_edit: { label: "Creating project files", detail: "Applying code changes in project files." },
+      source_list: { label: "Scanning project files", detail: "Checking project structure." },
+      source_search: { label: "Searching project files", detail: "Looking for the right place to edit." },
+      web_search: { label: "Searching sources", detail: "Looking up relevant online sources." },
+      browse: { label: "Opening source page", detail: "Trying to open the requested web page." },
+      schedule_task: { label: "Setting recurring monitor", detail: "Creating the schedule for automatic runs." },
+      frontend_build: { label: "Installing dependencies", detail: "Preparing dependencies and building dashboard UI." }
+    };
+    return byTool[normalized] || {
+      label: `Running ${toHumanToolName(name).toLowerCase()}`,
+      detail: "Executing this action."
+    };
+  };
+
+  const simplifyConsoleDetail = (detail: string): string => {
+    let text = (detail || "").replace(/\s+/g, " ").trim();
+    if (!text) return "";
+
+    if (/^loaded \d+ messages?, packed \d+/i.test(text)) return "Collected recent chat context.";
+    if (/channel:\s*\w+\s*\|\s*length:\s*\d+\s*chars/i.test(text)) return "Reading your request.";
+    if (/mem0 pending/i.test(text)) return "Checking saved memory context.";
+    if (/found \d+ relevant memories/i.test(text)) {
+      const m = text.match(/found\s+(\d+)\s+relevant memories/i);
+      const count = m?.[1] || "0";
+      return `Found ${count} related memory item${count === "1" ? "" : "s"}.`;
+    }
+    if (/complex\s*[-=]?>\s*direct llm/i.test(text)) return "Using a direct execution strategy.";
+    if (/using primary model/i.test(text)) return "Selected the best available model.";
+    if (/response length:\s*\d+\s*chars/i.test(text) || /tool calls:\s*\d+/i.test(text)) {
+      return "Prepared the next response.";
+    }
+    if (/proof id:/i.test(text)) return "Saved an execution proof.";
+    if (/running in sandboxed environment/i.test(text)) return "Running this action in a safe workspace.";
+    if (/install(ing)? dependencies|npm install|pnpm install|yarn install|cargo fetch/i.test(text)) {
+      return "Installing dependencies.";
+    }
+    if (/approval required|needs approval|awaiting approval|requires approval/i.test(text)) {
+      return "Waiting for your approval/input.";
+    }
+    if (/browse failed; used search fallback/i.test(text)) {
+      return "Could not open the page directly, switched to web search.";
+    }
+    if (/http error 404/i.test(text) || /\b404\b.*not found/i.test(text)) {
+      return "Page not found (404). Trying alternate sources.";
+    }
+    if (/search results for:/i.test(text)) return "Found search results and selected relevant sources.";
+    if (/^\{\s*"name"\s*:\s*"[^"]+"\s*\}$/i.test(text)) {
+      const toolMatch = text.match(/"name"\s*:\s*"([^"]+)"/i);
+      if (toolMatch?.[1]) return `${toHumanToolName(toolMatch[1])} started.`;
+    }
+
+    if (text.length > 170) text = `${text.slice(0, 167).trimEnd()}...`;
+    return text;
+  };
+
+  const normalizeStatusText = (value: string): string =>
+    (value || "")
+      .toLowerCase()
+      .replace(/[`"'.,:;!?()[\]{}<>/_\\-]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  const isRedundantStatusDetail = (label: string, detail: string): boolean => {
+    const a = normalizeStatusText(label);
+    const b = normalizeStatusText(detail);
+    if (!a || !b) return false;
+    if (a === b) return true;
+    if (a.length >= 16 && b.includes(a)) return true;
+    if (b.length >= 16 && a.includes(b)) return true;
+    return false;
+  };
+
+  const humanizeStep = (
+    title: string,
+    detail: string,
+    stepType: string
+  ): { label: string; detail: string; kind?: string; tone?: string } => {
+    const t = title.toLowerCase();
+    // Log-style: short typed label + actual detail from the step data
+    if (t === "message received" || t.startsWith("message received")) {
+      return { label: "Reading your request", detail: detail || "" };
+    }
+    if (t === "memory layer" || t.startsWith("memory layer")) {
+      return { label: "Loading memory", detail: detail || "Checking saved context and preferences" };
+    }
+    if (t === "memory retrieval" || t.startsWith("memory retrieval")) {
+      return { label: "Searching memory", detail: detail || "Looking for related past conversations" };
+    }
+    if (t === "context packing" || t.startsWith("context packing")) {
+      return { label: "Building context", detail: detail || "Assembling conversation history" };
+    }
+    if (t === "llm routing decision" || t.startsWith("llm routing decision")) {
+      return { label: "Choosing strategy", detail: detail || "Deciding the best execution approach" };
+    }
+    if (t === "model selection" || t.startsWith("model selection")) {
+      return { label: "Selecting model", detail: detail || "Picking the best available model" };
+    }
+    if (t === "llm request" || t.startsWith("llm request")) {
+      return { label: "Thinking", detail: detail || "Sending request to AI model" };
+    }
+    if (t === "parallel thinking started" || t.startsWith("parallel thinking started")) {
+      return { label: "Parallel reasoning", detail: detail || "Exploring multiple approaches simultaneously" };
+    }
+    if (t === "parallel thinking complete" || t.startsWith("parallel thinking complete")) {
+      return { label: "Reasoning complete", detail: detail || "Merged parallel results", kind: "Done", tone: "tone-success" };
+    }
+    if (t === "autopilot proceed" || t.startsWith("autopilot proceed")) {
+      return { label: "Running autonomously", detail: detail || "Proceeding without user input" };
+    }
+    if (t.startsWith("tool started:")) {
+      const rawName = title.split(":").slice(1).join(":").trim();
+      const humanName = toHumanToolName(rawName);
+      return {
+        label: `Running ${humanName}`,
+        detail: detail || "",
+        kind: "Running",
+        tone: "tone-action"
+      };
+    }
+    if (t.startsWith("tool finished:")) {
+      const rawName = title.split(":").slice(1).join(":").trim();
+      if (detail && detail.length > 2) {
+        return {
+          label: detail,
+          detail: "",
+          kind: "Done",
+          tone: "tone-success"
+        };
+      }
+      return {
+        label: `${toHumanToolName(rawName)} completed`,
+        detail: "",
+        kind: "Done",
+        tone: "tone-success"
+      };
+    }
+    if (t.startsWith("tool progress:")) {
+      const rawName = title.split(":").slice(1).join(":").trim();
+      return {
+        label: `Running ${toHumanToolName(rawName)}`,
+        detail: detail || "Working...",
+        kind: "Running",
+        tone: "tone-action"
+      };
+    }
+    if (stepType.includes("tool_start")) {
+      return {
+        label: "Executing action",
+        detail: detail || "",
+        kind: "Running",
+        tone: "tone-action"
+      };
+    }
+    if (stepType.includes("tool_progress")) {
+      return { label: "Action in progress", detail: detail || "", kind: "Running", tone: "tone-action" };
+    }
+    if (stepType.includes("tool_result")) {
+      return { label: "Action completed", detail: detail || "", kind: "Done", tone: "tone-success" };
+    }
+    if (t.includes("approval")) {
+      return { label: "Waiting for approval", detail: detail || "", tone: "tone-thinking" };
+    }
+    if (t === "response complete" || t.startsWith("response complete")) {
+      return { label: "Response delivered", detail: detail || "", kind: "Done", tone: "tone-success" };
+    }
+    if (t === "llm response received" || t.startsWith("llm response received")) {
+      return { label: "Response received", detail: detail || "Model finished generating", kind: "Update" };
+    }
+    if (t === "self evolve" || t.startsWith("self evolve") || t.startsWith("running self evolve")) {
+      return { label: "Self-evolving", detail: detail || "Autonomous code modification started", kind: "Running", tone: "tone-action" };
+    }
+    // Fallback: use raw title as-is
+    const fallbackLabel = title || stepType.replace(/[_-]+/g, " ").trim();
+    return { label: fallbackLabel, detail };
+  };
+
   const buildStepCard = (step: JsonRecord, index: number) => {
     const stepType = str(step.step_type, str(step.type, "step")).toLowerCase();
     const title = str(step.title, "").trim();
-    const detail = (str(step.detail, "").trim() || str(step.data, "").trim()).slice(0, 320);
+    const fullDetail = extractStepDetailText(step, 2800);
+    const rawDetail = fullDetail.slice(0, 900);
+    const human = humanizeStep(title, rawDetail, stepType);
+    const humanDetailRaw = str(human.detail, "").trim();
+    let detail = humanDetailRaw ? simplifyConsoleDetail(humanDetailRaw) : "";
     const time = str(step.time, "");
     const baseLabel = stepType.replace(/[_-]+/g, " ").trim() || "step";
-    const label = title || baseLabel.replace(/\b\w/g, (ch) => ch.toUpperCase());
+    const rawLabel = human.label || title || baseLabel;
+    // Only capitalize if label doesn't contain file paths/extensions
+    const label = /\.\w{1,5}\b|\//.test(rawLabel) ? rawLabel : rawLabel.replace(/\b\w/g, (ch) => ch.toUpperCase());
     let tone = "tone-neutral";
-    let kind = "STEP";
+    let kind = "Update";
+    const labelLower = label.toLowerCase();
     if (stepType.includes("tool_start")) {
       tone = "tone-tool";
-      kind = "TOOL START";
+      kind = "Running";
+    } else if (stepType.includes("tool_progress")) {
+      tone = "tone-action";
+      kind = "Running";
     } else if (stepType.includes("tool_result") || stepType.includes("result") || stepType.includes("complete")) {
       tone = "tone-success";
-      kind = "TOOL RESULT";
+      kind = "Done";
     } else if (stepType.includes("error") || stepType.includes("fail")) {
       tone = "tone-error";
-      kind = "ERROR";
+      kind = "Issue";
     } else if (stepType.includes("think") || stepType.includes("plan") || stepType.includes("reason")) {
       tone = "tone-thinking";
-      kind = "THINK";
+      kind = "Planning";
     } else if (stepType.includes("action") || stepType.includes("execute")) {
       tone = "tone-action";
-      kind = "ACTION";
+      kind = "Running";
     } else if (stepType.includes("response") || stepType.includes("final") || stepType.includes("summary")) {
       tone = "tone-synthesis";
-      kind = "SYNTH";
+      kind = "Done";
+    } else if (/start|running|loading|checking|choosing|selecting|generating/.test(labelLower)) {
+      tone = "tone-action";
+      kind = "Running";
+    } else if (/finished|complete|done|recorded|generated/.test(labelLower)) {
+      tone = "tone-success";
+      kind = "Done";
+    } else if (/issue|error|failed|blocked/.test(labelLower)) {
+      tone = "tone-error";
+      kind = "Issue";
+    }
+    if (human.tone) tone = human.tone;
+    if (human.kind) kind = human.kind;
+    let detailFull = humanDetailRaw ? (fullDetail || rawDetail) : "";
+    if (isRedundantStatusDetail(label, detail)) {
+      detail = "";
+    }
+    if (
+      detailFull &&
+      (isRedundantStatusDetail(label, detailFull) ||
+        (detail && isRedundantStatusDetail(detail, detailFull)))
+    ) {
+      detailFull = "";
     }
     return {
       id: `${time || "live"}-${index}-${label}`,
@@ -1856,6 +2596,7 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
       kind,
       label,
       detail,
+      detailFull,
       time
     };
   };
@@ -1864,16 +2605,23 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
     () => streamingSteps.map((step, idx) => buildStepCard(step, idx)).slice(-24),
     [streamingSteps]
   );
+  const streamingActivity = useMemo(() => {
+    if (streamingTraceCards.length === 0) return "Getting ready to start...";
+    const last = streamingTraceCards[streamingTraceCards.length - 1];
+    const detail = (last.detail || "").trim();
+    if (detail) return `${last.label}: ${detail}`;
+    return `Now: ${last.label}`;
+  }, [streamingTraceCards]);
 
   const traceSummaryText = (
     cards: Array<ReturnType<typeof buildStepCard>>,
     opts?: { loading?: boolean; streaming?: boolean; error?: string }
   ) => {
-    if (opts?.error) return "Trace unavailable";
-    if (opts?.loading) return "Trace loading...";
-    if (cards.length === 0) return opts?.streaming ? "Trace | waiting for first step..." : "Trace";
+    if (opts?.error) return "Activity details unavailable.";
+    if (opts?.loading) return "Loading activity...";
+    if (cards.length === 0) return opts?.streaming ? "Waiting for first activity update..." : "No activity yet.";
     const last = cards[cards.length - 1];
-    return `Trace | ${cards.length} step${cards.length === 1 ? "" : "s"} | ${last.kind}: ${last.label}`;
+    return `${cards.length} update${cards.length === 1 ? "" : "s"} • Now: ${last.label}`;
   };
 
   const parseTraceSteps = (payload: unknown): JsonRecord[] => {
@@ -1901,7 +2649,7 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
         // keep raw
       }
       if (/trace/i.test(normalized) && /not found/i.test(normalized)) {
-        normalized = "Trace is not available for this response.";
+        normalized = "Detailed activity is not available for this response.";
       }
       setTraceErrorById((prev) => ({ ...prev, [traceId]: normalized }));
     } finally {
@@ -1919,10 +2667,40 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
     setChatError(null);
     setChatNotice(null);
     setPendingUserMessage(null);
+    setFailedUserMessage(null);
     setStreamingResponse("");
     setStreamingSteps([]);
+    streamingStepsRef.current = [];
+    setTraceStepsById({});
+    setTraceLoadingById({});
+    setTraceErrorById({});
+    setLastRunSteps([]);
+    setLiveFileWrites({});
+    setDeployedFiles([]);
+    setCodeViewerFileIdx(0);
     setStreamTraceOpen(false);
     setMessageTraceOpen({});
+  };
+
+  const openConversationById = (id: string) => {
+    if (!id || isStreaming) return;
+    setChatError(null);
+    if (conversationId === id) return;
+    setPendingUserMessage(null);
+    setFailedUserMessage(null);
+    setStreamingResponse("");
+    setStreamingSteps([]);
+    streamingStepsRef.current = [];
+    setTraceStepsById({});
+    setTraceLoadingById({});
+    setTraceErrorById({});
+    setLastRunSteps([]);
+    setLiveFileWrites({});
+    setDeployedFiles([]);
+    setCodeViewerFileIdx(0);
+    setStreamTraceOpen(false);
+    setMessageTraceOpen({});
+    setConversationId(id);
   };
 
   const queueAttachedFiles = (files: FileList | null) => {
@@ -2028,6 +2806,119 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
     if (!ok) throw new Error("Copy failed.");
   };
 
+  const normalizeChatError = (raw: string): string => {
+    let message = (raw || "").trim();
+    if (!message) return "Something went wrong while running this request.";
+
+    for (let i = 0; i < 3; i += 1) {
+      const withoutPrefix = message.replace(/^error:\s*/i, "").trim();
+      if (withoutPrefix !== message) {
+        message = withoutPrefix;
+        continue;
+      }
+      try {
+        const parsed = JSON.parse(message) as unknown;
+        if (typeof parsed === "string") {
+          const next = parsed.trim();
+          if (next && next !== message) {
+            message = next;
+            continue;
+          }
+          break;
+        }
+        const obj = asRecord(parsed);
+        const extracted = [
+          str(obj.error, ""),
+          str(obj.message, ""),
+          str(obj.detail, ""),
+          str(obj.reason, "")
+        ]
+          .map((v) => v.trim())
+          .find(Boolean);
+        if (extracted && extracted !== message) {
+          message = extracted;
+          continue;
+        }
+      } catch {
+        // keep raw text when it is not JSON
+      }
+      break;
+    }
+
+    if (
+      /missing ['"`]?files['"`]?/i.test(message) ||
+      /object mapping filename to content/i.test(message)
+    ) {
+      return "Deploy payload was malformed (missing files). Retry the request; AgentArk will regenerate a valid app_deploy payload.";
+    }
+    if (
+      /error decoding response body/i.test(message) ||
+      /error deserializing response body/i.test(message)
+    ) {
+      return "Model/provider response format mismatch. For GLM, use OpenAI-compatible Chat Completions in Settings > Models (correct base URL + model), or switch to a known-compatible model.";
+    }
+    if (
+      /openai-compatible response schema mismatch/i.test(message) ||
+      /openai-compatible response was not valid json/i.test(message) ||
+      /openai-compatible api returned an error payload/i.test(message) ||
+      /no response from openai/i.test(message)
+    ) {
+      return "Model/provider response format mismatch. For GLM, confirm OpenAI-compatible Chat Completions support in Settings > Models, or switch to a known-compatible model.";
+    }
+    if (/syntaxerror/i.test(message) && /(app\.py|python)/i.test(message)) {
+      const lineMatch = message.match(/line\s+(\d+)/i);
+      const lineHint = lineMatch?.[1] ? ` at line ${lineMatch[1]}` : "";
+      return `Generated app code has a Python syntax error${lineHint}. Ask AgentArk to fix the generated file and redeploy.`;
+    }
+    if (
+      /stopped shortly after launch/i.test(message) ||
+      /runtime is not active/i.test(message)
+    ) {
+      return "The deployed app process crashed after startup. Check the validation/error details for runtime logs, then retry deploy with a corrected entry/install command.";
+    }
+    if (
+      /missing authorization:\s*bearer/i.test(message) ||
+      /bearer\s*<api_key>/i.test(message) ||
+      /api authentication is not configured/i.test(message) ||
+      /^unauthorized\b/i.test(message)
+    ) {
+      return "HTTP API auth is missing or expired. Open Settings > Advanced > API Key (HTTP), regenerate/copy the key, then retry.";
+    }
+    if (/openai api error/i.test(message) || /anthropic api error/i.test(message)) {
+      const lower = message.toLowerCase();
+      if (
+        /missing.*api[_\s-]?key/.test(lower) ||
+        /invalid.*api[_\s-]?key/.test(lower) ||
+        /authentication/.test(lower) ||
+        /unauthorized/.test(lower)
+      ) {
+        return "A provider API key is missing. Set it in Settings > Models (LLM) or Settings > Integrations (tool-specific keys), then retry.";
+      }
+      return message;
+    }
+    if (
+      /missing.*api[_\s-]?key/i.test(message) ||
+      /no api key available/i.test(message) ||
+      /api key.*not configured/i.test(message)
+    ) {
+      return "A provider API key is missing. Set it in Settings > Models (LLM) or Settings > Integrations (tool-specific keys), then retry.";
+    }
+    if (/missing.*auth/i.test(message)) {
+      return "Authentication is missing for this action. Check Settings > Models and Settings > Advanced > API Key (HTTP).";
+    }
+    if (/http error 404/i.test(message) || /\b404\b.*not found/i.test(message)) {
+      return "A page request returned 404 (not found). The agent should switch to another source automatically.";
+    }
+    if (
+      /error executing 'browse'/i.test(message) ||
+      /failed to fetch url/i.test(message) ||
+      /\bbrowse\b.*\bfailed\b/i.test(message)
+    ) {
+      return "The web page lookup failed. The agent can continue by searching alternative sources.";
+    }
+    return message;
+  };
+
   const exportConversationById = async (targetId: string, titleHint?: string) => {
     if (!targetId) return;
     setChatError(null);
@@ -2064,7 +2955,7 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
       URL.revokeObjectURL(url);
       setChatNotice("Chat exported.");
     } catch (err) {
-      setChatError(errMessage(err));
+      setChatError(normalizeChatError(errMessage(err)));
     }
   };
 
@@ -2075,7 +2966,7 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
       await copyText(role === "user" ? stripAttachmentContextMarker(content) : content);
       setChatNotice("Message copied.");
     } catch (err) {
-      setChatError(errMessage(err));
+      setChatError(normalizeChatError(errMessage(err)));
     }
   };
 
@@ -2088,7 +2979,7 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
       setChatNotice("Chat deleted.");
     },
     onError: (err) => {
-      setChatError(errMessage(err));
+      setChatError(normalizeChatError(errMessage(err)));
     }
   });
 
@@ -2111,21 +3002,105 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
     setConversationMenuTarget(null);
   };
 
+  const isHeartbeatStreamingStep = (value: JsonRecord): boolean => {
+    const title = normalizeStatusText(str(value.title, ""));
+    const icon = normalizeStatusText(str(value.icon, ""));
+    const detail = normalizeStatusText(str(value.detail, ""));
+    const stepType = normalizeStatusText(str(value.step_type, str(value.type, "")));
+    return (
+      title.includes("still working") ||
+      icon === "wait" ||
+      stepType.includes("still work") ||
+      stepType.includes("heartbeat") ||
+      (stepType.includes("thinking") &&
+        detail.includes("no new output") &&
+        detail.includes("idle"))
+    );
+  };
+
+  const streamingStepDedupKey = (value: JsonRecord): string => {
+    const stepType = normalizeStatusText(str(value.step_type, str(value.type, "step")));
+    const title = normalizeStatusText(str(value.title, ""));
+    const detail = normalizeStatusText(str(value.detail, ""));
+    return `${stepType}|${title}|${detail}`;
+  };
+
+  const streamingStepDisplayKey = (value: JsonRecord): string => {
+    const title = normalizeStatusText(str(value.title, ""));
+    const detail = normalizeStatusText(str(value.detail, ""));
+    return `${title}|${detail}`;
+  };
+
+  const summarizeToolStartPayload = (name: string, payload: unknown): string => {
+    const normalizedName = (name || "").trim().toLowerCase();
+    if (normalizedName === "app_deploy") {
+      const root = asRecord(payload);
+      const nested = asRecord(root.payload);
+      const rootFiles = asRecord(root.files);
+      const nestedFiles = asRecord(nested.files);
+      const filesObj = Object.keys(rootFiles).length > 0 ? rootFiles : nestedFiles;
+      const fileCount = Object.keys(filesObj).length;
+      const entryCommand = str(root.entry_command, str(nested.entry_command, "")).trim();
+      if (fileCount > 0) {
+        return `Preparing deployment package (${fileCount} file${fileCount === 1 ? "" : "s"}${entryCommand ? ", dynamic runtime" : ", static runtime"}).`;
+      }
+      return "Preparing deployment package.";
+    }
+    const compact = compactUnknown(payload, 320);
+    if (!compact) return `Starting ${toHumanToolName(name)}.`;
+    return simplifyConsoleDetail(compact);
+  };
+
   const pushStreamingStep = (step: JsonRecord) => {
     setStreamingSteps((prev) => {
-      const next = [...prev, step];
+      const incomingHeartbeat = isHeartbeatStreamingStep(step);
+      let next: JsonRecord[];
+      if (incomingHeartbeat) {
+        const existingIndex = prev.findIndex((row) => isHeartbeatStreamingStep(row));
+        if (existingIndex >= 0) {
+          next = [...prev];
+          next[existingIndex] = step;
+        } else {
+          next = [...prev, step];
+        }
+      } else {
+        next = [...prev.filter((row) => !isHeartbeatStreamingStep(row))];
+        const incomingKey = streamingStepDedupKey(step);
+        const incomingDisplayKey = streamingStepDisplayKey(step);
+        const lastIdx = next.length - 1;
+        if (
+          lastIdx >= 0 &&
+          (streamingStepDedupKey(next[lastIdx]) === incomingKey ||
+            (incomingDisplayKey &&
+              incomingDisplayKey !== "|" &&
+              streamingStepDisplayKey(next[lastIdx]) === incomingDisplayKey))
+        ) {
+          next[lastIdx] = step;
+        } else {
+          next.push(step);
+        }
+      }
       if (next.length > 32) next.splice(0, next.length - 32);
+      streamingStepsRef.current = next;
       return next;
     });
   };
 
-  const runStreamingChat = async (message: string, files: File[] = []) => {
-    const activeMessage =
+  const runStreamingChat = async (
+    message: string,
+    files: File[] = [],
+    opts?: { sensitive?: boolean }
+  ): Promise<boolean> => {
+    let activeMessage =
       message.trim() ||
       (files.length > 0
         ? "Please analyze the attached documents and answer using them."
         : "");
-    if (!activeMessage || isStreaming || streamLockRef.current) return;
+    if (/^\s*use current (llm|model) (key|config)\s*$/i.test(activeMessage)) {
+      const fallbackKey = (secretHelperKey || "OPENAI_API_KEY").trim().toUpperCase();
+      activeMessage = `use current llm key for ${fallbackKey}`;
+    }
+    if (!activeMessage || isStreaming || streamLockRef.current) return false;
     const now = Date.now();
     const fingerprint = `${conversationId || "__new__"}::${activeProjectId || "__no_project__"}::${activeMessage
       .toLowerCase()
@@ -2134,19 +3109,28 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
     const lastSend = recentSendRef.current;
     if (lastSend && lastSend.fingerprint === fingerprint && now - lastSend.at < 1500) {
       setChatNotice("Duplicate send ignored.");
-      return;
+      return false;
     }
     recentSendRef.current = { fingerprint, at: now };
     streamLockRef.current = true;
 
     setChatError(null);
-    setPendingUserMessage(activeMessage);
+    const sensitiveMessage =
+      Boolean(opts?.sensitive) ||
+      /^\s*set secret\s+/i.test(activeMessage) ||
+      /^\s*use current (llm|model) (key|config)(?:\s+for\s+.+)?\s*$/i.test(activeMessage);
+    setPendingUserMessage(sensitiveMessage ? null : activeMessage);
+    setFailedUserMessage(null);
     setStreamingResponse("");
     setStreamingSteps([]);
+    setLiveFileWrites({});
+    setDeployedFiles([]);
+    setCodeViewerFileIdx(0);
     setStreamTraceOpen(false);
     setIsStreaming(true);
 
-    let resolvedConversationId = conversationId || generateConversationId();
+    const requestedConversationId = conversationId || generateConversationId();
+    let resolvedConversationId = conversationId || "";
     let payloadMessage = activeMessage;
     let streamError: string | null = null;
     const absorbConversationId = (payload: unknown) => {
@@ -2172,7 +3156,7 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
         {
           message: payloadMessage,
           channel: "web",
-          conversation_id: resolvedConversationId,
+          conversation_id: requestedConversationId,
           project_id: activeProjectId || undefined
         },
         {
@@ -2186,19 +3170,112 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
             absorbConversationId(step);
             pushStreamingStep(step);
           },
-          onToolStart: (name) => {
+          onToolStart: (name, payload) => {
+            const payloadSummary = summarizeToolStartPayload(name, payload);
             pushStreamingStep({
               step_type: "tool_start",
               title: `Tool started: ${name}`,
+              detail: payloadSummary || `Starting ${toHumanToolName(name)}.`,
               data: name
             });
+            // Capture deployed app files for code viewer
+            if (name === "app_deploy" && payload && typeof payload === "object") {
+              const rec = payload as Record<string, unknown>;
+              const nested = rec.payload && typeof rec.payload === "object"
+                ? (rec.payload as Record<string, unknown>)
+                : null;
+              const files = (rec.files as Record<string, string> | undefined)
+                || (nested?.files as Record<string, string> | undefined);
+              if (files && typeof files === "object") {
+                const captured = Object.entries(files)
+                  .filter(([, v]) => typeof v === "string")
+                  .map(([k, v]) => ({ name: k, content: v as string }));
+                if (captured.length > 0) {
+                  setDeployedFiles(captured);
+                  setLiveFileWrites((prev) => {
+                    const next = { ...prev };
+                    for (const file of captured) {
+                      if (!next[file.name]) {
+                        const totalLines =
+                          file.content.length > 0
+                            ? file.content.split(/\r?\n/).length
+                            : 0;
+                        next[file.name] = {
+                          content: "",
+                          line: 0,
+                          totalLines,
+                          done: false
+                        };
+                      }
+                    }
+                    return next;
+                  });
+                  setCodeViewerFileIdx(0);
+                  setWorkspaceOpen(true);
+                }
+              }
+            }
           },
-          onToolResult: (name, content) => {
-            const preview = content.trim().slice(0, 180);
+          onToolResult: (name, content, payload) => {
+            const preview = content.trim().slice(0, 1600);
+            if (name === "app_deploy") {
+              setLiveFileWrites((prev) => {
+                const next: Record<string, LiveFileWriteState> = {};
+                for (const [file, state] of Object.entries(prev)) {
+                  next[file] = { ...state, done: true };
+                }
+                return next;
+              });
+            }
             pushStreamingStep({
               step_type: "tool_result",
               title: `Tool finished: ${name || "tool"}`,
-              data: preview
+              detail: preview,
+              data: payload || preview
+            });
+          },
+          onToolProgress: (name, content, payload) => {
+            const preview = content.trim().slice(0, 1600);
+            const payloadObj = asRecord(payload);
+            if (name === "app_deploy" && str(payloadObj.kind, "") === "file_write") {
+              const fileName = str(payloadObj.file, "").trim();
+              if (fileName) {
+                const lineNo = Math.max(0, num(payloadObj.line, 0));
+                const totalLines = Math.max(0, num(payloadObj.total_lines, 0));
+                const done =
+                  toBool(payloadObj.done) || (totalLines > 0 && lineNo >= totalLines);
+                const text = str(payloadObj.text, "");
+                setLiveFileWrites((prev) => {
+                  const current = prev[fileName];
+                  const currentLine = current?.line ?? 0;
+                  let nextContent = current?.content ?? "";
+                  if (lineNo > currentLine) {
+                    if (lineNo > 0) nextContent += `${text}\n`;
+                  } else if (!current && text) {
+                    nextContent = `${text}\n`;
+                  }
+                  return {
+                    ...prev,
+                    [fileName]: {
+                      content: nextContent,
+                      line: Math.max(currentLine, lineNo),
+                      totalLines: totalLines > 0 ? totalLines : (current?.totalLines ?? 0),
+                      done
+                    }
+                  };
+                });
+                setDeployedFiles((prev) => {
+                  if (prev.some((f) => f.name === fileName)) return prev;
+                  return [...prev, { name: fileName, content: "" }];
+                });
+                setWorkspaceOpen(true);
+              }
+            }
+            pushStreamingStep({
+              step_type: "tool_progress",
+              title: `Tool progress: ${name || "tool"}`,
+              detail: preview,
+              data: Object.keys(payloadObj).length > 0 ? payloadObj : preview
             });
           },
           onContent: (payload) => {
@@ -2207,36 +3284,58 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
             absorbConversationId(payload);
           },
           onError: (messageText) => {
-            streamError = messageText;
+            streamError = normalizeChatError(messageText);
           }
         }
       );
     } catch (err) {
-      streamError = errMessage(err);
+      streamError = normalizeChatError(errMessage(err));
     } finally {
-      if (streamError) setChatError(streamError);
-      if (!resolvedConversationId) {
-        try {
-          const latest = await api.rawGet("/conversations?limit=1");
-          const newest = pickRecords(latest, "conversations")[0];
-          const newestId = str(newest?.id, "");
-          if (newestId) resolvedConversationId = newestId;
-        } catch {
-          // Ignore fallback lookup failures; chat can still be selected manually.
+      if (streamError) {
+        setChatError(streamError);
+        if (!sensitiveMessage) {
+          setFailedUserMessage(activeMessage);
         }
       }
-      if (resolvedConversationId) {
-        setConversationId(resolvedConversationId);
-        await queryClient.invalidateQueries({ queryKey: ["chat-messages", resolvedConversationId] });
-      }
       await queryClient.invalidateQueries({ queryKey: ["chat-conversations"] });
+      if (!streamError) {
+        setFailedUserMessage(null);
+        const candidateConversationId = resolvedConversationId || requestedConversationId;
+        if (candidateConversationId) {
+          try {
+            await api.rawGet(`/conversations/${encodeURIComponent(candidateConversationId)}`);
+            resolvedConversationId = candidateConversationId;
+          } catch {
+            resolvedConversationId = "";
+          }
+        }
+        if (!resolvedConversationId) {
+          try {
+            const latest = await api.rawGet("/conversations?limit=1");
+            const newest = pickRecords(latest, "conversations")[0];
+            const newestId = str(newest?.id, "");
+            if (newestId) resolvedConversationId = newestId;
+          } catch {
+            // Ignore fallback lookup failures; chat can still be selected manually.
+          }
+        }
+        if (resolvedConversationId) {
+          setConversationId(resolvedConversationId);
+          await queryClient.invalidateQueries({ queryKey: ["chat-messages", resolvedConversationId] });
+        }
+      }
       if (!streamError) setAttachedFiles([]);
+      if (!streamError && streamingStepsRef.current.length > 0) {
+        setLastRunSteps(streamingStepsRef.current.slice(-64));
+      }
       setPendingUserMessage(null);
       setIsStreaming(false);
       setStreamingSteps([]);
+      streamingStepsRef.current = [];
       setStreamingResponse("");
       streamLockRef.current = false;
     }
+    return !streamError;
   };
 
   useEffect(() => {
@@ -2246,6 +3345,23 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
   }, [messages.length, pendingUserMessage, streamingResponse, isStreaming]);
 
   useEffect(() => {
+    if (!pendingUserMessage) return;
+    const pendingNormalized = stripAttachmentContextMarker(pendingUserMessage).trim();
+    if (!pendingNormalized) {
+      setPendingUserMessage(null);
+      return;
+    }
+    const lastUserMessage = [...messages]
+      .reverse()
+      .find((m) => str(m.role, "").toLowerCase() === "user");
+    if (!lastUserMessage) return;
+    const lastUserText = stripAttachmentContextMarker(str(lastUserMessage.content, "")).trim();
+    if (lastUserText === pendingNormalized) {
+      setPendingUserMessage(null);
+    }
+  }, [messages, pendingUserMessage]);
+
+  useEffect(() => {
     if (!chatNotice) return;
     const timer = window.setTimeout(() => setChatNotice(null), 2200);
     return () => window.clearTimeout(timer);
@@ -2253,6 +3369,250 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
 
   const hasLiveThreadActivity = Boolean(pendingUserMessage || isStreaming || streamingResponse.trim());
   const hasRenderableThread = messages.length > 0 || hasLiveThreadActivity;
+  const origin = typeof window !== "undefined" ? window.location.origin : "";
+  const latestAssistantMessageText = str(
+    [...messages].reverse().find((m) => str(m.role, "").toLowerCase() === "assistant")?.content,
+    ""
+  );
+
+  const workspaceSteps = isStreaming && streamingSteps.length > 0 ? streamingSteps : lastRunSteps;
+  const workspaceCards = useMemo(
+    () => workspaceSteps.map((step, idx) => buildStepCard(step, idx)).slice(-48),
+    [workspaceSteps]
+  );
+  const latestWorkspaceCard = workspaceCards.length > 0 ? workspaceCards[workspaceCards.length - 1] : null;
+  const progressRows = useMemo(() => {
+    const seen = new Set<string>();
+    const rows: Array<{
+      label: string;
+      status: "done" | "running" | "update";
+      detail: string;
+      time: string;
+      tone: string;
+    }> = [];
+    for (const row of workspaceCards) {
+      const key = row.label.trim().toLowerCase();
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      const status =
+        row.kind === "Done"
+          ? "done"
+          : row.kind === "Running"
+            ? "running"
+            : "update";
+      rows.push({
+        label: row.label,
+        status,
+        detail: row.detail || "",
+        time: row.time || "",
+        tone: row.tone
+      });
+    }
+    return rows.slice(-16);
+  }, [workspaceCards]);
+  const progressDoneCount = useMemo(
+    () => progressRows.filter((row) => row.status === "done").length,
+    [progressRows]
+  );
+  const progressSummary = progressRows.length
+    ? `${progressDoneCount}/${progressRows.length} steps complete`
+    : "No steps yet";
+
+  const codeFromCards = (() => {
+    for (let i = workspaceCards.length - 1; i >= 0; i -= 1) {
+      const detail = (workspaceCards[i]?.detail || "").trim();
+      const fenced = extractFirstCodeFence(detail);
+      if (fenced) return fenced;
+      if (detail.length > 80 && /(import |const |function |class |=>|<div|SELECT |INSERT |CREATE )/i.test(detail)) {
+        return detail;
+      }
+    }
+    return "";
+  })();
+  const codeSnapshot =
+    codeFromCards ||
+    extractFirstCodeFence(streamingResponse) ||
+    extractFirstCodeFence(latestAssistantMessageText);
+  const activeCodeFile = deployedFiles[codeViewerFileIdx] ?? null;
+  const activeLiveWrite = activeCodeFile ? liveFileWrites[activeCodeFile.name] : undefined;
+  const codeViewerContent = activeLiveWrite
+    ? activeLiveWrite.content
+    : (activeCodeFile?.content ?? "");
+  const codeViewerWriteStatus = activeLiveWrite
+    ? activeLiveWrite.totalLines > 0
+      ? `${Math.min(activeLiveWrite.line, activeLiveWrite.totalLines)}/${activeLiveWrite.totalLines} lines written${activeLiveWrite.done ? " (done)" : ""}`
+      : activeLiveWrite.done
+        ? "File write complete"
+        : "Writing file..."
+    : "";
+
+  const appsWorkspaceQ = useQuery({
+    queryKey: ["chat-workspace-apps"],
+    queryFn: () => api.rawGet("/api/apps"),
+    enabled: workspaceOpen,
+    refetchInterval: workspaceOpen && autoRefresh ? REFRESH_MS : false
+  });
+  const tunnelWorkspaceQ = useQuery({
+    queryKey: ["chat-workspace-tunnel"],
+    queryFn: () => api.rawGet("/tunnel/status"),
+    enabled: workspaceOpen,
+    refetchInterval: workspaceOpen && autoRefresh ? REFRESH_MS : false
+  });
+  const workspaceApps = pickRecords(appsWorkspaceQ.data, "apps");
+  const workspaceTunnel = asRecord(tunnelWorkspaceQ.data);
+  const workspaceTunnelBaseUrl = str(workspaceTunnel.url, "").trim().replace(/\/+$/, "");
+  const activeWorkspaceApp = useMemo(() => {
+    if (workspaceApps.length === 0) return null;
+    const running = workspaceApps.find(
+      (app) => toBool(app.running) || str(app.running, "").toLowerCase() === "true"
+    );
+    return running || workspaceApps[0];
+  }, [workspaceApps]);
+  const previewPath = str(activeWorkspaceApp?.access_url, str(activeWorkspaceApp?.url, "")).trim();
+  const previewUrl = toAbsoluteAppUrl(previewPath, origin);
+  const previewImagePath = useMemo(() => {
+    const streamImage = extractPreviewImageUrl(streamingResponse);
+    if (streamImage) return streamImage;
+    return extractPreviewImageUrl(latestAssistantMessageText);
+  }, [streamingResponse, latestAssistantMessageText]);
+  const previewImageUrl = toAbsoluteAppUrl(previewImagePath, origin);
+  const publicPreviewUrl =
+    workspaceTunnelBaseUrl && workspaceTunnelBaseUrl !== origin
+      ? toAbsoluteAppUrl(previewPath, workspaceTunnelBaseUrl)
+      : "";
+  const runtimeMode = str(activeWorkspaceApp?.runtime_mode, "").toLowerCase();
+  const runtimeSummary = (() => {
+    if (runtimeMode === "isolated_container") {
+      return { label: "Sandboxed container", tone: "success" as const };
+    }
+    if (runtimeMode === "local_process_fallback") {
+      return { label: "Local process fallback", tone: "warning" as const };
+    }
+    if (runtimeMode === "static") {
+      return { label: "Static app hosting", tone: "default" as const };
+    }
+    if (runtimeMode === "stopped") {
+      return { label: "Stopped", tone: "default" as const };
+    }
+    if (toBool(activeWorkspaceApp?.is_static)) {
+      return { label: "Static app hosting", tone: "default" as const };
+    }
+    if (toBool(activeWorkspaceApp?.running)) {
+      return { label: "Dynamic app runtime", tone: "default" as const };
+    }
+    return { label: "No app runtime yet", tone: "default" as const };
+  })();
+  const showWorkspacePanel = workspaceOpen;
+  const chatErrorLower = (chatError || "").toLowerCase();
+  const chatErrorNormalized = chatError ? normalizeChatError(chatError).toLowerCase() : "";
+  const apiKeyActionNeeded =
+    !!chatError &&
+    (/required api key is missing/.test(chatErrorLower) ||
+      /missing authorization/.test(chatErrorLower) ||
+      /bearer.{0,3}api.?key/i.test(chatErrorLower) ||
+      /missing.*api[_\s-]?key/.test(chatErrorLower) ||
+      /api.?key.*required/.test(chatErrorLower) ||
+      /api.?key.*required/.test(chatErrorNormalized) ||
+      /^unauthorized\b/.test(chatErrorLower));
+  const extractedKeyHints =
+    chatError?.match(/\b[A-Z][A-Z0-9_]{2,}\b/g)?.filter((v) => /KEY|TOKEN|SECRET/.test(v)) ?? [];
+  const suggestedSecretKey = extractedKeyHints[0] || secretHelperKey;
+  const latestRunningCard = useMemo(
+    () => [...workspaceCards].reverse().find((row) => row.kind === "Running" || row.kind === "Planning") || null,
+    [workspaceCards]
+  );
+  const runState = apiKeyActionNeeded
+    ? ("waiting_input" as const)
+    : isStreaming
+      ? ("running" as const)
+      : ("stopped" as const);
+  const runStateLabel =
+    runState === "running"
+      ? "RUNNING"
+      : runState === "waiting_input"
+        ? "WAITING INPUT"
+        : "STOPPED";
+  const runStateChipColor = runState === "running" ? "info" : runState === "waiting_input" ? "warning" : "default";
+  const workspaceStatusCopy = useMemo(() => {
+    if (apiKeyActionNeeded) {
+      return {
+        line1: "Status: Waiting for your approval/input",
+        line2: "An API key is needed before deployment can continue.",
+        tone: "warning"
+      };
+    }
+    if (isStreaming) {
+      const active = latestRunningCard || latestWorkspaceCard;
+      return {
+        line1: "Status: Running",
+        line2: active?.detail || "Agent is actively running actions.",
+        tone: "info"
+      };
+    }
+    if (latestWorkspaceCard) {
+      return {
+        line1: "Status: Stopped",
+        line2: `Last completed step: ${latestWorkspaceCard.label}`,
+        tone: "default"
+      };
+    }
+    return {
+      line1: "Status: Stopped",
+      line2: "Send a request to start a run.",
+      tone: "default"
+    };
+  }, [apiKeyActionNeeded, isStreaming, latestRunningCard, latestWorkspaceCard]);
+  const nowDoingLabel = useMemo(() => {
+    if (apiKeyActionNeeded) return "Waiting for your approval/input";
+    const active = latestRunningCard || latestWorkspaceCard;
+    return active?.label || "Waiting for next step";
+  }, [apiKeyActionNeeded, latestRunningCard, latestWorkspaceCard]);
+
+  const submitSecretHelper = async (modeOverride?: "reuse" | "manual") => {
+    if (secretHelperBusy || isStreaming) return;
+    const key = (secretHelperKey || "").trim().toUpperCase();
+    const mode = modeOverride || secretHelperMode;
+    if (!key) {
+      setChatError("Enter which key name to set first (example: OPENAI_API_KEY).");
+      return;
+    }
+    setSecretHelperBusy(true);
+    setChatError(null);
+    try {
+      if (mode === "reuse") {
+        const ok = await runStreamingChat(`use current llm key for ${key}`, [], { sensitive: true });
+        if (!ok) return;
+        setChatNotice(`Saved ${key} from current model key.`);
+        return;
+      }
+      if (!secretHelperValue.trim()) {
+        setChatError("Enter the key value first.");
+        return;
+      }
+      const ok = await runStreamingChat(`set secret ${key}=${secretHelperValue}`, [], {
+        sensitive: true
+      });
+      if (!ok) return;
+      setSecretHelperValue("");
+      setChatNotice(`${key} saved securely.`);
+    } finally {
+      setSecretHelperBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!apiKeyActionNeeded) return;
+    if (!secretHelperKey || secretHelperKey === "OPENAI_API_KEY") {
+      setSecretHelperKey(suggestedSecretKey);
+    }
+  }, [apiKeyActionNeeded, suggestedSecretKey, secretHelperKey]);
+
+  useEffect(() => {
+    if (!activityAutoFollow) return;
+    const node = workspaceActivityRef.current;
+    if (!node) return;
+    node.scrollTop = node.scrollHeight;
+  }, [workspaceCards.length, activityAutoFollow, isStreaming]);
 
   return (
     <Box
@@ -2260,8 +3620,14 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
         height: "100%",
         minHeight: 0,
         display: "grid",
-        gridTemplateColumns: { xs: "1fr", md: "320px 1fr" },
-        gap: 1.5
+        gridTemplateColumns: {
+          xs: "1fr",
+          md: "228px minmax(0,1fr)",
+          lg: showWorkspacePanel
+            ? "228px minmax(0,1fr) clamp(300px, 24vw, 340px)"
+            : "228px minmax(0,1fr)"
+        },
+        gap: 1
       }}
     >
       <Box className="list-shell chat-sidebar" sx={{ minHeight: 0, display: "flex", flexDirection: "column" }}>
@@ -2273,7 +3639,7 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
         </Stack>
 
         <Box sx={{ flex: 1, minHeight: 0, overflow: "auto", pr: 0.5 }}>
-          <Stack spacing={1}>
+          <Stack spacing={0.5} className="conversation-list">
             {conversations.length === 0 ? (
               <Typography variant="body2" color="text.secondary">
                 No conversations yet.
@@ -2282,44 +3648,43 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
               conversations.map((conv) => {
                 const id = str(conv.id, "");
                 const active = conversationId === id;
-                const convProjectId = str(conv.project_id, "").trim();
-                const convProjectName = convProjectId ? (projectNameById.get(convProjectId) || convProjectId) : "";
+                const title = str(conv.title, "Untitled")
+                  .replace(/\s+/g, " ")
+                  .trim() || "Untitled";
                 return (
                   <Box
                     key={id}
                     className={active ? "conversation-card active" : "conversation-card"}
-                    onClick={() => setConversationId(id)}
+                    onClick={() => {
+                      openConversationById(id);
+                    }}
                     role="button"
                     tabIndex={0}
                     onKeyDown={(e) => {
-                      if (e.key === "Enter" || e.key === " ") setConversationId(id);
+                      if (e.key === "Enter" || e.key === " ") {
+                        openConversationById(id);
+                      }
                     }}
                   >
                     <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={0.5}>
-                      <div className="conversation-card-title">{str(conv.title, "Untitled")}</div>
+                      <div className="conversation-card-title" title={title}>
+                        {title}
+                      </div>
                       <Tooltip title="Chat options">
                         <span>
                           <IconButton
                             size="small"
+                            className="conversation-card-menu"
                             onClick={(e) => {
                               openConversationMenu(e, conv);
                             }}
                             disabled={deleteConversationMutation.isPending}
-                            sx={{ color: "rgba(188, 211, 242, 0.85)" }}
                           >
                             <MoreVertIcon fontSize="small" />
                           </IconButton>
                         </span>
                       </Tooltip>
                     </Stack>
-                    <div className="conversation-card-meta">
-                      {str(conv.channel)} | {str(conv.updated_at)}
-                    </div>
-                    {convProjectName ? (
-                      <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.35 }}>
-                        Project: {convProjectName}
-                      </Typography>
-                    ) : null}
                   </Box>
                 );
               })
@@ -2363,15 +3728,27 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
             <Avatar src={AgentLogo} variant="rounded" sx={{ width: 28, height: 28, bgcolor: "rgba(12,22,40,0.85)" }} />
             <Typography variant="h6">Chat</Typography>
           </Stack>
-          {conversationId ? (
-            <Typography variant="caption" color="text.secondary" sx={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" }}>
-              ID: {conversationId}
-            </Typography>
-          ) : (
-            <Typography variant="caption" color="text.secondary">
-              Draft chat
-            </Typography>
-          )}
+          <Stack direction="row" spacing={1} alignItems="center">
+            <Tooltip title={showWorkspacePanel ? "Hide agent activity" : "Show agent activity"}>
+              <span
+                className={`activity-toggle-pill${showWorkspacePanel ? " active" : ""}${isStreaming ? " streaming" : ""}`}
+                onClick={() => setWorkspaceOpen((prev) => !prev)}
+                style={{ display: "inline-flex" }}
+              >
+                <span className="toggle-dot" />
+                Activity
+              </span>
+            </Tooltip>
+            {conversationId ? (
+              <Typography variant="caption" color="text.secondary" sx={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" }}>
+                ID: {conversationId}
+              </Typography>
+            ) : (
+              <Typography variant="caption" color="text.secondary">
+                Draft chat
+              </Typography>
+            )}
+          </Stack>
         </Stack>
         <Stack direction={{ xs: "column", md: "row" }} spacing={1} sx={{ mb: 1 }}>
           <TextField
@@ -2489,7 +3866,7 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
                                 </Typography>
                               ) : traceCards.length === 0 ? (
                                 <Typography variant="caption" color="text.secondary">
-                                  {traceLoading ? "Loading trace..." : "No trace steps captured for this message."}
+                                  {traceLoading ? "Loading activity..." : "No activity updates captured for this message."}
                                 </Typography>
                               ) : (
                                 <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
@@ -2505,9 +3882,13 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
                           ) : null}
                         </Box>
                       ) : null}
-                    <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
-                      {renderedContent}
-                    </Typography>
+                      {isUser ? (
+                        <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
+                          {renderedContent}
+                        </Typography>
+                      ) : (
+                        renderChatMarkdown(renderedContent)
+                      )}
                     </Box>
                     {isUser ? (
                       <Avatar className="chat-avatar chat-avatar-user" sx={{ width: 30, height: 30, bgcolor: "rgba(47,212,255,0.18)" }}>
@@ -2518,7 +3899,7 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
                 );
               })}
 
-              {pendingUserMessage ? (
+              {pendingUserMessage && isStreaming ? (
                 <Box className="chat-row chat-row-user">
                   <Box className="chat-bubble chat-bubble-user">
                     <Typography variant="caption" color="text.secondary">
@@ -2526,6 +3907,22 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
                     </Typography>
                     <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
                       {pendingUserMessage}
+                    </Typography>
+                  </Box>
+                  <Avatar className="chat-avatar chat-avatar-user" sx={{ width: 30, height: 30, bgcolor: "rgba(47,212,255,0.18)" }}>
+                    U
+                  </Avatar>
+                </Box>
+              ) : null}
+
+              {failedUserMessage && !isStreaming ? (
+                <Box className="chat-row chat-row-user">
+                  <Box className="chat-bubble chat-bubble-user">
+                    <Typography variant="caption" color="warning.main">
+                      You | not sent
+                    </Typography>
+                    <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
+                      {failedUserMessage}
                     </Typography>
                   </Box>
                   <Avatar className="chat-avatar chat-avatar-user" sx={{ width: 30, height: 30, bgcolor: "rgba(47,212,255,0.18)" }}>
@@ -2583,11 +3980,14 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
                     <Typography variant="caption" color="text.secondary">
                       {streamingResponse.trim() ? "AgentArk is streaming..." : "AgentArk is thinking..."}
                     </Typography>
+                    <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.25 }}>
+                      {streamingActivity}
+                    </Typography>
                     {streamingResponse.trim() ? (
-                      <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
-                        {streamingResponse}
+                      <>
+                        {renderChatMarkdown(streamingResponse)}
                         <span className="stream-caret" />
-                      </Typography>
+                      </>
                     ) : (
                       <div className="typing-dots" aria-label="typing">
                         <span />
@@ -2602,10 +4002,77 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
           )}
         </Box>
 
-        {convQ.error || messagesQ.error || chatError ? (
+        {convQ.error || messagesQ.error || (chatError && !apiKeyActionNeeded) ? (
           <Alert severity="error" sx={{ mt: 1 }}>
-            {chatError || errMessage(convQ.error || messagesQ.error)}
+            {normalizeChatError(chatError || errMessage(convQ.error || messagesQ.error))}
           </Alert>
+        ) : null}
+        {apiKeyActionNeeded ? (
+          <Box className="chat-action-required" sx={{ mt: 1 }}>
+            <Stack spacing={1}>
+              <Typography variant="subtitle2">Waiting for your input</Typography>
+              <Typography variant="body2" color="text.secondary">
+                I need an API key before I can continue building and deploying this app.
+              </Typography>
+              <Stack direction={{ xs: "column", md: "row" }} spacing={1} className="chat-action-options">
+                <Button
+                  size="small"
+                  variant={secretHelperMode === "reuse" ? "contained" : "outlined"}
+                  onClick={async () => {
+                    setSecretHelperMode("reuse");
+                    await submitSecretHelper("reuse");
+                  }}
+                >
+                  Use current LLM key
+                </Button>
+                <Button
+                  size="small"
+                  variant={secretHelperMode === "manual" ? "contained" : "outlined"}
+                  onClick={() => setSecretHelperMode("manual")}
+                >
+                  Add API key manually
+                </Button>
+              </Stack>
+              <Typography variant="caption" color="text.secondary">
+                Quick message also works: <code>use current llm key</code>
+              </Typography>
+              <Stack direction={{ xs: "column", md: "row" }} spacing={1} alignItems={{ md: "center" }}>
+                <TextField
+                  size="small"
+                  label="Key name"
+                  value={secretHelperKey}
+                  onChange={(e) => setSecretHelperKey(e.target.value.toUpperCase())}
+                  placeholder="OPENAI_API_KEY"
+                  sx={{ minWidth: 210 }}
+                />
+                {secretHelperMode === "manual" ? (
+                  <TextField
+                    size="small"
+                    label="Key value"
+                    type="password"
+                    value={secretHelperValue}
+                    onChange={(e) => setSecretHelperValue(e.target.value)}
+                    placeholder="Paste key"
+                    sx={{ flex: 1 }}
+                  />
+                ) : (
+                  <Typography variant="caption" color="text.secondary" sx={{ flex: 1 }}>
+                    Reuses your current model key and stores it encrypted for this app.
+                  </Typography>
+                )}
+                <Button
+                  size="small"
+                  variant="contained"
+                  disabled={secretHelperBusy || isStreaming}
+                  onClick={() => {
+                    void submitSecretHelper();
+                  }}
+                >
+                  {secretHelperBusy ? "Saving..." : "Continue build"}
+                </Button>
+              </Stack>
+            </Stack>
+          </Box>
         ) : null}
         {chatNotice && !(convQ.error || messagesQ.error || chatError) ? (
           <Alert severity="info" sx={{ mt: 1 }}>
@@ -2632,21 +4099,6 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
             e.currentTarget.value = "";
           }}
         />
-        <Stack direction="row" spacing={1} alignItems="center" sx={{ mt: 1, mb: 0.5 }} useFlexGap flexWrap="wrap">
-          <Button
-            size="small"
-            variant="outlined"
-            onClick={() => fileInputRef.current?.click()}
-            disabled={isStreaming}
-          >
-            Attach Docs
-          </Button>
-          {attachedFiles.length > 0 ? (
-            <Typography variant="caption" color="text.secondary">
-              {attachedFiles.length} file{attachedFiles.length === 1 ? "" : "s"} ready. They will be indexed before send.
-            </Typography>
-          ) : null}
-        </Stack>
         {attachedFiles.length > 0 ? (
           <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" sx={{ mb: 0.5 }}>
             {attachedFiles.map((file, idx) => (
@@ -2659,40 +4111,342 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
             ))}
           </Stack>
         ) : null}
-
-        <Stack direction={{ xs: "column", md: "row" }} spacing={1} sx={{ mt: 1 }}>
-          <TextField
-            fullWidth
-            multiline
-            minRows={2}
-            maxRows={6}
-            label="Message"
+        <Box className="chat-composer-shell">
+          <textarea
+            className="chat-composer-textarea"
+            placeholder="Message (Enter to send, Shift+Enter for newline)"
+            aria-label="Message"
             value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
+            onChange={(e) => {
+              setPrompt(e.target.value);
+              const el = e.target;
+              el.style.height = "auto";
+              el.style.height = `${Math.min(el.scrollHeight, 150)}px`;
+            }}
             onKeyDown={(e) => {
-              if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+              if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                 e.preventDefault();
-                const btn = document.getElementById("chat-send-btn") as HTMLButtonElement | null;
-                btn?.click();
+                if (isStreaming || (!prompt.trim() && attachedFiles.length === 0)) return;
+                const msg = prompt.trim();
+                setPrompt("");
+                (e.target as HTMLTextAreaElement).style.height = "auto";
+                setChatError(null);
+                void runStreamingChat(msg, attachedFiles);
               }
             }}
+            rows={1}
+            disabled={false}
           />
-          <Button
-            id="chat-send-btn"
-            variant="contained"
-            disabled={isStreaming || (!prompt.trim() && attachedFiles.length === 0)}
-            onClick={async () => {
-              setChatError(null);
-              const msg = prompt.trim();
-              setPrompt("");
-              await runStreamingChat(msg, attachedFiles);
-            }}
-            sx={{ minWidth: 120 }}
-          >
-            {isStreaming ? "Streaming..." : "Send"}
-          </Button>
-        </Stack>
+          <div className="chat-composer-actions">
+            <Tooltip title="Attach files">
+              <IconButton
+                size="small"
+                className="chat-composer-action-btn"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={isStreaming}
+              >
+                <AttachFileRoundedIcon fontSize="small" />
+              </IconButton>
+            </Tooltip>
+            {isStreaming ? (
+              <IconButton
+                size="small"
+                className="chat-composer-stop-btn"
+                onClick={() => {
+                  // abort handled by parent streaming logic
+                }}
+              >
+                <StopRoundedIcon fontSize="small" />
+              </IconButton>
+            ) : (
+              <IconButton
+                id="chat-send-btn"
+                size="small"
+                className="chat-composer-send-btn"
+                disabled={!prompt.trim() && attachedFiles.length === 0}
+                onClick={async () => {
+                  setChatError(null);
+                  const msg = prompt.trim();
+                  setPrompt("");
+                  const ta = document.querySelector(".chat-composer-textarea") as HTMLTextAreaElement | null;
+                  if (ta) ta.style.height = "auto";
+                  await runStreamingChat(msg, attachedFiles);
+                }}
+              >
+                <ArrowUpwardRoundedIcon fontSize="small" />
+              </IconButton>
+            )}
+          </div>
+        </Box>
       </Box>
+
+      {showWorkspacePanel ? (
+        <Box
+          className="list-shell chat-workspace-shell"
+          sx={{ minHeight: 0, display: { xs: "none", lg: "flex" }, flexDirection: "column", p: 1 }}
+        >
+          <Box className="activity-status-bar">
+            <span className={`activity-status-dot${isStreaming ? " running" : " idle"}`} />
+            <span className="activity-status-text">
+              {isStreaming ? workspaceStatusCopy.line1 || "Processing..." : runStateLabel === "STOPPED" ? "Waiting for activity" : workspaceStatusCopy.line1 || runStateLabel}
+            </span>
+            <span className="activity-step-count">{workspaceCards.length} step{workspaceCards.length === 1 ? "" : "s"}</span>
+          </Box>
+
+          <Box sx={{ flex: 1, minHeight: 0, overflow: "auto" }} className="chat-workspace-sections">
+              <Box className="term-shell">
+                <Box className="term-titlebar">
+                  <Typography variant="caption" className="term-titlebar-text">
+                    agentark — console
+                  </Typography>
+                  <Box sx={{ flex: 1 }} />
+                  <Typography variant="caption" className="term-titlebar-stats">
+                    {progressSummary} | {workspaceCards.length} event{workspaceCards.length === 1 ? "" : "s"}
+                  </Typography>
+                </Box>
+                  <Box
+                    className="term-body"
+                    ref={workspaceActivityRef}
+                    onScroll={() => {
+                      const node = workspaceActivityRef.current;
+                      if (!node) return;
+                      const nearBottom = node.scrollHeight - node.scrollTop - node.clientHeight < 22;
+                      if (nearBottom && !activityAutoFollow) setActivityAutoFollow(true);
+                      if (!nearBottom && activityAutoFollow) setActivityAutoFollow(false);
+                    }}
+                  >
+                    {workspaceCards.length === 0 ? (
+                      <Box className="term-line">
+                        <span className="term-text term-dim">Waiting for agent activity...</span>
+                      </Box>
+                    ) : (
+                      workspaceCards.map((row, idx) => {
+                        const dot = row.kind === "Done" ? "term-dot-ok" : row.kind === "Issue" ? "term-dot-err" : row.kind === "Running" || row.kind === "Planning" ? "term-dot-run" : "term-dot-info";
+                        const isLast = idx === workspaceCards.length - 1;
+                        return (
+                          <Box key={`activity-${row.id}`} className={`term-line${isLast && isStreaming ? " term-line-latest" : ""}`}>
+                            <span className={`term-dot ${dot}`} />
+                            <Box className="term-content">
+                              <span className={`term-label${isLast && isStreaming ? " term-typing" : ""}`}>{row.label}</span>
+                              {row.detailFull ? (
+                                <span className="term-detail-full">{row.detailFull.slice(0, 300)}</span>
+                              ) : row.detail ? (
+                                <span className="term-detail-full">{row.detail}</span>
+                              ) : null}
+                            </Box>
+                          </Box>
+                        );
+                      })
+                    )}
+                    {isStreaming && (
+                      <Box className="term-line">
+                        <span className="term-cursor">_</span>
+                      </Box>
+                    )}
+                  </Box>
+              </Box>
+
+            {deployedFiles.length > 0 ? (
+              <Accordion className="chat-workspace-section" defaultExpanded disableGutters>
+                <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ minHeight: 34 }}>
+                  <Typography variant="subtitle2">Files ({deployedFiles.length})</Typography>
+                </AccordionSummary>
+                <AccordionDetails sx={{ p: "4px 8px 8px" }}>
+                  <Stack spacing={0.5}>
+                    {deployedFiles.map((f, i) => (
+                      <Box
+                        key={f.name}
+                        className="deployed-file-row"
+                        onClick={() => { setCodeViewerFileIdx(i); setCodeViewerOpen(true); }}
+                      >
+                        <span className="deployed-file-icon">&#128196;</span>
+                        <span className="deployed-file-name">{f.name}</span>
+                        <span className="deployed-file-size">
+                          {(() => {
+                            const live = liveFileWrites[f.name];
+                            if (!live) return `${(f.content.length / 1024).toFixed(1)}KB`;
+                            if (live.totalLines > 0) {
+                              return `${Math.min(live.line, live.totalLines)}/${live.totalLines} lines${live.done ? " done" : ""}`;
+                            }
+                            return live.done ? "written" : "writing...";
+                          })()}
+                        </span>
+                      </Box>
+                    ))}
+                  </Stack>
+                </AccordionDetails>
+              </Accordion>
+            ) : codeSnapshot ? (
+              <Accordion className="chat-workspace-section" disableGutters>
+                <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ minHeight: 34 }}>
+                  <Typography variant="subtitle2">Code</Typography>
+                </AccordionSummary>
+                <AccordionDetails>
+                  <pre className="chat-workspace-pre"><code>{codeSnapshot}</code></pre>
+                </AccordionDetails>
+              </Accordion>
+            ) : null}
+
+            {previewUrl ? (
+              <Accordion className="chat-workspace-section chat-workspace-section-preview" disableGutters>
+                <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ minHeight: 34 }}>
+                  <Typography variant="subtitle2">Preview</Typography>
+                </AccordionSummary>
+                <AccordionDetails>
+                  <Box className="chat-workspace-preview">
+                    <Typography
+                      variant="caption"
+                      color="text.secondary"
+                      sx={{ display: "block", mb: 0.7 }}
+                      noWrap
+                      title={previewUrl}
+                    >
+                      Local:{" "}
+                      <Link href={previewUrl} target="_blank" rel="noopener noreferrer" underline="hover">
+                        {previewUrl}
+                      </Link>
+                    </Typography>
+                    {publicPreviewUrl ? (
+                      <Typography
+                        variant="caption"
+                        color="info.main"
+                        sx={{ display: "block", mb: 0.7 }}
+                        noWrap
+                        title={publicPreviewUrl}
+                      >
+                        Public:{" "}
+                        <Link href={publicPreviewUrl} target="_blank" rel="noopener noreferrer" underline="hover">
+                        {publicPreviewUrl}
+                      </Link>
+                    </Typography>
+                    ) : null}
+                    <Stack direction="row" spacing={0.8} sx={{ mt: 0.7 }}>
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        onClick={() => window.open(previewUrl, "_blank", "noopener,noreferrer")}
+                      >
+                        Open live app
+                      </Button>
+                      <Button
+                        size="small"
+                        variant="contained"
+                        onClick={() => setPreviewDialogOpen(true)}
+                        disabled={!previewImageUrl}
+                      >
+                        Open preview popup
+                      </Button>
+                    </Stack>
+                    {!previewImageUrl ? (
+                      <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.7 }}>
+                        Screenshot preview will appear after deployment validation captures it.
+                      </Typography>
+                    ) : null}
+                  </Box>
+                </AccordionDetails>
+              </Accordion>
+            ) : null}
+          </Box>
+        </Box>
+      ) : null}
+
+      {/* Code Viewer Dialog */}
+      <Dialog
+        open={codeViewerOpen}
+        onClose={() => setCodeViewerOpen(false)}
+        maxWidth="lg"
+        fullWidth
+        PaperProps={{ className: "code-viewer-dialog" }}
+      >
+        <DialogTitle sx={{ p: "10px 16px", borderBottom: "1px solid rgba(100,160,230,0.18)" }}>
+          <Stack direction="row" justifyContent="space-between" alignItems="center">
+            <Box>
+              <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>Generated Files</Typography>
+              {activeCodeFile && codeViewerWriteStatus ? (
+                <Typography variant="caption" color="text.secondary">
+                  {activeCodeFile.name} • {codeViewerWriteStatus}
+                </Typography>
+              ) : null}
+            </Box>
+            <IconButton size="small" onClick={() => setCodeViewerOpen(false)}>
+              <CloseIcon fontSize="small" />
+            </IconButton>
+          </Stack>
+          {deployedFiles.length > 1 && (
+            <Box className="code-file-tabs" sx={{ mt: 0.5 }}>
+              {deployedFiles.map((f, i) => (
+                <button
+                  key={f.name}
+                  className={`code-file-tab${i === codeViewerFileIdx ? " code-file-tab-active" : ""}`}
+                  onClick={() => setCodeViewerFileIdx(i)}
+                >
+                  {f.name}
+                </button>
+              ))}
+            </Box>
+          )}
+        </DialogTitle>
+        <DialogContent sx={{ p: 0 }}>
+          {activeCodeFile && (
+            <>
+              <pre className="code-viewer-pre">
+                <code>{codeViewerContent}</code>
+              </pre>
+              {activeLiveWrite && !activeLiveWrite.done ? (
+                <Box sx={{ px: 1.5, pb: 1 }}>
+                  <Typography variant="caption" color="text.secondary">
+                    Writing in progress...
+                  </Typography>
+                </Box>
+              ) : null}
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={previewDialogOpen}
+        onClose={() => setPreviewDialogOpen(false)}
+        maxWidth="md"
+        fullWidth
+      >
+        <DialogTitle sx={{ p: "10px 16px", borderBottom: "1px solid rgba(100,160,230,0.18)" }}>
+          Deployment Preview
+        </DialogTitle>
+        <DialogContent sx={{ p: 2 }}>
+          <Stack spacing={1}>
+            <Typography variant="body2">
+              Local:{" "}
+              <Link href={previewUrl} target="_blank" rel="noopener noreferrer" underline="hover">
+                {previewUrl}
+              </Link>
+            </Typography>
+            {publicPreviewUrl ? (
+              <Typography variant="body2">
+                Public:{" "}
+                <Link href={publicPreviewUrl} target="_blank" rel="noopener noreferrer" underline="hover">
+                  {publicPreviewUrl}
+                </Link>
+              </Typography>
+            ) : null}
+            {previewImageUrl ? (
+              <Box
+                component="img"
+                src={previewImageUrl}
+                alt="Deployed app screenshot"
+                sx={{
+                  width: "100%",
+                  borderRadius: 1,
+                  border: "1px solid rgba(108, 156, 212, 0.2)",
+                  background: "rgba(8, 16, 30, 0.7)"
+                }}
+              />
+            ) : (
+              <Alert severity="info">No screenshot is available yet for this deployment.</Alert>
+            )}
+          </Stack>
+        </DialogContent>
+      </Dialog>
     </Box>
   );
 }
@@ -3196,13 +4950,18 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
       setTestResults((prev) => ({ ...prev, [name]: "Running..." }));
     },
     onSuccess: (out, { name }) => {
+      const outputPreview = str(out.output, "").replace(/\s+/g, " ").trim();
+      const outputSuffix =
+        outputPreview.length > 0
+          ? `: ${outputPreview.slice(0, 180)}${outputPreview.length > 180 ? "..." : ""}`
+          : "";
       const status =
         out.status === "needs_input"
           ? out.message || "Needs required input."
           : out.status === "ok"
             ? out.mode === "workflow"
-              ? "Workflow test completed"
-              : "Skill test completed"
+              ? `Workflow test completed${outputSuffix}`
+              : `Skill test completed${outputSuffix}`
             : out.error || out.message || "Test returned";
       setTestResults((prev) => ({ ...prev, [name]: status }));
     },
@@ -3606,7 +5365,7 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
                     disabled={isTesting || !enabled}
                     onClick={() => { setSkillMenuAnchor(null); testMutation.mutate({ name }); }}
                   >
-                    {isTesting ? "Testing..." : "Test"}
+                    {isTesting ? "Testing..." : "Run test"}
                   </MenuItem>
                   <MenuItem
                     disabled={setEnabledMutation.isPending}
@@ -4406,6 +6165,13 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
 function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
   const queryClient = useQueryClient();
   const appsQ = useQuery({ queryKey: ["apps-manager"], queryFn: () => api.rawGet("/api/apps"), refetchInterval: autoRefresh ? REFRESH_MS : false });
+  const tunnelQ = useQuery({
+    queryKey: ["apps-manager-tunnel-status"],
+    queryFn: () => api.rawGet("/tunnel/status"),
+    refetchInterval: autoRefresh ? REFRESH_MS : false
+  });
+  const [tunnelActionError, setTunnelActionError] = useState<string | null>(null);
+  const [tunnelActionState, setTunnelActionState] = useState<"idle" | "starting" | "stopping">("idle");
 
   const opMutation = useMutation({
     mutationFn: ({ path, method }: { path: string; method: "POST" | "DELETE" }) => (method === "DELETE" ? api.rawDelete(path) : api.rawPost(path, {})),
@@ -4413,17 +6179,97 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
       await queryClient.invalidateQueries({ queryKey: ["apps-manager"] });
     }
   });
+  const tunnelStartMutation = useMutation({
+    mutationFn: () => api.rawPost("/tunnel/start", {}),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["apps-manager-tunnel-status"] });
+      await queryClient.invalidateQueries({ queryKey: ["apps-manager"] });
+    }
+  });
+  const tunnelStopMutation = useMutation({
+    mutationFn: () => api.rawPost("/tunnel/stop", {}),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["apps-manager-tunnel-status"] });
+      await queryClient.invalidateQueries({ queryKey: ["apps-manager"] });
+    }
+  });
 
   const apps = pickRecords(appsQ.data, "apps");
   const origin = typeof window !== "undefined" ? window.location.origin : "";
+  const tunnel = asRecord(tunnelQ.data);
+  const tunnelBaseUrl = str(tunnel.url, "").trim().replace(/\/+$/, "");
+  const tunnelActive = toBool(tunnel.active);
+  const tunnelAvailable = toBool(tunnel.available);
+  const tunnelErrorText = str(tunnel.error, "").trim();
+  const tunnelStarting = tunnelActionState === "starting" || tunnelStartMutation.isPending;
+  const tunnelStopping = tunnelActionState === "stopping" || tunnelStopMutation.isPending;
+
+  useEffect(() => {
+    if (tunnelActionState === "starting") {
+      if (tunnelBaseUrl || tunnelErrorText) {
+        setTunnelActionState("idle");
+      }
+      return;
+    }
+    if (tunnelActionState === "stopping" && !tunnelActive) {
+      setTunnelActionState("idle");
+    }
+  }, [tunnelActionState, tunnelBaseUrl, tunnelErrorText, tunnelActive]);
+
+  useEffect(() => {
+    if (tunnelActionState === "idle") return;
+    const timer = setInterval(() => {
+      void tunnelQ.refetch();
+      void appsQ.refetch();
+    }, 1200);
+    return () => clearInterval(timer);
+  }, [tunnelActionState, tunnelQ, appsQ]);
+
+  const refreshLinks = async () => {
+    setTunnelActionError(null);
+    await Promise.all([appsQ.refetch(), tunnelQ.refetch()]);
+  };
+  const startTunnel = async () => {
+    setTunnelActionError(null);
+    setTunnelActionState("starting");
+    try {
+      await tunnelStartMutation.mutateAsync();
+      await refreshLinks();
+    } catch (e) {
+      setTunnelActionState("idle");
+      setTunnelActionError(errMessage(e));
+    }
+  };
+  const stopTunnel = async () => {
+    setTunnelActionError(null);
+    setTunnelActionState("stopping");
+    try {
+      await tunnelStopMutation.mutateAsync();
+      await refreshLinks();
+    } catch (e) {
+      setTunnelActionState("idle");
+      setTunnelActionError(errMessage(e));
+    }
+  };
 
   return (
     <Stack spacing={2}>
       <Box className="list-shell">
         <Typography variant="h6" mb={1}>Deployed Apps</Typography>
+        {tunnelQ.error ? <Alert severity="error" sx={{ mb: 1 }}>{errMessage(tunnelQ.error)}</Alert> : null}
+        {tunnelErrorText ? <Alert severity="error" sx={{ mb: 1 }}>{tunnelErrorText}</Alert> : null}
+        {tunnelActionError ? <Alert severity="error" sx={{ mb: 1 }}>{tunnelActionError}</Alert> : null}
         <TableContainer className="table-shell">
           <Table size="small">
-            <TableHead><TableRow><TableCell>Title</TableCell><TableCell>ID</TableCell><TableCell>Running</TableCell><TableCell>Links</TableCell><TableCell>Ops</TableCell></TableRow></TableHead>
+            <TableHead>
+              <TableRow>
+                <TableCell>Title</TableCell>
+                <TableCell>ID</TableCell>
+                <TableCell>Running</TableCell>
+                <TableCell>Links</TableCell>
+                <TableCell align="right">Ops</TableCell>
+              </TableRow>
+            </TableHead>
             <TableBody>
               {apps.length === 0 ? (
                 <TableRow>
@@ -4438,40 +6284,114 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
                   const id = str(appItem.id, "");
                   const url = str(appItem.url, "");
                   const accessUrl = str(appItem.access_url, "");
+                  const localUrl = toAbsoluteAppUrl(url, origin);
+                  const localAccessUrl = toAbsoluteAppUrl(accessUrl || url, origin);
+                  const publicUrl = tunnelBaseUrl ? toAbsoluteAppUrl(url, tunnelBaseUrl) : "";
+                  const publicAccessUrl = tunnelBaseUrl ? toAbsoluteAppUrl(accessUrl || url, tunnelBaseUrl) : "";
+                  const hasProtectedVariant = !!accessUrl && localAccessUrl !== localUrl;
+                  const publicShareUrl = publicAccessUrl || publicUrl;
+                  const localShareUrl = localAccessUrl || localUrl;
+                  const shareUrl = publicShareUrl || localShareUrl;
+                  const openTargets = dedupeLinkTargets([
+                    { label: "Open Local", url: localUrl },
+                    { label: "Open Local (Key)", url: hasProtectedVariant ? localAccessUrl : "" },
+                    { label: "Open Public", url: publicUrl },
+                    { label: "Open Public (Key)", url: hasProtectedVariant ? publicAccessUrl : "" }
+                  ]);
                   return (
                     <TableRow key={id}>
                       <TableCell>{str(appItem.title)}</TableCell>
                       <TableCell>{id}</TableCell>
                       <TableCell>{str(appItem.running)}</TableCell>
-                      <TableCell sx={{ maxWidth: 320 }}>
-                        <Typography variant="body2" noWrap title={`${origin}${accessUrl || url}`}>
-                          {accessUrl || url}
-                        </Typography>
+                      <TableCell sx={{ maxWidth: 420 }}>
+                        <Stack spacing={0.2}>
+                          {localUrl ? (
+                            <Typography variant="caption" component="div" noWrap title={localUrl}>
+                              Local:{" "}
+                              <Link href={localUrl} target="_blank" rel="noopener noreferrer" underline="hover">
+                                {localUrl}
+                              </Link>
+                            </Typography>
+                          ) : (
+                            <Typography variant="caption" component="div" noWrap title={url || "-"}>
+                              Local: {url || "-"}
+                            </Typography>
+                          )}
+                          {hasProtectedVariant ? (
+                            <Typography variant="caption" component="div" noWrap title={localAccessUrl}>
+                              Local (Key):{" "}
+                              <Link href={localAccessUrl} target="_blank" rel="noopener noreferrer" underline="hover">
+                                {localAccessUrl}
+                              </Link>
+                            </Typography>
+                          ) : null}
+                          {publicUrl ? (
+                            <Typography variant="caption" component="div" color="info.main" noWrap title={publicUrl}>
+                              Public:{" "}
+                              <Link href={publicUrl} target="_blank" rel="noopener noreferrer" underline="hover">
+                                {publicUrl}
+                              </Link>
+                            </Typography>
+                          ) : tunnelStarting ? (
+                            <Typography variant="caption" component="div" color="info.main">
+                              Public: starting tunnel...
+                            </Typography>
+                          ) : tunnelStopping ? (
+                            <Typography variant="caption" component="div" color="text.secondary">
+                              Public: stopping tunnel...
+                            </Typography>
+                          ) : (
+                            <Typography variant="caption" component="div" color="text.secondary">
+                              Public: tunnel inactive
+                            </Typography>
+                          )}
+                          {hasProtectedVariant && publicAccessUrl && publicAccessUrl !== publicUrl ? (
+                            <Typography variant="caption" component="div" color="info.main" noWrap title={publicAccessUrl}>
+                              Public (Key):{" "}
+                              <Link href={publicAccessUrl} target="_blank" rel="noopener noreferrer" underline="hover">
+                                {publicAccessUrl}
+                              </Link>
+                            </Typography>
+                          ) : null}
+                        </Stack>
                       </TableCell>
                       <TableCell align="right">
                         <RowOpsMenu
                           actions={[
-                            {
-                              label: "Open",
+                            ...openTargets.map((target, idx) => ({
+                              label: target.label,
+                              divider: idx === 0 ? false : undefined,
                               onClick: () => {
-                                window.open(`${origin}${url}`, "_blank", "noopener,noreferrer");
+                                window.open(target.url, "_blank", "noopener,noreferrer");
+                              }
+                            })),
+                            {
+                              label: publicShareUrl ? "Copy Public Link" : "Copy Local Link",
+                              divider: openTargets.length > 0,
+                              disabled: !shareUrl,
+                              onClick: async () => {
+                                if (!shareUrl) return;
+                                try {
+                                  await navigator.clipboard.writeText(shareUrl);
+                                } catch {
+                                  window.prompt("Copy this link", shareUrl);
+                                }
                               }
                             },
-                            ...(accessUrl
-                              ? [
-                                  {
-                                    label: "Open (Key)",
-                                    onClick: () => {
-                                      window.open(`${origin}${accessUrl}`, "_blank", "noopener,noreferrer");
-                                    }
-                                  }
-                                ]
-                              : []),
                             {
-                              label: "Share Link",
-                              onClick: () => {
-                                window.open(`${origin}${accessUrl || url}`, "_blank", "noopener,noreferrer");
-                              }
+                              label: tunnelStarting ? "Starting Public Tunnel..." : "Start Public Tunnel",
+                              divider: true,
+                              disabled: tunnelStarting || tunnelActive || !tunnelAvailable,
+                              onClick: startTunnel
+                            },
+                            {
+                              label: tunnelStopping ? "Stopping Public Tunnel..." : "Stop Public Tunnel",
+                              disabled: tunnelStopping || !tunnelActive,
+                              onClick: stopTunnel
+                            },
+                            {
+                              label: "Refresh Public Link",
+                              onClick: refreshLinks
                             },
                             {
                               label: "Stop",
@@ -4506,6 +6426,14 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
 
 function GoalsManager({ autoRefresh }: { autoRefresh: boolean }) {
   const queryClient = useQueryClient();
+  type GoalLoopPayload = {
+    goal: string;
+    constraints?: string;
+    due_date?: string;
+    report_cron?: string;
+    preview_only?: boolean;
+    plan_override?: JsonRecord;
+  };
   const [description, setDescription] = useState("");
   const [dueDate, setDueDate] = useState("");
   const [autopilotEnabled, setAutopilotEnabled] = useState(true);
@@ -4516,6 +6444,7 @@ function GoalsManager({ autoRefresh }: { autoRefresh: boolean }) {
   const [selectedGoalId, setSelectedGoalId] = useState<string | null>(null); // goal_id from arguments
   const [planPreview, setPlanPreview] = useState<JsonRecord | null>(null);
   const [goalCreateOpen, setGoalCreateOpen] = useState(false);
+  const [goalConfirmOpen, setGoalConfirmOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const schedulePresets: { key: string; label: string; cron: string | null; hint?: string }[] = [
@@ -4556,13 +6485,14 @@ function GoalsManager({ autoRefresh }: { autoRefresh: boolean }) {
     }
   });
 
+  const autopilotPreviewMutation = useMutation({
+    mutationFn: (payload: GoalLoopPayload) =>
+      api.rawPost("/autonomy/goals/loop", { ...payload, preview_only: true })
+  });
+
   const autopilotMutation = useMutation({
-    mutationFn: (payload: { goal: string; constraints?: string; due_date?: string; report_cron?: string }) => api.rawPost("/autonomy/goals/loop", payload),
-    onSuccess: async (out) => {
-      const preview = asRecord(asRecord(out).plan_preview);
-      setPlanPreview(Object.keys(preview).length ? preview : null);
-      const gid = str(asRecord(out).goal_id, "");
-      if (gid) setSelectedGoalId(gid);
+    mutationFn: (payload: GoalLoopPayload) => api.rawPost("/autonomy/goals/loop", payload),
+    onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["goals-list"] });
       await queryClient.invalidateQueries({ queryKey: ["goals-progress"] });
     }
@@ -4602,6 +6532,8 @@ function GoalsManager({ autoRefresh }: { autoRefresh: boolean }) {
     setReportCron("0 0 9 * * *");
     setAdvancedOpen(false);
     setAutopilotEnabled(nextAutopilot);
+    setGoalConfirmOpen(false);
+    setPlanPreview(null);
     setError(null);
   };
 
@@ -4610,24 +6542,51 @@ function GoalsManager({ autoRefresh }: { autoRefresh: boolean }) {
     setGoalCreateOpen(true);
   };
 
+  const buildGoalLoopPayload = (): GoalLoopPayload => ({
+    goal: description.trim(),
+    constraints: guardrails.trim() || undefined,
+    due_date: dueDate.trim() || undefined,
+    report_cron: reportCron.trim() || undefined
+  });
+
   const submitGoalDraft = async () => {
     setError(null);
-    setPlanPreview(null);
     try {
       const goalText = description.trim();
       if (autopilotEnabled) {
-        await autopilotMutation.mutateAsync({
-          goal: goalText,
-          constraints: guardrails.trim() || undefined,
-          due_date: dueDate.trim() || undefined,
-          report_cron: reportCron.trim() || undefined
-        });
+        if (!goalText) {
+          setError("Goal is required.");
+          return;
+        }
+        const previewOut = await autopilotPreviewMutation.mutateAsync(buildGoalLoopPayload());
+        const preview = asRecord(asRecord(previewOut).plan_preview);
+        setPlanPreview(Object.keys(preview).length ? preview : null);
+        setGoalCreateOpen(false);
+        setGoalConfirmOpen(true);
+        return;
       } else {
         await createMutation.mutateAsync({
           description: goalText,
           due_date: dueDate.trim() || undefined
         });
       }
+      setGoalCreateOpen(false);
+      resetGoalDraft(true);
+    } catch (e) {
+      setError(errMessage(e));
+    }
+  };
+
+  const confirmAutopilotGoal = async () => {
+    setError(null);
+    try {
+      const out = await autopilotMutation.mutateAsync({
+        ...buildGoalLoopPayload(),
+        plan_override: planPreview || undefined
+      });
+      const gid = str(asRecord(out).goal_id, "");
+      if (gid) setSelectedGoalId(gid);
+      setGoalConfirmOpen(false);
       setGoalCreateOpen(false);
       resetGoalDraft(true);
     } catch (e) {
@@ -4683,10 +6642,20 @@ function GoalsManager({ autoRefresh }: { autoRefresh: boolean }) {
                       <Box key={id} className="action-row">
                         <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
                           <Button
-                            variant={isSelected ? "contained" : "text"}
+                            variant="text"
                             size="small"
-                            sx={{ justifyContent: "flex-start", textAlign: "left", flex: 1 }}
-                            onClick={() => setSelectedGoalId(hasAutopilot ? goalId : null)}
+                            sx={{
+                              justifyContent: "flex-start",
+                              textAlign: "left",
+                              flex: 1,
+                              ...(isSelected
+                                ? {
+                                    border: "1px solid rgba(47,212,255,0.35)",
+                                    background: "rgba(47,212,255,0.08)"
+                                  }
+                                : {})
+                            }}
+                            onClick={() => setSelectedGoalId(hasAutopilot ? (isSelected ? null : goalId) : null)}
                           >
                             <Stack alignItems="flex-start" spacing={0.3}>
                               <Stack direction="row" spacing={1} alignItems="center">
@@ -4723,7 +6692,9 @@ function GoalsManager({ autoRefresh }: { autoRefresh: boolean }) {
                                 Start Autopilot
                               </Button>
                             ) : (
-                              <Button size="small" onClick={() => setSelectedGoalId(goalId)}>View</Button>
+                              <Button size="small" onClick={() => setSelectedGoalId(isSelected ? null : goalId)}>
+                                {isSelected ? "Deselect" : "View"}
+                              </Button>
                             )}
                             <Button size="small" color="error" disabled={deleteMutation.isPending} onClick={() => deleteMutation.mutate(id)}>
                               Delete
@@ -4900,86 +6871,185 @@ function GoalsManager({ autoRefresh }: { autoRefresh: boolean }) {
           <Button onClick={() => setGoalCreateOpen(false)}>Cancel</Button>
           <Button
             variant="contained"
-            disabled={!description.trim() || createMutation.isPending || autopilotMutation.isPending}
+            startIcon={
+              autopilotEnabled && autopilotPreviewMutation.isPending ? (
+                <CircularProgress size={14} color="inherit" />
+              ) : undefined
+            }
+            disabled={
+              !description.trim() ||
+              createMutation.isPending ||
+              autopilotMutation.isPending ||
+              autopilotPreviewMutation.isPending
+            }
             onClick={submitGoalDraft}
           >
-            {autopilotEnabled ? "Create with AI" : "Save Goal"}
+            {autopilotEnabled
+              ? autopilotPreviewMutation.isPending
+                ? "Generating..."
+                : "Create with AI"
+              : "Save Goal"}
           </Button>
         </DialogActions>
       </Dialog>
 
-      <Dialog open={planPreview != null} onClose={() => setPlanPreview(null)} maxWidth="md" fullWidth>
-        <DialogTitle>Autopilot Plan Preview</DialogTitle>
-        <DialogContent>
-          {planPreview ? (
-            <Stack spacing={1.25}>
-              {str(planPreview.summary, "").trim() ? (
-                <Alert severity="info">{str(planPreview.summary)}</Alert>
-              ) : null}
-              {Array.isArray(planPreview.steps) && planPreview.steps.length > 0 ? (
-                <TableContainer className="table-shell">
-                  <Table size="small">
-                    <TableHead>
-                      <TableRow>
-                        <TableCell>Step</TableCell>
-                        <TableCell>Action</TableCell>
-                        <TableCell>Why</TableCell>
-                        <TableCell>Args</TableCell>
-                      </TableRow>
-                    </TableHead>
-                    <TableBody>
-                      {(planPreview.steps as unknown[]).slice(0, 25).map((rawStep, idx) => {
-                        const step = asRecord(rawStep);
-                        const args = asRecord(step.arguments);
-                        const argKeys = Object.keys(args);
-                        return (
-                          <TableRow key={str(step.title, String(idx))}>
-                            <TableCell sx={{ maxWidth: 260 }}>
-                              <Typography variant="body2" noWrap title={str(step.title, `Step ${idx + 1}`)}>
-                                {str(step.title, `Step ${idx + 1}`)}
-                              </Typography>
-                            </TableCell>
-                            <TableCell sx={{ maxWidth: 220 }}>
-                              <Typography variant="body2" noWrap title={str(step.action, "-")}>
-                                {str(step.action, "-")}
-                              </Typography>
-                            </TableCell>
-                            <TableCell sx={{ maxWidth: 360 }}>
-                              <Typography
-                                variant="caption"
-                                color="text.secondary"
-                                sx={{
-                                  display: "-webkit-box",
-                                  WebkitBoxOrient: "vertical",
-                                  WebkitLineClamp: 2,
-                                  overflow: "hidden",
-                                  wordBreak: "break-word"
-                                }}
-                                title={str(step.why, "")}
-                              >
-                                {str(step.why, "-")}
-                              </Typography>
-                            </TableCell>
-                            <TableCell sx={{ maxWidth: 240 }}>
-                              <Typography variant="caption" color="text.secondary" noWrap title={argKeys.join(", ")}>
-                                {argKeys.length ? argKeys.slice(0, 6).join(", ") : "-"}
-                                {argKeys.length > 6 ? ` (+${argKeys.length - 6})` : ""}
-                              </Typography>
-                            </TableCell>
-                          </TableRow>
-                        );
-                      })}
-                    </TableBody>
-                  </Table>
-                </TableContainer>
-              ) : (
-                <Typography variant="body2" color="text.secondary">
-                  No steps found in plan preview.
-                </Typography>
-              )}
-            </Stack>
-          ) : null}
+      <Dialog
+        open={goalConfirmOpen}
+        onClose={() => {
+          if (autopilotMutation.isPending) return;
+          setGoalConfirmOpen(false);
+        }}
+        maxWidth="md"
+        fullWidth
+      >
+        <DialogTitle>Confirm Goal Before Create</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={1.25}>
+            <Alert severity="info">
+              AI has prepared a draft. Review and edit details before creating this goal.
+            </Alert>
+            <Grid2 container spacing={1}>
+              <Grid2 size={{ xs: 12, md: 8 }}>
+                <TextField
+                  fullWidth
+                  label="Goal"
+                  value={description}
+                  onChange={(e) => setDescription(e.target.value)}
+                />
+              </Grid2>
+              <Grid2 size={{ xs: 12, md: 4 }}>
+                <TextField
+                  fullWidth
+                  label="Due date (optional)"
+                  placeholder="YYYY-MM-DD"
+                  value={dueDate}
+                  onChange={(e) => setDueDate(e.target.value)}
+                />
+              </Grid2>
+              <Grid2 size={{ xs: 12 }}>
+                <TextField
+                  fullWidth
+                  size="small"
+                  label="Guardrails (optional)"
+                  value={guardrails}
+                  onChange={(e) => setGuardrails(e.target.value)}
+                />
+              </Grid2>
+              <Grid2 size={{ xs: 12 }}>
+                <TextField
+                  fullWidth
+                  size="small"
+                  label="Report cron"
+                  value={reportCron}
+                  onChange={(e) => setReportCron(e.target.value)}
+                  helperText="6-field cron expression for periodic progress reports."
+                />
+              </Grid2>
+            </Grid2>
+
+            {planPreview ? (
+              <Stack spacing={1}>
+                <TextField
+                  fullWidth
+                  size="small"
+                  label="AI summary"
+                  value={str(planPreview.summary, "")}
+                  onChange={(e) =>
+                    setPlanPreview((prev) => (prev ? { ...prev, summary: e.target.value } : prev))
+                  }
+                />
+
+                {Array.isArray(planPreview.steps) && planPreview.steps.length > 0 ? (
+                  <Stack spacing={1}>
+                    {(planPreview.steps as unknown[]).slice(0, 12).map((rawStep, idx) => {
+                      const step = asRecord(rawStep);
+                      const args = asRecord(step.arguments);
+                      const argKeys = Object.keys(args);
+                      const updateStepField = (field: "title" | "action" | "why", value: string) => {
+                        setPlanPreview((prev) => {
+                          if (!prev) return prev;
+                          const currentSteps = Array.isArray(prev.steps) ? [...(prev.steps as unknown[])] : [];
+                          const existingStep = asRecord(currentSteps[idx]);
+                          currentSteps[idx] = { ...existingStep, [field]: value };
+                          return { ...prev, steps: currentSteps };
+                        });
+                      };
+                      return (
+                        <Box key={`goal-step-${idx}`} className="action-row">
+                          <Stack spacing={0.8}>
+                            <Typography variant="caption" color="text.secondary">
+                              Step {idx + 1}
+                            </Typography>
+                            <TextField
+                              fullWidth
+                              size="small"
+                              label="Title"
+                              value={str(step.title, `Step ${idx + 1}`)}
+                              onChange={(e) => updateStepField("title", e.target.value)}
+                            />
+                            <TextField
+                              fullWidth
+                              size="small"
+                              label="Action"
+                              value={str(step.action, "research")}
+                              onChange={(e) => updateStepField("action", e.target.value)}
+                            />
+                            <TextField
+                              fullWidth
+                              size="small"
+                              label="Why"
+                              value={str(step.why, "")}
+                              onChange={(e) => updateStepField("why", e.target.value)}
+                            />
+                            <Typography variant="caption" color="text.secondary">
+                              Args: {argKeys.length ? argKeys.join(", ") : "-"}
+                            </Typography>
+                          </Stack>
+                        </Box>
+                      );
+                    })}
+                  </Stack>
+                ) : (
+                  <Typography variant="body2" color="text.secondary">
+                    AI returned no steps. You can still create the goal.
+                  </Typography>
+                )}
+              </Stack>
+            ) : (
+              <Alert severity="warning">
+                AI draft is unavailable. Update fields above and create directly.
+              </Alert>
+            )}
+          </Stack>
         </DialogContent>
+        <DialogActions>
+          <Button
+            onClick={() => {
+              if (autopilotMutation.isPending) return;
+              setGoalConfirmOpen(false);
+              setGoalCreateOpen(true);
+            }}
+          >
+            Back
+          </Button>
+          <Button
+            onClick={() => {
+              if (autopilotMutation.isPending) return;
+              setGoalConfirmOpen(false);
+              resetGoalDraft(true);
+            }}
+          >
+            Cancel
+          </Button>
+          <Button
+            variant="contained"
+            startIcon={autopilotMutation.isPending ? <CircularProgress size={14} color="inherit" /> : undefined}
+            disabled={autopilotMutation.isPending || !description.trim()}
+            onClick={confirmAutopilotGoal}
+          >
+            {autopilotMutation.isPending ? "Creating..." : "Confirm & Create"}
+          </Button>
+        </DialogActions>
       </Dialog>
     </Stack>
   );
@@ -5150,6 +7220,14 @@ function AutonomyManager({ autoRefresh }: { autoRefresh: boolean }) {
   const briefingRecord = asRecord(briefingQ.data);
   const queueSummary = asRecord(asRecord(briefingRecord.trust_summary).queue);
   const topRisks = pickRecords(briefingRecord, "top_risks");
+  const attentionRisks = topRisks.filter((risk) => {
+    const hay = `${str(risk.type, "")} ${str(risk.title, "")} ${str(risk.detail, "")}`.toLowerCase();
+    return !(
+      hay.includes("arkpulse") ||
+      hay.includes("auth-related security events") ||
+      hay.includes("security events were logged")
+    );
+  });
   const unreadNotifications = pickRecords(notificationsQ.data, "notifications");
   const awaitingApprovals = num(queueSummary.awaiting_approval, 0);
   const missingInputs = unreadNotifications.filter((row) => {
@@ -5477,11 +7555,11 @@ function AutonomyManager({ autoRefresh }: { autoRefresh: boolean }) {
         </Stack>
       </Box>
 
-      {topRisks.length > 0 ? (
+      {attentionRisks.length > 0 ? (
         <Box className="list-shell">
           <Typography variant="subtitle2" mb={0.75}>Needs Your Attention</Typography>
           <Stack spacing={0.75}>
-            {topRisks.slice(0, 4).map((risk, idx) => (
+            {attentionRisks.slice(0, 4).map((risk, idx) => (
               <Stack
                 key={`risk-${idx}`}
                 direction={{ xs: "column", sm: "row" }}
@@ -5490,15 +7568,20 @@ function AutonomyManager({ autoRefresh }: { autoRefresh: boolean }) {
                 justifyContent="space-between"
                 className="action-row"
               >
-                <Typography variant="body2" color="text.secondary">
-                  {str(risk.title, "Risk")} - {str(risk.detail, "")}
-                </Typography>
+                <Stack spacing={0.25} sx={{ minWidth: 0 }}>
+                  <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                    {str(risk.title, "Risk")}
+                  </Typography>
+                  <Typography variant="caption" color="text.secondary" noWrap title={str(risk.detail, "")}>
+                    {str(risk.detail, "")}
+                  </Typography>
+                </Stack>
                 <Button
                   size="small"
                   variant="outlined"
                   onClick={() => openSettingsTab(recommendedTabForRisk(risk))}
                 >
-                  Review
+                  Open
                 </Button>
               </Stack>
             ))}
@@ -6350,71 +8433,46 @@ function MemoryManager({ autoRefresh }: { autoRefresh: boolean }) {
 
   return (
     <Stack spacing={2}>
-      <Grid2 container spacing={2} alignItems="stretch">
-        <Grid2 size={{ xs: 12, sm: 6, md: 4, lg: 3 }} sx={{ display: "flex" }}>
-          <Box className="list-shell" sx={{ minHeight: 120, height: "100%", width: "100%" }}>
-            <Typography variant="caption" color="text.secondary">
-              Episodic Memory
-            </Typography>
-            <Typography variant="h5">{num(stats.episodes)}</Typography>
-          </Box>
-        </Grid2>
-        <Grid2 size={{ xs: 12, sm: 6, md: 4, lg: 3 }} sx={{ display: "flex" }}>
-          <Box className="list-shell" sx={{ minHeight: 120, height: "100%", width: "100%" }}>
-            <Typography variant="caption" color="text.secondary">
-              Semantic Facts
-            </Typography>
-            <Typography variant="h5">{num(stats.facts)}</Typography>
-          </Box>
-        </Grid2>
-        <Grid2 size={{ xs: 12, sm: 6, md: 4, lg: 3 }} sx={{ display: "flex" }}>
-          <Box className="list-shell" sx={{ minHeight: 120, height: "100%", width: "100%" }}>
-            <Typography variant="caption" color="text.secondary">
-              Preferences
-            </Typography>
-            <Typography variant="h5">{num(stats.preferences)}</Typography>
-          </Box>
-        </Grid2>
-        <Grid2 size={{ xs: 12, sm: 6, md: 6, lg: 3 }} sx={{ display: "flex" }}>
-          <Box className="list-shell" sx={{ minHeight: 120, height: "100%", width: "100%" }}>
-            <Typography variant="caption" color="text.secondary">
-              User Data Items
-            </Typography>
-            <Typography variant="h5">{num(stats.user_data)}</Typography>
-          </Box>
-        </Grid2>
-        <Grid2 size={{ xs: 12, sm: 6, md: 6, lg: 3 }} sx={{ display: "flex" }}>
-          <Box className="list-shell" sx={{ minHeight: 120, height: "100%", width: "100%" }}>
-            <Typography variant="caption" color="text.secondary">
-              Knowledge Base
-            </Typography>
-            <Typography variant="h5">{num(stats.knowledge)}</Typography>
-          </Box>
-        </Grid2>
-      </Grid2>
-
-      <Box className="list-shell">
-        <Stack direction={{ xs: "column", md: "row" }} justifyContent="space-between" alignItems={{ xs: "flex-start", md: "center" }} gap={1}>
-          <Box>
-            <Typography variant="h6">Memory Layer</Typography>
-            <Typography variant="body2" color="text.secondary">
-              Manage what the agent remembers: preferences, user-owned data, and durable knowledge.
-            </Typography>
-          </Box>
-          <Tabs
-            value={memoryTab}
-            onChange={(_e, next) => setMemoryTab(next)}
-            variant="scrollable"
-            allowScrollButtonsMobile
-            sx={{ minHeight: 0, "& .MuiTab-root": { minHeight: 0, py: 0.5 } }}
+      {/* ── Compact stat row ── */}
+      <Box sx={{ display: "grid", gridTemplateColumns: { xs: "repeat(2, 1fr)", sm: "repeat(3, 1fr)", md: "repeat(5, 1fr)" }, gap: 1.5 }}>
+        {[
+          { label: "Episodes", value: num(stats.episodes), color: "#2fd4ff" },
+          { label: "Facts", value: num(stats.facts), color: "#14f195" },
+          { label: "Preferences", value: num(stats.preferences), color: "#a78bfa" },
+          { label: "User Data", value: num(stats.user_data), color: "#f59e0b" },
+          { label: "Knowledge", value: num(stats.knowledge), color: "#f472b6" },
+        ].map((s) => (
+          <Box
+            key={s.label}
+            sx={{
+              p: 1.5,
+              borderRadius: 2,
+              border: "1px solid rgba(255,255,255,0.06)",
+              background: "rgba(255,255,255,0.02)",
+              display: "flex",
+              alignItems: "center",
+              gap: 1.5,
+            }}
           >
-            <Tab label={`Facts (${facts.length})`} />
-            <Tab label={`Preferences (${preferences.length})`} />
-            <Tab label={`User Data (${userDataItems.length})`} />
-            <Tab label={`Knowledge (${knowledgeItems.length})`} />
-          </Tabs>
-        </Stack>
+            <Typography variant="h5" sx={{ fontWeight: 600, color: s.color, lineHeight: 1, minWidth: 28 }}>{s.value}</Typography>
+            <Typography variant="caption" sx={{ color: "rgba(180,200,225,0.55)", fontSize: "0.72rem", lineHeight: 1.2 }}>{s.label}</Typography>
+          </Box>
+        ))}
       </Box>
+
+      {/* ── Memory tabs ── */}
+      <Tabs
+        value={memoryTab}
+        onChange={(_e, next) => setMemoryTab(next)}
+        variant="scrollable"
+        allowScrollButtonsMobile
+        sx={{ minHeight: 0, "& .MuiTab-root": { minHeight: 0, py: 0.5, fontSize: "0.8rem" } }}
+      >
+        <Tab label={`Facts (${facts.length})`} />
+        <Tab label={`Preferences (${preferences.length})`} />
+        <Tab label={`User Data (${userDataItems.length})`} />
+        <Tab label={`Knowledge (${knowledgeItems.length})`} />
+      </Tabs>
 
       {memoryTab === 0 ? (
         <Box className="list-shell">
@@ -7433,12 +9491,12 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
       media: 3,
       security: 4,
       advanced: 5,
-      analytics: 6,
       moltbook: 7,
       mcp: 8,
       memory: 12,
       system: 9,
-      trace: 11
+      trace: 11,
+      evolution: 13
     };
     if (normalized in byName) return byName[normalized];
     const asNumber = Number(normalized);
@@ -7464,8 +9522,11 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
   const [vaultEditorKey, setVaultEditorKey] = useState("");
   const [vaultEditorValue, setVaultEditorValue] = useState("");
   const [showVaultSecretValue, setShowVaultSecretValue] = useState(false);
+  const [securityLogsDialogOpen, setSecurityLogsDialogOpen] = useState(false);
+  const [selectedSecurityLog, setSelectedSecurityLog] = useState<JsonRecord | null>(null);
   const [selectedPulseEvent, setSelectedPulseEvent] = useState<JsonRecord | null>(null);
   const [selectedMoltbookEvent, setSelectedMoltbookEvent] = useState<JsonRecord | null>(null);
+  const [pulsePollState, setPulsePollState] = useState<{ baselineEventId: string; deadlineAt: number } | null>(null);
   const [developerModeEnabled, setDeveloperModeEnabledState] = useState(getDeveloperModeEnabled);
   const [trustPresetId, setTrustPresetId] = useState(TRUST_APPROVAL_PRESETS[0]?.id ?? "run_terminal_command");
   const [trustPresetDetail, setTrustPresetDetail] = useState("ls -la");
@@ -7526,6 +9587,12 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
     queryFn: () => api.rawGet("/security/status"),
     refetchInterval: autoRefresh ? REFRESH_MS : false
   });
+  const securityLogsQ = useQuery({
+    queryKey: ["settings-security-logs-dialog"],
+    queryFn: () => api.rawGet("/security/logs?limit=80"),
+    enabled: tab === 4 && securityLogsDialogOpen,
+    refetchInterval: securityLogsDialogOpen && autoRefresh ? REFRESH_MS : false
+  });
   const vaultSecretsQ = useQuery({
     queryKey: ["settings-secrets"],
     queryFn: () => api.rawGet("/settings/secrets"),
@@ -7534,7 +9601,7 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
   const pulseQ = useQuery({
     queryKey: ["arkpulse-log"],
     queryFn: () => api.rawGet("/arkpulse?limit=40"),
-    refetchInterval: autoRefresh ? REFRESH_MS : false
+    refetchInterval: pulsePollState ? 2000 : autoRefresh ? REFRESH_MS : false
   });
   const moltbookStatusQ = useQuery({
     queryKey: ["moltbook-status"],
@@ -7546,26 +9613,28 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
     queryFn: () => api.rawGet("/moltbook/log?limit=40"), 
     refetchInterval: autoRefresh ? REFRESH_MS : false 
   }); 
+  const evolutionQ = useQuery({
+    queryKey: ["settings-evolution"],
+    queryFn: () => api.rawGet("/settings/evolution"),
+    refetchInterval: autoRefresh ? REFRESH_MS : false
+  });
+  const evolutionDevQ = useQuery({
+    queryKey: ["settings-evolution-dev"],
+    queryFn: () => api.rawGet("/settings/evolution/dev?limit=5000"),
+    enabled: developerModeEnabled && tab === 13,
+    refetchInterval: autoRefresh ? REFRESH_MS : false
+  });
  
-  const llmAnalyticsHourQ = useQuery({
-    queryKey: ["llm-analytics", "24h", "hour"],
-    queryFn: () => api.getLlmAnalytics({ range: "24h", bucket: "hour" }),
-    refetchInterval: autoRefresh ? 30000 : false
-  });
-  const llmAnalyticsDayQ = useQuery({
-    queryKey: ["llm-analytics", "30d", "day"],
-    queryFn: () => api.getLlmAnalytics({ range: "30d", bucket: "day" }),
-    refetchInterval: autoRefresh ? 120000 : false
-  });
-  const llmAnalyticsWeekQ = useQuery({
-    queryKey: ["llm-analytics", "90d", "week"],
-    queryFn: () => api.getLlmAnalytics({ range: "90d", bucket: "week" }),
-    refetchInterval: autoRefresh ? 300000 : false
-  });
 
   const settings = asRecord(settingsQ.data);
   const media = asRecord(mediaQ.data);
   const modelsPayload = asRecord(modelsQ.data);
+  const evolution = asRecord(evolutionQ.data);
+  const evolutionCanary = asRecord(evolution.canary);
+  const evolutionDev = asRecord(evolutionDevQ.data);
+  const evolutionPolicyMetrics = pickRecords(evolutionDev, "policy_metrics");
+  const evolutionStrategyMetrics = pickRecords(evolutionDev, "strategy_metrics");
+  const evolutionLineage = pickRecords(evolutionDev, "lineage_recent");
 
   const configuredProviders = useMemo(() => { 
     const raw = media.configured; 
@@ -7573,86 +9642,6 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
     return raw.filter((x) => typeof x === "string") as string[]; 
   }, [media.configured]); 
  
-  const llmHour = llmAnalyticsHourQ.data as LlmAnalyticsResponse | undefined;
-  const llmDay = llmAnalyticsDayQ.data as LlmAnalyticsResponse | undefined;
-  const llmWeek = llmAnalyticsWeekQ.data as LlmAnalyticsResponse | undefined;
- 
-  const analyticsOption = useMemo(() => {
-    const build = (resp: LlmAnalyticsResponse | undefined, label: string) => {
-      const series = resp?.series || [];
-      const x = series.map((p) => {
-        const s = p.bucket_start || "";
-        if (resp?.range?.bucket === "hour") return s.slice(11, 16);
-        if (resp?.range?.bucket === "day") return s.slice(0, 10);
-        return s.slice(0, 10);
-      });
-      const yTokens = series.map((p) => p.total_tokens || 0);
-      const yCost = series.map((p) => (typeof p.cost_usd === "number" ? p.cost_usd : null));
-      const hasCost = yCost.some((v) => typeof v === "number");
-      return {
-        backgroundColor: "transparent",
-        textStyle: { color: "#9bb4d6" },
-        animationDuration: 650,
-        animationDurationUpdate: 420,
-        grid: { left: 40, right: hasCost ? 54 : 20, top: 34, bottom: 30, containLabel: true },
-        title: { text: label, left: 6, top: 0, textStyle: { color: "#cce3ff", fontSize: 12 } },
-        tooltip: { trigger: "axis" },
-        xAxis: {
-          type: "category",
-          data: x,
-          axisLine: { lineStyle: { color: "rgba(155,180,214,0.35)" } },
-          axisLabel: { color: "#8ea9cf" }
-        },
-        yAxis: [
-          {
-            type: "value",
-            axisLine: { lineStyle: { color: "rgba(155,180,214,0.35)" } },
-            splitLine: { lineStyle: { color: "rgba(155,180,214,0.12)" } },
-            axisLabel: { color: "#8ea9cf" }
-          },
-          ...(hasCost
-            ? [
-                {
-                  type: "value",
-                  axisLine: { lineStyle: { color: "rgba(155,180,214,0.25)" } },
-                  splitLine: { show: false },
-                  axisLabel: { color: "#8ea9cf", formatter: (v: number) => `$${Number(v).toFixed(2)}` }
-                }
-              ]
-            : [])
-        ],
-        series: [
-          {
-            name: "Tokens",
-            type: "line",
-            smooth: true,
-            data: yTokens,
-            lineStyle: { width: 2, color: "#2fd4ff" },
-            areaStyle: { color: "rgba(47, 212, 255, 0.18)" },
-            itemStyle: { color: "#14f195" }
-          },
-          ...(hasCost
-            ? [
-                {
-                  name: "Cost (USD)",
-                  type: "line",
-                  smooth: true,
-                  yAxisIndex: 1,
-                  data: yCost,
-                  lineStyle: { width: 2, color: "rgba(255, 193, 7, 0.9)" },
-                  itemStyle: { color: "rgba(255, 193, 7, 0.9)" }
-                }
-              ]
-            : [])
-        ]
-      };
-    };
-    return {
-      hour: build(llmHour, "Last 24h (hourly)"),
-      day: build(llmDay, "Last 30d (daily)"),
-      week: build(llmWeek, "Last 90d (weekly)"),
-    };
-  }, [llmHour, llmDay, llmWeek]);
 
   const [form, setForm] = useState({
     bot_name: "AgentArk",
@@ -7663,6 +9652,7 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
     email_format: "",
     daily_brief_channel: "telegram",
     smart_routing: true,
+    app_deploy_model_id: "",
 
     llm_provider: "ollama",
     llm_model: "",
@@ -7765,6 +9755,12 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
     const tgUsers = Array.isArray(settings.telegram_allowed_users) ? (settings.telegram_allowed_users as unknown[]) : [];
     const waNums = Array.isArray(settings.whatsapp_allowed_numbers) ? (settings.whatsapp_allowed_numbers as unknown[]) : [];
     const autoApprove = Array.isArray(settings.auto_approve) ? (settings.auto_approve as unknown[]) : [];
+    const modelPool = Array.isArray(settings.model_pool) ? (settings.model_pool as unknown[]) : [];
+    const modelPoolIds = modelPool
+      .map((slot) => str(asRecord(slot).id, "").trim())
+      .filter((id) => id.length > 0);
+    const appDeployModelIdRaw = str(settings.app_deploy_model_id, "").trim();
+    const appDeployModelId = modelPoolIds.includes(appDeployModelIdRaw) ? appDeployModelIdRaw : "";
 
     setForm((prev) => ({
       ...prev,
@@ -7776,6 +9772,7 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
       email_format: str(settings.email_format, prev.email_format),
       daily_brief_channel: str(settings.daily_brief_channel, "telegram"),
       smart_routing: toBool(settings.smart_routing),
+      app_deploy_model_id: appDeployModelId,
 
       llm_provider: str(settings.llm_provider, "ollama"),
       llm_model: str(settings.llm_model, ""),
@@ -7894,6 +9891,7 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
         email_format: form.email_format,
         daily_brief_channel: form.daily_brief_channel || "telegram",
         smart_routing: form.smart_routing,
+        app_deploy_model_id: form.app_deploy_model_id,
 
         llm_provider: form.llm_provider,
         llm_model: form.llm_model,
@@ -7983,13 +9981,97 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
       await queryClient.invalidateQueries({ queryKey: ["moltbook-status"] });
     }
   });
+  const updateEvolutionSettingsMutation = useMutation({
+    mutationFn: (payload: Record<string, unknown>) =>
+      api.rawPost("/settings/evolution", payload),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["settings-evolution"] });
+      await queryClient.invalidateQueries({ queryKey: ["settings-evolution-dev"] });
+    },
+    onError: (e) => setError(errMessage(e))
+  });
+  const runEvolutionDevActionMutation = useMutation({
+    mutationFn: (action: string) =>
+      api.rawPost("/settings/evolution/dev/action", { action }),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["settings-evolution"] });
+      await queryClient.invalidateQueries({ queryKey: ["settings-evolution-dev"] });
+    },
+    onError: (e) => setError(errMessage(e))
+  });
 
-  const modelSlots = useMemo(() => pickRecords(modelsPayload, "models"), [modelsPayload]);
+  const modelSlotsLive = useMemo(() => pickRecords(modelsPayload, "models"), [modelsPayload]);
+  const settingsPayloadError = str(settings.error, "").trim();
+  const modelsPayloadError = str(modelsPayload.error, "").trim();
+  const [stableModelSlots, setStableModelSlots] = useState<JsonRecord[]>([]);
+  const [stableSettingsComplete, setStableSettingsComplete] = useState(false);
+  const consecutiveEmptyModelSnapshotsRef = useRef(0);
+  const consecutiveIncompleteSettingsRef = useRef(0);
+
+  useEffect(() => {
+    if (modelSlotsLive.length > 0) {
+      consecutiveEmptyModelSnapshotsRef.current = 0;
+      setStableModelSlots(modelSlotsLive);
+      return;
+    }
+    if (modelsQ.isFetching || modelsQ.isError || modelsPayloadError) return;
+    if (!modelsQ.isSuccess) return;
+    consecutiveEmptyModelSnapshotsRef.current += 1;
+    if (consecutiveEmptyModelSnapshotsRef.current >= 2) {
+      setStableModelSlots([]);
+    }
+  }, [modelSlotsLive, modelsQ.isFetching, modelsQ.isError, modelsQ.isSuccess, modelsPayloadError]);
+
+  const modelSlots = useMemo(() => {
+    if (modelSlotsLive.length > 0) return modelSlotsLive;
+    if (stableModelSlots.length > 0) return stableModelSlots;
+    return modelSlotsLive;
+  }, [modelSlotsLive, stableModelSlots]);
+
+  useEffect(() => {
+    const hasSnapshotIssue =
+      !!settingsPayloadError || !!modelsPayloadError || settingsQ.isError || modelsQ.isError;
+    const computedComplete = toBool(settings.settings_complete) || modelSlotsLive.length > 0 || stableModelSlots.length > 0;
+    if (computedComplete) {
+      consecutiveIncompleteSettingsRef.current = 0;
+      if (!stableSettingsComplete) setStableSettingsComplete(true);
+      return;
+    }
+    if (hasSnapshotIssue || settingsQ.isFetching || modelsQ.isFetching || !settingsQ.isSuccess || !modelsQ.isSuccess) {
+      return;
+    }
+    consecutiveIncompleteSettingsRef.current += 1;
+    if (consecutiveIncompleteSettingsRef.current >= 2 && stableSettingsComplete) {
+      setStableSettingsComplete(false);
+    }
+  }, [
+    settings.settings_complete,
+    modelSlotsLive.length,
+    stableModelSlots.length,
+    settingsPayloadError,
+    modelsPayloadError,
+    settingsQ.isError,
+    modelsQ.isError,
+    settingsQ.isFetching,
+    modelsQ.isFetching,
+    settingsQ.isSuccess,
+    modelsQ.isSuccess,
+    stableSettingsComplete
+  ]);
+
   const moltbookEvents = pickRecords(moltbookLogQ.data, "events");
 
   const [modelDialogOpen, setModelDialogOpen] = useState(false);
   const [modelEditingId, setModelEditingId] = useState<string | null>(null);
   const [modelAdvancedOpen, setModelAdvancedOpen] = useState(false);
+  const [openaiSubAuth, setOpenaiSubAuth] = useState<{
+    message: string;
+    authUrl: string;
+    deviceCode: string;
+    running: boolean;
+    openedBrowser: boolean;
+  } | null>(null);
+  const [codexAuthBusy, setCodexAuthBusy] = useState(false);
   const [modelForm, setModelForm] = useState({
     label: "",
     role: "primary",
@@ -8015,6 +10097,7 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
     const prevProvider = previousModelProviderRef.current;
     if (prevProvider === modelForm.provider) return;
     previousModelProviderRef.current = modelForm.provider;
+    setOpenaiSubAuth(null);
 
     setModelForm((p) => {
       const current = p.base_url.trim();
@@ -8024,7 +10107,10 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
       } else if (p.provider === "ollama") {
         if (!current || current === OPENROUTER_DEFAULT_BASE_URL) next = OLLAMA_DEFAULT_BASE_URL;
       } else if (
-        (p.provider === "openai" || p.provider === "anthropic") &&
+        (p.provider === "openai" ||
+          p.provider === "anthropic" ||
+          p.provider === "openai-subscription" ||
+          p.provider === "codex-cli") &&
         (current === OLLAMA_DEFAULT_BASE_URL || current === OPENROUTER_DEFAULT_BASE_URL)
       ) {
         next = "";
@@ -8033,10 +10119,32 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
     });
   }, [modelForm.provider]);
 
+  const discoverModelsQ = useQuery({
+    queryKey: ["discover-models", modelForm.provider, modelForm.api_key, modelForm.base_url],
+    queryFn: async () => {
+      const p = modelForm.provider;
+      if (p === "openai-compatible") return [] as string[];
+      const params = new URLSearchParams();
+      if (modelForm.api_key.trim()) params.set("api_key", modelForm.api_key.trim());
+      if (modelForm.base_url.trim()) params.set("base_url", modelForm.base_url.trim());
+      try {
+        const resp = asRecord(await api.rawGet(`/models/discover/${encodeURIComponent(p)}?${params.toString()}`));
+        const models = resp.models;
+        if (Array.isArray(models)) return models.map((m: unknown) => str((m as Record<string, unknown>).id, "")).filter(Boolean);
+      } catch { /* ignore */ }
+      return [] as string[];
+    },
+    enabled: modelDialogOpen && modelForm.provider !== "openai-compatible",
+    staleTime: 60_000,
+    retry: false,
+  });
+  const modelOptions = (discoverModelsQ.data?.length ? discoverModelsQ.data : MODEL_FALLBACKS_BY_PROVIDER[modelForm.provider]) || [];
+
   function openAddModel() {
     setModelEditingId(null);
     setModelAdvancedOpen(false);
     setModelConnectivityWarning(null);
+    setOpenaiSubAuth(null);
     setModelForm({
       label: "",
       role: "primary",
@@ -8053,16 +10161,81 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
     setModelEditingId(str(slot.id, ""));
     setModelAdvancedOpen(false);
     setModelConnectivityWarning(null);
+    setOpenaiSubAuth(null);
     setModelForm({
       label: str(slot.label, ""),
       role: str(slot.role, "primary"),
-      provider: str(slot.provider, "ollama"),
+      provider:
+        str(slot.provider, "ollama") === "codex-cli"
+          ? "openai-subscription"
+          : str(slot.provider, "ollama"),
       model: str(slot.model, ""),
       base_url: str(slot.base_url, ""),
       api_key: "",
       enabled: toBool(slot.enabled)
     });
     setModelDialogOpen(true);
+  }
+
+  async function startOpenaiSubscriptionOAuth() {
+    if (codexAuthBusy) return;
+    setCodexAuthBusy(true);
+    setError(null);
+    try {
+      const response = asRecord(await api.rawPost("/models/openai-subscription/oauth/start", {}));
+      const message = str(response.message, "").trim() || "OpenAI Subscription sign-in started.";
+      const authUrl = str(response.auth_url, "").trim();
+      const deviceCode = str(response.device_code, "").trim();
+      const running = toBool(response.running);
+      let openedInBrowser = false;
+      if (authUrl) {
+        const tab = window.open(authUrl, "_blank", "noopener,noreferrer");
+        openedInBrowser = !!tab;
+      }
+      const openedBrowser = toBool(response.opened_browser) || openedInBrowser;
+      setOpenaiSubAuth({ message, authUrl, deviceCode, running, openedBrowser });
+    } catch (e) {
+      setError(errMessage(e));
+    } finally {
+      setCodexAuthBusy(false);
+    }
+  }
+
+  async function checkOpenaiSubscriptionOAuthStatus() {
+    if (codexAuthBusy) return;
+    setCodexAuthBusy(true);
+    setOpenaiSubAuth(null);
+    setError(null);
+    try {
+      const response = asRecord(await api.rawGet("/models/openai-subscription/oauth/status"));
+      const connected = toBool(response.connected);
+      const message = str(response.message, "").trim();
+      const authUrl = str(response.auth_url, "").trim();
+      const deviceCode = str(response.device_code, "").trim();
+      const running = toBool(response.running);
+      const openedBrowser = false;
+      if (connected) {
+        setOpenaiSubAuth({
+          message: message || "OpenAI Subscription login is connected.",
+          authUrl,
+          deviceCode,
+          running,
+          openedBrowser
+        });
+      } else {
+        setOpenaiSubAuth({
+          message: message || "OpenAI Subscription login is not connected yet.",
+          authUrl,
+          deviceCode,
+          running,
+          openedBrowser
+        });
+      }
+    } catch (e) {
+      setError(errMessage(e));
+    } finally {
+      setCodexAuthBusy(false);
+    }
   }
 
   const saveModelMutation = useMutation({
@@ -8074,6 +10247,8 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
           ? baseUrl || OPENROUTER_DEFAULT_BASE_URL
           : provider === "ollama"
             ? baseUrl || OLLAMA_DEFAULT_BASE_URL
+            : provider === "openai-subscription" || provider === "codex-cli"
+              ? ""
             : provider === "openai-compatible"
               ? baseUrl
               : "";
@@ -8109,13 +10284,16 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
       };
     },
     onSuccess: async (result: { connectivityOk: boolean; connectivityError: string }) => {
+      const wasEdit = !!modelEditingId;
       setModelDialogOpen(false);
       if (!result.connectivityOk) {
         setModelConnectivityWarning(
           `Model saved, but connection test failed: ${result.connectivityError || "could not reach provider"}. Runs may fail until fixed.`
         );
+        setSuccess(wasEdit ? "Model updated (connectivity issue detected)." : "Model added (connectivity issue detected).");
       } else {
         setModelConnectivityWarning(null);
+        setSuccess(wasEdit ? "Model updated." : "Model added.");
       }
       await queryClient.invalidateQueries({ queryKey: ["models"] });
       await queryClient.invalidateQueries({ queryKey: ["settings"] });
@@ -8156,7 +10334,20 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
   const hasWhatsAppToken = toBool(settings.has_whatsapp_token);
   const hasPrimaryApiKey = toBool(settings.has_api_key);
   const hasFallbackApiKey = toBool(settings.has_fallback_api_key);
-  const settingsComplete = toBool(settings.settings_complete);
+  const settingsComplete = stableSettingsComplete || toBool(settings.settings_complete) || modelSlots.length > 0;
+  const showSetupRequired =
+    !settingsComplete &&
+    !settingsPayloadError &&
+    !modelsPayloadError &&
+    settingsQ.isSuccess &&
+    modelsQ.isSuccess &&
+    !settingsQ.isFetching &&
+    !modelsQ.isFetching;
+  const modelsRefreshIssue = modelsPayloadError || (modelsQ.isError ? errMessage(modelsQ.error) : "");
+  const showingModelFallback =
+    modelSlotsLive.length === 0 &&
+    stableModelSlots.length > 0 &&
+    (modelsQ.isFetching || !!modelsRefreshIssue);
 
   const apiKeyPayload = asRecord(apiKeyQ.data);
   const apiKeyIssuedAtUnix = num(apiKeyPayload.issued_at_unix, 0);
@@ -8171,11 +10362,13 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
   const apiKeyRotated = toBool(apiKeyPayload.rotated);
   const tunnel = asRecord(tunnelQ.data);
   const sec = asRecord(securityStatusQ.data);
+  const securityLogs = pickRecords(securityLogsQ.data, "logs");
   const hasCustomMasterPassword = toBool(sec.master_password_set) && !toBool(sec.using_default);
   const vaultSecrets = pickRecords(vaultSecretsQ.data, "entries");
   const pulseEvents = pickRecords(pulseQ.data, "events");
   const pulseMeta = asRecord(pulseQ.data);
   const pulseRunning = toBool(pulseMeta.running);
+  const latestPulseEventId = str(asRecord(pulseEvents[0]).id, "");
   const moltbookStatus = asRecord(moltbookStatusQ.data);
   const moltbookRunning = toBool(moltbookStatus.running);
   const moltbookLastStatus = str(moltbookStatus.last_status, "").toLowerCase();
@@ -8185,9 +10378,9 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
     moltbookLastStatus === "error";
 
   const selectedPulseDetails = asRecord(selectedPulseEvent?.details);
-  const selectedPulseFindings = Array.isArray(selectedPulseDetails.doctor_findings)
-    ? (selectedPulseDetails.doctor_findings as unknown[])
-    : [];
+  const selectedPulseFindings = pickRecords(selectedPulseDetails, "doctor_findings").filter((f) =>
+    isUserActionableDoctorFinding(f)
+  );
   const selectedPulseScore = num(selectedPulseDetails.doctor_score, -1);
   const selectedPulseStatus = str(selectedPulseEvent?.status, "-");
   const selectedPulseStatusOk = selectedPulseStatus.toLowerCase() === "ok";
@@ -8229,9 +10422,9 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
   ];
   const latestPulseEvent = asRecord(pulseEvents[0]);
   const latestPulseDetails = asRecord(latestPulseEvent.details);
-  const latestPulseFindingsCount = Array.isArray(latestPulseDetails.doctor_findings)
-    ? (latestPulseDetails.doctor_findings as unknown[]).length
-    : 0;
+  const latestPulseFindingsCount = pickRecords(latestPulseDetails, "doctor_findings").filter((f) =>
+    isUserActionableDoctorFinding(f)
+  ).length;
   const latestPulseScore = num(latestPulseDetails.doctor_score, -1);
   const latestPulseStatus = str(latestPulseEvent.status, "").toLowerCase();
   const latestPulseHeadline =
@@ -8252,6 +10445,17 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
       : latestPulseFindingsCount > 0
       ? "Open the latest report and start with Fix #1."
       : "No urgent action needed right now.";
+
+  useEffect(() => {
+    if (!pulsePollState) return;
+    if (Date.now() >= pulsePollState.deadlineAt) {
+      setPulsePollState(null);
+      return;
+    }
+    if (!pulseRunning && latestPulseEventId && latestPulseEventId !== pulsePollState.baselineEventId) {
+      setPulsePollState(null);
+    }
+  }, [pulsePollState, pulseRunning, latestPulseEventId]);
 
   function severityChipColor(sev: string): "error" | "warning" | "info" | "success" | "default" {
     const s = (sev || "").toLowerCase();
@@ -8554,186 +10758,303 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
     }
   }
 
+  const settingsNavGroups: Array<{ id: string; label: string; items: Array<{ value: number; label: string }> }> = [
+    {
+      id: "setup",
+      label: "Setup",
+      items: [
+        { value: 0, label: "General" },
+        { value: 1, label: "Models" },
+        { value: 2, label: "Integrations" },
+        { value: 3, label: "Media" }
+      ]
+    },
+    {
+      id: "knowledge",
+      label: "Knowledge",
+      items: [
+        { value: 12, label: "Memory" },
+        { value: 8, label: "MCP Servers" }
+      ]
+    },
+    {
+      id: "operations",
+      label: "Operations",
+      items: [
+        { value: 11, label: "Trace" },
+        { value: 9, label: "ArkPulse" },
+        { value: 13, label: "Evolution" }
+      ]
+    },
+    {
+      id: "security",
+      label: "Security",
+      items: [
+        { value: 4, label: "Security" },
+        { value: 5, label: "Advanced" }
+      ]
+    }
+  ];
+  const settingsNavActual = settingsNavGroups.flatMap((group) => group.items);
+  const selectedSettingsNav = settingsNavActual.find((item) => item.value === tab) || settingsNavActual[0];
+
   return (
     <Stack spacing={2}>
-      <Stack direction="row" justifyContent="space-between" alignItems="center">
-        <Stack spacing={0.5}>
-          <Typography variant="h6">Settings</Typography>
-          <Typography variant="caption" color="text.secondary">
-            {dirty ? "Unsaved changes" : "Up to date"}
-          </Typography>
-        </Stack>
-        <Stack direction="row" spacing={1}>
-          <Button
-            size="small"
-            variant="contained"
-            onClick={async () => {
-              setError(null);
-              setSuccess(null);
-              try {
-                await saveMutation.mutateAsync();
-              } catch (e) {
-                setError(errMessage(e));
-              }
-            }}
-            disabled={saveMutation.isPending || !dirty}
-          >
-            Save
-          </Button>
-        </Stack>
-      </Stack>
-
-      {!settingsComplete ? (
+      {showSetupRequired ? (
         <Alert severity="warning">
           Setup required: configure at least one model in the Models tab, then Save Settings.
         </Alert>
       ) : null}
 
-      <Tabs value={tab} onChange={(_, v) => setTab(Number(v) || 0)} variant="scrollable" scrollButtons="auto">
-        <Tab value={0} label="Quick Setup" />
-        <Tab value={1} label="Models" />
-        <Tab value={2} label="Integrations" />
-        <Tab value={3} label="Media" />
-        <Tab value={4} label="Security" />
-        <Tab value={6} label="Analytics" />
-        <Tab value={7} label="Moltbook" />
-        <Tab value={8} label="MCP Servers" />
-        <Tab value={12} label="Memory" />
-        <Tab value={11} label="Trace" />
-        <Tab value={9} label="ArkPulse" />
-        <Tab value={5} label="Advanced" />
-      </Tabs>
+      <Box className="settings-shell-layout">
+        <Box className="settings-sidebar">
+          <Box className="settings-brand">
+            <Avatar src={AgentLogo} variant="rounded" sx={{ width: 28, height: 28 }} />
+            <Stack spacing={0.1}>
+              <Typography variant="subtitle2">AgentArk</Typography>
+              <Typography variant="caption" color="text.secondary">
+                Settings
+              </Typography>
+            </Stack>
+          </Box>
+          <Stack spacing={0.2} className="settings-nav-list" sx={{ display: { xs: "none", md: "flex" } }}>
+            {settingsNavGroups.map((group, groupIdx) => (
+              <Box key={`settings-nav-group-${group.id}`}>
+                <Typography className="settings-nav-group-label">
+                  {group.label}
+                </Typography>
+                {group.items.map((item) => (
+                  <Button
+                    key={`settings-nav-${item.value}`}
+                    className={`settings-nav-btn${tab === item.value ? " active" : ""}`}
+                    variant="text"
+                    onClick={() => setTab(item.value)}
+                  >
+                    <span>{item.label}</span>
+                  </Button>
+                ))}
+                {groupIdx < settingsNavGroups.length - 1 ? (
+                  <div className="settings-nav-divider" />
+                ) : null}
+              </Box>
+            ))}
+          </Stack>
+          <Tabs
+            value={tab}
+            onChange={(_, v) => setTab(Number(v) || 0)}
+            variant="scrollable"
+            scrollButtons="auto"
+            sx={{ display: { xs: "flex", md: "none" } }}
+          >
+            {settingsNavActual.map((item) => (
+              <Tab key={`settings-mobile-${item.value}`} value={item.value} label={item.label} />
+            ))}
+          </Tabs>
+        </Box>
+        <Box className="settings-main">
+          <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1.5 }}>
+            <Typography variant="subtitle1" sx={{ fontWeight: 600, fontSize: "1rem" }}>{selectedSettingsNav?.label || "Settings"}</Typography>
+            <Stack direction="row" spacing={1} alignItems="center">
+              {modelsQ.isFetching && showingModelFallback ? (
+                <Chip size="small" color="warning" variant="outlined" label="Reconnecting..." />
+              ) : null}
+              <Button
+                size="small"
+                variant="contained"
+                onClick={async () => {
+                  setError(null);
+                  setSuccess(null);
+                  try {
+                    await saveMutation.mutateAsync();
+                  } catch (e) {
+                    setError(errMessage(e));
+                  }
+                }}
+                disabled={saveMutation.isPending || !dirty}
+              >
+                Save
+              </Button>
+            </Stack>
+          </Stack>
 
       {tab === 0 ? (
-        <Grid2 container spacing={2} alignItems="stretch">
-          <Grid2 size={{ xs: 12, md: 6 }} sx={{ display: "flex" }}>
-            <Box className="list-shell" sx={{ minHeight: 0, width: "100%" }}>
-              <Typography variant="h6" mb={1}>
-                Core
-              </Typography>
-              <Stack spacing={1.5}>
-                <TextField label="Bot Name" value={form.bot_name} onChange={(e) => setField("bot_name", e.target.value)} fullWidth />
-                <TextField
-                  label="Personality"
-                  select
-                  value={form.personality}
-                  onChange={(e) => setField("personality", e.target.value)}
-                  fullWidth
+        <Stack spacing={2.5}>
+          {/* ── Status Overview ── */}
+          <Box>
+            <Typography className="settings-section-label">Status</Typography>
+            <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr 1fr", md: "repeat(4, 1fr)" }, gap: 1.5 }}>
+              {[
+                { label: "Primary API Key", ok: hasPrimaryApiKey },
+                { label: "Fallback API Key", ok: hasFallbackApiKey },
+                { label: "Telegram", ok: hasTelegramToken },
+                { label: "WhatsApp", ok: hasWhatsAppToken },
+              ].map((s) => (
+                <Box
+                  key={s.label}
+                  sx={{
+                    p: 1.5,
+                    borderRadius: 2,
+                    border: "1px solid",
+                    borderColor: s.ok ? "rgba(20,241,149,0.18)" : "rgba(255,255,255,0.06)",
+                    background: s.ok ? "rgba(20,241,149,0.04)" : "rgba(255,255,255,0.02)",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 1,
+                  }}
                 >
-                  <MenuItem value="friendly">friendly</MenuItem>
-                  <MenuItem value="professional">professional</MenuItem>
-                  <MenuItem value="casual">casual</MenuItem>
-                  <MenuItem value="technical">technical</MenuItem>
-                  <MenuItem value="creative">creative</MenuItem>
-                  <MenuItem value="concise">concise</MenuItem>
-                </TextField>
-
-                <Autocomplete
-                  freeSolo
-                  options={[
-                    "UTC",
-                    "America/New_York",
-                    "America/Chicago",
-                    "America/Denver",
-                    "America/Los_Angeles",
-                    "America/Phoenix",
-                    "America/Toronto",
-                    "America/Vancouver",
-                    "Europe/London",
-                    "Europe/Paris",
-                    "Europe/Berlin",
-                    "Asia/Dubai",
-                    "Asia/Kolkata",
-                    "Asia/Singapore",
-                    "Asia/Tokyo",
-                    "Australia/Sydney"
-                  ]}
-                  value={form.timezone || ""}
-                  onChange={(_, v) => setField("timezone", String(v ?? ""))}
-                  inputValue={form.timezone || ""}
-                  onInputChange={(_, v) => setField("timezone", v)}
-                  renderInput={(params) => (
-                    <TextField
-                      {...params}
-                      label="Timezone (IANA)"
-                      placeholder="e.g. America/New_York"
-                      fullWidth
-                    />
-                  )}
-                />
-
-                <TextField label="Language" value={form.language} onChange={(e) => setField("language", e.target.value)} fullWidth placeholder="e.g. English" />
-                <TextField
-                  label="Tone"
-                  select
-                  value={form.tone}
-                  onChange={(e) => setField("tone", e.target.value)}
-                  fullWidth
-                  InputLabelProps={{ shrink: true }}
-                  SelectProps={{ displayEmpty: true }}
-                >
-                  <MenuItem value="">Default</MenuItem>
-                  <MenuItem value="concise">Concise</MenuItem>
-                  <MenuItem value="friendly">Friendly</MenuItem>
-                  <MenuItem value="professional">Professional</MenuItem>
-                  <MenuItem value="casual">Casual</MenuItem>
-                  <MenuItem value="technical">Technical</MenuItem>
-                  <MenuItem value="creative">Creative</MenuItem>
-                </TextField>
-                <TextField
-                  label="Email Format"
-                  select
-                  value={form.email_format}
-                  onChange={(e) => setField("email_format", e.target.value)}
-                  fullWidth
-                  InputLabelProps={{ shrink: true }}
-                  SelectProps={{ displayEmpty: true }}
-                >
-                  <MenuItem value="">Default</MenuItem>
-                  <MenuItem value="bullets">Bullets</MenuItem>
-                  <MenuItem value="sections">Sections</MenuItem>
-                  <MenuItem value="narrative">Narrative</MenuItem>
-                </TextField>
-                <TextField
-                  label="Daily Brief Channel"
-                  select
-                  value={form.daily_brief_channel}
-                  onChange={(e) => setField("daily_brief_channel", e.target.value)}
-                  fullWidth
-                  InputLabelProps={{ shrink: true }}
-                >
-                  <MenuItem value="telegram">Telegram</MenuItem>
-                  <MenuItem value="whatsapp">WhatsApp</MenuItem>
-                  <MenuItem value="email">Email</MenuItem>
-                </TextField>
-              </Stack>
+                  <Box
+                    sx={{
+                      width: 8,
+                      height: 8,
+                      borderRadius: "50%",
+                      flexShrink: 0,
+                      background: s.ok ? "#14f195" : "rgba(255,255,255,0.15)",
+                      boxShadow: s.ok ? "0 0 6px rgba(20,241,149,0.4)" : "none",
+                    }}
+                  />
+                  <Stack spacing={0}>
+                    <Typography variant="caption" sx={{ color: "rgba(180,200,225,0.55)", fontSize: "0.68rem", lineHeight: 1.2 }}>{s.label}</Typography>
+                    <Typography variant="body2" sx={{ fontWeight: 500, fontSize: "0.8rem", color: s.ok ? "rgba(225,242,255,0.9)" : "rgba(180,200,225,0.45)" }}>
+                      {s.ok ? "Connected" : "Not configured"}
+                    </Typography>
+                  </Stack>
+                </Box>
+              ))}
             </Box>
-          </Grid2>
-          <Grid2 size={{ xs: 12, md: 6 }} sx={{ display: "flex" }}>
-            <Box className="list-shell" sx={{ minHeight: 0, width: "100%" }}>
-              <Typography variant="h6" mb={1}>
-                Snapshot
-              </Typography>
-              <Stack spacing={0.5}>
-                <Typography variant="body2">Primary API key configured: {hasPrimaryApiKey ? "yes" : "no"}</Typography>
-                <Typography variant="body2">Fallback API key configured: {hasFallbackApiKey ? "yes" : "no"}</Typography>
-                <Typography variant="body2">Telegram token configured: {hasTelegramToken ? "yes" : "no"}</Typography>
-                <Typography variant="body2">WhatsApp token configured: {hasWhatsAppToken ? "yes" : "no"}</Typography>
-                <Typography variant="body2">Settings complete: {settingsComplete ? "yes" : "no"}</Typography>
-                <Typography variant="body2">Model slots: {modelSlots.length}</Typography>
-                <Typography variant="body2">Media providers: {configuredProviders.length ? configuredProviders.join(", ") : "-"}</Typography>
-              </Stack>
+            <Box sx={{ display: "flex", gap: 2, mt: 1.5, flexWrap: "wrap" }}>
+              <Chip size="small" variant="outlined" label={`${modelSlots.length} model${modelSlots.length !== 1 ? "s" : ""}`} sx={{ borderColor: "rgba(47,212,255,0.25)", color: "rgba(47,212,255,0.85)", fontSize: "0.72rem" }} />
+              <Chip size="small" variant="outlined" label={configuredProviders.length ? configuredProviders.join(", ") : "No media providers"} sx={{ borderColor: "rgba(255,255,255,0.08)", color: "rgba(180,200,225,0.55)", fontSize: "0.72rem" }} />
+              {settingsComplete ? (
+                <Chip size="small" variant="outlined" label="Setup complete" sx={{ borderColor: "rgba(20,241,149,0.25)", color: "rgba(20,241,149,0.85)", fontSize: "0.72rem" }} />
+              ) : (
+                <Chip size="small" variant="outlined" label="Setup incomplete" sx={{ borderColor: "rgba(255,180,50,0.3)", color: "rgba(255,180,50,0.85)", fontSize: "0.72rem" }} />
+              )}
             </Box>
-          </Grid2>
-        </Grid2>
+          </Box>
+
+          <hr className="settings-divider" />
+
+          {/* ── Identity ── */}
+          <Box>
+            <Typography className="settings-section-label">Identity</Typography>
+            <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" }, gap: 1.5 }}>
+              <TextField label="Bot Name" value={form.bot_name} onChange={(e) => setField("bot_name", e.target.value)} fullWidth size="small" />
+              <TextField
+                label="Personality"
+                select
+                value={form.personality}
+                onChange={(e) => setField("personality", e.target.value)}
+                fullWidth
+                size="small"
+              >
+                <MenuItem value="friendly">Friendly</MenuItem>
+                <MenuItem value="professional">Professional</MenuItem>
+                <MenuItem value="casual">Casual</MenuItem>
+                <MenuItem value="technical">Technical</MenuItem>
+                <MenuItem value="creative">Creative</MenuItem>
+                <MenuItem value="concise">Concise</MenuItem>
+              </TextField>
+              <TextField label="Language" value={form.language} onChange={(e) => setField("language", e.target.value)} fullWidth size="small" placeholder="e.g. English" />
+              <TextField
+                label="Tone"
+                select
+                value={form.tone}
+                onChange={(e) => setField("tone", e.target.value)}
+                fullWidth
+                size="small"
+                InputLabelProps={{ shrink: true }}
+                SelectProps={{ displayEmpty: true }}
+              >
+                <MenuItem value="">Default</MenuItem>
+                <MenuItem value="concise">Concise</MenuItem>
+                <MenuItem value="friendly">Friendly</MenuItem>
+                <MenuItem value="professional">Professional</MenuItem>
+                <MenuItem value="casual">Casual</MenuItem>
+                <MenuItem value="technical">Technical</MenuItem>
+                <MenuItem value="creative">Creative</MenuItem>
+              </TextField>
+            </Box>
+          </Box>
+
+          <hr className="settings-divider" />
+
+          {/* ── Preferences ── */}
+          <Box>
+            <Typography className="settings-section-label">Preferences</Typography>
+            <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "1fr 1fr 1fr" }, gap: 1.5 }}>
+              <Autocomplete
+                freeSolo
+                options={[
+                  "UTC",
+                  "America/New_York",
+                  "America/Chicago",
+                  "America/Denver",
+                  "America/Los_Angeles",
+                  "America/Phoenix",
+                  "America/Toronto",
+                  "America/Vancouver",
+                  "Europe/London",
+                  "Europe/Paris",
+                  "Europe/Berlin",
+                  "Asia/Dubai",
+                  "Asia/Kolkata",
+                  "Asia/Singapore",
+                  "Asia/Tokyo",
+                  "Australia/Sydney"
+                ]}
+                value={form.timezone || ""}
+                onChange={(_, v) => setField("timezone", String(v ?? ""))}
+                inputValue={form.timezone || ""}
+                onInputChange={(_, v) => setField("timezone", v)}
+                renderInput={(params) => (
+                  <TextField
+                    {...params}
+                    label="Timezone"
+                    placeholder="e.g. America/New_York"
+                    fullWidth
+                    size="small"
+                  />
+                )}
+              />
+              <TextField
+                label="Email Format"
+                select
+                value={form.email_format}
+                onChange={(e) => setField("email_format", e.target.value)}
+                fullWidth
+                size="small"
+                InputLabelProps={{ shrink: true }}
+                SelectProps={{ displayEmpty: true }}
+              >
+                <MenuItem value="">Default</MenuItem>
+                <MenuItem value="bullets">Bullets</MenuItem>
+                <MenuItem value="sections">Sections</MenuItem>
+                <MenuItem value="narrative">Narrative</MenuItem>
+              </TextField>
+              <TextField
+                label="Daily Brief Channel"
+                select
+                value={form.daily_brief_channel}
+                onChange={(e) => setField("daily_brief_channel", e.target.value)}
+                fullWidth
+                size="small"
+                InputLabelProps={{ shrink: true }}
+              >
+                <MenuItem value="telegram">Telegram</MenuItem>
+                <MenuItem value="whatsapp">WhatsApp</MenuItem>
+                <MenuItem value="email">Email</MenuItem>
+              </TextField>
+            </Box>
+          </Box>
+        </Stack>
       ) : null}
 
       {tab === 1 ? (
         <Stack spacing={2} data-tour-target="settings-models">
-          <Box className="list-shell" sx={{ minHeight: 0 }}>
+          <Box sx={{ minHeight: 0 }}>
             <Stack direction="row" justifyContent="space-between" alignItems="center" mb={1}>
               <Stack spacing={0.3}>
-                <Typography variant="h6">Model Pool</Typography>
+                <Typography className="settings-section-label" sx={{ mb: "0 !important" }}>Model Pool</Typography>
                 <Typography variant="caption" color="text.secondary">
                   Configure multiple models for different roles. Changes apply immediately.
                 </Typography>
@@ -8757,86 +11078,125 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
                 When off, the agent uses the primary model for everything.
               </Typography>
             </Stack>
+            <TextField
+              label="App Deploy Model (optional)"
+              select
+              fullWidth
+              size="small"
+              sx={{ mb: 1.25, maxWidth: 560 }}
+              value={form.app_deploy_model_id}
+              onChange={(e) => setField("app_deploy_model_id", e.target.value)}
+              helperText="If not set, app deploy uses the default primary model."
+            >
+              <MenuItem value="">Default (Primary model)</MenuItem>
+              {modelSlots.map((slot) => {
+                const id = str(slot.id, "");
+                const label = str(slot.label, "Model");
+                const role = str(slot.role, "primary");
+                const model = str(slot.model, "");
+                const enabled = toBool(slot.enabled);
+                return (
+                  <MenuItem key={id || `${label}:${model}`} value={id} disabled={!enabled}>
+                    {enabled ? `${label} [${role}] - ${model}` : `${label} [${role}] - ${model} (disabled)`}
+                  </MenuItem>
+                );
+              })}
+            </TextField>
 
-            {modelsQ.isLoading ? (
+            {modelsQ.isLoading && modelSlots.length === 0 ? (
               <Typography variant="body2" color="text.secondary">
                 Loading models...
               </Typography>
+            ) : modelsRefreshIssue && modelSlots.length === 0 ? (
+              <Alert severity="warning">
+                Could not refresh model list right now. Please retry in a moment.
+              </Alert>
             ) : modelSlots.length === 0 ? (
               <Typography variant="body2" color="text.secondary">
                 No models configured. Add a model to complete setup.
               </Typography>
             ) : (
-              <TableContainer className="table-shell">
-                <Table size="small">
-                  <TableHead>
-                    <TableRow>
-                      <TableCell>Label</TableCell>
-                      <TableCell>Role</TableCell>
-                      <TableCell>Provider</TableCell>
-                      <TableCell>Model</TableCell>
-                      <TableCell>Enabled</TableCell>
-                      <TableCell>API Key</TableCell>
-                      <TableCell align="right">Ops</TableCell>
-                    </TableRow>
-                  </TableHead>
-                  <TableBody>
-                    {modelSlots.map((slot) => {
-                      const id = str(slot.id, "");
-                      const enabled = toBool(slot.enabled);
-                      return (
-                        <TableRow key={id}>
-                          <TableCell>{str(slot.label, "-")}</TableCell>
-                          <TableCell>{str(slot.role, "-")}</TableCell>
-                          <TableCell>{str(slot.provider, "-")}</TableCell>
-                          <TableCell sx={{ wordBreak: "break-word" }}>{str(slot.model, "-")}</TableCell>
-                          <TableCell>{enabled ? "yes" : "no"}</TableCell>
-                          <TableCell>{toBool(slot.has_api_key) ? "configured" : "-"}</TableCell>
-                          <TableCell align="right">
-                            <RowOpsMenu
-                              actions={[
-                                {
-                                  label: "Edit",
-                                  onClick: () => openEditModel(slot)
-                                },
-                                {
-                                  label: enabled ? "Disable" : "Enable",
-                                  disabled: toggleModelEnabledMutation.isPending,
-                                  onClick: async () => {
-                                    setError(null);
-                                    try {
-                                      await toggleModelEnabledMutation.mutateAsync(slot);
-                                    } catch (e) {
-                                      setError(errMessage(e));
+              <Stack spacing={1}>
+                {showingModelFallback ? (
+                  <Alert severity="info">
+                    Showing last known model list while refresh is in progress.
+                  </Alert>
+                ) : null}
+                <TableContainer className="table-shell">
+                  <Table size="small">
+                    <TableHead>
+                      <TableRow>
+                        <TableCell>Label</TableCell>
+                        <TableCell>Role</TableCell>
+                        <TableCell>Provider</TableCell>
+                        <TableCell>Model</TableCell>
+                        <TableCell>Enabled</TableCell>
+                        <TableCell>API Key</TableCell>
+                        <TableCell align="right">Ops</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {modelSlots.map((slot) => {
+                        const id = str(slot.id, "");
+                        const enabled = toBool(slot.enabled);
+                        return (
+                          <TableRow key={id}>
+                            <TableCell>{str(slot.label, "-")}</TableCell>
+                            <TableCell>{str(slot.role, "-")}</TableCell>
+                            <TableCell>
+                              {str(slot.provider, "-") === "codex-cli"
+                                ? "openai-subscription"
+                                : str(slot.provider, "-")}
+                            </TableCell>
+                            <TableCell sx={{ wordBreak: "break-word" }}>{str(slot.model, "-")}</TableCell>
+                            <TableCell>{enabled ? "yes" : "no"}</TableCell>
+                            <TableCell>{toBool(slot.has_api_key) ? "configured" : "-"}</TableCell>
+                            <TableCell align="right">
+                              <RowOpsMenu
+                                actions={[
+                                  {
+                                    label: "Edit",
+                                    onClick: () => openEditModel(slot)
+                                  },
+                                  {
+                                    label: enabled ? "Disable" : "Enable",
+                                    disabled: toggleModelEnabledMutation.isPending,
+                                    onClick: async () => {
+                                      setError(null);
+                                      try {
+                                        await toggleModelEnabledMutation.mutateAsync(slot);
+                                      } catch (e) {
+                                        setError(errMessage(e));
+                                      }
+                                    }
+                                  },
+                                  {
+                                    label: "Delete",
+                                    tone: "error",
+                                    divider: true,
+                                    disabled: deleteModelMutation.isPending,
+                                    onClick: async () => {
+                                      const ok = window.confirm("Delete this model slot?");
+                                      if (!ok) return;
+                                      setError(null);
+                                      try {
+                                        await deleteModelMutation.mutateAsync(id);
+                                      } catch (e) {
+                                        setError(errMessage(e));
+                                      }
                                     }
                                   }
-                                },
-                                {
-                                  label: "Delete",
-                                  tone: "error",
-                                  divider: true,
-                                  disabled: deleteModelMutation.isPending,
-                                  onClick: async () => {
-                                    const ok = window.confirm("Delete this model slot?");
-                                    if (!ok) return;
-                                    setError(null);
-                                    try {
-                                      await deleteModelMutation.mutateAsync(id);
-                                    } catch (e) {
-                                      setError(errMessage(e));
-                                    }
-                                  }
-                                }
-                              ]}
-                              ariaLabel="Model options"
-                            />
-                          </TableCell>
-                        </TableRow>
-                      );
-                    })}
-                  </TableBody>
-                </Table>
-              </TableContainer>
+                                ]}
+                                ariaLabel="Model options"
+                              />
+                            </TableCell>
+                          </TableRow>
+                        );
+                      })}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              </Stack>
             )}
           </Box>
 
@@ -8873,22 +11233,158 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
                   <MenuItem value="ollama">ollama</MenuItem>
                   <MenuItem value="anthropic">anthropic</MenuItem>
                   <MenuItem value="openai">openai</MenuItem>
+                  <MenuItem value="openai-subscription">openai-subscription (OAuth)</MenuItem>
                   <MenuItem value="openrouter">openrouter</MenuItem>
                   <MenuItem value="openai-compatible">openai-compatible</MenuItem>
                 </TextField>
-                <TextField
-                  label="Model"
+                <Autocomplete
+                  freeSolo
+                  options={modelOptions}
                   value={modelForm.model}
-                  onChange={(e) => setModelForm((p) => ({ ...p, model: e.target.value }))}
-                  fullWidth
+                  onChange={(_, v) => setModelForm((p) => ({ ...p, model: String(v ?? "") }))}
+                  inputValue={modelForm.model}
+                  onInputChange={(_, v) => setModelForm((p) => ({ ...p, model: v }))}
+                  renderInput={(params) => (
+                    <TextField
+                      {...params}
+                      label="Model"
+                      fullWidth
+                      placeholder={
+                        modelForm.provider === "openai-subscription"
+                          ? "Choose OpenAI model"
+                          : "Enter model id"
+                      }
+                    />
+                  )}
                 />
-                <TextField
-                  label="API Key (optional)"
-                  value={modelForm.api_key}
-                  onChange={(e) => setModelForm((p) => ({ ...p, api_key: e.target.value }))}
-                  fullWidth
-                  type="password"
-                />
+                {modelForm.provider === "openai-subscription" || modelForm.provider === "codex-cli" ? (
+                  <Stack spacing={1}>
+                    <Alert severity="info">
+                      Connect your OpenAI subscription with browser OAuth. You can reconnect any time, especially if auth expires.
+                      <br /><br />
+                      <strong>First time?</strong> Enable device code auth in your OpenAI account: go to{" "}
+                      <a href="https://chatgpt.com/settings/security" target="_blank" rel="noopener noreferrer" style={{ color: "inherit" }}>
+                        chatgpt.com/settings/security
+                      </a>{" "}
+                      → toggle <strong>"Enable device code authorization"</strong> on.
+                    </Alert>
+                    <Stack direction="row" spacing={1}>
+                      <Button
+                        variant="contained"
+                        size="small"
+                        onClick={startOpenaiSubscriptionOAuth}
+                        disabled={codexAuthBusy}
+                      >
+                        {codexAuthBusy ? "Starting..." : modelEditingId ? "Reconnect OAuth" : "Connect via Browser"}
+                      </Button>
+                      <Button
+                        variant="outlined"
+                        size="small"
+                        onClick={checkOpenaiSubscriptionOAuthStatus}
+                        disabled={codexAuthBusy}
+                      >
+                        Check Status
+                      </Button>
+                      <Button
+                        variant="text"
+                        size="small"
+                        onClick={() => {
+                          const authUrl = (openaiSubAuth?.authUrl || "").trim();
+                          if (!authUrl) return;
+                          window.open(authUrl, "_blank", "noopener,noreferrer");
+                        }}
+                        disabled={codexAuthBusy || !(openaiSubAuth?.authUrl || "").trim()}
+                      >
+                        Open URL
+                      </Button>
+                    </Stack>
+                    {(openaiSubAuth?.deviceCode || "").trim() ? (
+                      <Stack direction="row" spacing={0.8} alignItems="center" sx={{ minWidth: 0 }}>
+                        <Typography variant="caption" color="text.secondary">
+                          Device code:
+                        </Typography>
+                        <Typography
+                          variant="caption"
+                          component="code"
+                          sx={{
+                            px: 0.8,
+                            py: 0.2,
+                            borderRadius: 1,
+                            bgcolor: "rgba(0,0,0,0.22)",
+                            fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace"
+                          }}
+                        >
+                          {(openaiSubAuth?.deviceCode || "").trim()}
+                        </Typography>
+                        <IconButton
+                          size="small"
+                          onClick={async () => {
+                            try {
+                              await navigator.clipboard.writeText((openaiSubAuth?.deviceCode || "").trim());
+                              setSuccess("Device code copied.");
+                            } catch {
+                              setError("Could not copy device code.");
+                            }
+                          }}
+                          aria-label="Copy device code"
+                        >
+                          <ContentCopyRoundedIcon fontSize="inherit" />
+                        </IconButton>
+                      </Stack>
+                    ) : null}
+                    {(openaiSubAuth?.authUrl || "").trim() ? (
+                      <Stack direction="row" spacing={0.8} alignItems="center" sx={{ minWidth: 0 }}>
+                        <Link
+                          href={(openaiSubAuth?.authUrl || "").trim()}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          underline="hover"
+                          sx={{ fontSize: "0.75rem", wordBreak: "break-all", flex: 1, minWidth: 0 }}
+                        >
+                          {(openaiSubAuth?.authUrl || "").trim()}
+                        </Link>
+                        <IconButton
+                          size="small"
+                          onClick={async () => {
+                            try {
+                              await navigator.clipboard.writeText((openaiSubAuth?.authUrl || "").trim());
+                              setSuccess("OAuth URL copied.");
+                            } catch {
+                              setError("Could not copy URL.");
+                            }
+                          }}
+                          aria-label="Copy OAuth URL"
+                        >
+                          <ContentCopyRoundedIcon fontSize="inherit" />
+                        </IconButton>
+                      </Stack>
+                    ) : null}
+                    {openaiSubAuth && !openaiSubAuth.openedBrowser && (openaiSubAuth.authUrl || "").trim() ? (
+                      <Typography variant="caption" color="warning.main">
+                        Browser did not open automatically. Click "Open URL" above to complete sign-in.
+                      </Typography>
+                    ) : null}
+                    {openaiSubAuth?.running ? (
+                      <Typography variant="caption" color="info.main">
+                        Login is in progress. Finish auth in browser/device flow, then click Check Status.
+                      </Typography>
+                    ) : null}
+                    {openaiSubAuth?.message ? (
+                      <Typography variant="caption" color="text.secondary">
+                        {openaiSubAuth.message}
+                      </Typography>
+                    ) : null}
+                  </Stack>
+                ) : (
+                  <TextField
+                    label="API Key (optional)"
+                    value={modelForm.api_key}
+                    onChange={(e) => setModelForm((p) => ({ ...p, api_key: e.target.value }))}
+                    fullWidth
+                    type="password"
+                    helperText={modelEditingId ? "Leave blank to keep the current key." : undefined}
+                  />
+                )}
                 <Accordion expanded={modelAdvancedOpen} onChange={(_, expanded) => setModelAdvancedOpen(expanded)} disableGutters>
                   <AccordionSummary expandIcon={<ExpandMoreIcon />}>
                     <Typography variant="body2">Advanced</Typography>
@@ -8944,10 +11440,10 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
       ) : null}
 
       {tab === 3 ? (
-        <Grid2 container spacing={2} alignItems="stretch">
+        <Grid2 container spacing={1.5} alignItems="stretch">
           <Grid2 size={{ xs: 12, lg: 6 }} sx={{ display: "flex" }}>
-            <Box className="list-shell" sx={{ minHeight: 0, width: "100%" }}>
-              <Typography variant="h6" mb={1}>
+            <Box sx={{ minHeight: 0, width: "100%" }}>
+              <Typography className="settings-section-label">
                 Provider Keys
               </Typography>
               <Typography variant="caption" color="text.secondary">
@@ -9004,12 +11500,12 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
       ) : null}
 
       {tab === 4 ? (
-        <Grid2 container spacing={2}>
+        <Grid2 container spacing={1.5}>
           <Grid2 size={{ xs: 12, lg: 6 }}>
             <Stack spacing={2}>
-              <Box className="list-shell" sx={{ minHeight: 0 }}>
+              <Box sx={{ minHeight: 0 }}>
                 <Stack spacing={1}>
-                  <Typography variant="h6">Security & Master Password</Typography>
+                  <Typography className="settings-section-label">Security & Master Password</Typography>
                   {securityStatusQ.isLoading ? (
                     <Typography variant="body2" color="text.secondary">
                       Loading security status...
@@ -9341,7 +11837,26 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
           </Grid2>
 
           <Grid2 size={{ xs: 12 }}>
-            <QueryTable title="Security Logs" path="/security/logs?limit=20" arrayKey="logs" columns={["event_type", "severity", "message", "source", "created_at", "count"]} autoRefresh={autoRefresh} emptyLabel="No security logs yet." queryKey="settings-security-logs-table" />
+            <Box className="list-shell" sx={{ minHeight: 0 }}>
+              <Stack direction={{ xs: "column", sm: "row" }} justifyContent="space-between" alignItems={{ xs: "flex-start", sm: "center" }} spacing={1}>
+                <Stack spacing={0.25}>
+                  <Typography variant="h6">Security Logs</Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    Hidden by default. Open the viewer to inspect individual events.
+                  </Typography>
+                </Stack>
+                <Button
+                  size="small"
+                  variant="outlined"
+                  onClick={() => {
+                    setSelectedSecurityLog(null);
+                    setSecurityLogsDialogOpen(true);
+                  }}
+                >
+                  Open Logs
+                </Button>
+              </Stack>
+            </Box>
           </Grid2>
         </Grid2>
       ) : null}
@@ -9730,191 +12245,7 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
         </Grid2>
       ) : null}
 
-      {tab === 6 ? (
-        <Stack spacing={2}>
-          <Grid2 container spacing={2}>
-            <Grid2 size={{ xs: 12, md: 4 }}>
-              <Box className="list-shell" sx={{ minHeight: 0 }}>
-                <Typography variant="h6" mb={1}>
-                  Summary (24h)
-                </Typography>
-                {llmAnalyticsHourQ.error ? (
-                  <Alert severity="error">{errMessage(llmAnalyticsHourQ.error)}</Alert>
-                ) : (
-                  <Stack spacing={0.5}>
-                    <Typography variant="body2">
-                      Requests: {num(llmHour?.totals?.request_count, 0)}
-                    </Typography>
-                    <Typography variant="body2">
-                      Tokens: {num(llmHour?.totals?.total_tokens, 0)}
-                    </Typography>
-                    <Typography variant="body2">
-                      Estimated rows: {num(llmHour?.totals?.estimated_count, 0)}
-                    </Typography>
-                    <Typography variant="body2">
-                      Cost (USD):{" "}
-                      {typeof llmHour?.totals?.cost_usd === "number"
-                        ? `$${llmHour.totals.cost_usd.toFixed(4)}`
-                        : "n/a"}
-                    </Typography>
-                  </Stack>
-                )}
-              </Box>
-            </Grid2>
-
-            <Grid2 size={{ xs: 12, md: 4 }}>
-              <Box className="list-shell" sx={{ minHeight: 0 }}>
-                <Typography variant="h6" mb={1}>
-                  Summary (30d)
-                </Typography>
-                {llmAnalyticsDayQ.error ? (
-                  <Alert severity="error">{errMessage(llmAnalyticsDayQ.error)}</Alert>
-                ) : (
-                  <Stack spacing={0.5}>
-                    <Typography variant="body2">
-                      Requests: {num(llmDay?.totals?.request_count, 0)}
-                    </Typography>
-                    <Typography variant="body2">
-                      Tokens: {num(llmDay?.totals?.total_tokens, 0)}
-                    </Typography>
-                    <Typography variant="body2">
-                      Cost (USD):{" "}
-                      {typeof llmDay?.totals?.cost_usd === "number"
-                        ? `$${llmDay.totals.cost_usd.toFixed(4)}`
-                        : "n/a"}
-                    </Typography>
-                  </Stack>
-                )}
-              </Box>
-            </Grid2>
-
-            <Grid2 size={{ xs: 12, md: 4 }}>
-              <Box className="list-shell" sx={{ minHeight: 0 }}>
-                <Typography variant="h6" mb={1}>
-                  Summary (90d)
-                </Typography>
-                {llmAnalyticsWeekQ.error ? (
-                  <Alert severity="error">{errMessage(llmAnalyticsWeekQ.error)}</Alert>
-                ) : (
-                  <Stack spacing={0.5}>
-                    <Typography variant="body2">
-                      Requests: {num(llmWeek?.totals?.request_count, 0)}
-                    </Typography>
-                    <Typography variant="body2">
-                      Tokens: {num(llmWeek?.totals?.total_tokens, 0)}
-                    </Typography>
-                    <Typography variant="body2">
-                      Cost (USD):{" "}
-                      {typeof llmWeek?.totals?.cost_usd === "number"
-                        ? `$${llmWeek.totals.cost_usd.toFixed(4)}`
-                        : "n/a"}
-                    </Typography>
-                  </Stack>
-                )}
-              </Box>
-            </Grid2>
-          </Grid2>
-
-          <Grid2 container spacing={2}>
-            <Grid2 size={{ xs: 12, lg: 4 }}>
-              <Box className="chart-shell">
-                <ReactECharts option={analyticsOption.hour} style={{ height: 280 }} />
-              </Box>
-            </Grid2>
-            <Grid2 size={{ xs: 12, lg: 4 }}>
-              <Box className="chart-shell">
-                <ReactECharts option={analyticsOption.day} style={{ height: 280 }} />
-              </Box>
-            </Grid2>
-            <Grid2 size={{ xs: 12, lg: 4 }}>
-              <Box className="chart-shell">
-                <ReactECharts option={analyticsOption.week} style={{ height: 280 }} />
-              </Box>
-            </Grid2>
-          </Grid2>
-
-          <Grid2 container spacing={2} alignItems="stretch">
-            <Grid2 size={{ xs: 12, lg: 6 }} sx={{ display: "flex" }}>
-              <Box className="list-shell" sx={{ minHeight: 0, flex: 1 }}>
-                <Typography variant="h6" mb={1}>
-                  Top Models (30d)
-                </Typography>
-                {llmDay?.by_model?.length ? (
-                  <TableContainer className="table-shell">
-                    <Table size="small">
-                      <TableHead>
-                        <TableRow>
-                          <TableCell>Provider</TableCell>
-                          <TableCell>Model</TableCell>
-                          <TableCell align="right">Requests</TableCell>
-                          <TableCell align="right">Tokens</TableCell>
-                          <TableCell align="right">Cost</TableCell>
-                        </TableRow>
-                      </TableHead>
-                      <TableBody>
-                        {llmDay.by_model.slice(0, 12).map((r, idx) => (
-                          <TableRow key={`${r.provider}:${r.model}:${idx}`}>
-                            <TableCell>{r.provider || "-"}</TableCell>
-                            <TableCell sx={{ wordBreak: "break-word" }}>{r.model || "-"}</TableCell>
-                            <TableCell align="right">{num(r.request_count, 0)}</TableCell>
-                            <TableCell align="right">{num(r.total_tokens, 0)}</TableCell>
-                            <TableCell align="right">
-                              {typeof r.cost_usd === "number" ? `$${r.cost_usd.toFixed(4)}` : "n/a"}
-                            </TableCell>
-                          </TableRow>
-                        ))}
-                      </TableBody>
-                    </Table>
-                  </TableContainer>
-                ) : (
-                  <Typography variant="body2" color="text.secondary">
-                    No usage yet.
-                  </Typography>
-                )}
-              </Box>
-            </Grid2>
-            <Grid2 size={{ xs: 12, lg: 6 }} sx={{ display: "flex" }}>
-              <Box className="list-shell" sx={{ minHeight: 0, flex: 1 }}>
-                <Typography variant="h6" mb={1}>
-                  By Channel (30d)
-                </Typography>
-                {llmDay?.by_channel?.length ? (
-                  <TableContainer className="table-shell">
-                    <Table size="small">
-                      <TableHead>
-                        <TableRow>
-                          <TableCell>Channel</TableCell>
-                          <TableCell align="right">Requests</TableCell>
-                          <TableCell align="right">Tokens</TableCell>
-                          <TableCell align="right">Cost</TableCell>
-                        </TableRow>
-                      </TableHead>
-                      <TableBody>
-                        {llmDay.by_channel.slice(0, 12).map((r, idx) => (
-                          <TableRow key={`${r.channel || "?"}:${idx}`}>
-                            <TableCell>{r.channel || "-"}</TableCell>
-                            <TableCell align="right">{num(r.request_count, 0)}</TableCell>
-                            <TableCell align="right">{num(r.total_tokens, 0)}</TableCell>
-                            <TableCell align="right">
-                              {typeof r.cost_usd === "number" ? `$${r.cost_usd.toFixed(4)}` : "n/a"}
-                            </TableCell>
-                          </TableRow>
-                        ))}
-                      </TableBody>
-                    </Table>
-                  </TableContainer>
-                ) : (
-                  <Typography variant="body2" color="text.secondary">
-                    No usage yet.
-                  </Typography>
-                )}
-              </Box>
-            </Grid2>
-          </Grid2>
-        </Stack>
-      ) : null}
-
-      {tab === 7 ? ( 
+      {tab === 7 ? (
         <Stack spacing={2}>
           <Box className="list-shell">
             <Stack spacing={0.6}>
@@ -10213,6 +12544,11 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
                     size="small"
                     onClick={async () => {
                       setError(null);
+                      const baselineEventId = latestPulseEventId;
+                      setPulsePollState({
+                        baselineEventId,
+                        deadlineAt: Date.now() + 2 * 60 * 1000
+                      });
                       try {
                         const out = asRecord(await triggerPulseMutation.mutateAsync());
                         const status = str(out.status, "").toLowerCase();
@@ -10222,6 +12558,7 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
                           setSuccess(str(out.message, "ArkPulse check started."));
                         }
                       } catch (e) {
+                        setPulsePollState(null);
                         setError(errMessage(e));
                       }
                     }}
@@ -10278,7 +12615,9 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
                       <TableBody>
                         {pulseEvents.slice(0, 40).map((ev, idx) => {
                           const details = asRecord(ev.details);
-                          const findings = Array.isArray(details.doctor_findings) ? details.doctor_findings : [];
+                          const findings = pickRecords(details, "doctor_findings").filter((f) =>
+                            isUserActionableDoctorFinding(f)
+                          );
                           const score = num(details.doctor_score, -1);
                           const status = str(ev.status, "-");
                           const ok = status.toLowerCase() === "ok";
@@ -10327,6 +12666,410 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
           </Grid2>
         </Stack>
       ) : null}
+
+      {tab === 13 ? (
+        <Stack spacing={2}>
+          <Grid2 container spacing={2}>
+            <Grid2 size={{ xs: 12, lg: 6 }}>
+              <Box className="list-shell" sx={{ minHeight: 0 }}>
+                <Typography variant="h6" mb={1}>Evolution Status</Typography>
+                {evolutionQ.isLoading ? (
+                  <Typography variant="body2" color="text.secondary">Loading evolution status...</Typography>
+                ) : evolutionQ.error ? (
+                  <Alert severity="error">{errMessage(evolutionQ.error)}</Alert>
+                ) : (
+                  <Stack spacing={1}>
+                    <Stack direction="row" spacing={1} alignItems="center" useFlexGap flexWrap="wrap">
+                      <Typography variant="body2">Self-evolve:</Typography>
+                      <Chip size="small" color={toBool(evolution.self_evolve_enabled) ? "success" : "default"} label={toBool(evolution.self_evolve_enabled) ? "On" : "Off"} />
+                    </Stack>
+                    <Stack direction="row" spacing={1} alignItems="center" useFlexGap flexWrap="wrap">
+                      <Typography variant="body2">Canary:</Typography>
+                      <Chip size="small" color={toBool(evolutionCanary.enabled) ? "warning" : "default"} label={toBool(evolutionCanary.enabled) ? "On" : "Off"} />
+                      <Typography variant="caption" color="text.secondary">
+                        Rollout: {num(evolutionCanary.rollout_percent, 0)}%
+                      </Typography>
+                    </Stack>
+                    <Typography variant="body2">
+                      Baseline: {str(evolutionCanary.baseline_version, "routing-policy-default-v1")}
+                    </Typography>
+                    <Typography variant="body2">
+                      Candidate: {str(evolutionCanary.candidate_version, "-")}
+                    </Typography>
+                    <Typography variant="body2">
+                      Last promotion result: {str(evolution.last_promotion_result, "No evolution runs yet")}
+                    </Typography>
+                    <Typography variant="body2">
+                      Promotion mode: {str(evolution.promotion_mode, "none")}
+                    </Typography>
+                    <Typography variant="body2">
+                      Replay gate: {str(evolution.replay_gate_result, "-")}
+                    </Typography>
+                  </Stack>
+                )}
+              </Box>
+            </Grid2>
+            <Grid2 size={{ xs: 12, lg: 6 }}>
+              <Box className="list-shell" sx={{ minHeight: 0 }}>
+                <Typography variant="h6" mb={1}>Deploy Guard Default</Typography>
+                <Typography variant="body2" color="text.secondary" mb={1}>
+                  Default remains OFF unless changed. This controls app deploy default when a request does not specify `access_guard`.
+                </Typography>
+                <Stack spacing={1}>
+                  <Stack direction="row" spacing={1} alignItems="center">
+                    <Typography variant="body2">Current default:</Typography>
+                    <Chip
+                      size="small"
+                      color={toBool(evolution.deploy_guard_default) ? "warning" : "default"}
+                      label={toBool(evolution.deploy_guard_default) ? "ON" : "OFF"}
+                    />
+                  </Stack>
+                  <Stack direction="row" spacing={1}>
+                    <Button
+                      size="small"
+                      variant="contained"
+                      onClick={async () => {
+                        setError(null);
+                        setSuccess(null);
+                        try {
+                          await updateEvolutionSettingsMutation.mutateAsync({ deploy_guard_default: true });
+                          setSuccess("Deploy guard default enabled.");
+                        } catch (e) {
+                          setError(errMessage(e));
+                        }
+                      }}
+                      disabled={updateEvolutionSettingsMutation.isPending || toBool(evolution.deploy_guard_default)}
+                    >
+                      Enable Default Guard
+                    </Button>
+                    <Button
+                      size="small"
+                      onClick={async () => {
+                        setError(null);
+                        setSuccess(null);
+                        try {
+                          await updateEvolutionSettingsMutation.mutateAsync({ deploy_guard_default: false });
+                          setSuccess("Deploy guard default disabled.");
+                        } catch (e) {
+                          setError(errMessage(e));
+                        }
+                      }}
+                      disabled={updateEvolutionSettingsMutation.isPending || !toBool(evolution.deploy_guard_default)}
+                    >
+                      Keep Default Off
+                    </Button>
+                  </Stack>
+                </Stack>
+              </Box>
+            </Grid2>
+          </Grid2>
+
+          {developerModeEnabled ? (
+            <Grid2 container spacing={2}>
+              <Grid2 size={{ xs: 12 }}>
+                <Box className="list-shell" sx={{ minHeight: 0 }}>
+                  <Stack direction={{ xs: "column", md: "row" }} spacing={1} justifyContent="space-between" alignItems={{ xs: "flex-start", md: "center" }}>
+                    <Typography variant="h6">Developer Controls</Typography>
+                    <Stack direction="row" spacing={1}>
+                      <Button
+                        size="small"
+                        onClick={async () => {
+                          setError(null);
+                          setSuccess(null);
+                          try {
+                            await runEvolutionDevActionMutation.mutateAsync("disable_canary");
+                            setSuccess("Canary disabled.");
+                          } catch (e) {
+                            setError(errMessage(e));
+                          }
+                        }}
+                        disabled={runEvolutionDevActionMutation.isPending}
+                      >
+                        Disable Canary
+                      </Button>
+                      <Button
+                        size="small"
+                        variant="contained"
+                        onClick={async () => {
+                          const ok = window.confirm("Promote candidate policy to baseline now?");
+                          if (!ok) return;
+                          setError(null);
+                          setSuccess(null);
+                          try {
+                            await runEvolutionDevActionMutation.mutateAsync("promote_candidate");
+                            setSuccess("Candidate promoted to baseline.");
+                          } catch (e) {
+                            setError(errMessage(e));
+                          }
+                        }}
+                        disabled={runEvolutionDevActionMutation.isPending}
+                      >
+                        Promote Candidate
+                      </Button>
+                      <Button
+                        size="small"
+                        color="warning"
+                        onClick={async () => {
+                          const ok = window.confirm("Rollback baseline policy to stored snapshot?");
+                          if (!ok) return;
+                          setError(null);
+                          setSuccess(null);
+                          try {
+                            await runEvolutionDevActionMutation.mutateAsync("rollback_baseline");
+                            setSuccess("Rolled back to baseline snapshot.");
+                          } catch (e) {
+                            setError(errMessage(e));
+                          }
+                        }}
+                        disabled={runEvolutionDevActionMutation.isPending}
+                      >
+                        Rollback Baseline
+                      </Button>
+                    </Stack>
+                  </Stack>
+                </Box>
+              </Grid2>
+
+              <Grid2 size={{ xs: 12, lg: 6 }}>
+                <Box className="list-shell" sx={{ minHeight: 0 }}>
+                  <Typography variant="h6" mb={1}>Policy Metrics</Typography>
+                  {evolutionDevQ.isLoading ? (
+                    <Typography variant="body2" color="text.secondary">Loading developer metrics...</Typography>
+                  ) : evolutionDevQ.error ? (
+                    <Alert severity="error">{errMessage(evolutionDevQ.error)}</Alert>
+                  ) : evolutionPolicyMetrics.length === 0 ? (
+                    <Typography variant="body2" color="text.secondary">No policy metrics yet.</Typography>
+                  ) : (
+                    <TableContainer className="table-shell">
+                      <Table size="small">
+                        <TableHead>
+                          <TableRow>
+                            <TableCell>Version</TableCell>
+                            <TableCell align="right">Samples</TableCell>
+                            <TableCell align="right">Success</TableCell>
+                            <TableCell align="right">Errors</TableCell>
+                            <TableCell align="right">p95 (ms)</TableCell>
+                          </TableRow>
+                        </TableHead>
+                        <TableBody>
+                          {evolutionPolicyMetrics.map((row, idx) => (
+                            <TableRow key={`${str(row.version, "policy")}-${idx}`}>
+                              <TableCell>{str(row.version, "-")}</TableCell>
+                              <TableCell align="right">{num(row.samples, 0)}</TableCell>
+                              <TableCell align="right">{(num(row.success_rate, 0) * 100).toFixed(1)}%</TableCell>
+                              <TableCell align="right">{(num(row.error_rate, 0) * 100).toFixed(1)}%</TableCell>
+                              <TableCell align="right">{row.p95_latency_ms == null ? "-" : num(row.p95_latency_ms, 0)}</TableCell>
+                            </TableRow>
+                          ))}
+                        </TableBody>
+                      </Table>
+                    </TableContainer>
+                  )}
+                </Box>
+              </Grid2>
+
+              <Grid2 size={{ xs: 12, lg: 6 }}>
+                <Box className="list-shell" sx={{ minHeight: 0 }}>
+                  <Typography variant="h6" mb={1}>Strategy Metrics</Typography>
+                  {evolutionDevQ.isLoading ? (
+                    <Typography variant="body2" color="text.secondary">Loading developer metrics...</Typography>
+                  ) : evolutionDevQ.error ? (
+                    <Alert severity="error">{errMessage(evolutionDevQ.error)}</Alert>
+                  ) : evolutionStrategyMetrics.length === 0 ? (
+                    <Typography variant="body2" color="text.secondary">No strategy metrics yet.</Typography>
+                  ) : (
+                    <TableContainer className="table-shell">
+                      <Table size="small">
+                        <TableHead>
+                          <TableRow>
+                            <TableCell>Version</TableCell>
+                            <TableCell align="right">Samples</TableCell>
+                            <TableCell align="right">Success</TableCell>
+                            <TableCell align="right">Errors</TableCell>
+                            <TableCell align="right">p95 (ms)</TableCell>
+                          </TableRow>
+                        </TableHead>
+                        <TableBody>
+                          {evolutionStrategyMetrics.map((row, idx) => (
+                            <TableRow key={`${str(row.version, "strategy")}-${idx}`}>
+                              <TableCell>{str(row.version, "-")}</TableCell>
+                              <TableCell align="right">{num(row.samples, 0)}</TableCell>
+                              <TableCell align="right">{(num(row.success_rate, 0) * 100).toFixed(1)}%</TableCell>
+                              <TableCell align="right">{(num(row.error_rate, 0) * 100).toFixed(1)}%</TableCell>
+                              <TableCell align="right">{row.p95_latency_ms == null ? "-" : num(row.p95_latency_ms, 0)}</TableCell>
+                            </TableRow>
+                          ))}
+                        </TableBody>
+                      </Table>
+                    </TableContainer>
+                  )}
+                </Box>
+              </Grid2>
+
+              <Grid2 size={{ xs: 12 }}>
+                <Box className="list-shell" sx={{ minHeight: 0 }}>
+                  <Typography variant="h6" mb={1}>Lineage</Typography>
+                  {evolutionDevQ.isLoading ? (
+                    <Typography variant="body2" color="text.secondary">Loading lineage...</Typography>
+                  ) : evolutionDevQ.error ? (
+                    <Alert severity="error">{errMessage(evolutionDevQ.error)}</Alert>
+                  ) : evolutionLineage.length === 0 ? (
+                    <Typography variant="body2" color="text.secondary">No lineage entries found.</Typography>
+                  ) : (
+                    <TableContainer className="table-shell">
+                      <Table size="small">
+                        <TableHead>
+                          <TableRow>
+                            <TableCell>Timestamp</TableCell>
+                            <TableCell>Source</TableCell>
+                            <TableCell align="right">Gain</TableCell>
+                            <TableCell align="right">p-value</TableCell>
+                            <TableCell align="right">Promoted</TableCell>
+                          </TableRow>
+                        </TableHead>
+                        <TableBody>
+                          {evolutionLineage.slice().reverse().map((row, idx) => (
+                            <TableRow key={`${str(row.entry_id, "lineage")}-${idx}`}>
+                              <TableCell sx={{ whiteSpace: "nowrap" }}>{str(row.timestamp_utc, "-")}</TableCell>
+                              <TableCell>{str(row.candidate_source, "-")}</TableCell>
+                              <TableCell align="right">{num(row.accuracy_gain, 0).toFixed(4)}</TableCell>
+                              <TableCell align="right">{num(row.p_value, 1).toFixed(4)}</TableCell>
+                              <TableCell align="right">{toBool(row.promoted) ? "yes" : "no"}</TableCell>
+                            </TableRow>
+                          ))}
+                        </TableBody>
+                      </Table>
+                    </TableContainer>
+                  )}
+                </Box>
+              </Grid2>
+            </Grid2>
+          ) : (
+            <Alert severity="info">
+              Enable Developer mode in Settings -&gt; Advanced to view replay metrics, lineage, and manual canary controls.
+            </Alert>
+          )}
+        </Stack>
+      ) : null}
+        </Box>
+      </Box>
+
+      <Dialog
+        open={securityLogsDialogOpen}
+        onClose={() => {
+          setSecurityLogsDialogOpen(false);
+          setSelectedSecurityLog(null);
+        }}
+        maxWidth="lg"
+        fullWidth
+      >
+        <DialogTitle>Security Logs</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={1}>
+            <Stack direction="row" justifyContent="space-between" alignItems="center">
+              <Typography variant="caption" color="text.secondary">
+                event_type | severity | message
+              </Typography>
+              <Button size="small" onClick={() => void securityLogsQ.refetch()} disabled={securityLogsQ.isFetching}>
+                {securityLogsQ.isFetching ? "Refreshing..." : "Refresh"}
+              </Button>
+            </Stack>
+            {securityLogsQ.isLoading ? (
+              <Typography variant="body2" color="text.secondary">
+                Loading security logs...
+              </Typography>
+            ) : securityLogsQ.error ? (
+              <Alert severity="error">{errMessage(securityLogsQ.error)}</Alert>
+            ) : securityLogs.length === 0 ? (
+              <Typography variant="body2" color="text.secondary">
+                No security logs yet.
+              </Typography>
+            ) : (
+              <TableContainer className="table-shell">
+                <Table size="small">
+                  <TableHead>
+                    <TableRow>
+                      <TableCell>event_type</TableCell>
+                      <TableCell>severity</TableCell>
+                      <TableCell>message</TableCell>
+                      <TableCell align="right">Ops</TableCell>
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {securityLogs.map((row, idx) => {
+                      const eventType = str(row.event_type, "-");
+                      const severity = str(row.severity, "-");
+                      const message = str(row.message, "-");
+                      const rowKey = `${str(row.created_at, "")}:${eventType}:${idx}`;
+                      const selected = selectedSecurityLog === row;
+                      return (
+                        <TableRow
+                          key={rowKey}
+                          hover
+                          selected={selected}
+                          sx={{ cursor: "pointer" }}
+                          onClick={() => setSelectedSecurityLog(row)}
+                        >
+                          <TableCell sx={{ whiteSpace: "nowrap" }}>{eventType}</TableCell>
+                          <TableCell sx={{ whiteSpace: "nowrap" }}>
+                            <Chip size="small" label={severity} color={severityChipColor(severity)} />
+                          </TableCell>
+                          <TableCell sx={{ maxWidth: 560 }}>
+                            <Typography variant="body2" noWrap title={message}>
+                              {message}
+                            </Typography>
+                          </TableCell>
+                          <TableCell align="right">
+                            <Button
+                              size="small"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setSelectedSecurityLog(row);
+                              }}
+                            >
+                              View
+                            </Button>
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })}
+                  </TableBody>
+                </Table>
+              </TableContainer>
+            )}
+
+            {selectedSecurityLog ? (
+              <Box className="metadata-box">
+                <Stack spacing={0.5}>
+                  <Typography variant="subtitle2">Selected Log</Typography>
+                  <Typography variant="body2">
+                    <strong>event_type:</strong> {str(selectedSecurityLog.event_type, "-")}
+                  </Typography>
+                  <Typography variant="body2">
+                    <strong>severity:</strong> {str(selectedSecurityLog.severity, "-")}
+                  </Typography>
+                  <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
+                    <strong>message:</strong> {str(selectedSecurityLog.message, "-")}
+                  </Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    source: {str(selectedSecurityLog.source, "-")} | created_at: {str(selectedSecurityLog.created_at, "-")} | count: {str(selectedSecurityLog.count, "-")}
+                  </Typography>
+                </Stack>
+              </Box>
+            ) : null}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button
+            onClick={() => {
+              setSecurityLogsDialogOpen(false);
+              setSelectedSecurityLog(null);
+            }}
+          >
+            Close
+          </Button>
+        </DialogActions>
+      </Dialog>
 
       <Dialog open={selectedPulseEvent != null} onClose={() => setSelectedPulseEvent(null)} maxWidth="lg" fullWidth>
         <DialogTitle>{str(selectedPulseEvent?.summary, "ArkPulse Details")}</DialogTitle>
@@ -10710,6 +13453,360 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
   );
 }
 
+/* ───────────── Analytics (top-level page) ───────────── */
+
+function AnalyticsManager({ autoRefresh }: { autoRefresh: boolean }) {
+  type AnalyticsRange = "24h" | "30d" | "90d" | "custom";
+  type BreakdownView = "model" | "channel" | "purpose";
+
+  function toLocalDatetimeInput(date: Date): string {
+    const pad = (n: number) => String(n).padStart(2, "0");
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  }
+
+  function parseInputDate(value: string): Date | null {
+    const t = Date.parse(value);
+    return Number.isFinite(t) ? new Date(t) : null;
+  }
+
+  function compactNumber(value: number): string {
+    if (!Number.isFinite(value)) return "0";
+    if (Math.abs(value) >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
+    if (Math.abs(value) >= 1_000) return `${(value / 1_000).toFixed(1)}K`;
+    return value.toLocaleString();
+  }
+
+  const [activeRange, setActiveRange] = useState<AnalyticsRange>("24h");
+  const [breakdownView, setBreakdownView] = useState<BreakdownView>("model");
+  const defaultCustomTo = useMemo(() => toLocalDatetimeInput(new Date()), []);
+  const defaultCustomFrom = useMemo(
+    () => toLocalDatetimeInput(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)),
+    []
+  );
+  const [customFrom, setCustomFrom] = useState(defaultCustomFrom);
+  const [customTo, setCustomTo] = useState(defaultCustomTo);
+  const [appliedCustomFrom, setAppliedCustomFrom] = useState(defaultCustomFrom);
+  const [appliedCustomTo, setAppliedCustomTo] = useState(defaultCustomTo);
+
+  const customFromDate = useMemo(() => parseInputDate(customFrom), [customFrom]);
+  const customToDate = useMemo(() => parseInputDate(customTo), [customTo]);
+  const appliedFromDate = useMemo(() => parseInputDate(appliedCustomFrom), [appliedCustomFrom]);
+  const appliedToDate = useMemo(() => parseInputDate(appliedCustomTo), [appliedCustomTo]);
+  const customRangeInvalid =
+    !customFromDate ||
+    !customToDate ||
+    customFromDate.getTime() >= customToDate.getTime();
+  const customBucket = useMemo(() => {
+    if (!appliedFromDate || !appliedToDate) return "day";
+    const diffMs = appliedToDate.getTime() - appliedFromDate.getTime();
+    const diffHours = diffMs / (1000 * 60 * 60);
+    if (diffHours <= 72) return "hour";
+    if (diffHours <= 24 * 120) return "day";
+    return "week";
+  }, [appliedFromDate, appliedToDate]);
+
+  const hourQ = useQuery({
+    queryKey: ["llm-analytics", "24h", "hour"],
+    queryFn: () => api.getLlmAnalytics({ range: "24h", bucket: "hour" }),
+    refetchInterval: autoRefresh ? 30000 : false
+  });
+  const dayQ = useQuery({
+    queryKey: ["llm-analytics", "30d", "day"],
+    queryFn: () => api.getLlmAnalytics({ range: "30d", bucket: "day" }),
+    refetchInterval: autoRefresh ? 120000 : false
+  });
+  const weekQ = useQuery({
+    queryKey: ["llm-analytics", "90d", "week"],
+    queryFn: () => api.getLlmAnalytics({ range: "90d", bucket: "week" }),
+    refetchInterval: autoRefresh ? 300000 : false
+  });
+  const customQ = useQuery({
+    queryKey: ["llm-analytics", "custom", appliedCustomFrom, appliedCustomTo, customBucket],
+    queryFn: async () => {
+      if (!appliedFromDate || !appliedToDate) {
+        throw new Error("Custom date range is invalid.");
+      }
+      return api.getLlmAnalytics({
+        range: "24h",
+        bucket: customBucket,
+        from: appliedFromDate.toISOString(),
+        to: appliedToDate.toISOString()
+      });
+    },
+    enabled: activeRange === "custom" && Boolean(appliedFromDate && appliedToDate),
+    refetchInterval: autoRefresh ? 120000 : false
+  });
+
+  const dataMap: Record<AnalyticsRange, LlmAnalyticsResponse | undefined> = {
+    "24h": hourQ.data as LlmAnalyticsResponse | undefined,
+    "30d": dayQ.data as LlmAnalyticsResponse | undefined,
+    "90d": weekQ.data as LlmAnalyticsResponse | undefined,
+    custom: customQ.data as LlmAnalyticsResponse | undefined
+  };
+  const errorMap: Record<AnalyticsRange, unknown> = {
+    "24h": hourQ.error,
+    "30d": dayQ.error,
+    "90d": weekQ.error,
+    custom: customQ.error
+  };
+  const resp = dataMap[activeRange];
+  const activeError = errorMap[activeRange];
+  const totals = resp?.totals;
+  const byModelRows = (resp?.by_model || []).slice(0, 4);
+  const breakdownRows =
+    breakdownView === "model"
+      ? resp?.by_model || []
+      : breakdownView === "channel"
+        ? resp?.by_channel || []
+        : resp?.by_purpose || [];
+
+  const palette = ["#2fd4ff", "#14f195", "#fbbf24", "#d946ef", "#60a5fa", "#f97316"];
+  const seriesNames = byModelRows.map((r) => str(r.model, str(r.provider, "Other")));
+  const spendSeries = byModelRows.map((r) => (typeof r.cost_usd === "number" ? r.cost_usd : 0));
+  const requestSeries = byModelRows.map((r) => num(r.request_count, 0));
+  const tokenSeries = byModelRows.map((r) => num(r.total_tokens, 0));
+
+  function miniBarsOption(values: number[]) {
+    return {
+      backgroundColor: "transparent",
+      animationDuration: 400,
+      grid: { left: 6, right: 6, top: 8, bottom: 12, containLabel: false },
+      tooltip: {
+        trigger: "axis",
+        backgroundColor: "rgba(6,14,28,0.95)",
+        borderColor: "rgba(84,198,255,0.25)",
+        textStyle: { color: "#d8edff" }
+      },
+      xAxis: {
+        type: "category",
+        data: seriesNames,
+        axisLine: { show: false },
+        axisTick: { show: false },
+        axisLabel: { show: false }
+      },
+      yAxis: {
+        type: "value",
+        splitLine: { show: false },
+        axisLine: { show: false },
+        axisTick: { show: false },
+        axisLabel: { show: false }
+      },
+      series: [
+        {
+          type: "bar",
+          data: values.map((v, idx) => ({
+            value: v,
+            itemStyle: {
+              color: palette[idx % palette.length],
+              borderRadius: [6, 6, 0, 0]
+            }
+          })),
+          barWidth: "40%"
+        }
+      ]
+    };
+  }
+
+  const spendValue = typeof totals?.cost_usd === "number" ? `$${totals.cost_usd.toFixed(4)}` : "n/a";
+  const requestsValue = compactNumber(num(totals?.request_count, 0));
+  const tokensValue = compactNumber(num(totals?.total_tokens, 0));
+
+  return (
+    <Stack spacing={1.5} sx={{ pb: 3 }}>
+      <Stack direction={{ xs: "column", md: "row" }} justifyContent="space-between" alignItems={{ xs: "stretch", md: "center" }} spacing={1}>
+        <Typography variant="h4" sx={{ fontWeight: 700, letterSpacing: -0.6, color: "#ecf5ff" }}>
+          Activity
+        </Typography>
+        <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+          <Button
+            size="small"
+            variant="outlined"
+            startIcon={<FilterListRoundedIcon fontSize="small" />}
+            sx={{ textTransform: "none" }}
+          >
+            Filters
+          </Button>
+          <TextField
+            select
+            size="small"
+            value={activeRange}
+            onChange={(e) => setActiveRange((e.target.value as AnalyticsRange) || "24h")}
+            sx={{ minWidth: 120 }}
+          >
+            <MenuItem value="24h">24 h</MenuItem>
+            <MenuItem value="30d">30 d</MenuItem>
+            <MenuItem value="90d">90 d</MenuItem>
+            <MenuItem value="custom">Custom</MenuItem>
+          </TextField>
+          <TextField
+            select
+            size="small"
+            value={breakdownView}
+            onChange={(e) => setBreakdownView((e.target.value as BreakdownView) || "model")}
+            sx={{ minWidth: 140 }}
+          >
+            <MenuItem value="model">By Model</MenuItem>
+            <MenuItem value="channel">By Channel</MenuItem>
+            <MenuItem value="purpose">By Purpose</MenuItem>
+          </TextField>
+          <IconButton size="small" sx={{ border: "1px solid rgba(108,156,212,0.25)" }}>
+            <SettingsRoundedIcon fontSize="small" />
+          </IconButton>
+        </Stack>
+      </Stack>
+
+      {activeRange === "custom" ? (
+        <Stack
+          direction={{ xs: "column", md: "row" }}
+          spacing={1}
+          alignItems={{ xs: "stretch", md: "center" }}
+          className="list-shell"
+          sx={{ p: 1.2 }}
+        >
+          <TextField
+            size="small"
+            label="From"
+            type="datetime-local"
+            value={customFrom}
+            onChange={(e) => setCustomFrom(e.target.value)}
+            InputLabelProps={{ shrink: true }}
+            sx={{ minWidth: 220 }}
+          />
+          <TextField
+            size="small"
+            label="To"
+            type="datetime-local"
+            value={customTo}
+            onChange={(e) => setCustomTo(e.target.value)}
+            InputLabelProps={{ shrink: true }}
+            sx={{ minWidth: 220 }}
+            error={customRangeInvalid}
+            helperText={customRangeInvalid ? "To must be later than From." : "Choose any custom date/time range."}
+          />
+          <Button
+            variant="contained"
+            onClick={() => {
+              if (customRangeInvalid) return;
+              setAppliedCustomFrom(customFrom);
+              setAppliedCustomTo(customTo);
+            }}
+            disabled={customRangeInvalid || customQ.isFetching}
+          >
+            {customQ.isFetching ? "Applying..." : "Apply"}
+          </Button>
+        </Stack>
+      ) : null}
+
+      {activeError ? <Alert severity="error">{String(activeError)}</Alert> : null}
+
+      <Box
+        sx={{
+          display: "grid",
+          gridTemplateColumns: { xs: "1fr", lg: "repeat(3, minmax(0, 1fr))" },
+          gap: 1.5
+        }}
+      >
+        {[
+          { title: "Spend", value: spendValue, values: spendSeries },
+          { title: "Requests", value: requestsValue, values: requestSeries },
+          { title: "Tokens", value: tokensValue, values: tokenSeries }
+        ].map((card) => (
+          <Box
+            key={card.title}
+            className="list-shell"
+            sx={{
+              p: 1.6,
+              borderRadius: "12px",
+              border: "1px solid rgba(108,156,212,0.18)",
+              background: "linear-gradient(170deg, rgba(6,15,29,0.95), rgba(3,9,21,0.9))"
+            }}
+          >
+            <Typography variant="subtitle1" sx={{ color: "#d8edff", fontWeight: 600 }}>
+              {card.title}
+            </Typography>
+            <Typography variant="h4" sx={{ color: "#f3fbff", fontWeight: 700, mb: 0.6 }}>
+              {card.value}
+            </Typography>
+            <ReactECharts option={miniBarsOption(card.values)} style={{ height: 120 }} />
+            <Stack spacing={0.5} sx={{ mt: 0.8 }}>
+              {byModelRows.map((row, idx) => (
+                <Stack key={`${card.title}-legend-${idx}`} direction="row" justifyContent="space-between" alignItems="center">
+                  <Stack direction="row" spacing={0.8} alignItems="center" sx={{ minWidth: 0 }}>
+                    <Box sx={{ width: 8, height: 8, borderRadius: "50%", bgcolor: palette[idx % palette.length], flex: "0 0 auto" }} />
+                    <Typography variant="body2" noWrap title={str(row.model, str(row.provider, "Other"))}>
+                      {str(row.model, str(row.provider, "Other"))}
+                    </Typography>
+                  </Stack>
+                  <Typography variant="body2" color="text.secondary">
+                    {card.title === "Spend"
+                      ? (typeof row.cost_usd === "number" ? `$${row.cost_usd.toFixed(4)}` : "n/a")
+                      : card.title === "Requests"
+                        ? compactNumber(num(row.request_count, 0))
+                        : compactNumber(num(row.total_tokens, 0))}
+                  </Typography>
+                </Stack>
+              ))}
+            </Stack>
+          </Box>
+        ))}
+      </Box>
+
+      <Box className="list-shell">
+        <Stack direction={{ xs: "column", md: "row" }} justifyContent="space-between" alignItems={{ xs: "flex-start", md: "center" }} spacing={1} sx={{ mb: 1 }}>
+          <Typography variant="h6">
+            {breakdownView === "model" ? "By Model" : breakdownView === "channel" ? "By Channel" : "By Purpose"}
+          </Typography>
+          <Typography variant="caption" color="text.secondary">
+            Range: {str(asRecord(resp?.range).since, "-")} to {str(asRecord(resp?.range).until, "-")}
+          </Typography>
+        </Stack>
+        {breakdownRows.length === 0 ? (
+          <Typography variant="body2" color="text.secondary">
+            No analytics data yet for the selected range.
+          </Typography>
+        ) : (
+          <TableContainer className="table-shell">
+            <Table size="small">
+              <TableHead>
+                <TableRow>
+                  <TableCell>{breakdownView === "model" ? "Model" : breakdownView === "channel" ? "Channel" : "Purpose"}</TableCell>
+                  <TableCell align="right">Requests</TableCell>
+                  <TableCell align="right">Tokens</TableCell>
+                  <TableCell align="right">Cost</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {breakdownRows.slice(0, 30).map((row, idx) => {
+                  const label =
+                    breakdownView === "model"
+                      ? `${str(row.provider, "-")} / ${str(row.model, "-")}`
+                      : breakdownView === "channel"
+                        ? str((row as Record<string, unknown>).channel, "-")
+                        : str((row as Record<string, unknown>).purpose, "-");
+                  return (
+                    <TableRow key={`analytics-row-${idx}`}>
+                      <TableCell sx={{ maxWidth: 340 }}>
+                        <Typography variant="body2" noWrap title={label}>
+                          {label}
+                        </Typography>
+                      </TableCell>
+                      <TableCell align="right">{num(row.request_count, 0).toLocaleString()}</TableCell>
+                      <TableCell align="right">{num(row.total_tokens, 0).toLocaleString()}</TableCell>
+                      <TableCell align="right">
+                        {typeof row.cost_usd === "number" ? `$${row.cost_usd.toFixed(4)}` : "n/a"}
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          </TableContainer>
+        )}
+      </Box>
+    </Stack>
+  );
+}
+
 export function NativeWorkspace({
   view,
   autoRefresh,
@@ -10723,8 +13820,8 @@ export function NativeWorkspace({
   return (
     <Box
       sx={{
-        p: 1,
-        height: "calc(100vh - 84px)",
+        p: 0.75,
+        height: "calc(100vh - var(--appbar-height) - 8px)",
         overflow: isChat ? "hidden" : "auto",
         display: "flex",
         flexDirection: "column",
@@ -10742,6 +13839,7 @@ export function NativeWorkspace({
       {view === "swarm" ? <SwarmManager autoRefresh={autoRefresh} /> : null}
       {view === "trace" ? <TraceManager autoRefresh={autoRefresh} /> : null}
       {view === "status" ? <StatusManager autoRefresh={autoRefresh} /> : null}
+      {view === "analytics" ? <AnalyticsManager autoRefresh={autoRefresh} /> : null}
       {view === "settings" ? <SettingsManager autoRefresh={autoRefresh} /> : null}
       {["tasks", "skills", "apps"].includes(view) ? <Divider sx={{ mt: 2 }} /> : null}
     </Box>

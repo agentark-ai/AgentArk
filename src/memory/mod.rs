@@ -92,7 +92,6 @@ pub struct CognitiveMemory {
     storage: Arc<Storage>,
     /// Encrypted storage for sensitive content (episodes, facts)
     encrypted_storage: crate::storage::encrypted::EncryptedStorage,
-    _embedding_model: String,
     episode_count: AtomicUsize,
     /// Configuration for memory decay and scoring
     decay_config: MemoryDecayConfig,
@@ -127,7 +126,6 @@ impl CognitiveMemory {
         Ok(Self {
             storage,
             encrypted_storage,
-            _embedding_model: "BAAI/bge-small-en-v1.5".to_string(),
             episode_count: AtomicUsize::new(episode_count),
             decay_config,
         })

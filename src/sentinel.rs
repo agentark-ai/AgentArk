@@ -197,10 +197,81 @@ pub struct DoctorFinding {
     pub evidence: String,
     pub root_cause: String,
     pub fix_command: String,
+    #[serde(default = "default_user_actionable_true")]
+    pub user_actionable: bool,
+}
+
+fn default_user_actionable_true() -> bool {
+    true
 }
 
 const PULSE_LOG_KEY: &str = "arkpulse_log";
 const MAX_PULSE_EVENTS: usize = 100;
+const ARKPULSE_LAST_RUN_AT_KEY: &str = "arkpulse_last_run_at";
+const ARKPULSE_CRITICAL_LAST_SIG_KEY: &str = "arkpulse_critical_last_sig_v1";
+const ARKPULSE_CRITICAL_LAST_SENT_KEY: &str = "arkpulse_critical_last_sent_v1";
+const ARKPULSE_CRITICAL_NOTIFY_COOLDOWN_SECS: i64 = 24 * 3600;
+
+fn normalize_arkpulse_alert_signature(text: &str) -> String {
+    let mut out = String::with_capacity(text.len().min(240));
+    let mut prev_space = false;
+    for ch in text.trim().chars() {
+        if ch.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+            continue;
+        }
+        prev_space = false;
+        out.push(ch.to_ascii_lowercase());
+        if out.len() >= 220 {
+            break;
+        }
+    }
+    out.trim().to_string()
+}
+
+async fn should_emit_arkpulse_critical_notification(
+    storage: &crate::storage::Storage,
+    alert_text: &str,
+) -> bool {
+    let signature = normalize_arkpulse_alert_signature(alert_text);
+    let now_ts = chrono::Utc::now().timestamp();
+    let last_sent_ts = storage
+        .get(ARKPULSE_CRITICAL_LAST_SENT_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| String::from_utf8(raw).ok())
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+
+    let elapsed = if now_ts > last_sent_ts {
+        now_ts - last_sent_ts
+    } else {
+        0
+    };
+
+    // Hard cap: emit at most one ArkPulse critical notification every 24h,
+    // regardless of message/signature variance.
+    if elapsed < ARKPULSE_CRITICAL_NOTIFY_COOLDOWN_SECS {
+        return false;
+    }
+
+    if !signature.is_empty() {
+        let _ = storage
+            .set(ARKPULSE_CRITICAL_LAST_SIG_KEY, signature.as_bytes())
+            .await;
+    }
+    let _ = storage
+        .set(
+            ARKPULSE_CRITICAL_LAST_SENT_KEY,
+            now_ts.to_string().as_bytes(),
+        )
+        .await;
+    true
+}
 
 fn control_plane_bases() -> (String, String) {
     let bind_addr = std::env::var("AGENTARK_BIND").unwrap_or_else(|_| "127.0.0.1:8990".to_string());
@@ -275,29 +346,42 @@ fn severity_weight(severity: &str) -> u32 {
 }
 
 fn compute_doctor_score(findings: &[DoctorFinding]) -> u32 {
-    let penalty: u32 = findings.iter().map(|f| severity_weight(&f.severity)).sum();
+    let penalty: u32 = findings
+        .iter()
+        .filter(|f| f.user_actionable)
+        .map(|f| severity_weight(&f.severity))
+        .sum();
     100u32.saturating_sub(penalty.min(100))
 }
 
-fn push_finding(
-    findings: &mut Vec<DoctorFinding>,
-    severity: &str,
-    category: &str,
-    target: impl Into<String>,
-    title: impl Into<String>,
-    evidence: impl Into<String>,
-    root_cause: impl Into<String>,
-    fix_command: impl Into<String>,
-) {
-    findings.push(DoctorFinding {
-        severity: severity.to_string(),
-        category: category.to_string(),
-        target: target.into(),
-        title: title.into(),
-        evidence: evidence.into(),
-        root_cause: root_cause.into(),
-        fix_command: fix_command.into(),
-    });
+macro_rules! push_finding {
+    ($findings:expr, $severity:expr, $category:expr, $target:expr, $title:expr, $evidence:expr, $root_cause:expr, $fix_command:expr $(,)?) => {{
+        $findings.push(DoctorFinding {
+            severity: ($severity).to_string(),
+            category: ($category).to_string(),
+            target: ($target).into(),
+            title: ($title).into(),
+            evidence: ($evidence).into(),
+            root_cause: ($root_cause).into(),
+            fix_command: ($fix_command).into(),
+            user_actionable: true,
+        });
+    }};
+}
+
+macro_rules! push_internal_finding {
+    ($findings:expr, $severity:expr, $category:expr, $target:expr, $title:expr, $evidence:expr, $root_cause:expr, $fix_command:expr $(,)?) => {{
+        $findings.push(DoctorFinding {
+            severity: ($severity).to_string(),
+            category: ($category).to_string(),
+            target: ($target).into(),
+            title: ($title).into(),
+            evidence: ($evidence).into(),
+            root_cause: ($root_cause).into(),
+            fix_command: ($fix_command).into(),
+            user_actionable: false,
+        });
+    }};
 }
 
 fn parse_access_key(access_url: &str) -> Option<String> {
@@ -426,7 +510,7 @@ fn run_dependency_and_supply_checks_for_app(app: &AppEndpoint, findings: &mut Ve
         || app.app_dir.join("yarn.lock").exists();
     if package_json.exists() {
         if !npm_lock_exists {
-            push_finding(
+            push_finding!(
                 findings,
                 "high",
                 "supply_chain",
@@ -446,7 +530,7 @@ fn run_dependency_and_supply_checks_for_app(app: &AppEndpoint, findings: &mut Ve
         ) {
             if let (Ok(pkg_m), Ok(lock_m)) = (pkg_meta.modified(), lock_meta.modified()) {
                 if pkg_m > lock_m {
-                    push_finding(
+                    push_finding!(
                         findings,
                         "medium",
                         "supply_chain",
@@ -482,7 +566,7 @@ fn run_dependency_and_supply_checks_for_app(app: &AppEndpoint, findings: &mut Ve
                     }
                 }
                 if !risky_specs.is_empty() {
-                    push_finding(
+                    push_finding!(
                         findings,
                         "high",
                         "dependency",
@@ -517,7 +601,7 @@ fn run_dependency_and_supply_checks_for_app(app: &AppEndpoint, findings: &mut Ve
                         }
                     }
                     if !suspicious.is_empty() {
-                        push_finding(
+                        push_finding!(
                             findings,
                             "critical",
                             "supply_chain",
@@ -536,7 +620,7 @@ fn run_dependency_and_supply_checks_for_app(app: &AppEndpoint, findings: &mut Ve
     let cargo_toml = app.app_dir.join("Cargo.toml");
     if cargo_toml.exists() {
         if !app.app_dir.join("Cargo.lock").exists() {
-            push_finding(
+            push_finding!(
                 findings,
                 "high",
                 "dependency",
@@ -549,7 +633,7 @@ fn run_dependency_and_supply_checks_for_app(app: &AppEndpoint, findings: &mut Ve
         }
         if let Some(text) = read_text_limited(&cargo_toml, 512 * 1024) {
             if text.contains("git =") || text.contains("path =") {
-                push_finding(
+                push_finding!(
                     findings,
                     "medium",
                     "supply_chain",
@@ -586,7 +670,7 @@ fn run_dependency_and_supply_checks_for_app(app: &AppEndpoint, findings: &mut Ve
                 }
             }
             if !unpinned.is_empty() {
-                push_finding(
+                push_finding!(
                     findings,
                     "medium",
                     "dependency",
@@ -601,7 +685,7 @@ fn run_dependency_and_supply_checks_for_app(app: &AppEndpoint, findings: &mut Ve
                 );
             }
             if !remote_specs.is_empty() {
-                push_finding(
+                push_finding!(
                     findings,
                     "high",
                     "supply_chain",
@@ -625,7 +709,7 @@ fn run_dependency_and_supply_checks_for_app(app: &AppEndpoint, findings: &mut Ve
 
 fn run_secret_scan_for_app(app: &AppEndpoint, findings: &mut Vec<DoctorFinding>) {
     if app.app_dir.join(".env").exists() {
-        push_finding(
+        push_finding!(
             findings,
             "high",
             "secrets",
@@ -677,7 +761,7 @@ fn run_secret_scan_for_app(app: &AppEndpoint, findings: &mut Vec<DoctorFinding>)
         }
         if let Some(kind) = matched {
             hit_count += 1;
-            push_finding(
+            push_finding!(
                 findings,
                 "critical",
                 "secrets",
@@ -698,6 +782,9 @@ fn run_secret_scan_for_app(app: &AppEndpoint, findings: &mut Vec<DoctorFinding>)
 async fn run_attack_surface_checks(
     http_client: &reqwest::Client,
     http_base: &str,
+    has_deployed_apps: bool,
+    public_base_url: Option<&str>,
+    api_key: Option<&str>,
     findings: &mut Vec<DoctorFinding>,
 ) {
     let health = http_client
@@ -707,7 +794,7 @@ async fn run_attack_surface_checks(
     match health {
         Ok(resp) => {
             if !resp.status().is_success() {
-                push_finding(
+                push_finding!(
                     findings,
                     "medium",
                     "attack_surface",
@@ -720,7 +807,7 @@ async fn run_attack_surface_checks(
             }
         }
         Err(e) => {
-            push_finding(
+            push_finding!(
                 findings,
                 "medium",
                 "attack_surface",
@@ -736,6 +823,7 @@ async fn run_attack_surface_checks(
 
     let protected_checks = vec![
         ("GET", "/api/apps"),
+        ("GET", "/tunnel/status"),
         ("POST", "/tunnel/start"),
         ("GET", "/settings"),
     ];
@@ -748,7 +836,7 @@ async fn run_attack_surface_checks(
             Ok(resp) => {
                 let code = resp.status().as_u16();
                 if code != 401 && code != 403 {
-                    push_finding(
+                    push_finding!(
                         findings,
                         "critical",
                         "attack_surface",
@@ -764,7 +852,7 @@ async fn run_attack_surface_checks(
                 }
             }
             Err(e) => {
-                push_finding(
+                push_finding!(
                     findings,
                     "low",
                     "attack_surface",
@@ -774,6 +862,148 @@ async fn run_attack_surface_checks(
                     "Could not verify endpoint authentication behavior.",
                     "Retry probe when control plane is stable".to_string(),
                 );
+            }
+        }
+    }
+
+    if has_deployed_apps {
+        let public_base = public_base_url
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| {
+                push_finding!(
+                    findings,
+                    "high",
+                    "attack_surface",
+                    "public_base_url",
+                    "Public tunnel URL missing for deployed apps",
+                    "No active public tunnel base URL found while apps are deployed".to_string(),
+                    "Apps are not publicly reachable through the managed Cloudflare tunnel.",
+                    "Start tunnel and verify /tunnel/status returns active + URL".to_string(),
+                );
+                String::new()
+            });
+        if !public_base.is_empty() {
+            let public_health_url = format!("{}/health", public_base);
+            match http_client.get(&public_health_url).send().await {
+                Ok(resp) if resp.status().is_success() => {}
+                Ok(resp) => {
+                    push_finding!(
+                        findings,
+                        "high",
+                        "attack_surface",
+                        public_health_url.clone(),
+                        "Public tunnel health probe failed",
+                        format!("GET {} returned {}", public_health_url, resp.status()),
+                        "Tunnel endpoint is reachable but unhealthy for public traffic.",
+                        "Restart tunnel and inspect cloudflared logs".to_string(),
+                    );
+                }
+                Err(e) => {
+                    push_finding!(
+                        findings,
+                        "high",
+                        "attack_surface",
+                        public_health_url.clone(),
+                        "Public tunnel unreachable",
+                        e.to_string(),
+                        "Cannot reach service through the configured public tunnel URL.",
+                        "Restart tunnel and verify DNS/TLS connectivity".to_string(),
+                    );
+                }
+            }
+        }
+
+        let mut tunnel_status_req = http_client.get(format!("{}/tunnel/status", http_base));
+        if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
+            tunnel_status_req = tunnel_status_req.bearer_auth(key);
+        }
+        match tunnel_status_req.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(payload) = resp.json::<serde_json::Value>().await {
+                    let active = payload
+                        .get("active")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let url_present = payload
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .map(|v| !v.trim().is_empty())
+                        .unwrap_or(false);
+                    if !active || !url_present {
+                        push_finding!(
+                            findings,
+                            "high",
+                            "attack_surface",
+                            "/tunnel/status",
+                            "Tunnel status degraded while apps are deployed",
+                            format!(
+                                "active={}, url_present={}",
+                                active,
+                                url_present
+                            ),
+                            "Managed tunnel should stay active while deployed apps need public access.",
+                            "Restart the tunnel and confirm URL discovery".to_string(),
+                        );
+                    }
+                }
+            }
+            Ok(resp) => {
+                push_finding!(
+                    findings,
+                    "medium",
+                    "attack_surface",
+                    "/tunnel/status",
+                    "Tunnel status probe failed",
+                    format!("Authenticated status probe returned {}", resp.status()),
+                    "ArkPulse could not verify managed tunnel state from control plane.",
+                    "Verify API auth and tunnel control endpoints".to_string(),
+                );
+            }
+            Err(e) => {
+                push_finding!(
+                    findings,
+                    "medium",
+                    "attack_surface",
+                    "/tunnel/status",
+                    "Tunnel status probe request failed",
+                    e.to_string(),
+                    "ArkPulse could not verify tunnel process state.",
+                    "Check local control plane reachability".to_string(),
+                );
+            }
+        }
+
+        if !public_base.is_empty() {
+            let tunnel_apps_probe = format!("{}/api/apps", public_base);
+            match http_client.get(&tunnel_apps_probe).send().await {
+                Ok(resp) => {
+                    let code = resp.status().as_u16();
+                    if code != 401 && code != 403 {
+                        push_finding!(
+                            findings,
+                            "critical",
+                            "attack_surface",
+                            tunnel_apps_probe,
+                            "Public tunnel exposed protected app inventory endpoint",
+                            format!("GET /api/apps over tunnel returned {}", code),
+                            "Sensitive management endpoint is reachable from public tunnel without auth.",
+                            "Require auth middleware for tunneled management routes".to_string(),
+                        );
+                    }
+                }
+                Err(e) => {
+                    push_finding!(
+                        findings,
+                        "low",
+                        "attack_surface",
+                        "/api/apps",
+                        "Public tunnel app-inventory auth probe failed",
+                        e.to_string(),
+                        "Could not verify auth enforcement of /api/apps over public tunnel.",
+                        "Retry when tunnel stabilizes".to_string(),
+                    );
+                }
             }
         }
     }
@@ -799,7 +1029,7 @@ async fn run_runtime_hardening_checks(
             .filter(|h| !headers.contains_key(*h))
             .collect();
         if !missing.is_empty() {
-            push_finding(
+            push_internal_finding!(
                 findings,
                 "medium",
                 "runtime_hardening",
@@ -822,7 +1052,7 @@ async fn run_runtime_hardening_checks(
         {
             let lower = session_cookie.to_ascii_lowercase();
             if !lower.contains("httponly") || !lower.contains("samesite") {
-                push_finding(
+                push_finding!(
                     findings,
                     "high",
                     "runtime_hardening",
@@ -856,16 +1086,13 @@ async fn run_runtime_hardening_checks(
                 if status.is_success() {
                     let body = resp.text().await.unwrap_or_default();
                     if !body.to_lowercase().contains("access key required") {
-                        push_finding(
+                        push_finding!(
                             findings,
                             "critical",
                             "runtime_hardening",
                             traversal_url.clone(),
                             "Path traversal regression risk",
-                            format!(
-                                "Static app traversal payload returned {}",
-                                status.as_u16()
-                            ),
+                            format!("Static app traversal payload returned {}", status.as_u16()),
                             "Static app file serving may be bypassing root path constraints.",
                             "Keep canonical-path prefix checks and deny traversal sequences"
                                 .to_string(),
@@ -893,7 +1120,7 @@ async fn run_runtime_hardening_checks(
         let url = format!("{}{}", http_base, path);
         if let Ok(resp) = http_client.get(&url).send().await {
             if resp.status().is_success() {
-                push_finding(
+                push_finding!(
                     findings,
                     "critical",
                     "runtime_hardening",
@@ -917,13 +1144,14 @@ fn run_resource_checks(
     data_dir: &Path,
     deployed_apps: &[AppPulseInfo],
     security: Option<&crate::core::SecuritySnapshot>,
+    security_thresholds: ArkPulseSecurityThresholds,
     findings: &mut Vec<DoctorFinding>,
 ) {
     let db_path = data_dir.join("agentark.db");
     if let Ok(meta) = std::fs::metadata(&db_path) {
         let size_mb = meta.len() as f64 / (1024.0 * 1024.0);
         if size_mb > 1024.0 {
-            push_finding(
+            push_finding!(
                 findings,
                 "high",
                 "resource",
@@ -934,7 +1162,7 @@ fn run_resource_checks(
                 "Archive old rows and run VACUUM during maintenance window".to_string(),
             );
         } else if size_mb > 512.0 {
-            push_finding(
+            push_finding!(
                 findings,
                 "medium",
                 "resource",
@@ -949,7 +1177,7 @@ fn run_resource_checks(
 
     for app in deployed_apps {
         if app.requests_since_last_check > 5000 {
-            push_finding(
+            push_finding!(
                 findings,
                 "high",
                 "resource",
@@ -966,7 +1194,7 @@ fn run_resource_checks(
                 ),
             );
         } else if app.requests_since_last_check > 1200 {
-            push_finding(
+            push_finding!(
                 findings,
                 "medium",
                 "resource",
@@ -983,20 +1211,23 @@ fn run_resource_checks(
     }
 
     if let Some(sec) = security {
-        if sec.auth_failures >= 8 {
-            push_finding(
+        if sec.auth_failures >= security_thresholds.auth_failures {
+            push_finding!(
                 findings,
                 "high",
                 "resource",
                 "auth subsystem",
                 "Auth-failure burst detected",
-                format!("{} auth failures since previous pulse", sec.auth_failures),
+                format!(
+                    "{} auth failures since previous pulse (threshold {})",
+                    sec.auth_failures, security_thresholds.auth_failures
+                ),
                 "May indicate credential stuffing or stale automation credentials.",
                 "Rotate API keys and tighten IP/rate limits".to_string(),
             );
         }
         if sec.injection_attempts > 0 {
-            push_finding(
+            push_finding!(
                 findings,
                 "high",
                 "resource",
@@ -1013,7 +1244,7 @@ fn run_resource_checks(
 async fn run_data_safety_checks(agent: &Agent, data_dir: &Path, findings: &mut Vec<DoctorFinding>) {
     let backup_dir = data_dir.join("backups");
     if !backup_dir.exists() {
-        push_finding(
+        push_internal_finding!(
             findings,
             "medium",
             "data_safety",
@@ -1037,7 +1268,7 @@ async fn run_data_safety_checks(agent: &Agent, data_dir: &Path, findings: &mut V
         if let Some(ts) = latest {
             if let Ok(age) = ts.elapsed() {
                 if age > Duration::from_secs(7 * 24 * 3600) {
-                    push_finding(
+                    push_finding!(
                         findings,
                         "high",
                         "data_safety",
@@ -1050,7 +1281,7 @@ async fn run_data_safety_checks(agent: &Agent, data_dir: &Path, findings: &mut V
                 }
             }
         } else {
-            push_finding(
+            push_finding!(
                 findings,
                 "high",
                 "data_safety",
@@ -1066,7 +1297,7 @@ async fn run_data_safety_checks(agent: &Agent, data_dir: &Path, findings: &mut V
     match agent.storage.sqlite_quick_check().await {
         Ok(result) => {
             if result.to_lowercase() != "ok" {
-                push_finding(
+                push_finding!(
                     findings,
                     "critical",
                     "data_safety",
@@ -1079,7 +1310,7 @@ async fn run_data_safety_checks(agent: &Agent, data_dir: &Path, findings: &mut V
             }
         }
         Err(e) => {
-            push_finding(
+            push_finding!(
                 findings,
                 "high",
                 "data_safety",
@@ -1110,7 +1341,7 @@ async fn run_data_safety_checks(agent: &Agent, data_dir: &Path, findings: &mut V
                 .filter(|t| !table_set.contains(*t))
                 .collect();
             if !missing.is_empty() {
-                push_finding(
+                push_finding!(
                     findings,
                     "critical",
                     "data_safety",
@@ -1123,7 +1354,7 @@ async fn run_data_safety_checks(agent: &Agent, data_dir: &Path, findings: &mut V
             }
         }
         Err(e) => {
-            push_finding(
+            push_finding!(
                 findings,
                 "medium",
                 "data_safety",
@@ -1144,7 +1375,7 @@ fn run_policy_compliance_checks(findings: &mut Vec<DoctorFinding>) {
 
     if let Ok(agent_src) = std::fs::read_to_string(&agent_path) {
         if !has_bounded_app_validation_retry(&agent_src) {
-            push_finding(
+            push_finding!(
                 findings,
                 "high",
                 "policy",
@@ -1152,11 +1383,12 @@ fn run_policy_compliance_checks(findings: &mut Vec<DoctorFinding>) {
                 "Missing bounded retry cap for app validation",
                 "App validation flow missing bounded-loop structure".to_string(),
                 "App repair/validation loop may become unbounded.",
-                "Use a finite attempt loop with explicit stop + terminal failure return".to_string(),
+                "Use a finite attempt loop with explicit stop + terminal failure return"
+                    .to_string(),
             );
         }
         if !has_bounded_self_heal_retry(&agent_src) {
-            push_finding(
+            push_finding!(
                 findings,
                 "high",
                 "policy",
@@ -1168,7 +1400,7 @@ fn run_policy_compliance_checks(findings: &mut Vec<DoctorFinding>) {
             );
         }
         if !has_tool_call_dedupe_guard(&agent_src) {
-            push_finding(
+            push_finding!(
                 findings,
                 "medium",
                 "policy",
@@ -1183,7 +1415,7 @@ fn run_policy_compliance_checks(findings: &mut Vec<DoctorFinding>) {
 
     if let Ok(router_src) = std::fs::read_to_string(&task_router_path) {
         if !has_retry_cap_prompt_policy(&router_src) {
-            push_finding(
+            push_finding!(
                 findings,
                 "medium",
                 "policy",
@@ -1198,7 +1430,7 @@ fn run_policy_compliance_checks(findings: &mut Vec<DoctorFinding>) {
 
     if let Ok(parallel_src) = std::fs::read_to_string(&parallel_path) {
         if !has_parallel_app_deploy_recovery(&parallel_src) {
-            push_finding(
+            push_finding!(
                 findings,
                 "low",
                 "policy",
@@ -1234,7 +1466,9 @@ fn extract_block_by_signature<'a>(src: &'a str, signature: &str) -> Option<&'a s
 }
 
 fn has_bounded_app_validation_retry(agent_src: &str) -> bool {
-    let Some(body) = extract_block_by_signature(agent_src, "async fn validate_and_capture_app_preview") else {
+    let Some(body) =
+        extract_block_by_signature(agent_src, "async fn validate_and_capture_app_preview")
+    else {
         return false;
     };
     let has_finite_loop = Regex::new(r"for\s+\w+\s+in\s+1\.\.=")
@@ -1243,12 +1477,14 @@ fn has_bounded_app_validation_retry(agent_src: &str) -> bool {
         .unwrap_or(false);
     let has_terminal_failure_return =
         body.contains("return Ok((None, false") && body.contains("last_error");
-    let has_attempt_feedback = body.contains("attempt {}/") || body.contains("Validated on attempt");
+    let has_attempt_feedback =
+        body.contains("attempt {}/") || body.contains("Validated on attempt");
     has_finite_loop && has_terminal_failure_return && has_attempt_feedback
 }
 
 fn has_bounded_self_heal_retry(agent_src: &str) -> bool {
-    let Some(body) = extract_block_by_signature(agent_src, "if call.name == \"code_execute\"") else {
+    let Some(body) = extract_block_by_signature(agent_src, "if call.name == \"code_execute\"")
+    else {
         return false;
     };
     let has_counter = body.contains("total_retries");
@@ -1260,11 +1496,12 @@ fn has_bounded_self_heal_retry(agent_src: &str) -> bool {
         .ok()
         .map(|re| re.is_match(body))
         .unwrap_or(false);
-    let has_hard_stop = Regex::new(r"(?s)if\s+total_retries\s*>=\s*([A-Z_][A-Z0-9_]*|\d+)\s*\{.*?break;")
-        .ok()
-        .map(|re| re.is_match(body))
-        .unwrap_or(false)
-        || body.contains("maximum attempts reached");
+    let has_hard_stop =
+        Regex::new(r"(?s)if\s+total_retries\s*>=\s*([A-Z_][A-Z0-9_]*|\d+)\s*\{.*?break;")
+            .ok()
+            .map(|re| re.is_match(body))
+            .unwrap_or(false)
+            || body.contains("maximum attempts reached");
     has_counter && has_increment && has_cap_check && has_hard_stop
 }
 
@@ -1284,10 +1521,12 @@ fn has_retry_cap_prompt_policy(router_src: &str) -> bool {
         .ok()
         .map(|re| re.is_match(router_src))
         .unwrap_or(false);
-    let has_cap_language = Regex::new(r"(?i)\b(max(?:imum)?\s+attempts?|bounded\s+retr(?:y|ies)|stop\s+when\s+reached)\b")
-        .ok()
-        .map(|re| re.is_match(router_src))
-        .unwrap_or(false);
+    let has_cap_language = Regex::new(
+        r"(?i)\b(max(?:imum)?\s+attempts?|bounded\s+retr(?:y|ies)|stop\s+when\s+reached)\b",
+    )
+    .ok()
+    .map(|re| re.is_match(router_src))
+    .unwrap_or(false);
     has_retry_language && has_cap_language
 }
 
@@ -1312,7 +1551,7 @@ async fn run_app_health_checks(
     for app in app_endpoints {
         if let Some(snapshot) = app_state.get(&app.id) {
             if !snapshot.process_alive && !snapshot.is_static {
-                push_finding(
+                push_finding!(
                     findings,
                     "critical",
                     "app_health",
@@ -1332,7 +1571,7 @@ async fn run_app_health_checks(
             Ok(Ok(resp)) => {
                 let elapsed_ms = started.elapsed().as_millis();
                 if resp.status().as_u16() >= 500 {
-                    push_finding(
+                    push_finding!(
                         findings,
                         "high",
                         "app_health",
@@ -1343,7 +1582,7 @@ async fn run_app_health_checks(
                         format!("POST /api/apps/{}/restart", app.id),
                     );
                 } else if elapsed_ms > 2500 {
-                    push_finding(
+                    push_finding!(
                         findings,
                         "medium",
                         "app_health",
@@ -1356,7 +1595,7 @@ async fn run_app_health_checks(
                 }
             }
             Ok(Err(e)) => {
-                push_finding(
+                push_finding!(
                     findings,
                     "high",
                     "app_health",
@@ -1368,7 +1607,7 @@ async fn run_app_health_checks(
                 );
             }
             Err(_) => {
-                push_finding(
+                push_finding!(
                     findings,
                     "high",
                     "app_health",
@@ -1388,7 +1627,7 @@ async fn run_app_health_checks(
                     .await
             {
                 if resp.status().as_u16() >= 500 {
-                    push_finding(
+                    push_finding!(
                         findings,
                         "high",
                         "app_health",
@@ -1413,7 +1652,7 @@ async fn run_app_health_checks(
                         let _ = futures::SinkExt::close(&mut stream).await;
                     }
                     Ok(Err(e)) => {
-                        push_finding(
+                        push_finding!(
                             findings,
                             "medium",
                             "app_health",
@@ -1426,7 +1665,7 @@ async fn run_app_health_checks(
                         );
                     }
                     Err(_) => {
-                        push_finding(
+                        push_finding!(
                             findings,
                             "medium",
                             "app_health",
@@ -1448,16 +1687,42 @@ async fn run_doctor_checks(
     http_client: &reqwest::Client,
     deployed_apps: &[AppPulseInfo],
     security: Option<&crate::core::SecuritySnapshot>,
+    security_thresholds: ArkPulseSecurityThresholds,
 ) -> Vec<DoctorFinding> {
     let mut findings: Vec<DoctorFinding> = Vec::new();
     let data_dir = agent.data_dir().to_path_buf();
     let app_rows = agent.app_registry.list().await;
     let app_endpoints = parse_app_endpoints(&app_rows, &data_dir);
     let (http_base, ws_base) = control_plane_bases();
+    let has_deployed_apps = !deployed_apps.is_empty();
+    let public_base_url = agent
+        .storage
+        .get("public_base_url")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| String::from_utf8(raw).ok())
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty());
+    let api_key = agent.api_key.as_deref();
 
-    run_attack_surface_checks(http_client, &http_base, &mut findings).await;
+    run_attack_surface_checks(
+        http_client,
+        &http_base,
+        has_deployed_apps,
+        public_base_url.as_deref(),
+        api_key,
+        &mut findings,
+    )
+    .await;
     run_runtime_hardening_checks(http_client, &http_base, &app_endpoints, &mut findings).await;
-    run_resource_checks(&data_dir, deployed_apps, security, &mut findings);
+    run_resource_checks(
+        &data_dir,
+        deployed_apps,
+        security,
+        security_thresholds,
+        &mut findings,
+    );
     run_data_safety_checks(agent, &data_dir, &mut findings).await;
     run_policy_compliance_checks(&mut findings);
 
@@ -2175,11 +2440,16 @@ fn build_noncritical_summary(
         parts.push(format!("{} overdue task(s)", overdue_tasks));
     }
     if approaching_goals > 0 {
-        parts.push(format!("{} goal deadline(s) approaching", approaching_goals));
+        parts.push(format!(
+            "{} goal deadline(s) approaching",
+            approaching_goals
+        ));
     }
     if let Some(sec) = security {
-        let total =
-            sec.auth_failures + sec.rate_limit_hits + sec.unauthorized_channel_attempts + sec.injection_attempts;
+        let total = sec.auth_failures
+            + sec.rate_limit_hits
+            + sec.unauthorized_channel_attempts
+            + sec.injection_attempts;
         if total > 0 {
             parts.push(format!("{} security event(s)", total));
         }
@@ -2235,7 +2505,10 @@ fn build_critical_notification(
     if let Some(sec) = security {
         if sec.injection_attempts > 0 {
             flags.push("security_injection".to_string());
-            reasons.push(format!("{} prompt injection attempt(s)", sec.injection_attempts));
+            reasons.push(format!(
+                "{} prompt injection attempt(s)",
+                sec.injection_attempts
+            ));
         }
         if sec.auth_failures >= thresholds.auth_failures
             || sec.rate_limit_hits >= thresholds.rate_limit_hits
@@ -2257,11 +2530,14 @@ fn build_critical_notification(
 
     let mut high_or_critical: Vec<&DoctorFinding> = doctor_findings
         .iter()
-        .filter(|f| f.severity == "critical" || f.severity == "high")
+        .filter(|f| f.user_actionable && (f.severity == "critical" || f.severity == "high"))
         .collect();
     if !high_or_critical.is_empty() {
         flags.push("doctor_high".to_string());
-        reasons.push(format!("{} high-risk doctor finding(s)", high_or_critical.len()));
+        reasons.push(format!(
+            "{} high-risk doctor finding(s)",
+            high_or_critical.len()
+        ));
         high_or_critical.sort_by(|a, b| a.severity.cmp(&b.severity));
         if let Some(f) = high_or_critical.first() {
             let fix = f.fix_command.trim();
@@ -2278,7 +2554,8 @@ fn build_critical_notification(
 
     if reasons.is_empty() {
         (
-            "ArkPulse critical incident detected. Open ArkPulse details for diagnostics.".to_string(),
+            "ArkPulse critical incident detected. Open ArkPulse details for diagnostics."
+                .to_string(),
             vec!["critical".to_string()],
         )
     } else if actions.is_empty() {
@@ -2323,6 +2600,16 @@ pub async fn run_pulse(agent: &SharedAgent) {
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .unwrap_or_default();
+
+    let storage = {
+        let agent_guard = agent.read().await;
+        agent_guard.storage.clone()
+    };
+    let now_marker = chrono::Utc::now().to_rfc3339();
+    let _ = storage
+        .set(ARKPULSE_LAST_RUN_AT_KEY, now_marker.as_bytes())
+        .await;
+    let security_thresholds = load_arkpulse_security_thresholds(&storage).await;
 
     let (overdue_tasks, failed_tasks, approaching_goals, brief_channel, details, deployed_apps) = {
         let agent = agent.read().await;
@@ -2645,6 +2932,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
             &http_client,
             &deployed_apps,
             security_snapshot.as_ref(),
+            security_thresholds,
         )
         .await;
         let doctor_score = compute_doctor_score(&doctor_findings);
@@ -2676,17 +2964,12 @@ pub async fn run_pulse(agent: &SharedAgent) {
         )
     };
 
-    let storage = {
-        let agent_guard = agent.read().await;
-        agent_guard.storage.clone()
-    };
-    let security_thresholds = load_arkpulse_security_thresholds(&storage).await;
-
     // Deterministic pulse classification: notify only on critical breakage or security spikes.
     let has_overdue = !overdue_tasks.is_empty();
     let has_failures = !failed_tasks.is_empty();
-    let has_security = details.security.as_ref().map_or(false, |s| s.has_events());
-    let has_security_incident = is_security_incident(details.security.as_ref(), security_thresholds);
+    let has_security = details.security.as_ref().is_some_and(|s| s.has_events());
+    let has_security_incident =
+        is_security_incident(details.security.as_ref(), security_thresholds);
     let has_goal_deadlines = !approaching_goals.is_empty();
     let has_dead_apps = deployed_apps
         .iter()
@@ -2698,17 +2981,17 @@ pub async fn run_pulse(agent: &SharedAgent) {
     let doctor_high_count = details
         .doctor_findings
         .iter()
-        .filter(|f| f.severity == "critical" || f.severity == "high")
+        .filter(|f| f.user_actionable && (f.severity == "critical" || f.severity == "high"))
         .count();
     let doctor_medium_count = details
         .doctor_findings
         .iter()
-        .filter(|f| f.severity == "medium")
+        .filter(|f| f.user_actionable && f.severity == "medium")
         .count();
     let doctor_low_count = details
         .doctor_findings
         .iter()
-        .filter(|f| f.severity == "low")
+        .filter(|f| f.user_actionable && f.severity == "low")
         .count();
     let has_doctor_alert = doctor_high_count > 0;
     let has_doctor_findings = !details.doctor_findings.is_empty();
@@ -2795,10 +3078,18 @@ pub async fn run_pulse(agent: &SharedAgent) {
         dead_app_count,
         doctor_high_count,
     );
+    let should_emit_alert = should_emit_arkpulse_critical_notification(&storage, &alert_text).await;
     let agent_guard = agent.read().await;
-    agent_guard
-        .emit_notification("ArkPulse Critical", &alert_text, "error", "arkpulse")
-        .await;
+    if should_emit_alert {
+        agent_guard
+            .emit_notification("ArkPulse Critical", &alert_text, "error", "arkpulse")
+            .await;
+    } else {
+        tracing::info!(
+            "ArkPulse: suppressed duplicate critical notification within {}s cooldown",
+            ARKPULSE_CRITICAL_NOTIFY_COOLDOWN_SECS
+        );
+    }
     let event = PulseEvent {
         timestamp: chrono::Utc::now().to_rfc3339(),
         status: "alert".to_string(),
@@ -2810,11 +3101,18 @@ pub async fn run_pulse(agent: &SharedAgent) {
         details: details.clone(),
     };
     log_pulse_event(&agent_guard, event).await;
-    agent_guard.notify_preferred_channel(&alert_text).await;
-    tracing::info!(
-        "ArkPulse: critical alert sent to preferred channel ({})",
-        brief_channel
-    );
+    if should_emit_alert {
+        agent_guard.notify_preferred_channel(&alert_text).await;
+        tracing::info!(
+            "ArkPulse: critical alert sent to preferred channel ({})",
+            brief_channel
+        );
+    } else {
+        tracing::info!(
+            "ArkPulse: duplicate critical alert not pushed to preferred channel ({})",
+            brief_channel
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3154,8 +3452,7 @@ async fn run_episode_retention_cleanup(agent: &SharedAgent) {
         let emergency_cap = mem_cfg
             .retention_max_delete_per_run
             .saturating_mul(4)
-            .max(200)
-            .min(EPISODE_RETENTION_EMERGENCY_MAX_DELETE_PER_RUN);
+            .clamp(200, EPISODE_RETENTION_EMERGENCY_MAX_DELETE_PER_RUN);
         let max_deletable = (count - mem_cfg.retention_keep_last as i64).max(0) as u64;
         max_deletable.min(emergency_cap)
     } else {
@@ -3214,9 +3511,7 @@ async fn run_episode_retention_cleanup(agent: &SharedAgent) {
         } else {
             EPISODE_RETENTION_CLEANUP_KEY
         };
-        let _ = storage
-            .set(key, now.to_rfc3339().as_bytes())
-            .await;
+        let _ = storage.set(key, now.to_rfc3339().as_bytes()).await;
         return;
     }
 
@@ -3246,9 +3541,7 @@ async fn run_episode_retention_cleanup(agent: &SharedAgent) {
             } else {
                 EPISODE_RETENTION_CLEANUP_KEY
             };
-            let _ = storage
-                .set(key, now.to_rfc3339().as_bytes())
-                .await;
+            let _ = storage.set(key, now.to_rfc3339().as_bytes()).await;
         }
         Err(e) => {
             if emergency_mode {

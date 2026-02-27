@@ -1,0 +1,40 @@
+{
+  "target_key": "routing_complexity_policy_v1",
+  "version": 1,
+  "cases": [
+    {"prompt": "hi", "expected": "simple"},
+    {"prompt": "thanks", "expected": "simple"},
+    {"prompt": "what time is it in new york?", "expected": "simple"},
+    {"prompt": "translate hello to spanish", "expected": "simple"},
+    {"prompt": "status?", "expected": "simple"},
+    {"prompt": "who won yesterday's game?", "expected": "simple"},
+    {"prompt": "ping", "expected": "simple"},
+    {"prompt": "set a reminder for 5pm", "expected": "simple"},
+
+    {"prompt": "explain how dns works", "expected": "medium"},
+    {"prompt": "why is my build failing", "expected": "medium"},
+    {"prompt": "which is better rust or go for cli tools?", "expected": "medium"},
+    {"prompt": "help me understand async await in rust", "expected": "medium"},
+    {"prompt": "create a simple budget tracker app", "expected": "medium"},
+    {"prompt": "build a landing page for a bakery", "expected": "medium"},
+    {"prompt": "recommend three names for my startup", "expected": "medium"},
+    {"prompt": "suggest project ideas for machine learning", "expected": "medium"},
+    {"prompt": "fix this sql query", "expected": "medium"},
+    {"prompt": "deploy my app", "expected": "medium"},
+    {"prompt": "check my gmail for interview updates", "expected": "medium"},
+    {"prompt": "generate a tweet thread about ai safety", "expected": "medium"},
+
+    {"prompt": "research and compare llm providers for enterprise deployments and write a report", "expected": "complex"},
+    {"prompt": "investigate why checkout conversion dropped over the last month and analyze each funnel step", "expected": "complex"},
+    {"prompt": "analyze and compare the top vector databases for latency, cost, and reliability", "expected": "complex"},
+    {"prompt": "write a comprehensive migration plan from monolith to microservices with rollback strategy", "expected": "complex"},
+    {"prompt": "step by step plan to move all of our analytics pipelines to real-time processing", "expected": "complex"},
+    {"prompt": "compare and rank all of our vendors across security, price, support, and sla", "expected": "complex"},
+    {"prompt": "evaluate each of these 12 resumes and provide a hiring recommendation matrix", "expected": "complex"},
+    {"prompt": "i need a comprehensive analysis of retention by cohort and channel across all regions", "expected": "complex"},
+    {"prompt": "plan a multi-phase rollout for account permissions migration with prechecks, validation matrix, and staged fallback procedures", "expected": "complex"},
+    {"prompt": "design an experiment framework to measure prompt quality across ten task families with confidence intervals and rollback criteria", "expected": "complex"},
+    {"prompt": "map dependencies between backend services and produce a risk-ranked change calendar for the next quarter", "expected": "complex"},
+    {"prompt": "can you provide a full tradeoff analysis for replacing postgres with a managed distributed sql system including risk, migration sequencing, and fallback options?", "expected": "complex"}
+  ]
+}

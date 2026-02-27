@@ -436,7 +436,7 @@ impl ResearchClient {
         let mut key_points = Vec::new();
 
         // Split content into sentences
-        for sentence in content.split(|c| c == '.' || c == '!' || c == '?') {
+        for sentence in content.split(['.', '!', '?']) {
             let sentence = sentence.trim();
             if sentence.len() < 20 || sentence.len() > 500 {
                 continue;

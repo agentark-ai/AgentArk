@@ -58,7 +58,7 @@ pub struct McpClient {
 
 enum McpTransport {
     Http(HttpTransport),
-    Stdio(StdioTransport),
+    Stdio(Box<StdioTransport>),
 }
 
 struct HttpTransport {
@@ -95,12 +95,12 @@ impl McpClient {
                 command,
                 args,
                 working_dir,
-            } => McpTransport::Stdio(StdioTransport {
+            } => McpTransport::Stdio(Box::new(StdioTransport {
                 command: command.clone(),
                 args: args.clone(),
                 working_dir: working_dir.as_ref().map(std::path::PathBuf::from),
                 session: None,
-            }),
+            })),
         };
 
         Ok(Self {
@@ -343,13 +343,7 @@ impl StdioTransport {
 
     async fn ensure_session(&mut self) -> Result<()> {
         let needs_spawn = match self.session.as_mut() {
-            Some(sess) => {
-                if let Ok(Some(_)) = sess.child.try_wait() {
-                    true
-                } else {
-                    false
-                }
-            }
+            Some(sess) => matches!(sess.child.try_wait(), Ok(Some(_))),
             None => true,
         };
 

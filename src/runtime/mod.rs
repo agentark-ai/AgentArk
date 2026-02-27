@@ -1079,7 +1079,17 @@ impl ActionRuntime {
                     "property_id": { "type": "string", "description": "GA4 property ID" },
                     "dimensions": { "type": "array", "items": { "type": "string" }, "description": "Dimension names" },
                     "metrics": { "type": "array", "items": { "type": "string" }, "description": "Metric names" },
-                    "date_ranges": { "type": "array", "description": "GA4 date ranges payload" },
+                    "date_ranges": {
+                        "type": "array",
+                        "description": "GA4 date ranges payload",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "startDate": { "type": "string", "description": "Start date (e.g. 7daysAgo or YYYY-MM-DD)" },
+                                "endDate": { "type": "string", "description": "End date (e.g. today or YYYY-MM-DD)" }
+                            }
+                        }
+                    },
                     "limit": { "type": "integer", "description": "Maximum rows (default: 1000)" }
                 },
                 "required": ["action"]
@@ -1307,7 +1317,7 @@ impl ActionRuntime {
         // App deployment — write files, start servers, return live URL
         self.register_builtin_action(ActionDef {
             name: "app_deploy".to_string(),
-            description: "Deploy a web app or server and return a live URL. Supports ANY type of app: static HTML/JS/CSS, Python (FastAPI, Flask, Streamlit), Node.js (Express), or any language. Use when asked to build a dashboard, create a tool, make a website, build an app, or anything that should be accessible via a browser. For static apps, provide HTML/JS/CSS files. For dynamic apps (Python/Node servers), also provide entry_command to start the server. Dynamic apps run in an isolated container runtime. Declare required inputs via required_inputs and mark each item sensitive=true/false.".to_string(),
+            description: "Deploy a web app or server and return a live URL. Supports ANY type of app: static HTML/JS/CSS, Python (FastAPI, Flask, Streamlit), Node.js (Express), or any language. Use when asked to build a dashboard, create a tool, make a website, build an app, or anything that should be accessible via a browser. For static apps, provide HTML/JS/CSS files. For dynamic apps (Python/Node servers), also provide entry_command to start the server. Dynamic apps default to local runtime with container fallback (runtime_preference=local). Public exposure defaults to enabled (expose_public=true) so the agent can return a tunnel-ready link. Declare required inputs via required_inputs and mark each item sensitive=true/false. Access guard is optional and defaults to false.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -1365,6 +1375,19 @@ impl ActionRuntime {
                     "runtime_image": {
                         "type": "string",
                         "description": "Optional container image used to run the app (default: agentark-sandbox:latest)"
+                    },
+                    "runtime_preference": {
+                        "type": "string",
+                        "enum": ["local", "container"],
+                        "description": "Preferred runtime for dynamic apps. Default: local (local process first, container fallback unless docker is required)."
+                    },
+                    "expose_public": {
+                        "type": "boolean",
+                        "description": "Whether to expose the app on the Cloudflare tunnel when available. Default: true."
+                    },
+                    "access_guard": {
+                        "type": "boolean",
+                        "description": "Enable access-key guard for the app URL. Default: false (public app URL)."
                     }
                 },
                 "required": ["files"]
@@ -1419,6 +1442,67 @@ impl ActionRuntime {
                 "required": ["prompt"]
             }),
             capabilities: vec!["video_generation".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        }).await;
+
+        // Self-evolve - policy-first self-improvement
+        self.register_builtin_action(ActionDef {
+            name: "self_evolve".to_string(),
+            description: "Evolve AgentArk behavior with an auditable promotion loop. Default mode is policy/strategy evolution (benchmark, lineage archive, statistical gating, canary rollout with replay gate, optional promotion). Code evolution is disabled by default and requires explicit allow_code_writes=true.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "request": {
+                        "type": "string",
+                        "description": "Natural language description of what should evolve"
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["policy", "code"],
+                        "description": "Evolution mode. policy (default) evolves runtime strategy; code enables source mutation mode."
+                    },
+                    "allow_code_writes": {
+                        "type": "boolean",
+                        "description": "Required true to run code mode. Ignored for policy mode."
+                    },
+                    "apply_promotion": {
+                        "type": "boolean",
+                        "description": "For policy mode: apply promoted policy by activating canary rollout and replay gate. Default true."
+                    },
+                    "canary_rollout_percent": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "description": "Traffic percentage for candidate policy during canary rollout. Default 20."
+                    },
+                    "canary_min_samples_per_version": {
+                        "type": "integer",
+                        "minimum": 5,
+                        "description": "Minimum baseline/candidate samples required for replay promotion. Default 25."
+                    },
+                    "canary_min_success_gain": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "description": "Minimum success-rate improvement required for promotion. Default 0.03."
+                    },
+                    "canary_max_sign_test_p_value": {
+                        "type": "number",
+                        "minimum": 0.0001,
+                        "maximum": 1.0,
+                        "description": "Maximum one-sided sign-test p-value for promotion. Default 0.10."
+                    },
+                    "replay_log_limit": {
+                        "type": "integer",
+                        "minimum": 100,
+                        "description": "Operational log window size used for replay evaluation. Default 4000."
+                    }
+                },
+                "required": ["request"]
+            }),
+            capabilities: vec!["self_evolve".to_string()],
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
@@ -2040,6 +2124,7 @@ impl ActionRuntime {
                     .and_then(|c| c.get(1))
                     .map(|m| m.as_str().trim().to_string())
                     .unwrap_or_default();
+                let tag_re = regex::Regex::new(r"<[^>]+>").unwrap();
 
                 match extract {
                     "title" => Ok(if title.is_empty() {
@@ -2057,7 +2142,6 @@ impl ActionRuntime {
                             let href = cap.get(1).map(|m| m.as_str()).unwrap_or("");
                             let text = cap.get(2).map(|m| m.as_str()).unwrap_or("");
                             // Strip HTML tags from link text
-                            let tag_re = regex::Regex::new(r"<[^>]+>").unwrap();
                             let clean_text = tag_re.replace_all(text, "").trim().to_string();
                             if !href.is_empty()
                                 && !href.starts_with('#')
@@ -2099,7 +2183,6 @@ impl ActionRuntime {
                         for cap in link_re.captures_iter(&html) {
                             let href = cap.get(1).map(|m| m.as_str()).unwrap_or("");
                             let link_text = cap.get(2).map(|m| m.as_str()).unwrap_or("");
-                            let tag_re = regex::Regex::new(r"<[^>]+>").unwrap();
                             let clean_text = tag_re.replace_all(link_text, "").trim().to_string();
                             if !href.is_empty()
                                 && !href.starts_with('#')
@@ -3155,8 +3238,7 @@ print(result["text"])
         let mut backoff_ms = policy.initial_backoff_ms;
 
         loop {
-            match std::pin::Pin::from(Box::new(self.execute_action(action_name, arguments))).await
-            {
+            match std::pin::Pin::from(Box::new(self.execute_action(action_name, arguments))).await {
                 Ok(output) => return Ok((output, attempt)),
                 Err(err) => {
                     let message = err.to_string();
@@ -3421,7 +3503,9 @@ print(result["text"])
     /// Convert HTML to plain text by stripping tags and decoding entities
     fn html_to_text(html: &str) -> String {
         // Remove script and style blocks entirely
-        let script_re = regex::Regex::new(r"(?is)<(script|style|noscript)[^>]*>.*?</(script|style|noscript)>").unwrap();
+        let script_re =
+            regex::Regex::new(r"(?is)<(script|style|noscript)[^>]*>.*?</(script|style|noscript)>")
+                .unwrap();
         let cleaned = script_re.replace_all(html, "");
 
         // Remove HTML comments
@@ -4201,7 +4285,7 @@ print(result["text"])
                 && name
                     .chars()
                     .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
-                && name.chars().next().map_or(false, |c| c.is_alphanumeric())
+                && name.chars().next().is_some_and(|c| c.is_alphanumeric())
         }
 
         let mut deps = std::collections::HashSet::new();
@@ -4216,7 +4300,6 @@ print(result["text"])
             if let Some(rest) = line.strip_prefix("import ") {
                 for part in rest.split(',') {
                     let module = part
-                        .trim()
                         .split_whitespace()
                         .next()
                         .unwrap_or("")
@@ -4656,6 +4739,21 @@ print(result["text"])
     pub async fn list_actions(&self) -> Result<Vec<ActionDef>> {
         let actions = self.actions.read().await;
         Ok(actions.values().map(|s| s.info.clone()).collect())
+    }
+
+    /// List only actions that are currently executable by the agent.
+    /// System actions are always included; non-system actions honor the disabled set.
+    pub async fn list_enabled_actions(&self) -> Result<Vec<ActionDef>> {
+        let actions = self.actions.read().await;
+        let disabled = self.disabled_actions.read().await;
+        Ok(actions
+            .values()
+            .filter(|loaded| {
+                loaded.info.source == ActionSource::System
+                    || !disabled.contains(loaded.info.name.as_str())
+            })
+            .map(|loaded| loaded.info.clone())
+            .collect())
     }
 
     /// Returns true if an action is enabled (not in the disabled set).
@@ -5493,9 +5591,9 @@ print(result["text"])
         let mut version = "1.0.0".to_string();
         let mut frontmatter_text = String::new();
 
-        if content.starts_with("---") {
-            if let Some(end_pos) = content[3..].find("---") {
-                let frontmatter = &content[3..3 + end_pos];
+        if let Some(stripped) = content.strip_prefix("---") {
+            if let Some(end_pos) = stripped.find("---") {
+                let frontmatter = &stripped[..end_pos];
                 frontmatter_text = frontmatter.to_string();
                 for line in frontmatter.lines() {
                     let line = line.trim();
@@ -5523,11 +5621,14 @@ print(result["text"])
         // Extract first heading as description if not in frontmatter
         if description.is_empty() {
             for line in content.lines() {
-                if line.starts_with("# ") {
-                    description = line[2..].trim().to_string();
+                if let Some(stripped) = line.strip_prefix("# ") {
+                    description = stripped.trim().to_string();
                     break;
                 }
             }
+        }
+        if description.is_empty() {
+            description = format!("Custom skill '{}'", name);
         }
 
         // Parse permissions from frontmatter

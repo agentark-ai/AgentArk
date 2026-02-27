@@ -117,6 +117,41 @@ pub fn parse_set_secret_command(message: &str) -> Option<(String, String)> {
     Some((key.to_string(), value.to_string()))
 }
 
+/// Parse a request to reuse the currently configured LLM credential for a target key.
+///
+/// Supported forms:
+/// - `use current llm key for OPENAI_API_KEY`
+/// - `use current model key for OPENAI_API_KEY`
+/// - `use llm key OPENAI_API_KEY`
+pub fn parse_use_current_llm_key_command(message: &str) -> Option<String> {
+    let trimmed = message.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let prefixes = [
+        "use current llm key for ",
+        "use current model key for ",
+        "use llm key ",
+        "use model key ",
+    ];
+    let mut rest = None;
+    for prefix in prefixes {
+        if lower.starts_with(prefix) && trimmed.len() >= prefix.len() {
+            rest = Some(trimmed[prefix.len()..].trim());
+            break;
+        }
+    }
+    let key = rest?;
+    if key.is_empty() {
+        return None;
+    }
+    if key.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    if key.contains('\n') || key.contains('\r') {
+        return None;
+    }
+    Some(key.to_string())
+}
+
 pub fn store_user_secret(
     config_dir: &Path,
     data_dir: Option<&Path>,

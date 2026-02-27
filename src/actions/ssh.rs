@@ -19,18 +19,10 @@ pub struct SshConnection {
     pub key_name: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct SshKeyStore {
     /// Map of key_name -> PEM-encoded private key content
     pub keys: std::collections::HashMap<String, String>,
-}
-
-impl Default for SshKeyStore {
-    fn default() -> Self {
-        Self {
-            keys: std::collections::HashMap::new(),
-        }
-    }
 }
 
 fn load_connections(config_dir: &Path) -> Result<Vec<SshConnection>> {

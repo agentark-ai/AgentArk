@@ -160,6 +160,36 @@ impl Mem0Client {
         }
     }
 
+    /// Warm up embedding model + vector stack so first real request is faster.
+    /// This is best-effort and should not block normal startup.
+    pub async fn warmup(&self) -> Result<()> {
+        if !self.is_available() {
+            return Ok(());
+        }
+
+        let req = SearchRequest {
+            query: "startup warmup".to_string(),
+            user_id: "system:warmup".to_string(),
+            limit: 1,
+        };
+
+        let resp = self
+            .client
+            .post(format!("{}/memories/search", self.bridge_url))
+            .json(&req)
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            tracing::info!("Mem0 warmup completed");
+            Ok(())
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Mem0 warmup failed ({}): {}", status, body)
+        }
+    }
+
     /// Send a user+assistant exchange to Mem0 for intelligent memory extraction
     pub async fn add_memory(
         &self,

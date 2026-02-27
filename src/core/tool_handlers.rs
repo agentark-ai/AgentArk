@@ -32,6 +32,7 @@ pub struct BrowserAutoToolHandler;
 pub struct ScreenshotToolHandler;
 pub struct ComposeReportToolHandler;
 pub struct IntegrationToolHandler;
+pub struct SelfEvolveToolHandler;
 pub struct AppDeployToolHandler;
 pub struct RuntimeToolHandler;
 
@@ -167,6 +168,7 @@ impl ToolHandler for IntegrationToolHandler {
             || call.name == "generate_video"
             || call.name == "page_screenshot"
             || call.name == "compose_report"
+            || call.name == "self_evolve"
             || call.name == "app_deploy"
         {
             return false;
@@ -185,9 +187,19 @@ impl ToolHandler for IntegrationToolHandler {
         if let Some(tx) = ctx.stream_tx {
             let _ = tx.try_send(StreamEvent::ToolStart {
                 name: call.name.clone(),
+                payload: None,
             });
         }
-        if !agent.safety.is_allowed(&call.name, &call.arguments).await? {
+        let allowed = if agent.should_auto_approve_action(&call.name) {
+            tracing::info!(
+                "Auto-approving command-like action '{}' for AgentArk",
+                call.name
+            );
+            true
+        } else {
+            agent.safety.is_allowed(&call.name, &call.arguments).await?
+        };
+        if !allowed {
             let blocked = format!("Tool '{}' blocked by safety policy", call.name);
             if let Some(tx) = ctx.stream_tx {
                 let _ = tx.try_send(StreamEvent::ToolResult {
@@ -211,6 +223,29 @@ impl ToolHandler for IntegrationToolHandler {
                 &integration_id,
             )
             .await;
+        Ok(Some(out))
+    }
+}
+
+#[async_trait]
+impl ToolHandler for SelfEvolveToolHandler {
+    fn id(&self) -> &'static str {
+        "self_evolve"
+    }
+
+    fn can_handle(&self, _agent: &Agent, call: &ToolCall, _ctx: &ToolHandlerContext<'_>) -> bool {
+        call.name == "self_evolve"
+    }
+
+    async fn handle(
+        &self,
+        agent: &Agent,
+        call: &ToolCall,
+        ctx: &ToolHandlerContext<'_>,
+    ) -> Result<Option<String>> {
+        let out = agent
+            .handle_self_evolve_tool_call(call, ctx.stream_tx)
+            .await?;
         Ok(Some(out))
     }
 }
@@ -280,6 +315,7 @@ pub fn default_tool_handlers() -> Vec<Box<dyn ToolHandler>> {
         Box::new(ScreenshotToolHandler),
         Box::new(ComposeReportToolHandler),
         Box::new(IntegrationToolHandler),
+        Box::new(SelfEvolveToolHandler),
         Box::new(AppDeployToolHandler),
         Box::new(RuntimeToolHandler),
     ]
