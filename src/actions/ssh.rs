@@ -110,8 +110,9 @@ pub async fn ssh_execute(config_dir: &Path, arguments: &serde_json::Value) -> Re
         .ok_or_else(|| anyhow!("SSH key '{}' not found", conn.key_name))?;
 
     // Parse the private key
-    let key_pair = russh_keys::decode_secret_key(key_pem, None)
+    let key_pair = russh::keys::decode_secret_key(key_pem, None)
         .map_err(|e| anyhow!("Failed to parse SSH key '{}': {}", conn.key_name, e))?;
+    let key_pair = russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key_pair), None);
 
     // Connect and execute
     let config = russh::client::Config::default();
@@ -130,11 +131,11 @@ pub async fn ssh_execute(config_dir: &Path, arguments: &serde_json::Value) -> Re
 
     // Authenticate
     let auth_result = session
-        .authenticate_publickey(&conn.username, Arc::new(key_pair))
+        .authenticate_publickey(&conn.username, key_pair)
         .await
         .map_err(|e| anyhow!("SSH auth failed for {}@{}: {}", conn.username, conn.host, e))?;
 
-    if !auth_result {
+    if !auth_result.success() {
         return Err(anyhow!(
             "SSH authentication rejected for {}@{}",
             conn.username,
@@ -242,15 +243,14 @@ pub fn list_key_names(config_dir: &Path) -> Result<Vec<String>> {
 /// Minimal SSH client handler (accepts all host keys - user manages trust via connection config)
 struct Handler;
 
-#[async_trait::async_trait]
 impl russh::client::Handler for Handler {
     type Error = anyhow::Error;
 
-    async fn check_server_key(
+    fn check_server_key(
         &mut self,
-        _server_public_key: &russh_keys::key::PublicKey,
-    ) -> std::result::Result<bool, Self::Error> {
+        _server_public_key: &russh::keys::ssh_key::PublicKey,
+    ) -> impl std::future::Future<Output = std::result::Result<bool, Self::Error>> + Send {
         // Accept all host keys - trust is managed by the user configuring connections
-        Ok(true)
+        async { Ok(true) }
     }
 }

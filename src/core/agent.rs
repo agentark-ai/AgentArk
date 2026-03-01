@@ -777,7 +777,7 @@ pub struct ProcessedMessage {
     pub conversation_title: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct LlmAttemptCandidate {
     slot_id: String,
     slot_label: String,
@@ -4695,7 +4695,7 @@ Do not ask the user for JSON.",
                     segments
                         .filter(|s| !s.trim().is_empty())
                         .filter(|s| !s.contains('.') && *s != "SKILL.md" && *s != "ACTION.md")
-                        .next_back()
+                        .last()
                         .map(|s| s.to_string())
                 })
             })

@@ -860,6 +860,7 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
                 /memory - Memory stats\n\
                 /model <name> - Switch model\n\
                 /settings - View settings\n\
+                /install <url> - Install a skill from URL\n\
                 /tunnel [start|stop|status] - Manage public UI tunnel\n\
                 /run <skill> [query] - Run a custom/bundled skill\n\
                 /setsecret KEY=VALUE - Store a secret encrypted (private + allowlisted only)\n\
@@ -1076,6 +1077,22 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
             }
         }
 
+        "/install" => {
+            if args.is_empty() {
+                "Usage: /install <skill_url>".to_string()
+            } else {
+                let prompt = format!("install this skill {}", args.trim());
+                let agent = agent.read().await;
+                match agent
+                    .process_message(&prompt, "telegram", Some(&conversation_id), None)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => format!("❌ Error: {}", e),
+                }
+            }
+        }
+
         "/summarize" => {
             let response = {
                 let agent = agent.read().await;
@@ -1203,7 +1220,7 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
             }
         }
 
-        cmd if cmd.starts_with("/run ") => {
+        "/run" => {
             let rest = args.trim();
             if rest.is_empty() {
                 "Usage: /run <skill_name> [query]".to_string()

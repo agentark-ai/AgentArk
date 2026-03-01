@@ -1204,6 +1204,7 @@ async fn handle_command(text: &str, agent: &SharedAgent, from: &str) -> String {
                  /help - Show this help message\n\
                  /status - Agent status\n\
                  /skills - List available skills\n\
+                 /install <url> - Install a skill from URL\n\
                  /run <skill> [query] - Run a custom/bundled skill\n\
                  /tasks - View pending tasks\n\
                  /search <query> - Web search\n\
@@ -1263,6 +1264,22 @@ async fn handle_command(text: &str, agent: &SharedAgent, from: &str) -> String {
                     String::new()
                 };
                 format!("*Available Skills*\n\n{}{}", list, more)
+            }
+        }
+
+        "/install" => {
+            if args.is_empty() {
+                "Usage: /install <skill_url>".to_string()
+            } else {
+                let prompt = format!("install this skill {}", args.trim());
+                let agent = agent.read().await;
+                match agent
+                    .process_message(&prompt, "whatsapp", Some(&conversation_id), None)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => format!("Error: {}", e),
+                }
             }
         }
 
