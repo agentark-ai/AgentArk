@@ -139,6 +139,20 @@ impl Storage {
                 signature TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS execution_traces (
+                id TEXT PRIMARY KEY,
+                message TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                duration_ms INTEGER,
+                step_count INTEGER NOT NULL DEFAULT 0,
+                steps_json TEXT NOT NULL,
+                response TEXT,
+                proof_id TEXT,
+                created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS tasks (
                 id TEXT PRIMARY KEY,
                 description TEXT NOT NULL,
@@ -255,6 +269,8 @@ impl Storage {
 
             CREATE INDEX IF NOT EXISTS idx_episodes_timestamp ON episodes(timestamp);
             CREATE INDEX IF NOT EXISTS idx_proofs_timestamp ON execution_proofs(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_execution_traces_created ON execution_traces(created_at);
+            CREATE INDEX IF NOT EXISTS idx_execution_traces_started ON execution_traces(started_at);
             CREATE INDEX IF NOT EXISTS idx_swarm_delegations_agent ON swarm_delegations(agent_id);
             CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);
             CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
@@ -1746,7 +1762,8 @@ impl Storage {
     fn collapse_recent_arkpulse_notifications(
         notifications: Vec<notification::Model>,
     ) -> Vec<notification::Model> {
-        let cutoff = chrono::Utc::now() - chrono::Duration::hours(Self::ARKPULSE_NOTIFICATION_WINDOW_HOURS);
+        let cutoff =
+            chrono::Utc::now() - chrono::Duration::hours(Self::ARKPULSE_NOTIFICATION_WINDOW_HOURS);
         let mut kept_recent_arkpulse = false;
         let mut filtered = Vec::with_capacity(notifications.len());
 
@@ -2028,7 +2045,10 @@ impl Storage {
             .filter(notification::Column::Read.eq(false))
             .count(&self.db)
             .await?;
-        let arkpulse_recent_unread = self.count_recent_arkpulse_notifications(true).await.unwrap_or(0);
+        let arkpulse_recent_unread = self
+            .count_recent_arkpulse_notifications(true)
+            .await
+            .unwrap_or(0);
         if arkpulse_recent_unread > 1 {
             Ok(count.saturating_sub(arkpulse_recent_unread - 1))
         } else {
@@ -2075,6 +2095,68 @@ impl Storage {
             .all(&self.db)
             .await?;
         Ok(log)
+    }
+
+    // ==================== Execution Traces ====================
+
+    /// Persist a completed execution trace for Trace history/detail views.
+    pub async fn insert_execution_trace(&self, trace: &crate::core::ExecutionTrace) -> Result<()> {
+        let duration_ms = trace.started_at.and_then(|start| {
+            trace
+                .completed_at
+                .map(|end| (end - start).num_milliseconds())
+        });
+        let started_at = trace.started_at.map(|value| value.to_rfc3339());
+        let completed_at = trace.completed_at.map(|value| value.to_rfc3339());
+        let created_at = trace
+            .completed_at
+            .or(trace.started_at)
+            .unwrap_or_else(chrono::Utc::now)
+            .to_rfc3339();
+        let steps_json = serde_json::to_string(&trace.steps)?;
+
+        crate::storage::entities::execution_trace::ActiveModel {
+            id: Set(trace.id.clone()),
+            message: Set(trace.message.clone()),
+            channel: Set(trace.channel.clone()),
+            started_at: Set(started_at),
+            completed_at: Set(completed_at),
+            duration_ms: Set(duration_ms),
+            step_count: Set(trace.steps.len() as i64),
+            steps_json: Set(steps_json),
+            response: Set(trace.response.clone()),
+            proof_id: Set(trace.proof_id.clone()),
+            created_at: Set(created_at),
+        }
+        .insert(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    /// List persisted execution traces (newest first).
+    pub async fn list_execution_traces(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<crate::storage::entities::execution_trace::Model>> {
+        let traces = crate::storage::entities::execution_trace::Entity::find()
+            .order_by_desc(crate::storage::entities::execution_trace::Column::CreatedAt)
+            .limit(limit)
+            .offset(offset)
+            .all(&self.db)
+            .await?;
+        Ok(traces)
+    }
+
+    /// Get a single persisted execution trace by id.
+    pub async fn get_execution_trace(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::storage::entities::execution_trace::Model>> {
+        let trace = crate::storage::entities::execution_trace::Entity::find_by_id(id.to_string())
+            .one(&self.db)
+            .await?;
+        Ok(trace)
     }
 
     // ==================== Security Logs ====================

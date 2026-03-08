@@ -56,7 +56,7 @@ import ReactECharts from "echarts-for-react";
 import { api } from "../api/client";
 import AgentLogo from "../assets/logo.svg";
 import { IntegrationsPanel } from "./IntegrationsPanel";
-import type { SkillImportResponse, LlmAnalyticsResponse } from "../types";
+import type { ArkPulseRemediationSpec, ArkPulseRunFixRequest, SkillImportResponse, LlmAnalyticsResponse } from "../types";
 import { useUiStore } from "../store/uiStore";
 
 const REFRESH_MS = 8000;
@@ -66,7 +66,41 @@ const DEVELOPER_MODE_EVENT = "agentark:developer-mode-change";
 const OLLAMA_DEFAULT_BASE_URL = "http://localhost:11434";
 const OPENROUTER_DEFAULT_BASE_URL = "https://openrouter.ai/api/v1";
 const SHOW_EXPERIMENTAL_AUTONOMY_TOOLS = false;
+const CHAT_LAST_CONVERSATION_STORAGE_KEY = "agentark.chat.lastConversationId";
+const CHAT_PENDING_RUN_STORAGE_KEY = "agentark.chat.pendingRun";
+const CHAT_PENDING_RUN_TTL_MS = 45 * 60 * 1000;
+const CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS = 16000;
+const CHAT_PENDING_STREAM_STEPS_MAX = 48;
+const CHAT_LAUNCH_RUN_EVENT = "agentark.chat.launch-run";
+const CHAT_RUN_STATUS_EVENT = "agentark.chat.run-status";
 type ImportRiskBand = "secure" | "review" | "risky";
+
+type ChatPendingRunSnapshot = {
+  conversationId: string;
+  message: string;
+  projectId: string;
+  startedAt: number;
+  streamingResponse?: string;
+  streamingSteps?: JsonRecord[];
+  failedUserMessage?: string;
+};
+
+type ChatLaunchRunDetail = {
+  message: string;
+  conversationId?: string;
+  projectId?: string;
+  navigateToChat?: boolean;
+  source?: string;
+  resolve?: (started: boolean) => void;
+  reject?: (message: string) => void;
+};
+
+type ChatRunStatusDetail = {
+  conversationId: string;
+  status: "completed" | "error";
+  source?: string;
+  message: string;
+};
 
 const MODEL_FALLBACKS_BY_PROVIDER: Record<string, string[]> = {
   openai: ["gpt-5", "gpt-5-mini", "gpt-4.1", "o4-mini", "o3"],
@@ -205,6 +239,7 @@ export type WorkspaceView =
   | "trace"
   | "status"
   | "analytics"
+  | "arkpulse"
   | "settings";
 
 function isRecord(value: unknown): value is JsonRecord {
@@ -284,6 +319,118 @@ function extractStepDetailText(step: JsonRecord, maxLen = 2200): string {
   return titleData;
 }
 
+function normalizeHeartbeatDetailText(detail: string): string {
+  let text = (detail || "").trim();
+  text = text.replace(/^still working:\s*/i, "");
+  text = text.replace(/\s*\(\d+\s*[smh]\s*idle\)\.?\s*/gi, " ");
+  text = text.replace(/\bno new output yet\b\.?/gi, "");
+  text = text.replace(/\s+\./g, ".");
+  text = text.replace(/([.!?])\s*[.!?]+/g, "$1");
+  text = text.replace(/\s+/g, " ").trim();
+  if (!text) return "Working on the current step. No new output yet.";
+  if (!/[.!?]$/.test(text)) text += ".";
+  return `${text} No new output yet.`;
+}
+
+function looksLikeHtmlPayload(text: string): boolean {
+  const trimmed = text.trim();
+  return (
+    /^<!doctype html/i.test(trimmed) ||
+    /^<html\b/i.test(trimmed) ||
+    (/<(html|head|body|title|div|script|main)\b/i.test(trimmed) && /<\/(html|body|div|script|main)>/i.test(trimmed))
+  );
+}
+
+function looksLikeSourcePayload(text: string): boolean {
+  const sample = text.trim().split(/\r?\n/).slice(0, 10).join("\n");
+  if (!sample) return false;
+  return (
+    /^(from\s+\w+\s+import|import\s+[\w.{},* ]+|def\s+\w+\(|class\s+\w+|async\s+def\s+\w+\()/m.test(sample) ||
+    /^(const|let|var|function|export|import)\s/m.test(sample) ||
+    /^\s*#include\s+[<"]/m.test(sample) ||
+    /^package\s+[\w.]+;$/m.test(sample)
+  );
+}
+
+function summarizeJsonActivityPayload(value: unknown): string {
+  if (Array.isArray(value)) {
+    return value.length === 0
+      ? "Returned empty list."
+      : `Returned list with ${value.length} item${value.length === 1 ? "" : "s"}.`;
+  }
+  const obj = asRecord(value);
+  const keys = Object.keys(obj);
+  if (keys.length === 0) return "Returned empty object.";
+
+  const apps = Array.isArray(obj.apps) ? asRecords(obj.apps) : [];
+  const matchedApp = asRecord(obj.matched_app);
+  if (apps.length > 0 || Object.keys(matchedApp).length > 0) {
+    const matchedTitle = str(matchedApp.title, "").trim();
+    if (matchedTitle) {
+      return `Matched ${Math.max(apps.length, 1)} app${Math.max(apps.length, 1) === 1 ? "" : "s"}; selected ${matchedTitle}.`;
+    }
+    return `Matched ${apps.length} app${apps.length === 1 ? "" : "s"} and loaded app metadata.`;
+  }
+
+  const title = str(obj.title, "").trim();
+  const fileBytes = num(obj.file_bytes, -1);
+  if (title && fileBytes >= 0) {
+    return `Loaded metadata for ${title} (${formatBytes(fileBytes)}).`;
+  }
+
+  const visibleKeys = keys.slice(0, 4).join(", ");
+  const remaining = keys.length > 4 ? `, +${keys.length - 4} more` : "";
+  return `Returned structured data: ${visibleKeys}${remaining}.`;
+}
+
+function summarizeActivityDetail(detail: string): string {
+  const trimmed = (detail || "").trim();
+  if (!trimmed) return "";
+
+  if (/^still working:/i.test(trimmed) || /\bno new output yet\b/i.test(trimmed)) {
+    return normalizeHeartbeatDetailText(trimmed);
+  }
+
+  if ((trimmed.startsWith("{") && trimmed.endsWith("}")) || (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
+    try {
+      return summarizeJsonActivityPayload(JSON.parse(trimmed));
+    } catch {
+      // Fall through to other heuristics.
+    }
+  }
+
+  if (looksLikeHtmlPayload(trimmed)) {
+    const titleMatch = trimmed.match(/<title[^>]*>([^<]+)<\/title>/i);
+    const title = titleMatch?.[1]?.trim();
+    return title ? `Read HTML document: ${title}.` : "Read HTML document.";
+  }
+
+  if (looksLikeSourcePayload(trimmed)) {
+    const lineCount = trimmed.split(/\r?\n/).length;
+    return `Read source file contents (${lineCount} line${lineCount === 1 ? "" : "s"}).`;
+  }
+
+  if (trimmed.length > 240 && /[{}[\]<>;]/.test(trimmed)) {
+    return "Returned verbose tool output.";
+  }
+
+  return trimmed;
+}
+
+function isHumanReadableStatus(detail: string): boolean {
+  const trimmed = (detail || "").trim();
+  if (!trimmed || trimmed.length > 120) return false;
+  if (looksLikeHtmlPayload(trimmed) || looksLikeSourcePayload(trimmed)) return false;
+  if ((trimmed.startsWith("{") && trimmed.endsWith("}")) || (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
+    return false;
+  }
+  return true;
+}
+
+function isSafetyPolicyBlockedText(text: string): boolean {
+  return /blocked by safety policy/i.test(text || "");
+}
+
 function formatBytes(value: unknown): string {
   const bytes = num(value, -1);
   if (bytes < 0) return "-";
@@ -298,6 +445,72 @@ function generateConversationId(): string {
     return crypto.randomUUID();
   }
   return `conv-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function loadChatPendingRunSnapshot(): ChatPendingRunSnapshot | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.sessionStorage.getItem(CHAT_PENDING_RUN_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<ChatPendingRunSnapshot>;
+    const conversationId = typeof parsed.conversationId === "string" ? parsed.conversationId.trim() : "";
+    const startedAt = typeof parsed.startedAt === "number" ? parsed.startedAt : 0;
+    if (!conversationId || startedAt <= 0) {
+      window.sessionStorage.removeItem(CHAT_PENDING_RUN_STORAGE_KEY);
+      return null;
+    }
+    if (Date.now() - startedAt > CHAT_PENDING_RUN_TTL_MS) {
+      window.sessionStorage.removeItem(CHAT_PENDING_RUN_STORAGE_KEY);
+      return null;
+    }
+    const streamingResponse =
+      typeof parsed.streamingResponse === "string"
+        ? parsed.streamingResponse.slice(0, CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS)
+        : "";
+    const streamingSteps = Array.isArray(parsed.streamingSteps)
+      ? asRecords(parsed.streamingSteps)
+          .slice(-CHAT_PENDING_STREAM_STEPS_MAX)
+          .map((raw) => {
+            const normalized: JsonRecord = {};
+            const icon = str(raw.icon, "").trim();
+            const title = str(raw.title, "").trim();
+            const detail = str(raw.detail, "").trim();
+            const stepType = str(raw.step_type, "").trim();
+            const data = compactUnknown(raw.data, 800);
+            if (icon) normalized.icon = icon.slice(0, 64);
+            if (title) normalized.title = title.slice(0, 220);
+            if (detail) normalized.detail = detail.slice(0, 900);
+            if (stepType) normalized.step_type = stepType.slice(0, 80);
+            if (data) normalized.data = data;
+            return normalized;
+          })
+      : [];
+    return {
+      conversationId,
+      message: typeof parsed.message === "string" ? parsed.message : "",
+      projectId: typeof parsed.projectId === "string" ? parsed.projectId : "",
+      startedAt,
+      streamingResponse,
+      streamingSteps,
+      failedUserMessage:
+        typeof parsed.failedUserMessage === "string" ? parsed.failedUserMessage : ""
+    };
+  } catch {
+    return null;
+  }
+}
+
+function storeChatPendingRunSnapshot(snapshot: ChatPendingRunSnapshot | null): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (!snapshot) {
+      window.sessionStorage.removeItem(CHAT_PENDING_RUN_STORAGE_KEY);
+      return;
+    }
+    window.sessionStorage.setItem(CHAT_PENDING_RUN_STORAGE_KEY, JSON.stringify(snapshot));
+  } catch {
+    // Ignore storage failures.
+  }
 }
 
 function stripAttachmentContextMarker(text: string): string {
@@ -381,21 +594,20 @@ function computeImportRiskSummary(security: SkillImportResponse["security"] | nu
   let score = providedRiskScore >= 0 ? Math.min(10, providedRiskScore) : Math.min(10, rawSeverity / 4);
 
   // Common integration patterns (curl/env refs/placeholders) should count as context, not danger.
-  if (providedRiskScore < 0) {
-    if (contextualRatio >= 0.75) {
-      score *= 0.65;
-    } else if (contextualRatio >= 0.5) {
-      score *= 0.8;
-    }
+  if (contextualRatio >= 0.8) {
+    // Nearly all findings are standard patterns — cap score regardless of backend value.
+    score = Math.min(score, 4);
+  } else if (contextualRatio >= 0.5) {
+    score = Math.min(score, 6);
   }
 
   const threatLevel = str(security.threat_level, "").toLowerCase();
-  if (threatLevel === "malicious") {
+  if (threatLevel === "malicious" && contextualRatio < 0.8) {
     score = Math.max(score, 8.5);
-  } else if (threatLevel === "suspicious") {
+  } else if (threatLevel === "suspicious" && contextualRatio < 0.5) {
     score = Math.max(score, 5);
   }
-  if (toBool(security.blocked)) {
+  if (toBool(security.blocked) && contextualRatio < 0.8) {
     score = Math.max(score, 8.5);
   }
 
@@ -444,6 +656,95 @@ function isUserActionableDoctorFinding(value: unknown): boolean {
   const row = asRecord(value);
   if (!Object.prototype.hasOwnProperty.call(row, "user_actionable")) return true;
   return toBool(row.user_actionable);
+}
+
+function parseArkPulseRemediationSpec(value: unknown): ArkPulseRemediationSpec | null {
+  const row = asRecord(value);
+  const kind = str(row.kind, "").trim().toLowerCase();
+  if (!kind) return null;
+  if (kind === "tunnel_start_verify") {
+    return { kind: "tunnel_start_verify" };
+  }
+  if (kind === "tunnel_restart_verify") {
+    return { kind: "tunnel_restart_verify" };
+  }
+  if (kind === "shell_command") {
+    const command = str(row.command, "").trim();
+    if (!command) return null;
+    return { kind: "shell_command", command };
+  }
+  return null;
+}
+
+function describeArkPulseRemediation(remediation: ArkPulseRemediationSpec | null): string {
+  if (!remediation) return "-";
+  if (remediation.kind === "tunnel_start_verify") {
+    return "Start tunnel and verify /tunnel/status returns active + URL";
+  }
+  if (remediation.kind === "tunnel_restart_verify") {
+    return "Restart tunnel and verify public reachability";
+  }
+  return remediation.command.trim() || "-";
+}
+
+function classifyLegacyRunnableArkPulseFixCommand(value: string): ArkPulseRemediationSpec | null {
+  const normalized = (value || "").trim();
+  if (!normalized) return null;
+  const lower = normalized.toLowerCase();
+  if (lower === "-" || lower === "n/a" || lower === "none") return null;
+
+  if (lower.includes("start tunnel") && lower.includes("/tunnel/status")) {
+    return { kind: "tunnel_start_verify" };
+  }
+  if (lower.includes("restart") && lower.includes("tunnel")) {
+    return { kind: "tunnel_restart_verify" };
+  }
+
+  if (
+    lower.includes("\n") ||
+    lower.includes("\r") ||
+    lower.includes("||") ||
+    lower.includes(";") ||
+    lower.includes("`") ||
+    lower.includes("$(")
+  ) {
+    return null;
+  }
+
+  const segments = normalized
+    .split("&&")
+    .map((segment) => segment.trim())
+    .filter((segment) => segment.length > 0);
+  if (segments.length < 2) return null;
+
+  const cdSegment = segments[0].toLowerCase();
+  if (!cdSegment.startsWith("cd /app/data/apps/")) return null;
+
+  const supported = segments.slice(1).every((segment) => {
+    const seg = segment.toLowerCase();
+    return (
+      seg.startsWith("pip-compile requirements.txt") ||
+      seg.startsWith("rg -n ") ||
+      seg === "cargo generate-lockfile" ||
+      seg.startsWith("npm pkg delete ") ||
+      seg.startsWith("mv .env ")
+    );
+  });
+
+  if (!supported) return null;
+  return { kind: "shell_command", command: normalized };
+}
+
+function getRunnableArkPulseRemediation(value: unknown): ArkPulseRemediationSpec | null {
+  const row = asRecord(value);
+  return parseArkPulseRemediationSpec(row.remediation) ?? classifyLegacyRunnableArkPulseFixCommand(str(row.fix_command, "").trim());
+}
+
+function getArkPulseFixText(value: unknown): string {
+  const row = asRecord(value);
+  const fix = str(row.fix_command, "").trim();
+  if (fix) return fix;
+  return describeArkPulseRemediation(parseArkPulseRemediationSpec(row.remediation));
 }
 
 function parseChatMarkdown(source: string): ChatMarkdownBlock[] {
@@ -728,7 +1029,23 @@ function formatDurationClock(totalSeconds: number): string {
 }
 
 function errMessage(error: unknown): string {
-  if (error instanceof Error) return error.message;
+  const normalize = (raw: string): string => {
+    const msg = (raw || "").trim();
+    if (!msg) return "Request failed";
+    if (msg.startsWith("{") && msg.endsWith("}")) {
+      try {
+        const parsed = JSON.parse(msg) as Record<string, unknown>;
+        const nested = str(parsed.error, "").trim() || str(parsed.message, "").trim();
+        if (nested) return nested;
+      } catch {
+        // Fall through to raw message.
+      }
+    }
+    return msg;
+  };
+
+  if (error instanceof Error) return normalize(error.message);
+  if (typeof error === "string") return normalize(error);
   return "Request failed";
 }
 
@@ -1216,6 +1533,76 @@ function formatTimestampForHumans(value: string): { label: string; tooltip: stri
   return { label: fmt.format(dt), tooltip: value };
 }
 
+function formatRelativeTimeFromNow(date: Date): string {
+  const diffMs = Date.now() - date.getTime();
+  const isPast = diffMs >= 0;
+  const absMs = Math.abs(diffMs);
+  const absSec = Math.round(absMs / 1000);
+  const unit = (count: number, singular: string, plural: string) =>
+    `${count} ${count === 1 ? singular : plural}`;
+
+  if (absSec < 30) return "just now";
+
+  const absMin = Math.round(absSec / 60);
+  if (absMin < 60) {
+    const display = unit(absMin, "minute", "minutes");
+    return isPast ? `${display} ago` : `in ${display}`;
+  }
+
+  const absHours = Math.round(absMin / 60);
+  if (absHours < 24) {
+    const display = unit(absHours, "hour", "hours");
+    return isPast ? `${display} ago` : `in ${display}`;
+  }
+
+  const absDays = Math.round(absHours / 24);
+  if (absDays < 7) {
+    const display = unit(absDays, "day", "days");
+    return isPast ? `${display} ago` : `in ${display}`;
+  }
+
+  const absWeeks = Math.round(absDays / 7);
+  if (absWeeks < 5) {
+    const display = unit(absWeeks, "week", "weeks");
+    return isPast ? `${display} ago` : `in ${display}`;
+  }
+
+  const absMonths = Math.round(absDays / 30);
+  if (absMonths < 12) {
+    const display = unit(absMonths, "month", "months");
+    return isPast ? `${display} ago` : `in ${display}`;
+  }
+
+  const absYears = Math.round(absDays / 365);
+  const display = unit(absYears, "year", "years");
+  return isPast ? `${display} ago` : `in ${display}`;
+}
+
+function formatChatTimestamp(value: string): { label: string; tooltip: string } {
+  const dt = new Date(value);
+  if (Number.isNaN(dt.getTime())) return { label: value, tooltip: value };
+
+  const absolute = new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit"
+  }).format(dt);
+  const relative = formatRelativeTimeFromNow(dt);
+  const tooltip = new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    timeZoneName: "short"
+  }).format(dt);
+
+  return { label: `${absolute} · ${relative}`, tooltip };
+}
+
 function formatDurationFromSeconds(value: unknown): string {
   const total = num(value, -1);
   if (total < 0) return "-";
@@ -1385,8 +1772,21 @@ function KeyValuePanel({
 type BulkImportItem = {
   url: string;
   selected: boolean;
+  analyzed: boolean;
   status?: string;
-  result?: SkillImportResponse;
+  discovered: BulkImportDiscoveredSkill[];
+};
+
+type BulkImportDiscoveredSkill = {
+  key: string;
+  parentUrl: string;
+  url: string;
+  name: string;
+  selected: boolean;
+  status?: string;
+  preview?: SkillImportResponse;
+  importResult?: SkillImportResponse;
+  error?: string;
 };
 
 function BulkImportDialog({
@@ -1402,11 +1802,12 @@ function BulkImportDialog({
 }) {
   const [urlsText, setUrlsText] = useState("");
   const [items, setItems] = useState<BulkImportItem[]>([]);
-  const [loading, setLoading] = useState(false);
+  const [analyzing, setAnalyzing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [importing, setImporting] = useState(false);
   const [force, setForce] = useState(false);
   const [model, setModel] = useState("");
+  const [analysisDone, setAnalysisDone] = useState(false);
 
   const parseUrlsFromText = (text: string): string[] => {
     const urls = text
@@ -1427,74 +1828,334 @@ function BulkImportDialog({
     return uniq;
   };
 
+  const requiresForceForResult = (result: SkillImportResponse | undefined): boolean => {
+    if (!result) return false;
+    const risk = computeImportRiskSummary(result.security);
+    const blocked = toBool(result.security?.blocked) || result.status === "blocked";
+    return blocked || risk.score10 >= IMPORT_SECURITY_FORCE_RISK_THRESHOLD;
+  };
+
+  const normalizeDiscoveredSkills = (
+    sourceUrl: string,
+    previewResult: SkillImportResponse
+  ): BulkImportDiscoveredSkill[] => {
+    const importedChildren = Array.isArray(previewResult.imported) ? previewResult.imported : [];
+    if (importedChildren.length > 0) {
+      return importedChildren.map((entry, idx) => {
+        const childResult = entry?.result;
+        const childUrl = str(entry?.url, sourceUrl);
+        const childName = str(childResult?.name, `skill-${idx + 1}`);
+        const needsForce = requiresForceForResult(childResult);
+        return {
+          key: `${sourceUrl}::${childUrl}::${idx}`,
+          parentUrl: sourceUrl,
+          url: childUrl,
+          name: childName,
+          selected: force || !needsForce,
+          status:
+            str(childResult?.message, "") ||
+            (childResult?.status === "blocked"
+              ? "Blocked by security verification"
+              : "Preview ready"),
+          preview: childResult
+        };
+      });
+    }
+
+    const singleNeedsForce = requiresForceForResult(previewResult);
+    return [
+      {
+        key: `${sourceUrl}::single`,
+        parentUrl: sourceUrl,
+        url: sourceUrl,
+        name: str(previewResult.name, "imported-skill"),
+        selected: force || !singleNeedsForce,
+        status:
+          str(previewResult.message, "") ||
+          (previewResult.status === "blocked" ? "Blocked by security verification" : "Preview ready"),
+        preview: previewResult
+      }
+    ];
+  };
+
+  const buildItemsFromText = (): BulkImportItem[] =>
+    parseUrlsFromText(urlsText).map((url) => ({
+      url,
+      selected: true,
+      analyzed: false,
+      discovered: []
+    }));
+
+  const selectedDiscoveredSkills: BulkImportDiscoveredSkill[] = items.flatMap((item) =>
+    item.selected ? item.discovered.filter((skill) => skill.selected) : []
+  );
+  const selectedSkillCount = selectedDiscoveredSkills.length;
+  const riskySelectedCount = selectedDiscoveredSkills.filter((skill) =>
+    requiresForceForResult(skill.preview)
+  ).length;
+
   useEffect(() => {
     if (!open) {
       setError(null);
-      setLoading(false);
+      setAnalyzing(false);
       setImporting(false);
+      setAnalysisDone(false);
       return;
     }
     setUrlsText("");
     setItems([]);
+    setAnalyzing(false);
+    setImporting(false);
+    setAnalysisDone(false);
+    setError(null);
+    setForce(false);
+    setModel("");
   }, [open]);
 
-  const parseUrls = () => {
-    const uniq = parseUrlsFromText(urlsText);
-    setItems(uniq.map((url) => ({ url, selected: true })));
+  const updateDiscoveredSkill = (
+    parentUrl: string,
+    skillKey: string,
+    patch: Partial<BulkImportDiscoveredSkill>
+  ) => {
+    setItems((prev) =>
+      prev.map((item) => {
+        if (item.url !== parentUrl) return item;
+        return {
+          ...item,
+          discovered: item.discovered.map((skill) =>
+            skill.key === skillKey ? { ...skill, ...patch } : skill
+          )
+        };
+      })
+    );
+  };
+
+  const handleAnalyzeSelected = async () => {
+    setError(null);
+    setAnalysisDone(false);
+    const effectiveItems = items.length > 0 ? items : buildItemsFromText();
+    if (!effectiveItems.length) {
+      setError("Paste at least one import URL before analyzing.");
+      return;
+    }
+    const toAnalyze = effectiveItems.filter((item) => item.selected);
+    if (!toAnalyze.length) {
+      setError("Select at least one URL to analyze.");
+      return;
+    }
+    if (items.length === 0) setItems(effectiveItems);
+
+    setAnalyzing(true);
+    for (const item of toAnalyze) {
+      setItems((prev) =>
+        prev.map((x) => (x.url === item.url ? { ...x, status: "Analyzing security...", analyzed: false } : x))
+      );
+      try {
+        const preview = await api.importSkill({
+          url: item.url,
+          force,
+          model: model.trim() || undefined,
+          preview_only: true
+        });
+        const discovered = normalizeDiscoveredSkills(item.url, preview);
+        setItems((prev) =>
+          prev.map((x) =>
+            x.url === item.url
+              ? {
+                  ...x,
+                  analyzed: true,
+                  status:
+                    preview.message ||
+                    `Previewed ${discovered.length} skill${discovered.length === 1 ? "" : "s"}.`,
+                  discovered
+                }
+              : x
+          )
+        );
+      } catch (err) {
+        const message = `Error: ${errMessage(err)}`;
+        setItems((prev) =>
+          prev.map((x) =>
+            x.url === item.url
+              ? {
+                  ...x,
+                  analyzed: true,
+                  status: message,
+                  discovered: []
+                }
+              : x
+          )
+        );
+      }
+    }
+    setAnalyzing(false);
+    setAnalysisDone(true);
   };
 
   const handleImportSelected = async () => {
-    // If the user never clicked "Preview list", build the list automatically.
-    const effectiveItems =
-      items.length > 0 ? items : parseUrlsFromText(urlsText).map((url) => ({ url, selected: true } as BulkImportItem));
-
-    if (items.length === 0 && effectiveItems.length > 0) {
-      setItems(effectiveItems);
+    setError(null);
+    if (!analysisDone) {
+      setError("Analyze selected URLs first so you can review security and choose which skills to import.");
+      return;
+    }
+    if (!selectedSkillCount) {
+      setError("Select at least one skill to import.");
+      return;
+    }
+    if (!force && riskySelectedCount > 0) {
+      setError(
+        `Selected set includes ${riskySelectedCount} risky skill(s). Enable override or deselect them before importing.`
+      );
+      return;
     }
 
-    const toImport = effectiveItems.filter((item) => item.selected);
-    if (!toImport.length) return;
+    const selectedByParent = new Map<string, BulkImportDiscoveredSkill[]>();
+    for (const skill of selectedDiscoveredSkills) {
+      const bucket = selectedByParent.get(skill.parentUrl) || [];
+      bucket.push(skill);
+      selectedByParent.set(skill.parentUrl, bucket);
+    }
+
     setImporting(true);
-    for (const item of toImport) {
-      setItems((prev) =>
-        prev.map((x) => (x.url === item.url ? { ...x, status: "Importing..." } : x))
-      );
+    for (const [parentUrl, selectedSkills] of selectedByParent.entries()) {
+      for (const skill of selectedSkills) {
+        updateDiscoveredSkill(skill.parentUrl, skill.key, {
+          status: "Importing...",
+          error: undefined
+        });
+      }
       try {
-        const result = await api.importSkill({ url: item.url, force, model: model.trim() || undefined });
-        let statusMessage = result.message || `Imported ${result.name}`;
-        if (result.status === "blocked") {
-          statusMessage = result.message || "Blocked by security verification (enable override and retry).";
-        } else if (result.status === "needs_secrets") {
-          statusMessage = result.message || `Imported ${result.name} (disabled until secrets are configured)`;
+        const result = await api.importSkill({
+          url: parentUrl,
+          force,
+          model: model.trim() || undefined,
+          selected_urls: selectedSkills.map((skill) => skill.url)
+        });
+
+        const importedEntries = Array.isArray(result.imported) ? result.imported : [];
+        const importedByUrl = new Map<string, SkillImportResponse>();
+        for (const entry of importedEntries) {
+          const childResult = entry?.result;
+          const childUrl = str(entry?.url, "").trim();
+          if (!childResult || !childUrl) continue;
+          importedByUrl.set(childUrl, childResult);
         }
-        setItems((prev) =>
-          prev.map((x) => (x.url === item.url ? { ...x, status: statusMessage, result } : x))
-        );
-        const importedChildren = Array.isArray(result.imported) ? result.imported : [];
-        if (importedChildren.length > 0) {
-          for (const child of importedChildren) {
-            const childResult = child?.result;
-            if (!childResult?.name) continue;
-            const childMessage =
-              childResult.message ||
-              (childResult.status === "needs_secrets"
-                ? `Imported ${childResult.name} (disabled until secrets are configured)`
-                : `Imported ${childResult.name}`);
+
+        if (importedEntries.length > 0) {
+          for (const skill of selectedSkills) {
+            const childResult = importedByUrl.get(skill.url);
+            if (!childResult) {
+              updateDiscoveredSkill(skill.parentUrl, skill.key, {
+                status: "Error: selected skill was not returned by bulk import response."
+              });
+              continue;
+            }
+            let childMessage = childResult.message || `Imported ${childResult.name}`;
+            if (childResult.status === "blocked") {
+              childMessage =
+                childResult.message || "Blocked by security verification (enable override and retry).";
+            } else if (childResult.status === "needs_secrets") {
+              childMessage =
+                childResult.message ||
+                `Imported ${childResult.name} (disabled until secrets are configured)`;
+            }
+
+            updateDiscoveredSkill(skill.parentUrl, skill.key, {
+              status: childMessage,
+              importResult: childResult
+            });
             await onAfterImport?.(childResult.name, childResult);
             await onImported?.({ result: childResult, message: childMessage });
           }
         } else {
+          let statusMessage = result.message || `Imported ${result.name}`;
+          if (result.status === "blocked") {
+            statusMessage = result.message || "Blocked by security verification (enable override and retry).";
+          } else if (result.status === "needs_secrets") {
+            statusMessage = result.message || `Imported ${result.name} (disabled until secrets are configured)`;
+          }
+          for (const skill of selectedSkills) {
+            updateDiscoveredSkill(skill.parentUrl, skill.key, {
+              status: statusMessage,
+              importResult: result
+            });
+          }
           await onAfterImport?.(result.name, result);
           await onImported?.({ result, message: statusMessage });
         }
       } catch (err) {
         const message = `Error: ${errMessage(err)}`;
-        setItems((prev) =>
-          prev.map((x) => (x.url === item.url ? { ...x, status: message } : x))
-        );
+        for (const skill of selectedSkills) {
+          updateDiscoveredSkill(skill.parentUrl, skill.key, { status: message, error: message });
+        }
       }
     }
     setImporting(false);
+    onClose();
+  };
+
+  const titleCaseWords = (value: string): string =>
+    value
+      .split(/[\s_-]+/)
+      .filter(Boolean)
+      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+      .join(" ");
+
+  const compactStatusToken = (value: string): string => value.toLowerCase().replace(/[^a-z0-9]+/g, "");
+
+  const buildBulkSkillStatus = (
+    skill: BulkImportDiscoveredSkill
+  ): { label: string; color: "default" | "success" | "warning" | "error" | "info"; detail: string } => {
+    const rawStatus = str(skill.status, "").trim();
+    const rawLower = rawStatus.toLowerCase();
+    const result = skill.importResult || skill.preview;
+    const blocked = toBool(result?.security?.blocked) || result?.status === "blocked";
+
+    if (rawLower === "importing...") {
+      return { label: "Importing", color: "info", detail: "" };
+    }
+    if (skill.error || rawLower.startsWith("error")) {
+      return {
+        label: "Import failed",
+        color: "error",
+        detail: rawStatus.replace(/^error:\s*/i, "").trim() || "Import failed."
+      };
+    }
+    if (blocked) {
+      return {
+        label: "Blocked",
+        color: "error",
+        detail: rawStatus || str(result?.message, "Blocked by security verification.")
+      };
+    }
+    if (result?.status === "needs_secrets") {
+      return {
+        label: "Needs secrets",
+        color: "warning",
+        detail:
+          rawStatus ||
+          str(result?.message, "Imported template is disabled until required secrets are configured.")
+      };
+    }
+    if (skill.importResult && result?.status === "ok") {
+      return {
+        label: "Imported",
+        color: "success",
+        detail: rawStatus || str(result?.message, `Imported ${str(result?.name, "skill")}.`)
+      };
+    }
+    if (skill.preview) {
+      return {
+        label: "Preview ready",
+        color: "info",
+        detail: rawStatus || str(result?.message, "Preview completed. Select and import when ready.")
+      };
+    }
+    return {
+      label: "Pending",
+      color: "default",
+      detail: rawStatus || "Waiting for analysis."
+    };
   };
 
   return (
@@ -1504,7 +2165,7 @@ function BulkImportDialog({
         <Stack spacing={1.25}>
           {error ? <Alert severity="error">{error}</Alert> : null}
           <Typography variant="body2" color="text.secondary">
-            Paste one or more skill URLs (one per line). Use <code>/tree/</code> for GitHub folders, not <code>/blob/</code>.
+            Paste one or more skill URLs (one per line). Then run Analyze to review discovered skills and security before any import.
           </Typography>
           <Alert severity="info" variant="outlined" sx={{ py: 0.25, "& .MuiAlert-message": { fontSize: "0.75rem" } }}>
             Getting 403 errors? GitHub rate-limits unauthenticated requests. Go to Settings &gt; Integrations &gt; GitHub and add a Personal Access Token for higher limits.
@@ -1521,7 +2182,12 @@ https://raw.githubusercontent.com/org/repo/main/skills/my-skill/SKILL.md`}
             maxRows={8}
             label="Import URLs"
             value={urlsText}
-            onChange={(e) => setUrlsText(e.target.value)}
+            onChange={(e) => {
+              setUrlsText(e.target.value);
+              setItems([]);
+              setAnalysisDone(false);
+              setError(null);
+            }}
             placeholder={"https://github.com/openclaw/skills/tree/main/skills"}
           />
           <TextField
@@ -1535,16 +2201,140 @@ https://raw.githubusercontent.com/org/repo/main/skills/my-skill/SKILL.md`}
             control={<Switch checked={force} onChange={(e) => setForce(e.target.checked)} />}
             label="Override warnings (import anyway)"
           />
+          {analysisDone ? (
+            <Typography variant="caption" color="text.secondary">
+              Selected for import: {selectedSkillCount} skill{selectedSkillCount === 1 ? "" : "s"}.
+            </Typography>
+          ) : null}
+          {!force && riskySelectedCount > 0 ? (
+            <Alert severity="warning">
+              {riskySelectedCount} selected skill{riskySelectedCount === 1 ? "" : "s"} exceed the risk threshold ({IMPORT_SECURITY_FORCE_RISK_THRESHOLD}/10) or are blocked. Enable override or deselect those entries.
+            </Alert>
+          ) : null}
           {items.length > 0 ? (
-            <Stack spacing={0.5}>
+            <Stack spacing={1}>
               {items.map((it) => (
-                <Box key={it.url} className="console-line">
-                  <Typography variant="body2" noWrap title={it.url}>
-                    {it.url}
-                  </Typography>
-                  <Typography variant="caption" color={it.status?.startsWith("Error") ? "error" : "text.secondary"}>
+                <Box key={it.url} className="bulk-import-source-card">
+                  <Stack direction="row" spacing={1} alignItems="flex-start" className="bulk-import-source-header">
+                    <Checkbox
+                      size="small"
+                      checked={it.selected}
+                      onChange={(event) => {
+                        const checked = event.target.checked;
+                        setItems((prev) =>
+                          prev.map((item) => (item.url === it.url ? { ...item, selected: checked } : item))
+                        );
+                      }}
+                      disabled={analyzing || importing}
+                    />
+                    <Box sx={{ flex: 1, minWidth: 0 }}>
+                      <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 0.25 }}>
+                        Source URL
+                      </Typography>
+                      <Typography variant="body2" className="bulk-import-source-url">
+                        {it.url}
+                      </Typography>
+                    </Box>
+                  </Stack>
+                  <Typography
+                    variant="caption"
+                    color={it.status?.startsWith("Error") ? "error" : "text.secondary"}
+                    sx={{ display: "block", mt: 0.5 }}
+                  >
                     {it.status || "Pending"}
                   </Typography>
+
+                  {it.analyzed && it.discovered.length > 0 ? (
+                    <TableContainer className="table-shell bulk-import-table-shell" sx={{ mt: 1 }}>
+                      <Table size="small" className="bulk-import-table">
+                        <TableHead>
+                          <TableRow>
+                            <TableCell padding="checkbox" className="bulk-import-col-select">Import</TableCell>
+                            <TableCell className="bulk-import-col-skill">Skill</TableCell>
+                            <TableCell className="bulk-import-col-source">Skill URL</TableCell>
+                            <TableCell className="bulk-import-col-risk">Risk</TableCell>
+                            <TableCell className="bulk-import-col-security">Security</TableCell>
+                            <TableCell className="bulk-import-col-findings">Findings</TableCell>
+                          </TableRow>
+                        </TableHead>
+                        <TableBody>
+                          {it.discovered.map((skill) => {
+                            const result = skill.importResult || skill.preview;
+                            const risk = computeImportRiskSummary(result?.security);
+                            const findingsCount = risk.totalFindings;
+                            const blocked = toBool(result?.security?.blocked) || result?.status === "blocked";
+                            const threatRaw = str(result?.security?.threat_level, "").trim().toLowerCase();
+                            const threatLabel = threatRaw ? titleCaseWords(threatRaw) : "Unknown";
+                            const threatColor =
+                              threatRaw === "malicious"
+                                ? "error"
+                                : threatRaw === "suspicious" || threatRaw === "elevated"
+                                ? "warning"
+                                : threatRaw
+                                ? "success"
+                                : "default";
+                            const securityLabel = blocked ? "Blocked" : risk.band === "secure" ? "Clean" : risk.bandLabel;
+                            const securityColor = blocked ? "error" : risk.chipColor;
+                            const statusMeta = buildBulkSkillStatus(skill);
+                            const statusDetail =
+                              compactStatusToken(statusMeta.label) === compactStatusToken(statusMeta.detail)
+                                ? ""
+                                : statusMeta.detail;
+                            return (
+                              <TableRow key={skill.key}>
+                                <TableCell padding="checkbox">
+                                  <Checkbox
+                                    size="small"
+                                    checked={skill.selected}
+                                    onChange={(event) => {
+                                      const checked = event.target.checked;
+                                      setItems((prev) =>
+                                        prev.map((item) => {
+                                          if (item.url !== it.url) return item;
+                                          return {
+                                            ...item,
+                                            discovered: item.discovered.map((entry) =>
+                                              entry.key === skill.key ? { ...entry, selected: checked } : entry
+                                            )
+                                          };
+                                        })
+                                      );
+                                    }}
+                                    disabled={!it.selected || analyzing || importing}
+                                  />
+                                </TableCell>
+                                <TableCell>
+                                  <Typography variant="body2" className="bulk-import-wrap">
+                                    {skill.name}
+                                  </Typography>
+                                </TableCell>
+                                <TableCell>
+                                  <Typography variant="caption" color="text.secondary" className="bulk-import-wrap">
+                                    {skill.url}
+                                  </Typography>
+                                </TableCell>
+                                <TableCell>
+                                  <Typography variant="caption" sx={{ color: risk.chipColor === "success" ? "rgba(15,240,179,0.8)" : risk.chipColor === "error" ? "#ff5f57" : risk.chipColor === "warning" ? "#febc2e" : "rgba(180,220,200,0.6)" }}>
+                                    {risk.score10.toFixed(1)}/10 · {risk.bandLabel}
+                                  </Typography>
+                                </TableCell>
+                                <TableCell>
+                                  <Typography variant="caption" sx={{ color: threatColor === "success" ? "rgba(15,240,179,0.8)" : threatColor === "error" ? "#ff5f57" : threatColor === "warning" ? "#febc2e" : "rgba(180,220,200,0.6)" }}>
+                                    {threatLabel} · {securityLabel}
+                                  </Typography>
+                                </TableCell>
+                                <TableCell>
+                                  <Typography variant="caption" color={findingsCount > 0 ? "text.primary" : "text.secondary"}>
+                                    {findingsCount === 0 ? "None" : `${findingsCount}${risk.contextualFindings > 0 ? ` (${risk.contextualFindings} contextual)` : ""}`}
+                                  </Typography>
+                                </TableCell>
+                              </TableRow>
+                            );
+                          })}
+                        </TableBody>
+                      </Table>
+                    </TableContainer>
+                  ) : null}
                 </Box>
               ))}
             </Stack>
@@ -1554,11 +2344,24 @@ https://raw.githubusercontent.com/org/repo/main/skills/my-skill/SKILL.md`}
       <DialogActions>
         <Button onClick={onClose}>Close</Button>
         <Button
+          variant="outlined"
+          disabled={importing || analyzing || !urlsText.trim()}
+          onClick={handleAnalyzeSelected}
+        >
+          {analyzing ? "Analyzing..." : "Analyze"}
+        </Button>
+        <Button
           variant="contained"
-          disabled={importing || loading || !urlsText.trim()}
+          disabled={
+            importing ||
+            analyzing ||
+            !analysisDone ||
+            selectedSkillCount === 0 ||
+            (!force && riskySelectedCount > 0)
+          }
           onClick={handleImportSelected}
         >
-          {importing ? "Importing..." : "Import"}
+          {importing ? "Importing..." : `Import Selected (${selectedSkillCount})`}
         </Button>
       </DialogActions>
     </Dialog>
@@ -1646,6 +2449,30 @@ function ImportUrlDialog({
 
       setPreviewReady(false);
       setImportCommitted(true);
+
+      // Auto-save secrets if the user pre-filled them during preview
+      const requiredEnvs = result.secrets?.required_env || [];
+      if (result.name && requiredEnvs.length > 0) {
+        const filledSecrets = requiredEnvs
+          .map((env) => {
+            const d = secretDrafts[env] || { storeAs: env, value: "", useBuiltin: false };
+            if (d.useBuiltin) return { env, store_as: "builtin" as const };
+            const storeAs = (d.storeAs || env).trim();
+            const value = (d.value || "").trim();
+            return value ? { env, store_as: storeAs, value } : null;
+          })
+          .filter(Boolean);
+        if (filledSecrets.length > 0) {
+          try {
+            const secretsOut = await api.setSkillSecrets(result.name, { secrets: filledSecrets as { env: string; store_as: string; value?: string }[] });
+            if ((secretsOut.missing_env || []).length === 0) {
+              setSecretsSaved(true);
+              setInfo(`Imported ${result.name} — secrets saved automatically.`);
+            }
+          } catch { /* silent — user can still save manually */ }
+        }
+      }
+
       const importedChildren = Array.isArray(result.imported) ? result.imported : [];
       if (importedChildren.length > 0) {
         for (const child of importedChildren) {
@@ -1765,128 +2592,97 @@ function ImportUrlDialog({
             control={<Switch checked={force} onChange={(event) => setForce(event.target.checked)} />}
             label="Override all warnings (import anyway)"
           />
-          {importRequiresForce ? (
-            <Alert severity="warning">
-              Risk score {importRisk.score10.toFixed(1)}/10 is in the risky range (threshold {IMPORT_SECURITY_FORCE_RISK_THRESHOLD}/10). Enable override to continue.
-            </Alert>
-          ) : null}
-          {importResult?.security?.warnings?.length ? (
-            <Alert severity={importResult.security.blocked ? "warning" : "info"}>
-              {importResult.security.warnings.join("\n")}
-            </Alert>
-          ) : null}
-          {importResult?.security ? (
-            <Box sx={{ mt: 1 }}>
-              <Typography variant="subtitle2" mb={1}>
-                Security scan
-              </Typography>
-              <Stack spacing={1}>
-                <Stack direction="row" spacing={1} alignItems="center" useFlexGap flexWrap="wrap">
-                  <Chip
-                    size="small"
-                    color={importRisk.chipColor}
-                    label={`Risk ${importRisk.score10.toFixed(1)}/10`}
-                  />
-                  <Chip size="small" variant="outlined" color={importRisk.chipColor} label={importRisk.bandLabel} />
-                  <Typography variant="caption" color="text.secondary">
-                    Scale: &lt;5 secure, 5-8 needs review, 8-10 risky
-                  </Typography>
-                </Stack>
-                <Typography variant="body2" color="text.secondary">
-                  Threat level: {str(importResult.security.threat_level, "-")} | Blocked: {boolText(importResult.security.blocked)} | Raw severity: {importRisk.rawSeverity}
+          {importResult?.security ? (() => {
+            const riskColor = importRisk.score10 >= 8 ? "#ff5f57" : importRisk.score10 >= 5 ? "#febc2e" : "#0ff0b3";
+            const riskBg = importRisk.score10 >= 8 ? "rgba(255,95,87,0.06)" : importRisk.score10 >= 5 ? "rgba(254,188,46,0.06)" : "rgba(15,240,179,0.04)";
+            const riskEmoji = importRisk.score10 >= 8 ? "High Risk" : importRisk.score10 >= 5 ? "Needs Review" : "Safe";
+            const categoryLabels: Record<string, string> = {
+              NetworkAccess: "Network access",
+              CredentialPattern: "Credential pattern",
+              EnvironmentAccess: "Environment variable",
+              FileSystem: "File system access",
+              CodeExecution: "Code execution",
+              DataExfiltration: "Data exfiltration",
+            };
+            return (
+            <Box sx={{ mt: 1, border: `1px solid ${riskColor}22`, borderRadius: "10px", background: riskBg, overflow: "hidden" }}>
+              <Box sx={{ px: 1.5, py: 1, display: "flex", alignItems: "center", gap: 1, borderBottom: `1px solid ${riskColor}15` }}>
+                <Box sx={{ width: 8, height: 8, borderRadius: "50%", background: riskColor, boxShadow: `0 0 6px ${riskColor}60`, flexShrink: 0 }} />
+                <Typography variant="subtitle2" sx={{ fontSize: "12px", fontWeight: 700, color: riskColor }}>
+                  {riskEmoji} — {importRisk.score10.toFixed(1)}/10
                 </Typography>
-                {importRisk.totalFindings > 0 ? (
-                  <Typography variant="caption" color="text.secondary">
-                    Signals: {importRisk.totalFindings} total, {importRisk.contextualFindings} contextual (common for integration templates: API key refs, env lookups, curl/wget).
-                  </Typography>
+                <Box sx={{ flex: 1 }} />
+                {securityBlocked ? (
+                  <Typography variant="caption" sx={{ color: "#ff5f57", fontWeight: 600 }}>BLOCKED</Typography>
+                ) : importRequiresForce ? (
+                  <Typography variant="caption" sx={{ color: "#febc2e", fontWeight: 600 }}>OVERRIDE REQUIRED</Typography>
                 ) : null}
+              </Box>
+              <Box sx={{ px: 1.5, py: 1 }}>
+                <Typography variant="caption" sx={{ color: "rgba(200,230,210,0.55)", display: "block", mb: 0.5 }}>
+                  {(() => {
+                    const raw = str(importResult.security.threat_level, "unknown");
+                    const ctxRatio = importRisk.totalFindings > 0 ? importRisk.contextualFindings / importRisk.totalFindings : 0;
+                    const display = raw.toLowerCase() === "malicious" && ctxRatio >= 0.8
+                      ? "Standard integration patterns"
+                      : `Threat level: ${raw}`;
+                    return display;
+                  })()}
+                  {importRisk.totalFindings > 0 ? ` · ${importRisk.totalFindings} signal${importRisk.totalFindings === 1 ? "" : "s"} found` : " · No signals"}
+                  {importRisk.contextualFindings > 0 ? ` (${importRisk.contextualFindings} likely safe — common in integrations)` : ""}
+                </Typography>
                 {Array.isArray(importResult.security.findings) && importResult.security.findings.length > 0 ? (
-                  <TableContainer className="table-shell">
-                    <Table size="small">
-                      <TableHead>
-                        <TableRow>
-                          <TableCell>Severity</TableCell>
-                          <TableCell>Category</TableCell>
-                          <TableCell>Line</TableCell>
-                          <TableCell>Description</TableCell>
-                        </TableRow>
-                      </TableHead>
-                      <TableBody>
-                        {(importResult.security.findings as unknown[]).slice(0, 30).map((rawFinding, idx) => {
-                          const f = asRecord(rawFinding);
-                          return (
-                            <TableRow key={`${idx}-${str(f.category, "")}`}>
-                              <TableCell sx={{ whiteSpace: "nowrap" }}>{str(f.severity, "-")}</TableCell>
-                              <TableCell sx={{ whiteSpace: "nowrap" }}>{str(f.category, "-")}</TableCell>
-                              <TableCell sx={{ whiteSpace: "nowrap" }}>{num(f.line, -1) >= 0 ? num(f.line) : "-"}</TableCell>
-                              <TableCell>
-                                <Typography variant="body2">{str(f.description, "-")}</Typography>
-                                {str(f.matched_text, "").trim() ? (
-                                  <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
-                                    Match: {str(f.matched_text).slice(0, 120)}
-                                  </Typography>
-                                ) : null}
-                              </TableCell>
-                            </TableRow>
-                          );
-                        })}
-                      </TableBody>
-                    </Table>
-                  </TableContainer>
-                ) : (
-                  <Typography variant="body2" color="text.secondary">
-                    No findings.
-                  </Typography>
-                )}
-              </Stack>
-            </Box>
-          ) : null}
-          {Array.isArray(importResult?.imported) && importResult.imported.length > 0 ? (
-            <Box sx={{ mt: 1 }}>
-              <Typography variant="subtitle2" mb={1}>
-                Per-skill security
-              </Typography>
-              <TableContainer className="table-shell">
-                    <Table size="small">
-                      <TableHead>
-                        <TableRow>
-                          <TableCell>Skill</TableCell>
-                          <TableCell>Status</TableCell>
-                          <TableCell>Risk</TableCell>
-                          <TableCell>Threat</TableCell>
-                          <TableCell>Blocked</TableCell>
-                          <TableCell>Warnings</TableCell>
-                          <TableCell>Findings</TableCell>
-                        </TableRow>
-                  </TableHead>
-                  <TableBody>
-                    {importResult.imported.map((entry, idx) => {
-                      const child = entry?.result;
-                      const sec = child?.security;
-                      const warningsCount = Array.isArray(sec?.warnings) ? sec?.warnings.length : 0;
-                      const findingsCount = Array.isArray(sec?.findings) ? sec?.findings.length : 0;
-                      const childRisk = computeImportRiskSummary(sec);
+                  <Stack spacing={0.3} sx={{ mt: 0.75 }}>
+                    {(importResult.security.findings as unknown[]).slice(0, 15).map((rawFinding, idx) => {
+                      const f = asRecord(rawFinding);
+                      const sev = num(f.severity, 0);
+                      const sevColor = sev >= 6 ? "#ff5f57" : sev >= 3 ? "#febc2e" : "#0ff0b3";
+                      const sevLabel = sev >= 6 ? "HIGH" : sev >= 3 ? "MED" : "LOW";
+                      const cat = str(f.category, "");
+                      const humanCat = categoryLabels[cat] || cat.replace(/([A-Z])/g, " $1").trim().toLowerCase();
                       return (
-                        <TableRow key={`${entry?.url || child?.name || idx}-${idx}`}>
-                          <TableCell sx={{ wordBreak: "break-word" }}>{child?.name || "-"}</TableCell>
-                          <TableCell>{child?.status || "-"}</TableCell>
-                          <TableCell sx={{ whiteSpace: "nowrap" }}>
-                            <Chip
-                              size="small"
-                              color={childRisk.chipColor}
-                              label={`${childRisk.score10.toFixed(1)}/10`}
-                            />
-                          </TableCell>
-                          <TableCell>{str(sec?.threat_level, "-")}</TableCell>
-                          <TableCell>{boolText(sec?.blocked)}</TableCell>
-                          <TableCell>{warningsCount}</TableCell>
-                          <TableCell>{findingsCount}</TableCell>
-                        </TableRow>
+                        <Box key={`${idx}-${cat}`} sx={{ display: "flex", gap: 1, py: 0.35, alignItems: "baseline" }}>
+                          <Typography sx={{ fontSize: "9.5px", fontWeight: 700, color: sevColor, minWidth: "30px", flexShrink: 0 }}>{sevLabel}</Typography>
+                          <Typography sx={{ fontSize: "10.5px", color: "rgba(200,230,210,0.7)", flex: 1 }}>
+                            {humanCat}{num(f.line, -1) >= 0 ? ` at line ${num(f.line)}` : ""}
+                            {str(f.matched_text, "").trim() ? <span style={{ color: "rgba(130,170,160,0.4)" }}>{` — ${str(f.matched_text).slice(0, 80)}`}</span> : null}
+                          </Typography>
+                        </Box>
                       );
                     })}
-                  </TableBody>
-                </Table>
-              </TableContainer>
+                  </Stack>
+                ) : (
+                  <Typography variant="caption" sx={{ color: "#0ff0b3" }}>
+                    No signals detected — looks safe.
+                  </Typography>
+                )}
+              </Box>
+            </Box>
+            );
+          })() : null}
+          {Array.isArray(importResult?.imported) && importResult.imported.length > 0 ? (
+            <Box className="term-shell" sx={{ mt: 1, p: 0 }}>
+              <Box sx={{ px: 1.5, py: 0.75, borderBottom: "1px solid rgba(0,255,170,0.06)" }}>
+                <Typography sx={{ fontFamily: "inherit", fontSize: "10.5px", fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: "rgba(0,255,170,0.4)" }}>
+                  Per-Skill Analysis
+                </Typography>
+              </Box>
+              <Stack spacing={0} sx={{ px: 1.5, py: 0.5 }}>
+                {importResult.imported.map((entry, idx) => {
+                  const child = entry?.result;
+                  const sec = child?.security;
+                  const findingsCount = Array.isArray(sec?.findings) ? sec?.findings.length : 0;
+                  const childRisk = computeImportRiskSummary(sec);
+                  const riskColor = childRisk.score10 >= 8 ? "#ff5f57" : childRisk.score10 >= 5 ? "#febc2e" : "rgba(15,240,179,0.7)";
+                  return (
+                    <Box key={`${entry?.url || child?.name || idx}-${idx}`} sx={{ display: "flex", gap: 1.5, py: 0.4, borderBottom: "1px solid rgba(0,255,170,0.03)", alignItems: "baseline" }}>
+                      <Typography sx={{ fontFamily: "inherit", fontSize: "10.5px", color: "rgba(200,230,210,0.8)", minWidth: "120px", flexShrink: 0 }}>{child?.name || "-"}</Typography>
+                      <Typography sx={{ fontFamily: "inherit", fontSize: "10px", color: riskColor, fontWeight: 600, minWidth: "55px", flexShrink: 0 }}>{childRisk.score10.toFixed(1)}/10</Typography>
+                      <Typography sx={{ fontFamily: "inherit", fontSize: "10px", color: "rgba(180,220,200,0.5)", flex: 1 }}>{str(sec?.threat_level, "-")} · {findingsCount} signals</Typography>
+                    </Box>
+                  );
+                })}
+              </Stack>
               <Stack spacing={0.75} sx={{ mt: 1 }}>
                 {importResult.imported.map((entry, idx) => {
                   const child = entry?.result;
@@ -1934,9 +2730,11 @@ function ImportUrlDialog({
                 Required credentials
               </Typography>
               {!importCommitted ? (
-                <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1 }}>
-                  Credentials can be edited now, but are saved only after Import Template completes.
-                </Typography>
+                <Box sx={{ mb: 1, p: 1, borderRadius: "6px", background: "rgba(254,188,46,0.06)", border: "1px solid rgba(254,188,46,0.15)" }}>
+                  <Typography variant="caption" sx={{ color: "#febc2e", fontWeight: 600 }}>
+                    Fill in credentials below, then click "Import Template" to save them.
+                  </Typography>
+                </Box>
               ) : null}
               <Stack spacing={1}>
                 {(importResult?.secrets?.required_env || []).map((env) => {
@@ -1992,7 +2790,7 @@ function ImportUrlDialog({
                   disabled={savingSecrets || secretsSaved || !importCommitted}
                   onClick={handleSaveSecrets}
                 >
-                  {savingSecrets ? "Saving..." : "Save secrets"}
+                  {savingSecrets ? "Saving..." : secretsSaved ? "Secrets saved" : !importCommitted ? "Import template first" : "Save secrets"}
                 </Button>
               </Stack>
             </Box>
@@ -2242,8 +3040,9 @@ function RowOpsMenu({ actions, ariaLabel = "Row actions" }: { actions: RowMenuAc
   );
 }
 
-function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
+function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive: boolean }) {
   const queryClient = useQueryClient();
+  const chatAutoRefresh = autoRefresh && isActive;
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [draftProjectId, setDraftProjectId] = useState("");
   const [prompt, setPrompt] = useState("");
@@ -2275,39 +3074,69 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
   const [lastRunSteps, setLastRunSteps] = useState<JsonRecord[]>([]);
   const [conversationMenuAnchor, setConversationMenuAnchor] = useState<HTMLElement | null>(null);
   const [conversationMenuTarget, setConversationMenuTarget] = useState<JsonRecord | null>(null);
+  const [pendingRunSnapshot, setPendingRunSnapshot] = useState<ChatPendingRunSnapshot | null>(
+    () => loadChatPendingRunSnapshot()
+  );
+  const chatBackgroundRefresh = isStreaming || pendingRunSnapshot !== null;
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const dragDepthRef = useRef(0);
   const threadRef = useRef<HTMLDivElement | null>(null);
   const streamLockRef = useRef(false);
   const recentSendRef = useRef<{ fingerprint: string; at: number } | null>(null);
   const streamingStepsRef = useRef<JsonRecord[]>([]);
+  const streamingStepKeySeqRef = useRef(1);
   const workspaceActivityRef = useRef<HTMLDivElement | null>(null);
 
   const convQ = useQuery({
     queryKey: ["chat-conversations"],
     queryFn: () => api.rawGet("/conversations?limit=30"),
-    refetchInterval: autoRefresh ? REFRESH_MS : false
+    refetchInterval: chatAutoRefresh || chatBackgroundRefresh ? REFRESH_MS : false,
+    refetchIntervalInBackground: chatBackgroundRefresh
   });
   const projectsQ = useQuery({
     queryKey: ["chat-projects"],
     queryFn: () => api.rawGet("/projects"),
-    refetchInterval: autoRefresh ? REFRESH_MS : false
-  });
-
-  const messagesQ = useQuery({
-    queryKey: ["chat-messages", conversationId],
-    queryFn: () => api.rawGet(`/conversations/${encodeURIComponent(conversationId || "")}/messages?limit=100`),
-    enabled: !!conversationId,
-    refetchInterval: autoRefresh ? REFRESH_MS : false
+    refetchInterval: chatAutoRefresh || chatBackgroundRefresh ? REFRESH_MS : false,
+    refetchIntervalInBackground: chatBackgroundRefresh
   });
 
   const conversations = pickRecords(convQ.data, "conversations");
   const projects = pickRecords(projectsQ.data, "projects");
-  const messages = conversationId ? pickRecords(messagesQ.data, "messages") : [];
   const selectedConversation = useMemo(
     () => conversations.find((conv) => str(conv.id, "") === conversationId) ?? null,
     [conversations, conversationId]
   );
+  const selectedMessageCount = num(selectedConversation?.message_count, 0);
+  const selectedConversationUpdatedAtMs = Date.parse(str(selectedConversation?.updated_at, ""));
+  const recentlyTouchedEmptyConversation =
+    selectedMessageCount === 0 &&
+    Number.isFinite(selectedConversationUpdatedAtMs) &&
+    Date.now() - selectedConversationUpdatedAtMs < 10 * 60 * 1000;
+  const hasPendingSnapshotForConversation =
+    !!conversationId && pendingRunSnapshot?.conversationId === conversationId;
+  const shouldPollMessages =
+    !!conversationId &&
+    (isStreaming ||
+      hasPendingSnapshotForConversation ||
+      recentlyTouchedEmptyConversation);
+  const messagesQ = useQuery({
+    queryKey: ["chat-messages", conversationId],
+    queryFn: () => api.rawGet(`/conversations/${encodeURIComponent(conversationId || "")}/messages?limit=100`),
+    enabled: !!conversationId && (isActive || shouldPollMessages),
+    refetchInterval: shouldPollMessages ? 2000 : chatAutoRefresh ? REFRESH_MS : false,
+    refetchIntervalInBackground: shouldPollMessages
+  });
+
+  const messages = conversationId ? pickRecords(messagesQ.data, "messages") : [];
+  const latestAssistantTraceId = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const candidate = messages[i];
+      if (str(candidate.role, "").toLowerCase() !== "assistant") continue;
+      const traceId = str(candidate.trace_id, "").trim();
+      if (traceId) return traceId;
+    }
+    return "";
+  }, [messages]);
   const projectNameById = useMemo(() => {
     const map = new Map<string, string>();
     for (const project of projects) {
@@ -2319,6 +3148,150 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
   }, [projects]);
   const selectedConversationProjectId = str(selectedConversation?.project_id, "").trim();
   const activeProjectId = selectedConversationProjectId || draftProjectId;
+
+  useEffect(() => {
+    if (!pendingRunSnapshot) {
+      storeChatPendingRunSnapshot(null);
+      return;
+    }
+    const snapshotSteps = streamingSteps
+      .slice(-CHAT_PENDING_STREAM_STEPS_MAX)
+      .map((step) => {
+        const compacted: JsonRecord = {};
+        const icon = str(step.icon, "").trim();
+        const title = str(step.title, "").trim();
+        const detail = str(step.detail, "").trim();
+        const stepType = str(step.step_type, "").trim();
+        const data = compactUnknown(step.data, 800);
+        if (icon) compacted.icon = icon.slice(0, 64);
+        if (title) compacted.title = title.slice(0, 220);
+        if (detail) compacted.detail = detail.slice(0, 900);
+        if (stepType) compacted.step_type = stepType.slice(0, 80);
+        if (data) compacted.data = data;
+        return compacted;
+      });
+    storeChatPendingRunSnapshot({
+      ...pendingRunSnapshot,
+      message: pendingUserMessage ?? pendingRunSnapshot.message,
+      projectId: activeProjectId || pendingRunSnapshot.projectId || "",
+      streamingResponse: streamingResponse.slice(0, CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS),
+      streamingSteps: snapshotSteps,
+      failedUserMessage: failedUserMessage ?? ""
+    });
+  }, [
+    pendingRunSnapshot,
+    pendingUserMessage,
+    failedUserMessage,
+    streamingResponse,
+    streamingSteps,
+    activeProjectId
+  ]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !conversationId) return;
+    try {
+      window.sessionStorage.setItem(CHAT_LAST_CONVERSATION_STORAGE_KEY, conversationId);
+    } catch {
+      // Ignore storage failures.
+    }
+  }, [conversationId]);
+
+  useEffect(() => {
+    const pending = pendingRunSnapshot ?? loadChatPendingRunSnapshot();
+    if (
+      pending &&
+      conversations.some((conv) => str(conv.id, "") === pending.conversationId)
+    ) {
+      const shouldSelectPendingConversation = !conversationId;
+      const viewingPendingConversation = conversationId === pending.conversationId;
+      if (shouldSelectPendingConversation) {
+        setConversationId(pending.conversationId);
+      }
+      if (shouldSelectPendingConversation || viewingPendingConversation) {
+        if (pending.message && !pendingUserMessage) {
+          setPendingUserMessage(pending.message);
+        }
+        if (pending.failedUserMessage && !failedUserMessage) {
+          setFailedUserMessage(pending.failedUserMessage);
+        }
+        if (pending.streamingResponse && !streamingResponse) {
+          setStreamingResponse(pending.streamingResponse);
+        }
+        if (
+          Array.isArray(pending.streamingSteps) &&
+          pending.streamingSteps.length > 0 &&
+          streamingStepsRef.current.length === 0
+        ) {
+          setStreamingSteps(pending.streamingSteps);
+          streamingStepsRef.current = pending.streamingSteps;
+        }
+        return;
+      }
+    }
+
+    if (conversationId || conversations.length === 0 || typeof window === "undefined") return;
+    try {
+      const lastSelected = window.sessionStorage
+        .getItem(CHAT_LAST_CONVERSATION_STORAGE_KEY)
+        ?.trim();
+      if (
+        lastSelected &&
+        conversations.some((conv) => str(conv.id, "") === lastSelected)
+      ) {
+        setConversationId(lastSelected);
+      }
+    } catch {
+      // Ignore storage failures.
+    }
+  }, [
+    conversationId,
+    conversations,
+    pendingRunSnapshot,
+    pendingUserMessage,
+    failedUserMessage,
+    streamingResponse,
+    streamingSteps.length
+  ]);
+
+  useEffect(() => {
+    if (!pendingRunSnapshot) return;
+    if (conversationId !== pendingRunSnapshot.conversationId) return;
+    const latestMessage = messages[messages.length - 1];
+    if (str(latestMessage?.role, "").toLowerCase() !== "assistant") return;
+    const latestTimestampMs = Date.parse(str(latestMessage?.timestamp, ""));
+    if (
+      Number.isFinite(latestTimestampMs) &&
+      latestTimestampMs + 1000 < pendingRunSnapshot.startedAt
+    ) {
+      return;
+    }
+    const preservedSteps =
+      streamingStepsRef.current.length > 0
+        ? streamingStepsRef.current.slice(-64)
+        : streamingSteps.slice(-64);
+    if (preservedSteps.length > 0) {
+      setLastRunSteps(preservedSteps);
+    }
+    storeChatPendingRunSnapshot(null);
+    setPendingRunSnapshot(null);
+    setPendingUserMessage(null);
+    setStreamingResponse("");
+    setStreamingSteps([]);
+    streamingStepsRef.current = [];
+  }, [pendingRunSnapshot, conversationId, messages, streamingSteps]);
+
+  useEffect(() => {
+    if (!latestAssistantTraceId || isStreaming || hasPendingSnapshotForConversation) return;
+    if (traceStepsById[latestAssistantTraceId] || traceLoadingById[latestAssistantTraceId] || traceErrorById[latestAssistantTraceId]) return;
+    void loadTraceForId(latestAssistantTraceId);
+  }, [
+    latestAssistantTraceId,
+    isStreaming,
+    hasPendingSnapshotForConversation,
+    traceStepsById,
+    traceLoadingById,
+    traceErrorById
+  ]);
 
   const toHumanToolName = (name: string): string => {
     const normalized = (name || "").trim().toLowerCase();
@@ -2388,6 +3361,9 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
     if (/running in sandboxed environment/i.test(text)) return "Running this action in a safe workspace.";
     if (/install(ing)? dependencies|npm install|pnpm install|yarn install|cargo fetch/i.test(text)) {
       return "Installing dependencies.";
+    }
+    if (isSafetyPolicyBlockedText(text)) {
+      return "Blocked by safety policy. The agent needs a different approach.";
     }
     if (/approval required|needs approval|awaiting approval|requires approval/i.test(text)) {
       return "Waiting for your approval/input.";
@@ -2474,17 +3450,23 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
     }
     if (t.startsWith("tool finished:")) {
       const rawName = title.split(":").slice(1).join(":").trim();
-      if (detail && detail.length > 2) {
+      const summarized = summarizeActivityDetail(detail);
+      if (isSafetyPolicyBlockedText(detail) || isSafetyPolicyBlockedText(summarized)) {
         return {
-          label: detail,
-          detail: "",
-          kind: "Done",
-          tone: "tone-success"
+          label: `${toHumanToolName(rawName)} blocked`,
+          detail: "Blocked by safety policy. The agent needs a different approach.",
+          kind: "Issue",
+          tone: "tone-error"
         };
       }
       return {
         label: `${toHumanToolName(rawName)} completed`,
-        detail: "",
+        detail:
+          summarized && !isHumanReadableStatus(summarized)
+            ? summarized
+            : summarized && summarized !== `${toHumanToolName(rawName)} completed`
+              ? summarized
+              : "",
         kind: "Done",
         tone: "tone-success"
       };
@@ -2529,6 +3511,50 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
     return { label: fallbackLabel, detail };
   };
 
+  const isHeartbeatStreamingStep = (value: JsonRecord): boolean => {
+    const title = normalizeStatusText(str(value.title, ""));
+    const icon = normalizeStatusText(str(value.icon, ""));
+    const detail = normalizeStatusText(str(value.detail, ""));
+    const stepType = normalizeStatusText(str(value.step_type, str(value.type, "")));
+    return (
+      title.includes("still working") ||
+      icon === "wait" ||
+      stepType.includes("still work") ||
+      stepType.includes("heartbeat") ||
+      (stepType.includes("thinking") &&
+        detail.includes("no new output") &&
+        detail.includes("idle"))
+    );
+  };
+
+  const streamingStepDedupKey = (value: JsonRecord): string => {
+    const stepType = normalizeStatusText(str(value.step_type, str(value.type, "step")));
+    const title = normalizeStatusText(str(value.title, ""));
+    const detail = normalizeStatusText(str(value.detail, ""));
+    return `${stepType}|${title}|${detail}`;
+  };
+
+  const streamingStepDisplayKey = (value: JsonRecord): string => {
+    const title = normalizeStatusText(str(value.title, ""));
+    const detail = normalizeStatusText(str(value.detail, ""));
+    return `${title}|${detail}`;
+  };
+
+  const getStreamingStepStableKey = (value: JsonRecord): string =>
+    str(value.__streamKey, str(value.id, ""));
+
+  const attachStreamingStepStableKey = (
+    value: JsonRecord,
+    preferredKey?: string
+  ): JsonRecord => {
+    const existing = getStreamingStepStableKey(value);
+    if (existing) return value;
+    return {
+      ...value,
+      __streamKey: preferredKey || `stream-step-${streamingStepKeySeqRef.current++}`
+    };
+  };
+
   const buildStepCard = (step: JsonRecord, index: number) => {
     const stepType = str(step.step_type, str(step.type, "step")).toLowerCase();
     const title = str(step.title, "").trim();
@@ -2536,7 +3562,8 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
     const rawDetail = fullDetail.slice(0, 900);
     const human = humanizeStep(title, rawDetail, stepType);
     const humanDetailRaw = str(human.detail, "").trim();
-    let detail = humanDetailRaw ? simplifyConsoleDetail(humanDetailRaw) : "";
+    const summarizedDetail = humanDetailRaw ? summarizeActivityDetail(humanDetailRaw) : "";
+    let detail = summarizedDetail ? simplifyConsoleDetail(summarizedDetail) : "";
     const time = str(step.time, "");
     const baseLabel = stepType.replace(/[_-]+/g, " ").trim() || "step";
     const rawLabel = human.label || title || baseLabel;
@@ -2551,8 +3578,11 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
     } else if (stepType.includes("tool_progress")) {
       tone = "tone-action";
       kind = "Running";
-    } else if (stepType.includes("tool_result") || stepType.includes("result") || stepType.includes("complete")) {
+    } else if (stepType.includes("tool_result") || stepType.includes("result") || stepType.includes("complete") || stepType.includes("success")) {
       tone = "tone-success";
+      kind = "Done";
+    } else if (stepType === "info") {
+      tone = "tone-neutral";
       kind = "Done";
     } else if (stepType.includes("error") || stepType.includes("fail")) {
       tone = "tone-error";
@@ -2576,9 +3606,13 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
       tone = "tone-error";
       kind = "Issue";
     }
+    if (isSafetyPolicyBlockedText(`${label} ${detail}`)) {
+      tone = "tone-error";
+      kind = "Issue";
+    }
     if (human.tone) tone = human.tone;
     if (human.kind) kind = human.kind;
-    let detailFull = humanDetailRaw ? (fullDetail || rawDetail) : "";
+    let detailFull = summarizedDetail;
     if (isRedundantStatusDetail(label, detail)) {
       detail = "";
     }
@@ -2589,26 +3623,68 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
     ) {
       detailFull = "";
     }
+    const stableId = getStreamingStepStableKey(step);
     return {
-      id: `${time || "live"}-${index}-${label}`,
+      id: stableId || `${time || "live"}-${index}-${label}`,
       index,
       tone,
       kind,
       label,
       detail,
       detailFull,
+      rawDetailFull: humanDetailRaw ? (fullDetail || rawDetail) : "",
+      isHeartbeat: isHeartbeatStreamingStep(step),
       time
     };
   };
 
+  const safeBuildStepCard = (step: unknown, index: number) => {
+    const record = asRecord(step);
+    try {
+      return buildStepCard(record, index);
+    } catch {
+      const stepType = str(record.step_type, str(record.type, "step")).toLowerCase();
+      const title = str(record.title, "").trim();
+      const rawDetail = extractStepDetailText(record, 600);
+      const label = title || stepType.replace(/[_-]+/g, " ").trim() || "Activity update";
+      const stableId = getStreamingStepStableKey(record);
+      return {
+        id: stableId || `${str(record.time, "live") || "live"}-${index}-${label}`,
+        index,
+        tone: "tone-neutral",
+        kind: "Update",
+        label,
+        detail: rawDetail ? simplifyConsoleDetail(rawDetail) : "",
+        detailFull: "",
+        rawDetailFull: rawDetail,
+        isHeartbeat: false,
+        time: str(record.time, "")
+      };
+    }
+  };
+
   const streamingTraceCards = useMemo(
-    () => streamingSteps.map((step, idx) => buildStepCard(step, idx)).slice(-24),
+    () => streamingSteps.map((step, idx) => safeBuildStepCard(step, idx)).slice(-24),
     [streamingSteps]
   );
+  const pickPrimaryActivityCard = (
+    cards: Array<ReturnType<typeof buildStepCard>>
+  ): ReturnType<typeof buildStepCard> | null => {
+    if (cards.length === 0) return null;
+    const last = cards[cards.length - 1];
+    if (!last.isHeartbeat) return last;
+    return [...cards].reverse().find((card) => !card.isHeartbeat) || last;
+  };
   const streamingActivity = useMemo(() => {
-    if (streamingTraceCards.length === 0) return "Getting ready to start...";
-    const last = streamingTraceCards[streamingTraceCards.length - 1];
+    const last = pickPrimaryActivityCard(streamingTraceCards);
+    if (!last) return "Getting ready to start...";
     const detail = (last.detail || "").trim();
+    if (last.isHeartbeat) {
+      const stable = [...streamingTraceCards].reverse().find((card) => !card.isHeartbeat);
+      if (stable) return `Working on: ${stable.label}`;
+      if (detail) return detail;
+      return "Still working...";
+    }
     if (detail) return `${last.label}: ${detail}`;
     return `Now: ${last.label}`;
   }, [streamingTraceCards]);
@@ -2618,21 +3694,57 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
     opts?: { loading?: boolean; streaming?: boolean; error?: string }
   ) => {
     if (opts?.error) return "Activity details unavailable.";
-    if (opts?.loading) return "Loading activity...";
-    if (cards.length === 0) return opts?.streaming ? "Waiting for first activity update..." : "No activity yet.";
-    const last = cards[cards.length - 1];
+    if (opts?.loading && cards.length === 0) return "View activity";
+    if (cards.length === 0) return opts?.streaming ? "Waiting for first activity update..." : "View activity";
+    const last = pickPrimaryActivityCard(cards) || cards[cards.length - 1];
+    const count = countMeaningfulActivityCards(cards);
+    return `${count} update${count === 1 ? "" : "s"} | Now: ${last.label}`;
     return `${cards.length} update${cards.length === 1 ? "" : "s"} • Now: ${last.label}`;
+  };
+
+  const traceSummaryFromSteps = (
+    steps: JsonRecord[],
+    opts?: { loading?: boolean; streaming?: boolean; error?: string }
+  ) => {
+    if (opts?.error) return "Activity details unavailable.";
+    if (opts?.loading && steps.length === 0) return "View activity";
+    if (steps.length === 0) return opts?.streaming ? "Waiting for first activity update..." : "View activity";
+    const normalizedSteps = compressActivitySteps(steps);
+    let normalizedPrimaryIndex = normalizedSteps.length - 1;
+    for (let i = normalizedSteps.length - 1; i >= 0; i -= 1) {
+      if (!isHeartbeatStreamingStep(normalizedSteps[i])) {
+        normalizedPrimaryIndex = i;
+        break;
+      }
+    }
+    const normalizedPrimaryCard = safeBuildStepCard(
+      normalizedSteps[normalizedPrimaryIndex],
+      normalizedPrimaryIndex
+    );
+    const normalizedCount =
+      normalizedSteps.filter((step) => !isHeartbeatStreamingStep(step)).length ||
+      normalizedSteps.length;
+    return `${normalizedCount} update${normalizedCount === 1 ? "" : "s"} | Now: ${normalizedPrimaryCard.label}`;
+    let primaryIndex = steps.length - 1;
+    for (let i = steps.length - 1; i >= 0; i -= 1) {
+      if (!isHeartbeatStreamingStep(steps[i])) {
+        primaryIndex = i;
+        break;
+      }
+    }
+    const primaryCard = safeBuildStepCard(steps[primaryIndex], primaryIndex);
+    return `${steps.length} update${steps.length === 1 ? "" : "s"} â€¢ Now: ${primaryCard.label}`;
   };
 
   const parseTraceSteps = (payload: unknown): JsonRecord[] => {
     const rec = asRecord(payload);
     const raw = Array.isArray(rec.steps) ? rec.steps : Array.isArray(rec.trace) ? rec.trace : [];
-    return raw.filter((x) => x && typeof x === "object") as JsonRecord[];
+    return compressActivitySteps(raw.filter((x) => x && typeof x === "object") as JsonRecord[]);
   };
 
   const loadTraceForId = async (traceId: string) => {
     if (!traceId) return;
-    if (traceStepsById[traceId] || traceLoadingById[traceId]) return;
+    if (traceStepsById[traceId] || traceLoadingById[traceId] || traceErrorById[traceId]) return;
     setTraceLoadingById((prev) => ({ ...prev, [traceId]: true }));
     setTraceErrorById((prev) => ({ ...prev, [traceId]: "" }));
     try {
@@ -2658,6 +3770,15 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
   };
 
   const startNewConversation = () => {
+    storeChatPendingRunSnapshot(null);
+    setPendingRunSnapshot(null);
+    if (typeof window !== "undefined") {
+      try {
+        window.sessionStorage.removeItem(CHAT_LAST_CONVERSATION_STORAGE_KEY);
+      } catch {
+        // Ignore storage failures.
+      }
+    }
     dragDepthRef.current = 0;
     setIsDragOverChat(false);
     setConversationId(null);
@@ -2701,6 +3822,24 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
     setStreamTraceOpen(false);
     setMessageTraceOpen({});
     setConversationId(id);
+    if (pendingRunSnapshot?.conversationId === id) {
+      if (pendingRunSnapshot.message) {
+        setPendingUserMessage(pendingRunSnapshot.message);
+      }
+      if (pendingRunSnapshot.failedUserMessage) {
+        setFailedUserMessage(pendingRunSnapshot.failedUserMessage);
+      }
+      if (pendingRunSnapshot.streamingResponse) {
+        setStreamingResponse(pendingRunSnapshot.streamingResponse);
+      }
+      if (
+        Array.isArray(pendingRunSnapshot.streamingSteps) &&
+        pendingRunSnapshot.streamingSteps.length > 0
+      ) {
+        setStreamingSteps(pendingRunSnapshot.streamingSteps);
+        streamingStepsRef.current = pendingRunSnapshot.streamingSteps;
+      }
+    }
   };
 
   const queueAttachedFiles = (files: FileList | null) => {
@@ -3002,33 +4141,77 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
     setConversationMenuTarget(null);
   };
 
-  const isHeartbeatStreamingStep = (value: JsonRecord): boolean => {
-    const title = normalizeStatusText(str(value.title, ""));
-    const icon = normalizeStatusText(str(value.icon, ""));
-    const detail = normalizeStatusText(str(value.detail, ""));
-    const stepType = normalizeStatusText(str(value.step_type, str(value.type, "")));
-    return (
-      title.includes("still working") ||
-      icon === "wait" ||
-      stepType.includes("still work") ||
-      stepType.includes("heartbeat") ||
-      (stepType.includes("thinking") &&
-        detail.includes("no new output") &&
-        detail.includes("idle"))
-    );
+  const normalizeActivityStepForDisplay = (step: JsonRecord): JsonRecord => {
+    if (isHeartbeatStreamingStep(step)) {
+      return {
+        ...step,
+        step_type: "heartbeat",
+        title: "Still Working",
+        detail: normalizeHeartbeatDetailText(str(step.detail, ""))
+      };
+    }
+
+    const title = str(step.title, "");
+    const stepType = normalizeStatusText(str(step.step_type, str(step.type, "")));
+    const detail = str(step.detail, "").trim();
+    const lowerTitle = title.toLowerCase();
+    const isToolActivity =
+      stepType.includes("tool_progress") ||
+      stepType.includes("tool_result") ||
+      lowerTitle.startsWith("tool progress:") ||
+      lowerTitle.startsWith("tool finished:");
+
+    if (!isToolActivity || !detail) return step;
+    const summarized = simplifyConsoleDetail(summarizeActivityDetail(detail));
+    if (!summarized || summarized === detail) return step;
+    return {
+      ...step,
+      detail: summarized
+    };
   };
 
-  const streamingStepDedupKey = (value: JsonRecord): string => {
-    const stepType = normalizeStatusText(str(value.step_type, str(value.type, "step")));
-    const title = normalizeStatusText(str(value.title, ""));
-    const detail = normalizeStatusText(str(value.detail, ""));
-    return `${stepType}|${title}|${detail}`;
+  const compressActivitySteps = (steps: JsonRecord[]): JsonRecord[] => {
+    const out: JsonRecord[] = [];
+    for (const raw of steps) {
+      const step = normalizeActivityStepForDisplay(raw);
+      const incomingHeartbeat = isHeartbeatStreamingStep(step);
+      const lastIdx = out.length - 1;
+      if (incomingHeartbeat) {
+        if (lastIdx >= 0 && isHeartbeatStreamingStep(out[lastIdx])) {
+          if (streamingStepDisplayKey(out[lastIdx]) === streamingStepDisplayKey(step)) {
+            continue;
+          }
+          out[lastIdx] = step;
+        } else {
+          out.push(step);
+        }
+        continue;
+      }
+
+      if (lastIdx >= 0) {
+        const incomingKey = streamingStepDedupKey(step);
+        const incomingDisplayKey = streamingStepDisplayKey(step);
+        if (
+          streamingStepDedupKey(out[lastIdx]) === incomingKey ||
+          (incomingDisplayKey &&
+            incomingDisplayKey !== "|" &&
+            streamingStepDisplayKey(out[lastIdx]) === incomingDisplayKey)
+        ) {
+          out[lastIdx] = step;
+          continue;
+        }
+      }
+      out.push(step);
+    }
+    if (out.length > 120) return out.slice(out.length - 120);
+    return out;
   };
 
-  const streamingStepDisplayKey = (value: JsonRecord): string => {
-    const title = normalizeStatusText(str(value.title, ""));
-    const detail = normalizeStatusText(str(value.detail, ""));
-    return `${title}|${detail}`;
+  const countMeaningfulActivityCards = (
+    cards: Array<ReturnType<typeof buildStepCard>>
+  ): number => {
+    const nonHeartbeat = cards.filter((card) => !card.isHeartbeat).length;
+    return nonHeartbeat > 0 ? nonHeartbeat : cards.length;
   };
 
   const summarizeToolStartPayload = (name: string, payload: unknown): string => {
@@ -3053,21 +4236,29 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
 
   const pushStreamingStep = (step: JsonRecord) => {
     setStreamingSteps((prev) => {
-      const incomingHeartbeat = isHeartbeatStreamingStep(step);
+      const normalizedStep = normalizeActivityStepForDisplay(step);
+      const incomingHeartbeat = isHeartbeatStreamingStep(normalizedStep);
       let next: JsonRecord[];
       if (incomingHeartbeat) {
         const existingIndex = prev.findIndex((row) => isHeartbeatStreamingStep(row));
         if (existingIndex >= 0) {
+          if (streamingStepDisplayKey(prev[existingIndex]) === streamingStepDisplayKey(normalizedStep)) {
+            return prev;
+          }
           next = [...prev];
-          next[existingIndex] = step;
+          next[existingIndex] = attachStreamingStepStableKey(
+            normalizedStep,
+            getStreamingStepStableKey(prev[existingIndex])
+          );
         } else {
-          next = [...prev, step];
+          next = [...prev, attachStreamingStepStableKey(normalizedStep)];
         }
       } else {
-        next = [...prev.filter((row) => !isHeartbeatStreamingStep(row))];
-        const incomingKey = streamingStepDedupKey(step);
-        const incomingDisplayKey = streamingStepDisplayKey(step);
-        const lastIdx = next.length - 1;
+        next = [...prev];
+        const heartbeatIndex = next.findIndex((row) => isHeartbeatStreamingStep(row));
+        const incomingKey = streamingStepDedupKey(normalizedStep);
+        const incomingDisplayKey = streamingStepDisplayKey(normalizedStep);
+        const lastIdx = heartbeatIndex >= 0 ? heartbeatIndex - 1 : next.length - 1;
         if (
           lastIdx >= 0 &&
           (streamingStepDedupKey(next[lastIdx]) === incomingKey ||
@@ -3075,9 +4266,14 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
               incomingDisplayKey !== "|" &&
               streamingStepDisplayKey(next[lastIdx]) === incomingDisplayKey))
         ) {
-          next[lastIdx] = step;
+          next[lastIdx] = attachStreamingStepStableKey(
+            normalizedStep,
+            getStreamingStepStableKey(next[lastIdx])
+          );
+        } else if (heartbeatIndex >= 0) {
+          next.splice(heartbeatIndex, 0, attachStreamingStepStableKey(normalizedStep));
         } else {
-          next.push(step);
+          next.push(attachStreamingStepStableKey(normalizedStep));
         }
       }
       if (next.length > 32) next.splice(0, next.length - 32);
@@ -3089,8 +4285,18 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
   const runStreamingChat = async (
     message: string,
     files: File[] = [],
-    opts?: { sensitive?: boolean }
+    opts?: {
+      sensitive?: boolean;
+      conversationIdOverride?: string;
+      projectIdOverride?: string;
+      statusSource?: string;
+    }
   ): Promise<boolean> => {
+    const requestedConversationOverride = (opts?.conversationIdOverride || "").trim();
+    const requestedProjectOverride = (opts?.projectIdOverride || "").trim();
+    const targetConversationId =
+      requestedConversationOverride || conversationId || generateConversationId();
+    const targetProjectId = requestedProjectOverride || activeProjectId || "";
     let activeMessage =
       message.trim() ||
       (files.length > 0
@@ -3102,7 +4308,7 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
     }
     if (!activeMessage || isStreaming || streamLockRef.current) return false;
     const now = Date.now();
-    const fingerprint = `${conversationId || "__new__"}::${activeProjectId || "__no_project__"}::${activeMessage
+    const fingerprint = `${targetConversationId || "__new__"}::${targetProjectId || "__no_project__"}::${activeMessage
       .toLowerCase()
       .replace(/\s+/g, " ")
       .trim()}`;
@@ -3129,14 +4335,39 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
     setStreamTraceOpen(false);
     setIsStreaming(true);
 
-    const requestedConversationId = conversationId || generateConversationId();
-    let resolvedConversationId = conversationId || "";
+    if (conversationId !== targetConversationId) {
+      setConversationId(targetConversationId);
+    }
+    if (!selectedConversationProjectId && targetProjectId && draftProjectId !== targetProjectId) {
+      setDraftProjectId(targetProjectId);
+    }
+    const initialPendingSnapshot: ChatPendingRunSnapshot = {
+      conversationId: targetConversationId,
+      message: sensitiveMessage ? "" : activeMessage,
+      projectId: targetProjectId,
+      startedAt: Date.now(),
+      streamingResponse: "",
+      streamingSteps: [],
+      failedUserMessage: ""
+    };
+    storeChatPendingRunSnapshot(initialPendingSnapshot);
+    setPendingRunSnapshot(initialPendingSnapshot);
+
+    let resolvedConversationId = targetConversationId;
     let payloadMessage = activeMessage;
     let streamError: string | null = null;
     const absorbConversationId = (payload: unknown) => {
       const obj = asRecord(payload);
       const cid = str(obj.conversation_id, str(obj.cid, str(obj.conversationId, "")));
-      if (cid) resolvedConversationId = cid;
+      if (cid) {
+        resolvedConversationId = cid;
+        setPendingRunSnapshot((prev) => {
+          const base = prev ?? initialPendingSnapshot;
+          const next = { ...base, conversationId: cid };
+          storeChatPendingRunSnapshot(next);
+          return next;
+        });
+      }
     };
 
     try {
@@ -3156,8 +4387,8 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
         {
           message: payloadMessage,
           channel: "web",
-          conversation_id: requestedConversationId,
-          project_id: activeProjectId || undefined
+          conversation_id: targetConversationId,
+          project_id: targetProjectId || undefined
         },
         {
           onEvent: (_eventName, payload) => {
@@ -3218,6 +4449,7 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
           },
           onToolResult: (name, content, payload) => {
             const preview = content.trim().slice(0, 1600);
+            const detail = simplifyConsoleDetail(summarizeActivityDetail(preview));
             if (name === "app_deploy") {
               setLiveFileWrites((prev) => {
                 const next: Record<string, LiveFileWriteState> = {};
@@ -3230,12 +4462,13 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
             pushStreamingStep({
               step_type: "tool_result",
               title: `Tool finished: ${name || "tool"}`,
-              detail: preview,
-              data: payload || preview
+              detail: detail || preview,
+              data: payload || detail || preview
             });
           },
           onToolProgress: (name, content, payload) => {
             const preview = content.trim().slice(0, 1600);
+            const detail = simplifyConsoleDetail(summarizeActivityDetail(preview));
             const payloadObj = asRecord(payload);
             if (name === "app_deploy" && str(payloadObj.kind, "") === "file_write") {
               const fileName = str(payloadObj.file, "").trim();
@@ -3274,8 +4507,8 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
             pushStreamingStep({
               step_type: "tool_progress",
               title: `Tool progress: ${name || "tool"}`,
-              detail: preview,
-              data: Object.keys(payloadObj).length > 0 ? payloadObj : preview
+              detail: detail || preview,
+              data: Object.keys(payloadObj).length > 0 ? payloadObj : detail || preview
             });
           },
           onContent: (payload) => {
@@ -3300,7 +4533,7 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
       await queryClient.invalidateQueries({ queryKey: ["chat-conversations"] });
       if (!streamError) {
         setFailedUserMessage(null);
-        const candidateConversationId = resolvedConversationId || requestedConversationId;
+        const candidateConversationId = resolvedConversationId || targetConversationId;
         if (candidateConversationId) {
           try {
             await api.rawGet(`/conversations/${encodeURIComponent(candidateConversationId)}`);
@@ -3328,20 +4561,80 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
       if (!streamError && streamingStepsRef.current.length > 0) {
         setLastRunSteps(streamingStepsRef.current.slice(-64));
       }
-      setPendingUserMessage(null);
+      if (typeof window !== "undefined" && opts?.statusSource) {
+        window.dispatchEvent(
+          new CustomEvent<ChatRunStatusDetail>(CHAT_RUN_STATUS_EVENT, {
+            detail: {
+              conversationId: resolvedConversationId || targetConversationId,
+              source: opts.statusSource,
+              status: streamError ? "error" : "completed",
+              message: streamError
+                ? streamError
+                : "ArkPulse fix completed. Review Chat for the result."
+            }
+          })
+        );
+      }
+      if (streamError) {
+        storeChatPendingRunSnapshot(null);
+        setPendingRunSnapshot(null);
+        setPendingUserMessage(null);
+        setStreamingSteps([]);
+        streamingStepsRef.current = [];
+        setStreamingResponse("");
+      }
       setIsStreaming(false);
-      setStreamingSteps([]);
-      streamingStepsRef.current = [];
-      setStreamingResponse("");
       streamLockRef.current = false;
     }
     return !streamError;
   };
 
   useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handleLaunchRun = (event: Event) => {
+      const detail = (event as CustomEvent<ChatLaunchRunDetail>).detail;
+      const message = str(detail?.message, "").trim();
+      if (!message) {
+        detail?.reject?.("No message provided.");
+        return;
+      }
+      if (isStreaming || streamLockRef.current) {
+        detail?.reject?.("Chat is already busy with another run. Wait for it to finish, then retry this fix.");
+        return;
+      }
+      detail?.resolve?.(true);
+      void runStreamingChat(message, [], {
+        conversationIdOverride: str(detail?.conversationId, "").trim() || undefined,
+        projectIdOverride: str(detail?.projectId, "").trim() || undefined,
+        statusSource: str(detail?.source, "").trim() || undefined
+      }).catch((err) => {
+        if (typeof window !== "undefined" && detail?.source) {
+          window.dispatchEvent(
+            new CustomEvent<ChatRunStatusDetail>(CHAT_RUN_STATUS_EVENT, {
+              detail: {
+                conversationId: str(detail?.conversationId, "").trim(),
+                source: detail.source,
+                status: "error",
+                message: errMessage(err)
+              }
+            })
+          );
+        }
+      });
+    };
+    window.addEventListener(CHAT_LAUNCH_RUN_EVENT, handleLaunchRun as EventListener);
+    return () => {
+      window.removeEventListener(CHAT_LAUNCH_RUN_EVENT, handleLaunchRun as EventListener);
+    };
+  }, [isStreaming, runStreamingChat]);
+
+  useEffect(() => {
     const thread = threadRef.current;
     if (!thread) return;
-    thread.scrollTop = thread.scrollHeight;
+    const nearBottom = thread.scrollHeight - thread.scrollTop - thread.clientHeight < 80;
+    if (nearBottom) {
+      thread.scrollTop = thread.scrollHeight;
+    }
   }, [messages.length, pendingUserMessage, streamingResponse, isStreaming]);
 
   useEffect(() => {
@@ -3367,20 +4660,63 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
     return () => window.clearTimeout(timer);
   }, [chatNotice]);
 
-  const hasLiveThreadActivity = Boolean(pendingUserMessage || isStreaming || streamingResponse.trim());
+  const hasRecoveredStream = !isStreaming && hasPendingSnapshotForConversation;
+  const showStreamingAssistant = isStreaming || hasRecoveredStream;
+  const hasLiveThreadActivity = Boolean(
+    pendingUserMessage ||
+    isStreaming ||
+    hasPendingSnapshotForConversation ||
+    streamingResponse.trim()
+  );
   const hasRenderableThread = messages.length > 0 || hasLiveThreadActivity;
   const origin = typeof window !== "undefined" ? window.location.origin : "";
   const latestAssistantMessageText = str(
     [...messages].reverse().find((m) => str(m.role, "").toLowerCase() === "assistant")?.content,
     ""
   );
+  const latestAssistantTraceSteps = latestAssistantTraceId
+    ? traceStepsById[latestAssistantTraceId] || []
+    : [];
 
-  const workspaceSteps = isStreaming && streamingSteps.length > 0 ? streamingSteps : lastRunSteps;
-  const workspaceCards = useMemo(
-    () => workspaceSteps.map((step, idx) => buildStepCard(step, idx)).slice(-48),
-    [workspaceSteps]
-  );
-  const latestWorkspaceCard = workspaceCards.length > 0 ? workspaceCards[workspaceCards.length - 1] : null;
+  const workspaceSteps =
+    (showStreamingAssistant || pendingRunSnapshot !== null) && streamingSteps.length > 0
+      ? streamingSteps
+      : lastRunSteps.length > 0
+        ? lastRunSteps
+        : latestAssistantTraceSteps;
+  const workspaceCards = useMemo(() => {
+    const raw = workspaceSteps.map((step, idx) => safeBuildStepCard(step, idx)).slice(-48);
+    // Deduplicate: collapse entries with the same label, keep latest status/detail
+    const deduped: typeof raw = [];
+    const labelIndex = new Map<string, number>();
+    for (const card of raw) {
+      const key = card.label.trim().toLowerCase();
+      const existingIdx = labelIndex.get(key);
+      if (existingIdx !== undefined) {
+        deduped[existingIdx] = { ...card, id: deduped[existingIdx].id };
+      } else {
+        labelIndex.set(key, deduped.length);
+        deduped.push(card);
+      }
+    }
+    return deduped;
+  }, [workspaceSteps]);
+  const expandedTraceCardsById = useMemo(() => {
+    const expanded = new Set<string>();
+    messages.forEach((message, idx) => {
+      const messageId = str(message.id, String(idx));
+      if (!messageTraceOpen[messageId]) return;
+      const traceId = str(message.trace_id, "").trim();
+      if (traceId) expanded.add(traceId);
+    });
+    const out: Record<string, Array<ReturnType<typeof buildStepCard>>> = {};
+    expanded.forEach((traceId) => {
+      const steps = traceStepsById[traceId] || [];
+      out[traceId] = steps.map((step, idx) => safeBuildStepCard(step, idx)).slice(-24);
+    });
+    return out;
+  }, [messages, messageTraceOpen, traceStepsById]);
+  const latestWorkspaceCard = pickPrimaryActivityCard(workspaceCards);
   const progressRows = useMemo(() => {
     const seen = new Set<string>();
     const rows: Array<{
@@ -3420,7 +4756,7 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
 
   const codeFromCards = (() => {
     for (let i = workspaceCards.length - 1; i >= 0; i -= 1) {
-      const detail = (workspaceCards[i]?.detail || "").trim();
+      const detail = str(workspaceCards[i]?.rawDetailFull, workspaceCards[i]?.detail || "").trim();
       const fenced = extractFirstCodeFence(detail);
       if (fenced) return fenced;
       if (detail.length > 80 && /(import |const |function |class |=>|<div|SELECT |INSERT |CREATE )/i.test(detail)) {
@@ -3521,6 +4857,13 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
     () => [...workspaceCards].reverse().find((row) => row.kind === "Running" || row.kind === "Planning") || null,
     [workspaceCards]
   );
+  const latestIssueCard = useMemo(
+    () => [...workspaceCards].reverse().find((row) => row.kind === "Issue") || null,
+    [workspaceCards]
+  );
+  const safetyPolicyBlocked = isSafetyPolicyBlockedText(
+    `${latestIssueCard?.label || ""} ${latestIssueCard?.detail || ""} ${latestIssueCard?.detailFull || ""}`
+  );
   const runState = apiKeyActionNeeded
     ? ("waiting_input" as const)
     : isStreaming
@@ -3538,6 +4881,13 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
       return {
         line1: "Status: Waiting for your approval/input",
         line2: "An API key is needed before deployment can continue.",
+        tone: "warning"
+      };
+    }
+    if (safetyPolicyBlocked) {
+      return {
+        line1: "Status: Blocked by safety policy",
+        line2: "The agent tried a disallowed tool and needs a different approach.",
         tone: "warning"
       };
     }
@@ -3561,12 +4911,13 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
       line2: "Send a request to start a run.",
       tone: "default"
     };
-  }, [apiKeyActionNeeded, isStreaming, latestRunningCard, latestWorkspaceCard]);
+  }, [apiKeyActionNeeded, isStreaming, latestRunningCard, latestWorkspaceCard, safetyPolicyBlocked]);
   const nowDoingLabel = useMemo(() => {
     if (apiKeyActionNeeded) return "Waiting for your approval/input";
+    if (safetyPolicyBlocked) return "Blocked by safety policy";
     const active = latestRunningCard || latestWorkspaceCard;
     return active?.label || "Waiting for next step";
-  }, [apiKeyActionNeeded, latestRunningCard, latestWorkspaceCard]);
+  }, [apiKeyActionNeeded, latestRunningCard, latestWorkspaceCard, safetyPolicyBlocked]);
 
   const submitSecretHelper = async (modeOverride?: "reuse" | "manual") => {
     if (secretHelperBusy || isStreaming) return;
@@ -3617,8 +4968,11 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
   return (
     <Box
       sx={{
+        flex: 1,
+        width: "100%",
         height: "100%",
         minHeight: 0,
+        minWidth: 0,
         display: "grid",
         gridTemplateColumns: {
           xs: "1fr",
@@ -3667,9 +5021,26 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
                     }}
                   >
                     <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={0.5}>
-                      <div className="conversation-card-title" title={title}>
-                        {title}
-                      </div>
+                      <Box sx={{ minWidth: 0, flex: 1 }}>
+                        <div className="conversation-card-title" title={title}>
+                          {title}
+                        </div>
+                        {(() => {
+                          const updatedAt = str(conv.updated_at, "");
+                          if (!updatedAt) return null;
+                          const parsed = formatChatTimestamp(updatedAt);
+                          return (
+                            <Typography
+                              variant="caption"
+                              color="text.secondary"
+                              sx={{ display: "block", mt: 0.15, opacity: 0.88 }}
+                              title={parsed.tooltip}
+                            >
+                              {parsed.label}
+                            </Typography>
+                          );
+                        })()}
+                      </Box>
                       <Tooltip title="Chat options">
                         <span>
                           <IconButton
@@ -3797,7 +5168,8 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
                 const role = str(message.role, "").toLowerCase();
                 const isUser = role === "user";
                 const messageId = str(message.id, String(idx));
-                const ts = str(message.timestamp, "");
+                const tsRaw = str(message.timestamp, "");
+                const ts = tsRaw ? formatChatTimestamp(tsRaw) : null;
                 const content = str(message.content);
                 const renderedContent = isUser ? stripAttachmentContextMarker(content) : content;
                 const traceId = str(message.trace_id, "").trim();
@@ -3805,9 +5177,9 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
                 const traceLoading = hasTrace ? Boolean(traceLoadingById[traceId]) : false;
                 const traceError = hasTrace ? str(traceErrorById[traceId], "").trim() : "";
                 const rawTraceSteps = hasTrace ? traceStepsById[traceId] || [] : [];
-                const traceCards = rawTraceSteps.map((step, sIdx) => buildStepCard(step, sIdx)).slice(-24);
                 const traceExpanded = Boolean(messageTraceOpen[messageId]);
-                const traceSummary = traceSummaryText(traceCards, { loading: traceLoading, error: traceError });
+                const traceCards = traceExpanded && hasTrace ? expandedTraceCardsById[traceId] || [] : [];
+                const traceSummary = traceSummaryFromSteps(rawTraceSteps, { loading: traceLoading, error: traceError });
                 return (
                   <Box key={messageId} className={isUser ? "chat-row chat-row-user" : "chat-row"}>
                     {!isUser ? (
@@ -3820,8 +5192,12 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
                     ) : null}
                     <Box className={isUser ? "chat-bubble chat-bubble-user" : "chat-bubble chat-bubble-assistant"}>
                       <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={0.5}>
-                        <Typography variant="caption" color="text.secondary">
-                          {isUser ? "You" : "AgentArk"}{ts ? ` | ${ts}` : ""}
+                        <Typography
+                          variant="caption"
+                          color="text.secondary"
+                          title={ts?.tooltip || undefined}
+                        >
+                          {isUser ? "You" : "AgentArk"}{ts ? ` | ${ts.label}` : ""}
                         </Typography>
                         <Tooltip title="Copy message">
                           <IconButton
@@ -3899,7 +5275,7 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
                 );
               })}
 
-              {pendingUserMessage && isStreaming ? (
+              {pendingUserMessage && showStreamingAssistant ? (
                 <Box className="chat-row chat-row-user">
                   <Box className="chat-bubble chat-bubble-user">
                     <Typography variant="caption" color="text.secondary">
@@ -3931,7 +5307,7 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
                 </Box>
               ) : null}
 
-              {isStreaming ? (
+              {showStreamingAssistant ? (
                 <Box className="chat-row">
                   <Avatar
                     src={AgentLogo}
@@ -3955,7 +5331,7 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
                         }
                       >
                         <span className="chat-inline-trace-summary">
-                          {traceSummaryText(streamingTraceCards, { streaming: true })}
+                          {traceSummaryText(streamingTraceCards, { streaming: isStreaming })}
                         </span>
                       </Button>
                       {streamTraceOpen ? (
@@ -3978,10 +5354,7 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
                       ) : null}
                     </Box>
                     <Typography variant="caption" color="text.secondary">
-                      {streamingResponse.trim() ? "AgentArk is streaming..." : "AgentArk is thinking..."}
-                    </Typography>
-                    <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.25 }}>
-                      {streamingActivity}
+                      {streamingResponse.trim() ? "AgentArk is streaming..." : streamingActivity}
                     </Typography>
                     {streamingResponse.trim() ? (
                       <>
@@ -4186,9 +5559,13 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
           sx={{ minHeight: 0, display: { xs: "none", lg: "flex" }, flexDirection: "column", p: 1 }}
         >
           <Box className="activity-status-bar">
-            <span className={`activity-status-dot${isStreaming ? " running" : " idle"}`} />
+            <span className={`activity-status-dot${safetyPolicyBlocked ? " error" : showStreamingAssistant ? " running" : " idle"}`} />
             <span className="activity-status-text">
-              {isStreaming ? workspaceStatusCopy.line1 || "Processing..." : runStateLabel === "STOPPED" ? "Waiting for activity" : workspaceStatusCopy.line1 || runStateLabel}
+              {showStreamingAssistant
+                ? workspaceStatusCopy.line1 || (isStreaming ? "Processing..." : "Recovered latest progress")
+                : runStateLabel === "STOPPED"
+                  ? "Waiting for activity"
+                  : workspaceStatusCopy.line1 || runStateLabel}
             </span>
             <span className="activity-step-count">{workspaceCards.length} step{workspaceCards.length === 1 ? "" : "s"}</span>
           </Box>
@@ -4196,12 +5573,15 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
           <Box sx={{ flex: 1, minHeight: 0, overflow: "auto" }} className="chat-workspace-sections">
               <Box className="term-shell">
                 <Box className="term-titlebar">
+                  <span className="term-tl-dot" style={{ background: "#ff5f57" }} />
+                  <span className="term-tl-dot" style={{ background: "#febc2e" }} />
+                  <span className="term-tl-dot" style={{ background: "#28c840" }} />
                   <Typography variant="caption" className="term-titlebar-text">
-                    agentark — console
+                    agentark://console
                   </Typography>
                   <Box sx={{ flex: 1 }} />
                   <Typography variant="caption" className="term-titlebar-stats">
-                    {progressSummary} | {workspaceCards.length} event{workspaceCards.length === 1 ? "" : "s"}
+                    {progressSummary}
                   </Typography>
                 </Box>
                   <Box
@@ -4217,31 +5597,28 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
                   >
                     {workspaceCards.length === 0 ? (
                       <Box className="term-line">
-                        <span className="term-text term-dim">Waiting for agent activity...</span>
+                        <span className="term-prompt">&gt;</span>
+                        <span className="term-text term-dim">awaiting_activity<span className="term-block-cursor" /></span>
                       </Box>
                     ) : (
                       workspaceCards.map((row, idx) => {
-                        const dot = row.kind === "Done" ? "term-dot-ok" : row.kind === "Issue" ? "term-dot-err" : row.kind === "Running" || row.kind === "Planning" ? "term-dot-run" : "term-dot-info";
+                        const badgeCls = row.kind === "Done" ? "term-badge-ok" : row.kind === "Issue" ? "term-badge-err" : row.kind === "Running" ? "term-badge-run" : row.kind === "Planning" ? "term-badge-plan" : "term-badge-info";
+                        const badgeText = row.kind === "Done" ? "OK" : row.kind === "Issue" ? "ERR" : row.kind === "Running" ? "RUN" : row.kind === "Planning" ? "PLAN" : "INFO";
                         const isLast = idx === workspaceCards.length - 1;
+                        const isActive = isLast && isStreaming;
                         return (
-                          <Box key={`activity-${row.id}`} className={`term-line${isLast && isStreaming ? " term-line-latest" : ""}`}>
-                            <span className={`term-dot ${dot}`} />
+                          <Box key={`activity-${row.id}`} className={`term-line${isActive ? " term-line-active" : ""}`}>
+                            <span className="term-prompt">&gt;</span>
+                            <span className={`term-badge ${badgeCls}`}>{badgeText}</span>
                             <Box className="term-content">
-                              <span className={`term-label${isLast && isStreaming ? " term-typing" : ""}`}>{row.label}</span>
-                              {row.detailFull ? (
-                                <span className="term-detail-full">{row.detailFull.slice(0, 300)}</span>
-                              ) : row.detail ? (
-                                <span className="term-detail-full">{row.detail}</span>
+                              <span className={`term-label${isActive ? " term-typewriter" : ""}`}>{row.label}</span>
+                              {(row.detailFull || row.detail) ? (
+                                <span className="term-detail">{(row.detailFull || row.detail || "").slice(0, 200)}</span>
                               ) : null}
                             </Box>
                           </Box>
                         );
                       })
-                    )}
-                    {isStreaming && (
-                      <Box className="term-line">
-                        <span className="term-cursor">_</span>
-                      </Box>
                     )}
                   </Box>
               </Box>
@@ -4287,7 +5664,7 @@ function ChatManager({ autoRefresh }: { autoRefresh: boolean }) {
               </Accordion>
             ) : null}
 
-            {previewUrl ? (
+            {previewUrl && deployedFiles.length > 0 ? (
               <Accordion className="chat-workspace-section chat-workspace-section-preview" disableGutters>
                 <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ minHeight: 34 }}>
                   <Typography variant="subtitle2">Preview</Typography>
@@ -4879,6 +6256,7 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
   const [editForm, setEditForm] = useState<SkillEditorForm>(defaultSkillEditorForm());
   const [editContent, setEditContent] = useState("");
   const [editError, setEditError] = useState<string | null>(null);
+  const [editLoading, setEditLoading] = useState(false);
   const [createWizardEnabled, setCreateWizardEnabled] = useState(true);
   const [createWizardStep, setCreateWizardStep] = useState(0);
   const [editAttachHook, setEditAttachHook] = useState(false);
@@ -5026,6 +6404,7 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
     setEditForm(defaultSkillEditorForm());
     setEditContent("");
     setEditError(null);
+    setEditLoading(false);
     setCreateWizardEnabled(true);
     setCreateWizardStep(0);
     setEditAttachHook(false);
@@ -5112,7 +6491,10 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
 
   const openEditor = async (name: string) => {
     setEditError(null);
+    setEditLoading(true);
     setEditTargetName(name);
+    setEditForm(defaultSkillEditorForm(name));
+    setEditContent("");
     setEditOpen(true);
     setCreateWizardEnabled(false);
     setCreateWizardStep(0);
@@ -5124,13 +6506,34 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
     setEditTaskInstruction("");
     setEditTaskCron("");
     try {
-      const out = (await api.rawGet(`/skills/${encodeURIComponent(name)}`)) as JsonRecord;
-      const content = str(out.content, "");
-      const parsed = parseSkillEditorForm(content, name);
-      setEditContent(content);
-      setEditForm({ ...parsed, name });
+      const loadDetails = async () => {
+        const out = (await api.rawGet(`/skills/${encodeURIComponent(name)}`)) as JsonRecord;
+        const content = str(out.content, "");
+        const parsed = parseSkillEditorForm(content, name);
+        setEditContent(content);
+        setEditForm({ ...parsed, name });
+      };
+
+      try {
+        await loadDetails();
+      } catch (err) {
+        const message = errMessage(err);
+        if (message.toLowerCase().includes("rate limit")) {
+          await new Promise((resolve) => setTimeout(resolve, 1200));
+          await loadDetails();
+        } else {
+          throw err;
+        }
+      }
     } catch (err) {
-      setEditError(errMessage(err));
+      const message = errMessage(err);
+      if (message.toLowerCase().includes("rate limit")) {
+        setEditError("Skill details are temporarily rate-limited. Wait a few seconds and reopen the editor.");
+      } else {
+        setEditError(message);
+      }
+    } finally {
+      setEditLoading(false);
     }
   };
 
@@ -5694,6 +7097,7 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
         <DialogContent dividers>
           <Stack spacing={1.25}>
             {editError ? <Alert severity="error">{editError}</Alert> : null}
+            {editLoading ? <Alert severity="info">Loading skill details...</Alert> : null}
             {editRawMode ? (
               <Alert severity="warning">
                 Developer mode is enabled. You are editing raw SKILL.md directly.
@@ -6041,7 +7445,7 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
                   saveEditor();
                 }
               }}
-              disabled={wizardStepBlocked}
+              disabled={wizardStepBlocked || editLoading}
             >
               {createWizardStep < 2 ? "Next" : "Save"}
             </Button>
@@ -6050,6 +7454,7 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
               variant="contained"
               onClick={saveEditor}
               disabled={
+                editLoading ||
                 (editRawMode ? !editContent.trim() : !editForm.description.trim()) ||
                 hookBlocked ||
                 scheduleBlocked
@@ -6172,6 +7577,7 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
   });
   const [tunnelActionError, setTunnelActionError] = useState<string | null>(null);
   const [tunnelActionState, setTunnelActionState] = useState<"idle" | "starting" | "stopping">("idle");
+  const [tunnelActionAppId, setTunnelActionAppId] = useState<string>("");
 
   const opMutation = useMutation({
     mutationFn: ({ path, method }: { path: string; method: "POST" | "DELETE" }) => (method === "DELETE" ? api.rawDelete(path) : api.rawPost(path, {})),
@@ -6180,7 +7586,7 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
     }
   });
   const tunnelStartMutation = useMutation({
-    mutationFn: () => api.rawPost("/tunnel/start", {}),
+    mutationFn: (payload: { app_id?: string }) => api.rawPost("/tunnel/start", payload),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["apps-manager-tunnel-status"] });
       await queryClient.invalidateQueries({ queryKey: ["apps-manager"] });
@@ -6201,6 +7607,7 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
   const tunnelActive = toBool(tunnel.active);
   const tunnelAvailable = toBool(tunnel.available);
   const tunnelErrorText = str(tunnel.error, "").trim();
+  const selectedPublicAppId = str(tunnel.selected_app_id, "").trim();
   const tunnelStarting = tunnelActionState === "starting" || tunnelStartMutation.isPending;
   const tunnelStopping = tunnelActionState === "stopping" || tunnelStopMutation.isPending;
 
@@ -6229,11 +7636,12 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
     setTunnelActionError(null);
     await Promise.all([appsQ.refetch(), tunnelQ.refetch()]);
   };
-  const startTunnel = async () => {
+  const startTunnel = async (appId?: string) => {
     setTunnelActionError(null);
     setTunnelActionState("starting");
+    setTunnelActionAppId(appId || "");
     try {
-      await tunnelStartMutation.mutateAsync();
+      await tunnelStartMutation.mutateAsync(appId ? { app_id: appId } : {});
       await refreshLinks();
     } catch (e) {
       setTunnelActionState("idle");
@@ -6286,8 +7694,10 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
                   const accessUrl = str(appItem.access_url, "");
                   const localUrl = toAbsoluteAppUrl(url, origin);
                   const localAccessUrl = toAbsoluteAppUrl(accessUrl || url, origin);
-                  const publicUrl = tunnelBaseUrl ? toAbsoluteAppUrl(url, tunnelBaseUrl) : "";
-                  const publicAccessUrl = tunnelBaseUrl ? toAbsoluteAppUrl(accessUrl || url, tunnelBaseUrl) : "";
+                  const isSelectedPublicApp = !selectedPublicAppId || selectedPublicAppId === id;
+                  const publicUrl = tunnelBaseUrl && isSelectedPublicApp ? toAbsoluteAppUrl(url, tunnelBaseUrl) : "";
+                  const publicAccessUrl =
+                    tunnelBaseUrl && isSelectedPublicApp ? toAbsoluteAppUrl(accessUrl || url, tunnelBaseUrl) : "";
                   const hasProtectedVariant = !!accessUrl && localAccessUrl !== localUrl;
                   const publicShareUrl = publicAccessUrl || publicUrl;
                   const localShareUrl = localAccessUrl || localUrl;
@@ -6332,11 +7742,11 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
                                 {publicUrl}
                               </Link>
                             </Typography>
-                          ) : tunnelStarting ? (
+                          ) : tunnelStarting && (tunnelActionAppId === id || (!tunnelActionAppId && isSelectedPublicApp)) ? (
                             <Typography variant="caption" component="div" color="info.main">
                               Public: starting tunnel...
                             </Typography>
-                          ) : tunnelStopping ? (
+                          ) : tunnelStopping && isSelectedPublicApp ? (
                             <Typography variant="caption" component="div" color="text.secondary">
                               Public: stopping tunnel...
                             </Typography>
@@ -6379,10 +7789,17 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
                               }
                             },
                             {
-                              label: tunnelStarting ? "Starting Public Tunnel..." : "Start Public Tunnel",
+                              label:
+                                tunnelStarting
+                                  ? "Starting Public Tunnel..."
+                                  : tunnelActive && selectedPublicAppId === id
+                                    ? "Refresh Public Exposure"
+                                    : tunnelActive && selectedPublicAppId && selectedPublicAppId !== id
+                                      ? "Expose This App Publicly"
+                                      : "Start Public Tunnel",
                               divider: true,
-                              disabled: tunnelStarting || tunnelActive || !tunnelAvailable,
-                              onClick: startTunnel
+                              disabled: tunnelStarting || !tunnelAvailable,
+                              onClick: () => startTunnel(id)
                             },
                             {
                               label: tunnelStopping ? "Stopping Public Tunnel..." : "Stop Public Tunnel",
@@ -9256,6 +10673,54 @@ function SwarmManager({ autoRefresh }: { autoRefresh: boolean }) {
     </Stack>
   );
 }
+function formatTraceDuration(durationMs: unknown): string {
+  const ms = num(durationMs, -1);
+  if (ms < 0) return "pending";
+  if (ms < 1000) return `${ms}ms`;
+  const totalSeconds = ms / 1000;
+  if (totalSeconds < 60) return `${totalSeconds >= 10 ? totalSeconds.toFixed(0) : totalSeconds.toFixed(1)}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = Math.round(totalSeconds % 60);
+  return `${minutes}m ${seconds}s`;
+}
+
+function traceStatusColor(status: string): "default" | "success" | "warning" | "error" {
+  switch (status.trim().toLowerCase()) {
+    case "completed":
+      return "success";
+    case "warning":
+      return "warning";
+    case "failed":
+      return "error";
+    default:
+      return "default";
+  }
+}
+
+function traceStepColor(stepType: string): "default" | "success" | "warning" | "error" {
+  switch (stepType.trim().toLowerCase()) {
+    case "success":
+      return "success";
+    case "warning":
+      return "warning";
+    case "error":
+      return "error";
+    default:
+      return "default";
+  }
+}
+
+function formatTraceData(value: unknown): string {
+  if (typeof value !== "string") return str(value, "");
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  try {
+    return JSON.stringify(JSON.parse(trimmed), null, 2);
+  } catch {
+    return trimmed;
+  }
+}
+
 function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
   const [selectedTraceId, setSelectedTraceId] = useState<string | null>(null);
 
@@ -9267,45 +10732,88 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
     refetchInterval: autoRefresh ? REFRESH_MS : false
   });
 
-  const history = pickRecords(traceQ.data, "history");
+  const traceData = asRecord(traceQ.data);
+  const history = pickRecords(traceData, "history");
   const selectedTrace = asRecord(traceDetailQ.data);
   const steps = pickRecords(traceDetailQ.data, "steps");
   const approvals = pickRecords(approvalsQ.data, "approvals");
+  const historyTotal = num(traceData.history_total, history.length);
+  const selectedTraceStatus = str(selectedTrace.status, selectedTraceId ? "running" : "-");
+  const selectedTraceProofId = str(selectedTrace.proof_id, "");
+  const selectedTraceChannel = str(selectedTrace.channel, "chat");
 
   return (
     <Stack spacing={2}>
       <Box className="list-shell">
-        <Typography variant="h6" mb={1}>Trace History</Typography>
-        <TableContainer className="table-shell">
-          <Table size="small">
-            <TableHead><TableRow><TableCell>Message</TableCell><TableCell>Channel</TableCell><TableCell>Status</TableCell><TableCell>Duration</TableCell><TableCell>Started</TableCell><TableCell>Ops</TableCell></TableRow></TableHead>
-            <TableBody>
-              {history.map((item) => {
-                const id = str(item.id, "");
-                return (
-                  <TableRow key={id}>
-                    <TableCell>{str(item.message_preview)}</TableCell>
-                    <TableCell>{str(item.channel)}</TableCell>
-                    <TableCell>{str(item.status)}</TableCell>
-                    <TableCell>{str(item.duration_ms)}</TableCell>
-                    <TableCell>{str(item.started_at)}</TableCell>
-                    <TableCell align="right">
-                      <RowOpsMenu
-                        actions={[
-                          {
-                            label: "View",
-                            onClick: () => setSelectedTraceId(id)
-                          }
-                        ]}
-                        ariaLabel="Trace options"
-                      />
-                    </TableCell>
-                  </TableRow>
-                );
-              })}
-            </TableBody>
-          </Table>
-        </TableContainer>
+        <Stack direction="row" alignItems="center" justifyContent="space-between" mb={1}>
+          <Typography variant="h6">Trace History</Typography>
+          <Typography variant="caption" color="text.secondary">
+            Showing {history.length} of {historyTotal} runs
+          </Typography>
+        </Stack>
+        {history.length === 0 ? (
+          <Alert severity="info">
+            No trace history is available yet. New chat runs will appear here with detailed execution steps. Older runs from before trace persistence was enabled may not be listed.
+          </Alert>
+        ) : (
+          <TableContainer className="table-shell">
+            <Table size="small" sx={{ tableLayout: "fixed" }}>
+              <TableHead>
+                <TableRow>
+                  <TableCell width="14%">Started</TableCell>
+                  <TableCell width="12%">Source</TableCell>
+                  <TableCell width="40%">Message</TableCell>
+                  <TableCell width="12%">Status</TableCell>
+                  <TableCell width="10%">Steps</TableCell>
+                  <TableCell width="12%">Duration</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {history.map((item, idx) => {
+                  const id = str(item.id, `trace-${idx}`);
+                  const status = str(item.status, "running");
+                  return (
+                    <TableRow
+                      key={id}
+                      hover
+                      onClick={() => setSelectedTraceId(id)}
+                      sx={{ cursor: "pointer" }}
+                    >
+                      <TableCell>
+                        <Typography variant="body2" noWrap title={str(item.started_at)}>
+                          {str(item.started_at)}
+                        </Typography>
+                      </TableCell>
+                      <TableCell>
+                        <Typography variant="body2" noWrap title={str(item.channel)}>
+                          {str(item.channel)}
+                        </Typography>
+                      </TableCell>
+                      <TableCell>
+                        <Typography variant="body2" fontWeight={600} noWrap title={str(item.message_preview)}>
+                          {str(item.message_preview)}
+                        </Typography>
+                      </TableCell>
+                      <TableCell>
+                        <Chip size="small" color={traceStatusColor(status)} label={status} />
+                      </TableCell>
+                      <TableCell>
+                        <Typography variant="body2" noWrap>
+                          {num(item.step_count, 0)}
+                        </Typography>
+                      </TableCell>
+                      <TableCell>
+                        <Typography variant="body2" noWrap>
+                          {formatTraceDuration(item.duration_ms)}
+                        </Typography>
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          </TableContainer>
+        )}
       </Box>
 
       <Box className="list-shell">
@@ -9348,35 +10856,130 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
         <Alert severity="error">{errMessage(traceQ.error || traceDetailQ.error || approvalsQ.error)}</Alert>
       ) : null}
 
-      <Dialog open={selectedTraceId != null} onClose={() => setSelectedTraceId(null)} maxWidth="md" fullWidth>
-        <DialogTitle>Trace Detail</DialogTitle>
-        <DialogContent>
-          <Stack spacing={1}>
-            <Typography variant="caption" color="text.secondary">{str(selectedTrace.started_at)} | {str(selectedTrace.channel)}</Typography>
-            <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>{str(selectedTrace.message)}</Typography>
-            <Box className="metadata-box" sx={{ maxHeight: 340 }}>
-              {steps.length === 0 ? (
-                <Typography variant="body2" color="text.secondary">No steps.</Typography>
-              ) : (
-                <Stack spacing={1}>
-                  {steps.map((step, idx) => (
-                    <Box key={str(step.id, `step-${idx}`)} className="console-line">
-                      <Typography variant="caption" color="text.secondary">{str(step.time)} | {str(step.type)}</Typography>
-                      <Typography variant="body2">{str(step.title)}</Typography>
-                      <Typography variant="caption" color="text.secondary" sx={{ whiteSpace: "pre-wrap" }}>{str(step.detail)}</Typography>
+      <Dialog open={selectedTraceId != null} onClose={() => setSelectedTraceId(null)} maxWidth="lg" fullWidth>
+        <DialogTitle sx={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 2 }}>
+          <Box>
+            <Typography variant="h6">Trace Detail</Typography>
+            <Typography variant="caption" color="text.secondary">
+              {str(selectedTrace.started_at)} | {selectedTraceChannel}
+            </Typography>
+          </Box>
+          <IconButton size="small" onClick={() => setSelectedTraceId(null)}>
+            <CloseIcon fontSize="small" />
+          </IconButton>
+        </DialogTitle>
+        <DialogContent dividers>
+          {traceDetailQ.isLoading ? (
+            <Typography variant="body2" color="text.secondary">Loading trace...</Typography>
+          ) : (
+            <Stack spacing={2}>
+              <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+                <Chip size="small" color={traceStatusColor(selectedTraceStatus)} label={selectedTraceStatus} />
+                <Chip size="small" variant="outlined" label={`${num(selectedTrace.step_count, steps.length)} steps`} />
+                <Chip size="small" variant="outlined" label={formatTraceDuration(selectedTrace.duration_ms)} />
+                {selectedTraceProofId ? <Chip size="small" variant="outlined" label={`Proof ${selectedTraceProofId}`} /> : null}
+              </Stack>
+
+              <Box className="list-shell">
+                <Typography variant="subtitle2" mb={1}>Conversation</Typography>
+                <Stack spacing={1.25}>
+                  <Box
+                    sx={{
+                      maxWidth: "82%",
+                      p: 1.25,
+                      borderRadius: 2,
+                      bgcolor: "rgba(255,255,255,0.03)",
+                      border: "1px solid rgba(255,255,255,0.08)"
+                    }}
+                  >
+                    <Stack direction="row" alignItems="center" spacing={1} useFlexGap flexWrap="wrap" sx={{ mb: 0.5 }}>
+                      <Chip size="small" variant="outlined" label={selectedTraceChannel} />
+                      <Typography variant="caption" color="text.secondary">user</Typography>
+                    </Stack>
+                    <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
+                      {str(selectedTrace.message)}
+                    </Typography>
+                  </Box>
+
+                  {selectedTrace.response ? (
+                    <Box sx={{ display: "flex", justifyContent: "flex-end" }}>
+                      <Box
+                        sx={{
+                          maxWidth: "82%",
+                          p: 1.25,
+                          borderRadius: 2,
+                          bgcolor: "rgba(70, 174, 255, 0.08)",
+                          border: "1px solid rgba(70, 174, 255, 0.22)"
+                        }}
+                      >
+                        <Stack direction="row" alignItems="center" spacing={1} useFlexGap flexWrap="wrap" sx={{ mb: 0.5 }}>
+                          <Chip size="small" color="info" variant="outlined" label="AgentArk" />
+                          <Typography variant="caption" color="text.secondary">assistant</Typography>
+                        </Stack>
+                        <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
+                          {str(selectedTrace.response)}
+                        </Typography>
+                      </Box>
                     </Box>
-                  ))}
+                  ) : null}
                 </Stack>
-              )}
-            </Box>
-            {selectedTrace.response ? (
-              <>
-                <Typography variant="subtitle2">Response</Typography>
-                <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>{str(selectedTrace.response)}</Typography>
-              </>
-            ) : null}
-          </Stack>
+                <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 1.25 }}>
+                  Started: {str(selectedTrace.started_at)}{selectedTrace.completed_at ? ` | Completed: ${str(selectedTrace.completed_at)}` : ""}
+                </Typography>
+              </Box>
+
+              <Box className="list-shell">
+                <Typography variant="subtitle2" mb={1}>Advanced Trace</Typography>
+                <Box className="metadata-box" sx={{ maxHeight: 440 }}>
+                  {steps.length === 0 ? (
+                    <Typography variant="body2" color="text.secondary">No steps.</Typography>
+                  ) : (
+                    <Stack spacing={1}>
+                      {steps.map((step, idx) => {
+                        const dataText = formatTraceData(step.data);
+                        return (
+                          <Box key={`${str(step.time, "step")}-${idx}`} className="console-line">
+                            <Stack spacing={0.75}>
+                              <Stack direction="row" alignItems="center" spacing={1} useFlexGap flexWrap="wrap">
+                                <Chip size="small" color={traceStepColor(str(step.type))} label={str(step.type, "step")} />
+                                <Typography variant="caption" color="text.secondary">{str(step.time)}</Typography>
+                              </Stack>
+                              <Typography variant="body2" fontWeight={600}>{str(step.title)}</Typography>
+                              <Typography variant="caption" color="text.secondary" sx={{ whiteSpace: "pre-wrap" }}>
+                                {str(step.detail)}
+                              </Typography>
+                              {dataText ? (
+                                <Box
+                                  component="pre"
+                                  sx={{
+                                    m: 0,
+                                    p: 1.25,
+                                    whiteSpace: "pre-wrap",
+                                    wordBreak: "break-word",
+                                    overflowX: "auto",
+                                    fontSize: 12,
+                                    borderRadius: 1,
+                                    bgcolor: "rgba(255,255,255,0.03)",
+                                    border: "1px solid rgba(255,255,255,0.08)"
+                                  }}
+                                >
+                                  {dataText}
+                                </Box>
+                              ) : null}
+                            </Stack>
+                          </Box>
+                        );
+                      })}
+                    </Stack>
+                  )}
+                </Box>
+              </Box>
+            </Stack>
+          )}
         </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setSelectedTraceId(null)}>Close</Button>
+        </DialogActions>
       </Dialog>
     </Stack>
   );
@@ -9475,9 +11078,18 @@ function StatusManager({ autoRefresh }: { autoRefresh: boolean }) {
   );
 }
 
-function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
+function SettingsManager({
+  autoRefresh,
+  initialTab,
+  hideSettingsNav
+}: {
+  autoRefresh: boolean;
+  initialTab?: number | null;
+  hideSettingsNav?: boolean;
+}) {
   const queryClient = useQueryClient();
   const [tab, setTab] = useState(() => {
+    if (typeof initialTab === "number") return initialTab;
     if (typeof window === "undefined") return 0;
     const raw = new URLSearchParams(window.location.search).get("settings_tab");
     if (!raw) return 0;
@@ -9525,6 +11137,7 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
   const [securityLogsDialogOpen, setSecurityLogsDialogOpen] = useState(false);
   const [selectedSecurityLog, setSelectedSecurityLog] = useState<JsonRecord | null>(null);
   const [selectedPulseEvent, setSelectedPulseEvent] = useState<JsonRecord | null>(null);
+  const [activePulseFixId, setActivePulseFixId] = useState<string | null>(null);
   const [selectedMoltbookEvent, setSelectedMoltbookEvent] = useState<JsonRecord | null>(null);
   const [pulsePollState, setPulsePollState] = useState<{ baselineEventId: string; deadlineAt: number } | null>(null);
   const [developerModeEnabled, setDeveloperModeEnabledState] = useState(getDeveloperModeEnabled);
@@ -9534,6 +11147,12 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
   const [trustActionKind, setTrustActionKind] = useState("shell");
   const [trustPayloadJson, setTrustPayloadJson] = useState("{}");
   const [trustResult, setTrustResult] = useState<JsonRecord | null>(null);
+
+  useEffect(() => {
+    if (typeof initialTab === "number" && tab !== initialTab) {
+      setTab(initialTab);
+    }
+  }, [initialTab, tab]);
 
   useEffect(() => {
     const refreshDeveloperMode = () => setDeveloperModeEnabledState(getDeveloperModeEnabled());
@@ -9635,7 +11254,6 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
   const evolutionPolicyMetrics = pickRecords(evolutionDev, "policy_metrics");
   const evolutionStrategyMetrics = pickRecords(evolutionDev, "strategy_metrics");
   const evolutionLineage = pickRecords(evolutionDev, "lineage_recent");
-
   const configuredProviders = useMemo(() => { 
     const raw = media.configured; 
     if (!Array.isArray(raw)) return []; 
@@ -9650,6 +11268,8 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
     language: "English",
     tone: "",
     email_format: "",
+    daily_brief_enabled: false,
+    daily_brief_time: "09:00",
     daily_brief_channel: "telegram",
     smart_routing: true,
     app_deploy_model_id: "",
@@ -9770,6 +11390,8 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
       language: str(settings.language, prev.language),
       tone: str(settings.tone, prev.tone),
       email_format: str(settings.email_format, prev.email_format),
+      daily_brief_enabled: toBool(settings.daily_brief_enabled),
+      daily_brief_time: str(settings.daily_brief_time, "09:00"),
       daily_brief_channel: str(settings.daily_brief_channel, "telegram"),
       smart_routing: toBool(settings.smart_routing),
       app_deploy_model_id: appDeployModelId,
@@ -9889,6 +11511,8 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
         language: form.language,
         tone: form.tone,
         email_format: form.email_format,
+        daily_brief_enabled: form.daily_brief_enabled,
+        daily_brief_time: form.daily_brief_time || "09:00",
         daily_brief_channel: form.daily_brief_channel || "telegram",
         smart_routing: form.smart_routing,
         app_deploy_model_id: form.app_deploy_model_id,
@@ -10401,7 +12025,7 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
       return {
         severity: "warning" as const,
         title: `${selectedPulseFindings.length} ${issueLabel} need attention.`,
-        detail: "Use the fix command under each issue, then run ArkPulse again."
+        detail: "Use the recommended remediation under each issue, then run ArkPulse again."
       };
     }
     return {
@@ -10445,6 +12069,8 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
       : latestPulseFindingsCount > 0
       ? "Open the latest report and start with Fix #1."
       : "No urgent action needed right now.";
+  const latestPulseNavCount =
+    latestPulseFindingsCount > 0 ? latestPulseFindingsCount : latestPulseStatus === "alert" ? 1 : 0;
 
   useEffect(() => {
     if (!pulsePollState) return;
@@ -10514,6 +12140,28 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
     return null;
   }
 
+  async function copyClipboardText(value: string): Promise<void> {
+    const text = value.trim();
+    if (!text) throw new Error("Nothing to copy.");
+    const nav = typeof navigator !== "undefined" ? navigator : null;
+    if (nav?.clipboard?.writeText) {
+      await nav.clipboard.writeText(text);
+      return;
+    }
+    const doc = typeof document !== "undefined" ? document : null;
+    if (!doc) throw new Error("Clipboard is not available.");
+    const ta = doc.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.left = "-9999px";
+    doc.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok = doc.execCommand("copy");
+    doc.body.removeChild(ta);
+    if (!ok) throw new Error("Copy failed.");
+  }
+
   const regenerateApiKeyMutation = useMutation({
     mutationFn: () => api.rawPost("/settings/api-key/regenerate", {}),
     onSuccess: async () => {
@@ -10548,6 +12196,56 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
     mutationFn: () => api.rawPost("/arkpulse/trigger", {}),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["arkpulse-log"] });
+    },
+    onError: (e) => setError(errMessage(e))
+  });
+
+  const runPulseFixMutation = useMutation({
+    mutationFn: async (payload: {
+      fixCommand: string;
+      remediation?: ArkPulseRemediationSpec | null;
+      issueTitle: string;
+      target: string;
+      eventTimestamp?: string;
+      findingIndex?: number;
+    }) => {
+      const body: ArkPulseRunFixRequest = {
+        issue_title: payload.issueTitle,
+        target: payload.target,
+        event_timestamp: payload.eventTimestamp || undefined,
+        finding_index: payload.findingIndex
+      };
+      const fixCommand = payload.fixCommand.trim();
+      if (fixCommand) {
+        body.fix_command = fixCommand;
+      }
+      if (payload.remediation) {
+        body.remediation = payload.remediation;
+      }
+      const out = asRecord(
+        await api.rawPost("/arkpulse/fix", body)
+      );
+      const status = str(out.status, "").toLowerCase();
+      if (status === "error") {
+        const errorText = str(out.error, "").trim() || str(out.message, "").trim() || "ArkPulse fix failed.";
+        throw new Error(errorText);
+      }
+      return out;
+    },
+    onSuccess: async (raw) => {
+      const message = str(raw.message, "").trim();
+      const output = str(raw.output, "").trim();
+      if (message && output) {
+        setSuccess(`${message}\n\n${output}`);
+      } else if (message) {
+        setSuccess(message);
+      } else {
+        setSuccess("ArkPulse fix completed.");
+      }
+      await queryClient.invalidateQueries({ queryKey: ["arkpulse-log"] });
+      await queryClient.invalidateQueries({ queryKey: ["tunnel-status"] });
+      await queryClient.invalidateQueries({ queryKey: ["chat-workspace-tunnel"] });
+      await queryClient.invalidateQueries({ queryKey: ["chat-workspace-apps"] });
     },
     onError: (e) => setError(errMessage(e))
   });
@@ -10781,8 +12479,6 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
       id: "operations",
       label: "Operations",
       items: [
-        { value: 11, label: "Trace" },
-        { value: 9, label: "ArkPulse" },
         { value: 13, label: "Evolution" }
       ]
     },
@@ -10796,7 +12492,19 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
     }
   ];
   const settingsNavActual = settingsNavGroups.flatMap((group) => group.items);
-  const selectedSettingsNav = settingsNavActual.find((item) => item.value === tab) || settingsNavActual[0];
+  const selectedSettingsNav =
+    settingsNavActual.find((item) => item.value === tab) ||
+    (tab === 9
+      ? {
+          value: 9,
+          label: latestPulseNavCount > 0 ? `ArkPulse (${latestPulseNavCount})` : "ArkPulse"
+        }
+      : tab === 11
+        ? {
+            value: 11,
+            label: "Trace"
+          }
+      : settingsNavActual[0]);
 
   return (
     <Stack spacing={2}>
@@ -10806,7 +12514,8 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
         </Alert>
       ) : null}
 
-      <Box className="settings-shell-layout">
+      <Box className="settings-shell-layout" sx={hideSettingsNav ? { gridTemplateColumns: "1fr !important" } : undefined}>
+        {!hideSettingsNav ? (
         <Box className="settings-sidebar">
           <Box className="settings-brand">
             <Avatar src={AgentLogo} variant="rounded" sx={{ width: 28, height: 28 }} />
@@ -10851,7 +12560,9 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
             ))}
           </Tabs>
         </Box>
+        ) : null}
         <Box className="settings-main">
+          {hideSettingsNav ? null : (
           <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1.5 }}>
             <Typography variant="subtitle1" sx={{ fontWeight: 600, fontSize: "1rem" }}>{selectedSettingsNav?.label || "Settings"}</Typography>
             <Stack direction="row" spacing={1} alignItems="center">
@@ -10876,6 +12587,7 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
               </Button>
             </Stack>
           </Stack>
+          )}
 
       {tab === 0 ? (
         <Stack spacing={2.5}>
@@ -10922,7 +12634,7 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
               ))}
             </Box>
             <Box sx={{ display: "flex", gap: 2, mt: 1.5, flexWrap: "wrap" }}>
-              <Chip size="small" variant="outlined" label={`${modelSlots.length} model${modelSlots.length !== 1 ? "s" : ""}`} sx={{ borderColor: "rgba(47,212,255,0.25)", color: "rgba(47,212,255,0.85)", fontSize: "0.72rem" }} />
+              <Chip size="small" variant="outlined" label={modelsQ.isLoading && modelSlots.length === 0 ? "Loading models…" : `${modelSlots.length} model${modelSlots.length !== 1 ? "s" : ""}`} sx={{ borderColor: "rgba(47,212,255,0.25)", color: "rgba(47,212,255,0.85)", fontSize: "0.72rem" }} />
               <Chip size="small" variant="outlined" label={configuredProviders.length ? configuredProviders.join(", ") : "No media providers"} sx={{ borderColor: "rgba(255,255,255,0.08)", color: "rgba(180,200,225,0.55)", fontSize: "0.72rem" }} />
               {settingsComplete ? (
                 <Chip size="small" variant="outlined" label="Setup complete" sx={{ borderColor: "rgba(20,241,149,0.25)", color: "rgba(20,241,149,0.85)", fontSize: "0.72rem" }} />
@@ -10981,7 +12693,7 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
           {/* ── Preferences ── */}
           <Box>
             <Typography className="settings-section-label">Preferences</Typography>
-            <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "1fr 1fr 1fr" }, gap: 1.5 }}>
+            <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" }, gap: 1.5 }}>
               <Autocomplete
                 freeSolo
                 options={[
@@ -11031,20 +12743,68 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
                 <MenuItem value="sections">Sections</MenuItem>
                 <MenuItem value="narrative">Narrative</MenuItem>
               </TextField>
-              <TextField
-                label="Daily Brief Channel"
-                select
-                value={form.daily_brief_channel}
-                onChange={(e) => setField("daily_brief_channel", e.target.value)}
-                fullWidth
-                size="small"
-                InputLabelProps={{ shrink: true }}
-              >
-                <MenuItem value="telegram">Telegram</MenuItem>
-                <MenuItem value="whatsapp">WhatsApp</MenuItem>
-                <MenuItem value="email">Email</MenuItem>
-              </TextField>
             </Box>
+          </Box>
+
+          <hr className="settings-divider" />
+
+          <Box>
+            <Typography className="settings-section-label">Daily Brief</Typography>
+            <Stack spacing={1.25}>
+              <Box className="metadata-box">
+                <Stack
+                  direction={{ xs: "column", md: "row" }}
+                  spacing={1.5}
+                  justifyContent="space-between"
+                  alignItems={{ xs: "flex-start", md: "center" }}
+                >
+                  <Stack spacing={0.35}>
+                    <Typography variant="subtitle2">Morning Summary</Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Send a recurring daily brief using your selected timezone.
+                    </Typography>
+                  </Stack>
+                  <FormControlLabel
+                    control={
+                      <Switch
+                        checked={form.daily_brief_enabled}
+                        onChange={(e) => setField("daily_brief_enabled", e.target.checked)}
+                      />
+                    }
+                    label={form.daily_brief_enabled ? "Enabled" : "Disabled"}
+                  />
+                </Stack>
+              </Box>
+              <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" }, gap: 1.5 }}>
+                <TextField
+                  label="Preferred Delivery Time"
+                  type="time"
+                  value={form.daily_brief_time}
+                  onChange={(e) => setField("daily_brief_time", e.target.value)}
+                  fullWidth
+                  size="small"
+                  InputLabelProps={{ shrink: true }}
+                  inputProps={{ step: 60 }}
+                  helperText="24-hour time. The brief follows the timezone above."
+                />
+                <TextField
+                  label="Delivery Channel"
+                  select
+                  value={form.daily_brief_channel}
+                  onChange={(e) => setField("daily_brief_channel", e.target.value)}
+                  fullWidth
+                  size="small"
+                  InputLabelProps={{ shrink: true }}
+                >
+                  <MenuItem value="telegram">Telegram</MenuItem>
+                  <MenuItem value="whatsapp">WhatsApp</MenuItem>
+                  <MenuItem value="email">Email</MenuItem>
+                </TextField>
+              </Box>
+              <Typography variant="caption" color="text.secondary">
+                Turning this off pauses the scheduled brief but keeps your preferred time saved.
+              </Typography>
+            </Stack>
           </Box>
         </Stack>
       ) : null}
@@ -12669,10 +14429,16 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
 
       {tab === 13 ? (
         <Stack spacing={2}>
+          <Alert severity="info" sx={{ borderRadius: 2 }}>
+            Evolution lets AgentArk improve its own routing and decision-making over time. It tests new strategies via canary rollouts, measures performance, and automatically promotes winners.
+          </Alert>
           <Grid2 container spacing={2}>
             <Grid2 size={{ xs: 12, lg: 6 }}>
               <Box className="list-shell" sx={{ minHeight: 0 }}>
                 <Typography variant="h6" mb={1}>Evolution Status</Typography>
+                <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1.5 }}>
+                  Current state of the self-evolution engine. When enabled, AgentArk automatically generates and tests improved routing policies.
+                </Typography>
                 {evolutionQ.isLoading ? (
                   <Typography variant="body2" color="text.secondary">Loading evolution status...</Typography>
                 ) : evolutionQ.error ? (
@@ -12680,31 +14446,47 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
                 ) : (
                   <Stack spacing={1}>
                     <Stack direction="row" spacing={1} alignItems="center" useFlexGap flexWrap="wrap">
-                      <Typography variant="body2">Self-evolve:</Typography>
+                      <Tooltip title="When On, AgentArk periodically generates improved routing policies and tests them automatically." arrow>
+                        <Typography variant="body2" sx={{ cursor: "help", textDecoration: "underline dotted", textDecorationColor: "rgba(140,170,210,0.35)", textUnderlineOffset: 3 }}>Self-evolve:</Typography>
+                      </Tooltip>
                       <Chip size="small" color={toBool(evolution.self_evolve_enabled) ? "success" : "default"} label={toBool(evolution.self_evolve_enabled) ? "On" : "Off"} />
                     </Stack>
                     <Stack direction="row" spacing={1} alignItems="center" useFlexGap flexWrap="wrap">
-                      <Typography variant="body2">Canary:</Typography>
+                      <Tooltip title="Canary deploys route a percentage of traffic to a new candidate policy to compare its performance against the current baseline before fully promoting it." arrow>
+                        <Typography variant="body2" sx={{ cursor: "help", textDecoration: "underline dotted", textDecorationColor: "rgba(140,170,210,0.35)", textUnderlineOffset: 3 }}>Canary:</Typography>
+                      </Tooltip>
                       <Chip size="small" color={toBool(evolutionCanary.enabled) ? "warning" : "default"} label={toBool(evolutionCanary.enabled) ? "On" : "Off"} />
-                      <Typography variant="caption" color="text.secondary">
-                        Rollout: {num(evolutionCanary.rollout_percent, 0)}%
-                      </Typography>
+                      <Tooltip title="The percentage of requests routed to the candidate policy for testing." arrow>
+                        <Typography variant="caption" color="text.secondary" sx={{ cursor: "help" }}>
+                          Rollout: {num(evolutionCanary.rollout_percent, 0)}%
+                        </Typography>
+                      </Tooltip>
                     </Stack>
-                    <Typography variant="body2">
-                      Baseline: {str(evolutionCanary.baseline_version, "routing-policy-default-v1")}
-                    </Typography>
-                    <Typography variant="body2">
-                      Candidate: {str(evolutionCanary.candidate_version, "-")}
-                    </Typography>
-                    <Typography variant="body2">
-                      Last promotion result: {str(evolution.last_promotion_result, "No evolution runs yet")}
-                    </Typography>
-                    <Typography variant="body2">
-                      Promotion mode: {str(evolution.promotion_mode, "none")}
-                    </Typography>
-                    <Typography variant="body2">
-                      Replay gate: {str(evolution.replay_gate_result, "-")}
-                    </Typography>
+                    <Tooltip title="The currently active routing policy. All non-canary traffic uses this version." arrow placement="right">
+                      <Typography variant="body2" sx={{ cursor: "help" }}>
+                        Baseline: {str(evolutionCanary.baseline_version, "routing-policy-default-v1")}
+                      </Typography>
+                    </Tooltip>
+                    <Tooltip title="The new policy being tested via canary rollout. Shows '-' when no candidate is active." arrow placement="right">
+                      <Typography variant="body2" sx={{ cursor: "help" }}>
+                        Candidate: {str(evolutionCanary.candidate_version, "-")}
+                      </Typography>
+                    </Tooltip>
+                    <Tooltip title="Result of the most recent promotion attempt (e.g. whether a candidate was promoted or rejected based on metrics)." arrow placement="right">
+                      <Typography variant="body2" sx={{ cursor: "help" }}>
+                        Last promotion: {str(evolution.last_promotion_result, "No evolution runs yet")}
+                      </Typography>
+                    </Tooltip>
+                    <Tooltip title="How promotions are decided: 'auto' promotes automatically when metrics pass, 'manual' requires developer action, 'none' means evolution is idle." arrow placement="right">
+                      <Typography variant="body2" sx={{ cursor: "help" }}>
+                        Promotion mode: {str(evolution.promotion_mode, "none")}
+                      </Typography>
+                    </Tooltip>
+                    <Tooltip title="The replay gate re-runs past conversations against the candidate to verify it doesn't regress before promotion." arrow placement="right">
+                      <Typography variant="body2" sx={{ cursor: "help" }}>
+                        Replay gate: {str(evolution.replay_gate_result, "-")}
+                      </Typography>
+                    </Tooltip>
                   </Stack>
                 )}
               </Box>
@@ -12713,7 +14495,7 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
               <Box className="list-shell" sx={{ minHeight: 0 }}>
                 <Typography variant="h6" mb={1}>Deploy Guard Default</Typography>
                 <Typography variant="body2" color="text.secondary" mb={1}>
-                  Default remains OFF unless changed. This controls app deploy default when a request does not specify `access_guard`.
+                  Controls whether apps deployed by the agent require an access guard by default. When OFF, deployed apps are publicly accessible unless the request explicitly sets an access guard.
                 </Typography>
                 <Stack spacing={1}>
                   <Stack direction="row" spacing={1} alignItems="center">
@@ -12725,39 +14507,47 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
                     />
                   </Stack>
                   <Stack direction="row" spacing={1}>
-                    <Button
-                      size="small"
-                      variant="contained"
-                      onClick={async () => {
-                        setError(null);
-                        setSuccess(null);
-                        try {
-                          await updateEvolutionSettingsMutation.mutateAsync({ deploy_guard_default: true });
-                          setSuccess("Deploy guard default enabled.");
-                        } catch (e) {
-                          setError(errMessage(e));
-                        }
-                      }}
-                      disabled={updateEvolutionSettingsMutation.isPending || toBool(evolution.deploy_guard_default)}
-                    >
-                      Enable Default Guard
-                    </Button>
-                    <Button
-                      size="small"
-                      onClick={async () => {
-                        setError(null);
-                        setSuccess(null);
-                        try {
-                          await updateEvolutionSettingsMutation.mutateAsync({ deploy_guard_default: false });
-                          setSuccess("Deploy guard default disabled.");
-                        } catch (e) {
-                          setError(errMessage(e));
-                        }
-                      }}
-                      disabled={updateEvolutionSettingsMutation.isPending || !toBool(evolution.deploy_guard_default)}
-                    >
-                      Keep Default Off
-                    </Button>
+                    <Tooltip title="Require an access guard on all app deploys by default. Recommended for production use." arrow>
+                      <span>
+                        <Button
+                          size="small"
+                          variant="contained"
+                          onClick={async () => {
+                            setError(null);
+                            setSuccess(null);
+                            try {
+                              await updateEvolutionSettingsMutation.mutateAsync({ deploy_guard_default: true });
+                              setSuccess("Deploy guard default enabled.");
+                            } catch (e) {
+                              setError(errMessage(e));
+                            }
+                          }}
+                          disabled={updateEvolutionSettingsMutation.isPending || toBool(evolution.deploy_guard_default)}
+                        >
+                          Enable Default Guard
+                        </Button>
+                      </span>
+                    </Tooltip>
+                    <Tooltip title="Allow apps to be deployed without an access guard unless explicitly specified." arrow>
+                      <span>
+                        <Button
+                          size="small"
+                          onClick={async () => {
+                            setError(null);
+                            setSuccess(null);
+                            try {
+                              await updateEvolutionSettingsMutation.mutateAsync({ deploy_guard_default: false });
+                              setSuccess("Deploy guard default disabled.");
+                            } catch (e) {
+                              setError(errMessage(e));
+                            }
+                          }}
+                          disabled={updateEvolutionSettingsMutation.isPending || !toBool(evolution.deploy_guard_default)}
+                        >
+                          Keep Default Off
+                        </Button>
+                      </span>
+                    </Tooltip>
                   </Stack>
                 </Stack>
               </Box>
@@ -12769,62 +14559,77 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
               <Grid2 size={{ xs: 12 }}>
                 <Box className="list-shell" sx={{ minHeight: 0 }}>
                   <Stack direction={{ xs: "column", md: "row" }} spacing={1} justifyContent="space-between" alignItems={{ xs: "flex-start", md: "center" }}>
-                    <Typography variant="h6">Developer Controls</Typography>
+                    <Box>
+                      <Typography variant="h6">Developer Controls</Typography>
+                      <Typography variant="caption" color="text.secondary">Manual overrides for canary deployments and policy management.</Typography>
+                    </Box>
                     <Stack direction="row" spacing={1}>
-                      <Button
-                        size="small"
-                        onClick={async () => {
-                          setError(null);
-                          setSuccess(null);
-                          try {
-                            await runEvolutionDevActionMutation.mutateAsync("disable_canary");
-                            setSuccess("Canary disabled.");
-                          } catch (e) {
-                            setError(errMessage(e));
-                          }
-                        }}
-                        disabled={runEvolutionDevActionMutation.isPending}
-                      >
-                        Disable Canary
-                      </Button>
-                      <Button
-                        size="small"
-                        variant="contained"
-                        onClick={async () => {
-                          const ok = window.confirm("Promote candidate policy to baseline now?");
-                          if (!ok) return;
-                          setError(null);
-                          setSuccess(null);
-                          try {
-                            await runEvolutionDevActionMutation.mutateAsync("promote_candidate");
-                            setSuccess("Candidate promoted to baseline.");
-                          } catch (e) {
-                            setError(errMessage(e));
-                          }
-                        }}
-                        disabled={runEvolutionDevActionMutation.isPending}
-                      >
-                        Promote Candidate
-                      </Button>
-                      <Button
-                        size="small"
-                        color="warning"
-                        onClick={async () => {
-                          const ok = window.confirm("Rollback baseline policy to stored snapshot?");
-                          if (!ok) return;
-                          setError(null);
-                          setSuccess(null);
-                          try {
-                            await runEvolutionDevActionMutation.mutateAsync("rollback_baseline");
-                            setSuccess("Rolled back to baseline snapshot.");
-                          } catch (e) {
-                            setError(errMessage(e));
-                          }
-                        }}
-                        disabled={runEvolutionDevActionMutation.isPending}
-                      >
-                        Rollback Baseline
-                      </Button>
+                      <Tooltip title="Stop the active canary rollout and route 100% of traffic back to the baseline policy." arrow>
+                        <span>
+                          <Button
+                            size="small"
+                            onClick={async () => {
+                              setError(null);
+                              setSuccess(null);
+                              try {
+                                await runEvolutionDevActionMutation.mutateAsync("disable_canary");
+                                setSuccess("Canary disabled.");
+                              } catch (e) {
+                                setError(errMessage(e));
+                              }
+                            }}
+                            disabled={runEvolutionDevActionMutation.isPending}
+                          >
+                            Disable Canary
+                          </Button>
+                        </span>
+                      </Tooltip>
+                      <Tooltip title="Immediately promote the candidate policy to become the new baseline. Use when you're confident the candidate performs well." arrow>
+                        <span>
+                          <Button
+                            size="small"
+                            variant="contained"
+                            onClick={async () => {
+                              const ok = window.confirm("Promote candidate policy to baseline now?");
+                              if (!ok) return;
+                              setError(null);
+                              setSuccess(null);
+                              try {
+                                await runEvolutionDevActionMutation.mutateAsync("promote_candidate");
+                                setSuccess("Candidate promoted to baseline.");
+                              } catch (e) {
+                                setError(errMessage(e));
+                              }
+                            }}
+                            disabled={runEvolutionDevActionMutation.isPending}
+                          >
+                            Promote Candidate
+                          </Button>
+                        </span>
+                      </Tooltip>
+                      <Tooltip title="Revert the baseline policy to its previous stored snapshot. Use if the current baseline is performing poorly." arrow>
+                        <span>
+                          <Button
+                            size="small"
+                            color="warning"
+                            onClick={async () => {
+                              const ok = window.confirm("Rollback baseline policy to stored snapshot?");
+                              if (!ok) return;
+                              setError(null);
+                              setSuccess(null);
+                              try {
+                                await runEvolutionDevActionMutation.mutateAsync("rollback_baseline");
+                                setSuccess("Rolled back to baseline snapshot.");
+                              } catch (e) {
+                                setError(errMessage(e));
+                              }
+                            }}
+                            disabled={runEvolutionDevActionMutation.isPending}
+                          >
+                            Rollback Baseline
+                          </Button>
+                        </span>
+                      </Tooltip>
                     </Stack>
                   </Stack>
                 </Box>
@@ -12832,7 +14637,9 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
 
               <Grid2 size={{ xs: 12, lg: 6 }}>
                 <Box className="list-shell" sx={{ minHeight: 0 }}>
-                  <Typography variant="h6" mb={1}>Policy Metrics</Typography>
+                  <Tooltip title="Performance metrics for each routing policy version. Shows how many requests were sampled, the success/error rates, and the 95th percentile latency." arrow placement="top-start">
+                    <Typography variant="h6" mb={1} sx={{ cursor: "help" }}>Policy Metrics</Typography>
+                  </Tooltip>
                   {evolutionDevQ.isLoading ? (
                     <Typography variant="body2" color="text.secondary">Loading developer metrics...</Typography>
                   ) : evolutionDevQ.error ? (
@@ -12870,7 +14677,9 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
 
               <Grid2 size={{ xs: 12, lg: 6 }}>
                 <Box className="list-shell" sx={{ minHeight: 0 }}>
-                  <Typography variant="h6" mb={1}>Strategy Metrics</Typography>
+                  <Tooltip title="Performance metrics for task-routing strategies. Strategies determine how the agent selects which model or approach to use for each request." arrow placement="top-start">
+                    <Typography variant="h6" mb={1} sx={{ cursor: "help" }}>Strategy Metrics</Typography>
+                  </Tooltip>
                   {evolutionDevQ.isLoading ? (
                     <Typography variant="body2" color="text.secondary">Loading developer metrics...</Typography>
                   ) : evolutionDevQ.error ? (
@@ -12908,7 +14717,9 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
 
               <Grid2 size={{ xs: 12 }}>
                 <Box className="list-shell" sx={{ minHeight: 0 }}>
-                  <Typography variant="h6" mb={1}>Lineage</Typography>
+                  <Tooltip title="History of all evolution promotion attempts. Shows when candidates were tested, whether they improved accuracy, and if they were promoted to become the new baseline." arrow placement="top-start">
+                    <Typography variant="h6" mb={1} sx={{ cursor: "help" }}>Lineage</Typography>
+                  </Tooltip>
                   {evolutionDevQ.isLoading ? (
                     <Typography variant="body2" color="text.secondary">Loading lineage...</Typography>
                   ) : evolutionDevQ.error ? (
@@ -13135,7 +14946,13 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
                   const title = str(fr.title, "Issue");
                   const target = str(fr.target, "-");
                   const cause = str(fr.root_cause, "-");
-                  const fix = str(fr.fix_command, "-");
+                  const typedRemediation = parseArkPulseRemediationSpec(fr.remediation);
+                  const runnableRemediation = typedRemediation ?? getRunnableArkPulseRemediation(fr);
+                  const fix = getArkPulseFixText(fr);
+                  const canCopyFix = fix.trim().length > 0 && fix.trim() !== "-";
+                  const canRunFix = runnableRemediation != null;
+                  const fixActionId = `${title}:${target}:${idx}`;
+                  const fixBusy = runPulseFixMutation.isPending && activePulseFixId === fixActionId;
                   return (
                     <Box key={`${title}-${idx}`} className="metadata-box">
                       <Stack spacing={0.75}>
@@ -13158,7 +14975,7 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
                           }}
                         >
                           <Typography variant="caption" color="text.secondary">
-                            Recommended fix command
+                            Recommended remediation
                           </Typography>
                           <Typography
                             variant="body2"
@@ -13172,6 +14989,58 @@ function SettingsManager({ autoRefresh }: { autoRefresh: boolean }) {
                             {fix}
                           </Typography>
                         </Box>
+                        <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+                          <Button
+                            size="small"
+                            variant="outlined"
+                            disabled={!canCopyFix}
+                            onClick={async () => {
+                              setError(null);
+                              setSuccess(null);
+                              try {
+                                await copyClipboardText(fix);
+                                setSuccess("Remediation copied.");
+                              } catch (e) {
+                                setError(errMessage(e));
+                              }
+                            }}
+                          >
+                            Copy remediation
+                          </Button>
+                          <Button
+                            size="small"
+                            variant="contained"
+                            disabled={!canRunFix || runPulseFixMutation.isPending}
+                            onClick={async () => {
+                              setError(null);
+                              setSuccess(null);
+                              setActivePulseFixId(fixActionId);
+                              try {
+                                await runPulseFixMutation.mutateAsync({
+                                  fixCommand: fix,
+                                  remediation: typedRemediation,
+                                  issueTitle: title,
+                                  target,
+                                  eventTimestamp: str(selectedPulseEvent?.timestamp, ""),
+                                  findingIndex: idx
+                                });
+                              } catch {
+                                // handled by mutation onError
+                              } finally {
+                                setActivePulseFixId((prev) => (prev === fixActionId ? null : prev));
+                              }
+                            }}
+                          >
+                            {fixBusy ? "Running..." : "Run fix now"}
+                          </Button>
+                        </Stack>
+                        <Typography variant="caption" color="text.secondary">
+                          {typedRemediation
+                            ? "Runs directly from ArkPulse using the finding's typed remediation."
+                            : canRunFix
+                              ? "Legacy event: ArkPulse is using the saved fix command fallback for this run."
+                              : "This remediation is advisory only. Copy and run manually."}
+                        </Typography>
                       </Stack>
                     </Box>
                   );
@@ -13810,11 +15679,13 @@ function AnalyticsManager({ autoRefresh }: { autoRefresh: boolean }) {
 export function NativeWorkspace({
   view,
   autoRefresh,
-  showAdvanced
+  showAdvanced,
+  settingsInitialTab
 }: {
   view: WorkspaceView;
   autoRefresh: boolean;
   showAdvanced: boolean;
+  settingsInitialTab?: number | null;
 }) {
   const isChat = view === "chat";
   return (
@@ -13825,10 +15696,13 @@ export function NativeWorkspace({
         overflow: isChat ? "hidden" : "auto",
         display: "flex",
         flexDirection: "column",
-        minHeight: 0
+        minHeight: 0,
+        minWidth: 0
       }}
     >
-      {view === "chat" ? <ChatManager autoRefresh={autoRefresh} /> : null}
+      <Box sx={{ display: view === "chat" ? "flex" : "none", flex: 1, minHeight: 0, minWidth: 0, width: "100%" }}>
+        <ChatManager autoRefresh={autoRefresh} isActive={view === "chat"} />
+      </Box>
       {view === "tasks" ? <TasksManager autoRefresh={autoRefresh} /> : null}
       {view === "skills" ? <SkillsManager autoRefresh={autoRefresh} /> : null}
       {view === "apps" ? <AppsManager autoRefresh={autoRefresh} /> : null}
@@ -13840,9 +15714,15 @@ export function NativeWorkspace({
       {view === "trace" ? <TraceManager autoRefresh={autoRefresh} /> : null}
       {view === "status" ? <StatusManager autoRefresh={autoRefresh} /> : null}
       {view === "analytics" ? <AnalyticsManager autoRefresh={autoRefresh} /> : null}
-      {view === "settings" ? <SettingsManager autoRefresh={autoRefresh} /> : null}
+      {view === "arkpulse" ? (
+        <SettingsManager autoRefresh={autoRefresh} initialTab={9} hideSettingsNav />
+      ) : null}
+      {view === "settings" ? (
+        <SettingsManager autoRefresh={autoRefresh} initialTab={settingsInitialTab} />
+      ) : null}
       {["tasks", "skills", "apps"].includes(view) ? <Divider sx={{ mt: 2 }} /> : null}
     </Box>
   );
 }
+
 

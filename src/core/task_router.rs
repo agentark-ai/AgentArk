@@ -13,7 +13,7 @@ use tokio::sync::RwLock;
 
 use super::agent::QueryComplexity;
 use super::config::{ModelRole, ModelSlot};
-use super::intent::has_action_intent_default;
+use super::intent::{action_intent_score, preferred_direct_action_name};
 use super::llm::LlmClient;
 use super::orchestra::SubAgentType;
 use super::prompt_policy::{delegated_policy_v2_block, synthesis_policy_v2_block};
@@ -276,7 +276,7 @@ impl TaskRouter {
                 resp
             } else {
                 // Specialist-only single result: run a final synthesis pass so tool calls
-                // (e.g. app_deploy) can still be emitted by the primary model.
+                // can still be emitted by the primary model.
                 self.aggregate(
                     primary_llm,
                     message,
@@ -317,18 +317,18 @@ impl TaskRouter {
         };
 
         // Safety net: delegated synthesis can occasionally omit tool calls even when
-        // sub-agents produced them. Recover app_deploy for clear app/deploy requests.
-        if has_action_intent_default(message, actions, "app_deploy")
-            && final_response.tool_calls.is_empty()
-        {
-            if let Some(app_call) = results
-                .iter()
-                .filter_map(|r| r.llm_response.as_ref())
-                .flat_map(|resp| resp.tool_calls.iter())
-                .find(|tc| tc.name == "app_deploy")
-                .cloned()
-            {
-                final_response.tool_calls.push(app_call);
+        // sub-agents produced them. Recover the clearest direct action when available.
+        if let Some(preferred_action) = preferred_direct_action_name(message, actions) {
+            if final_response.tool_calls.is_empty() {
+                if let Some(recovered_call) = results
+                    .iter()
+                    .filter_map(|r| r.llm_response.as_ref())
+                    .flat_map(|resp| resp.tool_calls.iter())
+                    .find(|tc| tc.name == preferred_action)
+                    .cloned()
+                {
+                    final_response.tool_calls.push(recovered_call);
+                }
             }
         }
 
@@ -439,62 +439,33 @@ impl TaskRouter {
 
     /// Keep sub-agent tool context small by passing only task-relevant actions.
     fn select_actions_for_task(&self, task: &str, actions: &[ActionDef]) -> Vec<ActionDef> {
-        let task_lower = task.to_lowercase();
-        let mut wanted: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        if has_action_intent_default(task, actions, "app_deploy") {
-            wanted.insert("app_deploy".to_string());
-        }
-        if task_lower.contains("research")
-            || task_lower.contains("search")
-            || task_lower.contains("arxiv")
-            || task_lower.contains("news")
-            || task_lower.contains("latest")
-        {
-            wanted.insert("research".to_string());
-            wanted.insert("web_search".to_string());
-        }
-        if task_lower.contains("schedule")
-            || task_lower.contains("cron")
-            || task_lower.contains("every")
-            || task_lower.contains("monitor")
-            || task_lower.contains("watch")
-        {
-            wanted.insert("schedule_task".to_string());
-            wanted.insert("watch".to_string());
-        }
-        if task_lower.contains("code")
-            || task_lower.contains("script")
-            || task_lower.contains("run")
-            || task_lower.contains("execute")
-            || task_lower.contains("fix")
-        {
-            wanted.insert("code_execute".to_string());
-            wanted.insert("file_read".to_string());
-            wanted.insert("file_write".to_string());
-        }
-
-        for action in actions {
-            if task_lower.contains(&action.name.to_lowercase()) {
-                wanted.insert(action.name.clone());
-            }
-        }
-
-        for fallback in ["app_deploy", "web_search", "research", "code_execute"] {
-            if actions.iter().any(|a| a.name == fallback) {
-                wanted.insert(fallback.to_string());
-            }
-        }
-
-        let mut selected: Vec<ActionDef> = actions
+        let task_lower = task.to_ascii_lowercase();
+        let mut scored: Vec<(f32, ActionDef)> = actions
             .iter()
-            .filter(|a| wanted.contains(&a.name))
-            .cloned()
+            .map(|action| {
+                let mut score = action_intent_score(task, action);
+                if task_lower.contains(&action.name.to_ascii_lowercase()) {
+                    score = score.max(0.95);
+                }
+                (score, action.clone())
+            })
             .collect();
 
-        // Hard cap keeps token usage bounded while preserving common capabilities.
-        if selected.len() > 8 {
-            selected.truncate(8);
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut selected: Vec<ActionDef> = scored
+            .iter()
+            .filter(|(score, _)| *score >= 0.10)
+            .take(8)
+            .map(|(_, action)| action.clone())
+            .collect();
+
+        if selected.is_empty() {
+            selected = scored
+                .into_iter()
+                .take(8)
+                .map(|(_, action)| action)
+                .collect();
         }
         selected
     }
@@ -755,7 +726,8 @@ impl TaskRouter {
             Specialist outputs:\n{}\n\n\
             Requirements:\n\
             - Do not mention agents or synthesis.\n\
-            - If the user asked for a runnable app/dashboard/site/tool, call app_deploy with complete files.\n\
+            - If the task maps cleanly to an available action, emit that tool call with complete arguments.\n\
+            - If the task targets the current workspace or framework itself, prefer local code, file, or shell actions over deploying a separate artifact.\n\
             - Any retry/repair plan must explicitly state a maximum attempts cap.\n\
             - Include a compact evidence summary for actions used.\n\
             - Keep the response concise and practical.",
@@ -764,9 +736,6 @@ impl TaskRouter {
         );
 
         let mut wanted_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
-        if has_action_intent_default(original_task, actions, "app_deploy") {
-            wanted_tools.insert("app_deploy".to_string());
-        }
         for result in results {
             if let Some(resp) = &result.llm_response {
                 for tc in &resp.tool_calls {
@@ -774,16 +743,14 @@ impl TaskRouter {
                 }
             }
         }
-        for name in [
-            "app_deploy",
-            "web_search",
-            "research",
-            "schedule_task",
-            "watch",
-            "code_execute",
-        ] {
-            if actions.iter().any(|a| a.name == name) {
-                wanted_tools.insert(name.to_string());
+        let mut scored_actions: Vec<(f32, String)> = actions
+            .iter()
+            .map(|a| (action_intent_score(original_task, a), a.name.clone()))
+            .collect();
+        scored_actions.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        for (idx, (score, name)) in scored_actions.into_iter().enumerate() {
+            if score >= 0.10 || idx < 6 {
+                wanted_tools.insert(name);
             }
         }
         let filtered_actions: Vec<ActionDef> = actions
@@ -794,7 +761,8 @@ impl TaskRouter {
 
         let synth_system_prompt = format!(
             "You are AgentArk. Return only the final user-facing answer. \
-Use tool calls when required by the task, especially app_deploy for runnable apps and dashboards. \
+Use tool calls when required by the task and prefer the clearest semantic action match from the available actions. \
+For requests about the current workspace/framework itself, prefer local code, file, and shell actions over deployment actions. \
 Any retry/repair loop must declare an explicit max attempts cap and stop when reached. \
 Be concise and action-oriented.\n\n{}",
             synthesis_policy_v2_block()

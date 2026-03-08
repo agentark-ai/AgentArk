@@ -1,62 +1,28 @@
 use super::*;
 
 const ROUTING_COMPLEXITY_POLICY_KEY: &str = "routing_complexity_policy_v1";
-const ROUTING_COMPLEXITY_POLICY_DEFAULT_VERSION: &str = "routing-policy-default-v1";
+const ROUTING_COMPLEXITY_POLICY_DEFAULT_VERSION: &str = "routing-policy-default-v2";
+const ROUTER_CALL_TIMEOUT_MS: u64 = 3500;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct RoutingComplexityPolicy {
-    complex_indicators: Vec<String>,
-    medium_indicators: Vec<String>,
     long_question_word_threshold: usize,
     long_message_word_threshold: usize,
     multi_sentence_threshold: usize,
+    structured_line_threshold: usize,
+    medium_score_threshold: f32,
+    complex_score_threshold: f32,
 }
 
 impl Default for RoutingComplexityPolicy {
     fn default() -> Self {
         Self {
-            complex_indicators: vec![
-                "research".to_string(),
-                "investigate".to_string(),
-                "analyze and".to_string(),
-                "compare and".to_string(),
-                "write a report".to_string(),
-                "write an article".to_string(),
-                "comprehensive".to_string(),
-                "step by step".to_string(),
-                "multiple".to_string(),
-                "all of".to_string(),
-                "each of".to_string(),
-            ],
-            medium_indicators: vec![
-                "explain".to_string(),
-                "why".to_string(),
-                "how does".to_string(),
-                "what is the difference".to_string(),
-                "should i".to_string(),
-                "which is better".to_string(),
-                "pros and cons".to_string(),
-                "analyze".to_string(),
-                "evaluate".to_string(),
-                "recommend".to_string(),
-                "suggest".to_string(),
-                "help me understand".to_string(),
-                "clarify".to_string(),
-                "create a".to_string(),
-                "build a".to_string(),
-                "develop".to_string(),
-                "implement".to_string(),
-                "design".to_string(),
-                "make a".to_string(),
-                "deploy".to_string(),
-                "generate".to_string(),
-                "send".to_string(),
-                "check".to_string(),
-                "fix".to_string(),
-            ],
             long_question_word_threshold: 50,
             long_message_word_threshold: 30,
             multi_sentence_threshold: 3,
+            structured_line_threshold: 4,
+            medium_score_threshold: 0.38,
+            complex_score_threshold: 0.72,
         }
     }
 }
@@ -70,22 +36,6 @@ impl Agent {
             return;
         };
 
-        if let Some(v) = obj.get("complex_indicators").and_then(|v| v.as_array()) {
-            policy.complex_indicators = v
-                .iter()
-                .filter_map(|item| item.as_str())
-                .map(|s| s.trim().to_ascii_lowercase())
-                .filter(|s| !s.is_empty())
-                .collect();
-        }
-        if let Some(v) = obj.get("medium_indicators").and_then(|v| v.as_array()) {
-            policy.medium_indicators = v
-                .iter()
-                .filter_map(|item| item.as_str())
-                .map(|s| s.trim().to_ascii_lowercase())
-                .filter(|s| !s.is_empty())
-                .collect();
-        }
         if let Some(v) = obj
             .get("long_question_word_threshold")
             .and_then(|v| v.as_u64())
@@ -100,6 +50,29 @@ impl Agent {
         }
         if let Some(v) = obj.get("multi_sentence_threshold").and_then(|v| v.as_u64()) {
             policy.multi_sentence_threshold = v.clamp(1, 50) as usize;
+        }
+        if let Some(v) = obj
+            .get("structured_line_threshold")
+            .and_then(|v| v.as_u64())
+        {
+            policy.structured_line_threshold = v.clamp(2, 50) as usize;
+        }
+        if let Some(v) = obj
+            .get("medium_score_threshold")
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32)
+        {
+            policy.medium_score_threshold = v.clamp(0.05, 0.95);
+        }
+        if let Some(v) = obj
+            .get("complex_score_threshold")
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32)
+        {
+            policy.complex_score_threshold = v.clamp(0.10, 0.99);
+        }
+        if policy.complex_score_threshold <= policy.medium_score_threshold {
+            policy.complex_score_threshold = (policy.medium_score_threshold + 0.05).min(0.99);
         }
     }
 
@@ -210,70 +183,42 @@ impl Agent {
         if !self.config.model_pool.smart_routing {
             return ModelRole::Primary;
         }
-        let msg_lower = message.to_lowercase();
-        let tokens = tokenize_lower(message);
+        let trimmed = message.trim();
+        let word_count = trimmed.split_whitespace().count();
+        let question_count = trimmed.matches('?').count();
         let has_role = |role: ModelRole| {
             self.model_pool
                 .values()
                 .any(|(s, _)| s.role == role && s.enabled)
         };
 
-        if (msg_lower.contains("deep research")
-            || msg_lower.contains("research in depth")
-            || msg_lower.starts_with("[deep_research]"))
-            && has_role(ModelRole::Research)
-        {
-            return ModelRole::Research;
-        }
-
-        let research_terms = [
-            "research",
-            "paper",
-            "literature",
-            "survey",
-            "benchmark",
-            "arxiv",
-        ];
-        let research_hits = tokens
-            .iter()
-            .filter(|t| research_terms.iter().any(|k| t.contains(k)))
-            .count();
-        if has_role(ModelRole::Research)
-            && (research_hits >= 2
-                || (research_hits >= 1 && matches!(complexity, QueryComplexity::Complex)))
-        {
-            return ModelRole::Research;
-        }
-
-        let code_terms = [
-            "code",
-            "function",
-            "class",
-            "bug",
-            "debug",
-            "refactor",
-            "python",
-            "javascript",
-            "rust",
-            "typescript",
-            "sql",
-            "regex",
-            "algorithm",
-            "compile",
-            "stacktrace",
-            "exception",
-        ];
-        let code_hits = tokens
-            .iter()
-            .filter(|t| code_terms.iter().any(|k| t.contains(k)))
-            .count();
         let code_syntax_signal = message.contains("```")
             || message.contains("fn ")
             || message.contains("def ")
             || message.contains("SELECT ")
-            || message.contains("select ");
-        if has_role(ModelRole::Code) && (code_hits >= 2 || code_syntax_signal) {
+            || message.contains("class ")
+            || message.contains("import ")
+            || message.contains("=>");
+        let symbol_chars = trimmed
+            .chars()
+            .filter(|c| "{}[]();:=<>/\\#`".contains(*c))
+            .count();
+        let symbol_ratio = if trimmed.is_empty() {
+            0.0
+        } else {
+            symbol_chars as f32 / trimmed.chars().count().max(1) as f32
+        };
+
+        if has_role(ModelRole::Code)
+            && (code_syntax_signal || (symbol_ratio >= 0.08 && word_count >= 12))
+        {
             return ModelRole::Code;
+        }
+        if has_role(ModelRole::Research)
+            && matches!(complexity, QueryComplexity::Complex)
+            && (question_count > 0 || word_count >= 90)
+        {
+            return ModelRole::Research;
         }
 
         match complexity {
@@ -323,30 +268,51 @@ impl Agent {
         let (routing_policy_hint, routing_policy_version) = self
             .load_routing_complexity_policy_for_message(message)
             .await;
-        let complex_hint = routing_policy_hint
-            .complex_indicators
+        let mut scored_actions: Vec<(f32, &crate::actions::ActionDef)> = actions
             .iter()
-            .filter(|s| !s.trim().is_empty())
-            .take(10)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ");
-        let medium_hint = routing_policy_hint
-            .medium_indicators
-            .iter()
-            .filter(|s| !s.trim().is_empty())
-            .take(12)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ");
+            .map(|action| {
+                (
+                    crate::core::intent::action_intent_score(message, action),
+                    action,
+                )
+            })
+            .collect();
+        scored_actions.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.name.cmp(&b.1.name))
+        });
+        let action_hint_block = if scored_actions.is_empty() {
+            "No registered actions available.".to_string()
+        } else {
+            scored_actions
+                .iter()
+                .take(8)
+                .map(|(score, action)| {
+                    format!(
+                        "- {} ({:.2}): {}",
+                        action.name,
+                        score,
+                        super::safe_truncate(action.description.trim(), 120)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let preferred_direct_action =
+            crate::core::intent::preferred_direct_action_name(message, actions)
+                .unwrap_or_else(|| "none".to_string());
         let policy_hint_block = format!(
-            "Active routing policy version: {}\nComplex indicators: {}\nMedium indicators: {}\nThresholds: long_question_word_threshold={}, long_message_word_threshold={}, multi_sentence_threshold={}",
+            "Active routing policy version: {}\n\
+Routing fallback signals are structure-first (not keyword lists).\n\
+Thresholds: long_question_word_threshold={}, long_message_word_threshold={}, multi_sentence_threshold={}, structured_line_threshold={}, medium_score_threshold={:.2}, complex_score_threshold={:.2}",
             routing_policy_version,
-            complex_hint,
-            medium_hint,
             routing_policy_hint.long_question_word_threshold,
             routing_policy_hint.long_message_word_threshold,
-            routing_policy_hint.multi_sentence_threshold
+            routing_policy_hint.multi_sentence_threshold,
+            routing_policy_hint.structured_line_threshold,
+            routing_policy_hint.medium_score_threshold,
+            routing_policy_hint.complex_score_threshold,
         );
 
         let routing_prompt = format!(
@@ -357,10 +323,13 @@ Available model roles: Primary, Fast, Code, Research
 Custom specialists: {specialists}
 {router_policy}
 {policy_hint}
+Top semantic action candidates:
+{action_hints}
+Preferred direct action candidate: {preferred_action}
 
 Rules:
 - "needs_delegation": true ONLY for pure analysis/research tasks that truly need multiple independent agents.
-- For execution tasks (build/create/make/deploy/run/send/check/fix), prefer direct execution:
+- For executable tasks that map clearly to available actions, prefer direct execution:
   needs_delegation=false unless there is explicit parallel decomposition.
 - Set should_clarify=true only when the request is ambiguous or missing critical details.
 - Any retry/repair strategy MUST define a hard maximum attempts cap.
@@ -379,12 +348,19 @@ Task: {message}"#,
             specialists = specialist_desc,
             router_policy = crate::core::prompt_policy::router_policy_v2_block(),
             policy_hint = policy_hint_block,
+            action_hints = action_hint_block,
+            preferred_action = preferred_direct_action,
             message = message
         );
 
         let empty_actions: Vec<crate::actions::ActionDef> = Vec::new();
         let mut router_response: Option<crate::core::llm::LlmResponse> = None;
         let mut router_errors: Vec<String> = Vec::new();
+        let timeout_ms = std::env::var("AGENTARK_ROUTER_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|ms| *ms >= 500 && *ms <= 20000)
+            .unwrap_or(ROUTER_CALL_TIMEOUT_MS);
         for (idx, candidate) in router_candidates.iter().enumerate() {
             if idx > 0 {
                 tracing::warn!(
@@ -393,21 +369,20 @@ Task: {message}"#,
                     candidate.client.model_name()
                 );
             }
-            match candidate
-                .client
-                .chat(
-                    "You are a task router. Follow Router Policy v2. Output only valid JSON. No markdown, no explanation.",
-                    &routing_prompt,
-                    &[],
-                    &empty_actions,
-                )
+            let route_call = candidate.client.chat(
+                "You are a task router. Follow Router Policy v2. Output only valid JSON. No markdown, no explanation.",
+                &routing_prompt,
+                &[],
+                &empty_actions,
+            );
+            match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), route_call)
                 .await
             {
-                Ok(resp) => {
+                Ok(Ok(resp)) => {
                     router_response = Some(resp);
                     break;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     let err_msg = format!(
                         "{} ({}) failed: {}",
                         candidate.slot_label,
@@ -417,7 +392,17 @@ Task: {message}"#,
                     tracing::warn!("Routing model attempt failed: {}", err_msg);
                     router_errors.push(err_msg);
                 }
-            }
+                Err(_) => {
+                    let err_msg = format!(
+                        "{} ({}) timed out after {}ms",
+                        candidate.slot_label,
+                        candidate.client.model_name(),
+                        timeout_ms
+                    );
+                    tracing::warn!("Routing model attempt timed out: {}", err_msg);
+                    router_errors.push(err_msg);
+                }
+            };
         }
 
         match router_response {
@@ -434,22 +419,29 @@ Task: {message}"#,
                     content.to_string()
                 };
 
-                match serde_json::from_str::<crate::core::task_router::RoutingDecision>(&json_str)
-                {
+                match serde_json::from_str::<crate::core::task_router::RoutingDecision>(&json_str) {
                     Ok(mut decision) => {
                         if !(0.0..=1.0).contains(&decision.confidence) || decision.confidence <= 0.0
                         {
-                            decision.confidence = if decision.needs_delegation { 0.75 } else { 0.65 };
+                            decision.confidence = if decision.needs_delegation {
+                                0.75
+                            } else {
+                                0.65
+                            };
                         }
 
-                        let app_intent = has_action_intent_default(message, actions, "app_deploy");
-                        if has_execution_intent(message, actions) && app_intent {
+                        let preferred_direct_action =
+                            crate::core::intent::preferred_direct_action_name(message, actions);
+                        if has_execution_intent(message, actions)
+                            && preferred_direct_action.is_some()
+                        {
                             decision.needs_delegation = false;
                             decision.complexity = QueryComplexity::Simple;
                             decision.sub_agents.clear();
                             decision.reasoning = format!(
-                                "{} | App/deploy request forced to direct execution path",
-                                decision.reasoning
+                                "{} | Clear direct action match: {}",
+                                decision.reasoning,
+                                preferred_direct_action.as_deref().unwrap_or("unknown")
                             );
                             decision.confidence = decision.confidence.max(0.90);
                         }
@@ -467,40 +459,29 @@ Task: {message}"#,
                             );
                         }
 
+                        // When the LLM router succeeds, trust its judgment about clarification.
+                        // Only boost confidence when keyword heuristics confirm clear intent —
+                        // never override the LLM to FORCE clarification via keyword scoring.
                         if has_execution_intent(message, actions) && decision.confidence < 0.90 {
                             let best_score = best_execution_intent_score(message, actions);
                             let ambiguous = is_ambiguous_user_request(message, actions);
                             let detailed_brief = is_detailed_execution_brief(message, actions);
                             let clear_enough = detailed_brief || (!ambiguous && best_score >= 0.55);
-                            if clear_enough {
+                            if clear_enough || best_score >= 0.80 {
                                 decision.confidence = decision.confidence.max(0.90);
                                 decision.should_clarify = false;
                                 decision.clarification_question = None;
-                            } else if best_score < 0.80 {
-                                decision.should_clarify = true;
-                                if decision.clarification_question.is_none() {
-                                    decision.clarification_question = Some(if ambiguous {
-                                        "I can do that. What exactly should I build and should I deploy it as a live app link?"
-                                            .to_string()
-                                    } else {
-                                        "I can execute that now. Confirm the exact output you want me to deliver."
-                                            .to_string()
-                                    });
-                                }
-                            } else {
-                                // High-confidence action match — boost routing confidence
-                                // so the LLM proceeds without asking.
-                                decision.confidence = decision.confidence.max(0.92);
-                                decision.should_clarify = false;
-                                decision.clarification_question = None;
                             }
+                            // Otherwise: keep the LLM router's original should_clarify value.
+                            // Don't override it with keyword heuristics — the LLM understands
+                            // semantic intent better than token overlap scoring.
                         }
 
                         decision
                     }
                     Err(e) => {
                         tracing::warn!(
-                            "Failed to parse routing JSON, falling back to keyword: {}",
+                            "Failed to parse routing JSON, falling back to structural classifier: {}",
                             e
                         );
                         self.classify_complexity_fallback(message, actions).await
@@ -509,7 +490,7 @@ Task: {message}"#,
             }
             None => {
                 tracing::warn!(
-                    "Routing LLM call failed across all candidates, falling back to keyword: {}",
+                    "Routing LLM call failed across all candidates, falling back to structural classifier: {}",
                     router_errors.join(" | ")
                 );
                 self.classify_complexity_fallback(message, actions).await
@@ -517,7 +498,7 @@ Task: {message}"#,
         }
     }
 
-    /// Fallback: keyword-based complexity classification (used when LLM routing fails)
+    /// Fallback: structural complexity classification (used when LLM routing fails)
     pub(crate) async fn classify_complexity_fallback(
         &self,
         message: &str,
@@ -529,50 +510,85 @@ Task: {message}"#,
             complexity = QueryComplexity::Medium;
         }
 
-        let should_clarify = execution_intent
-            && is_ambiguous_user_request(message, actions)
-            && !is_detailed_execution_brief(message, actions);
+        // Fallback classifier uses keyword heuristics which can't reliably
+        // determine if clarification is needed — never ask for clarification here.
+        // The processing LLM will ask for clarification itself if truly confused.
         crate::core::task_router::RoutingDecision {
             needs_delegation: matches!(complexity, QueryComplexity::Complex) && !execution_intent,
             complexity,
             sub_agents: vec![],
-            reasoning: "Fallback keyword classification".to_string(),
-            confidence: if should_clarify { 0.45 } else { 0.60 },
-            should_clarify,
-            clarification_question: if should_clarify {
-                Some("I can do that. What exactly do you want me to execute right now?".to_string())
-            } else {
-                None
-            },
+            reasoning: "Fallback structural classification".to_string(),
+            confidence: 0.60,
+            should_clarify: false,
+            clarification_question: None,
         }
     }
 
-    /// Classify query complexity for routing (keyword-based, used as fallback)
-    pub(crate) async fn classify_complexity(&self, message: &str) -> QueryComplexity {
-        let msg_lower = message.to_lowercase();
-        let word_count = message.split_whitespace().count();
+    fn structural_complexity_score(message: &str, policy: &RoutingComplexityPolicy) -> f32 {
+        let trimmed = message.trim();
+        if trimmed.is_empty() {
+            return 0.0;
+        }
 
+        let word_count = trimmed.split_whitespace().count();
+        let line_count = trimmed.lines().count();
+        let sentence_count = trimmed.matches('.').count()
+            + trimmed.matches('?').count()
+            + trimmed.matches('!').count();
+        let question_count = trimmed.matches('?').count();
+        let has_code_block = trimmed.contains("```");
+        let has_list_shape = trimmed
+            .lines()
+            .map(str::trim_start)
+            .any(|line| line.starts_with("- ") || line.starts_with("* ") || line.starts_with("1."));
+        let has_structured_layout =
+            line_count >= policy.structured_line_threshold || has_code_block || has_list_shape;
+
+        let mut score = 0.0_f32;
+
+        if word_count >= policy.long_message_word_threshold {
+            let span = (policy.long_message_word_threshold.max(1)) as f32;
+            let normalized = ((word_count as f32 - span) / span).clamp(0.0, 1.0);
+            score += 0.35 * normalized.max(0.25);
+        }
+
+        if sentence_count >= policy.multi_sentence_threshold {
+            let normalized = (sentence_count as f32 / policy.multi_sentence_threshold as f32)
+                .clamp(1.0, 3.0)
+                / 3.0;
+            score += 0.22 * normalized;
+        }
+
+        if question_count > 0 && word_count >= policy.long_question_word_threshold {
+            score += 0.14;
+        } else if question_count >= 2 {
+            score += 0.08;
+        }
+
+        if has_structured_layout {
+            score += 0.16;
+        }
+        if line_count >= policy.structured_line_threshold + 2 {
+            score += 0.10;
+        }
+        if has_code_block {
+            score += 0.10;
+        }
+
+        score.clamp(0.0, 1.0)
+    }
+
+    /// Classify query complexity for routing (structure-first fallback)
+    pub(crate) async fn classify_complexity(&self, message: &str) -> QueryComplexity {
         let (policy, _) = self
             .load_routing_complexity_policy_for_message(message)
             .await;
+        let score = Self::structural_complexity_score(message, &policy);
 
-        for indicator in &policy.complex_indicators {
-            if !indicator.is_empty() && msg_lower.contains(indicator) {
-                return QueryComplexity::Complex;
-            }
-        }
-        if word_count > policy.long_question_word_threshold && msg_lower.contains('?') {
+        if score >= policy.complex_score_threshold {
             return QueryComplexity::Complex;
         }
-        for indicator in &policy.medium_indicators {
-            if !indicator.is_empty() && msg_lower.contains(indicator) {
-                return QueryComplexity::Medium;
-            }
-        }
-        let sentence_count = message.matches('.').count() + message.matches('?').count();
-        if sentence_count >= policy.multi_sentence_threshold
-            || word_count > policy.long_message_word_threshold
-        {
+        if score >= policy.medium_score_threshold {
             return QueryComplexity::Medium;
         }
         QueryComplexity::Simple

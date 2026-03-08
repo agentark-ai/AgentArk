@@ -647,6 +647,32 @@ async fn send_via_bridge(config: &WhatsAppChannelConfig, to: &str, text: &str) -
     Ok(())
 }
 
+/// Send a presence update (e.g. "composing" or "paused") via the Baileys bridge.
+async fn send_presence(config: &WhatsAppChannelConfig, to: &str, presence_type: &str) -> Result<()> {
+    let client = http_client();
+    let url = format!("{}/presence", config.bridge_url);
+
+    let body = serde_json::json!({
+        "to": to,
+        "type": presence_type
+    });
+
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let error_body = resp.text().await.unwrap_or_default();
+        tracing::warn!("WhatsApp bridge presence error ({}): {}", status, error_body);
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Webhook verification (HTTP GET)
 // ---------------------------------------------------------------------------
@@ -1024,6 +1050,24 @@ pub async fn handle_webhook(agent: SharedAgent, body: &serde_json::Value) -> Res
         return Ok("ok".to_string());
     }
 
+    // ---- Show "composing..." typing indicator ----
+    let _ = send_presence(&config, from, "composing").await;
+
+    // Keep typing indicator alive in background (WhatsApp composing expires after ~10s)
+    let typing_config = config.clone();
+    let typing_from = from.to_string();
+    let typing_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let typing_flag = typing_done.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+            if typing_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            let _ = send_presence(&typing_config, &typing_from, "composing").await;
+        }
+    });
+
     // ---- Process via agent ----
     let response = {
         let agent_read = agent.read().await;
@@ -1038,6 +1082,8 @@ pub async fn handle_webhook(agent: SharedAgent, body: &serde_json::Value) -> Res
             }
         }
     };
+    typing_done.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = send_presence(&config, from, "paused").await;
 
     // ---- Send reply ----
     send_reply(&config, from, &response).await?;

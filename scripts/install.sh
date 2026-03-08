@@ -6,7 +6,6 @@
 
 set -e
 
-# Colors
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
@@ -14,17 +13,16 @@ RED='\033[0;31m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-IMAGE="ghcr.io/agentark-ai/agentark:latest"
 INSTALL_DIR="$HOME/agentark"
+SOURCE_DIR="$INSTALL_DIR/source"
+REPO_URL="https://github.com/agentark-ai/AgentArk.git"
 
 echo ""
-echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BOLD}=========================================${NC}"
 echo -e "${BOLD}  AgentArk Installer${NC}"
 echo -e "  Think. Act. Remember. Securely."
-echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BOLD}=========================================${NC}"
 echo ""
-
-# ── Step 1: Check / Install Docker ──────────────────────────────────────────
 
 install_docker() {
     echo -e "${YELLOW}Docker not found. Installing...${NC}"
@@ -38,7 +36,7 @@ install_docker() {
                 sudo install -m 0755 -d /etc/apt/keyrings
                 curl -fsSL https://download.docker.com/linux/$ID/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg 2>/dev/null
                 sudo chmod a+r /etc/apt/keyrings/docker.gpg
-                echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$ID $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+                echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$ID $(. /etc/os-release && echo \"$VERSION_CODENAME\") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
                 sudo apt-get update -qq
                 sudo apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
                 ;;
@@ -74,11 +72,9 @@ install_docker() {
         exit 1
     fi
 
-    # Start and enable Docker
     sudo systemctl start docker 2>/dev/null || true
     sudo systemctl enable docker 2>/dev/null || true
 
-    # Add current user to docker group
     if ! groups | grep -q docker; then
         sudo usermod -aG docker "$USER"
         echo -e "${YELLOW}Added $USER to docker group. You may need to log out and back in.${NC}"
@@ -94,7 +90,6 @@ else
     echo -e "${GREEN}[1/4] Docker installed.${NC}"
 fi
 
-# Verify docker compose
 if docker compose version &>/dev/null; then
     COMPOSE="docker compose"
 elif command -v docker-compose &>/dev/null; then
@@ -105,16 +100,20 @@ else
 fi
 echo -e "${GREEN}[2/4] Docker Compose found.${NC}"
 
-# ── Step 2: Create install directory ────────────────────────────────────────
-
 mkdir -p "$INSTALL_DIR"
 
-# ── Step 3: Generate docker-compose.yml ─────────────────────────────────────
+if [ ! -d "$SOURCE_DIR/.git" ]; then
+    echo -e "${CYAN}Cloning AgentArk source into $SOURCE_DIR...${NC}"
+    docker run --rm -v "$INSTALL_DIR:/work" -w /work alpine/git clone --depth 1 "$REPO_URL" source
+else
+    echo -e "${GREEN}Existing source checkout found at $SOURCE_DIR${NC}"
+fi
 
-cat > "$INSTALL_DIR/docker-compose.yml" << 'COMPOSE_EOF'
+cat > "$INSTALL_DIR/docker-compose.yml" <<COMPOSE_EOF
 services:
   agentark:
-    image: ghcr.io/agentark-ai/agentark:latest
+    build: "$SOURCE_DIR"
+    image: agentark:latest
     container_name: agentark
     restart: unless-stopped
     ports:
@@ -122,6 +121,8 @@ services:
     volumes:
       - agentark-data:/app/data
       - agentark-config:/app/config
+      - "${SOURCE_DIR}:/workspace/agentark"
+      - "${INSTALL_DIR}:${INSTALL_DIR}"
     depends_on:
       - docker-socket-proxy
     environment:
@@ -130,10 +131,10 @@ services:
       - AGENTARK_DATA=/app/data
       - AGENTARK_BIND=0.0.0.0:8990
       - DOCKER_HOST=tcp://docker-socket-proxy:2375
-      - AGENTARK_DEBUG=${AGENTARK_DEBUG:-false}
-      - AGENTARK_TUNNEL=${AGENTARK_TUNNEL:-false}
-      - AGENTARK_MASTER_PASSWORD=${AGENTARK_MASTER_PASSWORD:-}
-      - TUNNEL_TOKEN=${TUNNEL_TOKEN:-}
+      - AGENTARK_DEBUG=\${AGENTARK_DEBUG:-false}
+      - AGENTARK_TUNNEL=\${AGENTARK_TUNNEL:-false}
+      - AGENTARK_MASTER_PASSWORD=\${AGENTARK_MASTER_PASSWORD:-}
+      - TUNNEL_TOKEN=\${TUNNEL_TOKEN:-}
     networks:
       - agent-network
     healthcheck:
@@ -193,13 +194,8 @@ COMPOSE_EOF
 
 echo -e "${GREEN}[3/4] Configuration created at $INSTALL_DIR${NC}"
 
-# ── Step 4: Generate management script ──────────────────────────────────────
-
 cat > "$INSTALL_DIR/agentark.sh" << 'SCRIPT_EOF'
 #!/bin/bash
-# AgentArk Management Script
-# Think. Act. Remember. Securely.
-
 set -e
 cd "$(dirname "$0")"
 
@@ -212,16 +208,14 @@ NC='\033[0m'
 case "${1:-start}" in
     start)
         echo -e "${GREEN}Starting AgentArk...${NC}"
-        docker compose up -d
+        docker compose up -d --build
         echo ""
         echo -e "${GREEN}AgentArk is running!${NC}"
         echo -e "  Web UI:  ${CYAN}http://localhost:8990${NC}"
-        echo ""
-        echo -e "Want remote access? Enable from the Web UI or run: ${BOLD}./agentark.sh tunnel${NC}"
         ;;
     tunnel)
         echo -e "${GREEN}Starting AgentArk with remote access...${NC}"
-        AGENTARK_TUNNEL=true docker compose up -d
+        AGENTARK_TUNNEL=true docker compose up -d --build
         echo ""
         echo -e "  Local:   ${CYAN}http://localhost:8990${NC}"
         echo -e "  Remote:  ${CYAN}Your Cloudflare URL will appear in the Web UI${NC}"
@@ -232,13 +226,13 @@ case "${1:-start}" in
         echo -e "${GREEN}Stopped. Your data is preserved.${NC}"
         ;;
     restart)
-        docker compose restart
+        docker compose up -d agentark
         ;;
     update)
-        echo -e "${YELLOW}Updating AgentArk...${NC}"
-        docker compose down
-        docker compose pull
-        docker compose up -d
+        echo -e "${YELLOW}Updating AgentArk source and rebuilding...${NC}"
+        docker run --rm -v "$(pwd):/work" -w /work alpine/git git -C /work/source pull --ff-only || true
+        docker compose build agentark
+        docker compose up -d agentark
         echo -e "${GREEN}Updated! Your data is intact.${NC}"
         ;;
     logs)
@@ -249,11 +243,11 @@ case "${1:-start}" in
         ;;
     uninstall)
         echo -e "${YELLOW}This will stop AgentArk and remove containers.${NC}"
-        echo -e "${BOLD}Your data volumes will be preserved.${NC}"
+        echo -e "${BOLD}Your data volumes and source checkout will be preserved.${NC}"
         read -p "Continue? [y/N] " confirm
         if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
             docker compose down
-            echo -e "${GREEN}Removed. Data volumes kept. To delete data too: docker volume rm agentark-data agentark-config${NC}"
+            echo -e "${GREEN}Removed. Data volumes kept. Source remains in ./source.${NC}"
         fi
         ;;
     *)
@@ -264,19 +258,16 @@ SCRIPT_EOF
 
 chmod +x "$INSTALL_DIR/agentark.sh"
 
-# ── Step 5: Pull image and start ────────────────────────────────────────────
-
-echo -e "${CYAN}Pulling AgentArk image (this may take a minute)...${NC}"
+echo -e "${CYAN}Building AgentArk image from local source (this may take a few minutes)...${NC}"
 cd "$INSTALL_DIR"
-$COMPOSE pull agentark 2>/dev/null || true
 
 echo -e "${GREEN}[4/4] Starting AgentArk...${NC}"
-$COMPOSE up -d
+$COMPOSE up -d --build
 
 echo ""
-echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BOLD}=========================================${NC}"
 echo -e "${GREEN}  AgentArk is running!${NC}"
-echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BOLD}=========================================${NC}"
 echo ""
 echo -e "  Web UI:  ${CYAN}http://localhost:8990${NC}"
 echo ""
@@ -286,9 +277,10 @@ echo -e "  Commands:"
 echo -e "    ./agentark.sh start     Start AgentArk"
 echo -e "    ./agentark.sh tunnel    Start with remote access"
 echo -e "    ./agentark.sh stop      Stop AgentArk"
-echo -e "    ./agentark.sh update    Update to latest version"
+echo -e "    ./agentark.sh update    Pull source and rebuild"
 echo -e "    ./agentark.sh logs      View logs"
 echo -e "    ./agentark.sh status    Show status"
 echo ""
-echo -e "${YELLOW}Your data is stored in Docker volumes and survives updates.${NC}"
+echo -e "${YELLOW}Writable source checkout: $SOURCE_DIR${NC}"
+echo -e "${YELLOW}Data is stored in Docker volumes and survives rebuilds.${NC}"
 echo ""

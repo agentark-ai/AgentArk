@@ -21,7 +21,8 @@ mod tool_handlers;
 pub mod watcher;
 
 pub use agent::{
-    Agent, ExecutionTrace, SecurityEvents, SecuritySnapshot, StreamEvent, UserProfile,
+    Agent, ConversationMessage, ExecutionStep, ExecutionTrace, SecurityEvents, SecuritySnapshot,
+    StreamEvent, UserProfile,
 };
 pub use autonomy::{
     score_action_risk, AutonomySettings, AutopilotMode, ConversationScope, RecommendedAction,

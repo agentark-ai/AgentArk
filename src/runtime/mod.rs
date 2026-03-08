@@ -319,6 +319,34 @@ impl ActionRuntime {
         })
         .await;
 
+        self.register_builtin_action(ActionDef {
+            name: "app_restart".to_string(),
+            description: "Restart an existing deployed app from its saved metadata. Use after file_write edits to /app/data/apps/<id>/..., when a deployed app needs reload, or when the user asks to restart or re-run an existing app. Prefer app_id from app_inspect when available.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "app_id": {
+                        "type": "string",
+                        "description": "Exact deployed app ID to restart. Preferred when already known."
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Optional app title or app ID to match when app_id is not known."
+                    }
+                },
+                "anyOf": [
+                    { "required": ["app_id"] },
+                    { "required": ["query"] }
+                ]
+            }),
+            capabilities: vec!["app_hosting".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        })
+        .await;
+
         // Shell commands (requires approval by default)
         self.register_builtin_action(ActionDef {
             name: "shell".to_string(),
@@ -1314,6 +1342,37 @@ impl ActionRuntime {
             }).await;
         }
 
+        self.register_builtin_action(ActionDef {
+            name: "app_inspect".to_string(),
+            description: "Inspect existing deployed apps. Use when the user asks which apps are deployed, refers to a deployed app by name/ID, or wants to debug, diagnose, fix, or update an existing app. Returns matched app metadata, its /app/data/apps/<id> directory, key files, runtime state, and recent logs so you can use file_read/file_write/app_restart/http_get on the live app.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Optional app title or app ID to match. Leave empty to list deployed apps."
+                    },
+                    "include_files": {
+                        "type": "boolean",
+                        "description": "Include a file inventory for the matched app. Default: true."
+                    },
+                    "include_logs": {
+                        "type": "boolean",
+                        "description": "Include recent runtime log tail for the matched app when available. Default: true."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of apps to list in the summary. Default: 10."
+                    }
+                }
+            }),
+            capabilities: vec!["app_hosting".to_string(), "file_read".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        }).await;
+
         // App deployment — write files, start servers, return live URL
         self.register_builtin_action(ActionDef {
             name: "app_deploy".to_string(),
@@ -1388,6 +1447,10 @@ impl ActionRuntime {
                     "access_guard": {
                         "type": "boolean",
                         "description": "Enable access-key guard for the app URL. Default: false (public app URL)."
+                    },
+                    "replace_existing": {
+                        "type": "boolean",
+                        "description": "Force recreation even if a matching deployed app already exists. Default: false."
                     }
                 },
                 "required": ["files"]
@@ -5460,33 +5523,18 @@ print(result["text"])
             }
         }
 
-        // If no queries found in workflow, generate based on action type
+        // If the workflow does not declare explicit queries, fall back to a
+        // generic topic-based set rather than hardcoding skill names here.
         if queries.is_empty() {
-            match action_name {
-                "trend-prophet" => {
-                    queries.push(format!("arxiv AI machine learning latest papers {}", year));
-                    queries.push(format!("AI research trends {} emerging", year));
-                    queries.push(format!("breakthrough AI papers {} transformer LLM", year));
-                    if !user_query.is_empty() {
-                        queries.push(format!("AI research {} {}", user_query, year));
-                    }
-                }
-                "market-analysis" => {
-                    queries.push(format!("BSE penny stocks India multibagger {}", year));
-                    queries.push(format!("Indian stock market analysis small cap {}", year));
-                    queries.push(format!("emerging stocks India growth potential {}", year));
-                    if !user_query.is_empty() {
-                        queries.push(format!("{} stock analysis India {}", user_query, year));
-                    }
-                }
-                _ => {
-                    // Generic research queries
-                    queries.push(format!("{} latest news {}", action_name, year));
-                    queries.push(format!("{} trends analysis {}", action_name, year));
-                    if !user_query.is_empty() {
-                        queries.push(format!("{} {}", user_query, year));
-                    }
-                }
+            let topic = if user_query.trim().is_empty() {
+                action_name.replace('-', " ")
+            } else {
+                user_query.trim().to_string()
+            };
+            queries.push(format!("{} latest news {}", topic, year));
+            queries.push(format!("{} trends analysis {}", topic, year));
+            if !user_query.trim().is_empty() {
+                queries.push(format!("{} {}", user_query.trim(), year));
             }
         }
 

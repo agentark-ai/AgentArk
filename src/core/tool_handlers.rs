@@ -10,6 +10,7 @@ pub struct ToolHandlerContext<'a> {
     pub trace_ref: &'a Arc<RwLock<ExecutionTrace>>,
     pub stream_tx: Option<&'a Sender<StreamEvent>>,
     pub request_channel: &'a str,
+    pub conversation_id: Option<&'a str>,
     pub public_base_url: Option<&'a str>,
     pub integration_aliases: &'a HashMap<String, String>,
 }
@@ -33,6 +34,8 @@ pub struct ScreenshotToolHandler;
 pub struct ComposeReportToolHandler;
 pub struct IntegrationToolHandler;
 pub struct SelfEvolveToolHandler;
+pub struct AppInspectToolHandler;
+pub struct AppRestartToolHandler;
 pub struct AppDeployToolHandler;
 pub struct RuntimeToolHandler;
 
@@ -169,6 +172,7 @@ impl ToolHandler for IntegrationToolHandler {
             || call.name == "page_screenshot"
             || call.name == "compose_report"
             || call.name == "self_evolve"
+            || call.name == "app_restart"
             || call.name == "app_deploy"
         {
             return false;
@@ -251,6 +255,62 @@ impl ToolHandler for SelfEvolveToolHandler {
 }
 
 #[async_trait]
+impl ToolHandler for AppInspectToolHandler {
+    fn id(&self) -> &'static str {
+        "app_inspect"
+    }
+
+    fn can_handle(&self, _agent: &Agent, call: &ToolCall, _ctx: &ToolHandlerContext<'_>) -> bool {
+        call.name == "app_inspect"
+    }
+
+    async fn handle(
+        &self,
+        agent: &Agent,
+        call: &ToolCall,
+        ctx: &ToolHandlerContext<'_>,
+    ) -> Result<Option<String>> {
+        let out = agent
+            .handle_app_inspect_tool_call(
+                call,
+                ctx.stream_tx,
+                ctx.request_channel,
+                ctx.conversation_id,
+            )
+            .await?;
+        Ok(Some(out))
+    }
+}
+
+#[async_trait]
+impl ToolHandler for AppRestartToolHandler {
+    fn id(&self) -> &'static str {
+        "app_restart"
+    }
+
+    fn can_handle(&self, _agent: &Agent, call: &ToolCall, _ctx: &ToolHandlerContext<'_>) -> bool {
+        call.name == "app_restart"
+    }
+
+    async fn handle(
+        &self,
+        agent: &Agent,
+        call: &ToolCall,
+        ctx: &ToolHandlerContext<'_>,
+    ) -> Result<Option<String>> {
+        let out = agent
+            .handle_app_restart_tool_call(
+                call,
+                ctx.stream_tx,
+                ctx.request_channel,
+                ctx.conversation_id,
+            )
+            .await?;
+        Ok(Some(out))
+    }
+}
+
+#[async_trait]
 impl ToolHandler for AppDeployToolHandler {
     fn id(&self) -> &'static str {
         "app_deploy"
@@ -316,6 +376,8 @@ pub fn default_tool_handlers() -> Vec<Box<dyn ToolHandler>> {
         Box::new(ComposeReportToolHandler),
         Box::new(IntegrationToolHandler),
         Box::new(SelfEvolveToolHandler),
+        Box::new(AppInspectToolHandler),
+        Box::new(AppRestartToolHandler),
         Box::new(AppDeployToolHandler),
         Box::new(RuntimeToolHandler),
     ]

@@ -188,6 +188,14 @@ pub struct HealthCheck {
     pub message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DoctorRemediationSpec {
+    TunnelStartVerify,
+    TunnelRestartVerify,
+    ShellCommand { command: String },
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DoctorFinding {
     pub severity: String, // "critical" | "high" | "medium" | "low"
@@ -197,6 +205,8 @@ pub struct DoctorFinding {
     pub evidence: String,
     pub root_cause: String,
     pub fix_command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remediation: Option<DoctorRemediationSpec>,
     #[serde(default = "default_user_actionable_true")]
     pub user_actionable: bool,
 }
@@ -207,6 +217,7 @@ fn default_user_actionable_true() -> bool {
 
 const PULSE_LOG_KEY: &str = "arkpulse_log";
 const MAX_PULSE_EVENTS: usize = 100;
+const MAX_PULSE_EVENT_AGE_DAYS: i64 = 30;
 const ARKPULSE_LAST_RUN_AT_KEY: &str = "arkpulse_last_run_at";
 const ARKPULSE_CRITICAL_LAST_SIG_KEY: &str = "arkpulse_critical_last_sig_v1";
 const ARKPULSE_CRITICAL_LAST_SENT_KEY: &str = "arkpulse_critical_last_sent_v1";
@@ -295,10 +306,7 @@ async fn log_pulse_event(agent: &Agent, event: PulseEvent) {
         _ => Vec::new(),
     };
     events.push(event);
-    // Keep only the most recent entries
-    if events.len() > MAX_PULSE_EVENTS {
-        events.drain(0..events.len() - MAX_PULSE_EVENTS);
-    }
+    events = prune_pulse_events(events);
     if let Ok(json) = serde_json::to_vec(&events) {
         let _ = agent.storage.set(PULSE_LOG_KEY, &json).await;
     }
@@ -306,10 +314,30 @@ async fn log_pulse_event(agent: &Agent, event: PulseEvent) {
 
 /// Get the ArkPulse log from storage
 pub async fn get_pulse_log(agent: &Agent) -> Vec<PulseEvent> {
-    match agent.storage.get(PULSE_LOG_KEY).await {
+    let raw: Vec<PulseEvent> = match agent.storage.get(PULSE_LOG_KEY).await {
         Ok(Some(data)) => serde_json::from_slice(&data).unwrap_or_default(),
         _ => Vec::new(),
+    };
+    let pruned = prune_pulse_events(raw.clone());
+    if pruned.len() != raw.len() {
+        if let Ok(json) = serde_json::to_vec(&pruned) {
+            let _ = agent.storage.set(PULSE_LOG_KEY, &json).await;
+        }
     }
+    pruned
+}
+
+fn prune_pulse_events(mut events: Vec<PulseEvent>) -> Vec<PulseEvent> {
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(MAX_PULSE_EVENT_AGE_DAYS);
+    events.retain(|event| {
+        chrono::DateTime::parse_from_rfc3339(&event.timestamp)
+            .map(|ts| ts.with_timezone(&chrono::Utc) >= cutoff)
+            .unwrap_or(false)
+    });
+    if events.len() > MAX_PULSE_EVENTS {
+        events.drain(0..events.len() - MAX_PULSE_EVENTS);
+    }
+    events
 }
 
 #[derive(Debug, Clone)]
@@ -355,6 +383,19 @@ fn compute_doctor_score(findings: &[DoctorFinding]) -> u32 {
 }
 
 macro_rules! push_finding {
+    ($findings:expr, $severity:expr, $category:expr, $target:expr, $title:expr, $evidence:expr, $root_cause:expr, $fix_command:expr, $remediation:expr $(,)?) => {{
+        $findings.push(DoctorFinding {
+            severity: ($severity).to_string(),
+            category: ($category).to_string(),
+            target: ($target).into(),
+            title: ($title).into(),
+            evidence: ($evidence).into(),
+            root_cause: ($root_cause).into(),
+            fix_command: ($fix_command).into(),
+            remediation: Some($remediation),
+            user_actionable: true,
+        });
+    }};
     ($findings:expr, $severity:expr, $category:expr, $target:expr, $title:expr, $evidence:expr, $root_cause:expr, $fix_command:expr $(,)?) => {{
         $findings.push(DoctorFinding {
             severity: ($severity).to_string(),
@@ -364,12 +405,26 @@ macro_rules! push_finding {
             evidence: ($evidence).into(),
             root_cause: ($root_cause).into(),
             fix_command: ($fix_command).into(),
+            remediation: None,
             user_actionable: true,
         });
     }};
 }
 
 macro_rules! push_internal_finding {
+    ($findings:expr, $severity:expr, $category:expr, $target:expr, $title:expr, $evidence:expr, $root_cause:expr, $fix_command:expr, $remediation:expr $(,)?) => {{
+        $findings.push(DoctorFinding {
+            severity: ($severity).to_string(),
+            category: ($category).to_string(),
+            target: ($target).into(),
+            title: ($title).into(),
+            evidence: ($evidence).into(),
+            root_cause: ($root_cause).into(),
+            fix_command: ($fix_command).into(),
+            remediation: Some($remediation),
+            user_actionable: false,
+        });
+    }};
     ($findings:expr, $severity:expr, $category:expr, $target:expr, $title:expr, $evidence:expr, $root_cause:expr, $fix_command:expr $(,)?) => {{
         $findings.push(DoctorFinding {
             severity: ($severity).to_string(),
@@ -379,6 +434,7 @@ macro_rules! push_internal_finding {
             evidence: ($evidence).into(),
             root_cause: ($root_cause).into(),
             fix_command: ($fix_command).into(),
+            remediation: None,
             user_actionable: false,
         });
     }};
@@ -601,6 +657,10 @@ fn run_dependency_and_supply_checks_for_app(app: &AppEndpoint, findings: &mut Ve
                         }
                     }
                     if !suspicious.is_empty() {
+                        let fix_command = format!(
+                            "cd {} && npm pkg delete scripts.preinstall scripts.install scripts.postinstall",
+                            app.app_dir.display()
+                        );
                         push_finding!(
                             findings,
                             "critical",
@@ -609,7 +669,10 @@ fn run_dependency_and_supply_checks_for_app(app: &AppEndpoint, findings: &mut Ve
                             "Suspicious install script detected",
                             suspicious.join(" | "),
                             "Install hooks can execute arbitrary code during deployment.",
-                            format!("cd {} && npm pkg delete scripts.preinstall scripts.install scripts.postinstall", app.app_dir.display()),
+                            fix_command.clone(),
+                            DoctorRemediationSpec::ShellCommand {
+                                command: fix_command,
+                            },
                         );
                     }
                 }
@@ -620,6 +683,7 @@ fn run_dependency_and_supply_checks_for_app(app: &AppEndpoint, findings: &mut Ve
     let cargo_toml = app.app_dir.join("Cargo.toml");
     if cargo_toml.exists() {
         if !app.app_dir.join("Cargo.lock").exists() {
+            let fix_command = format!("cd {} && cargo generate-lockfile", app.app_dir.display());
             push_finding!(
                 findings,
                 "high",
@@ -628,11 +692,18 @@ fn run_dependency_and_supply_checks_for_app(app: &AppEndpoint, findings: &mut Ve
                 "Cargo lockfile missing",
                 format!("{} has Cargo.toml but no Cargo.lock", app.app_dir.display()),
                 "Rust dependency set is not pinned for reproducible builds.",
-                format!("cd {} && cargo generate-lockfile", app.app_dir.display()),
+                fix_command.clone(),
+                DoctorRemediationSpec::ShellCommand {
+                    command: fix_command,
+                },
             );
         }
         if let Some(text) = read_text_limited(&cargo_toml, 512 * 1024) {
             if text.contains("git =") || text.contains("path =") {
+                let fix_command = format!(
+                    "cd {} && rg -n \"git\\s*=|path\\s*=\" Cargo.toml",
+                    app.app_dir.display()
+                );
                 push_finding!(
                     findings,
                     "medium",
@@ -641,10 +712,10 @@ fn run_dependency_and_supply_checks_for_app(app: &AppEndpoint, findings: &mut Ve
                     "Git/path Rust dependency detected",
                     "Cargo.toml contains git/path dependency sources".to_string(),
                     "Non-registry dependency sources increase trust and drift risk.",
-                    format!(
-                        "cd {} && rg -n \"git\\s*=|path\\s*=\" Cargo.toml",
-                        app.app_dir.display()
-                    ),
+                    fix_command.clone(),
+                    DoctorRemediationSpec::ShellCommand {
+                        command: fix_command,
+                    },
                 );
             }
         }
@@ -670,6 +741,10 @@ fn run_dependency_and_supply_checks_for_app(app: &AppEndpoint, findings: &mut Ve
                 }
             }
             if !unpinned.is_empty() {
+                let fix_command = format!(
+                    "cd {} && pip-compile requirements.txt",
+                    app.app_dir.display()
+                );
                 push_finding!(
                     findings,
                     "medium",
@@ -678,13 +753,17 @@ fn run_dependency_and_supply_checks_for_app(app: &AppEndpoint, findings: &mut Ve
                     "Unpinned Python dependency",
                     unpinned.into_iter().take(8).collect::<Vec<_>>().join(", "),
                     "Floating versions can introduce breaking or vulnerable transitive updates.",
-                    format!(
-                        "cd {} && pip-compile requirements.txt",
-                        app.app_dir.display()
-                    ),
+                    fix_command.clone(),
+                    DoctorRemediationSpec::ShellCommand {
+                        command: fix_command,
+                    },
                 );
             }
             if !remote_specs.is_empty() {
+                let fix_command = format!(
+                    "cd {} && rg -n \"git\\+|https?://\" requirements.txt",
+                    app.app_dir.display()
+                );
                 push_finding!(
                     findings,
                     "high",
@@ -697,10 +776,10 @@ fn run_dependency_and_supply_checks_for_app(app: &AppEndpoint, findings: &mut Ve
                         .collect::<Vec<_>>()
                         .join(", "),
                     "Direct remote package sources bypass curated index trust controls.",
-                    format!(
-                        "cd {} && rg -n \"git\\+|https?://\" requirements.txt",
-                        app.app_dir.display()
-                    ),
+                    fix_command.clone(),
+                    DoctorRemediationSpec::ShellCommand {
+                        command: fix_command,
+                    },
                 );
             }
         }
@@ -761,6 +840,11 @@ fn run_secret_scan_for_app(app: &AppEndpoint, findings: &mut Vec<DoctorFinding>)
         }
         if let Some(kind) = matched {
             hit_count += 1;
+            let fix_command = format!(
+                "cd {} && rg -n \"(api[_-]?key|token|secret|BEGIN .*PRIVATE KEY)\" {}",
+                app.app_dir.display(),
+                rel
+            );
             push_finding!(
                 findings,
                 "critical",
@@ -769,11 +853,10 @@ fn run_secret_scan_for_app(app: &AppEndpoint, findings: &mut Vec<DoctorFinding>)
                 "Potential secret exposure",
                 format!("Matched {} in {}", kind, rel),
                 "Sensitive credentials may be hardcoded or stored in deploy artifact.",
-                format!(
-                    "cd {} && rg -n \"(api[_-]?key|token|secret|BEGIN .*PRIVATE KEY)\" {}",
-                    app.app_dir.display(),
-                    rel
-                ),
+                fix_command.clone(),
+                DoctorRemediationSpec::ShellCommand {
+                    command: fix_command,
+                },
             );
         }
     }
@@ -880,6 +963,7 @@ async fn run_attack_surface_checks(
                     "No active public tunnel base URL found while apps are deployed".to_string(),
                     "Apps are not publicly reachable through the managed Cloudflare tunnel.",
                     "Start tunnel and verify /tunnel/status returns active + URL".to_string(),
+                    DoctorRemediationSpec::TunnelStartVerify,
                 );
                 String::new()
             });
@@ -897,6 +981,7 @@ async fn run_attack_surface_checks(
                         format!("GET {} returned {}", public_health_url, resp.status()),
                         "Tunnel endpoint is reachable but unhealthy for public traffic.",
                         "Restart tunnel and inspect cloudflared logs".to_string(),
+                        DoctorRemediationSpec::TunnelRestartVerify,
                     );
                 }
                 Err(e) => {
@@ -909,6 +994,7 @@ async fn run_attack_surface_checks(
                         e.to_string(),
                         "Cannot reach service through the configured public tunnel URL.",
                         "Restart tunnel and verify DNS/TLS connectivity".to_string(),
+                        DoctorRemediationSpec::TunnelRestartVerify,
                     );
                 }
             }
@@ -944,6 +1030,7 @@ async fn run_attack_surface_checks(
                             ),
                             "Managed tunnel should stay active while deployed apps need public access.",
                             "Restart the tunnel and confirm URL discovery".to_string(),
+                            DoctorRemediationSpec::TunnelRestartVerify,
                         );
                     }
                 }
@@ -2983,6 +3070,11 @@ pub async fn run_pulse(agent: &SharedAgent) {
         .iter()
         .filter(|f| f.user_actionable && (f.severity == "critical" || f.severity == "high"))
         .count();
+    let doctor_critical_count = details
+        .doctor_findings
+        .iter()
+        .filter(|f| f.user_actionable && f.severity == "critical")
+        .count();
     let doctor_medium_count = details
         .doctor_findings
         .iter()
@@ -3006,7 +3098,11 @@ pub async fn run_pulse(agent: &SharedAgent) {
         .filter(|h| h.status.eq_ignore_ascii_case("warn"))
         .count();
     let is_breakage = has_failures || has_dead_apps || has_doctor_alert || health_error_count > 0;
-    let should_notify_user = is_breakage || has_security_incident;
+    let has_user_visible_alert = is_breakage || has_security_incident;
+    let should_notify_user = has_security_incident
+        || has_dead_apps
+        || health_error_count > 0
+        || doctor_critical_count > 0;
     let has_any_signal = has_overdue
         || has_failures
         || has_security
@@ -3034,7 +3130,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
         return;
     }
 
-    if !should_notify_user {
+    if !has_user_visible_alert {
         let summary = build_noncritical_summary(
             overdue_tasks.len(),
             approaching_goals.len(),
@@ -3078,16 +3174,24 @@ pub async fn run_pulse(agent: &SharedAgent) {
         dead_app_count,
         doctor_high_count,
     );
-    let should_emit_alert = should_emit_arkpulse_critical_notification(&storage, &alert_text).await;
+    let should_emit_alert = if should_notify_user {
+        should_emit_arkpulse_critical_notification(&storage, &alert_text).await
+    } else {
+        false
+    };
     let agent_guard = agent.read().await;
     if should_emit_alert {
         agent_guard
             .emit_notification("ArkPulse Critical", &alert_text, "error", "arkpulse")
             .await;
-    } else {
+    } else if should_notify_user {
         tracing::info!(
             "ArkPulse: suppressed duplicate critical notification within {}s cooldown",
             ARKPULSE_CRITICAL_NOTIFY_COOLDOWN_SECS
+        );
+    } else {
+        tracing::info!(
+            "ArkPulse: alert recorded without user notification (below ultra-severe threshold)"
         );
     }
     let event = PulseEvent {
@@ -3107,9 +3211,14 @@ pub async fn run_pulse(agent: &SharedAgent) {
             "ArkPulse: critical alert sent to preferred channel ({})",
             brief_channel
         );
-    } else {
+    } else if should_notify_user {
         tracing::info!(
             "ArkPulse: duplicate critical alert not pushed to preferred channel ({})",
+            brief_channel
+        );
+    } else {
+        tracing::info!(
+            "ArkPulse: preferred-channel notification skipped (below ultra-severe threshold) ({})",
             brief_channel
         );
     }

@@ -25,6 +25,32 @@ export type Notification = {
   metadata?: Record<string, unknown>;
 };
 
+export type ArkPulseRemediationSpec =
+  | { kind: "tunnel_start_verify" }
+  | { kind: "tunnel_restart_verify" }
+  | { kind: "shell_command"; command: string };
+
+export type ArkPulseDoctorFinding = {
+  severity: string;
+  category: string;
+  target: string;
+  title: string;
+  evidence: string;
+  root_cause: string;
+  fix_command: string;
+  remediation?: ArkPulseRemediationSpec | null;
+  user_actionable?: boolean;
+};
+
+export type ArkPulseRunFixRequest = {
+  fix_command?: string;
+  remediation?: ArkPulseRemediationSpec;
+  issue_title?: string;
+  target?: string;
+  event_timestamp?: string;
+  finding_index?: number;
+};
+
 export type TraceSummary = {
   id: string;
   message_preview: string;
@@ -160,6 +186,7 @@ export type SkillImportRequest = {
   force?: boolean;
   model?: string;
   preview_only?: boolean;
+  selected_urls?: string[];
 };
 
 export type SkillImportResponse = {

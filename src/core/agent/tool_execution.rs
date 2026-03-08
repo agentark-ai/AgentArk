@@ -10,6 +10,49 @@ pub(crate) struct ToolExecutionContext<'a> {
     pub model_slot: Option<&'a str>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ToolCallOutput {
+    pub name: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ToolExecutionBatch {
+    pub outputs: Vec<ToolCallOutput>,
+}
+
+impl ToolExecutionBatch {
+    pub(crate) fn combined_output(&self) -> String {
+        self.outputs
+            .iter()
+            .map(|output| output.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AppSemanticFingerprint {
+    title_tokens: std::collections::HashSet<String>,
+    keyword_tokens: std::collections::HashSet<String>,
+    file_tokens: std::collections::HashSet<String>,
+    is_static: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AppDuplicateMatch {
+    app: serde_json::Value,
+    match_kind: &'static str,
+    score: f32,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DuplicateAppResolution {
+    ReuseExisting,
+    ReplaceExisting,
+}
+
 impl Agent {
     fn canonicalize_json_value(value: &serde_json::Value) -> serde_json::Value {
         match value {
@@ -312,7 +355,10 @@ impl Agent {
                 .map(|s| s.len())
                 .sum();
 
-            summary.insert("file_count".to_string(), serde_json::json!(total_file_count));
+            summary.insert(
+                "file_count".to_string(),
+                serde_json::json!(total_file_count),
+            );
             summary.insert("file_names".to_string(), serde_json::json!(file_names));
             summary.insert("file_bytes".to_string(), serde_json::json!(total_bytes));
             if truncated {
@@ -490,6 +536,915 @@ impl Agent {
         }
     }
 
+    fn detect_app_runtime_error_marker(content: &str) -> Option<&'static str> {
+        let needles: [(&str, &str); 8] = [
+            ("error loading", "error loading"),
+            ("failed to load", "failed to load"),
+            ("something went wrong", "something went wrong"),
+            ("application error", "application error"),
+            ("could not fetch", "could not fetch"),
+            ("unable to fetch", "unable to fetch"),
+            ("please try again", "please try again"),
+            ("runtime error", "runtime error"),
+        ];
+        for (needle, label) in needles {
+            if content.contains(needle) {
+                return Some(label);
+            }
+        }
+        None
+    }
+
+    fn app_deploy_files_signature(arguments: &serde_json::Value) -> Option<String> {
+        let files = arguments.get("files")?;
+        let canonical = Self::canonicalize_json_value(files);
+        serde_json::to_string(&canonical).ok()
+    }
+
+    fn resolve_duplicate_app(match_kind: &str, existing_running: bool) -> DuplicateAppResolution {
+        if match_kind == "exact_files" && existing_running {
+            DuplicateAppResolution::ReuseExisting
+        } else {
+            DuplicateAppResolution::ReplaceExisting
+        }
+    }
+
+    async fn stop_and_remove_existing_app(
+        &self,
+        app_id: &str,
+        app_title: Option<&str>,
+    ) -> Result<()> {
+        if app_id.is_empty()
+            || app_id.len() > 64
+            || !app_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            anyhow::bail!("refusing to remove invalid app id '{}'", app_id);
+        }
+
+        let app_dir = self
+            .app_registry
+            .get_dir(app_id)
+            .await
+            .unwrap_or_else(|| self.data_dir.join("apps").join(app_id));
+
+        self.app_registry.stop(app_id).await?;
+
+        match tokio::fs::remove_dir_all(&app_dir).await {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                anyhow::bail!(
+                    "failed to remove app directory '{}': {}",
+                    app_dir.display(),
+                    error
+                );
+            }
+        }
+
+        if let Err(error) = self
+            .storage
+            .delete_app_notifications(app_id, app_title)
+            .await
+        {
+            tracing::warn!(
+                "failed to delete app notifications during replacement for {}: {}",
+                app_id,
+                error
+            );
+        }
+
+        Ok(())
+    }
+
+    fn normalize_app_title(value: &str) -> String {
+        value
+            .to_ascii_lowercase()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c.is_ascii_whitespace() {
+                    c
+                } else {
+                    ' '
+                }
+            })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn is_generic_title(title: &str) -> bool {
+        let mut token_count = 0usize;
+        let generic = [
+            "app",
+            "dashboard",
+            "tool",
+            "site",
+            "website",
+            "web",
+            "page",
+            "project",
+            "demo",
+        ];
+        for token in title.split_whitespace() {
+            token_count += 1;
+            if !generic.iter().any(|g| g == &token) {
+                return false;
+            }
+        }
+        token_count > 0
+    }
+
+    fn is_probably_text_bytes(bytes: &[u8]) -> bool {
+        if bytes.is_empty() {
+            return false;
+        }
+        let sample_len = std::cmp::min(bytes.len(), 4096);
+        let sample = &bytes[..sample_len];
+        if sample.contains(&0) {
+            return false;
+        }
+        let control_count = sample
+            .iter()
+            .filter(|b| {
+                let c = **b;
+                c < 0x20 && c != b'\n' && c != b'\r' && c != b'\t'
+            })
+            .count();
+        (control_count as f32 / sample_len as f32) <= 0.12
+    }
+
+    fn extract_semantic_excerpt_from_bytes(bytes: &[u8], max_chars: usize) -> Option<String> {
+        if max_chars == 0 || !Self::is_probably_text_bytes(bytes) {
+            return None;
+        }
+        let excerpt = String::from_utf8_lossy(bytes)
+            .chars()
+            .take(max_chars)
+            .collect::<String>();
+        if excerpt.trim().is_empty() {
+            None
+        } else {
+            Some(excerpt)
+        }
+    }
+
+    fn app_token_stopword(token: &str) -> bool {
+        matches!(
+            token,
+            "the"
+                | "and"
+                | "for"
+                | "with"
+                | "from"
+                | "into"
+                | "this"
+                | "that"
+                | "are"
+                | "was"
+                | "were"
+                | "you"
+                | "your"
+                | "http"
+                | "https"
+                | "www"
+                | "com"
+                | "org"
+                | "net"
+                | "api"
+                | "app"
+                | "apps"
+                | "dashboard"
+                | "tool"
+                | "page"
+                | "static"
+                | "dynamic"
+        )
+    }
+
+    fn append_semantic_tokens(
+        target: &mut std::collections::HashSet<String>,
+        text: &str,
+        max_tokens: usize,
+    ) {
+        if target.len() >= max_tokens {
+            return;
+        }
+        for raw in text.split(|c: char| !c.is_ascii_alphanumeric()) {
+            let token = raw.trim().to_ascii_lowercase();
+            if token.len() < 3 || Self::app_token_stopword(&token) {
+                continue;
+            }
+            target.insert(token);
+            if target.len() >= max_tokens {
+                break;
+            }
+        }
+    }
+
+    fn jaccard_similarity(
+        left: &std::collections::HashSet<String>,
+        right: &std::collections::HashSet<String>,
+    ) -> f32 {
+        if left.is_empty() || right.is_empty() {
+            return 0.0;
+        }
+        let inter = left.intersection(right).count() as f32;
+        let union = left.union(right).count() as f32;
+        if union <= f32::EPSILON {
+            0.0
+        } else {
+            inter / union
+        }
+    }
+
+    fn compact_app_lookup_key(value: &str) -> String {
+        value
+            .to_ascii_lowercase()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect()
+    }
+
+    fn should_skip_app_inventory_dir(name: &str) -> bool {
+        matches!(
+            name.trim().to_ascii_lowercase().as_str(),
+            ".git"
+                | ".hg"
+                | ".svn"
+                | "__pycache__"
+                | ".mypy_cache"
+                | ".pytest_cache"
+                | ".ruff_cache"
+                | ".turbo"
+                | ".next"
+                | ".venv"
+                | "node_modules"
+                | "_deps"
+                | "target"
+        )
+    }
+
+    fn preferred_app_file_rank(path: &str) -> usize {
+        let lower = path.trim().replace('\\', "/").to_ascii_lowercase();
+        match lower.as_str() {
+            ".app_meta.json" => 0,
+            "app.py" => 1,
+            "main.py" => 2,
+            "server.py" => 3,
+            "server.js" | "server.ts" => 4,
+            "index.html" => 5,
+            "package.json" => 6,
+            "requirements.txt" => 7,
+            "pyproject.toml" => 8,
+            "vite.config.ts" | "vite.config.js" => 9,
+            "src/main.tsx" | "src/main.jsx" => 10,
+            "src/app.tsx" | "src/app.jsx" => 11,
+            "src/index.tsx" | "src/index.jsx" => 12,
+            "readme.md" => 13,
+            _ if lower.ends_with("/app.py") => 14,
+            _ if lower.ends_with("/main.py") => 15,
+            _ if lower.ends_with("/server.py") || lower.ends_with("/server.js") => 16,
+            _ if lower.ends_with("/index.html") => 17,
+            _ if lower.ends_with("/package.json") => 18,
+            _ if lower.ends_with("/requirements.txt") => 19,
+            _ if lower.ends_with(".html") => 30,
+            _ if lower.ends_with(".py") => 31,
+            _ if lower.ends_with(".ts") || lower.ends_with(".tsx") => 32,
+            _ if lower.ends_with(".js") || lower.ends_with(".jsx") => 33,
+            _ if lower.ends_with(".css") => 34,
+            _ => 100,
+        }
+    }
+
+    fn score_deployed_app_match(query: &str, app_id: &str, title: &str) -> Option<(f32, String)> {
+        let query = query.trim();
+        if query.is_empty() {
+            return None;
+        }
+        let normalized_query = Self::normalize_app_title(query);
+        let normalized_title = Self::normalize_app_title(title);
+        let compact_query = Self::compact_app_lookup_key(query);
+        let compact_title = Self::compact_app_lookup_key(title);
+        let compact_id = Self::compact_app_lookup_key(app_id);
+
+        if !compact_query.is_empty() && compact_query == compact_id {
+            return Some((1.0, "exact_id".to_string()));
+        }
+        if !normalized_query.is_empty() && normalized_query == normalized_title {
+            return Some((0.99, "exact_title".to_string()));
+        }
+        if !compact_query.is_empty() && compact_id.contains(&compact_query) {
+            return Some((0.94, "id_substring".to_string()));
+        }
+        if !compact_query.is_empty() && compact_title.contains(&compact_query) {
+            return Some((0.92, "title_substring".to_string()));
+        }
+
+        let mut query_tokens = std::collections::HashSet::new();
+        Self::append_semantic_tokens(&mut query_tokens, &normalized_query, 18);
+        let mut app_tokens = std::collections::HashSet::new();
+        Self::append_semantic_tokens(&mut app_tokens, &normalized_title, 24);
+        Self::append_semantic_tokens(&mut app_tokens, app_id, 28);
+        if query_tokens.is_empty() || app_tokens.is_empty() {
+            return None;
+        }
+        let overlap = Self::jaccard_similarity(&query_tokens, &app_tokens);
+        if overlap < 0.20 {
+            None
+        } else {
+            Some((0.35 + (overlap * 0.55), "token_overlap".to_string()))
+        }
+    }
+
+    fn rank_deployed_apps(
+        query: &str,
+        apps: &[serde_json::Value],
+    ) -> Vec<(f32, String, serde_json::Value, String)> {
+        let mut ranked_apps: Vec<(f32, String, serde_json::Value, String)> = apps
+            .iter()
+            .map(|app| {
+                let app_id = app
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let title = app
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("App")
+                    .to_string();
+                let (score, reason) = if query.is_empty() {
+                    (0.0, "listed".to_string())
+                } else {
+                    Self::score_deployed_app_match(query, &app_id, &title)
+                        .unwrap_or((0.0, "no_match".to_string()))
+                };
+                (score, app_id, app.clone(), reason)
+            })
+            .collect();
+        ranked_apps.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        ranked_apps
+    }
+
+    fn select_best_ranked_app<'a>(
+        query: &str,
+        ranked_apps: &'a [(f32, String, serde_json::Value, String)],
+    ) -> Option<&'a (f32, String, serde_json::Value, String)> {
+        if query.is_empty() {
+            return if ranked_apps.len() == 1 {
+                ranked_apps.first()
+            } else {
+                None
+            };
+        }
+
+        ranked_apps.first().filter(|(score, _, _, _)| {
+            let next_score = ranked_apps.get(1).map(|row| row.0).unwrap_or(0.0);
+            *score >= 0.55 || (*score >= 0.30 && (*score - next_score) >= 0.10)
+        })
+    }
+
+    async fn collect_app_file_inventory(
+        &self,
+        app_dir: &std::path::Path,
+        max_files: usize,
+    ) -> (Vec<serde_json::Value>, usize, u64, bool) {
+        let root = app_dir.to_path_buf();
+        let capped_max = max_files.clamp(1, 200);
+        match tokio::task::spawn_blocking(move || {
+            let mut rows: Vec<(usize, String, u64)> = Vec::new();
+            let mut total_files = 0usize;
+            let mut total_bytes = 0u64;
+
+            let walker = walkdir::WalkDir::new(&root)
+                .into_iter()
+                .filter_entry(|entry| {
+                    if !entry.file_type().is_dir() {
+                        return true;
+                    }
+                    entry
+                        .file_name()
+                        .to_str()
+                        .map(|name| !Self::should_skip_app_inventory_dir(name))
+                        .unwrap_or(true)
+                });
+
+            for entry in walker {
+                let Ok(entry) = entry else {
+                    continue;
+                };
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                total_files += 1;
+                let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                total_bytes = total_bytes.saturating_add(len);
+                let relative = entry
+                    .path()
+                    .strip_prefix(&root)
+                    .unwrap_or(entry.path())
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                rows.push((Self::preferred_app_file_rank(&relative), relative, len));
+            }
+
+            rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            let truncated = rows.len() > capped_max;
+            let files = rows
+                .into_iter()
+                .take(capped_max)
+                .map(|(_, path, bytes)| serde_json::json!({ "path": path, "bytes": bytes }))
+                .collect::<Vec<_>>();
+            (files, total_files, total_bytes, truncated)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => (Vec::new(), 0, 0, false),
+        }
+    }
+
+    async fn build_deployed_app_inspection(
+        &self,
+        app: &serde_json::Value,
+        include_files: bool,
+        include_logs: bool,
+    ) -> Option<serde_json::Value> {
+        let app_id = app
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())?;
+        let title = app
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("App")
+            .to_string();
+        let app_dir = self.app_registry.get_dir(app_id).await?;
+        let meta_path = app_dir.join(".app_meta.json");
+        let meta: Option<serde_json::Value> = tokio::fs::read(&meta_path)
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+
+        let local_base = Self::user_facing_local_base_url();
+        let relative_url = app.get("url").and_then(|v| v.as_str()).unwrap_or("/apps/");
+        let local_url = Self::absolutize_public_url(Some(local_base.as_str()), relative_url);
+        let access_guard_enabled = app
+            .get("access_guard_enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let required_inputs = meta
+            .as_ref()
+            .map(crate::actions::app::parse_required_inputs)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| {
+                serde_json::json!({
+                    "key": item.key,
+                    "sensitive": item.sensitive,
+                })
+            })
+            .collect::<Vec<_>>();
+        let config_keys = meta
+            .as_ref()
+            .and_then(|m| m.get("config_values").and_then(|v| v.as_object()))
+            .map(|obj| obj.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        let (files, file_count, file_bytes, file_list_truncated) = if include_files {
+            self.collect_app_file_inventory(&app_dir, 48).await
+        } else {
+            (Vec::new(), 0, 0, false)
+        };
+        let suggested_read_files = files
+            .iter()
+            .filter_map(|row| row.get("path").and_then(|v| v.as_str()))
+            .take(8)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let recent_runtime_logs = if include_logs
+            && !app
+                .get("is_static")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true)
+        {
+            let tail = crate::actions::app::read_local_runtime_log_tail(&app_dir, 4096).await;
+            if tail.trim().is_empty() {
+                None
+            } else {
+                Some(tail)
+            }
+        } else {
+            None
+        };
+
+        let mut out = serde_json::json!({
+            "id": app_id,
+            "title": title,
+            "app_dir": app_dir.to_string_lossy().to_string(),
+            "metadata_path": meta_path.to_string_lossy().to_string(),
+          "local_url": local_url,
+          "running": app.get("running").and_then(|v| v.as_bool()).unwrap_or(false),
+          "is_static": app.get("is_static").and_then(|v| v.as_bool()).unwrap_or(true),
+          "runtime_mode": app.get("runtime_mode").and_then(|v| v.as_str()).unwrap_or("unknown"),
+          "created_at": app.get("created_at").and_then(|v| v.as_str()).unwrap_or(""),
+          "port": app.get("port").and_then(|v| v.as_u64()),
+          "access_guard_enabled": access_guard_enabled,
+          "entry_command": meta.as_ref().and_then(|m| m.get("entry_command").and_then(|v| v.as_str())),
+          "install_command": meta.as_ref().and_then(|m| m.get("install_command").and_then(|v| v.as_str())),
+          "runtime_preference": meta.as_ref().and_then(|m| m.get("runtime_preference").and_then(|v| v.as_str())),
+            "runtime_image": meta.as_ref().and_then(|m| m.get("runtime_image").and_then(|v| v.as_str())),
+            "required_inputs": required_inputs,
+            "config_keys": config_keys,
+            "file_count": file_count,
+            "file_bytes": file_bytes,
+            "suggested_read_files": suggested_read_files,
+            "suggested_actions": ["file_read", "file_write", "app_restart", "http_get"],
+        });
+        if let Some(obj) = out.as_object_mut() {
+            if include_files {
+                obj.insert("files".to_string(), serde_json::json!(files));
+                obj.insert(
+                    "file_list_truncated".to_string(),
+                    serde_json::json!(file_list_truncated),
+                );
+            }
+            if let Some(log_tail) = recent_runtime_logs {
+                obj.insert(
+                    "recent_runtime_logs".to_string(),
+                    serde_json::json!(log_tail),
+                );
+            }
+        }
+        Some(out)
+    }
+
+    fn sample_overlap_tokens(
+        left: &std::collections::HashSet<String>,
+        right: &std::collections::HashSet<String>,
+        max_items: usize,
+    ) -> Vec<String> {
+        let mut overlap: Vec<String> = left.intersection(right).cloned().collect();
+        overlap.sort_unstable();
+        overlap.into_iter().take(max_items).collect()
+    }
+
+    fn build_requested_app_fingerprint(
+        arguments: &serde_json::Value,
+    ) -> Option<AppSemanticFingerprint> {
+        let requested_files = arguments.get("files").and_then(|v| v.as_object())?;
+        let requested_title = arguments
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(Self::normalize_app_title)
+            .unwrap_or_default();
+        let is_static = arguments
+            .get("entry_command")
+            .and_then(|v| v.as_str())
+            .is_none();
+
+        let mut title_tokens = std::collections::HashSet::new();
+        Self::append_semantic_tokens(&mut title_tokens, &requested_title, 24);
+
+        let mut file_tokens = std::collections::HashSet::new();
+        let mut keyword_tokens = std::collections::HashSet::new();
+        for (path, value) in requested_files {
+            Self::append_semantic_tokens(&mut file_tokens, path, 80);
+            if let Some(content) = value.as_str() {
+                // Bound extraction cost on very large generated files.
+                let excerpt = content.chars().take(20_000).collect::<String>();
+                Self::append_semantic_tokens(&mut keyword_tokens, &excerpt, 420);
+            }
+        }
+
+        Some(AppSemanticFingerprint {
+            title_tokens,
+            keyword_tokens,
+            file_tokens,
+            is_static,
+        })
+    }
+
+    async fn build_existing_app_fingerprint(
+        &self,
+        app_id: &str,
+        app: &serde_json::Value,
+    ) -> Option<AppSemanticFingerprint> {
+        let app_dir = self.app_registry.get_dir(app_id).await?;
+        let title = app
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(Self::normalize_app_title)
+            .unwrap_or_default();
+        let is_static = app
+            .get("is_static")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        let mut title_tokens = std::collections::HashSet::new();
+        Self::append_semantic_tokens(&mut title_tokens, &title, 24);
+
+        let mut file_tokens = std::collections::HashSet::new();
+        let mut keyword_tokens = std::collections::HashSet::new();
+        let mut dirs = vec![app_dir.clone()];
+        let mut files_seen = 0usize;
+        let mut char_budget = 120_000usize;
+
+        while let Some(dir) = dirs.pop() {
+            let mut entries = match tokio::fs::read_dir(&dir).await {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                let metadata = match entry.metadata().await {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if metadata.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                files_seen += 1;
+                if files_seen > 64 {
+                    break;
+                }
+                let relative = path
+                    .strip_prefix(&app_dir)
+                    .unwrap_or(path.as_path())
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                Self::append_semantic_tokens(&mut file_tokens, &relative, 120);
+                if char_budget == 0 {
+                    continue;
+                }
+                if metadata.len() > 1_000_000 {
+                    continue;
+                }
+                let Ok(content) = tokio::fs::read(&path).await else {
+                    continue;
+                };
+                let take_chars = std::cmp::min(char_budget, 24_000);
+                let Some(excerpt) = Self::extract_semantic_excerpt_from_bytes(&content, take_chars)
+                else {
+                    continue;
+                };
+                char_budget = char_budget.saturating_sub(excerpt.chars().count());
+                Self::append_semantic_tokens(&mut keyword_tokens, &excerpt, 520);
+            }
+        }
+
+        Some(AppSemanticFingerprint {
+            title_tokens,
+            keyword_tokens,
+            file_tokens,
+            is_static,
+        })
+    }
+
+    fn score_app_similarity(
+        requested: &AppSemanticFingerprint,
+        existing: &AppSemanticFingerprint,
+    ) -> (f32, String) {
+        let title_score = Self::jaccard_similarity(&requested.title_tokens, &existing.title_tokens);
+        let keyword_score =
+            Self::jaccard_similarity(&requested.keyword_tokens, &existing.keyword_tokens);
+        let file_score = Self::jaccard_similarity(&requested.file_tokens, &existing.file_tokens);
+        let runtime_bonus = if requested.is_static == existing.is_static {
+            0.05
+        } else {
+            0.0
+        };
+        let score =
+            (0.35 * title_score) + (0.40 * keyword_score) + (0.20 * file_score) + runtime_bonus;
+        let overlaps =
+            Self::sample_overlap_tokens(&requested.keyword_tokens, &existing.keyword_tokens, 5);
+        let overlap_text = if overlaps.is_empty() {
+            "no strong shared keywords".to_string()
+        } else {
+            format!("shared keywords: {}", overlaps.join(", "))
+        };
+        let reason = format!(
+            "{} | title {:.0}%, content {:.0}%, files {:.0}%",
+            overlap_text,
+            title_score * 100.0,
+            keyword_score * 100.0,
+            file_score * 100.0
+        );
+        (score, reason)
+    }
+
+    async fn app_files_match_existing(
+        &self,
+        app_id: &str,
+        requested_files: &serde_json::Map<String, serde_json::Value>,
+    ) -> bool {
+        if requested_files.is_empty() {
+            return false;
+        }
+        let Some(app_dir) = self.app_registry.get_dir(app_id).await else {
+            return false;
+        };
+        for (relative_path, content_value) in requested_files {
+            let Some(expected) = content_value.as_str() else {
+                return false;
+            };
+            if relative_path.contains("..")
+                || relative_path.starts_with('/')
+                || relative_path.starts_with('\\')
+            {
+                return false;
+            }
+            let file_path = app_dir.join(relative_path);
+            let actual = match tokio::fs::read_to_string(&file_path).await {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            if actual != expected {
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn find_existing_duplicate_app(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Option<AppDuplicateMatch> {
+        let requested_title = arguments
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(Self::normalize_app_title)
+            .unwrap_or_default();
+        let requested_files = arguments.get("files").and_then(|v| v.as_object())?;
+        let requested_fingerprint = Self::build_requested_app_fingerprint(arguments)?;
+        let apps = self.app_registry.list().await;
+        let mut best_fuzzy: Option<AppDuplicateMatch> = None;
+        const SIMILARITY_THRESHOLD: f32 = 0.58;
+
+        for app in apps {
+            let app_id = app
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .unwrap_or("");
+            if app_id.is_empty() {
+                continue;
+            }
+            let existing_title = app
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(Self::normalize_app_title)
+                .unwrap_or_default();
+            let title_match = !requested_title.is_empty()
+                && !existing_title.is_empty()
+                && !Self::is_generic_title(&requested_title)
+                && requested_title == existing_title;
+            let files_match = self.app_files_match_existing(app_id, requested_files).await;
+            if files_match {
+                return Some(AppDuplicateMatch {
+                    app,
+                    match_kind: "exact_files",
+                    score: 1.0,
+                    reason: "files are identical".to_string(),
+                });
+            }
+            if title_match {
+                return Some(AppDuplicateMatch {
+                    app,
+                    match_kind: "exact_title",
+                    score: 0.92,
+                    reason: "title matches exactly".to_string(),
+                });
+            }
+
+            let Some(existing_fingerprint) =
+                self.build_existing_app_fingerprint(app_id, &app).await
+            else {
+                continue;
+            };
+            let (score, reason) =
+                Self::score_app_similarity(&requested_fingerprint, &existing_fingerprint);
+            if score < SIMILARITY_THRESHOLD {
+                continue;
+            }
+            let should_replace = best_fuzzy.as_ref().map(|m| score > m.score).unwrap_or(true);
+            if should_replace {
+                best_fuzzy = Some(AppDuplicateMatch {
+                    app,
+                    match_kind: "fuzzy",
+                    score,
+                    reason,
+                });
+            }
+        }
+
+        best_fuzzy
+    }
+
+    async fn build_app_deploy_self_heal_arguments(
+        &self,
+        current_args: &serde_json::Value,
+        validation_issue: &str,
+        request_channel: &str,
+        attempt: usize,
+        max_attempts: usize,
+    ) -> Result<serde_json::Value> {
+        let context = serde_json::json!({
+            "title": current_args.get("title"),
+            "entry_command": current_args.get("entry_command"),
+            "install_command": current_args.get("install_command"),
+            "runtime_image": current_args.get("runtime_image"),
+            "runtime_preference": current_args.get("runtime_preference"),
+            "required_inputs": current_args.get("required_inputs"),
+            "config": current_args.get("config"),
+            "files": current_args.get("files"),
+        });
+        let context_json = serde_json::to_string(&context).unwrap_or_default();
+        if context_json.len() > 180_000 {
+            anyhow::bail!(
+                "app payload too large for auto-fix prompt ({} chars)",
+                context_json.len()
+            );
+        }
+
+        let system_prompt = "You repair broken deployed apps. Return ONLY a JSON object. No markdown, no explanations.";
+        let user_prompt = format!(
+            "A deployed app failed runtime validation.\n\
+Attempt {}/{}.\n\
+Validation issue:\n{}\n\n\
+Current app_deploy context (JSON):\n{}\n\n\
+Return a JSON object with at least a complete `files` object.\n\
+Optional keys you may include when needed: `entry_command`, `install_command`, `runtime_image`, `runtime_preference`, `required_inputs`, `config`.\n\
+Do not include any extra prose.",
+            attempt,
+            max_attempts,
+            validation_issue.trim(),
+            context_json
+        );
+
+        let empty_actions: Vec<crate::actions::ActionDef> = Vec::new();
+        let repair = self
+            .llm
+            .chat(system_prompt, &user_prompt, &[], &empty_actions)
+            .await?;
+        self.record_llm_usage(request_channel, "app_deploy_self_heal", &repair)
+            .await;
+
+        let parsed = Self::parse_json_object_str(&repair.content)
+            .ok_or_else(|| anyhow::anyhow!("self-heal model returned non-JSON response"))?;
+        let normalized = Self::normalize_app_deploy_arguments(&parsed);
+        let Some(patch_obj) = normalized.as_object() else {
+            anyhow::bail!("self-heal patch was not a JSON object");
+        };
+        let Some(patch_files) = patch_obj.get("files").and_then(|v| v.as_object()) else {
+            anyhow::bail!("self-heal patch missing `files` object");
+        };
+        if patch_files.is_empty() {
+            anyhow::bail!("self-heal patch returned empty `files`");
+        }
+
+        let current_sig = Self::app_deploy_files_signature(current_args).unwrap_or_default();
+        let next_sig = serde_json::to_string(&Self::canonicalize_json_value(
+            &serde_json::Value::Object(patch_files.clone()),
+        ))
+        .unwrap_or_default();
+        if !current_sig.is_empty() && current_sig == next_sig {
+            anyhow::bail!("self-heal patch did not change files");
+        }
+
+        let mut merged = current_args.clone();
+        let Some(merged_obj) = merged.as_object_mut() else {
+            anyhow::bail!("current app args are not an object");
+        };
+        merged_obj.insert(
+            "files".to_string(),
+            serde_json::Value::Object(patch_files.clone()),
+        );
+        for key in [
+            "entry_command",
+            "install_command",
+            "runtime_image",
+            "runtime_preference",
+            "required_inputs",
+            "config",
+        ] {
+            if let Some(value) = patch_obj.get(key) {
+                merged_obj.insert(key.to_string(), value.clone());
+            }
+        }
+
+        Ok(merged)
+    }
+
     async fn validate_and_capture_app_preview(
         &self,
         app_url_with_key: &str,
@@ -539,7 +1494,7 @@ impl Agent {
             // Primary readiness signal: direct HTTP probe to the deployed app URL.
             if let Some(client) = &http_client {
                 match client.get(&internal_probe_url).send().await {
-                    Ok(resp) if !resp.status().is_server_error() => {
+                    Ok(mut resp) if !resp.status().is_server_error() => {
                         let status = resp.status();
                         if let Some(integration) = &integration {
                             let sidecar_session = match integration.create_session().await {
@@ -562,6 +1517,23 @@ impl Agent {
                                     .navigate(&sidecar_session, app_url_with_key)
                                     .await?;
                                 tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+                                let content = integration.get_content(&sidecar_session).await?;
+                                let combined = format!("{}\n{}", content.title, content.body_text)
+                                    .to_lowercase();
+                                let lock_page_detected = combined.contains("access key required")
+                                    || (combined.contains("enter access key")
+                                        && combined.contains("unlock"));
+                                if lock_page_detected {
+                                    anyhow::bail!("app opened in locked mode");
+                                }
+                                if let Some(marker) =
+                                    Self::detect_app_runtime_error_marker(&combined)
+                                {
+                                    anyhow::bail!(
+                                        "app page reports runtime error marker: {}",
+                                        marker
+                                    );
+                                }
                                 let screenshot = integration.screenshot(&sidecar_session).await?;
                                 if screenshot.is_empty() {
                                     anyhow::bail!("empty screenshot returned");
@@ -585,16 +1557,37 @@ impl Agent {
                                     ));
                                 }
                                 Err(e) => {
+                                    let err_text = e.to_string();
+                                    if err_text.contains("runtime error marker")
+                                        || err_text.contains("locked mode")
+                                    {
+                                        last_error = err_text;
+                                        tokio::time::sleep(std::time::Duration::from_millis(500))
+                                            .await;
+                                        continue;
+                                    }
                                     return Ok((
                                         None,
                                         true,
                                         attempt,
                                         format!(
                                             "HTTP probe passed on attempt {} (status {}, preview unavailable: {})",
-                                            attempt, status, e
+                                            attempt, status, err_text
                                         ),
                                     ));
                                 }
+                            }
+                        }
+
+                        if let Ok(body) = resp.text().await {
+                            let lower = body.to_lowercase();
+                            if let Some(marker) = Self::detect_app_runtime_error_marker(&lower) {
+                                last_error = format!(
+                                    "HTTP probe body reports runtime error marker: {}",
+                                    marker
+                                );
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                continue;
                             }
                         }
 
@@ -644,6 +1637,9 @@ impl Agent {
                     || (combined.contains("enter access key") && combined.contains("unlock"));
                 if lock_page_detected {
                     anyhow::bail!("app opened in locked mode");
+                }
+                if let Some(marker) = Self::detect_app_runtime_error_marker(&combined) {
+                    anyhow::bail!("app page reports runtime error marker: {}", marker);
                 }
 
                 let screenshot = integration.screenshot(&sidecar_session).await?;
@@ -1347,6 +2343,511 @@ impl Agent {
         .await
     }
 
+    async fn restart_deployed_app_from_metadata(&self, app_id: &str) -> Result<serde_json::Value> {
+        let app_id = app_id.trim();
+        if app_id.is_empty() {
+            anyhow::bail!("Missing app_id");
+        }
+
+        let app_dir = if let Some(path) = self.app_registry.get_dir(app_id).await {
+            path
+        } else {
+            let fallback = self.data_dir.join("apps").join(app_id);
+            if !fallback.exists() {
+                anyhow::bail!("App '{}' not found", app_id);
+            }
+            fallback
+        };
+
+        let meta_path = app_dir.join(".app_meta.json");
+        let mut meta: serde_json::Value = match tokio::fs::read(&meta_path).await {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|_| serde_json::json!({})),
+            Err(_) => serde_json::json!({}),
+        };
+        if !meta.is_object() {
+            meta = serde_json::json!({});
+        }
+
+        let title = meta
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or(app_id)
+            .to_string();
+        let entry_command = meta
+            .get("entry_command")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let install_command = meta
+            .get("install_command")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let runtime_image = meta
+            .get("runtime_image")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let runtime_preference = crate::actions::app::runtime_preference_from_opt(
+            meta.get("runtime_preference").and_then(|v| v.as_str()),
+        );
+        let required_inputs = crate::actions::app::parse_required_inputs(&meta);
+        let config_values: std::collections::HashMap<String, String> = meta
+            .get("config_values")
+            .and_then(|v| v.as_object())
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| {
+                        let value = match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            serde_json::Value::Bool(b) => b.to_string(),
+                            serde_json::Value::Number(n) => n.to_string(),
+                            _ => return None,
+                        };
+                        Some((k.clone(), value))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let access_guard_enabled = meta
+            .get("access_guard_enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let access_key = if access_guard_enabled {
+            meta.get("access_key")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(crate::actions::app::generate_access_key)
+        } else {
+            String::new()
+        };
+
+        if meta.get("access_guard_enabled").is_none()
+            || (access_guard_enabled && meta.get("access_key").is_none())
+        {
+            meta["access_guard_enabled"] = serde_json::Value::Bool(access_guard_enabled);
+            meta["access_key"] = serde_json::Value::String(access_key.clone());
+            let _ = tokio::fs::write(
+                &meta_path,
+                serde_json::to_vec_pretty(&meta).unwrap_or_default(),
+            )
+            .await;
+        }
+
+        self.app_registry.stop_runtime(app_id).await?;
+
+        let relative_url = format!("/apps/{}/", app_id);
+        let local_base = Self::user_facing_local_base_url();
+        let local_url = Self::absolutize_public_url(Some(local_base.as_str()), &relative_url);
+        let relative_access_url = if access_guard_enabled {
+            format!("/apps/{}/?key={}", app_id, access_key)
+        } else {
+            relative_url.clone()
+        };
+        let local_access_url =
+            Self::absolutize_public_url(Some(local_base.as_str()), &relative_access_url);
+
+        if let Some(entry_command) = entry_command {
+            let Some(port) = self.app_registry.find_available_port().await else {
+                anyhow::bail!("No available app port");
+            };
+            let llm_env = self.app_model_env_vars();
+
+            let (resolved_env, missing_sensitive, missing_config) =
+                crate::actions::app::resolve_required_env_values(
+                    &self.config_dir,
+                    &self.data_dir,
+                    &required_inputs,
+                    &llm_env,
+                    &config_values,
+                )
+                .await?;
+
+            if !missing_sensitive.is_empty() || !missing_config.is_empty() {
+                let mut missing_all = missing_sensitive.clone();
+                for item in &missing_config {
+                    if !missing_all.iter().any(|existing| existing == item) {
+                        missing_all.push(item.clone());
+                    }
+                }
+                let required_secret_keys: Vec<String> = required_inputs
+                    .iter()
+                    .filter(|required| required.sensitive)
+                    .map(|required| required.key.clone())
+                    .collect();
+                let required_config_keys: Vec<String> = required_inputs
+                    .iter()
+                    .filter(|required| !required.sensitive)
+                    .map(|required| required.key.clone())
+                    .collect();
+                return Ok(serde_json::json!({
+                    "status": "needs_secrets",
+                    "app_id": app_id,
+                    "title": title,
+                    "url": relative_url,
+                    "local_url": local_url,
+                    "missing_env": missing_sensitive,
+                    "missing_config": missing_config,
+                    "missing_inputs": missing_all,
+                    "required_inputs": required_inputs,
+                    "required_secrets": required_secret_keys.clone(),
+                    "required_env": required_secret_keys,
+                    "required_config": required_config_keys,
+                    "message": "Missing required inputs. Use set secret KEY=VALUE for sensitive values; provide config for non-sensitive values."
+                }));
+            }
+
+            let runtime_handle = crate::actions::app::launch_dynamic_runtime(
+                app_id,
+                &app_dir,
+                &entry_command,
+                install_command.as_deref(),
+                port,
+                &resolved_env,
+                runtime_image.as_deref(),
+                runtime_preference,
+                None,
+            )
+            .await?;
+
+            let (child, container_id, runtime_label) = match runtime_handle {
+                crate::actions::app::DynamicRuntimeHandle::Container(container_id) => {
+                    (None, Some(container_id), "container")
+                }
+                crate::actions::app::DynamicRuntimeHandle::Process(child) => {
+                    (Some(child), None, "local_process")
+                }
+            };
+            let diagnostics_dir = app_dir.clone();
+
+            self.app_registry
+                .register_dynamic(
+                    app_id.to_string(),
+                    crate::actions::app::DynamicAppRegistration {
+                        title: title.clone(),
+                        app_dir,
+                        child,
+                        container_id,
+                        port,
+                        access_key: access_key.clone(),
+                        access_guard_enabled,
+                    },
+                )
+                .await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            if !self.app_registry.runtime_is_alive(app_id).await {
+                let logs =
+                    crate::actions::app::read_local_runtime_log_tail(&diagnostics_dir, 4096).await;
+                if logs.is_empty() {
+                    anyhow::bail!("App process stopped shortly after restart.");
+                }
+                anyhow::bail!(
+                    "App process stopped shortly after restart. Recent runtime logs:\n{}",
+                    logs
+                );
+            }
+
+            return Ok(serde_json::json!({
+                "status": "restarted",
+                "type": "dynamic",
+                "runtime": runtime_label,
+                "app_id": app_id,
+                "title": title,
+                "url": relative_url,
+                "local_url": local_url,
+                "access_url": relative_access_url,
+                "local_access_url": local_access_url,
+                "access_guard_enabled": access_guard_enabled,
+                "port": port,
+                "runtime_preference": runtime_preference.as_str(),
+            }));
+        }
+
+        self.app_registry
+            .register_static(
+                app_id.to_string(),
+                title.clone(),
+                app_dir,
+                access_key.clone(),
+                access_guard_enabled,
+            )
+            .await;
+        Ok(serde_json::json!({
+            "status": "restarted",
+            "type": "static",
+            "app_id": app_id,
+            "title": title,
+            "url": relative_url,
+            "local_url": local_url,
+            "access_url": relative_access_url,
+            "local_access_url": local_access_url,
+            "access_guard_enabled": access_guard_enabled,
+            "runtime_preference": runtime_preference.as_str(),
+        }))
+    }
+
+    pub(crate) async fn handle_app_restart_tool_call(
+        &self,
+        call: &crate::core::llm::ToolCall,
+        stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+        _request_channel: &str,
+        conversation_id: Option<&str>,
+    ) -> Result<String> {
+        let explicit_app_id = call
+            .arguments
+            .get("app_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let query = call
+            .arguments
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+
+        let mut resolved_app_id = explicit_app_id.clone();
+        if resolved_app_id.is_empty() {
+            let apps = self.app_registry.list().await;
+            if apps.is_empty() {
+                let out = serde_json::json!({
+                    "app_id": serde_json::Value::Null,
+                    "query": if query.is_empty() { serde_json::Value::Null } else { serde_json::json!(query) },
+                    "status": "not_found",
+                    "message": "No deployed apps are currently registered."
+                });
+                let formatted = serde_json::to_string_pretty(&out)?;
+                if let Some(tx) = stream_tx {
+                    let _ = tx.try_send(StreamEvent::ToolResult {
+                        name: call.name.clone(),
+                        content: formatted.clone(),
+                    });
+                }
+                return Ok(formatted);
+            }
+
+            let ranked_apps = Self::rank_deployed_apps(&query, &apps);
+            let best_match = Self::select_best_ranked_app(&query, &ranked_apps);
+            if let Some((_, app_id, _, _)) = best_match {
+                resolved_app_id = app_id.clone();
+            } else {
+                let app_summaries = ranked_apps
+                    .iter()
+                    .take(10)
+                    .map(|(score, _, app, reason)| {
+                        let relative_url = app.get("url").and_then(|v| v.as_str()).unwrap_or("/apps/");
+                        let local_url = Self::absolutize_public_url(
+                            Some(Self::user_facing_local_base_url().as_str()),
+                            relative_url,
+                        );
+                        serde_json::json!({
+                            "id": app.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                            "title": app.get("title").and_then(|v| v.as_str()).unwrap_or("App"),
+                            "running": app.get("running").and_then(|v| v.as_bool()).unwrap_or(false),
+                            "local_url": local_url,
+                            "match_score": score,
+                            "match_reason": reason,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let out = serde_json::json!({
+                    "app_id": serde_json::Value::Null,
+                    "query": if query.is_empty() { serde_json::Value::Null } else { serde_json::json!(query) },
+                    "status": "not_found",
+                    "apps": app_summaries,
+                    "message": if query.is_empty() {
+                        "app_restart needs an app_id or query to identify which deployed app to restart."
+                    } else {
+                        "No single deployed app matched the restart request."
+                    }
+                });
+                let formatted = serde_json::to_string_pretty(&out)?;
+                if let Some(tx) = stream_tx {
+                    let _ = tx.try_send(StreamEvent::ToolResult {
+                        name: call.name.clone(),
+                        content: formatted.clone(),
+                    });
+                }
+                return Ok(formatted);
+            }
+        }
+
+        let out = self
+            .restart_deployed_app_from_metadata(&resolved_app_id)
+            .await?;
+        if out
+            .get("status")
+            .and_then(|v| v.as_str())
+            .is_some_and(|status| status == "restarted")
+        {
+            self.trigger_arkpulse_refresh("app_restart");
+            if let Some(cid) = conversation_id {
+                let title = out.get("title").and_then(|v| v.as_str()).unwrap_or("App");
+                let canonical_url = format!("/apps/{}/", resolved_app_id);
+                self.persist_last_deployed_app_context(
+                    cid,
+                    &resolved_app_id,
+                    title,
+                    &canonical_url,
+                )
+                .await;
+            }
+        }
+
+        let formatted = serde_json::to_string_pretty(&out)?;
+        if let Some(tx) = stream_tx {
+            let _ = tx.try_send(StreamEvent::ToolResult {
+                name: call.name.clone(),
+                content: formatted.clone(),
+            });
+        }
+        Ok(formatted)
+    }
+
+    pub(crate) async fn handle_app_inspect_tool_call(
+        &self,
+        call: &crate::core::llm::ToolCall,
+        stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+        _request_channel: &str,
+        conversation_id: Option<&str>,
+    ) -> Result<String> {
+        let query = call
+            .arguments
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let include_files = call
+            .arguments
+            .get("include_files")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let include_logs = call
+            .arguments
+            .get("include_logs")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let limit = call
+            .arguments
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10)
+            .clamp(1, 25) as usize;
+
+        let apps = self.app_registry.list().await;
+        if apps.is_empty() {
+            let out = serde_json::json!({
+                "query": if query.is_empty() { serde_json::Value::Null } else { serde_json::json!(query) },
+                "total_apps": 0,
+                "matched_app": serde_json::Value::Null,
+                "apps": Vec::<serde_json::Value>::new(),
+                "message": "No deployed apps are currently registered."
+            });
+            let formatted = serde_json::to_string_pretty(&out)?;
+            if let Some(tx) = stream_tx {
+                let _ = tx.try_send(StreamEvent::ToolResult {
+                    name: call.name.clone(),
+                    content: formatted.clone(),
+                });
+            }
+            return Ok(formatted);
+        }
+
+        let ranked_apps = Self::rank_deployed_apps(&query, &apps);
+        let best_match = Self::select_best_ranked_app(&query, &ranked_apps);
+
+        let mut app_summaries = Vec::new();
+        for (score, _app_id, app, reason) in ranked_apps.iter().take(limit) {
+            let title = app.get("title").and_then(|v| v.as_str()).unwrap_or("App");
+            let relative_url = app.get("url").and_then(|v| v.as_str()).unwrap_or("/apps/");
+            let local_url = Self::absolutize_public_url(
+                Some(Self::user_facing_local_base_url().as_str()),
+                relative_url,
+            );
+            let mut summary = serde_json::json!({
+                "id": app.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                "title": title,
+                "running": app.get("running").and_then(|v| v.as_bool()).unwrap_or(false),
+                "is_static": app.get("is_static").and_then(|v| v.as_bool()).unwrap_or(true),
+                "runtime_mode": app.get("runtime_mode").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                "local_url": local_url,
+            });
+            if !query.is_empty() {
+                if let Some(obj) = summary.as_object_mut() {
+                    obj.insert("match_score".to_string(), serde_json::json!(score));
+                    obj.insert("match_reason".to_string(), serde_json::json!(reason));
+                }
+            }
+            app_summaries.push(summary);
+        }
+
+        let matched_app = if let Some((_, app_id, app, _)) = best_match {
+            let inspection = self
+                .build_deployed_app_inspection(app, include_files, include_logs)
+                .await;
+            if let (Some(cid), Some(details)) = (conversation_id, inspection.as_ref()) {
+                let title = details
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("App");
+                let canonical_url = format!("/apps/{}/", app_id);
+                self.persist_last_deployed_app_context(cid, app_id, title, &canonical_url)
+                    .await;
+            }
+            inspection.unwrap_or_else(|| {
+                serde_json::json!({
+                    "id": app_id,
+                    "title": app.get("title").and_then(|v| v.as_str()).unwrap_or("App"),
+                    "message": "Matched app but failed to read detailed app metadata."
+                })
+            })
+        } else {
+            serde_json::Value::Null
+        };
+
+        let message = if matched_app.is_null() {
+            if query.is_empty() {
+                "Listed deployed apps. Use a title or app ID in query to inspect one in detail."
+                    .to_string()
+            } else {
+                format!(
+                    "No single deployed app matched '{}'. Review the listed apps or refine the query.",
+                    query
+                )
+            }
+        } else {
+            let title = matched_app
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("App");
+            let app_dir = matched_app
+                .get("app_dir")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            format!(
+                "Matched deployed app '{}'. Use file_read/file_write on {} to inspect or repair it, then app_restart to apply changes.",
+                title, app_dir
+            )
+        };
+
+        let out = serde_json::json!({
+            "query": if query.is_empty() { serde_json::Value::Null } else { serde_json::json!(query) },
+            "total_apps": apps.len(),
+            "matched_app": matched_app,
+            "apps": app_summaries,
+            "message": message,
+        });
+        let formatted = serde_json::to_string_pretty(&out)?;
+        if let Some(tx) = stream_tx {
+            let _ = tx.try_send(StreamEvent::ToolResult {
+                name: call.name.clone(),
+                content: formatted.clone(),
+            });
+        }
+        Ok(formatted)
+    }
+
     pub(crate) async fn handle_app_deploy_tool_call(
         &self,
         call: &crate::core::llm::ToolCall,
@@ -2022,9 +3523,9 @@ impl Agent {
         trace_ref: &Arc<RwLock<ExecutionTrace>>,
         stream_tx: Option<tokio::sync::mpsc::Sender<StreamEvent>>,
         ctx: ToolExecutionContext<'_>,
-    ) -> Result<String> {
+    ) -> Result<ToolExecutionBatch> {
         if response.tool_calls.is_empty() {
-            return Ok(response.content.clone());
+            return Ok(ToolExecutionBatch::default());
         }
         let request_channel = ctx.request_channel;
         let trace_id = ctx.trace_id;
@@ -2047,13 +3548,14 @@ impl Agent {
             }
         }
 
-        let mut results = Vec::new();
+        let mut results: Vec<ToolCallOutput> = Vec::new();
         for call in unique_calls {
             let call_started = std::time::Instant::now();
             let ctx = ToolHandlerContext {
                 trace_ref,
                 stream_tx: stream_tx.as_ref(),
                 request_channel,
+                conversation_id,
                 public_base_url: public_base_url.as_deref(),
                 integration_aliases: &integration_aliases,
             };
@@ -2099,7 +3601,10 @@ impl Agent {
                             model_slot,
                         })
                         .await;
-                        results.push(output);
+                        results.push(ToolCallOutput {
+                            name: call.name.clone(),
+                            content: output,
+                        });
                         handled = true;
                         break;
                     }
@@ -2161,15 +3666,14 @@ impl Agent {
                         content: msg.clone(),
                     });
                 }
-                results.push(msg);
+                results.push(ToolCallOutput {
+                    name: call.name.clone(),
+                    content: msg,
+                });
             }
         }
 
-        if response.content.is_empty() {
-            Ok(results.join("\n"))
-        } else {
-            Ok(format!("{}\n\n{}", response.content, results.join("\n")))
-        }
+        Ok(ToolExecutionBatch { outputs: results })
     }
 
     /// Legacy monolithic tool execution path. New dispatchers route through
@@ -2559,12 +4063,20 @@ impl Agent {
                     let notify_channel = channel.to_string();
                     let agent_config = self.config.clone();
                     let storage_clone = self.storage.clone();
+                    let notify_conversation_id = call
+                        .arguments
+                        .get("conversation_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
                     let notify_fn: std::sync::Arc<dyn Fn(String, Option<Vec<u8>>) + Send + Sync> =
                         std::sync::Arc::new(move |msg: String, screenshot: Option<Vec<u8>>| {
                             let config = agent_config.clone();
                             let channel = notify_channel.clone();
                             let chat_id = chat_id.clone();
                             let storage = storage_clone.clone();
+                            let conversation_id = notify_conversation_id.clone();
                             let _screenshot = screenshot; // screenshots sent via channel-specific methods
                             tokio::spawn(async move {
                                 // Store as notification in DB so it appears in web UI
@@ -2578,6 +4090,24 @@ impl Agent {
                                     created_at: chrono::Utc::now().to_rfc3339(),
                                 };
                                 let _ = storage.insert_notification(&notif).await;
+
+                                // Also append to conversation so browser prompts are visible in chat thread.
+                                if let Some(cid) = conversation_id.as_deref() {
+                                    let body = format!(
+                                        "[Browser automation] {}\nReply here in chat to continue.",
+                                        msg
+                                    );
+                                    let asst_msg = crate::storage::entities::message::Model {
+                                        id: uuid::Uuid::new_v4().to_string(),
+                                        conversation_id: cid.to_string(),
+                                        role: "assistant".to_string(),
+                                        content: body,
+                                        timestamp: chrono::Utc::now().to_rfc3339(),
+                                        model_used: Some("browser_auto".to_string()),
+                                        trace_id: None,
+                                    };
+                                    let _ = storage.insert_message(&asst_msg).await;
+                                }
 
                                 // Send to Telegram if configured
                                 #[cfg(feature = "telegram")]
@@ -2756,6 +4286,129 @@ impl Agent {
                     .get("expose_public")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
+                let replace_existing_requested = resolved_args
+                    .get("replace_existing")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !replace_existing_requested {
+                    if let Some(duplicate_match) =
+                        self.find_existing_duplicate_app(&resolved_args).await
+                    {
+                        let existing = &duplicate_match.app;
+                        let existing_id = existing
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|id| !id.is_empty())
+                            .unwrap_or("app");
+                        let existing_id_for_cleanup = existing
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|id| !id.is_empty());
+                        let existing_title = existing
+                            .get("title")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Existing app");
+                        let existing_running = existing
+                            .get("running")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let existing_url = existing
+                            .get("access_url")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| existing.get("url").and_then(|v| v.as_str()))
+                            .unwrap_or("/apps/");
+                        let local_base = Self::user_facing_local_base_url();
+                        let local_url =
+                            Self::absolutize_public_url(Some(local_base.as_str()), existing_url);
+                        let public_url = if expose_public_requested {
+                            self.load_public_base_url().await.map(|base| {
+                                Self::absolutize_public_url(Some(base.as_str()), existing_url)
+                            })
+                        } else {
+                            None
+                        };
+                        let mut duplicate_msg_lines = vec![
+                            format!(
+                                "Found an existing deployed app for this request: **{}** (`{}`).",
+                                existing_title, existing_id
+                            ),
+                            format!(
+                                "- Similarity: {} ({:.0}% confidence, {})",
+                                duplicate_match.match_kind,
+                                duplicate_match.score * 100.0,
+                                duplicate_match.reason
+                            ),
+                            format!("- Local: {}", local_url),
+                        ];
+                        if let Some(public_url) = public_url {
+                            duplicate_msg_lines.push(format!("- Public: {}", public_url));
+                        }
+
+                        match Self::resolve_duplicate_app(
+                            duplicate_match.match_kind,
+                            existing_running,
+                        ) {
+                            DuplicateAppResolution::ReuseExisting => {
+                                duplicate_msg_lines.push(
+                                    "Auto-resolution: reusing the existing deployment (exact file match + healthy runtime)."
+                                        .to_string(),
+                                );
+                                let duplicate_msg = duplicate_msg_lines.join("\n");
+                                if let Some(ref tx) = stream_tx {
+                                    let _ = tx.try_send(StreamEvent::ToolResult {
+                                        name: call.name.clone(),
+                                        content: duplicate_msg.clone(),
+                                    });
+                                }
+                                results.push(duplicate_msg);
+                                continue;
+                            }
+                            DuplicateAppResolution::ReplaceExisting => {
+                                let cleanup_note = if let Some(app_id) = existing_id_for_cleanup {
+                                    match self
+                                        .stop_and_remove_existing_app(app_id, Some(existing_title))
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            "Auto-resolution: replacing existing deployment before redeploy."
+                                                .to_string()
+                                        }
+                                        Err(error) => {
+                                            tracing::warn!(
+                                                "failed to cleanup duplicate app {} before redeploy: {}",
+                                                app_id,
+                                                error
+                                            );
+                                            format!(
+                                                "Auto-resolution: continuing with redeploy; cleanup of prior deployment failed: {}",
+                                                error
+                                            )
+                                        }
+                                    }
+                                } else {
+                                    "Auto-resolution: existing app id missing, continuing with redeploy."
+                                        .to_string()
+                                };
+                                if let Some(obj) = resolved_args.as_object_mut() {
+                                    obj.insert(
+                                        "replace_existing".to_string(),
+                                        serde_json::json!(true),
+                                    );
+                                }
+                                duplicate_msg_lines.push(cleanup_note);
+                                let duplicate_msg = duplicate_msg_lines.join("\n");
+                                if let Some(ref tx) = stream_tx {
+                                    let _ = tx.try_send(StreamEvent::ToolResult {
+                                        name: call.name.clone(),
+                                        content: duplicate_msg,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
                 let hook_event_id = uuid::Uuid::new_v4().to_string();
                 let hook_hint = action_message_hint(&resolved_args);
                 self.fire_action_hook(
@@ -2767,20 +4420,7 @@ impl Agent {
                     &hook_event_id,
                 )
                 .await;
-                let llm_env = self
-                    .model_pool
-                    .get(&self.primary_model_id)
-                    .map(|(slot, _)| slot.provider.app_env_vars())
-                    .filter(|env| {
-                        env.iter().any(|(k, v)| {
-                            if v.trim().is_empty() || v == "[ENCRYPTED]" {
-                                return false;
-                            }
-                            k.ends_with("_API_KEY")
-                                || (k == "LLM_PROVIDER" && v.eq_ignore_ascii_case("ollama"))
-                        })
-                    })
-                    .unwrap_or_else(|| self.config.llm.app_env_vars());
+                let llm_env = self.app_model_env_vars();
                 match crate::actions::app::app_deploy(
                     &self.config_dir,
                     &self.data_dir,
@@ -2892,29 +4532,32 @@ impl Agent {
                                 continue;
                             }
                             if parsed.get("url").is_some() || parsed.get("app_id").is_some() {
-                                let title = parsed
+                                let mut title = parsed
                                     .get("title")
                                     .and_then(|v| v.as_str())
-                                    .unwrap_or("App");
-                                let app_type = parsed
+                                    .unwrap_or("App")
+                                    .to_string();
+                                let mut app_type = parsed
                                     .get("type")
                                     .and_then(|v| v.as_str())
-                                    .unwrap_or("static");
+                                    .unwrap_or("static")
+                                    .to_string();
                                 let app_id_raw = parsed
                                     .get("app_id")
                                     .and_then(|v| v.as_str())
                                     .map(|v| v.trim())
                                     .unwrap_or("");
-                                let app_id = if app_id_raw.is_empty() {
-                                    "app"
+                                let mut app_id = if app_id_raw.is_empty() {
+                                    "app".to_string()
                                 } else {
-                                    app_id_raw
+                                    app_id_raw.to_string()
                                 };
-                                let access_key = parsed
+                                let mut access_key = parsed
                                     .get("access_key")
                                     .and_then(|v| v.as_str())
-                                    .unwrap_or("");
-                                let access_guard_enabled = parsed
+                                    .unwrap_or("")
+                                    .to_string();
+                                let mut access_guard_enabled = parsed
                                     .get("access_guard_enabled")
                                     .and_then(|v| v.as_bool())
                                     .unwrap_or(!access_key.is_empty());
@@ -2938,7 +4581,7 @@ impl Agent {
                                         if url_with_key.contains('?') { '&' } else { '?' };
                                     url_with_key.push(separator);
                                     url_with_key.push_str("key=");
-                                    url_with_key.push_str(access_key);
+                                    url_with_key.push_str(&access_key);
                                 }
                                 let mut public_base_for_app = if expose_public_requested {
                                     self.ensure_public_tunnel_base_url(stream_tx.as_ref())
@@ -2948,24 +4591,78 @@ impl Agent {
                                     public_base_url.clone()
                                 };
 
-                                let (preview_url, verified, verify_attempts, verify_detail) = self
+                                let (
+                                    mut preview_url,
+                                    mut verified,
+                                    mut verify_attempts,
+                                    mut verify_detail,
+                                ) = self
                                     .validate_and_capture_app_preview(
                                         &url_with_key,
-                                        app_id,
+                                        &app_id,
                                         stream_tx.as_ref(),
                                     )
                                     .await
                                     .unwrap_or_else(|e| {
                                         (None, false, 0, format!("Validation helper error: {}", e))
                                     });
+
+                                // App self-heal retries intentionally disabled by user request.
+                                let had_public_base = public_base_for_app.is_some();
                                 if expose_public_requested && public_base_for_app.is_none() {
-                                    public_base_for_app = self.load_public_base_url().await;
+                                    // Tunnel URL can appear shortly after initial startup polling.
+                                    // Re-run discovery here so the final chat reply includes the
+                                    // public link whenever it is already available.
+                                    public_base_for_app = self
+                                        .ensure_public_tunnel_base_url(None)
+                                        .await
+                                        .or_else(|| public_base_url.clone());
+                                    if public_base_for_app.is_none() {
+                                        public_base_for_app = self.load_public_base_url().await;
+                                    }
+                                }
+                                if expose_public_requested && !had_public_base {
+                                    if let (Some(public_base), Some(tx)) =
+                                        (public_base_for_app.as_deref(), stream_tx.as_ref())
+                                    {
+                                        let public_access_url = Self::absolutize_public_url(
+                                            Some(public_base),
+                                            &url_with_key,
+                                        );
+                                        let _ = tx.try_send(StreamEvent::ToolResult {
+                                            name: call.name.clone(),
+                                            content: format!(
+                                                "Public URL ready: {}",
+                                                public_access_url
+                                            ),
+                                        });
+                                    }
                                 }
                                 let local_base_url = Self::user_facing_local_base_url();
                                 let local_access_url = Self::absolutize_public_url(
                                     Some(local_base_url.as_str()),
                                     &url_with_key,
                                 );
+                                if let Some(cid) = call
+                                    .arguments
+                                    .get("conversation_id")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                {
+                                    let canonical_url = if app_id.is_empty() {
+                                        "/apps/".to_string()
+                                    } else {
+                                        format!("/apps/{}/", app_id)
+                                    };
+                                    self.persist_last_deployed_app_context(
+                                        cid,
+                                        &app_id,
+                                        &title,
+                                        &canonical_url,
+                                    )
+                                    .await;
+                                }
                                 if let Some(ref tx) = stream_tx {
                                     let _ = tx.try_send(StreamEvent::ToolResult {
                                         name: call.name.clone(),
@@ -3004,42 +4701,40 @@ impl Agent {
                                         "- Local: [Open local app]({})",
                                         local_access_url
                                     ));
-                                    if let Some(public_base) = public_base_for_app.as_deref() {
-                                        let public_access_url = Self::absolutize_public_url(
-                                            Some(public_base),
-                                            &url_with_key,
-                                        );
-                                        if public_access_url != local_access_url {
+                                } else {
+                                    app_message_lines.push(format!(
+                                        "- Local (unverified): [Open local app]({})",
+                                        local_access_url
+                                    ));
+                                }
+                                if let Some(public_base) = public_base_for_app.as_deref() {
+                                    let public_access_url = Self::absolutize_public_url(
+                                        Some(public_base),
+                                        &url_with_key,
+                                    );
+                                    if public_access_url != local_access_url {
+                                        if verified {
                                             app_message_lines.push(format!(
                                                 "- Public: [Open public app]({})",
                                                 public_access_url
                                             ));
+                                        } else {
+                                            app_message_lines.push(format!(
+                                                "- Public (unverified): [Open public app]({})",
+                                                public_access_url
+                                            ));
                                         }
-                                    } else if expose_public_requested {
-                                        app_message_lines.push(
-                                            "- Public: still pending. I started tunnel setup and it should appear shortly."
-                                                .to_string(),
-                                        );
                                     }
                                 } else if expose_public_requested {
-                                    app_message_lines.push(
-                                        "- Public: withheld until validation passes.".to_string(),
-                                    );
-                                } else {
-                                    app_message_lines.push(
-                                        "- Access link: withheld until validation passes."
-                                            .to_string(),
-                                    );
+                                    app_message_lines
+                                        .push("- Public: pending tunnel readiness.".to_string());
                                 }
 
                                 if access_guard_enabled {
-                                    app_message_lines.push(
-                                        "- Access guard: enabled.".to_string(),
-                                    );
+                                    app_message_lines.push("- Access guard: enabled.".to_string());
                                 } else {
-                                    app_message_lines.push(
-                                        "- Access guard: not enabled.".to_string(),
-                                    );
+                                    app_message_lines
+                                        .push("- Access guard: not enabled.".to_string());
                                 }
 
                                 app_message_lines.push(format!(
@@ -3054,11 +4749,8 @@ impl Agent {
                                     ));
                                 }
 
-                                if verified {
-                                    if let Some(preview) = preview_url {
-                                        app_message_lines
-                                            .push(format!("![App Preview]({})", preview));
-                                    }
+                                if let Some(preview) = preview_url {
+                                    app_message_lines.push(format!("![App Preview]({})", preview));
                                 }
                                 let app_message = app_message_lines.join("\n");
                                 results.push(app_message);
@@ -3922,6 +5614,30 @@ mod tests {
         assert_eq!(
             files.get("app.js").and_then(|v| v.as_str()),
             Some("console.log('ok')")
+        );
+    }
+
+    #[test]
+    fn resolve_duplicate_app_reuses_only_exact_files_with_live_runtime() {
+        assert_eq!(
+            Agent::resolve_duplicate_app("exact_files", true),
+            DuplicateAppResolution::ReuseExisting
+        );
+        assert_eq!(
+            Agent::resolve_duplicate_app("exact_files", false),
+            DuplicateAppResolution::ReplaceExisting
+        );
+    }
+
+    #[test]
+    fn resolve_duplicate_app_replaces_non_exact_matches() {
+        assert_eq!(
+            Agent::resolve_duplicate_app("exact_title", true),
+            DuplicateAppResolution::ReplaceExisting
+        );
+        assert_eq!(
+            Agent::resolve_duplicate_app("fuzzy", true),
+            DuplicateAppResolution::ReplaceExisting
         );
     }
 }

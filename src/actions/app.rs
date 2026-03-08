@@ -607,6 +607,57 @@ fn split_command_args(command: &str, label: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
+fn shell_quote_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "''".to_string();
+    }
+    let safe = arg.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                '_' | '-' | '.' | '/' | ':' | '@' | '%' | '+' | '=' | ',' | '{' | '}'
+            )
+    });
+    if safe {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\"'\"'"))
+    }
+}
+
+fn join_shell_command(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| shell_quote_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn normalize_python_runtime_command_for_container(command: &str) -> String {
+    let Ok(args) = split_command_args(command, "command") else {
+        return command.to_string();
+    };
+    if args.len() >= 2 {
+        let head = args[0].to_ascii_lowercase();
+        if (head == "sh" || head == "bash") && args[1] == "-c" {
+            return command.to_string();
+        }
+    }
+
+    let candidates = command_arg_candidates(&args);
+    if candidates.is_empty() {
+        return command.to_string();
+    }
+
+    if let Some(py3) = candidates.iter().find(|candidate| {
+        candidate
+            .first()
+            .is_some_and(|p| p.eq_ignore_ascii_case("python3"))
+    }) {
+        return join_shell_command(py3);
+    }
+    join_shell_command(candidates.first().unwrap_or(&args))
+}
+
 fn command_arg_candidates(args: &[String]) -> Vec<Vec<String>> {
     if args.is_empty() {
         return Vec::new();
@@ -822,17 +873,6 @@ fn with_node_bin_path(app_dir: &Path) -> Option<String> {
         .and_then(|os| os.into_string().ok())
 }
 
-async fn run_local_command(
-    command: &str,
-    label: &str,
-    cwd: &Path,
-    envs: &HashMap<String, String>,
-    timeout_secs: u64,
-) -> Result<std::process::Output> {
-    let args = split_command_args(command, label)?;
-    run_local_args_with_fallback(&args, label, cwd, envs, timeout_secs).await
-}
-
 fn compact_progress_line(line: &str, max_chars: usize) -> String {
     let trimmed = line.trim().replace('\r', "");
     let char_count = trimmed.chars().count();
@@ -1042,7 +1082,7 @@ pub async fn launch_dynamic_container(
     let container_name = app_container_name(app_id);
     cleanup_existing_container(&container_name).await;
 
-    let entry_cmd = validate_app_command(entry_command, "entry_command")?;
+    let mut entry_cmd = validate_app_command(entry_command, "entry_command")?;
     let install_cmd = if let Some(cmd) = install_command {
         Some(validate_app_command(cmd, "install_command")?)
     } else {
@@ -1053,6 +1093,9 @@ pub async fn launch_dynamic_container(
             .as_deref()
             .map(command_looks_python_related)
             .unwrap_or(false);
+    if uses_python_runtime {
+        entry_cmd = normalize_python_runtime_command_for_container(&entry_cmd);
+    }
 
     let mut script_parts: Vec<String> = Vec::new();
     script_parts.push("set -e".to_string());
@@ -1073,7 +1116,12 @@ pub async fn launch_dynamic_container(
     if let Some(ref cmd) = install_cmd {
         let trimmed = cmd.trim();
         if !trimmed.is_empty() {
-            script_parts.push(trimmed.to_string());
+            let normalized = if uses_python_runtime {
+                normalize_python_runtime_command_for_container(trimmed)
+            } else {
+                trimmed.to_string()
+            };
+            script_parts.push(normalized);
         }
     }
     script_parts.push(entry_cmd.trim().to_string());

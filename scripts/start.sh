@@ -113,16 +113,15 @@ case "${1:-start}" in
         ;;
     restart)
         echo -e "${YELLOW}Restarting AgentArk...${NC}"
-        docker compose restart
+        docker compose restart agentark
         ;;
     logs)
         docker compose logs -f
         ;;
     update)
         echo -e "${YELLOW}Updating AgentArk (your data will be preserved)...${NC}"
-        docker compose down
-        docker compose build --no-cache
-        docker compose up -d
+        docker compose build agentark
+        docker compose up -d agentark
         echo -e "${GREEN}Update complete! Your data is intact.${NC}"
         ;;
     backup)

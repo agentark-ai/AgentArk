@@ -21,7 +21,7 @@ use tokio::sync::RwLock;
 use super::{
     autonomy::ConversationScope,
     config::{ModelRole, ModelSlot},
-    intent::{action_intent_score, has_action_intent_default},
+    intent::{action_intent_score, has_action_intent_adaptive, preferred_direct_action_name},
     llm::LlmClient,
     orchestra::{Orchestra, OrchestraConfig},
     parallel::{ParallelConfig, ParallelThinkingController},
@@ -53,12 +53,19 @@ const CONTEXT_MIN_MSGS_FOR_DIGEST: usize = 12;
 const CONTEXT_DIGEST_REFRESH_EVERY: usize = 8;
 const CONTEXT_DIGEST_MAX_CHARS: usize = 2_200;
 const CONTEXT_SALIENT_OLDER_LIMIT: usize = 6;
+const CONVERSATION_RECENT_ARTIFACT_KEY_PREFIX: &str = "conversation_recent_artifact_v1:";
+const CONVERSATION_LAST_DEPLOYED_APP_KEY_PREFIX: &str = "conversation_last_deployed_app_v1:";
+const USER_SELECTED_MODEL_SLOT_KEY: &str = "user_selected_model_slot_v1";
+const APP_FOLLOWUP_CONTEXT_MAX_AGE_SECS: i64 = 24 * 60 * 60;
 const PROFILE_NUDGE_LAST_ASKED_KEY: &str = "profile_nudge_last_asked_at_v1";
 const PROFILE_NUDGE_INTERVAL_DAYS: i64 = 7;
 const PUSH_NOTIFICATIONS_MUTE_UNTIL_KEY: &str = "push_notifications_mute_until_v1";
 const PUSH_NOTIFICATIONS_LAST_SIGNATURE_KEY: &str = "push_notifications_last_signature_v1";
 const PUSH_NOTIFICATIONS_LAST_SENT_AT_KEY: &str = "push_notifications_last_sent_at_v1";
 const PUSH_NOTIFICATION_DUPLICATE_COOLDOWN_SECS: i64 = 30 * 60;
+const MAX_TOOL_FOLLOWUP_ROUNDS: usize = 8;
+const TOOL_FOLLOWUP_LLM_TIMEOUT_SECS: u64 = 90;
+const MAX_SHORTLISTED_ACTIONS: usize = 8;
 
 /// Safe string truncation that respects UTF-8 character boundaries
 fn safe_truncate(s: &str, max_chars: usize) -> String {
@@ -162,6 +169,97 @@ fn parse_register_tool_alias_command(message: &str) -> Option<(String, String)> 
     Some((tool_name.to_string(), integration_id.to_string()))
 }
 
+fn parse_use_model_command(message: &str) -> Option<String> {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("use model key ") || lower.starts_with("use current model key for ") {
+        return None;
+    }
+
+    let prefixes = [
+        "use model -",
+        "use model:",
+        "use model ",
+        "/use model -",
+        "/use model:",
+        "/use model ",
+    ];
+    for prefix in prefixes {
+        if lower.starts_with(prefix) && trimmed.len() >= prefix.len() {
+            let value = trimmed[prefix.len()..]
+                .trim()
+                .trim_matches(|c| matches!(c, '"' | '\'' | '`'))
+                .trim();
+            if value.is_empty() || value.contains('\n') || value.contains('\r') {
+                return None;
+            }
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn normalize_model_match_token(raw: &str) -> String {
+    raw.trim()
+        .trim_matches(|c| matches!(c, '"' | '\'' | '`'))
+        .to_ascii_lowercase()
+}
+
+fn compact_model_match_token(raw: &str) -> String {
+    normalize_model_match_token(raw)
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect()
+}
+
+fn merge_app_llm_env_from_providers(
+    provider_refs: &[&crate::core::LlmProvider],
+) -> std::collections::HashMap<String, String> {
+    let mut merged: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for provider in provider_refs {
+        for (k, v) in provider.app_env_vars() {
+            if v.trim().is_empty() || v == "[ENCRYPTED]" {
+                continue;
+            }
+            merged.entry(k).or_insert(v);
+        }
+    }
+
+    if !merged.contains_key("OPENROUTER_API_KEY")
+        && provider_refs.iter().any(|provider| {
+            matches!(
+                provider,
+                crate::core::LlmProvider::OpenAI { api_key, base_url, .. }
+                    if !api_key.trim().is_empty()
+                        && base_url
+                            .as_deref()
+                            .unwrap_or("")
+                            .to_ascii_lowercase()
+                            .contains("openrouter")
+            )
+        })
+    {
+        if let Some(v) = merged.get("OPENAI_API_KEY").cloned() {
+            merged.insert("OPENROUTER_API_KEY".to_string(), v);
+        }
+    }
+    if !merged.contains_key("OPENAI_KEY") {
+        if let Some(v) = merged.get("OPENAI_API_KEY").cloned() {
+            merged.insert("OPENAI_KEY".to_string(), v);
+        }
+    }
+    if !merged.contains_key("OPENAI_TOKEN") {
+        if let Some(v) = merged.get("OPENAI_API_KEY").cloned() {
+            merged.insert("OPENAI_TOKEN".to_string(), v);
+        }
+    }
+
+    merged
+}
+
 #[derive(Debug, Clone)]
 struct SkillRunIntent {
     skill_name: String,
@@ -197,6 +295,209 @@ fn parse_skill_install_url_request(message: &str) -> Option<String> {
     }
 
     extract_http_urls(trimmed).into_iter().next()
+}
+
+fn is_standalone_link_share(message: &str) -> bool {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let urls = extract_http_urls(trimmed);
+    if urls.is_empty() {
+        return false;
+    }
+
+    let mut remainder = trimmed.to_string();
+    for url in &urls {
+        remainder = remainder.replace(url, " ");
+    }
+
+    let residue: String = remainder
+        .chars()
+        .filter(|c| {
+            !c.is_whitespace()
+                && !matches!(
+                    *c,
+                    '"' | '\''
+                        | '<'
+                        | '>'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | ','
+                        | '.'
+                        | ';'
+                        | ':'
+                        | '!'
+                        | '?'
+                        | '|'
+                        | '-'
+                )
+        })
+        .collect();
+
+    residue.is_empty()
+}
+
+fn build_shared_link_memory_ack(message: &str) -> Option<String> {
+    if !is_standalone_link_share(message) {
+        return None;
+    }
+
+    let urls = extract_http_urls(message);
+    if urls.is_empty() {
+        return None;
+    }
+
+    let label = if urls.len() > 1 {
+        "these links"
+    } else if reqwest::Url::parse(&urls[0])
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+        .map(|host| host.contains("youtube.com") || host.contains("youtu.be"))
+        .unwrap_or(false)
+    {
+        "this YouTube link"
+    } else {
+        "this link"
+    };
+
+    let follow_up = if urls.len() > 1 {
+        "Ask me about them later and I'll pull them back into context."
+    } else {
+        "Ask me about it later and I'll pull it back into context."
+    };
+
+    Some(format!(
+        "Saved {} for later reference. {}",
+        label, follow_up
+    ))
+}
+
+fn normalize_preference_subject(subject: &str) -> Option<String> {
+    let cleaned = subject
+        .trim()
+        .trim_matches(|c: char| {
+            matches!(
+                c,
+                '"' | '\'' | '`' | '.' | ',' | ';' | ':' | '!' | '?' | '(' | ')' | '[' | ']'
+            )
+        })
+        .trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+
+    let lower = cleaned.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return None;
+    }
+    let without_article = lower
+        .strip_prefix("the ")
+        .or_else(|| lower.strip_prefix("a "))
+        .or_else(|| lower.strip_prefix("an "))
+        .unwrap_or(&lower)
+        .trim();
+    if without_article.is_empty() || without_article.len() > 64 {
+        return None;
+    }
+    let token_count = without_article.split_whitespace().count();
+    if token_count == 0 || token_count > 6 {
+        return None;
+    }
+
+    Some(
+        cleaned
+            .trim_start_matches(|c: char| c.is_whitespace())
+            .trim_matches(|c: char| matches!(c, '"' | '\'' | '`'))
+            .to_string(),
+    )
+}
+
+fn preference_subject_slug(subject: &str) -> String {
+    let mut out = String::with_capacity(subject.len());
+    let mut prev_sep = false;
+    for ch in subject.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_sep = false;
+        } else if !prev_sep {
+            out.push('_');
+            prev_sep = true;
+        }
+    }
+    out.trim_matches('_').to_string()
+}
+
+fn extract_stable_user_preferences(message: &str) -> Vec<(String, String)> {
+    let splitter = regex::Regex::new(r"(?i)\s*(?:\band\b|\bbut\b|[;\n]+)\s*").ok();
+    let clauses: Vec<&str> = if let Some(re) = splitter.as_ref() {
+        re.split(message).collect()
+    } else {
+        vec![message]
+    };
+
+    let positive_prefixes = [
+        "i love ",
+        "i really love ",
+        "i like ",
+        "i really like ",
+        "i prefer ",
+        "i'm into ",
+        "i am into ",
+    ];
+    let negative_prefixes = [
+        "i hate ",
+        "i really hate ",
+        "i dislike ",
+        "i don't like ",
+        "i do not like ",
+        "i can't stand ",
+    ];
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for clause in clauses {
+        let trimmed = clause.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        let sentiment = if let Some(prefix) = positive_prefixes
+            .iter()
+            .find(|prefix| lower.starts_with(**prefix))
+        {
+            Some(("likes", *prefix))
+        } else if let Some(prefix) = negative_prefixes
+            .iter()
+            .find(|prefix| lower.starts_with(**prefix))
+        {
+            Some(("dislikes", *prefix))
+        } else {
+            None
+        };
+        let Some((sentiment_key, prefix)) = sentiment else {
+            continue;
+        };
+        let subject = trimmed[prefix.len()..].trim();
+        let Some(normalized_subject) = normalize_preference_subject(subject) else {
+            continue;
+        };
+        let slug = preference_subject_slug(&normalized_subject);
+        if slug.is_empty() {
+            continue;
+        }
+        let key = format!("{}_{}", sentiment_key, slug);
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        out.push((key, normalized_subject));
+    }
+    out
 }
 
 fn parse_skill_run_intent(
@@ -510,48 +811,309 @@ fn best_execution_intent_score(text: &str, actions: &[crate::actions::ActionDef]
     best
 }
 
+fn is_workspace_modification_request(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let edit_verbs = [
+        "add", "update", "modify", "change", "rename", "remove", "fix", "refactor", "rewire",
+        "edit", "delete", "move", "restyle", "redesign", "wire",
+    ];
+    let workspace_terms = [
+        "file",
+        "files",
+        "code",
+        "codebase",
+        "repo",
+        "repository",
+        "component",
+        "components",
+        "route",
+        "routes",
+        "endpoint",
+        "endpoints",
+        "frontend",
+        "backend",
+        "framework",
+        "agentark",
+        "console",
+        "system",
+        "server",
+        "runtime",
+        "script",
+        "scripts",
+        "readme",
+        "docker",
+        "container",
+        "project",
+        "workspace",
+        "module",
+        "page",
+        "screen",
+        "ui",
+        "api",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+
+    let path_like = [
+        ".rs",
+        ".tsx",
+        ".ts",
+        ".js",
+        ".jsx",
+        ".py",
+        ".md",
+        ".toml",
+        "src/",
+        "src\\",
+        "frontend/",
+        "frontend\\",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+
+    if !(workspace_terms || path_like) {
+        return false;
+    }
+
+    edit_verbs.iter().any(|needle| lower.contains(needle))
+}
+
+fn request_looks_like_fix_or_debug(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "fix",
+        "debug",
+        "repair",
+        "broken",
+        "bug",
+        "issue",
+        "stuck",
+        "doesn't work",
+        "doesnt work",
+        "not working",
+        "isn't working",
+        "isnt working",
+        "fails",
+        "failure",
+        "empty",
+        "not pulling",
+        "no paper",
+        "no papers",
+        "refresh",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn has_app_deploy_intent(text: &str, actions: &[crate::actions::ActionDef]) -> bool {
+    if is_workspace_modification_request(text) {
+        return false;
+    }
+    has_action_intent_adaptive(text, actions, "app_deploy")
+}
+
 fn has_execution_intent(text: &str, actions: &[crate::actions::ActionDef]) -> bool {
-    if has_action_intent_default(text, actions, "app_deploy") {
+    if has_app_deploy_intent(text, actions) {
         return true;
     }
-    if best_execution_intent_score(text, actions) >= 0.45 {
+    let best_score = best_execution_intent_score(text, actions);
+    if best_score >= 0.45 {
         return true;
     }
-    let first = text
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_lowercase();
-    matches!(
-        first.as_str(),
-        "build"
-            | "create"
-            | "make"
-            | "deploy"
-            | "run"
-            | "send"
-            | "check"
-            | "fix"
-            | "act"
-            | "fetch"
-            | "monitor"
-            | "search"
-            | "find"
-            | "generate"
-            | "write"
-            | "implement"
-            | "setup"
-            | "set"
-            | "configure"
-            | "schedule"
-            | "start"
-            | "update"
-            | "add"
-            | "install"
-            | "publish"
-            | "test"
-            | "analyze"
-    )
+
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let word_count = trimmed.split_whitespace().count();
+    let has_structure = trimmed.lines().count() >= 3
+        || trimmed.contains("```")
+        || trimmed.contains("- ")
+        || trimmed.contains("1.");
+
+    best_score >= 0.33 || (!trimmed.ends_with('?') && has_structure && word_count >= 20)
+}
+
+fn is_capability_lookup_query(message: &str, actions: &[crate::actions::ActionDef]) -> bool {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if has_execution_intent(trimmed, actions) {
+        return false;
+    }
+    if trimmed.contains('\n') || trimmed.lines().count() > 2 {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let starts_like_question = [
+        "can you",
+        "do you",
+        "are you able",
+        "could you",
+        "is there",
+        "what can",
+        "which action",
+        "which tool",
+        "do we support",
+        "does this support",
+    ]
+    .iter()
+    .any(|p| lower.starts_with(p));
+    trimmed.ends_with('?') || starts_like_question
+}
+
+fn extract_capability_lookup_terms(message: &str) -> Vec<String> {
+    let stopwords: HashSet<&str> = [
+        "do", "you", "have", "the", "skill", "skills", "tool", "tools", "action", "actions", "of",
+        "for", "with", "a", "an", "is", "there", "any", "can", "your", "that", "this", "please",
+        "support", "able", "could", "would", "we", "does",
+    ]
+    .into_iter()
+    .collect();
+    let mut terms = Vec::new();
+    for token in tokenize_lower(message) {
+        if stopwords.contains(token.as_str()) {
+            continue;
+        }
+        if !terms.iter().any(|existing: &String| existing == &token) {
+            terms.push(token);
+        }
+    }
+    terms
+}
+
+fn fast_capability_lookup_response(
+    message: &str,
+    actions: &[crate::actions::ActionDef],
+) -> Option<String> {
+    if !is_capability_lookup_query(message, actions) {
+        return None;
+    }
+
+    let terms = extract_capability_lookup_terms(message);
+    let mut scored: Vec<(f32, &crate::actions::ActionDef)> = actions
+        .iter()
+        .filter_map(|action| {
+            let score = action_intent_score(message, action);
+            if score < 0.12 && !terms.is_empty() {
+                return None;
+            }
+            Some((score, action))
+        })
+        .collect();
+
+    scored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.name.cmp(&b.1.name))
+    });
+    if scored.is_empty() {
+        return Some(
+            "I don't see a matching built-in capability right now. Tell me the outcome you want and I can choose or create the right action path."
+                .to_string(),
+        );
+    }
+
+    let top: Vec<&crate::actions::ActionDef> =
+        scored.iter().take(4).map(|(_, action)| *action).collect();
+    let mut response = String::from("Yes. I found relevant actions:\n");
+    for action in top {
+        let desc = action.description.trim();
+        if desc.is_empty() {
+            response.push_str(&format!("- {}\n", action.name));
+        } else {
+            response.push_str(&format!(
+                "- {}: {}\n",
+                action.name,
+                safe_truncate(desc, 120)
+            ));
+        }
+    }
+    Some(response.trim_end().to_string())
+}
+
+fn continuation_message_score(message: &str, history: &[ConversationMessage]) -> f32 {
+    let word_count = message.split_whitespace().count();
+    if word_count == 0 {
+        return 0.0;
+    }
+
+    let msg_tokens: HashSet<String> = tokenize_lower(message).into_iter().collect();
+    if msg_tokens.is_empty() {
+        return 0.0;
+    }
+
+    let mut context_tokens: HashSet<String> = HashSet::new();
+    for msg in history.iter().rev().take(8) {
+        for token in tokenize_lower(&msg.content) {
+            context_tokens.insert(token);
+            if context_tokens.len() >= 240 {
+                break;
+            }
+        }
+        if context_tokens.len() >= 240 {
+            break;
+        }
+    }
+
+    let continuity = if context_tokens.is_empty() {
+        0.0
+    } else {
+        let overlap = msg_tokens.intersection(&context_tokens).count() as f32;
+        overlap / msg_tokens.len() as f32
+    };
+
+    let brevity_bonus = if word_count <= 18 {
+        0.22
+    } else if word_count <= 36 {
+        0.12
+    } else if word_count <= 60 {
+        0.05
+    } else {
+        0.0
+    };
+    let newline_penalty = if message.contains('\n') { -0.05 } else { 0.0 };
+
+    ((0.78 * continuity) + brevity_bonus + newline_penalty).clamp(0.0, 1.0)
+}
+
+fn artifact_reference_score(message: &str, artifact: &ConversationArtifactContext) -> f32 {
+    let msg_tokens: HashSet<String> = tokenize_lower(message).into_iter().collect();
+    if msg_tokens.is_empty() {
+        return 0.0;
+    }
+
+    let mut artifact_tokens: HashSet<String> =
+        tokenize_lower(&artifact.title).into_iter().collect();
+    artifact_tokens.extend(tokenize_lower(&artifact.summary));
+    artifact_tokens.extend(tokenize_lower(&artifact.artifact_type));
+    artifact_tokens.extend(tokenize_lower(&artifact.artifact_id));
+    artifact_tokens.extend(tokenize_lower(&artifact.url));
+    for action in &artifact.related_actions {
+        artifact_tokens.extend(tokenize_lower(action));
+    }
+
+    if artifact_tokens.is_empty() {
+        return 0.0;
+    }
+
+    let overlap = msg_tokens.intersection(&artifact_tokens).count() as f32;
+    let score = overlap / msg_tokens.len() as f32;
+    score.clamp(0.0, 1.0)
+}
+
+fn best_competing_intent_score(
+    text: &str,
+    actions: &[crate::actions::ActionDef],
+    excluded_actions: &HashSet<String>,
+) -> f32 {
+    actions
+        .iter()
+        .filter(|a| !excluded_actions.contains(&a.name))
+        .map(|a| action_intent_score(text, a))
+        .fold(0.0_f32, f32::max)
 }
 
 fn is_smalltalk_candidate(message: &str) -> bool {
@@ -595,29 +1157,56 @@ fn is_smalltalk_candidate(message: &str) -> bool {
 }
 
 fn is_ambiguous_user_request(text: &str, actions: &[crate::actions::ActionDef]) -> bool {
-    let t = text.to_lowercase();
-    let words: Vec<&str> = t.split_whitespace().collect();
-    if words.is_empty() {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
         return true;
     }
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
 
     let best_exec_score = best_execution_intent_score(text, actions);
-    let starts_generic = matches!(
-        words.first().copied().unwrap_or_default(),
-        "create" | "build" | "make" | "do" | "fix" | "check" | "send" | "deploy" | "implement"
-    );
-    let refers_pronoun = t.contains(" it ") || t.contains(" this ") || t.contains(" that ");
+    let has_structure = trimmed.lines().count() >= 3
+        || trimmed.contains("```")
+        || trimmed.contains("- ")
+        || trimmed.contains("1.");
 
-    if words.len() <= 6 && starts_generic && best_exec_score < 0.65 {
+    if words.len() <= 6 && best_exec_score < 0.62 {
         return true;
     }
-    if starts_generic && refers_pronoun && best_exec_score < 0.75 {
+    if trimmed.ends_with('?') && words.len() <= 12 && best_exec_score < 0.55 {
         return true;
     }
-    if t.ends_with('?') && best_exec_score < 0.45 && words.len() <= 10 {
+    if !has_structure && words.len() <= 18 && best_exec_score < 0.40 {
         return true;
     }
     false
+}
+
+fn should_use_local_routing_fast_path(
+    message: &str,
+    actions: &[crate::actions::ActionDef],
+) -> bool {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if trimmed.contains("```") || trimmed.lines().count() > 4 {
+        return false;
+    }
+
+    let word_count = trimmed.split_whitespace().count();
+
+    // Only fast-path very short messages (greetings, quick questions).
+    // Anything substantive (>12 words) should go through the LLM router
+    // which can understand arbitrary user intent without keyword matching.
+    if word_count > 12 {
+        return false;
+    }
+
+    if is_capability_lookup_query(trimmed, actions) {
+        return true;
+    }
+
+    !has_execution_intent(trimmed, actions) && is_smalltalk_candidate(trimmed)
 }
 
 fn is_detailed_execution_brief(text: &str, actions: &[crate::actions::ActionDef]) -> bool {
@@ -635,59 +1224,24 @@ fn is_detailed_execution_brief(text: &str, actions: &[crate::actions::ActionDef]
     }
 
     let lower = trimmed.to_ascii_lowercase();
-    let markers = [
-        "goal",
-        "deliverables",
-        "constraints",
-        "pipeline",
-        "dashboard",
-        "deploy",
-        "public link",
-        "auto-update",
-        "auto refresh",
-        "every 30 minutes",
-        "schedule",
-        "dedupe",
-        "rank",
-        "summarize",
-        "test",
-        "verify",
-        "latest",
-        "output",
-        "rules",
-        "queries",
-        "categories",
-        "filters",
-        "views",
-        "important",
-        "act as",
-        "you are",
-    ];
-    let marker_hits = markers.iter().filter(|m| lower.contains(**m)).count();
+    let section_markers = trimmed.matches(':').count();
 
     let has_structure = trimmed.contains('\n')
+        || trimmed.contains("```")
         || lower.contains("1.")
         || lower.contains("2.")
         || lower.contains("- ");
 
     // Long structured prompt with multiple markers → proceed without asking
-    if has_structure && marker_hits >= 3 && word_count >= 50 {
+    if word_count >= 120 || (line_count >= 6 && word_count >= 35) {
         return true;
     }
     // Very detailed brief with many markers
-    if word_count >= 80 && marker_hits >= 4 {
+    if has_structure && word_count >= 45 && best_execution_intent_score(trimmed, actions) >= 0.38 {
         return true;
     }
     // Massive prompt — user clearly knows what they want
-    if word_count >= 150 && line_count >= 8 {
-        return true;
-    }
-    // Has execution intent + moderate structure
-    if has_execution_intent(trimmed, actions)
-        && has_structure
-        && marker_hits >= 2
-        && word_count >= 40
-    {
+    if section_markers >= 3 && word_count >= 60 {
         return true;
     }
     false
@@ -709,13 +1263,13 @@ fn is_command_execution_action(action_name: &str) -> bool {
 fn select_actions_for_message(
     message: &str,
     all_actions: &[crate::actions::ActionDef],
+    boosted_action_names: &HashSet<String>,
 ) -> Vec<crate::actions::ActionDef> {
-    let app_intent = has_action_intent_default(message, all_actions, "app_deploy");
     let mut scored: Vec<(f32, crate::actions::ActionDef)> = Vec::new();
     for action in all_actions {
         let mut score = action_intent_score(message, action);
-        if app_intent && action.name == "app_deploy" {
-            score = score.max(0.95);
+        if boosted_action_names.contains(&action.name) {
+            score = (score + 0.16).max(0.24).min(0.94);
         }
         if score > 0.10 {
             scored.push((score, action.clone()));
@@ -731,6 +1285,736 @@ fn select_actions_for_message(
     } else {
         selected
     }
+}
+
+fn find_json_object_bounds(raw: &str) -> Option<(usize, usize)> {
+    let mut depth = 0i32;
+    let mut start: Option<usize> = None;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (idx, ch) in raw.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    start = Some(idx);
+                }
+                depth += 1;
+            }
+            '}' => {
+                if depth > 0 {
+                    depth -= 1;
+                    if depth == 0 {
+                        if let Some(s) = start {
+                            return Some((s, idx + ch.len_utf8()));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn extract_json_object_from_text(raw: &str) -> Option<serde_json::Value> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if value.is_object() {
+            return Some(value);
+        }
+    }
+    let (start, end) = find_json_object_bounds(trimmed)?;
+    serde_json::from_str::<serde_json::Value>(&trimmed[start..end])
+        .ok()
+        .filter(|value| value.is_object())
+}
+
+fn build_tool_followup_assistant_message(response: &crate::core::llm::LlmResponse) -> String {
+    let content = response.content.trim();
+    if content.is_empty()
+        || response_indicates_pending_execution(content)
+        || looks_like_raw_structured_tool_output(content)
+        || looks_like_raw_source_or_markup_dump(content)
+    {
+        String::new()
+    } else {
+        safe_truncate(content, 3000)
+    }
+}
+
+fn format_tool_results_for_followup(batch: &tool_execution::ToolExecutionBatch) -> String {
+    const MAX_PER_TOOL_CHARS: usize = 20000;
+    const MAX_TOTAL_CHARS: usize = 60000;
+
+    let mut parts = Vec::new();
+    let mut used = 0usize;
+    for output in &batch.outputs {
+        if used >= MAX_TOTAL_CHARS {
+            parts.push(
+                "[system] Additional tool output omitted to stay within context limits."
+                    .to_string(),
+            );
+            break;
+        }
+        let remaining = MAX_TOTAL_CHARS.saturating_sub(used);
+        let limit = remaining.min(MAX_PER_TOOL_CHARS);
+        let content = safe_truncate(output.content.trim(), limit);
+        if content.is_empty() {
+            continue;
+        }
+        used += content.len();
+        parts.push(format!("[{}] {}", output.name, content));
+    }
+    parts.join("\n\n")
+}
+
+fn build_tool_followup_user_message(
+    original_user_message: &str,
+    tool_results: &str,
+    execution_intent: bool,
+) -> String {
+    let execution_rules = if execution_intent {
+        "\n- This is an execution request. Do not stop at diagnosis, a plan, or a promise of future work while required actions remain.\n- Treat every tool call as intermediate evidence, not as completion.\n- If you say you will inspect, update, test, fix, validate, or deploy something, issue the corresponding tool call(s) in this turn.\n- Do not answer with tool-loop meta text such as `Called tools:` or narrate the internal tool loop.\n- Treat inspection, listing, reading, and restart/reload actions as intermediate progress unless the user explicitly asked only for that action.\n- If the user asked to fix the framework, system, console, or workspace, prefer local repo/code actions over deployed-app actions unless tool evidence shows the deployed app itself is the problem.\n- If a tool needed only for validation is blocked or unavailable, do not loop on it. Switch to another validation path and continue."
+    } else {
+        ""
+    };
+    let repair_rules = if execution_intent && request_looks_like_fix_or_debug(original_user_message)
+    {
+        "\n- This request is about fixing/debugging something. Do not stop after a restart, refresh, redeploy, inspection, or promise to verify later.\n- Completion requires concrete outcome evidence: inspect or reproduce the problem, apply the necessary change (or rule out code changes with evidence), then validate the result with a direct check such as logs, file contents, tests, refreshed data, a screenshot, or http_get when available.\n- If a validation tool such as `http_get` is blocked by safety policy, use another validation method instead of repeating the blocked call.\n- If a refresh, fetch, or validation step returns empty, missing, unchanged, or still broken results, treat the task as unresolved and continue."
+    } else {
+        ""
+    };
+    format!(
+        "Continue handling the same user request.\n\n\
+Original user request:\n{}\n\n\
+Tool results:\n{}\n\n\
+Rules:\n\
+- Use the tool results to decide the next step.\n\
+- If more actions are needed, call the next tool(s).\n\
+- If you already have enough information, answer the user directly.\n\
+- Do not dump raw tool JSON unless the user explicitly asked for it.\n\
+- Preserve any `[IMAGE_RESULT]` or `[VIDEO_RESULT]` blocks verbatim in the final answer.{}{}",
+        original_user_message.trim(),
+        tool_results.trim(),
+        execution_rules,
+        repair_rules
+    )
+}
+
+fn tool_output_contains_embedded_result_marker(text: &str) -> bool {
+    text.to_ascii_uppercase().contains("_RESULT]")
+}
+
+fn looks_like_raw_structured_tool_output(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    extract_json_object_from_text(trimmed).is_some()
+        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+}
+
+fn looks_like_raw_source_or_markup_dump(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if trimmed.len() >= 400
+        && (lower.starts_with("<!doctype html")
+            || lower.starts_with("<html")
+            || lower.starts_with("<body")
+            || lower.starts_with("<head"))
+    {
+        return true;
+    }
+
+    if trimmed.len() < 600 {
+        return false;
+    }
+
+    let mut non_empty_lines = 0usize;
+    let mut code_like_lines = 0usize;
+    for line in trimmed.lines().take(200) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        non_empty_lines += 1;
+        let lower_line = line.to_ascii_lowercase();
+        let code_like = lower_line.starts_with("import ")
+            || lower_line.starts_with("from ")
+            || lower_line.starts_with("const ")
+            || lower_line.starts_with("let ")
+            || lower_line.starts_with("var ")
+            || lower_line.starts_with("function ")
+            || lower_line.starts_with("class ")
+            || lower_line.starts_with("def ")
+            || lower_line.starts_with("async ")
+            || lower_line.starts_with("return ")
+            || lower_line.starts_with("<div")
+            || lower_line.starts_with("</")
+            || lower_line.starts_with("<script")
+            || lower_line.starts_with("<style")
+            || lower_line.starts_with("<main")
+            || lower_line.starts_with("<header")
+            || lower_line.starts_with("@app.")
+            || lower_line.starts_with("fn ")
+            || lower_line.contains("document.getelementbyid(")
+            || lower_line.contains("queryselector(")
+            || line.ends_with('{')
+            || line == "}";
+        if code_like {
+            code_like_lines += 1;
+        }
+    }
+
+    non_empty_lines >= 12 && code_like_lines >= 8
+}
+
+fn extract_html_title(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    let title_start = lower.find("<title")?;
+    let after_open = lower[title_start..].find('>')? + title_start + 1;
+    let title_end = lower[after_open..].find("</title>")? + after_open;
+    let title = text.get(after_open..title_end)?.trim();
+    if title.is_empty() {
+        None
+    } else {
+        Some(safe_truncate(title, 120))
+    }
+}
+
+fn humanize_tool_name(name: &str) -> String {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return "Tool".to_string();
+    }
+    trimmed
+        .split(|ch: char| ch == '_' || ch == '-' || ch.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            let Some(first) = chars.next() else {
+                return String::new();
+            };
+            let mut out = String::new();
+            out.push(first.to_ascii_uppercase());
+            out.push_str(chars.as_str());
+            out
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn summarize_tool_output_for_user(name: &str, content: &str) -> Option<String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let human_name = humanize_tool_name(name);
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("blocked by safety policy") {
+        return Some(format!("{} was blocked by safety policy.", human_name));
+    }
+
+    if name == "app_inspect" {
+        if let Some(value) = extract_json_object_from_text(trimmed) {
+            if let Some(title) = value
+                .get("matched_app")
+                .and_then(|v| v.get("title"))
+                .and_then(|v| v.as_str())
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty())
+            {
+                return Some(format!(
+                    "{} matched app `{}`.",
+                    human_name,
+                    safe_truncate(title, 120)
+                ));
+            }
+            if let Some(count) = value
+                .get("apps")
+                .and_then(|v| v.as_array())
+                .map(|items| items.len())
+                .filter(|count| *count > 0)
+            {
+                return Some(format!(
+                    "{} loaded metadata for {} app{}.",
+                    human_name,
+                    count,
+                    if count == 1 { "" } else { "s" }
+                ));
+            }
+        }
+    }
+
+    if looks_like_raw_source_or_markup_dump(trimmed) {
+        if let Some(title) = extract_html_title(trimmed) {
+            return Some(format!("{} read HTML document `{}`.", human_name, title));
+        }
+        let line_count = trimmed.lines().count();
+        return Some(format!(
+            "{} read source or markup output ({} line{}).",
+            human_name,
+            line_count,
+            if line_count == 1 { "" } else { "s" }
+        ));
+    }
+
+    if looks_like_raw_structured_tool_output(trimmed) {
+        if let Some(value) = extract_json_object_from_text(trimmed) {
+            if let Some(obj) = value.as_object() {
+                let keys = obj.keys().take(4).cloned().collect::<Vec<_>>().join(", ");
+                if !keys.is_empty() {
+                    return Some(format!(
+                        "{} returned structured data: {}.",
+                        human_name, keys
+                    ));
+                }
+            }
+        }
+        return Some(format!("{} returned structured output.", human_name));
+    }
+
+    let compact = safe_truncate(trimmed, 180);
+    if compact.is_empty() {
+        None
+    } else {
+        Some(format!("{}: {}", human_name, compact))
+    }
+}
+
+fn build_user_facing_tool_fallback_response(
+    candidate_response: &str,
+    batch: &tool_execution::ToolExecutionBatch,
+    failure_note: &str,
+) -> String {
+    let candidate = candidate_response.trim();
+    let safe_candidate = if candidate.is_empty()
+        || response_indicates_pending_execution(candidate)
+        || response_is_meta_tool_summary(candidate)
+        || looks_like_raw_structured_tool_output(candidate)
+        || looks_like_raw_source_or_markup_dump(candidate)
+    {
+        String::new()
+    } else {
+        safe_truncate(candidate, 3000)
+    };
+
+    let mut evidence = Vec::new();
+    let mut seen = HashSet::new();
+    for output in &batch.outputs {
+        if let Some(summary) = summarize_tool_output_for_user(&output.name, &output.content) {
+            if seen.insert(summary.clone()) {
+                evidence.push(summary);
+            }
+        }
+        if evidence.len() >= 4 {
+            break;
+        }
+    }
+
+    let mut sections = Vec::new();
+    if !safe_candidate.is_empty() {
+        sections.push(safe_candidate);
+    }
+
+    let note = failure_note.trim();
+    if !note.is_empty() {
+        sections.push(note.to_string());
+    }
+
+    if !evidence.is_empty() {
+        sections.push(evidence.join(" "));
+    }
+
+    if sections.is_empty() {
+        "I gathered tool output, but the final response could not be formatted cleanly.".to_string()
+    } else {
+        sections.join("\n\n")
+    }
+}
+
+fn strip_diagnostic_evidence_sections(response: &str) -> String {
+    let normalized = response.replace("\r\n", "\n");
+    let mut kept = Vec::new();
+    for paragraph in normalized.split("\n\n") {
+        let trimmed = paragraph.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed.replace(['—', '–'], "-").to_ascii_lowercase();
+        let is_diagnostic_evidence = lower.starts_with("evidence gathered:")
+            || lower.starts_with("evidence -")
+            || lower.starts_with("evidence —")
+            || lower.starts_with("evidence:");
+        if !is_diagnostic_evidence {
+            kept.push(trimmed);
+        }
+    }
+    kept.join("\n\n")
+}
+
+fn strip_diagnostic_evidence_sections_clean(response: &str) -> String {
+    let normalized = response.replace("\r\n", "\n");
+    let mut kept = Vec::new();
+    for paragraph in normalized.split("\n\n") {
+        let trimmed = paragraph.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed
+            .replace(['\u{2014}', '\u{2013}'], "-")
+            .to_ascii_lowercase();
+        let is_diagnostic_evidence = lower.starts_with("evidence gathered:")
+            || lower.starts_with("evidence -")
+            || lower.starts_with("evidence:");
+        if !is_diagnostic_evidence {
+            kept.push(trimmed);
+        }
+    }
+    kept.join("\n\n")
+}
+
+fn sanitize_final_user_response(response: &str) -> String {
+    let stripped = strip_diagnostic_evidence_sections_clean(response);
+    let trimmed = stripped.trim();
+    if looks_like_raw_structured_tool_output(trimmed)
+        || looks_like_raw_source_or_markup_dump(trimmed)
+    {
+        "I gathered raw tool output, but the final response formatting failed. Please retry the request."
+            .to_string()
+    } else {
+        stripped
+    }
+}
+
+fn extract_model_failure_tool_name(error: &str) -> Option<String> {
+    for marker in ["function '", "function \"", "tool '", "tool \""] {
+        let Some(start) = error.find(marker) else {
+            continue;
+        };
+        let rest = &error[start + marker.len()..];
+        let terminator = if marker.ends_with('\'') { '\'' } else { '"' };
+        if let Some(end) = rest.find(terminator) {
+            let name = rest[..end].trim();
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn summarize_model_failure_for_user(error: &str) -> String {
+    let trimmed = error.trim();
+    if trimmed.is_empty() {
+        return "A configured model failed unexpectedly.".to_string();
+    }
+
+    let (label, detail) = match trimmed.split_once(" failed: ") {
+        Some((head, tail)) if !head.trim().is_empty() => (Some(head.trim()), tail.trim()),
+        _ => (None, trimmed),
+    };
+    let lower = detail.to_ascii_lowercase();
+    let prefix = label
+        .map(|value| format!("{}: ", value))
+        .unwrap_or_default();
+
+    if lower.contains("invalid schema for function")
+        || lower.contains("invalid_function_parameters")
+    {
+        let tool_name = extract_model_failure_tool_name(detail)
+            .unwrap_or_else(|| "a framework tool".to_string());
+        return format!(
+            "{}rejected the current tool schema for `{}`.",
+            prefix, tool_name
+        );
+    }
+    if lower.contains("timed out") {
+        return format!("{}timed out before responding.", prefix);
+    }
+    if lower.contains("rate limit") || lower.contains("rate-limit") {
+        return format!("{}was rate-limited by the provider.", prefix);
+    }
+    if lower.contains("context length")
+        || lower.contains("maximum context")
+        || lower.contains("too many tokens")
+    {
+        return format!(
+            "{}rejected the request because the context was too large.",
+            prefix
+        );
+    }
+    if lower.contains("provider returned error")
+        || lower.contains("api error")
+        || lower.contains("bad request")
+    {
+        return format!("{}returned an upstream provider error.", prefix);
+    }
+
+    format!("{}failed: {}.", prefix, safe_truncate(detail, 160))
+}
+
+fn summarize_model_failures_for_user(errors: &[String]) -> String {
+    let mut summaries = Vec::new();
+    let mut seen = HashSet::new();
+    for error in errors {
+        let summary = summarize_model_failure_for_user(error);
+        if seen.insert(summary.clone()) {
+            summaries.push(summary);
+        }
+        if summaries.len() >= 3 {
+            break;
+        }
+    }
+    summaries.join(" ")
+}
+
+fn response_indicates_pending_execution(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    let promise_markers = [
+        "i'll ",
+        "i will ",
+        "let me ",
+        "now i need to ",
+        "next i ",
+        "the next step",
+    ];
+    let action_markers = [
+        "inspect", "read", "write", "update", "edit", "fix", "patch", "test", "verify", "deploy",
+        "redeploy", "restart", "validate",
+    ];
+    promise_markers.iter().any(|marker| lower.contains(marker))
+        && action_markers.iter().any(|marker| lower.contains(marker))
+}
+
+fn response_is_meta_tool_summary(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("called tools:") {
+        return true;
+    }
+    let lines: Vec<&str> = trimmed.lines().collect();
+    lines.len() <= 6
+        && lines.iter().any(|line| {
+            line.trim()
+                .to_ascii_lowercase()
+                .starts_with("called tools:")
+        })
+}
+
+fn append_preserved_tool_outputs(response: &mut String, preserved_outputs: &[String]) {
+    let mut seen: HashSet<&str> = HashSet::new();
+    for output in preserved_outputs {
+        let trimmed = output.trim();
+        if trimmed.is_empty() || !seen.insert(trimmed) {
+            continue;
+        }
+        if response.contains(trimmed) {
+            continue;
+        }
+        if !response.trim().is_empty() {
+            response.push_str("\n\n");
+        }
+        response.push_str(trimmed);
+    }
+}
+
+fn pin_preferred_actions(
+    selected: &mut Vec<crate::actions::ActionDef>,
+    all_actions: &[crate::actions::ActionDef],
+    preferred_action_names: &HashSet<String>,
+    limit: usize,
+) {
+    if preferred_action_names.is_empty() {
+        return;
+    }
+
+    let mut ordered_names: Vec<&str> = preferred_action_names
+        .iter()
+        .map(|name| name.as_str())
+        .collect();
+    ordered_names.sort_unstable();
+
+    let mut pinned = Vec::new();
+    for action_name in ordered_names {
+        if selected.iter().any(|action| action.name == action_name) {
+            continue;
+        }
+        if let Some(action) = all_actions.iter().find(|action| action.name == action_name) {
+            pinned.push(action.clone());
+        }
+    }
+
+    if pinned.is_empty() {
+        return;
+    }
+
+    pinned.extend(selected.drain(..));
+    *selected = pinned;
+    if selected.len() > limit {
+        selected.truncate(limit);
+    }
+}
+
+fn ensure_live_app_companion_actions(
+    selected: &mut Vec<crate::actions::ActionDef>,
+    all_actions: &[crate::actions::ActionDef],
+    limit: usize,
+) {
+    if !selected
+        .iter()
+        .any(|action| matches!(action.name.as_str(), "app_inspect" | "app_restart"))
+    {
+        return;
+    }
+
+    let companion_names = ["file_read", "file_write", "app_restart"];
+    let mut selected_names: HashSet<String> =
+        selected.iter().map(|action| action.name.clone()).collect();
+    for action_name in companion_names {
+        if selected_names.contains(action_name) {
+            continue;
+        }
+        if let Some(action) = all_actions.iter().find(|action| action.name == action_name) {
+            selected.push(action.clone());
+            selected_names.insert(action.name.clone());
+        }
+    }
+
+    if selected.len() <= limit {
+        return;
+    }
+
+    let essential_names: HashSet<&str> = ["app_inspect", "file_read", "file_write", "app_restart"]
+        .into_iter()
+        .collect();
+    let mut trimmed = Vec::new();
+    let mut seen = HashSet::new();
+
+    for action in selected.iter() {
+        if essential_names.contains(action.name.as_str()) && seen.insert(action.name.clone()) {
+            trimmed.push(action.clone());
+        }
+    }
+    for action in selected.iter() {
+        if trimmed.len() >= limit {
+            break;
+        }
+        if seen.insert(action.name.clone()) {
+            trimmed.push(action.clone());
+        }
+    }
+
+    *selected = trimmed;
+}
+
+fn ensure_workspace_repair_actions(
+    selected: &mut Vec<crate::actions::ActionDef>,
+    all_actions: &[crate::actions::ActionDef],
+    limit: usize,
+) {
+    let companion_names = ["file_read", "file_write", "shell"];
+    let mut selected_names: HashSet<String> =
+        selected.iter().map(|action| action.name.clone()).collect();
+    for action_name in companion_names {
+        if selected_names.contains(action_name) {
+            continue;
+        }
+        if let Some(action) = all_actions.iter().find(|action| action.name == action_name) {
+            selected.push(action.clone());
+            selected_names.insert(action.name.clone());
+        }
+    }
+
+    if selected.len() <= limit {
+        return;
+    }
+
+    let essential_names: HashSet<&str> = ["file_read", "file_write", "shell"].into_iter().collect();
+    let mut trimmed = Vec::new();
+    let mut seen = HashSet::new();
+
+    for action in selected.iter() {
+        if essential_names.contains(action.name.as_str()) && seen.insert(action.name.clone()) {
+            trimmed.push(action.clone());
+        }
+    }
+    for action in selected.iter() {
+        if trimmed.len() >= limit {
+            break;
+        }
+        if seen.insert(action.name.clone()) {
+            trimmed.push(action.clone());
+        }
+    }
+
+    *selected = trimmed;
+}
+
+fn should_apply_recent_artifact_context(
+    message: &str,
+    all_actions: &[crate::actions::ActionDef],
+    recent_artifact: Option<&ConversationArtifactContext>,
+    has_recent_artifact_context: bool,
+    continuation_score: f32,
+    artifact_reference: f32,
+    competing_intent: f32,
+) -> bool {
+    if !has_recent_artifact_context {
+        return false;
+    }
+
+    let Some(ctx) = recent_artifact else {
+        return false;
+    };
+
+    let artifact_signal = continuation_score >= 0.24
+        || artifact_reference >= 0.14
+        || ctx
+            .related_actions
+            .iter()
+            .any(|name| has_action_intent_adaptive(message, all_actions, name));
+    if !artifact_signal {
+        return false;
+    }
+
+    if !is_workspace_modification_request(message) {
+        return true;
+    }
+
+    continuation_score >= 0.34 || artifact_reference >= (competing_intent + 0.08)
 }
 
 /// Query complexity classification
@@ -899,6 +2183,9 @@ pub struct Agent {
     /// Security event counters (reset each pulse cycle)
     pub security_events: Arc<SecurityEvents>,
 
+    /// Optional user-selected model slot override (set via `use model - <name>`).
+    pub user_selected_model_slot_id: Arc<std::sync::RwLock<Option<String>>>,
+
     /// Deployed app registry (static files + dynamic server processes)
     pub app_registry: crate::actions::app::AppRegistry,
 }
@@ -912,6 +2199,28 @@ struct Mem0RetryItem {
     next_attempt_at: String,
     created_at: String,
     last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ConversationLastDeployedApp {
+    pub app_id: String,
+    pub title: String,
+    pub url: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ConversationArtifactContext {
+    pub artifact_type: String,
+    pub artifact_id: String,
+    pub title: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub related_actions: Vec<String>,
+    pub updated_at: String,
 }
 
 /// Atomic counters for security events between pulse cycles
@@ -975,7 +2284,7 @@ pub struct UserProfile {
 }
 
 /// Execution trace step - records what the agent actually did
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ExecutionStep {
     pub icon: String,
     pub title: String,
@@ -987,7 +2296,7 @@ pub struct ExecutionStep {
 }
 
 /// Full execution trace for a message
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ExecutionTrace {
     /// Unique ID for this trace
     pub id: String,
@@ -1005,6 +2314,8 @@ pub struct ExecutionTrace {
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     Token(String),
+    /// Periodic heartbeat during long waits (e.g., non-streaming fallback)
+    Thinking(String),
     ToolStart {
         name: String,
         payload: Option<serde_json::Value>,
@@ -1080,9 +2391,6 @@ impl Agent {
         };
         let config = secure_config.load()?;
 
-        // Extract LLM env vars for deployed apps (before config is moved)
-        let app_llm_env = config.llm.app_env_vars();
-
         // Load HTTP API key from encrypted secrets
         let api_key = secure_config.get_api_key().unwrap_or(None);
 
@@ -1119,6 +2427,62 @@ impl Agent {
             model_pool_map.len(),
             primary_model_id
         );
+
+        let persisted_model_override = storage
+            .get(USER_SELECTED_MODEL_SLOT_KEY)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let had_persisted_model_override = persisted_model_override.is_some();
+        let user_selected_model_slot = persisted_model_override.and_then(|slot_id| {
+            let ready = model_pool_map
+                .get(&slot_id)
+                .is_some_and(|(slot, _)| Self::provider_has_runtime_credentials(&slot.provider));
+            if ready {
+                Some(slot_id)
+            } else {
+                None
+            }
+        });
+        if had_persisted_model_override && user_selected_model_slot.is_none() {
+            let _ = storage.delete(USER_SELECTED_MODEL_SLOT_KEY).await;
+        }
+        if let Some(slot_id) = user_selected_model_slot.as_ref() {
+            tracing::info!("Restored user-selected model slot override: {}", slot_id);
+        }
+
+        let mut app_provider_refs: Vec<&crate::core::LlmProvider> = Vec::new();
+        if let Some(selected_slot_id) = user_selected_model_slot.as_ref() {
+            if let Some(slot) = config
+                .model_pool
+                .slots
+                .iter()
+                .find(|slot| slot.id == *selected_slot_id && slot.enabled)
+            {
+                app_provider_refs.push(&slot.provider);
+            }
+        }
+        if let Some(primary_slot) = config
+            .model_pool
+            .slots
+            .iter()
+            .find(|slot| slot.id == primary_model_id && slot.enabled)
+        {
+            app_provider_refs.push(&primary_slot.provider);
+        }
+        app_provider_refs.push(&config.llm);
+        if let Some(fallback) = config.llm_fallback.as_ref() {
+            app_provider_refs.push(fallback);
+        }
+        for slot in &config.model_pool.slots {
+            if slot.enabled && slot.id != primary_model_id {
+                app_provider_refs.push(&slot.provider);
+            }
+        }
+        let app_llm_env = merge_app_llm_env_from_providers(&app_provider_refs);
 
         // Initialize task queue
         let tasks = Arc::new(RwLock::new(TaskQueue::new()));
@@ -1408,6 +2772,7 @@ impl Agent {
             mem0_retry_lock: Arc::new(tokio::sync::Mutex::new(())),
             last_activity: Arc::new(RwLock::new(None)),
             security_events: Arc::new(SecurityEvents::new()),
+            user_selected_model_slot_id: Arc::new(std::sync::RwLock::new(user_selected_model_slot)),
             app_registry: {
                 let reg = crate::actions::app::AppRegistry::new();
                 reg.restore_from_disk(config_dir, data_dir, &app_llm_env)
@@ -2219,6 +3584,245 @@ impl Agent {
         (new_id, true)
     }
 
+    pub(crate) fn conversation_recent_artifact_key(conversation_id: &str) -> String {
+        format!(
+            "{}{}",
+            CONVERSATION_RECENT_ARTIFACT_KEY_PREFIX,
+            conversation_id.trim()
+        )
+    }
+
+    pub(crate) fn conversation_last_deployed_app_key(conversation_id: &str) -> String {
+        format!(
+            "{}{}",
+            CONVERSATION_LAST_DEPLOYED_APP_KEY_PREFIX,
+            conversation_id.trim()
+        )
+    }
+
+    pub(crate) async fn persist_conversation_artifact_context(
+        &self,
+        conversation_id: &str,
+        artifact_type: &str,
+        artifact_id: &str,
+        title: &str,
+        summary: &str,
+        url: Option<&str>,
+        related_actions: &[&str],
+    ) {
+        let cid = conversation_id.trim();
+        let artifact_type = artifact_type.trim();
+        let artifact_id = artifact_id.trim();
+        if cid.is_empty() || artifact_type.is_empty() || artifact_id.is_empty() {
+            return;
+        }
+        let payload = ConversationArtifactContext {
+            artifact_type: artifact_type.to_string(),
+            artifact_id: artifact_id.to_string(),
+            title: safe_truncate(title.trim(), 120),
+            summary: safe_truncate(summary.trim(), 240),
+            url: safe_truncate(url.unwrap_or_default().trim(), 300),
+            related_actions: related_actions
+                .iter()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        if let Ok(serialized) = serde_json::to_vec(&payload) {
+            let key = Self::conversation_recent_artifact_key(cid);
+            let _ = self.storage.set(&key, &serialized).await;
+        }
+    }
+
+    pub(crate) async fn persist_last_deployed_app_context(
+        &self,
+        conversation_id: &str,
+        app_id: &str,
+        title: &str,
+        url: &str,
+    ) {
+        let cid = conversation_id.trim();
+        let app_id = app_id.trim();
+        if cid.is_empty() || app_id.is_empty() {
+            return;
+        }
+
+        let payload = ConversationLastDeployedApp {
+            app_id: app_id.to_string(),
+            title: safe_truncate(title.trim(), 120),
+            url: safe_truncate(url.trim(), 300),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        if let Ok(serialized) = serde_json::to_vec(&payload) {
+            let key = Self::conversation_last_deployed_app_key(cid);
+            let _ = self.storage.set(&key, &serialized).await;
+        }
+
+        self.persist_conversation_artifact_context(
+            cid,
+            "app",
+            app_id,
+            title,
+            "Recently deployed app in this conversation",
+            Some(url),
+            &[
+                "app_inspect",
+                "file_read",
+                "file_write",
+                "app_restart",
+                "app_deploy",
+            ],
+        )
+        .await;
+    }
+
+    async fn load_recent_artifact_context(
+        &self,
+        conversation_id: &str,
+    ) -> Option<ConversationArtifactContext> {
+        let cid = conversation_id.trim();
+        if cid.is_empty() {
+            return None;
+        }
+        let key = Self::conversation_recent_artifact_key(cid);
+        let mut parsed = if let Some(raw) = self.storage.get(&key).await.ok().flatten() {
+            serde_json::from_slice::<ConversationArtifactContext>(&raw).ok()
+        } else {
+            None
+        };
+        if parsed.is_none() {
+            let legacy_key = Self::conversation_last_deployed_app_key(cid);
+            parsed = self
+                .storage
+                .get(&legacy_key)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|legacy_raw| {
+                    serde_json::from_slice::<ConversationLastDeployedApp>(&legacy_raw)
+                        .ok()
+                        .map(|legacy| ConversationArtifactContext {
+                            artifact_type: "app".to_string(),
+                            artifact_id: legacy.app_id,
+                            title: legacy.title,
+                            summary: "Recently deployed app in this conversation".to_string(),
+                            url: legacy.url,
+                            related_actions: vec![
+                                "app_inspect".to_string(),
+                                "file_read".to_string(),
+                                "file_write".to_string(),
+                                "app_restart".to_string(),
+                                "app_deploy".to_string(),
+                            ],
+                            updated_at: legacy.updated_at,
+                        })
+                });
+        }
+        let parsed = parsed?;
+        let updated_at = chrono::DateTime::parse_from_rfc3339(parsed.updated_at.as_str())
+            .ok()
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+        let age_secs = updated_at
+            .map(|dt| (chrono::Utc::now() - dt).num_seconds())
+            .unwrap_or(i64::MAX);
+        if age_secs > APP_FOLLOWUP_CONTEXT_MAX_AGE_SECS {
+            let _ = self.storage.delete(&key).await;
+            return None;
+        }
+        Some(parsed)
+    }
+
+    async fn select_actions_for_message_with_llm(
+        &self,
+        message: &str,
+        all_actions: &[crate::actions::ActionDef],
+        recent_artifact: Option<&ConversationArtifactContext>,
+    ) -> Option<Vec<crate::actions::ActionDef>> {
+        if all_actions.len() <= MAX_SHORTLISTED_ACTIONS {
+            return None;
+        }
+
+        let light_catalog = all_actions
+            .iter()
+            .map(|action| {
+                serde_json::json!({
+                    "name": action.name,
+                    "description": action.description,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let selector_prompt = r#"You are selecting the minimal action set for an AI agent.
+Return ONLY valid JSON. Do not include any extra text.
+
+Output schema:
+{
+  "needed_actions": ["action_name", "action_name"]
+}
+
+Rules:
+- Use only the provided actions.
+- Keep the list minimal.
+- Prefer actions that directly inspect, operate on, modify, or validate the user's target.
+- If the request refers to an existing artifact, file, deployment, or running system, prefer operational actions over topical/domain workflows that merely share keywords.
+- If the request is about AgentArk itself, the current workspace, chat/activity UX, traces, prompts, routing, or execution behavior, prefer local code/file/shell actions and ignore deployed-app context unless the user explicitly targets that app.
+- If you include `app_inspect` for a deployed app, also include the companion actions needed to finish the job, such as `file_read`, `file_write`, and `app_restart`. Treat `http_get` as optional validation only when it is useful and available.
+- For fix/debug/repair requests, include the minimal inspect + repair + validation path, not just the first tool.
+"#;
+
+        let mut selector_message = format!(
+            "User request:\n{}\n\nAvailable actions (names + descriptions):\n{}",
+            message,
+            serde_json::to_string_pretty(&light_catalog).ok()?
+        );
+        if let Some(ctx) = recent_artifact {
+            selector_message.push_str("\n\nRecent artifact context:\n");
+            selector_message.push_str(&format!(
+                "- type: {}\n- title: {}\n- id: {}\n- summary: {}\n- related_actions: {}\n",
+                ctx.artifact_type,
+                ctx.title,
+                ctx.artifact_id,
+                ctx.summary,
+                ctx.related_actions.join(", ")
+            ));
+        }
+
+        let response = self
+            .llm
+            .chat(selector_prompt, &selector_message, &[], all_actions)
+            .await
+            .ok()?;
+        let parsed = extract_json_object_from_text(&response.content)?;
+        let names = parsed
+            .get("needed_actions")
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        if names.is_empty() {
+            return None;
+        }
+
+        let mut selected = all_actions
+            .iter()
+            .filter(|action| names.contains(action.name.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            return None;
+        }
+        if selected.len() > MAX_SHORTLISTED_ACTIONS {
+            selected.truncate(MAX_SHORTLISTED_ACTIONS);
+        }
+        Some(selected)
+    }
+
     fn missing_profile_fields(profile: &UserProfile) -> Vec<&'static str> {
         let mut missing = Vec::new();
         if profile
@@ -2395,7 +3999,7 @@ impl Agent {
             }
 
             if let Some(key) = crate::core::secrets::parse_use_current_llm_key_command(message) {
-                let llm_env = self.config.llm.app_env_vars();
+                let llm_env = self.app_model_env_vars();
                 if let Some(value) = llm_env.get(&key).cloned().filter(|v| !v.trim().is_empty()) {
                     crate::core::secrets::store_user_secret(
                         &self.config_dir,
@@ -2454,6 +4058,51 @@ impl Agent {
                     conversation_title: None,
                 });
             }
+        }
+
+        if let Some(model_hint) = parse_use_model_command(message) {
+            let normalized = normalize_model_match_token(&model_hint);
+            if matches!(
+                normalized.as_str(),
+                "default" | "auto" | "system" | "settings" | "primary"
+            ) {
+                self.set_user_selected_model_slot_id_local(None);
+                let _ = self.storage.delete(USER_SELECTED_MODEL_SLOT_KEY).await;
+                return Ok(ProcessedMessage {
+                    response:
+                        "Cleared model override. I will use the configured model routing from Settings."
+                            .to_string(),
+                    conversation_id: conversation_id.map(|id| id.to_string()),
+                    conversation_title: None,
+                });
+            }
+
+            if let Some(candidate) = self.resolve_model_hint_candidate(&model_hint) {
+                self.set_user_selected_model_slot_id_local(Some(candidate.slot_id.clone()));
+                let _ = self
+                    .storage
+                    .set(USER_SELECTED_MODEL_SLOT_KEY, candidate.slot_id.as_bytes())
+                    .await;
+                return Ok(ProcessedMessage {
+                    response: format!(
+                        "Model override saved. I will use '{}' ({}) until you change it.",
+                        candidate.slot_label,
+                        candidate.client.model_name()
+                    ),
+                    conversation_id: conversation_id.map(|id| id.to_string()),
+                    conversation_title: None,
+                });
+            }
+
+            let available = self.available_model_selection_descriptions().join(", ");
+            return Ok(ProcessedMessage {
+                response: format!(
+                    "I couldn't find a configured model matching '{}'. Available models: {}",
+                    model_hint, available
+                ),
+                conversation_id: conversation_id.map(|id| id.to_string()),
+                conversation_title: None,
+            });
         }
 
         // Fast-path tool registration so newly wired integration tools are visible to the LLM
@@ -2553,6 +4202,51 @@ impl Agent {
         let conversation_key = resolved_conversation_id.clone();
         let profile_nudge = self.maybe_profile_nudge(channel, message).await;
 
+        if let Some(mut response) = build_shared_link_memory_ack(message) {
+            if let Some(nudge) = profile_nudge.as_ref() {
+                response.push_str("\n\n");
+                response.push_str(nudge);
+            }
+            return self
+                .persist_immediate_exchange(
+                    message,
+                    &response,
+                    channel,
+                    &conversation_key,
+                    is_new_conversation,
+                    project_id,
+                    "link_capture_fast_path",
+                )
+                .await;
+        }
+
+        let mut lookup_actions = self
+            .runtime
+            .list_enabled_actions()
+            .await
+            .unwrap_or_default();
+        self.append_dynamic_integration_actions(&mut lookup_actions)
+            .await;
+        if is_capability_lookup_query(message, &lookup_actions) {
+            if let Some(mut response) = fast_capability_lookup_response(message, &lookup_actions) {
+                if let Some(nudge) = profile_nudge.as_ref() {
+                    response.push_str("\n\n");
+                    response.push_str(nudge);
+                }
+                return self
+                    .persist_immediate_exchange(
+                        message,
+                        &response,
+                        channel,
+                        &conversation_key,
+                        is_new_conversation,
+                        project_id,
+                        "capability_lookup_fast_path",
+                    )
+                    .await;
+            }
+        }
+
         // Multi-turn onboarding: start/cancel integration connect flows without engaging the LLM.
         if let Some(flow_response) = self
             .maybe_handle_integration_connect_flow(&conversation_key, message)
@@ -2590,7 +4284,7 @@ impl Agent {
                     trace_id: None,
                 };
                 let _ = self.storage.insert_message(&user_msg).await;
-                self.capture_user_links_as_user_data(
+                self.capture_user_memory_hints(
                     message,
                     channel,
                     Some(&conversation_key),
@@ -2642,18 +4336,20 @@ impl Agent {
 
         // Chat-native skill run shortcut for custom/bundled skills:
         // e.g. "run calendar-helper and schedule 9am meeting tomorrow".
-        let enabled_actions = self.runtime.list_enabled_actions().await.unwrap_or_default();
+        let mut enabled_actions = self
+            .runtime
+            .list_enabled_actions()
+            .await
+            .unwrap_or_default();
+        self.append_dynamic_integration_actions(&mut enabled_actions)
+            .await;
         if let Some(intent) = parse_skill_run_intent(message, &enabled_actions) {
             let mut response = match self
                 .run_named_skill_chat_shortcut(&intent.skill_name, &intent.query)
                 .await
             {
                 Ok(out) => out,
-                Err(e) => format!(
-                    "I couldn't run skill '{}': {}",
-                    intent.skill_name,
-                    e
-                ),
+                Err(e) => format!("I couldn't run skill '{}': {}", intent.skill_name, e),
             };
             if let Some(nudge) = profile_nudge.as_ref() {
                 response.push_str("\n\n");
@@ -2766,6 +4462,24 @@ impl Agent {
             }
         }
 
+        // Persist user message to DB immediately so it survives LLM failures
+        if !conversation_key.is_empty() {
+            let user_msg = crate::storage::entities::message::Model {
+                id: uuid::Uuid::new_v4().to_string(),
+                conversation_id: conversation_key.clone(),
+                role: "user".to_string(),
+                content: message.to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                model_used: None,
+                trace_id: None,
+            };
+            if let Err(e) = self.storage.insert_message(&user_msg).await {
+                tracing::warn!("Failed to persist user message early: {}", e);
+            }
+            self.capture_user_memory_hints(message, channel, Some(&conversation_key), project_id)
+                .await;
+        }
+
         // Fast-path greetings: skip heavy routing/tooling/extra LLM calls.
         if self.classify_smalltalk_intent(channel, message).await {
             let mut response = "Hello! What would you like help with today?".to_string();
@@ -2808,29 +4522,12 @@ impl Agent {
 
             let mut conversation_title: Option<String> = None;
             {
-                let now = chrono::Utc::now().to_rfc3339();
                 let conv_id = conversation_key.clone();
                 *self.last_conversation_id.write().await = Some(conv_id.clone());
                 *self.last_conversation_title.write().await = None;
 
                 if !conv_id.is_empty() {
-                    let user_msg = crate::storage::entities::message::Model {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        conversation_id: conv_id.clone(),
-                        role: "user".to_string(),
-                        content: message.to_string(),
-                        timestamp: now,
-                        model_used: None,
-                        trace_id: None,
-                    };
-                    let _ = self.storage.insert_message(&user_msg).await;
-                    self.capture_user_links_as_user_data(
-                        message,
-                        channel,
-                        Some(&conv_id),
-                        project_id,
-                    )
-                    .await;
+                    // User message already persisted early (before LLM call)
 
                     let asst_msg = crate::storage::entities::message::Model {
                         id: uuid::Uuid::new_v4().to_string(),
@@ -2878,18 +4575,8 @@ impl Agent {
                     timestamp: end_time,
                     duration_ms: Some(total_duration),
                 });
-
-                let mut history = self.trace_history.write().await;
-                history.insert(0, trace.clone());
-                if history.len() > 100 {
-                    history.truncate(100);
-                }
             }
-
-            if !Arc::ptr_eq(&trace_ref, &self.last_trace) {
-                let trace_snapshot = trace_ref.read().await.clone();
-                *self.last_trace.write().await = trace_snapshot;
-            }
+            self.persist_completed_trace(&trace_ref).await;
 
             return Ok(ProcessedMessage {
                 response,
@@ -2921,15 +4608,37 @@ impl Agent {
                     .collect(),
                 Err(e) => {
                     tracing::warn!("Mem0 search failed, falling back to built-in memory: {}", e);
-                    self.memory
-                        .retrieve_relevant(message, 3, project_id)
-                        .await?
+                    match self.memory.retrieve_relevant(message, 3, project_id).await {
+                        Ok(memories) => memories,
+                        Err(err) => {
+                            let error_text = format!("Built-in memory retrieval failed: {}", err);
+                            self.finalize_failed_trace(
+                                &trace_ref,
+                                "Memory Retrieval Failed",
+                                &error_text,
+                                None,
+                            )
+                            .await;
+                            return Err(err);
+                        }
+                    }
                 }
             }
         } else {
-            self.memory
-                .retrieve_relevant(message, 3, project_id)
-                .await?
+            match self.memory.retrieve_relevant(message, 3, project_id).await {
+                Ok(memories) => memories,
+                Err(err) => {
+                    let error_text = format!("Built-in memory retrieval failed: {}", err);
+                    self.finalize_failed_trace(
+                        &trace_ref,
+                        "Memory Retrieval Failed",
+                        &error_text,
+                        None,
+                    )
+                    .await;
+                    return Err(err);
+                }
+            }
         };
         let memory_duration = memory_start.elapsed().as_millis() as u64;
         let mem_source = if self.mem0.is_available() {
@@ -3015,7 +4724,15 @@ impl Agent {
         };
 
         // 4b. Build context for LLM
-        let mut system_prompt = self.build_system_prompt(&relevant_memories).await?;
+        let mut system_prompt = match self.build_system_prompt(&relevant_memories).await {
+            Ok(prompt) => prompt,
+            Err(err) => {
+                let error_text = format!("Failed to build system prompt: {}", err);
+                self.finalize_failed_trace(&trace_ref, "System Prompt Failed", &error_text, None)
+                    .await;
+                return Err(err);
+            }
+        };
         let prompt_version = "system_prompt_v2".to_string();
         let mut strategy_version: Option<String> = None;
         let mut strategy_task_type: Option<String> = None;
@@ -3122,11 +4839,189 @@ impl Agent {
         }
 
         // 6. Get available actions
-        let mut all_actions = self.runtime.list_enabled_actions().await?;
+        let mut all_actions = match self.runtime.list_enabled_actions().await {
+            Ok(actions) => actions,
+            Err(err) => {
+                let error_text = format!("Failed to list enabled actions: {}", err);
+                self.finalize_failed_trace(
+                    &trace_ref,
+                    "Action Discovery Failed",
+                    &error_text,
+                    None,
+                )
+                .await;
+                return Err(err);
+            }
+        };
         self.append_dynamic_integration_actions(&mut all_actions)
             .await;
-        let available_actions = select_actions_for_message(message, &all_actions);
-        let app_deploy_intent = has_action_intent_default(message, &all_actions, "app_deploy");
+        let direct_app_deploy_intent = has_app_deploy_intent(message, &all_actions);
+        let recent_artifact = self.load_recent_artifact_context(&conversation_key).await;
+        let continuation_score = continuation_message_score(message, &conversation_history);
+        let recent_artifact_age_secs = recent_artifact
+            .as_ref()
+            .and_then(|ctx| chrono::DateTime::parse_from_rfc3339(&ctx.updated_at).ok())
+            .map(|dt| (chrono::Utc::now() - dt.with_timezone(&chrono::Utc)).num_seconds())
+            .unwrap_or(i64::MAX);
+        // Generic signal: conversation has a deployed app that's still relevant.
+        // When true, inject app context into the LLM prompt and skip clarification —
+        // let the LLM understand intent instead of keyword heuristics.
+        let has_recent_artifact_context = recent_artifact.is_some()
+            && recent_artifact_age_secs <= APP_FOLLOWUP_CONTEXT_MAX_AGE_SECS;
+        let artifact_reference = recent_artifact
+            .as_ref()
+            .map(|ctx| artifact_reference_score(message, ctx))
+            .unwrap_or(0.0);
+        let artifact_related_action_names: HashSet<String> = recent_artifact
+            .as_ref()
+            .map(|ctx| ctx.related_actions.iter().cloned().collect())
+            .unwrap_or_default();
+        let competing_intent =
+            best_competing_intent_score(message, &all_actions, &artifact_related_action_names);
+        let use_recent_artifact_context = should_apply_recent_artifact_context(
+            message,
+            &all_actions,
+            recent_artifact.as_ref(),
+            has_recent_artifact_context,
+            continuation_score,
+            artifact_reference,
+            competing_intent,
+        );
+        let boosted_action_names: HashSet<String> = if use_recent_artifact_context {
+            artifact_related_action_names.clone()
+        } else {
+            HashSet::new()
+        };
+        tracing::info!(
+            "artifact_context_check: recent_artifact={}, recent_age_secs={}, has_recent_artifact_context={}, conv_key={}",
+            recent_artifact.is_some(),
+            recent_artifact_age_secs,
+            use_recent_artifact_context,
+            &conversation_key,
+        );
+
+        if let Some(artifact_ctx) = recent_artifact
+            .as_ref()
+            .filter(|_| use_recent_artifact_context)
+        {
+            system_prompt.push_str(
+                "\n\n## Recent Artifact Context\n\
+This conversation recently produced or modified an artifact.\n",
+            );
+            system_prompt.push_str(&format!(
+                "Artifact type: `{}`\nArtifact title: '{}'\nArtifact id: `{}`.\n",
+                safe_truncate(&artifact_ctx.artifact_type, 48),
+                safe_truncate(&artifact_ctx.title, 120),
+                safe_truncate(&artifact_ctx.artifact_id, 48)
+            ));
+            if !artifact_ctx.url.trim().is_empty() {
+                system_prompt.push_str(&format!(
+                    "Artifact URL: `{}`.\n",
+                    safe_truncate(&artifact_ctx.url, 220)
+                ));
+            }
+            if !artifact_ctx.summary.trim().is_empty() {
+                system_prompt.push_str(&format!(
+                    "Artifact summary: {}.\n",
+                    safe_truncate(&artifact_ctx.summary, 220)
+                ));
+            }
+            if !artifact_ctx.related_actions.is_empty() {
+                system_prompt.push_str(&format!(
+                    "Related actions: {}.\n",
+                    artifact_ctx.related_actions.join(", ")
+                ));
+            }
+            if artifact_ctx.artifact_type.eq_ignore_ascii_case("app") {
+                let app_root = format!("/app/data/apps/{}", artifact_ctx.artifact_id);
+                system_prompt.push_str(&format!("Deployed app workspace root: `{}`.\n", app_root));
+                system_prompt.push_str(
+                    "When the user wants to debug or fix this app, do not ask whether the app exists. Prefer `app_inspect` first if you need metadata or file inventory, then use `file_read` and `file_write` on that app root. After changing a deployed app, prefer `app_restart` to apply the update, then validate it with the safest available direct check such as logs, refreshed data, a screenshot tool, or `http_get` when available. If one validation tool is blocked, switch to another instead of retrying the blocked tool. Prefer editing the existing deployed app over generating a brand-new deployment unless the user explicitly asks to rebuild or replace it.\n",
+                );
+            }
+            system_prompt.push_str(
+                "If the user is clearly continuing work on this artifact, prefer the related actions. If they switched topics or are asking about AgentArk/workspace behavior itself, ignore this context.\n",
+            );
+        }
+        let preferred_action_names = boosted_action_names.clone();
+        let llm_selected_actions = self
+            .select_actions_for_message_with_llm(
+                message,
+                &all_actions,
+                recent_artifact
+                    .as_ref()
+                    .filter(|_| use_recent_artifact_context),
+            )
+            .await;
+        let mut available_actions = llm_selected_actions.clone().unwrap_or_else(|| {
+            select_actions_for_message(message, &all_actions, &preferred_action_names)
+        });
+        pin_preferred_actions(
+            &mut available_actions,
+            &all_actions,
+            &preferred_action_names,
+            10,
+        );
+        ensure_live_app_companion_actions(
+            &mut available_actions,
+            &all_actions,
+            MAX_SHORTLISTED_ACTIONS,
+        );
+        if is_workspace_modification_request(message) {
+            ensure_workspace_repair_actions(
+                &mut available_actions,
+                &all_actions,
+                MAX_SHORTLISTED_ACTIONS,
+            );
+        }
+        if !boosted_action_names.is_empty() {
+            let mut trace = trace_ref.write().await;
+            trace.steps.push(ExecutionStep {
+                icon: "[ctx]".to_string(),
+                title: "Recent Artifact Context".to_string(),
+                detail: "Boosted related actions from the recent conversation artifact."
+                    .to_string(),
+                step_type: "info".to_string(),
+                data: Some(format!(
+                    "continuation_score={:.2}, artifact_reference={:.2}, competing_intent={:.2}, related_actions={}",
+                    continuation_score,
+                    artifact_reference,
+                    competing_intent,
+                    boosted_action_names
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+                timestamp: chrono::Utc::now(),
+                duration_ms: None,
+            });
+        }
+        if let Some(selected) = llm_selected_actions.as_ref() {
+            let mut trace = trace_ref.write().await;
+            trace.steps.push(ExecutionStep {
+                icon: "[sel]".to_string(),
+                title: "Action Selector".to_string(),
+                detail: "Used the LLM to shortlist relevant actions from the full catalog."
+                    .to_string(),
+                step_type: "info".to_string(),
+                data: Some(format!(
+                    "selected_actions={}",
+                    selected
+                        .iter()
+                        .map(|action| action.name.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+                timestamp: chrono::Utc::now(),
+                duration_ms: None,
+            });
+        }
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(&Self::build_action_catalog_prompt(&available_actions));
+
+        let app_deploy_intent =
+            direct_app_deploy_intent || boosted_action_names.contains("app_deploy");
         if app_deploy_intent {
             if let Some(tx) = token_tx.as_ref() {
                 let _ = tx.try_send(StreamEvent::ToolProgress {
@@ -3137,15 +5032,41 @@ impl Agent {
             }
         }
 
-        // 7. LLM-based routing decision
+        // 7. Routing decision
+        let local_routing_fast_path = should_use_local_routing_fast_path(message, &all_actions);
         let routing_start = std::time::Instant::now();
-        let routing_decision = self.route_query(message, &all_actions).await;
+        let (routing_decision, routing_mode) = if local_routing_fast_path {
+            (
+                self.classify_complexity_fallback(message, &all_actions)
+                    .await,
+                "local_fast_path",
+            )
+        } else {
+            (self.route_query(message, &all_actions).await, "llm_router")
+        };
         let routing_ms = routing_start.elapsed().as_millis() as u64;
         let policy_version = self
             .active_routing_policy_version_for_message(message)
             .await;
+        if local_routing_fast_path {
+            let mut trace = trace_ref.write().await;
+            trace.steps.push(ExecutionStep {
+                icon: "[zap]".to_string(),
+                title: "Routing Fast Path".to_string(),
+                detail: "Short request routed with local heuristics (skipped router model call)."
+                    .to_string(),
+                step_type: "success".to_string(),
+                data: Some(format!(
+                    "mode={} | complexity={:?} | clarify={}",
+                    routing_mode, routing_decision.complexity, routing_decision.should_clarify
+                )),
+                timestamp: chrono::Utc::now(),
+                duration_ms: Some(routing_ms),
+            });
+        }
         tracing::debug!(
-            "Routing: {:?} complexity, delegation={}, agents={} ({}ms)",
+            "Routing (mode={}): {:?} complexity, delegation={}, agents={} ({}ms)",
+            routing_mode,
             routing_decision.complexity,
             routing_decision.needs_delegation,
             routing_decision.sub_agents.len(),
@@ -3167,6 +5088,7 @@ impl Agent {
                 "sub_agents": routing_decision.sub_agents.len(),
                 "confidence": routing_decision.confidence,
                 "should_clarify": routing_decision.should_clarify,
+                "mode": routing_mode,
                 "reasoning": safe_truncate(&routing_decision.reasoning, 300),
                 "strategy_task_type": strategy_task_type,
             })),
@@ -3186,10 +5108,20 @@ impl Agent {
             model_slot_label,
             selected_llm.model_name()
         );
+        let user_selected_candidate = self.user_selected_llm_candidate();
+        if let Some(candidate) = user_selected_candidate.as_ref() {
+            selected_llm = candidate.client.clone();
+            model_slot_label = Self::model_role_label(&candidate.role).to_string();
+            model_selection_detail = format!(
+                "Using user-selected model '{}' ({})",
+                candidate.slot_label,
+                selected_llm.model_name()
+            );
+        }
 
         // App deploy should be predictable: use an optional pinned model slot if configured;
         // otherwise force primary instead of smart-routing to code/research roles.
-        if app_deploy_intent {
+        if app_deploy_intent && user_selected_candidate.is_none() {
             let mut applied_pinned = false;
             if let Some(pinned_id) = self
                 .config
@@ -3293,12 +5225,15 @@ impl Agent {
         let clear_execution_request = execution_intent
             && !ambiguous_request
             && (self_contained_brief || execution_intent_score >= 0.65 || msg_word_count >= 40);
-        let needs_clarification = if self_contained_brief || clear_execution_request {
+        let needs_clarification = if self_contained_brief
+            || clear_execution_request
+            || (!boosted_action_names.is_empty() && use_recent_artifact_context)
+        {
             false
         } else {
-            routing_decision.should_clarify
+            (routing_decision.should_clarify
                 && routing_decision.confidence < 0.78
-                && (ambiguous_request || !execution_intent)
+                && (ambiguous_request || !execution_intent))
         };
 
         if routing_decision.should_clarify && (self_contained_brief || clear_execution_request) {
@@ -3359,7 +5294,7 @@ impl Agent {
                 routing_decision.complexity
             );
             let router_start = std::time::Instant::now();
-            let router_result = self
+            let router_result = match self
                 .task_router
                 .execute(
                     &routing_decision,
@@ -3374,7 +5309,16 @@ impl Agent {
                         trace: &trace_ref,
                     },
                 )
-                .await?;
+                .await
+            {
+                Ok(result) => result,
+                Err(err) => {
+                    let error_text = format!("Task router execution failed: {}", err);
+                    self.finalize_failed_trace(&trace_ref, "Task Router Failed", &error_text, None)
+                        .await;
+                    return Err(err);
+                }
+            };
 
             tracing::info!(
                 "Task router done in {}ms → {:?}",
@@ -3472,16 +5416,50 @@ impl Agent {
                                     candidate.client.model_name(),
                                     e
                                 );
-                                tracing::warn!("Parallel thinking model attempt failed: {}", err_msg);
+                                tracing::warn!(
+                                    "Parallel thinking model attempt failed: {}",
+                                    err_msg
+                                );
                                 parallel_errors.push(err_msg);
                             }
                         }
                     }
                     let Some(result) = result_opt else {
-                        return Err(anyhow::anyhow!(
+                        let mut error_response_for_trace: Option<String> = None;
+                        if !conversation_key.is_empty() {
+                            let error_detail = summarize_model_failures_for_user(&parallel_errors);
+                            let error_content = format!(
+                                "I wasn't able to process your request because all configured models failed. Please try again or switch models in Settings.\n\n{}",
+                                if error_detail.is_empty() {
+                                    "No additional provider detail was available."
+                                } else {
+                                    error_detail.as_str()
+                                }
+                            );
+                            let err_msg = crate::storage::entities::message::Model {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                conversation_id: conversation_key.clone(),
+                                role: "assistant".to_string(),
+                                content: error_content.clone(),
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                                model_used: Some("error".to_string()),
+                                trace_id: Some(trace_id.clone()),
+                            };
+                            let _ = self.storage.insert_message(&err_msg).await;
+                            error_response_for_trace = Some(error_content);
+                        }
+                        let error_text = format!(
                             "Parallel thinking failed across all configured models. {}",
                             parallel_errors.join(" | ")
-                        ));
+                        );
+                        self.finalize_failed_trace(
+                            &trace_ref,
+                            "Parallel Thinking Failed",
+                            &error_text,
+                            error_response_for_trace.as_deref(),
+                        )
+                        .await;
+                        return Err(anyhow::anyhow!("{}", error_text));
                     };
 
                     {
@@ -3559,6 +5537,7 @@ impl Agent {
                         }
 
                         let attempt = if let Some(tx) = token_tx.clone() {
+                            let tx_for_fallback = tx.clone();
                             match candidate
                                 .client
                                 .chat_with_history_stream(
@@ -3574,28 +5553,127 @@ impl Agent {
                                 Ok(resp) => Ok(resp),
                                 Err(stream_err) => {
                                     tracing::warn!(
-                                        "Streaming failed for model {} after {}ms, trying non-streaming: {}",
+                                        "Streaming failed for model {} after {}ms, trying non-streaming fallback: {}",
                                         candidate.client.model_name(),
                                         main_llm_start.elapsed().as_millis(),
                                         stream_err
                                     );
-                                    candidate
-                                        .client
-                                        .chat_with_history(
-                                            &system_prompt,
-                                            message,
-                                            &conversation_history,
-                                            &relevant_memories,
-                                            &available_actions,
-                                        )
-                                        .await
-                                        .map_err(|non_stream_err| {
-                                            anyhow::anyhow!(
-                                                "stream={} | non_stream={}",
-                                                stream_err,
-                                                non_stream_err
+
+                                    let heartbeat_tx = tx_for_fallback.clone();
+                                    let heartbeat_model = candidate.client.model_name().to_string();
+                                    let heartbeat_flag = std::sync::Arc::new(
+                                        std::sync::atomic::AtomicBool::new(false),
+                                    );
+                                    let hb_flag_clone = heartbeat_flag.clone();
+
+                                    // Spawn heartbeat: emit Thinking events every 5s so UI shows activity
+                                    let heartbeat_handle = tokio::spawn(async move {
+                                        let mut elapsed_secs = 0u64;
+                                        loop {
+                                            tokio::time::sleep(std::time::Duration::from_secs(5))
+                                                .await;
+                                            if hb_flag_clone
+                                                .load(std::sync::atomic::Ordering::Relaxed)
+                                            {
+                                                break;
+                                            }
+                                            elapsed_secs += 5;
+                                            let status = format!(
+                                                "Model {} is generating ({}s elapsed)...",
+                                                heartbeat_model, elapsed_secs
+                                            );
+                                            if heartbeat_tx
+                                                .try_send(StreamEvent::Thinking(status))
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
+                                    });
+
+                                    // Retry the non-streaming fallback up to 2 attempts
+                                    let mut non_stream_result = None;
+                                    let mut last_non_stream_err = None;
+                                    for ns_attempt in 0..2u32 {
+                                        if ns_attempt > 0 {
+                                            tracing::warn!(
+                                                "Non-streaming fallback retry {}/2 for model {}",
+                                                ns_attempt + 1,
+                                                candidate.client.model_name(),
+                                            );
+                                            tokio::time::sleep(std::time::Duration::from_secs(1))
+                                                .await;
+                                        }
+                                        match candidate
+                                            .client
+                                            .chat_with_history(
+                                                &system_prompt,
+                                                message,
+                                                &conversation_history,
+                                                &relevant_memories,
+                                                &available_actions,
                                             )
-                                        })
+                                            .await
+                                        {
+                                            Ok(resp) => {
+                                                non_stream_result = Some(resp);
+                                                break;
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "Non-streaming fallback attempt {} failed: {}",
+                                                    ns_attempt + 1,
+                                                    e,
+                                                );
+                                                last_non_stream_err = Some(e);
+                                            }
+                                        }
+                                    }
+
+                                    // Stop heartbeat
+                                    heartbeat_flag
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                                    heartbeat_handle.abort();
+
+                                    // Simulate streaming: emit response as chunked tokens for progressive UI delivery
+                                    if let Some(ref resp) = non_stream_result {
+                                        let text = &resp.content;
+                                        if !text.is_empty() {
+                                            // Emit in ~200-char chunks for smooth progressive rendering
+                                            let mut pos = 0;
+                                            while pos < text.len() {
+                                                let end = (pos + 200).min(text.len());
+                                                // Snap to nearest newline or space to avoid splitting words
+                                                let snap = if end < text.len() {
+                                                    text[pos..end]
+                                                        .rfind('\n')
+                                                        .or_else(|| text[pos..end].rfind(' '))
+                                                        .map(|i| pos + i + 1)
+                                                        .unwrap_or(end)
+                                                } else {
+                                                    end
+                                                };
+                                                let chunk = &text[pos..snap];
+                                                let _ = tx_for_fallback.try_send(
+                                                    StreamEvent::Token(chunk.to_string()),
+                                                );
+                                                pos = snap;
+                                                // Small yield to let the SSE event flush to the client
+                                                tokio::task::yield_now().await;
+                                            }
+                                        }
+                                    }
+
+                                    match non_stream_result {
+                                        Some(resp) => Ok(resp),
+                                        None => Err(anyhow::anyhow!(
+                                            "stream={} | non_stream={}",
+                                            stream_err,
+                                            last_non_stream_err.unwrap_or_else(|| anyhow::anyhow!(
+                                                "no attempts made"
+                                            ))
+                                        )),
+                                    }
                                 }
                             }
                         } else {
@@ -3650,10 +5728,42 @@ impl Agent {
                     }
 
                     let Some(main_resp) = main_resp_opt else {
-                        return Err(anyhow::anyhow!(
+                        // Persist error so the conversation shows what happened
+                        let mut error_response_for_trace: Option<String> = None;
+                        if !conversation_key.is_empty() {
+                            let error_detail = summarize_model_failures_for_user(&model_errors);
+                            let error_content = format!(
+                                "I wasn't able to process your request because all configured models failed. Please try again or switch models in Settings.\n\n{}",
+                                if error_detail.is_empty() {
+                                    "No additional provider detail was available."
+                                } else {
+                                    error_detail.as_str()
+                                }
+                            );
+                            let err_msg = crate::storage::entities::message::Model {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                conversation_id: conversation_key.clone(),
+                                role: "assistant".to_string(),
+                                content: error_content.clone(),
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                                model_used: Some("error".to_string()),
+                                trace_id: Some(trace_id.clone()),
+                            };
+                            let _ = self.storage.insert_message(&err_msg).await;
+                            error_response_for_trace = Some(error_content);
+                        }
+                        let error_text = format!(
                             "All configured models failed for this request. {}",
                             model_errors.join(" | ")
-                        ));
+                        );
+                        self.finalize_failed_trace(
+                            &trace_ref,
+                            "Main LLM Failed",
+                            &error_text,
+                            error_response_for_trace.as_deref(),
+                        )
+                        .await;
+                        return Err(anyhow::anyhow!("{}", error_text));
                     };
                     tracing::info!(
                         "Main LLM done ← {}ms, content={}chars, tool_calls={}",
@@ -3938,9 +6048,8 @@ Do not ask the user for JSON.",
         })
         .await;
 
-        // Extract fields from LLM result
-        let response = llm_result.content.clone();
-        let tool_calls = llm_result.tool_calls.clone();
+        let initial_response = llm_result.content.clone();
+        let initial_tool_calls = llm_result.tool_calls.clone();
 
         {
             let mut trace = trace_ref.write().await;
@@ -3949,8 +6058,8 @@ Do not ask the user for JSON.",
                 title: "LLM Response Received".to_string(),
                 detail: format!(
                     "Response length: {} chars | Tool calls: {}",
-                    response.len(),
-                    tool_calls.len()
+                    initial_response.len(),
+                    initial_tool_calls.len()
                 ),
                 step_type: "success".to_string(),
                 data: None,
@@ -3976,10 +6085,119 @@ Do not ask the user for JSON.",
             }
         }
 
-        // 6. Execute any tool calls
-        let llm_response = llm_result;
+        // 6. Execute tool calls in a bounded internal loop so tool outputs
+        // become reasoning context instead of raw final user output.
+        let mut llm_response = llm_result;
+        let mut tool_turn = 0usize;
+        let mut response = llm_response.content.clone();
+        let mut all_executed_tool_calls: Vec<crate::core::llm::ToolCall> = Vec::new();
+        let mut preserved_tool_outputs: Vec<String> = Vec::new();
+        let mut tool_loop_history = conversation_history.clone();
 
-        if !tool_calls.is_empty() {
+        loop {
+            let tool_calls = llm_response.tool_calls.clone();
+            if tool_calls.is_empty() {
+                if execution_intent
+                    && tool_turn < MAX_TOOL_FOLLOWUP_ROUNDS
+                    && (response_indicates_pending_execution(&llm_response.content)
+                        || response_is_meta_tool_summary(&llm_response.content))
+                {
+                    let assistant_message = safe_truncate(llm_response.content.trim(), 3000);
+                    if !assistant_message.is_empty() {
+                        tool_loop_history.push(ConversationMessage {
+                            role: "assistant".to_string(),
+                            content: assistant_message,
+                            _timestamp: chrono::Utc::now(),
+                        });
+                    }
+                    tool_loop_history.push(ConversationMessage {
+                        role: "user".to_string(),
+                        content: "Continue executing the request now. Do not stop at a diagnosis, plan, or promise of future work. Either call the next tool(s) or report the completed result if the work is already done.".to_string(),
+                        _timestamp: chrono::Utc::now(),
+                    });
+                    let continuation_start = std::time::Instant::now();
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(TOOL_FOLLOWUP_LLM_TIMEOUT_SECS),
+                        selected_llm.chat_with_history(
+                            &system_prompt,
+                            "Continue executing the request now.",
+                            &tool_loop_history,
+                            &relevant_memories,
+                            &available_actions,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(next_response)) => {
+                            self.record_llm_usage(
+                                channel,
+                                "chat_execution_continuation",
+                                &next_response,
+                            )
+                            .await;
+                            let mut trace = trace_ref.write().await;
+                            trace.steps.push(ExecutionStep {
+                                icon: "[loop]".to_string(),
+                                title: "Execution Continuation Nudge".to_string(),
+                                detail: format!(
+                                    "Prompted the model to continue execution after a prose-only or meta-only turn ({}ms).",
+                                    continuation_start.elapsed().as_millis()
+                                ),
+                                step_type: "info".to_string(),
+                                data: Some(format!(
+                                    "response_chars={}, tool_calls={}",
+                                    next_response.content.chars().count(),
+                                    next_response.tool_calls.len()
+                                )),
+                                timestamp: chrono::Utc::now(),
+                                duration_ms: Some(
+                                    continuation_start.elapsed().as_millis() as u64,
+                                ),
+                            });
+                            llm_response = next_response;
+                            tool_turn += 1;
+                            continue;
+                        }
+                        Ok(Err(e)) => {
+                            let mut trace = trace_ref.write().await;
+                            trace.steps.push(ExecutionStep {
+                                icon: "[warn]".to_string(),
+                                title: "Execution Continuation Failed".to_string(),
+                                detail: "Fell back to the latest assistant response after the continuation nudge failed."
+                                    .to_string(),
+                                step_type: "warning".to_string(),
+                                data: Some(safe_truncate(&e.to_string(), 500)),
+                                timestamp: chrono::Utc::now(),
+                                duration_ms: Some(
+                                    continuation_start.elapsed().as_millis() as u64,
+                                ),
+                            });
+                        }
+                        Err(_) => {
+                            let mut trace = trace_ref.write().await;
+                            trace.steps.push(ExecutionStep {
+                                icon: "[warn]".to_string(),
+                                title: "Execution Continuation Timed Out".to_string(),
+                                detail: format!(
+                                    "Stopped waiting for an internal continuation response after {} seconds.",
+                                    TOOL_FOLLOWUP_LLM_TIMEOUT_SECS
+                                ),
+                                step_type: "warning".to_string(),
+                                data: None,
+                                timestamp: chrono::Utc::now(),
+                                duration_ms: Some(
+                                    continuation_start.elapsed().as_millis() as u64,
+                                ),
+                            });
+                        }
+                    }
+                }
+                if !llm_response.content.trim().is_empty() {
+                    response = llm_response.content.clone();
+                }
+                break;
+            }
+
             tracing::info!(
                 "Tool calls requested: {}",
                 tool_calls
@@ -3988,56 +6206,381 @@ Do not ask the user for JSON.",
                     .collect::<Vec<_>>()
                     .join(", ")
             );
-            let mut trace = trace_ref.write().await;
-            for call in &tool_calls {
+            {
+                let mut trace = trace_ref.write().await;
+                for call in &tool_calls {
+                    trace.steps.push(ExecutionStep {
+                        icon: "[run]".to_string(),
+                        title: format!("Executing Action: {}", call.name),
+                        detail: "Running in sandboxed environment".to_string(),
+                        step_type: "thinking".to_string(),
+                        data: Some(format!(
+                            "Args: {}",
+                            serde_json::to_string(&call.arguments).unwrap_or_default()
+                        )),
+                        timestamp: chrono::Utc::now(),
+                        duration_ms: None,
+                    });
+                }
+            }
+
+            all_executed_tool_calls.extend(tool_calls.clone());
+
+            let tool_start = std::time::Instant::now();
+            let tool_batch = match self
+                .execute_tool_calls(
+                    &llm_response,
+                    &trace_ref,
+                    token_tx.clone(),
+                    tool_execution::ToolExecutionContext {
+                        request_channel: channel,
+                        trace_id: Some(&trace_id),
+                        conversation_id: Some(&conversation_key),
+                        strategy_version: strategy_version.as_deref(),
+                        policy_version: Some(policy_version.as_str()),
+                        prompt_version: Some(prompt_version.as_str()),
+                        model_slot: Some(effective_model_slot_label.as_str()),
+                    },
+                )
+                .await
+            {
+                Ok(batch) => batch,
+                Err(err) => {
+                    let error_text = format!("Tool execution failed: {}", err);
+                    self.finalize_failed_trace(
+                        &trace_ref,
+                        "Tool Execution Failed",
+                        &error_text,
+                        None,
+                    )
+                    .await;
+                    return Err(err);
+                }
+            };
+            let tool_output_text = tool_batch.combined_output();
+            for output in &tool_batch.outputs {
+                if tool_output_contains_embedded_result_marker(&output.content) {
+                    preserved_tool_outputs.push(output.content.clone());
+                }
+            }
+            let fallback_response = if llm_response.content.trim().is_empty() {
+                tool_output_text.clone()
+            } else if tool_output_text.trim().is_empty() {
+                llm_response.content.clone()
+            } else {
+                format!("{}\n\n{}", llm_response.content, tool_output_text)
+            };
+            let safe_fallback_response = build_user_facing_tool_fallback_response(
+                &fallback_response,
+                &tool_batch,
+                "I gathered tool evidence, but the final response could not be formatted cleanly.",
+            );
+            tracing::info!(
+                "Tool execution done ({}ms), output={}chars",
+                tool_start.elapsed().as_millis(),
+                fallback_response.len()
+            );
+
+            let assistant_history_message = build_tool_followup_assistant_message(&llm_response);
+            if !assistant_history_message.is_empty() {
+                tool_loop_history.push(ConversationMessage {
+                    role: "assistant".to_string(),
+                    content: assistant_history_message,
+                    _timestamp: chrono::Utc::now(),
+                });
+            }
+
+            let tool_results_for_followup = format_tool_results_for_followup(&tool_batch);
+            if tool_results_for_followup.is_empty() {
+                response = safe_fallback_response.clone();
+                break;
+            }
+            tool_loop_history.push(ConversationMessage {
+                role: "user".to_string(),
+                content: build_tool_followup_user_message(
+                    message,
+                    &tool_results_for_followup,
+                    execution_intent,
+                ),
+                _timestamp: chrono::Utc::now(),
+            });
+
+            {
+                let mut trace = trace_ref.write().await;
                 trace.steps.push(ExecutionStep {
-                    icon: "[run]".to_string(),
-                    title: format!("Executing Action: {}", call.name),
-                    detail: "Running in sandboxed environment".to_string(),
+                    icon: "[think]".to_string(),
+                    title: "Reasoning From Tool Results".to_string(),
+                    detail: "Model is deciding the next step after completed tool calls."
+                        .to_string(),
                     step_type: "thinking".to_string(),
                     data: Some(format!(
-                        "Args: {}",
-                        serde_json::to_string(&call.arguments).unwrap_or_default()
+                        "turn={}, outputs={}",
+                        tool_turn + 1,
+                        tool_batch.outputs.len()
                     )),
                     timestamp: chrono::Utc::now(),
                     duration_ms: None,
                 });
             }
+
+            if tool_turn + 1 >= MAX_TOOL_FOLLOWUP_ROUNDS {
+                response = safe_fallback_response.clone();
+                let synthesis_start = std::time::Instant::now();
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(TOOL_FOLLOWUP_LLM_TIMEOUT_SECS),
+                    selected_llm.chat_with_history(
+                        &system_prompt,
+                        "Stop using tools. Based only on the gathered tool results, give the user the current diagnosis, the likely root cause, and the next concrete fix. Do not dump raw tool output or code.",
+                        &tool_loop_history,
+                        &relevant_memories,
+                        &[],
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(synthesized)) => {
+                        self.record_llm_usage(channel, "chat_tool_synthesis", &synthesized)
+                            .await;
+                        if !synthesized.content.trim().is_empty() {
+                            response = sanitize_final_user_response(&synthesized.content);
+                        }
+                        let mut trace = trace_ref.write().await;
+                        trace.steps.push(ExecutionStep {
+                            icon: "[stop]".to_string(),
+                            title: "Tool Loop Cap Reached".to_string(),
+                            detail: format!(
+                                "Stopped after {} bounded tool-reasoning turns and synthesized a final answer from gathered tool evidence.",
+                                MAX_TOOL_FOLLOWUP_ROUNDS
+                            ),
+                            step_type: "warning".to_string(),
+                            data: Some(format!(
+                                "synthesis_ms={}",
+                                synthesis_start.elapsed().as_millis()
+                            )),
+                            timestamp: chrono::Utc::now(),
+                            duration_ms: Some(synthesis_start.elapsed().as_millis() as u64),
+                        });
+                    }
+                    Ok(Err(e)) => {
+                        let mut trace = trace_ref.write().await;
+                        trace.steps.push(ExecutionStep {
+                            icon: "[stop]".to_string(),
+                            title: "Tool Loop Cap Reached".to_string(),
+                            detail: format!(
+                                "Stopped after {} bounded tool-reasoning turns and returned the latest tool-backed response because synthesis failed.",
+                                MAX_TOOL_FOLLOWUP_ROUNDS
+                            ),
+                            step_type: "warning".to_string(),
+                            data: Some(safe_truncate(&e.to_string(), 500)),
+                            timestamp: chrono::Utc::now(),
+                            duration_ms: Some(synthesis_start.elapsed().as_millis() as u64),
+                        });
+                    }
+                    Err(_) => {
+                        let mut trace = trace_ref.write().await;
+                        trace.steps.push(ExecutionStep {
+                            icon: "[stop]".to_string(),
+                            title: "Tool Loop Synthesis Timed Out".to_string(),
+                            detail: format!(
+                                "Stopped waiting for synthesis after {} seconds and returned the latest tool-backed response.",
+                                TOOL_FOLLOWUP_LLM_TIMEOUT_SECS
+                            ),
+                            step_type: "warning".to_string(),
+                            data: None,
+                            timestamp: chrono::Utc::now(),
+                            duration_ms: Some(synthesis_start.elapsed().as_millis() as u64),
+                        });
+                    }
+                }
+                break;
+            }
+
+            let followup_start = std::time::Instant::now();
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(TOOL_FOLLOWUP_LLM_TIMEOUT_SECS),
+                selected_llm.chat_with_history(
+                    &system_prompt,
+                    "Continue with the next step.",
+                    &tool_loop_history,
+                    &relevant_memories,
+                    &available_actions,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(next_response)) => {
+                    let mut next_response = next_response;
+                    self.record_llm_usage(channel, "chat_tool_followup", &next_response)
+                        .await;
+                    if next_response.tool_calls.is_empty()
+                        && (looks_like_raw_structured_tool_output(&next_response.content)
+                            || looks_like_raw_source_or_markup_dump(&next_response.content))
+                    {
+                        let synthesis_start = std::time::Instant::now();
+                        match tokio::time::timeout(
+                              std::time::Duration::from_secs(TOOL_FOLLOWUP_LLM_TIMEOUT_SECS),
+                              selected_llm.chat_with_history(
+                                  &system_prompt,
+                                  "Write the final user-facing answer now. Do not emit tool calls. Do not dump raw JSON, HTML, or source code. Preserve any `[IMAGE_RESULT]` or `[VIDEO_RESULT]` blocks verbatim if present.",
+                                  &tool_loop_history,
+                                  &relevant_memories,
+                                  &[],
+                              ),
+                        )
+                        .await
+                        {
+                            Ok(Ok(synthesized)) => {
+                                self.record_llm_usage(channel, "chat_tool_synthesis", &synthesized)
+                                    .await;
+                                  let mut trace = trace_ref.write().await;
+                                  trace.steps.push(ExecutionStep {
+                                      icon: "[refine]".to_string(),
+                                      title: "Raw Tool Output Synthesized".to_string(),
+                                      detail: format!(
+                                          "Rewrote raw tool payload into a user-facing answer in {}ms.",
+                                          synthesis_start.elapsed().as_millis()
+                                      ),
+                                    step_type: "info".to_string(),
+                                    data: Some(format!(
+                                        "raw_response_chars={}",
+                                        next_response.content.chars().count()
+                                    )),
+                                    timestamp: chrono::Utc::now(),
+                                    duration_ms: Some(
+                                        synthesis_start.elapsed().as_millis() as u64,
+                                    ),
+                                });
+                                next_response.content =
+                                    sanitize_final_user_response(&synthesized.content);
+                                next_response.tool_calls = synthesized.tool_calls;
+                                next_response.reasoning = synthesized.reasoning;
+                                next_response.usage = synthesized.usage;
+                                next_response.provider = synthesized.provider;
+                                next_response.model = synthesized.model;
+                            }
+                            Ok(Err(e)) => {
+                                let mut trace = trace_ref.write().await;
+                                trace.steps.push(ExecutionStep {
+                                    icon: "[warn]".to_string(),
+                                    title: "Structured Output Synthesis Failed".to_string(),
+                                    detail:
+                                        "Keeping the follow-up response because the synthesis-only pass failed."
+                                            .to_string(),
+                                    step_type: "warning".to_string(),
+                                    data: Some(safe_truncate(&e.to_string(), 500)),
+                                    timestamp: chrono::Utc::now(),
+                                    duration_ms: Some(
+                                        synthesis_start.elapsed().as_millis() as u64,
+                                    ),
+                                });
+                            }
+                            Err(_) => {
+                                let mut trace = trace_ref.write().await;
+                                trace.steps.push(ExecutionStep {
+                                    icon: "[warn]".to_string(),
+                                    title: "Structured Output Synthesis Timed Out".to_string(),
+                                    detail:
+                                        "Kept the current follow-up response after the rewrite pass timed out."
+                                            .to_string(),
+                                    step_type: "warning".to_string(),
+                                    data: None,
+                                    timestamp: chrono::Utc::now(),
+                                    duration_ms: Some(
+                                        synthesis_start.elapsed().as_millis() as u64,
+                                    ),
+                                });
+                            }
+                        }
+                        if next_response.tool_calls.is_empty()
+                            && (looks_like_raw_structured_tool_output(&next_response.content)
+                                || looks_like_raw_source_or_markup_dump(&next_response.content))
+                        {
+                            next_response.content = safe_fallback_response.clone();
+                        }
+                    }
+                    let mut trace = trace_ref.write().await;
+                    trace.steps.push(ExecutionStep {
+                        icon: "[loop]".to_string(),
+                        title: "Tool Follow-up Reasoning".to_string(),
+                        detail: format!(
+                            "Follow-up turn {} completed in {}ms ({} tool calls).",
+                            tool_turn + 1,
+                            followup_start.elapsed().as_millis(),
+                            next_response.tool_calls.len()
+                        ),
+                        step_type: "info".to_string(),
+                        data: Some(format!(
+                            "response_chars={}",
+                            next_response.content.chars().count()
+                        )),
+                        timestamp: chrono::Utc::now(),
+                        duration_ms: None,
+                    });
+                    llm_response = next_response;
+                    tool_turn += 1;
+                }
+                Ok(Err(e)) => {
+                    response = safe_fallback_response.clone();
+                    let mut trace = trace_ref.write().await;
+                    trace.steps.push(ExecutionStep {
+                        icon: "[warn]".to_string(),
+                        title: "Tool Follow-up Failed".to_string(),
+                        detail:
+                            "Fell back to the latest tool-backed response after a follow-up model error."
+                                .to_string(),
+                        step_type: "warning".to_string(),
+                        data: Some(safe_truncate(&e.to_string(), 500)),
+                        timestamp: chrono::Utc::now(),
+                        duration_ms: None,
+                    });
+                    break;
+                }
+                Err(_) => {
+                    response = safe_fallback_response;
+                    let mut trace = trace_ref.write().await;
+                    trace.steps.push(ExecutionStep {
+                        icon: "[warn]".to_string(),
+                        title: "Tool Follow-up Timed Out".to_string(),
+                        detail: format!(
+                            "Stopped waiting for the next-step model turn after {} seconds and returned the latest tool-backed response.",
+                            TOOL_FOLLOWUP_LLM_TIMEOUT_SECS
+                        ),
+                        step_type: "warning".to_string(),
+                        data: None,
+                        timestamp: chrono::Utc::now(),
+                        duration_ms: Some(followup_start.elapsed().as_millis() as u64),
+                    });
+                    break;
+                }
+            }
         }
 
-        let tool_start = std::time::Instant::now();
-        let mut response = self
-            .execute_tool_calls(
-                &llm_response,
-                &trace_ref,
-                token_tx.clone(),
-                tool_execution::ToolExecutionContext {
-                    request_channel: channel,
-                    trace_id: Some(&trace_id),
-                    conversation_id: Some(&conversation_key),
-                    strategy_version: strategy_version.as_deref(),
-                    policy_version: Some(policy_version.as_str()),
-                    prompt_version: Some(prompt_version.as_str()),
-                    model_slot: Some(effective_model_slot_label.as_str()),
-                },
-            )
-            .await?;
+        response = sanitize_final_user_response(&response);
+        append_preserved_tool_outputs(&mut response, &preserved_tool_outputs);
         if let Some(nudge) = profile_nudge.as_ref() {
             response.push_str("\n\n");
             response.push_str(nudge);
         }
-        if !tool_calls.is_empty() {
-            tracing::info!(
-                "Tool execution done ({}ms), response={}chars",
-                tool_start.elapsed().as_millis(),
-                response.len()
-            );
-        }
+        response = sanitize_final_user_response(&response);
 
         // 7. Generate execution proof
-        let proof = self
+        let proof = match self
             .proofs
-            .generate_proof(message, &response, &llm_response.tool_calls)?;
+            .generate_proof(message, &response, &all_executed_tool_calls)
+        {
+            Ok(proof) => proof,
+            Err(err) => {
+                let error_text = format!("Execution proof generation failed: {}", err);
+                self.finalize_failed_trace(
+                    &trace_ref,
+                    "Execution Proof Failed",
+                    &error_text,
+                    Some(response.as_str()),
+                )
+                .await;
+                return Err(err);
+            }
+        };
         tracing::debug!("Execution proof: {}", proof.id);
 
         {
@@ -4082,7 +6625,6 @@ Do not ask the user for JSON.",
         // 11. Persist messages to database (chat persistence)
         let mut conversation_title: Option<String> = None;
         {
-            let now = chrono::Utc::now().to_rfc3339();
             let conv_id = conversation_key.clone();
 
             // Expose conversation ID for HTTP response
@@ -4090,19 +6632,7 @@ Do not ask the user for JSON.",
             *self.last_conversation_title.write().await = None;
 
             if !conv_id.is_empty() {
-                // Store user message
-                let user_msg = crate::storage::entities::message::Model {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    conversation_id: conv_id.clone(),
-                    role: "user".to_string(),
-                    content: message.to_string(),
-                    timestamp: now.clone(),
-                    model_used: None,
-                    trace_id: None,
-                };
-                let _ = self.storage.insert_message(&user_msg).await;
-                self.capture_user_links_as_user_data(message, channel, Some(&conv_id), project_id)
-                    .await;
+                // User message already persisted early (before LLM call) — only store assistant response here
 
                 // Store assistant message
                 let asst_msg = crate::storage::entities::message::Model {
@@ -4176,20 +6706,8 @@ Do not ask the user for JSON.",
                 timestamp: end_time,
                 duration_ms: Some(total_duration),
             });
-
-            // Add to trace history (keep last 100)
-            let mut history = self.trace_history.write().await;
-            history.insert(0, trace.clone()); // Add to front
-            if history.len() > 100 {
-                history.truncate(100); // Keep only last 100
-            }
         }
-
-        // Keep last_trace in sync for UI /trace when using a per-request trace
-        if !Arc::ptr_eq(&trace_ref, &self.last_trace) {
-            let trace_snapshot = trace_ref.read().await.clone();
-            *self.last_trace.write().await = trace_snapshot;
-        }
+        self.persist_completed_trace(&trace_ref).await;
 
         // Security: Filter output to prevent sensitive data leakage
         let filtered = self.security.filter_output(&response);
@@ -4215,6 +6733,19 @@ Do not ask the user for JSON.",
         })
     }
 
+    async fn capture_user_memory_hints(
+        &self,
+        message: &str,
+        channel: &str,
+        conversation_id: Option<&str>,
+        project_id: Option<&str>,
+    ) {
+        self.capture_user_links_as_user_data(message, channel, conversation_id, project_id)
+            .await;
+        self.capture_user_preferences_as_memory(message, channel, project_id)
+            .await;
+    }
+
     async fn capture_user_links_as_user_data(
         &self,
         message: &str,
@@ -4235,6 +6766,32 @@ Do not ask the user for JSON.",
                 tracing::warn!(
                     "Failed to capture user link '{}' into user_data_items: {}",
                     url,
+                    e
+                );
+            }
+        }
+    }
+
+    async fn capture_user_preferences_as_memory(
+        &self,
+        message: &str,
+        channel: &str,
+        project_id: Option<&str>,
+    ) {
+        let preferences = extract_stable_user_preferences(message);
+        if preferences.is_empty() {
+            return;
+        }
+        for (key, value) in preferences {
+            if let Err(e) = self
+                .storage
+                .upsert_user_preference(&key, &value, 0.92, Some(channel), project_id)
+                .await
+            {
+                tracing::warn!(
+                    "Failed to capture user preference '{}' => '{}' into user_preferences: {}",
+                    key,
+                    value,
                     e
                 );
             }
@@ -4454,7 +7011,7 @@ Do not ask the user for JSON.",
                 trace_id: None,
             };
             let _ = self.storage.insert_message(&user_msg).await;
-            self.capture_user_links_as_user_data(message, channel, Some(conversation_key), project_id)
+            self.capture_user_memory_hints(message, channel, Some(conversation_key), project_id)
                 .await;
 
             let asst_msg = crate::storage::entities::message::Model {
@@ -4500,9 +7057,74 @@ Do not ask the user for JSON.",
         })
     }
 
+    async fn persist_completed_trace(&self, trace_ref: &Arc<RwLock<ExecutionTrace>>) {
+        let trace_snapshot = trace_ref.read().await.clone();
+        if trace_snapshot.id.trim().is_empty() {
+            return;
+        }
+
+        {
+            let mut history = self.trace_history.write().await;
+            history.retain(|item| item.id != trace_snapshot.id);
+            history.insert(0, trace_snapshot.clone());
+            if history.len() > 100 {
+                history.truncate(100);
+            }
+        }
+
+        if let Err(e) = self.storage.insert_execution_trace(&trace_snapshot).await {
+            tracing::warn!(
+                "Failed to persist execution trace '{}': {}",
+                trace_snapshot.id,
+                e
+            );
+        }
+
+        if !Arc::ptr_eq(trace_ref, &self.last_trace) {
+            *self.last_trace.write().await = trace_snapshot;
+        }
+    }
+
+    async fn finalize_failed_trace(
+        &self,
+        trace_ref: &Arc<RwLock<ExecutionTrace>>,
+        title: &str,
+        error_detail: &str,
+        response: Option<&str>,
+    ) {
+        {
+            let mut trace = trace_ref.write().await;
+            let end_time = chrono::Utc::now();
+            let total_duration = if let Some(start) = trace.started_at {
+                (end_time - start).num_milliseconds() as u64
+            } else {
+                0
+            };
+            trace.completed_at = Some(end_time);
+            if let Some(response) = response {
+                trace.response = Some(response.to_string());
+            }
+            trace.steps.push(ExecutionStep {
+                icon: "[error]".to_string(),
+                title: title.to_string(),
+                detail: format!(
+                    "{} | Total time: {}ms",
+                    safe_truncate(error_detail, 220),
+                    total_duration
+                ),
+                step_type: "error".to_string(),
+                data: Some(safe_truncate(error_detail, 4000)),
+                timestamp: end_time,
+                duration_ms: Some(total_duration),
+            });
+        }
+
+        self.persist_completed_trace(trace_ref).await;
+    }
+
     fn validate_skill_import_url(url: &str) -> Result<reqwest::Url> {
-        let parsed =
-            reqwest::Url::parse(url).map_err(|e| anyhow::anyhow!("Invalid URL '{}': {}", url, e))?;
+        let parsed = reqwest::Url::parse(url)
+            .map_err(|e| anyhow::anyhow!("Invalid URL '{}': {}", url, e))?;
         if parsed.scheme() != "https" {
             return Err(anyhow::anyhow!(
                 "Only https:// URLs are allowed for skill import"
@@ -4850,7 +7472,10 @@ Do not ask the user for JSON.",
                 .get_workflow_content(&workflow_action_name)
                 .await
                 .ok_or_else(|| {
-                    anyhow::anyhow!("Workflow content not found for skill '{}'", workflow_action_name)
+                    anyhow::anyhow!(
+                        "Workflow content not found for skill '{}'",
+                        workflow_action_name
+                    )
                 })?;
 
             let llm_candidates = self.llm_candidates_for_role(&ModelRole::Primary);
@@ -4868,10 +7493,7 @@ Do not ask the user for JSON.",
                 {
                     Ok(rendered) => {
                         let safe_output = safe_truncate(rendered.trim(), 12_000);
-                        return Ok(format!(
-                            "I ran skill '{}'.\n\n{}",
-                            skill_name, safe_output
-                        ));
+                        return Ok(format!("I ran skill '{}'.\n\n{}", skill_name, safe_output));
                     }
                     Err(e) => {
                         errors.push(format!(
@@ -4907,6 +7529,226 @@ Do not ask the user for JSON.",
         }
     }
 
+    fn provider_model_name(provider: &crate::core::LlmProvider) -> &str {
+        match provider {
+            crate::core::LlmProvider::Anthropic { model, .. }
+            | crate::core::LlmProvider::OpenAI { model, .. }
+            | crate::core::LlmProvider::Ollama { model, .. } => model.as_str(),
+        }
+    }
+
+    fn model_aliases_for_slot(slot: &ModelSlot, client: &LlmClient) -> Vec<String> {
+        let mut aliases = Vec::new();
+        let mut push = |value: &str| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            if !aliases
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(trimmed))
+            {
+                aliases.push(trimmed.to_string());
+            }
+        };
+
+        push(slot.id.as_str());
+        push(slot.label.as_str());
+        push(client.model_name());
+        push(Self::provider_model_name(&slot.provider));
+        aliases
+    }
+
+    fn model_alias_match_score(alias: &str, hint_norm: &str, hint_compact: &str) -> i32 {
+        let alias_norm = normalize_model_match_token(alias);
+        if alias_norm.is_empty() || hint_norm.is_empty() {
+            return 0;
+        }
+        if alias_norm == hint_norm {
+            return 120;
+        }
+
+        let alias_compact = compact_model_match_token(alias);
+        if !hint_compact.is_empty() && alias_compact == hint_compact {
+            return 110;
+        }
+
+        let long_enough = hint_norm.len() >= 4 && alias_norm.len() >= 4;
+        if long_enough && (alias_norm.starts_with(hint_norm) || hint_norm.starts_with(&alias_norm))
+        {
+            return 90;
+        }
+        if hint_norm.len() >= 5
+            && (alias_norm.contains(hint_norm) || hint_norm.contains(&alias_norm))
+        {
+            return 70;
+        }
+        0
+    }
+
+    fn llm_candidate_from_slot_id(&self, slot_id: &str) -> Option<LlmAttemptCandidate> {
+        let (slot, client) = self.model_pool.get(slot_id)?;
+        if !slot.enabled || !Self::provider_has_runtime_credentials(&slot.provider) {
+            return None;
+        }
+        Some(LlmAttemptCandidate {
+            slot_id: slot.id.clone(),
+            slot_label: if slot.label.trim().is_empty() {
+                format!("{} slot", Self::model_role_label(&slot.role))
+            } else {
+                slot.label.clone()
+            },
+            role: slot.role.clone(),
+            client: client.clone(),
+        })
+    }
+
+    fn user_selected_model_slot_id(&self) -> Option<String> {
+        self.user_selected_model_slot_id
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    fn set_user_selected_model_slot_id_local(&self, slot_id: Option<String>) {
+        if let Ok(mut guard) = self.user_selected_model_slot_id.write() {
+            *guard = slot_id;
+        }
+    }
+
+    fn user_selected_llm_candidate(&self) -> Option<LlmAttemptCandidate> {
+        let slot_id = self.user_selected_model_slot_id()?;
+        self.llm_candidate_from_slot_id(&slot_id)
+    }
+
+    fn resolve_model_hint_candidate(&self, hint: &str) -> Option<LlmAttemptCandidate> {
+        let hint_norm = normalize_model_match_token(hint);
+        let hint_compact = compact_model_match_token(hint);
+        if hint_norm.is_empty() {
+            return None;
+        }
+
+        let mut best: Option<(i32, LlmAttemptCandidate)> = None;
+        for slot in &self.config.model_pool.slots {
+            let Some((runtime_slot, client)) = self.model_pool.get(&slot.id) else {
+                continue;
+            };
+            if !runtime_slot.enabled
+                || !Self::provider_has_runtime_credentials(&runtime_slot.provider)
+            {
+                continue;
+            }
+
+            let aliases = Self::model_aliases_for_slot(runtime_slot, client);
+            let score = aliases
+                .iter()
+                .map(|alias| Self::model_alias_match_score(alias, &hint_norm, &hint_compact))
+                .max()
+                .unwrap_or(0);
+            if score <= 0 {
+                continue;
+            }
+
+            let candidate = LlmAttemptCandidate {
+                slot_id: runtime_slot.id.clone(),
+                slot_label: if runtime_slot.label.trim().is_empty() {
+                    format!("{} slot", Self::model_role_label(&runtime_slot.role))
+                } else {
+                    runtime_slot.label.clone()
+                },
+                role: runtime_slot.role.clone(),
+                client: client.clone(),
+            };
+
+            if let Some((best_score, _)) = best.as_ref() {
+                if score <= *best_score {
+                    continue;
+                }
+            }
+            best = Some((score, candidate));
+        }
+
+        best.map(|(_, candidate)| candidate)
+    }
+
+    fn available_model_selection_descriptions(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for slot in &self.config.model_pool.slots {
+            let Some((runtime_slot, client)) = self.model_pool.get(&slot.id) else {
+                continue;
+            };
+            if !runtime_slot.enabled
+                || !Self::provider_has_runtime_credentials(&runtime_slot.provider)
+            {
+                continue;
+            }
+            let label = if runtime_slot.label.trim().is_empty() {
+                runtime_slot.id.clone()
+            } else {
+                runtime_slot.label.clone()
+            };
+            out.push(format!("{} [{}]", label, client.model_name()));
+        }
+        if out.is_empty() {
+            out.push(format!("Legacy Primary [{}]", self.llm.model_name()));
+        }
+        out
+    }
+
+    pub(crate) fn select_llm_for_app_proxy(
+        &self,
+        requested_model_hint: Option<&str>,
+    ) -> (LlmClient, String, Option<String>) {
+        let requested_model_hint = requested_model_hint
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let mut warning: Option<String> = None;
+        if let Some(hint) = requested_model_hint {
+            if let Some(candidate) = self.resolve_model_hint_candidate(hint) {
+                return (
+                    candidate.client,
+                    candidate.slot_label,
+                    Some(format!("requested model '{}'", hint)),
+                );
+            }
+            warning = Some(format!(
+                "Requested model '{}' is not configured. Using default configured model.",
+                hint
+            ));
+        }
+
+        if let Some(candidate) = self.user_selected_llm_candidate() {
+            return (
+                candidate.client,
+                candidate.slot_label,
+                Some("user-selected model override".to_string()),
+            );
+        }
+
+        if let Some(pinned_id) = self
+            .config
+            .app_deploy_model_id
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            if let Some(candidate) = self.llm_candidate_from_slot_id(pinned_id) {
+                return (
+                    candidate.client,
+                    candidate.slot_label,
+                    Some("app deploy pinned model".to_string()),
+                );
+            }
+        }
+
+        (
+            self.llm_for_role(&ModelRole::Primary).clone(),
+            Self::model_role_label(&ModelRole::Primary).to_string(),
+            warning,
+        )
+    }
+
     fn llm_candidates_for_role(&self, preferred_role: &ModelRole) -> Vec<LlmAttemptCandidate> {
         let mut out: Vec<LlmAttemptCandidate> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
@@ -4932,6 +7774,19 @@ Do not ask the user for JSON.",
                 client: client.clone(),
             });
         };
+
+        // 0) User-selected override first.
+        if let Some(slot_id) = self.user_selected_model_slot_id() {
+            if let Some(slot) = self
+                .config
+                .model_pool
+                .slots
+                .iter()
+                .find(|slot| slot.id == slot_id)
+            {
+                push_slot(slot);
+            }
+        }
 
         // 1) Preferred role first.
         for slot in &self.config.model_pool.slots {
@@ -4978,6 +7833,13 @@ Do not ask the user for JSON.",
 
     /// Get LlmClient for a specific role (falls back to primary)
     pub fn llm_for_role(&self, role: &ModelRole) -> &LlmClient {
+        // 0) User-selected override slot always wins when available.
+        if let Some(slot_id) = self.user_selected_model_slot_id() {
+            if let Some(client) = self.ready_slot_client(&slot_id) {
+                return client;
+            }
+        }
+
         // 1) Preferred role (only if slot is fully configured at runtime)
         for slot in &self.config.model_pool.slots {
             if &slot.role == role && slot.enabled {
@@ -5003,6 +7865,40 @@ Do not ask the user for JSON.",
 
         // 4) Ultimate fallback: legacy llm field
         &self.llm
+    }
+
+    /// Merge model-backed app env vars across configured providers.
+    /// Prioritizes user-selected slot, then primary, then base llm, then fallback/other enabled slots.
+    pub fn app_model_env_vars(&self) -> std::collections::HashMap<String, String> {
+        let mut provider_refs: Vec<&crate::core::LlmProvider> = Vec::new();
+        let selected_slot_id = self.user_selected_model_slot_id();
+
+        if let Some(selected_slot) =
+            self.config.model_pool.slots.iter().find(|slot| {
+                selected_slot_id.as_ref().is_some_and(|id| id == &slot.id) && slot.enabled
+            })
+        {
+            provider_refs.push(&selected_slot.provider);
+        }
+        if let Some(primary_slot) = self
+            .config
+            .model_pool
+            .slots
+            .iter()
+            .find(|slot| slot.id == self.primary_model_id && slot.enabled)
+        {
+            provider_refs.push(&primary_slot.provider);
+        }
+        provider_refs.push(&self.config.llm);
+        if let Some(fallback) = self.config.llm_fallback.as_ref() {
+            provider_refs.push(fallback);
+        }
+        for slot in &self.config.model_pool.slots {
+            if slot.enabled && slot.id != self.primary_model_id {
+                provider_refs.push(&slot.provider);
+            }
+        }
+        merge_app_llm_env_from_providers(&provider_refs)
     }
 
     fn provider_has_runtime_credentials(provider: &crate::core::LlmProvider) -> bool {
@@ -5789,42 +8685,30 @@ Return: 1 short status paragraph + 3 bullet next steps.",
 
         // Dynamically select the best action from registered actions.
         let task_lower = task_desc.to_lowercase();
-        let task_tokens = tokenize_lower(task_desc);
-        let mut best_action: Option<(i32, String)> = None;
-        for action in &all_actions {
-            if action.name == "schedule_task"
-                || action.name == "watch"
-                || action.name == "list_tasks"
-            {
-                continue;
-            }
-            let name = action.name.to_lowercase();
-            let hay = format!(
-                "{} {} {}",
-                name,
-                action.description.to_lowercase(),
-                action.capabilities.join(" ").to_lowercase()
-            );
-
-            let mut score = 0;
-            if task_lower.contains(&name) {
-                score += 80;
-            }
-            for t in &task_tokens {
-                if hay.contains(t) {
-                    score += 2;
+        let preferred_task_action = preferred_direct_action_name(task_desc, &all_actions);
+        let best_action = all_actions
+            .iter()
+            .filter(|action| {
+                action.name != "schedule_task"
+                    && action.name != "watch"
+                    && action.name != "list_tasks"
+            })
+            .map(|action| {
+                let mut score = action_intent_score(task_desc, action);
+                if task_lower.contains(&action.name.to_lowercase()) {
+                    score = score.max(0.95);
                 }
-            }
-            if has_action_intent_default(task_desc, &all_actions, "app_deploy")
-                && action.name == "app_deploy"
-            {
-                score += 120;
-            }
-
-            if score > 0 && best_action.as_ref().is_none_or(|(best, _)| score > *best) {
-                best_action = Some((score, action.name.clone()));
-            }
-        }
+                if preferred_task_action
+                    .as_ref()
+                    .map(|name| name == &action.name)
+                    .unwrap_or(false)
+                {
+                    score = score.max(1.0);
+                }
+                (score, action.name.clone())
+            })
+            .filter(|(score, _)| *score >= 0.05)
+            .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
         let action_name = if explicit_valid {
             explicit_action.unwrap_or_default()
@@ -6458,5 +9342,373 @@ fn compute_next_run(
             .next()
             .map(|dt| dt.with_timezone(&chrono::Utc)),
         None => schedule.upcoming(chrono::Utc).next(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::actions::{ActionDef, ActionSource};
+
+    fn action(name: &str, description: &str) -> ActionDef {
+        ActionDef {
+            name: name.to_string(),
+            description: description.to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({}),
+            capabilities: vec![],
+            sandbox_mode: None,
+            source: ActionSource::System,
+            file_path: None,
+        }
+    }
+
+    #[test]
+    fn pin_preferred_actions_adds_missing_preferred_actions() {
+        let all_actions = vec![
+            action("alpha", "alpha"),
+            action("beta", "beta"),
+            action("gamma", "gamma"),
+            action("file_read", "Read a file from disk."),
+            action("research", "Research a topic and summarize findings."),
+        ];
+        let preferred = ["beta", "file_read"]
+            .into_iter()
+            .map(ToString::to_string)
+            .collect::<HashSet<_>>();
+        let mut selected = vec![action(
+            "research",
+            "Research a topic and summarize findings.",
+        )];
+
+        pin_preferred_actions(&mut selected, &all_actions, &preferred, 4);
+
+        let names: HashSet<String> = selected.into_iter().map(|action| action.name).collect();
+        assert!(names.contains("beta"));
+        assert!(names.contains("file_read"));
+    }
+
+    #[test]
+    fn ensure_live_app_companion_actions_adds_repair_tools() {
+        let all_actions = vec![
+            action("app_inspect", "Inspect deployed apps."),
+            action("file_read", "Read a file from disk."),
+            action("file_write", "Write contents to a file."),
+            action("app_restart", "Restart a deployed app."),
+            action("http_get", "Make an HTTP GET request."),
+            action("research", "Research a topic and summarize findings."),
+        ];
+        let mut selected = vec![action("app_inspect", "Inspect deployed apps.")];
+
+        ensure_live_app_companion_actions(&mut selected, &all_actions, MAX_SHORTLISTED_ACTIONS);
+
+        let names: HashSet<String> = selected.into_iter().map(|action| action.name).collect();
+        assert!(names.contains("app_inspect"));
+        assert!(names.contains("file_read"));
+        assert!(names.contains("file_write"));
+        assert!(names.contains("app_restart"));
+        assert!(!names.contains("http_get"));
+    }
+
+    #[test]
+    fn ensure_live_app_companion_actions_adds_repair_tools_for_restart() {
+        let all_actions = vec![
+            action("app_inspect", "Inspect deployed apps."),
+            action("file_read", "Read a file from disk."),
+            action("file_write", "Write contents to a file."),
+            action("app_restart", "Restart a deployed app."),
+            action("http_get", "Make an HTTP GET request."),
+        ];
+        let mut selected = vec![action("app_restart", "Restart a deployed app.")];
+
+        ensure_live_app_companion_actions(&mut selected, &all_actions, MAX_SHORTLISTED_ACTIONS);
+
+        let names: HashSet<String> = selected.into_iter().map(|action| action.name).collect();
+        assert!(names.contains("file_read"));
+        assert!(names.contains("file_write"));
+        assert!(names.contains("app_restart"));
+        assert!(!names.contains("http_get"));
+    }
+
+    #[test]
+    fn ensure_workspace_repair_actions_adds_file_and_shell_tools() {
+        let all_actions = vec![
+            action("research", "Research a topic and summarize findings."),
+            action("file_read", "Read a file from disk."),
+            action("file_write", "Write contents to a file."),
+            action("shell", "Execute a shell command."),
+        ];
+        let mut selected = vec![action(
+            "research",
+            "Research a topic and summarize findings.",
+        )];
+
+        ensure_workspace_repair_actions(&mut selected, &all_actions, MAX_SHORTLISTED_ACTIONS);
+
+        let names: HashSet<String> = selected.into_iter().map(|action| action.name).collect();
+        assert!(names.contains("file_read"));
+        assert!(names.contains("file_write"));
+        assert!(names.contains("shell"));
+    }
+
+    #[test]
+    fn extract_json_object_from_text_finds_embedded_payload() {
+        let parsed =
+            extract_json_object_from_text("before {\"needed_actions\":[\"app_inspect\"]} after")
+                .expect("json object should be extracted");
+        let needed_actions = parsed
+            .get("needed_actions")
+            .and_then(|value| value.as_array())
+            .expect("needed_actions array");
+        assert_eq!(needed_actions.len(), 1);
+        assert_eq!(needed_actions[0].as_str(), Some("app_inspect"));
+    }
+
+    #[test]
+    fn build_tool_followup_user_message_includes_request_and_rules() {
+        let msg = build_tool_followup_user_message(
+            "fix the broken app",
+            "[app_inspect] {\"matched_app\":{\"title\":\"Demo\"}}",
+            true,
+        );
+        assert!(msg.contains("fix the broken app"));
+        assert!(msg.contains("Do not dump raw tool JSON"));
+        assert!(msg.contains("[app_inspect]"));
+        assert!(msg.contains("This is an execution request"));
+        assert!(msg.contains("Do not answer with tool-loop meta text"));
+    }
+
+    #[test]
+    fn build_tool_followup_assistant_message_omits_called_tools_meta() {
+        let response = crate::core::llm::LlmResponse {
+            content: "Now I'll inspect the app.".to_string(),
+            tool_calls: vec![crate::core::llm::ToolCall {
+                id: "tool-1".to_string(),
+                name: "app_inspect".to_string(),
+                arguments: serde_json::json!({"query":"demo"}),
+            }],
+            reasoning: None,
+            usage: None,
+            provider: "test".to_string(),
+            model: "test".to_string(),
+        };
+        let msg = build_tool_followup_assistant_message(&response);
+        assert!(msg.is_empty());
+        assert!(!msg.contains("Called tools:"));
+    }
+
+    #[test]
+    fn workspace_modification_detector_catches_framework_fix_requests() {
+        assert!(is_workspace_modification_request(
+            "fix the AgentArk framework so the console honors full user requests"
+        ));
+        assert!(request_looks_like_fix_or_debug(
+            "the app doesnt work and refresh pulls no papers, fix it"
+        ));
+    }
+
+    #[test]
+    fn looks_like_raw_structured_tool_output_detects_json_objects() {
+        assert!(looks_like_raw_structured_tool_output(
+            "{\"matched_app\":{\"title\":\"Demo\"}}"
+        ));
+        assert!(!looks_like_raw_structured_tool_output(
+            "I found the issue and fixed the refresh route."
+        ));
+    }
+
+    #[test]
+    fn looks_like_raw_source_or_markup_dump_detects_html_and_source() {
+        assert!(looks_like_raw_source_or_markup_dump(
+            "<!DOCTYPE html>\n<html>\n<head>\n<script>const x = 1;</script>\n</head>\n<body>\n<div>demo</div>\n</body>\n</html>"
+        ));
+        assert!(looks_like_raw_source_or_markup_dump(
+            "import asyncio\nimport httpx\nfrom fastapi import FastAPI\n\nasync def fetch_data():\n    return await client.get(url)\n\nfunction render() {\n  return document.getElementById('app');\n}\nconst app = true;\nclass Demo {}\nreturn app;\n"
+        ));
+        assert!(!looks_like_raw_source_or_markup_dump(
+            "I checked the app, updated the refresh logic, and verified that new papers appear again."
+        ));
+    }
+
+    #[test]
+    fn build_tool_followup_assistant_message_omits_raw_markup_dump() {
+        let response = crate::core::llm::LlmResponse {
+            content: "<!DOCTYPE html>\n<html>\n<head>\n<script>const x = 1;</script>\n</head>\n<body>\n<div>demo</div>\n<div>more</div>\n<div>end</div>\n</body>\n</html>".to_string(),
+            tool_calls: vec![],
+            reasoning: None,
+            usage: None,
+            provider: "test".to_string(),
+            model: "test".to_string(),
+        };
+        let msg = build_tool_followup_assistant_message(&response);
+        assert!(msg.is_empty());
+    }
+
+    #[test]
+    fn standalone_link_share_detector_only_matches_bare_links() {
+        assert!(is_standalone_link_share(
+            "https://www.youtube.com/watch?v=testvideo01"
+        ));
+        assert!(is_standalone_link_share(
+            "https://example.com/test?x=1 https://example.com/other"
+        ));
+        assert!(!is_standalone_link_share(
+            "summarize this https://www.youtube.com/watch?v=testvideo01"
+        ));
+    }
+
+    #[test]
+    fn build_shared_link_memory_ack_prefers_memory_capture_language() {
+        let ack = build_shared_link_memory_ack("https://www.youtube.com/watch?v=testvideo01")
+            .expect("ack should be generated for standalone link share");
+        assert!(ack.contains("Saved this YouTube link"));
+        assert!(ack.contains("later reference"));
+        assert!(!ack.contains("transcript"));
+        assert!(!ack.contains("summary"));
+    }
+
+    #[test]
+    fn extract_stable_user_preferences_captures_positive_and_negative_clauses() {
+        let extracted = extract_stable_user_preferences("i love samsung and hate apple");
+        assert_eq!(
+            extracted,
+            vec![
+                ("likes_samsung".to_string(), "samsung".to_string()),
+                ("dislikes_apple".to_string(), "apple".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_stable_user_preferences_ignores_requests() {
+        let extracted =
+            extract_stable_user_preferences("can you tell me if samsung is better than apple?");
+        assert!(extracted.is_empty());
+    }
+
+    #[test]
+    fn response_indicates_pending_execution_detects_future_work_promises() {
+        assert!(response_indicates_pending_execution(
+            "The file fix has been written. Now I need to redeploy the app to apply the changes."
+        ));
+        assert!(!response_indicates_pending_execution(
+            "The fix is deployed and the refresh flow is working again."
+        ));
+    }
+
+    #[test]
+    fn response_is_meta_tool_summary_detects_called_tools_lines() {
+        assert!(response_is_meta_tool_summary(
+            "Now I'll restart the app to apply the fix.\n\nCalled tools: app_restart"
+        ));
+        assert!(response_is_meta_tool_summary(
+            "Called tools: file_read, file_write"
+        ));
+        assert!(!response_is_meta_tool_summary(
+            "I fixed the refresh flow, validated the response, and the app is working again."
+        ));
+    }
+
+    #[test]
+    fn build_user_facing_tool_fallback_response_summarizes_raw_html_output() {
+        let batch = crate::core::agent::tool_execution::ToolExecutionBatch {
+            outputs: vec![crate::core::agent::tool_execution::ToolCallOutput {
+                name: "file_read".to_string(),
+                content: "<!DOCTYPE html>\n<html>\n<head><title>arXiv Research Monitor | RL & Time-Series</title></head>\n<body><div>demo</div></body>\n</html>".to_string(),
+            }],
+        };
+
+        let response = build_user_facing_tool_fallback_response(
+            &batch.combined_output(),
+            &batch,
+            "I gathered tool evidence, but the final response could not be formatted cleanly.",
+        );
+
+        assert!(response.contains("I gathered tool evidence"));
+        assert!(response
+            .contains("File Read read HTML document `arXiv Research Monitor | RL & Time-Series`."));
+        assert!(!response.contains("<!DOCTYPE html>"));
+        assert!(!response.contains("Evidence gathered:"));
+    }
+
+    #[test]
+    fn tool_loop_timeout_fallback_does_not_leak_raw_html_to_user() {
+        let batch = crate::core::agent::tool_execution::ToolExecutionBatch {
+            outputs: vec![
+                crate::core::agent::tool_execution::ToolCallOutput {
+                    name: "app_inspect".to_string(),
+                    content: "{\"matched_app\":{\"title\":\"arXiv Research Monitor\"}}".to_string(),
+                },
+                crate::core::agent::tool_execution::ToolCallOutput {
+                    name: "file_read".to_string(),
+                    content: "<!DOCTYPE html>\n<html>\n<head><title>arXiv Research Monitor | RL & Time-Series</title></head>\n<body><div>demo</div></body>\n</html>".to_string(),
+                },
+            ],
+        };
+
+        let response = build_user_facing_tool_fallback_response(
+            &batch.combined_output(),
+            &batch,
+            "Stopped waiting for synthesis after 90 seconds and returned the latest tool-backed response.",
+        );
+
+        assert!(response.contains("Stopped waiting for synthesis after 90 seconds"));
+        assert!(response.contains("App Inspect matched app `arXiv Research Monitor`."));
+        assert!(response
+            .contains("File Read read HTML document `arXiv Research Monitor | RL & Time-Series`."));
+        assert!(!response.contains("<!DOCTYPE html>"));
+        assert!(!response.contains("<html>"));
+    }
+
+    #[test]
+    fn sanitize_final_user_response_rejects_raw_markup_dump() {
+        let response = sanitize_final_user_response(
+            "<!DOCTYPE html>\n<html>\n<head><title>Demo</title></head>\n<body></body>\n</html>",
+        );
+
+        assert_eq!(
+            response,
+            "I gathered raw tool output, but the final response formatting failed. Please retry the request."
+        );
+    }
+
+    #[test]
+    fn sanitize_final_user_response_strips_diagnostic_evidence_blocks() {
+        let response = sanitize_final_user_response(
+            "Latest Iran news from current coverage:\n- Reuters\n\nEvidence — action: web_search; intent: get latest Iran news; inputs: query=\"Iran latest news\"; result: multiple current news sources found.",
+        );
+
+        assert_eq!(
+            response,
+            "Latest Iran news from current coverage:\n- Reuters"
+        );
+    }
+
+    #[test]
+    fn summarize_model_failure_for_user_sanitizes_schema_rejection() {
+        let summary = summarize_model_failure_for_user(
+            "asdasd (openai/gpt-5.4) failed: OpenAI API error: {\"error\":{\"message\":\"Provider returned error\",\"metadata\":{\"raw\":\"{\\n \\\"error\\\": {\\n \\\"message\\\": \\\"Invalid schema for function 'app_restart': schema must have type 'object' and not have 'oneOf'/'anyOf'/'allOf'/'enum'/'not' at the top level.\\\"}}\"}}",
+        );
+
+        assert_eq!(
+            summary,
+            "asdasd (openai/gpt-5.4): rejected the current tool schema for `app_restart`."
+        );
+        assert!(!summary.contains("invalid_function_parameters"));
+        assert!(!summary.contains("{\"error\""));
+    }
+
+    #[test]
+    fn summarize_model_failures_for_user_deduplicates_and_limits_noise() {
+        let errors = vec![
+            "slot-a (openai/gpt-5.4) failed: timed out after 3500ms".to_string(),
+            "slot-a (openai/gpt-5.4) failed: timed out after 3500ms".to_string(),
+            "slot-b (openai/gpt-5.4) failed: Provider returned error".to_string(),
+        ];
+
+        let summary = summarize_model_failures_for_user(&errors);
+        assert!(summary.contains("slot-a (openai/gpt-5.4): timed out before responding."));
+        assert!(summary.contains("slot-b (openai/gpt-5.4): returned an upstream provider error."));
+        assert_eq!(summary.matches("timed out before responding.").count(), 1);
     }
 }

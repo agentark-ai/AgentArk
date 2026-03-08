@@ -35,6 +35,7 @@ services:
       # These volumes are managed by Docker and NEVER deleted on rebuild
       - agentark-data:/app/data # Database, memories, user skills
       - agentark-config:/app/config # Settings, identity keys, API keys
+      - .:/workspace/agentark
       # No raw Docker socket mount — use docker-socket-proxy instead
     depends_on:
       - docker-socket-proxy

@@ -22,6 +22,7 @@ mod proofs;
 mod runtime;
 mod safety;
 mod security;
+mod self_update;
 mod sentinel;
 mod storage;
 

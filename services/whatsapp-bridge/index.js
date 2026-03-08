@@ -127,6 +127,25 @@ app.post("/send", async (req, res) => {
   }
 });
 
+/** Send composing (typing) presence to a chat */
+app.post("/presence", async (req, res) => {
+  const { to, type: presenceType } = req.body;
+  if (!to) {
+    return res.status(400).json({ error: "Missing 'to' field" });
+  }
+  if (!sock || connectionStatus !== "connected") {
+    return res.status(503).json({ error: "WhatsApp not connected" });
+  }
+  try {
+    const jid = to.includes("@") ? to : `${to}@s.whatsapp.net`;
+    await sock.sendPresenceUpdate(presenceType || "composing", jid);
+    res.json({ ok: true });
+  } catch (err) {
+    logger.error({ err }, "Failed to send presence");
+    res.status(500).json({ error: err.message });
+  }
+});
+
 /** Send a video message (base64-encoded) */
 app.post("/send-video", async (req, res) => {
   const { to, video, caption } = req.body;

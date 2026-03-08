@@ -1172,174 +1172,104 @@ export function IntegrationsPanel({
 
       {showIntegrations ? (
         <Box className="list-shell">
-          <Typography variant="subtitle2" sx={{ mb: 1 }}>
-            Enabled ({enabledList.length})
-          </Typography>
-          {enabledList.length === 0 ? (
-            <Typography variant="body2" color="text.secondary">
-              No enabled integrations yet.
+          <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1.5 }}>
+            <Typography variant="subtitle2">
+              Integrations ({enabledList.length} active, {disabledList.length} available)
             </Typography>
-          ) : (
-            <Grid2 container spacing={1.5}>
-              {enabledList.map((integration) => (
-                <Grid2 key={integration.id} size={{ xs: 12, sm: 6, lg: 4 }}>
-                  <Box className="list-shell" sx={{ height: "100%", position: "relative" }}>
-                    <Stack spacing={1.25}>
-                      <Stack direction="row" alignItems="center" justifyContent="space-between">
-                        <Typography variant="subtitle1" fontWeight={700}>
-                          {integration.name}
-                        </Typography>
-                        <Stack direction="row" spacing={0.5} alignItems="center">
-                          <Typography variant="caption" color="text.secondary">
-                            {integration.status.replace(/_/g, " ")}
-                          </Typography>
-                          <Box
-                            sx={{
-                              width: 10,
-                              height: 10,
-                              borderRadius: "50%",
-                              background:
-                                statusColor(integration.status) === "success"
-                                  ? "#4ad29d"
-                                  : statusColor(integration.status) === "error"
-                                    ? "rgba(255, 88, 88, 0.85)"
-                                : "rgba(255,255,255,0.4)"
-                            }}
-                          />
-                          <CardActionsMenu
-                            ariaLabel={`${integration.name} options`}
-                            actions={[
-                              ...(integration.status === "needs_auth" || str(integration.auth_url, "").trim().length > 0
-                                ? [
-                                    {
-                                      label: oauthBusyId === integration.id ? "Connecting..." : "Connect",
-                                      disabled: oauthBusyId === integration.id,
-                                      onClick: () => startIntegrationAuth(integration)
-                                    }
-                                  ]
-                                : []),
-                              {
-                                label: "Test",
-                                disabled: testMutation.isPending,
-                                onClick: () => testMutation.mutate(integration.id)
-                              },
-                              ...(integration.config_fields && integration.config_fields.length > 0
-                                ? [{ label: "Manage", onClick: () => openConfig(integration) }]
-                                : []),
-                              {
-                                label: "Disable",
-                                tone: "warning",
-                                divider: true,
-                                disabled: disableMutation.isPending,
-                                onClick: () => disableMutation.mutate(integration.id)
-                              }
-                            ]}
-                          />
-                        </Stack>
-                      </Stack>
-                      <Typography variant="body2" color="text.secondary">
-                        {integration.description}
-                      </Typography>
-                      {integration.status_detail ? (
-                        <Typography variant="caption" color="text.secondary">
-                          {integration.status_detail}
-                        </Typography>
-                      ) : null}
-                    </Stack>
-                  </Box>
-                </Grid2>
-              ))}
-            </Grid2>
-          )}
-        </Box>
-      ) : null}
-
-      {showIntegrations ? (
-        <Box className="list-shell">
-          <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
-            <Typography variant="subtitle2">Disabled ({disabledList.length})</Typography>
-            {disabledList.length > 0 ? (
-              <Button size="small" onClick={() => setShowDisabledIntegrations((prev) => !prev)}>
-                {showDisabledIntegrations ? "Collapse" : "Expand"}
-              </Button>
-            ) : null}
           </Stack>
-          {disabledList.length === 0 ? (
-            <Typography variant="body2" color="text.secondary">
-              No disabled integrations.
-            </Typography>
-          ) : !showDisabledIntegrations ? (
-            <Typography variant="body2" color="text.secondary">
-              Collapsed by default. Expand to review and enable.
-            </Typography>
-          ) : (
-            <Grid2 container spacing={1.5}>
-              {disabledList.map((integration) => (
-                <Grid2 key={integration.id} size={{ xs: 12, sm: 6, lg: 4 }}>
-                  <Box className="list-shell" sx={{ height: "100%", position: "relative", opacity: 0.94 }}>
-                    <Stack spacing={1.25}>
-                      <Stack direction="row" alignItems="center" justifyContent="space-between">
-                        <Typography variant="subtitle1" fontWeight={700}>
+          <Grid2 container spacing={1}>
+            {[...enabledList, ...disabledList].map((integration) => {
+              const isEnabled = integration.enabled;
+              const sc = statusColor(integration.status);
+              const dotColor = sc === "success" ? "#4ad29d" : sc === "error" ? "rgba(255,88,88,0.85)" : sc === "warning" ? "rgba(255,180,50,0.85)" : "rgba(255,255,255,0.25)";
+              return (
+                <Grid2 key={integration.id} size={{ xs: 6, sm: 4, md: 3, lg: 2 }}>
+                  <Box
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => {
+                      if (isEnabled) {
+                        if (integration.config_fields && integration.config_fields.length > 0) {
+                          openConfig(integration);
+                        }
+                      } else {
+                        if (integration.status === "connected") {
+                          enableMutation.mutate(integration.id);
+                        } else {
+                          openConfig(integration);
+                        }
+                      }
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        if (isEnabled) {
+                          if (integration.config_fields && integration.config_fields.length > 0) {
+                            openConfig(integration);
+                          }
+                        } else {
+                          if (integration.status === "connected") {
+                            enableMutation.mutate(integration.id);
+                          } else {
+                            openConfig(integration);
+                          }
+                        }
+                      }
+                    }}
+                    sx={{
+                      height: "100%",
+                      p: 1.2,
+                      borderRadius: "10px",
+                      border: isEnabled ? "1px solid rgba(74,210,157,0.35)" : "1px solid rgba(108,156,212,0.18)",
+                      background: isEnabled ? "rgba(74,210,157,0.06)" : "rgba(6,15,29,0.5)",
+                      cursor: "pointer",
+                      transition: "border-color 0.15s, background 0.15s, box-shadow 0.15s",
+                      opacity: isEnabled ? 1 : 0.75,
+                      "&:hover": {
+                        borderColor: isEnabled ? "rgba(74,210,157,0.55)" : "rgba(47,212,255,0.4)",
+                        background: isEnabled ? "rgba(74,210,157,0.1)" : "rgba(47,212,255,0.06)",
+                        boxShadow: "0 2px 12px rgba(0,0,0,0.2)",
+                        opacity: 1
+                      }
+                    }}
+                  >
+                    <Stack spacing={0.5} sx={{ minHeight: 56 }}>
+                      <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={0.5}>
+                        <Typography variant="subtitle2" noWrap sx={{ fontWeight: 700, fontSize: "0.82rem" }}>
                           {integration.name}
                         </Typography>
-                        <Stack direction="row" spacing={0.5} alignItems="center">
-                          <Typography variant="caption" color="text.secondary">
-                            {integration.status.replace(/_/g, " ")}
-                          </Typography>
-                          <CardActionsMenu
-                            ariaLabel={`${integration.name} options`}
-                            actions={[
-                              ...(integration.status === "needs_auth" || str(integration.auth_url, "").trim().length > 0
-                                ? [
-                                    {
-                                      label: oauthBusyId === integration.id ? "Connecting..." : "Connect",
-                                      disabled: oauthBusyId === integration.id,
-                                      onClick: () => startIntegrationAuth(integration)
-                                    }
-                                  ]
-                                : []),
-                              {
-                                label: "Enable",
-                                disabled: enableMutation.isPending || saving,
-                                onClick: async () => {
-                                  if (integration.status === "connected") {
-                                    try {
-                                      await enableMutation.mutateAsync(integration.id);
-                                    } catch (err) {
-                                      setNotice({ kind: "error", text: asErrorMessage(err) });
-                                    }
-                                    return;
-                                  }
-                                  openConfig(integration);
-                                }
-                              },
-                              ...(integration.status !== "not_configured"
-                                ? [
-                                    {
-                                      label: "Test",
-                                      disabled: testMutation.isPending,
-                                      onClick: () => testMutation.mutate(integration.id)
-                                    }
-                                  ]
-                                : [])
-                            ]}
-                          />
-                        </Stack>
+                        <Box
+                          sx={{
+                            width: 8,
+                            height: 8,
+                            borderRadius: "50%",
+                            background: dotColor,
+                            flex: "0 0 auto"
+                          }}
+                        />
                       </Stack>
-                      <Typography variant="body2" color="text.secondary">
-                        {integration.description}
+                      <Typography variant="caption" color="text.secondary" sx={{ lineHeight: 1.3, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>
+                        {isEnabled ? (integration.status_detail || integration.description) : integration.description}
                       </Typography>
-                      {integration.status_detail ? (
-                        <Typography variant="caption" color="text.secondary">
-                          {integration.status_detail}
-                        </Typography>
-                      ) : null}
                     </Stack>
+                    <Chip
+                      size="small"
+                      label={isEnabled ? "Enabled" : "Disabled"}
+                      sx={{
+                        mt: 0.8,
+                        height: 20,
+                        fontSize: "0.66rem",
+                        fontWeight: 600,
+                        borderColor: isEnabled ? "rgba(74,210,157,0.3)" : "rgba(255,255,255,0.1)",
+                        color: isEnabled ? "rgba(74,210,157,0.9)" : "rgba(180,200,225,0.5)"
+                      }}
+                      variant="outlined"
+                    />
                   </Box>
                 </Grid2>
-              ))}
-            </Grid2>
-          )}
+              );
+            })}
+          </Grid2>
         </Box>
       ) : null}
 

@@ -7,6 +7,7 @@ pub mod document;
 pub mod document_chunk;
 pub mod episode;
 pub mod execution_proof;
+pub mod execution_trace;
 pub mod expense;
 pub mod knowledge_item;
 pub mod kv_store;

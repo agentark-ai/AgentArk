@@ -7,7 +7,11 @@ pub fn global_policy_v2_block() -> &'static str {
 - Clarification policy: ask one concise clarification only when critical execution details are missing or ambiguous; if the brief is clear and actionable, execute directly.
 - Bounded retries only: any repair/retry loop must declare max attempts before starting, stop at cap, then report last error + next fix.
 - Evidence per action: after each tool/action, provide a compact evidence line (action, intent, key non-secret inputs, observed result).
+- Completion contract: a tool call, restart, refresh, or redeploy is intermediate progress, not completion; finish only after the outcome is validated or the remaining blocker is explicit.
+- If the user refers to an existing deployed app, prefer `app_inspect` before asking whether the app exists.
+- After editing a deployed app, prefer `app_restart` to apply the change and validate before claiming it is fixed.
 - For deployed apps, validate before sharing: open URL, verify unlocked app load, capture preview screenshot, then return link.
+- For requests about AgentArk itself, the current workspace, chat UX, traces, prompts, or execution framework behavior, prefer local code/file/shell actions over deployed-app actions unless the user explicitly asks to operate on a deployed app.
 "#
 }
 
@@ -32,7 +36,8 @@ pub fn router_policy_v2_block() -> &'static str {
 pub fn synthesis_policy_v2_block() -> &'static str {
     r#"Synthesis Policy v2:
 - Keep output user-facing and actionable.
-- Preserve required tool calls (especially app_deploy for runnable apps).
+- Preserve required tool calls and prefer the clearest semantic action match from the available actions.
+- For requests about the current workspace/framework itself, prefer local code, file, and shell actions over deployment actions.
 - Ensure retry plans have explicit bounded max attempts.
 - Include compact evidence summary for actions used."#
 }

@@ -538,14 +538,19 @@ impl ActionGuard {
                 FindingCategory::EnvironmentAccess | FindingCategory::CredentialPattern
             )
         });
+        // Only count hard-coded credentials as dangerous — env-var refs ($VAR) and
+        // placeholder values ("your-api-key") are standard integration patterns.
+        let has_real_secret = findings
+            .iter()
+            .any(|f| matches!(f.category, FindingCategory::CredentialPattern) && f.severity > 3);
 
         let total_severity: u32 = findings.iter().map(|f| f.severity).sum();
-        let mut total_severity = if has_network && has_secret_reference {
+        let mut total_severity = if has_network && has_real_secret {
             total_severity + 5
         } else {
             total_severity
         };
-        if has_shell && has_network && (has_encoded || has_secret_reference) {
+        if has_shell && has_network && (has_encoded || has_real_secret) {
             total_severity += 12;
         }
         if has_shell && has_fs_escape {

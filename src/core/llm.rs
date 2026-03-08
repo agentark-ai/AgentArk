@@ -50,6 +50,99 @@ fn openai_provider_label(base_url: Option<&str>) -> &'static str {
     }
 }
 
+fn normalize_openai_text_chunk(text: &str, trim: bool) -> Option<String> {
+    if trim {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    } else if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+fn extract_openai_text_from_value(value: &serde_json::Value, trim: bool) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return normalize_openai_text_chunk(text, trim);
+    }
+
+    if let Some(obj) = value.as_object() {
+        if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+            if let Some(chunk) = normalize_openai_text_chunk(text, trim) {
+                return Some(chunk);
+            }
+        }
+        if let Some(content) = obj.get("content") {
+            if let Some(text) = extract_openai_text_from_value(content, trim) {
+                return Some(text);
+            }
+        }
+    }
+
+    if let Some(arr) = value.as_array() {
+        let mut chunks: Vec<String> = Vec::new();
+        for item in arr {
+            if let Some(text) = item.as_str() {
+                if let Some(chunk) = normalize_openai_text_chunk(text, trim) {
+                    chunks.push(chunk);
+                }
+                continue;
+            }
+
+            let Some(obj) = item.as_object() else {
+                continue;
+            };
+            let item_type = obj
+                .get("type")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_ascii_lowercase());
+            if let Some(t) = item_type.as_deref() {
+                if t != "text"
+                    && t != "input_text"
+                    && t != "output_text"
+                    && t != "content"
+                    && t != "reasoning"
+                {
+                    continue;
+                }
+            }
+
+            if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+                if let Some(chunk) = normalize_openai_text_chunk(text, trim) {
+                    chunks.push(chunk);
+                }
+                continue;
+            }
+            if let Some(content) = obj.get("content") {
+                if let Some(text) = extract_openai_text_from_value(content, trim) {
+                    chunks.push(text);
+                }
+            }
+        }
+        if !chunks.is_empty() {
+            return Some(if trim {
+                chunks.join("\n")
+            } else {
+                chunks.concat()
+            });
+        }
+    }
+
+    None
+}
+
+fn extract_openai_message_text(value: &serde_json::Value) -> Option<String> {
+    extract_openai_text_from_value(value, true)
+}
+
+fn extract_openai_delta_text(value: &serde_json::Value) -> Option<String> {
+    extract_openai_text_from_value(value, false)
+}
+
 /// Normalize tool JSON Schema for OpenAI-compatible function calling.
 /// OpenAI requires `items` to be present for every array schema.
 fn normalize_openai_tool_schema(schema: &serde_json::Value) -> serde_json::Value {
@@ -61,13 +154,289 @@ fn normalize_openai_tool_schema(schema: &serde_json::Value) -> serde_json::Value
             "properties": {}
         })
     };
-    normalize_openai_tool_schema_in_place(&mut normalized);
+    normalize_openai_tool_schema_in_place(&mut normalized, true);
     normalized
 }
 
-fn normalize_openai_tool_schema_in_place(node: &mut serde_json::Value) {
+fn append_schema_description_note(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    note: impl AsRef<str>,
+) {
+    let note = note.as_ref().trim();
+    if note.is_empty() {
+        return;
+    }
+    let existing = map
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if existing.contains(note) {
+        return;
+    }
+    let merged = if existing.is_empty() {
+        note.to_string()
+    } else if existing.ends_with('.') || existing.ends_with('!') || existing.ends_with('?') {
+        format!("{} {}", existing, note)
+    } else {
+        format!("{}. {}", existing, note)
+    };
+    map.insert("description".to_string(), serde_json::Value::String(merged));
+}
+
+fn merge_required_keys_into_map(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    required_keys: impl IntoIterator<Item = String>,
+) {
+    let mut merged: Vec<String> = map
+        .get("required")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    for key in required_keys {
+        if !merged.iter().any(|existing| existing == &key) {
+            merged.push(key);
+        }
+    }
+    if !merged.is_empty() {
+        map.insert(
+            "required".to_string(),
+            serde_json::Value::Array(merged.into_iter().map(serde_json::Value::String).collect()),
+        );
+    }
+}
+
+fn collect_branch_required_sets(branches: &[serde_json::Value]) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    for branch in branches {
+        let Some(obj) = branch.as_object() else {
+            continue;
+        };
+        let Some(required) = obj.get("required").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        let keys: Vec<String> = required
+            .iter()
+            .filter_map(|item| item.as_str().map(|s| s.to_string()))
+            .collect();
+        if !keys.is_empty() && !out.iter().any(|existing| existing == &keys) {
+            out.push(keys);
+        }
+    }
+    out
+}
+
+fn describe_required_branch_sets(mode: &str, branches: &[serde_json::Value]) -> Option<String> {
+    let required_sets = collect_branch_required_sets(branches);
+    if required_sets.is_empty() {
+        return None;
+    }
+
+    if mode == "allOf" {
+        let mut keys = Vec::new();
+        for set in required_sets {
+            for key in set {
+                if !keys.iter().any(|existing| existing == &key) {
+                    keys.push(key);
+                }
+            }
+        }
+        if keys.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "Include these keys when needed: {}.",
+                keys.join(", ")
+            ))
+        }
+    } else {
+        let mut single_keys = Vec::new();
+        let mut all_single = true;
+        for set in &required_sets {
+            if set.len() != 1 {
+                all_single = false;
+                break;
+            }
+            let key = set[0].clone();
+            if !single_keys.iter().any(|existing| existing == &key) {
+                single_keys.push(key);
+            }
+        }
+        if all_single && !single_keys.is_empty() {
+            Some(format!(
+                "Provide at least one of these keys: {}.",
+                single_keys.join(", ")
+            ))
+        } else {
+            let groups = required_sets
+                .iter()
+                .map(|set| set.join(", "))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            Some(format!("Valid key groups: {}.", groups))
+        }
+    }
+}
+
+fn merge_branch_object_shapes_into_root(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    mode: &str,
+    branches: &[serde_json::Value],
+) {
+    let mut merged_properties = map
+        .get("properties")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let mut all_of_required = Vec::new();
+
+    for branch in branches {
+        let Some(obj) = branch.as_object() else {
+            continue;
+        };
+        if let Some(props) = obj.get("properties").and_then(|v| v.as_object()) {
+            for (name, child) in props {
+                merged_properties
+                    .entry(name.clone())
+                    .or_insert_with(|| child.clone());
+            }
+        }
+        if mode == "allOf" {
+            if let Some(required) = obj.get("required").and_then(|v| v.as_array()) {
+                for key in required.iter().filter_map(|item| item.as_str()) {
+                    if !all_of_required.iter().any(|existing| existing == key) {
+                        all_of_required.push(key.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    map.insert(
+        "properties".to_string(),
+        serde_json::Value::Object(merged_properties),
+    );
+    if mode == "allOf" {
+        merge_required_keys_into_map(map, all_of_required);
+    }
+}
+
+fn normalize_type_array_in_place(map: &mut serde_json::Map<String, serde_json::Value>) {
+    let Some(type_arr) = map.get("type").and_then(|v| v.as_array()) else {
+        return;
+    };
+    let mut variants = Vec::new();
+    for item in type_arr {
+        if let Some(kind) = item.as_str() {
+            let lower = kind.trim().to_ascii_lowercase();
+            if !lower.is_empty() && !variants.iter().any(|existing| existing == &lower) {
+                variants.push(lower);
+            }
+        }
+    }
+    if variants.is_empty() {
+        map.remove("type");
+        return;
+    }
+    let non_null: Vec<String> = variants
+        .iter()
+        .filter(|kind| kind.as_str() != "null")
+        .cloned()
+        .collect();
+    if non_null.len() == 1 {
+        map.insert(
+            "type".to_string(),
+            serde_json::Value::String(non_null[0].clone()),
+        );
+        if variants.len() > 1 {
+            append_schema_description_note(
+                map,
+                "Null is also acceptable when omitted by the caller.",
+            );
+        }
+        return;
+    }
+
+    map.remove("type");
+    append_schema_description_note(
+        map,
+        format!("Allowed value types: {}.", variants.join(", ")),
+    );
+}
+
+fn normalize_openai_tool_schema_in_place(node: &mut serde_json::Value, is_root: bool) {
     match node {
         serde_json::Value::Object(map) => {
+            normalize_type_array_in_place(map);
+
+            if is_root {
+                if map.get("type").and_then(|v| v.as_str()) != Some("object") {
+                    map.insert(
+                        "type".to_string(),
+                        serde_json::Value::String("object".to_string()),
+                    );
+                }
+
+                let combinator_keys = ["allOf", "anyOf", "oneOf"];
+                for key in combinator_keys {
+                    let branches = map
+                        .get(key)
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    if branches.is_empty() {
+                        continue;
+                    }
+                    merge_branch_object_shapes_into_root(map, key, &branches);
+                    if let Some(note) = describe_required_branch_sets(key, &branches) {
+                        append_schema_description_note(map, note);
+                    }
+                }
+
+                if let Some(enum_values) = map.get("enum").and_then(|v| v.as_array()) {
+                    let variants = enum_values
+                        .iter()
+                        .filter_map(|item| match item {
+                            serde_json::Value::String(s) => Some(s.clone()),
+                            serde_json::Value::Number(n) => Some(n.to_string()),
+                            serde_json::Value::Bool(b) => Some(b.to_string()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    if !variants.is_empty() {
+                        append_schema_description_note(
+                            map,
+                            format!("Allowed values: {}.", variants.join(", ")),
+                        );
+                    }
+                }
+
+                if map.contains_key("not") {
+                    append_schema_description_note(
+                        map,
+                        "Avoid excluded argument combinations; use a straightforward JSON object.",
+                    );
+                }
+
+                for key in ["allOf", "anyOf", "oneOf", "not", "enum"] {
+                    map.remove(key);
+                }
+                if !map
+                    .get("properties")
+                    .map(|value| value.is_object())
+                    .unwrap_or(false)
+                {
+                    map.insert(
+                        "properties".to_string(),
+                        serde_json::Value::Object(serde_json::Map::new()),
+                    );
+                }
+            }
+
             if map.get("type").and_then(|v| v.as_str()) == Some("array")
                 && !map.contains_key("items")
             {
@@ -76,34 +445,130 @@ fn normalize_openai_tool_schema_in_place(node: &mut serde_json::Value) {
 
             if let Some(props) = map.get_mut("properties").and_then(|v| v.as_object_mut()) {
                 for (_name, child) in props.iter_mut() {
-                    normalize_openai_tool_schema_in_place(child);
+                    normalize_openai_tool_schema_in_place(child, false);
                 }
             }
             if let Some(items) = map.get_mut("items") {
-                normalize_openai_tool_schema_in_place(items);
+                normalize_openai_tool_schema_in_place(items, false);
             }
             if let Some(additional) = map.get_mut("additionalProperties") {
-                normalize_openai_tool_schema_in_place(additional);
+                normalize_openai_tool_schema_in_place(additional, false);
             }
             if let Some(defs) = map.get_mut("$defs").and_then(|v| v.as_object_mut()) {
                 for (_name, child) in defs.iter_mut() {
-                    normalize_openai_tool_schema_in_place(child);
+                    normalize_openai_tool_schema_in_place(child, false);
                 }
             }
             for key in ["allOf", "anyOf", "oneOf", "prefixItems"] {
                 if let Some(arr) = map.get_mut(key).and_then(|v| v.as_array_mut()) {
                     for child in arr.iter_mut() {
-                        normalize_openai_tool_schema_in_place(child);
+                        normalize_openai_tool_schema_in_place(child, false);
                     }
                 }
             }
         }
         serde_json::Value::Array(arr) => {
             for child in arr.iter_mut() {
-                normalize_openai_tool_schema_in_place(child);
+                normalize_openai_tool_schema_in_place(child, false);
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_openai_tool_schema;
+
+    #[test]
+    fn normalize_openai_tool_schema_removes_top_level_anyof_requirements() {
+        let normalized = normalize_openai_tool_schema(&serde_json::json!({
+            "type": "object",
+            "properties": {
+                "app_id": { "type": "string" },
+                "query": { "type": "string" }
+            },
+            "anyOf": [
+                { "required": ["app_id"] },
+                { "required": ["query"] }
+            ]
+        }));
+
+        assert_eq!(
+            normalized.get("type").and_then(|v| v.as_str()),
+            Some("object")
+        );
+        assert!(normalized
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .is_some());
+        assert!(normalized.get("anyOf").is_none());
+        let description = normalized
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(description.contains("Provide at least one of these keys: app_id, query."));
+    }
+
+    #[test]
+    fn normalize_openai_tool_schema_merges_top_level_branch_properties() {
+        let normalized = normalize_openai_tool_schema(&serde_json::json!({
+            "anyOf": [
+                {
+                    "type": "object",
+                    "properties": { "url": { "type": "string" } },
+                    "required": ["url"]
+                },
+                {
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"]
+                }
+            ]
+        }));
+
+        let properties = normalized
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("properties");
+        assert!(properties.contains_key("url"));
+        assert!(properties.contains_key("path"));
+        assert!(normalized.get("anyOf").is_none());
+        assert_eq!(
+            normalized.get("type").and_then(|v| v.as_str()),
+            Some("object")
+        );
+    }
+
+    #[test]
+    fn normalize_openai_tool_schema_rewrites_type_arrays_to_descriptive_shape() {
+        let normalized = normalize_openai_tool_schema(&serde_json::json!({
+            "type": "object",
+            "properties": {
+                "config": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": ["string", "number", "boolean"]
+                    }
+                }
+            }
+        }));
+
+        let config = normalized
+            .get("properties")
+            .and_then(|v| v.get("config"))
+            .and_then(|v| v.as_object())
+            .expect("config object");
+        let additional = config
+            .get("additionalProperties")
+            .and_then(|v| v.as_object())
+            .expect("additionalProperties object");
+        assert!(additional.get("type").is_none());
+        let description = additional
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(description.contains("Allowed value types: string, number, boolean."));
     }
 }
 
@@ -230,6 +695,99 @@ struct AnthropicStreamParams<'a> {
     token_tx: Sender<StreamEvent>,
 }
 
+/// Last-resort text extraction from any JSON structure.
+/// Walks the JSON tree looking for text content in common LLM response shapes
+/// (choices[].message.content, output_text, result, response, text, etc.)
+fn extract_text_from_any_json(value: &serde_json::Value) -> Option<String> {
+    // Try common top-level text fields
+    for key in &[
+        "output_text",
+        "result",
+        "response",
+        "text",
+        "answer",
+        "generated_text",
+    ] {
+        if let Some(s) = value.get(key).and_then(|v| v.as_str()) {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    // Try choices[*].message.content (flexible — accept content as string or object with text)
+    if let Some(choices) = value.get("choices").and_then(|v| v.as_array()) {
+        for choice in choices {
+            // Standard: choice.message.content
+            if let Some(msg) = choice.get("message").or_else(|| choice.get("delta")) {
+                if let Some(content) = msg.get("content") {
+                    if let Some(s) = content.as_str() {
+                        let trimmed = s.trim();
+                        if !trimmed.is_empty() {
+                            return Some(trimmed.to_string());
+                        }
+                    }
+                    // Content as array of blocks (Anthropic-style)
+                    if let Some(arr) = content.as_array() {
+                        let mut text = String::new();
+                        for block in arr {
+                            if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                                text.push_str(t);
+                            }
+                        }
+                        let trimmed = text.trim().to_string();
+                        if !trimmed.is_empty() {
+                            return Some(trimmed);
+                        }
+                    }
+                }
+            }
+            // Some models put text directly on the choice
+            if let Some(s) = choice.get("text").and_then(|v| v.as_str()) {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+    // Try data.choices (nested wrapper)
+    if let Some(data) = value.get("data") {
+        return extract_text_from_any_json(data);
+    }
+    None
+}
+
+/// Check if an error is transient and worth retrying (timeouts, connection issues, decode errors).
+/// Returns false for HTTP 4xx client errors (auth, validation) which won't succeed on retry.
+fn is_retryable_error(err: &anyhow::Error) -> bool {
+    let msg = format!("{}", err);
+    let msg_lower = msg.to_lowercase();
+    // Check reqwest-specific error types
+    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
+        if reqwest_err.is_timeout() || reqwest_err.is_connect() || reqwest_err.is_decode() {
+            return true;
+        }
+        // Don't retry 4xx client errors
+        if let Some(status) = reqwest_err.status() {
+            if status.is_client_error() && status.as_u16() != 429 {
+                return false;
+            }
+        }
+    }
+    // Check for common transient error strings
+    msg_lower.contains("connection reset")
+        || msg_lower.contains("broken pipe")
+        || msg_lower.contains("error decoding response body")
+        || msg_lower.contains("connection closed")
+        || msg_lower.contains("stream ended unexpectedly")
+        || msg_lower.contains("incomplete message")
+}
+
+/// Retry backoff delays in milliseconds for each attempt (attempt 1, 2, 3)
+const RETRY_DELAYS_MS: [u64; 3] = [500, 1500, 3000];
+const MAX_RETRY_ATTEMPTS: u32 = 3;
+
 impl LlmClient {
     /// Get the model name string for this client
     pub fn model_name(&self) -> &str {
@@ -242,7 +800,7 @@ impl LlmClient {
 
     pub fn new(provider: &LlmProvider) -> Result<Self> {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(std::time::Duration::from_secs(300))
             .build()?;
 
         Ok(Self {
@@ -557,6 +1115,7 @@ impl LlmClient {
 
         #[derive(Deserialize)]
         struct OpenAIResponse {
+            #[serde(default)]
             choices: Vec<OpenAIChoice>,
             #[serde(default)]
             usage: Option<OpenAIUsage>,
@@ -574,12 +1133,14 @@ impl LlmClient {
 
         #[derive(Deserialize)]
         struct OpenAIChoice {
+            #[serde(default)]
             message: OpenAIResponseMessage,
         }
 
-        #[derive(Deserialize)]
+        #[derive(Deserialize, Default)]
         struct OpenAIResponseMessage {
-            content: Option<String>,
+            #[serde(default)]
+            content: Option<serde_json::Value>,
             tool_calls: Option<Vec<OpenAIToolCall>>,
             /// OpenRouter reasoning content from reasoning-enabled models
             reasoning_content: Option<String>,
@@ -587,7 +1148,9 @@ impl LlmClient {
 
         #[derive(Deserialize)]
         struct OpenAIToolCall {
+            #[serde(default)]
             id: String,
+            #[serde(default)]
             function: OpenAIFunctionCall,
         }
 
@@ -598,8 +1161,9 @@ impl LlmClient {
             Json(serde_json::Value),
         }
 
-        #[derive(Deserialize)]
+        #[derive(Deserialize, Default)]
         struct OpenAIFunctionCall {
+            #[serde(default)]
             name: String,
             #[serde(default)]
             arguments: Option<OpenAIFunctionArguments>,
@@ -647,145 +1211,264 @@ impl LlmClient {
         };
 
         let url = effective_openai_base_url(base_url);
-        let mut req = self
-            .client
-            .post(format!("{}/chat/completions", url))
-            .header("Authorization", format!("Bearer {}", api_key))
-            .header("Content-Type", "application/json");
+        let endpoint = format!("{}/chat/completions", url);
+        let is_openrouter = url.contains("openrouter");
 
-        // OpenRouter app identification headers
-        if url.contains("openrouter") {
-            req = req
-                .header("HTTP-Referer", "https://github.com/agentark-ai/AgentArk")
-                .header("X-Title", "AgentArk");
-        }
-
-        let response = req.json(&request).send().await?;
-
-        if !response.status().is_success() {
-            let error = response.text().await?;
-            return Err(anyhow!("OpenAI API error: {}", error));
-        }
-
-        let response_text = response.text().await?;
-        let response_json: serde_json::Value =
-            serde_json::from_str(&response_text).map_err(|e| {
-                let preview: String = response_text.chars().take(380).collect();
-                anyhow!(
-                    "OpenAI-compatible response was not valid JSON: {}. Body preview: {}",
-                    e,
-                    preview
-                )
-            })?;
-        if response_json.get("choices").is_none() {
-            if let Some(err_payload) = response_json.get("error") {
-                return Err(anyhow!(
-                    "OpenAI-compatible API returned an error payload: {}",
-                    err_payload
-                ));
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 0..MAX_RETRY_ATTEMPTS {
+            if attempt > 0 {
+                let delay = RETRY_DELAYS_MS[attempt as usize - 1];
+                tracing::warn!(
+                    "Non-streaming retry attempt {}/{} after {}ms delay (model={})",
+                    attempt + 1,
+                    MAX_RETRY_ATTEMPTS,
+                    delay,
+                    model,
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             }
-            if let Some(text) = response_json
-                .get("output_text")
-                .and_then(|v| v.as_str())
-                .or_else(|| response_json.get("message").and_then(|v| v.as_str()))
-            {
-                let provider_label = openai_provider_label(base_url);
-                let prompt_chars = system_prompt.len()
-                    + user_message.len()
-                    + history.iter().map(|m| m.content.len()).sum::<usize>();
-                let prompt_tokens = estimate_tokens_from_chars(prompt_chars);
-                let completion_tokens = estimate_tokens_from_chars(text.len());
-                return Ok(LlmResponse {
-                    content: text.to_string(),
-                    tool_calls: vec![],
-                    reasoning: None,
-                    usage: Some(LlmTokenUsage {
-                        prompt_tokens,
-                        completion_tokens,
-                        total_tokens: prompt_tokens + completion_tokens,
-                        estimated: true,
-                    }),
-                    provider: provider_label.to_string(),
-                    model: model.to_string(),
-                });
-            }
-        }
-        let response: OpenAIResponse =
-            serde_json::from_value(response_json.clone()).map_err(|e| {
-                let preview = serde_json::to_string(&response_json)
-                    .unwrap_or_default()
-                    .chars()
-                    .take(380)
-                    .collect::<String>();
-                anyhow!(
-                    "OpenAI-compatible response schema mismatch: {}. Body preview: {}",
-                    e,
-                    preview
-                )
-            })?;
-        let choice = response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("No response from OpenAI"))?;
 
-        let content = choice.message.content.unwrap_or_default();
-        let reasoning = choice.message.reasoning_content;
-        let tool_calls = choice
-            .message
-            .tool_calls
-            .unwrap_or_default()
-            .into_iter()
-            .map(|tc| ToolCall {
-                id: tc.id,
-                name: tc.function.name,
-                arguments: match tc.function.arguments {
-                    Some(OpenAIFunctionArguments::String(raw)) => {
-                        let trimmed = raw.trim();
-                        if trimmed.is_empty() {
-                            serde_json::Value::Null
+            let mut req = self
+                .client
+                .post(&endpoint)
+                .header("Authorization", format!("Bearer {}", api_key))
+                .header("Content-Type", "application/json");
+
+            if is_openrouter {
+                req = req
+                    .header("HTTP-Referer", "https://github.com/agentark-ai/AgentArk")
+                    .header("X-Title", "AgentArk");
+            }
+
+            let response = match req.json(&request).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let err = anyhow::Error::from(e);
+                    if attempt + 1 < MAX_RETRY_ATTEMPTS && is_retryable_error(&err) {
+                        last_err = Some(err);
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
+            let status = response.status();
+
+            // Handle 429 Too Many Requests with Retry-After
+            if status.as_u16() == 429 && attempt + 1 < MAX_RETRY_ATTEMPTS {
+                let retry_after = response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(2)
+                    .min(30);
+                tracing::warn!(
+                    "Rate limited (429), waiting {}s before retry (model={})",
+                    retry_after,
+                    model,
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(retry_after)).await;
+                last_err = Some(anyhow!("OpenAI API rate limited (429)"));
+                continue;
+            }
+
+            if !status.is_success() {
+                let error = match response.bytes().await {
+                    Ok(bytes) => {
+                        let body = String::from_utf8_lossy(&bytes).trim().to_string();
+                        if body.is_empty() {
+                            "<empty body>".to_string()
                         } else {
-                            serde_json::from_str(trimmed)
-                                .unwrap_or_else(|_| serde_json::Value::String(raw))
+                            body
                         }
                     }
-                    Some(OpenAIFunctionArguments::Json(v)) => v,
-                    None => serde_json::Value::Null,
-                },
-            })
-            .collect();
+                    Err(read_err) => format!("<failed to read error body: {}>", read_err),
+                };
+                let err = anyhow!("OpenAI API error ({}): {}", status, error);
+                if attempt + 1 < MAX_RETRY_ATTEMPTS && is_retryable_error(&err) {
+                    last_err = Some(err);
+                    continue;
+                }
+                return Err(err);
+            }
 
-        let provider_label = openai_provider_label(base_url);
+            let response_text = match response.text().await {
+                Ok(t) => t,
+                Err(e) => {
+                    let err = anyhow::Error::from(e);
+                    if attempt + 1 < MAX_RETRY_ATTEMPTS && is_retryable_error(&err) {
+                        last_err = Some(err);
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
+            let response_json: serde_json::Value =
+                serde_json::from_str(&response_text).map_err(|e| {
+                    let preview: String = response_text.chars().take(380).collect();
+                    anyhow!(
+                        "OpenAI-compatible response was not valid JSON: {}. Body preview: {}",
+                        e,
+                        preview
+                    )
+                })?;
+            if response_json.get("choices").is_none() {
+                if let Some(err_payload) = response_json.get("error") {
+                    return Err(anyhow!(
+                        "OpenAI-compatible API returned an error payload: {}",
+                        err_payload
+                    ));
+                }
+                if let Some(text) = response_json
+                    .get("output_text")
+                    .and_then(extract_openai_message_text)
+                    .or_else(|| {
+                        response_json
+                            .get("message")
+                            .and_then(extract_openai_message_text)
+                    })
+                {
+                    let provider_label = openai_provider_label(base_url);
+                    let prompt_chars = system_prompt.len()
+                        + user_message.len()
+                        + history.iter().map(|m| m.content.len()).sum::<usize>();
+                    let prompt_tokens = estimate_tokens_from_chars(prompt_chars);
+                    let completion_tokens = estimate_tokens_from_chars(text.len());
+                    return Ok(LlmResponse {
+                        content: text.to_string(),
+                        tool_calls: vec![],
+                        reasoning: None,
+                        usage: Some(LlmTokenUsage {
+                            prompt_tokens,
+                            completion_tokens,
+                            total_tokens: prompt_tokens + completion_tokens,
+                            estimated: true,
+                        }),
+                        provider: provider_label.to_string(),
+                        model: model.to_string(),
+                    });
+                }
+            }
+            let response: OpenAIResponse = match serde_json::from_value(response_json.clone()) {
+                Ok(r) => r,
+                Err(e) => {
+                    // Last-resort: try to extract any text content from the response JSON
+                    // This handles non-standard models (GLM-5, etc.) that return unexpected schemas
+                    let fallback_text = extract_text_from_any_json(&response_json);
+                    if let Some(text) = fallback_text {
+                        tracing::warn!(
+                            "Schema mismatch but extracted fallback text ({}chars): {}",
+                            text.len(),
+                            e,
+                        );
+                        let provider_label = openai_provider_label(base_url);
+                        let prompt_chars = system_prompt.len()
+                            + user_message.len()
+                            + history.iter().map(|m| m.content.len()).sum::<usize>();
+                        let prompt_tokens = estimate_tokens_from_chars(prompt_chars);
+                        let completion_tokens = estimate_tokens_from_chars(text.len());
+                        return Ok(LlmResponse {
+                            content: text,
+                            tool_calls: vec![],
+                            reasoning: None,
+                            usage: Some(LlmTokenUsage {
+                                prompt_tokens,
+                                completion_tokens,
+                                total_tokens: prompt_tokens + completion_tokens,
+                                estimated: true,
+                            }),
+                            provider: provider_label.to_string(),
+                            model: model.to_string(),
+                        });
+                    }
+                    let preview = serde_json::to_string(&response_json)
+                        .unwrap_or_default()
+                        .chars()
+                        .take(380)
+                        .collect::<String>();
+                    return Err(anyhow!(
+                        "OpenAI-compatible response schema mismatch: {}. Body preview: {}",
+                        e,
+                        preview
+                    ));
+                }
+            };
+            let choice = response
+                .choices
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow!("No response from OpenAI"))?;
 
-        let prompt_chars = system_prompt.len()
-            + user_message.len()
-            + history.iter().map(|m| m.content.len()).sum::<usize>();
+            let content = choice
+                .message
+                .content
+                .as_ref()
+                .and_then(extract_openai_message_text)
+                .unwrap_or_default();
+            let reasoning = choice.message.reasoning_content;
+            let tool_calls = choice
+                .message
+                .tool_calls
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tc| ToolCall {
+                    id: tc.id,
+                    name: tc.function.name,
+                    arguments: match tc.function.arguments {
+                        Some(OpenAIFunctionArguments::String(raw)) => {
+                            let trimmed = raw.trim();
+                            if trimmed.is_empty() {
+                                serde_json::Value::Null
+                            } else {
+                                serde_json::from_str(trimmed)
+                                    .unwrap_or_else(|_| serde_json::Value::String(raw))
+                            }
+                        }
+                        Some(OpenAIFunctionArguments::Json(v)) => v,
+                        None => serde_json::Value::Null,
+                    },
+                })
+                .collect();
 
-        let usage = response.usage.map(|u| LlmTokenUsage {
-            prompt_tokens: u.prompt_tokens,
-            completion_tokens: u.completion_tokens,
-            total_tokens: u.total_tokens,
-            estimated: false,
-        });
-        let usage = usage.or_else(|| {
-            let prompt_tokens = estimate_tokens_from_chars(prompt_chars);
-            let completion_tokens = estimate_tokens_from_chars(content.len());
-            Some(LlmTokenUsage {
-                prompt_tokens,
-                completion_tokens,
-                total_tokens: prompt_tokens + completion_tokens,
-                estimated: true,
-            })
-        });
+            let provider_label = openai_provider_label(base_url);
 
-        Ok(LlmResponse {
-            content,
-            tool_calls,
-            reasoning,
-            usage,
-            provider: provider_label.to_string(),
-            model: model.to_string(),
-        })
+            let prompt_chars = system_prompt.len()
+                + user_message.len()
+                + history.iter().map(|m| m.content.len()).sum::<usize>();
+
+            let usage = response.usage.map(|u| LlmTokenUsage {
+                prompt_tokens: u.prompt_tokens,
+                completion_tokens: u.completion_tokens,
+                total_tokens: u.total_tokens,
+                estimated: false,
+            });
+            let usage = usage.or_else(|| {
+                let prompt_tokens = estimate_tokens_from_chars(prompt_chars);
+                let completion_tokens = estimate_tokens_from_chars(content.len());
+                Some(LlmTokenUsage {
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens: prompt_tokens + completion_tokens,
+                    estimated: true,
+                })
+            });
+
+            return Ok(LlmResponse {
+                content,
+                tool_calls,
+                reasoning,
+                usage,
+                provider: provider_label.to_string(),
+                model: model.to_string(),
+            });
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            anyhow!(
+                "Non-streaming LLM request failed after {} attempts",
+                MAX_RETRY_ATTEMPTS
+            )
+        }))
     }
 
     /// Streaming chat with history. Sends token events when supported by the provider.
@@ -1161,7 +1844,7 @@ impl LlmClient {
         #[derive(Deserialize, Default)]
         struct OpenAIStreamDelta {
             #[serde(default)]
-            content: Option<String>,
+            content: Option<serde_json::Value>,
             #[serde(default)]
             tool_calls: Option<Vec<OpenAIStreamToolCallDelta>>,
             #[serde(default)]
@@ -1284,8 +1967,39 @@ impl LlmClient {
             send_start.elapsed().as_millis()
         );
 
+        // Handle 429 Too Many Requests for streaming
+        if status.as_u16() == 429 {
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(2)
+                .min(30);
+            tracing::warn!(
+                "Stream rate limited (429), waiting {}s before error (model={})",
+                retry_after,
+                model,
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(retry_after)).await;
+            return Err(anyhow!(
+                "OpenAI API rate limited (429), retried after {}s",
+                retry_after
+            ));
+        }
+
         if !status.is_success() {
-            let error = response.text().await?;
+            let error = match response.bytes().await {
+                Ok(bytes) => {
+                    let body = String::from_utf8_lossy(&bytes).trim().to_string();
+                    if body.is_empty() {
+                        "<empty body>".to_string()
+                    } else {
+                        body
+                    }
+                }
+                Err(read_err) => format!("<failed to read error body: {}>", read_err),
+            };
             tracing::error!(
                 "LLM stream error status={}: {}",
                 status,
@@ -1299,12 +2013,71 @@ impl LlmClient {
         let mut tool_builders: HashMap<usize, ToolBuilder> = HashMap::new();
         let mut first_token = true;
         const TOOL_ARG_PROGRESS_STEP: usize = 4000;
+        const INTER_CHUNK_TIMEOUT_SECS: u64 = 30;
+        const FIRST_TOKEN_TIMEOUT_SECS: u64 = 300; // Slow models (GLM-5) may need minutes for TTFT
+
+        // Spawn heartbeat: emit Thinking events every 5s while waiting for first token
+        let heartbeat_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hb_done_clone = heartbeat_done.clone();
+        let hb_tx = token_tx.clone();
+        let hb_model = model.to_string();
+        let hb_start = std::time::Instant::now();
+        let heartbeat_handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                if hb_done_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let elapsed = hb_start.elapsed().as_secs();
+                let status = format!("Waiting for {} to respond ({}s)...", hb_model, elapsed);
+                if hb_tx.try_send(StreamEvent::Thinking(status)).is_err() {
+                    break;
+                }
+            }
+        });
 
         let mut buffer = String::new();
         let mut done = false;
+        let mut consecutive_errors: u32 = 0;
         let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
+        let mut stream_broken = false;
+        loop {
+            // Use a much longer timeout while waiting for the first token
+            let timeout_secs = if first_token {
+                FIRST_TOKEN_TIMEOUT_SECS
+            } else {
+                INTER_CHUNK_TIMEOUT_SECS
+            };
+            let chunk = match tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                stream.next(),
+            )
+            .await
+            {
+                Ok(Some(Ok(c))) => {
+                    consecutive_errors = 0;
+                    c
+                }
+                Ok(Some(Err(e))) => {
+                    tracing::warn!("Stream chunk error (continuing): {}", e);
+                    consecutive_errors += 1;
+                    if consecutive_errors > 3 {
+                        tracing::warn!("Too many consecutive stream chunk errors, breaking");
+                        stream_broken = true;
+                        break;
+                    }
+                    continue;
+                }
+                Ok(None) => break, // stream ended normally
+                Err(_) => {
+                    tracing::warn!(
+                        "Stream stalled ({}s no data), breaking with partial response",
+                        INTER_CHUNK_TIMEOUT_SECS,
+                    );
+                    stream_broken = true;
+                    break;
+                }
+            };
             buffer.push_str(&String::from_utf8_lossy(&chunk));
             let lines: Vec<&str> = buffer.split('\n').collect();
             let last = lines.last().copied().unwrap_or("");
@@ -1330,14 +2103,16 @@ impl LlmClient {
                         let r = reasoning.get_or_insert_with(String::new);
                         r.push_str(&rc);
                     }
-                    if let Some(tok) = choice.delta.content {
-                        if !tok.is_empty() {
+                    if let Some(content_delta) = choice.delta.content {
+                        if let Some(tok) = extract_openai_delta_text(&content_delta) {
                             if first_token {
                                 tracing::info!(
                                     "LLM stream first token after {}ms",
                                     send_start.elapsed().as_millis()
                                 );
                                 first_token = false;
+                                // Stop the heartbeat now that real tokens are flowing
+                                heartbeat_done.store(true, std::sync::atomic::Ordering::Relaxed);
                             }
                             content.push_str(&tok);
                             let _ = token_tx.try_send(StreamEvent::Token(tok));
@@ -1379,10 +2154,7 @@ impl LlmClient {
                                 if should_emit_progress {
                                     entry.last_progress_emit_chars = arg_chars;
                                     let progress_msg = if entry.name == "app_deploy" {
-                                        format!(
-                                            "Generating deploy payload... {} chars",
-                                            arg_chars
-                                        )
+                                        format!("Generating deploy payload... {} chars", arg_chars)
                                     } else {
                                         format!(
                                             "Generating {} arguments... {} chars",
@@ -1410,11 +2182,34 @@ impl LlmClient {
             }
         }
 
+        // Ensure heartbeat is stopped after stream loop exits
+        heartbeat_done.store(true, std::sync::atomic::Ordering::Relaxed);
+        heartbeat_handle.abort();
+
+        if stream_broken && !done {
+            let has_content = !content.trim().is_empty();
+            let has_tools =
+                !tool_builders.is_empty() && tool_builders.values().any(|tb| !tb.name.is_empty());
+            if has_content || has_tools {
+                tracing::warn!(
+                    "Stream broke prematurely but we have partial data (content={}chars, tools={}), returning partial response",
+                    content.len(),
+                    tool_builders.len(),
+                );
+            } else {
+                return Err(anyhow!(
+                    "Stream broke with no usable content after {}ms",
+                    send_start.elapsed().as_millis()
+                ));
+            }
+        }
+
         tracing::info!(
-            "LLM stream done ← {}ms, content={}chars, tool_builders={}",
+            "LLM stream done ← {}ms, content={}chars, tool_builders={}, clean={}",
             send_start.elapsed().as_millis(),
             content.len(),
-            tool_builders.len()
+            tool_builders.len(),
+            done && !stream_broken,
         );
 
         let mut tool_calls: Vec<(usize, ToolCall)> = tool_builders

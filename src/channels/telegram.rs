@@ -712,6 +712,24 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
                         return Ok(());
                     }
 
+                    // Show "typing..." indicator while processing
+                    let _ = bot.send_chat_action(chat_id, teloxide::types::ChatAction::Typing).await;
+
+                    // Keep typing indicator alive in background (Telegram typing expires after ~5s)
+                    let typing_bot = bot.clone();
+                    let typing_chat_id = chat_id;
+                    let typing_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let typing_flag = typing_done.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                            if typing_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+                            let _ = typing_bot.send_chat_action(typing_chat_id, teloxide::types::ChatAction::Typing).await;
+                        }
+                    });
+
                     // Process with agent
                     let conversation_id = format!("telegram:{}", chat_id.0);
                     let (response, _trace_ref) = {
@@ -725,6 +743,7 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
                         };
                         (r, agent.last_trace.clone())
                     };
+                    typing_done.store(true, std::sync::atomic::Ordering::Relaxed);
 
                     // Convert markdown to Telegram HTML
                     let html_response = markdown_to_telegram_html(&response);

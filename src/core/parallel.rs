@@ -10,7 +10,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use super::intent::has_action_intent_default;
+use super::intent::preferred_direct_action_name;
 use super::llm::{LlmClient, LlmResponse};
 use crate::actions::ActionDef;
 use crate::memory::MemoryEntry;
@@ -191,18 +191,18 @@ impl ParallelThinkingController {
 
         let total_time_ms = start_time.elapsed().as_millis() as u64;
         let mut final_response = self.aggregate_results(&path_results).await?;
-        // Safety net: if this is clearly an app/deploy ask and aggregation dropped tool calls,
-        // recover an app_deploy call from any successful path.
-        if has_action_intent_default(user_message, actions, "app_deploy")
-            && final_response.tool_calls.is_empty()
-        {
-            if let Some(app_call) = path_results
-                .iter()
-                .flat_map(|r| r.response.tool_calls.iter())
-                .find(|tc| tc.name == "app_deploy")
-                .cloned()
-            {
-                final_response.tool_calls.push(app_call);
+        // Safety net: if aggregation dropped tool calls, recover the clearest
+        // direct action produced by any successful reasoning path.
+        if let Some(preferred_action) = preferred_direct_action_name(user_message, actions) {
+            if final_response.tool_calls.is_empty() {
+                if let Some(recovered_call) = path_results
+                    .iter()
+                    .flat_map(|r| r.response.tool_calls.iter())
+                    .find(|tc| tc.name == preferred_action)
+                    .cloned()
+                {
+                    final_response.tool_calls.push(recovered_call);
+                }
             }
         }
 

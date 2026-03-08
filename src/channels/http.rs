@@ -104,6 +104,8 @@ pub struct TunnelState {
     process: Option<tokio::process::Child>,
     /// Public URL assigned by Cloudflare
     pub url: Option<String>,
+    /// If set, only this deployed app is reachable through the public tunnel.
+    pub selected_app_id: Option<String>,
     /// Whether the tunnel is actively running
     pub active: bool,
     /// Error message if tunnel failed
@@ -115,6 +117,7 @@ impl TunnelState {
         Self {
             process: None,
             url: None,
+            selected_app_id: None,
             active: false,
             error: None,
         }
@@ -284,7 +287,10 @@ impl TieredRateLimiter {
             &self.chat_limiter
         } else if path.contains("/approve") || path.contains("/reject") {
             &self.approval_limiter
-        } else if path.starts_with("/settings") || path.starts_with("/mcp/servers") {
+        } else if path.starts_with("/settings")
+            || path.starts_with("/models")
+            || path.starts_with("/mcp/servers")
+        {
             &self.settings_limiter
         } else if path.starts_with("/skills") {
             &self.action_limiter
@@ -1257,6 +1263,7 @@ async fn handle_tunnel_control_command(
             if let Some(url) = tunnel.url.clone() {
                 let agent = state.agent.read().await;
                 let _ = agent.storage.set("public_base_url", url.as_bytes()).await;
+                let _ = agent.storage.delete(PUBLIC_SELECTED_APP_KEY).await;
                 Ok(format!("Tunnel started.\nExternal URL: {}", url))
             } else if let Some(err) = tunnel.error.clone() {
                 Err(format!("Tunnel start failed: {}", err))
@@ -1272,11 +1279,13 @@ async fn handle_tunnel_control_command(
             tunnel.process = None;
             tunnel.active = false;
             tunnel.url = None;
+            tunnel.selected_app_id = None;
             tunnel.error = None;
             drop(tunnel);
             {
                 let agent = state.agent.read().await;
                 let _ = agent.storage.delete("public_base_url").await;
+                let _ = agent.storage.delete(PUBLIC_SELECTED_APP_KEY).await;
             }
             Ok("Tunnel stopped.".to_string())
         }
@@ -1380,6 +1389,10 @@ pub struct ImportActionRequest {
     /// If true, only analyze/preview security + required secrets without saving the skill.
     #[serde(default)]
     pub preview_only: bool,
+    /// Optional explicit list of raw skill URLs to import as one bulk request.
+    /// Used by Bulk Import confirmation flow after previewing a collection URL.
+    #[serde(default)]
+    pub selected_urls: Option<Vec<String>>,
 }
 
 /// User profile response
@@ -1475,6 +1488,8 @@ pub struct SettingsResponse {
     pub language: Option<String>,
     pub tone: Option<String>,
     pub email_format: Option<String>,
+    pub daily_brief_enabled: bool,
+    pub daily_brief_time: String,
     pub daily_brief_channel: String,
     // Primary LLM (legacy)
     pub llm_provider: String,
@@ -1569,6 +1584,10 @@ pub struct SettingsUpdate {
     pub language: Option<String>,
     pub tone: Option<String>,
     pub email_format: Option<String>,
+    #[serde(default)]
+    pub daily_brief_enabled: Option<bool>,
+    #[serde(default)]
+    pub daily_brief_time: Option<String>,
     pub daily_brief_channel: Option<String>,
     /// Model pool routing behavior (if false, always use primary)
     #[serde(default)]
@@ -1731,6 +1750,11 @@ const AUTONOMY_LAST_NUDGES_KEY: &str = "autonomy_last_nudges_v1";
 const AUTONOMY_NUDGE_PLANNED_KEY: &str = "autonomy_nudge_planned_v1";
 const AUTONOMY_NUDGE_LAST_SCAN_KEY: &str = "autonomy_nudge_last_scan_v1";
 const AUTONOMY_ATTENTION_STATE_KEY: &str = "autonomy_attention_state_v1";
+const DAILY_BRIEF_ENABLED_KEY: &str = "daily_brief_enabled";
+const DAILY_BRIEF_TIME_KEY: &str = "daily_brief_time";
+const DAILY_BRIEF_CHANNEL_KEY: &str = "daily_brief_channel";
+const DEFAULT_DAILY_BRIEF_TIME: &str = "09:00";
+const PUBLIC_SELECTED_APP_KEY: &str = "public_selected_app_id";
 const MOLTBOOK_SETTINGS_KEY: &str = "moltbook_settings_v1";
 const MOLTBOOK_ACTIVITY_LOG_KEY: &str = "moltbook_activity_log_v1";
 const MOLTBOOK_LAST_RUN_KEY: &str = "moltbook_last_run_v1";
@@ -1740,6 +1764,45 @@ const MOLTBOOK_LAST_STATUS_KEY: &str = "moltbook_last_status_v1";
 const MOLTBOOK_LAST_POST_KEY: &str = "moltbook_last_post_v1";
 const HOOKS_STORAGE_KEY: &str = "hooks_v1";
 const ROUTING_POLICY_LINEAGE_REL_PATH: &str = ".agentark/self_evolve/routing_policy_lineage.jsonl";
+
+fn parse_bool_pref(raw: Option<Vec<u8>>) -> bool {
+    raw.and_then(|bytes| String::from_utf8(bytes).ok())
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn normalize_daily_brief_time(value: &str) -> Option<String> {
+    let parsed = chrono::NaiveTime::parse_from_str(value.trim(), "%H:%M").ok()?;
+    Some(format!("{:02}:{:02}", parsed.hour(), parsed.minute()))
+}
+
+fn daily_brief_time_from_cron(cron: &str) -> Option<String> {
+    let parts: Vec<&str> = cron.split_whitespace().collect();
+    let (hour_raw, minute_raw) = match parts.as_slice() {
+        [_, minute, hour, _, _, _] => (*hour, *minute),
+        [minute, hour, _, _, _] => (*hour, *minute),
+        _ => return None,
+    };
+    let hour = hour_raw.parse::<u32>().ok()?;
+    let minute = minute_raw.parse::<u32>().ok()?;
+    if hour > 23 || minute > 59 {
+        return None;
+    }
+    Some(format!("{:02}:{:02}", hour, minute))
+}
+
+fn daily_brief_cron_from_time(value: &str) -> Option<String> {
+    let normalized = normalize_daily_brief_time(value)?;
+    let (hour_raw, minute_raw) = normalized.split_once(':')?;
+    let hour = hour_raw.parse::<u32>().ok()?;
+    let minute = minute_raw.parse::<u32>().ok()?;
+    Some(format!("0 {} {} * * *", minute, hour))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MoltbookSettings {
@@ -2739,12 +2802,199 @@ pub struct TraceDetailResponse {
     pub id: String,
     pub message: String,
     pub channel: String,
+    pub status: String,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
     pub duration_ms: Option<u64>,
+    pub step_count: usize,
     pub steps: Vec<TraceStep>,
     pub response: Option<String>,
     pub proof_id: Option<String>,
+}
+
+fn trace_message_preview(message: &str) -> String {
+    if message.len() > 120 {
+        format!("{}...", &message[..120])
+    } else {
+        message.to_string()
+    }
+}
+
+fn trace_status_from_steps(steps: &[crate::core::ExecutionStep], completed: bool) -> String {
+    if let Some(last_step) = steps.last() {
+        let title = last_step.title.to_ascii_lowercase();
+        let step_type = last_step.step_type.to_ascii_lowercase();
+        if step_type == "error" || title.contains("failed") {
+            return "failed".to_string();
+        }
+        if step_type == "warning" || title.contains("blocked") {
+            return "warning".to_string();
+        }
+    }
+    if completed {
+        "completed".to_string()
+    } else {
+        "running".to_string()
+    }
+}
+
+fn format_trace_step_time(step: &crate::core::ExecutionStep) -> String {
+    if let Some(ms) = step.duration_ms {
+        format!("{} ({}ms)", step.timestamp.format("%H:%M:%S"), ms)
+    } else {
+        step.timestamp.format("%H:%M:%S").to_string()
+    }
+}
+
+fn format_trace_summary_from_memory(t: &ExecutionTrace) -> TraceSummary {
+    let duration_ms = t.started_at.and_then(|start| {
+        t.completed_at
+            .map(|end| (end - start).num_milliseconds() as u64)
+    });
+    let status = trace_status_from_steps(&t.steps, t.completed_at.is_some());
+    TraceSummary {
+        id: t.id.clone(),
+        message_preview: trace_message_preview(&t.message),
+        channel: t.channel.clone(),
+        status,
+        step_count: t.steps.len(),
+        started_at: t
+            .started_at
+            .map(|s| s.format("%H:%M:%S").to_string())
+            .unwrap_or_default(),
+        duration_ms,
+    }
+}
+
+fn format_trace_detail_from_memory(t: &ExecutionTrace) -> TraceDetailResponse {
+    let duration_ms = t.started_at.and_then(|start| {
+        t.completed_at
+            .map(|end| (end - start).num_milliseconds() as u64)
+    });
+    let steps: Vec<TraceStep> = t
+        .steps
+        .iter()
+        .map(|step| TraceStep {
+            icon: step.icon.clone(),
+            title: step.title.clone(),
+            detail: step.detail.clone(),
+            step_type: step.step_type.clone(),
+            data: step.data.clone(),
+            time: format_trace_step_time(step),
+        })
+        .collect();
+
+    TraceDetailResponse {
+        id: t.id.clone(),
+        message: t.message.clone(),
+        channel: t.channel.clone(),
+        status: trace_status_from_steps(&t.steps, t.completed_at.is_some()),
+        started_at: t
+            .started_at
+            .map(|s| s.format("%Y-%m-%d %H:%M:%S").to_string()),
+        completed_at: t
+            .completed_at
+            .map(|c| c.format("%Y-%m-%d %H:%M:%S").to_string()),
+        duration_ms,
+        step_count: steps.len(),
+        steps,
+        response: t.response.clone(),
+        proof_id: t.proof_id.clone(),
+    }
+}
+
+fn parse_persisted_trace_steps(
+    model: &crate::storage::entities::execution_trace::Model,
+) -> Vec<crate::core::ExecutionStep> {
+    serde_json::from_str(&model.steps_json).unwrap_or_default()
+}
+
+fn parse_rfc3339_to_local_display(value: &Option<String>) -> Option<String> {
+    value.as_deref().and_then(|raw| {
+        chrono::DateTime::parse_from_rfc3339(raw)
+            .ok()
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+    })
+}
+
+fn parse_rfc3339_to_time_display(value: &Option<String>) -> String {
+    value
+        .as_deref()
+        .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+        .map(|dt| {
+            dt.with_timezone(&chrono::Utc)
+                .format("%H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+fn format_trace_summary_from_persisted(
+    t: &crate::storage::entities::execution_trace::Model,
+) -> TraceSummary {
+    let parsed_steps = parse_persisted_trace_steps(t);
+    let status = trace_status_from_steps(&parsed_steps, t.completed_at.is_some());
+    TraceSummary {
+        id: t.id.clone(),
+        message_preview: trace_message_preview(&t.message),
+        channel: t.channel.clone(),
+        status,
+        step_count: t.step_count.max(0) as usize,
+        started_at: parse_rfc3339_to_time_display(&t.started_at),
+        duration_ms: t.duration_ms.map(|value| value.max(0) as u64),
+    }
+}
+
+fn trace_sort_key_from_memory(t: &ExecutionTrace) -> String {
+    t.started_at
+        .or(t.completed_at)
+        .unwrap_or_else(chrono::Utc::now)
+        .to_rfc3339()
+}
+
+fn trace_sort_key_from_persisted(t: &crate::storage::entities::execution_trace::Model) -> String {
+    t.started_at
+        .clone()
+        .or(t.completed_at.clone())
+        .unwrap_or_else(|| t.created_at.clone())
+}
+
+fn format_trace_detail_from_persisted(
+    t: &crate::storage::entities::execution_trace::Model,
+) -> TraceDetailResponse {
+    let parsed_steps = parse_persisted_trace_steps(t);
+    let step_count = parsed_steps.len();
+    let steps = parsed_steps
+        .iter()
+        .cloned()
+        .into_iter()
+        .map(|step| {
+            let time = format_trace_step_time(&step);
+            TraceStep {
+                icon: step.icon,
+                title: step.title,
+                detail: step.detail,
+                step_type: step.step_type,
+                data: step.data,
+                time,
+            }
+        })
+        .collect();
+
+    TraceDetailResponse {
+        id: t.id.clone(),
+        message: t.message.clone(),
+        channel: t.channel.clone(),
+        status: trace_status_from_steps(&parsed_steps, t.completed_at.is_some()),
+        started_at: parse_rfc3339_to_local_display(&t.started_at),
+        completed_at: parse_rfc3339_to_local_display(&t.completed_at),
+        duration_ms: t.duration_ms.map(|value| value.max(0) as u64),
+        step_count,
+        steps,
+        response: t.response.clone(),
+        proof_id: t.proof_id.clone(),
+    }
 }
 
 impl IntoResponse for ErrorResponse {
@@ -2845,6 +3095,24 @@ async fn sync_http_api_key_state(
     }
 
     Ok((info, rotated))
+}
+
+fn has_valid_ui_session_cookie(headers: &HeaderMap, session_token: Option<&str>) -> bool {
+    let Some(session_token) = session_token else {
+        return false;
+    };
+    let cookies = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    for part in cookies.split(';') {
+        if let Some(value) = part.trim().strip_prefix("agentark_session=") {
+            if value == session_token {
+                return true;
+            }
+        }
+    }
+    false
 }
 async fn auth_middleware(
     State(state): State<AppState>,
@@ -2954,20 +3222,8 @@ async fn auth_middleware(
     }
 
     // Check 2: Session cookie (for web UI — set when page loads)
-    if let Some(ref session_token) = state.session_token {
-        let cookies = request
-            .headers()
-            .get(header::COOKIE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        for part in cookies.split(';') {
-            let part = part.trim();
-            if let Some(value) = part.strip_prefix("agentark_session=") {
-                if value == session_token {
-                    return next.run(request).await;
-                }
-            }
-        }
+    if has_valid_ui_session_cookie(request.headers(), state.session_token.as_deref()) {
+        return next.run(request).await;
     }
 
     state
@@ -2997,6 +3253,10 @@ async fn rate_limit_middleware(
     request: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
+    if has_valid_ui_session_cookie(request.headers(), state.session_token.as_deref()) {
+        return next.run(request).await;
+    }
+
     let ip = addr.ip().to_string();
     let path = request.uri().path().to_string();
     let method = request.method().to_string();
@@ -3249,6 +3509,7 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
         .route("/models/discover/{provider}", get(discover_provider_models))
         .route("/profile", get(get_profile))
         .route("/restart", post(restart_server))
+        // Self-update endpoints are intentionally left unmounted for now.
         .route("/trace", get(get_trace))
         .route("/trace/{id}", get(get_trace_detail))
         // Integrations routes
@@ -3415,6 +3676,7 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
         // ArkPulse log
         .route("/arkpulse", get(get_pulse_log))
         .route("/arkpulse/trigger", post(trigger_pulse))
+        .route("/arkpulse/fix", post(run_arkpulse_fix))
         // Moltbook automation and traceability
         .route("/moltbook/status", get(get_moltbook_status))
         .route("/moltbook/log", get(get_moltbook_log))
@@ -3778,7 +4040,7 @@ fn extract_request_host(headers: &HeaderMap) -> Option<String> {
     }
 }
 
-async fn docs_blocked_for_tunnel(state: &AppState, headers: &HeaderMap) -> bool {
+fn request_matches_active_tunnel(headers: &HeaderMap, tunnel_url: Option<&str>) -> bool {
     let Some(request_host) = extract_request_host(headers) else {
         return false;
     };
@@ -3787,15 +4049,20 @@ async fn docs_blocked_for_tunnel(state: &AppState, headers: &HeaderMap) -> bool 
         return true;
     }
 
-    let tunnel_url = { state.tunnel.read().await.url.clone() };
-    if let Some(url) = tunnel_url {
-        if let Ok(parsed) = reqwest::Url::parse(&url) {
-            if let Some(tunnel_host) = parsed.host_str() {
-                return normalize_host_for_compare(tunnel_host) == request_host;
-            }
+    let Some(url) = tunnel_url else {
+        return false;
+    };
+    if let Ok(parsed) = reqwest::Url::parse(url) {
+        if let Some(tunnel_host) = parsed.host_str() {
+            return normalize_host_for_compare(tunnel_host) == request_host;
         }
     }
     false
+}
+
+async fn docs_blocked_for_tunnel(state: &AppState, headers: &HeaderMap) -> bool {
+    let tunnel_url = { state.tunnel.read().await.url.clone() };
+    request_matches_active_tunnel(headers, tunnel_url.as_deref())
 }
 
 async fn docs_is_authorized(state: &AppState, headers: &HeaderMap) -> bool {
@@ -3838,18 +4105,8 @@ async fn docs_is_authorized(state: &AppState, headers: &HeaderMap) -> bool {
         }
     }
 
-    if let Some(session_token) = state.session_token.as_ref() {
-        let cookies = headers
-            .get(header::COOKIE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        for part in cookies.split(';') {
-            if let Some(value) = part.trim().strip_prefix("agentark_session=") {
-                if value == session_token {
-                    return true;
-                }
-            }
-        }
+    if has_valid_ui_session_cookie(headers, state.session_token.as_deref()) {
+        return true;
     }
     false
 }
@@ -4942,7 +5199,22 @@ fn should_upgrade_insecure_links(content_type: &str) -> bool {
 }
 
 fn rewrite_external_proxy_urls_for_public_apps(content: &str) -> String {
+    const ARXIV_EXPORT_PLACEHOLDER: &str = "__AGENTARK_ARXIV_EXPORT_API__";
+    const ARXIV_ROOT_PLACEHOLDER: &str = "__AGENTARK_ARXIV_ROOT_API__";
+
     content
+        // Redirect direct ArXiv API calls through our same-origin public proxy
+        // to avoid browser CORS failures on tunneled/public app URLs.
+        .replace(
+            "http://export.arxiv.org/api/query",
+            ARXIV_EXPORT_PLACEHOLDER,
+        )
+        .replace(
+            "https://export.arxiv.org/api/query",
+            ARXIV_EXPORT_PLACEHOLDER,
+        )
+        .replace("http://arxiv.org/api/query", ARXIV_ROOT_PLACEHOLDER)
+        .replace("https://arxiv.org/api/query", ARXIV_ROOT_PLACEHOLDER)
         .replace(
             "https://api.allorigins.win/raw?url=",
             "/public/proxy/raw?url=",
@@ -4952,6 +5224,409 @@ fn rewrite_external_proxy_urls_for_public_apps(content: &str) -> String {
             "https://api.codetabs.com/v1/proxy/?quest=",
             "/public/proxy/raw?url=",
         )
+        .replace(
+            ARXIV_EXPORT_PLACEHOLDER,
+            "/public/proxy/raw?url=https://export.arxiv.org/api/query",
+        )
+        .replace(
+            ARXIV_ROOT_PLACEHOLDER,
+            "/public/proxy/raw?url=https://arxiv.org/api/query",
+        )
+}
+
+fn inject_app_runtime_fetch_shims(content: &str, app_id: &str) -> String {
+    if content.contains("__agentarkLlmProxyShimApplied") {
+        return content.to_string();
+    }
+    let shim = format!(
+        r#"<script>
+(function() {{
+  if (window.__agentarkLlmProxyShimApplied) return;
+  window.__agentarkLlmProxyShimApplied = true;
+  const APP_ID = "{app_id}";
+  const PROXY_PATH = "/apps/" + encodeURIComponent(APP_ID) + "/__agentark/llm/chat";
+
+  const nativeFetch = window.fetch ? window.fetch.bind(window) : null;
+  if (nativeFetch) {{
+    const extractUrl = (input) => {{
+      try {{
+        if (typeof input === "string") return input;
+        if (input && typeof input.url === "string") return input.url;
+        if (input instanceof URL) return input.toString();
+      }} catch (_) {{}}
+      return "";
+    }};
+    const shouldProxy = (url) => {{
+      const lower = String(url || "").toLowerCase();
+      return (
+        lower.includes("openrouter.ai/api/v1/chat/completions") ||
+        lower.includes("openrouter.ai/api/v1/responses") ||
+        lower.includes("openrouter.ai/api/v1/completions") ||
+        lower.includes("api.openai.com/v1/chat/completions") ||
+        lower.includes("api.openai.com/v1/responses") ||
+        lower.includes("api.openai.com/v1/completions") ||
+        lower.endsWith("/v1/chat/completions") ||
+        lower.endsWith("/v1/responses") ||
+        lower.endsWith("/v1/completions")
+      );
+    }};
+    window.fetch = function(input, init) {{
+      const targetUrl = extractUrl(input);
+      if (!shouldProxy(targetUrl)) {{
+        return nativeFetch(input, init);
+      }}
+      const proxyInit = Object.assign({{}}, init || {{}});
+      const inferredMethod = (
+        proxyInit.method ||
+        (input && input.method) ||
+        "POST"
+      )
+        .toString()
+        .toUpperCase();
+      proxyInit.method = inferredMethod;
+      if (inferredMethod !== "POST") {{
+        return nativeFetch(input, init);
+      }}
+      const headers = new Headers(proxyInit.headers || (input && input.headers) || {{}});
+      headers.delete("authorization");
+      headers.delete("x-api-key");
+      headers.set("content-type", "application/json");
+      headers.set("x-agentark-app-proxy", "llm");
+      proxyInit.headers = headers;
+      return nativeFetch(PROXY_PATH, proxyInit);
+    }};
+  }}
+
+  const nativePrompt = window.prompt ? window.prompt.bind(window) : null;
+  if (nativePrompt) {{
+    window.prompt = function(message, defaultValue) {{
+      const text = String(message || "").toLowerCase();
+      if (
+        text.includes("api key") ||
+        text.includes("openai") ||
+        text.includes("openrouter") ||
+        text.includes("anthropic")
+      ) {{
+        return "agentark-managed";
+      }}
+      return nativePrompt(message, defaultValue);
+    }};
+  }}
+}})();
+</script>"#
+    );
+
+    if content.contains("</head>") {
+        return content.replacen("</head>", &format!("{}\n</head>", shim), 1);
+    }
+    if content.contains("</body>") {
+        return content.replacen("</body>", &format!("{}\n</body>", shim), 1);
+    }
+    format!("{}\n{}", content, shim)
+}
+
+fn extract_openai_message_text(value: &serde_json::Value) -> Option<String> {
+    if let Some(s) = value.as_str() {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Some(obj) = value.as_object() {
+        if let Some(s) = obj.get("text").and_then(|v| v.as_str()) {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+        if let Some(s) = obj.get("content").and_then(|v| v.as_str()) {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    if let Some(arr) = value.as_array() {
+        let mut chunks = Vec::new();
+        for item in arr {
+            if let Some(obj) = item.as_object() {
+                let item_type = obj
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("text")
+                    .to_ascii_lowercase();
+                if item_type != "text" && item_type != "input_text" && item_type != "output_text" {
+                    continue;
+                }
+                if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+                    if !text.trim().is_empty() {
+                        chunks.push(text.trim().to_string());
+                    }
+                }
+            } else if let Some(s) = item.as_str() {
+                if !s.trim().is_empty() {
+                    chunks.push(s.trim().to_string());
+                }
+            }
+        }
+        if !chunks.is_empty() {
+            return Some(chunks.join("\n"));
+        }
+    }
+    None
+}
+
+async fn app_scoped_llm_chat_proxy(
+    state: &AppState,
+    app_id: &str,
+    headers: &axum::http::HeaderMap,
+    body: axum::body::Body,
+) -> Response {
+    let has_proxy_header = headers
+        .get("x-agentark-app-proxy")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("llm"));
+    let referer_ok = headers
+        .get(header::REFERER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| reqwest::Url::parse(v).ok())
+        .map(|url| {
+            let path_prefix = format!("/apps/{}/", app_id);
+            url.path().starts_with(&path_prefix) || url.path() == format!("/apps/{}", app_id)
+        })
+        .unwrap_or(false);
+    if !has_proxy_header && !referer_ok {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "forbidden",
+                "message": "app-scoped LLM proxy requires app-origin request context"
+            })),
+        )
+            .into_response();
+    }
+
+    let body_bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({ "error": "request body too large" })),
+            )
+                .into_response()
+        }
+    };
+    let payload: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "invalid JSON payload" })),
+            )
+                .into_response()
+        }
+    };
+
+    let stream_requested = payload
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if stream_requested {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "streaming_not_supported",
+                "message": "Use non-streaming chat completion for app proxy requests."
+            })),
+        )
+            .into_response();
+    }
+
+    let mut system_lines: Vec<String> = Vec::new();
+    let mut convo: Vec<(String, String)> = Vec::new();
+    let requested_model_hint = payload
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    if let Some(messages) = payload.get("messages").and_then(|v| v.as_array()) {
+        for msg in messages {
+            let Some(obj) = msg.as_object() else {
+                continue;
+            };
+            let role = obj
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or("user")
+                .to_ascii_lowercase();
+            let Some(content_val) = obj.get("content") else {
+                continue;
+            };
+            let Some(text) = extract_openai_message_text(content_val) else {
+                continue;
+            };
+            if role == "system" {
+                system_lines.push(text);
+            } else {
+                convo.push((role, text));
+            }
+        }
+    }
+
+    if convo.is_empty() {
+        if let Some(input) = payload.get("input") {
+            if let Some(text) = extract_openai_message_text(input) {
+                convo.push(("user".to_string(), text));
+            } else if let Some(arr) = input.as_array() {
+                for item in arr {
+                    let Some(obj) = item.as_object() else {
+                        continue;
+                    };
+                    let role = obj
+                        .get("role")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("user")
+                        .to_ascii_lowercase();
+                    let content_val = obj.get("content").or_else(|| obj.get("text"));
+                    let Some(content_val) = content_val else {
+                        continue;
+                    };
+                    let Some(text) = extract_openai_message_text(content_val) else {
+                        continue;
+                    };
+                    if role == "system" {
+                        system_lines.push(text);
+                    } else {
+                        convo.push((role, text));
+                    }
+                }
+            }
+        }
+    }
+
+    if convo.is_empty() {
+        if let Some(prompt) = payload.get("prompt").and_then(|v| v.as_str()) {
+            let trimmed = prompt.trim();
+            if !trimmed.is_empty() {
+                convo.push(("user".to_string(), trimmed.to_string()));
+            }
+        }
+    }
+
+    if convo.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "missing_messages",
+                "message": "Provide messages[], input, or prompt."
+            })),
+        )
+            .into_response();
+    }
+
+    let system_prompt = if system_lines.is_empty() {
+        "You are a concise assistant helping summarize and explain app content for the end user."
+            .to_string()
+    } else {
+        system_lines.join("\n")
+    };
+
+    let (last_role, last_text) = convo
+        .pop()
+        .unwrap_or_else(|| ("user".to_string(), String::new()));
+    let user_message = if last_text.trim().is_empty() {
+        "Please help with this request.".to_string()
+    } else if last_role == "assistant" {
+        format!(
+            "Continue from the previous assistant context:\n{}",
+            last_text
+        )
+    } else {
+        last_text
+    };
+
+    let history: Vec<crate::core::ConversationMessage> = convo
+        .into_iter()
+        .map(|(role, content)| crate::core::ConversationMessage {
+            role: if role == "assistant" {
+                "assistant".to_string()
+            } else {
+                "user".to_string()
+            },
+            content,
+            _timestamp: chrono::Utc::now(),
+        })
+        .collect();
+
+    let (selected_llm, model_name, selection_note) = {
+        let agent = state.agent.read().await;
+        let (llm, _slot_label, note) =
+            agent.select_llm_for_app_proxy(requested_model_hint.as_deref());
+        let name = llm.model_name().to_string();
+        (llm, name, note)
+    };
+
+    let no_actions: Vec<crate::actions::ActionDef> = Vec::new();
+    let response = match selected_llm
+        .chat_with_history(&system_prompt, &user_message, &history, &[], &no_actions)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "llm_proxy_failed",
+                    "message": format!("LLM request failed: {}", e)
+                })),
+            )
+                .into_response()
+        }
+    };
+    let assistant_content = response.content;
+
+    let openai_like = serde_json::json!({
+        "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+        "object": "chat.completion",
+        "created": chrono::Utc::now().timestamp(),
+        "model": model_name,
+        "selection_note": selection_note,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": &assistant_content,
+            },
+            "text": &assistant_content,
+            "finish_reason": "stop"
+        }],
+        "output_text": &assistant_content,
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": &assistant_content
+            }]
+        }],
+        "status": "completed",
+        "usage": response.usage.as_ref().map(|u| serde_json::json!({
+            "prompt_tokens": u.prompt_tokens,
+            "completion_tokens": u.completion_tokens,
+            "total_tokens": u.total_tokens
+        }))
+    });
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/json".to_string()),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        openai_like.to_string(),
+    )
+        .into_response()
 }
 
 fn is_local_or_private_host_for_upgrade(host: &str) -> bool {
@@ -5012,8 +5687,20 @@ fn is_allowed_public_proxy_host(host: &str) -> bool {
 
 /// Public proxy for static tunneled apps.
 /// Strict allowlist prevents open-proxy abuse.
-async fn public_proxy_raw(Query(params): Query<HashMap<String, String>>) -> Response {
-    let raw_url = params.get("url").map(|s| s.trim()).unwrap_or("");
+async fn public_proxy_raw(uri: Uri, Query(params): Query<HashMap<String, String>>) -> Response {
+    // Accept both properly encoded URLs and pragmatic unencoded forms such as:
+    // /public/proxy/raw?url=https://export.arxiv.org/api/query?search_query=...&start=0
+    // The latter appears in generated JS that appends query params dynamically.
+    let mut raw_url = params
+        .get("url")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if let Some(raw_query) = uri.query().map(str::trim) {
+        if raw_query.starts_with("url=http://") || raw_query.starts_with("url=https://") {
+            raw_url = raw_query.trim_start_matches("url=").trim().to_string();
+        }
+    }
+    let raw_url = raw_url.trim();
     if raw_url.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -5085,6 +5772,7 @@ async fn public_proxy_raw(Query(params): Query<HashMap<String, String>>) -> Resp
                     [
                         (header::CONTENT_TYPE, content_type),
                         (header::CACHE_CONTROL, "no-store".to_string()),
+                        (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".to_string()),
                     ],
                     bytes,
                 )
@@ -5406,6 +6094,18 @@ async fn serve_app_file_inner(
         return StatusCode::NOT_FOUND.into_response();
     };
 
+    let (active_tunnel_url, selected_public_app_id) = {
+        let tunnel = state.tunnel.read().await;
+        (tunnel.url.clone(), tunnel.selected_app_id.clone())
+    };
+    if request_matches_active_tunnel(&headers, active_tunnel_url.as_deref()) {
+        if let Some(selected_app_id) = selected_public_app_id.as_deref() {
+            if selected_app_id != app_id {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+        }
+    }
+
     let access_guard_enabled = state.app_registry.access_guard_enabled(app_id).await;
     let cookie_name = format!("ark_app_{}", app_id);
     let key_from_query = if access_guard_enabled {
@@ -5468,6 +6168,13 @@ async fn serve_app_file_inner(
     } else {
         uri.query().map(|q| q.to_string())
     };
+    let normalized_path = path.trim_start_matches('/');
+    if normalized_path.eq_ignore_ascii_case("__agentark/llm/chat") {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        return app_scoped_llm_chat_proxy(state, app_id, &headers, body).await;
+    }
 
     if let Some(port) = state.app_registry.get_port(app_id).await {
         if is_ws_request {
@@ -5683,7 +6390,12 @@ async fn serve_app_file_inner(
                 if should_upgrade_insecure_links(&content_type) {
                     let mut rewritten = String::from_utf8_lossy(&response_bytes).into_owned();
                     rewritten = rewrite_external_proxy_urls_for_public_apps(&rewritten);
-                    rewritten = upgrade_http_links_for_secure_origin(&rewritten);
+                    if content_type.to_ascii_lowercase().starts_with("text/html") {
+                        rewritten = inject_app_runtime_fetch_shims(&rewritten, app_id);
+                    }
+                    if is_secure_origin_request(&headers) {
+                        rewritten = upgrade_http_links_for_secure_origin(&rewritten);
+                    }
                     response_bytes = rewritten.into_bytes();
                 }
                 if method == Method::HEAD {
@@ -5884,7 +6596,7 @@ async fn restart_app(State(state): State<AppState>, Path(app_id): Path<String>) 
             (
                 agent.config_dir.clone(),
                 agent.data_dir().to_path_buf(),
-                agent.config.llm.app_env_vars(),
+                agent.app_model_env_vars(),
             )
         };
         let (resolved_env, missing_sensitive, missing_config) =
@@ -6544,10 +7256,17 @@ async fn get_tunnel_status(State(state): State<AppState>) -> Json<serde_json::Va
     Json(serde_json::json!({
         "active": tunnel.active,
         "url": tunnel.url,
+        "selected_app_id": tunnel.selected_app_id,
         "error": tunnel.error,
         "provider": "cloudflare",
         "available": std::path::Path::new("/usr/local/bin/cloudflared").exists()
     }))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct StartTunnelRequest {
+    #[serde(default)]
+    app_id: Option<String>,
 }
 
 /// POST /tunnel/start — spawn cloudflared quick tunnel
@@ -6635,16 +7354,47 @@ async fn spawn_tunnel(tunnel_arc: Arc<RwLock<TunnelState>>) -> Result<(), String
             let mut tunnel = tunnel_arc.write().await;
             tunnel.active = false;
             tunnel.error = Some(format!("Failed to spawn cloudflared: {}", e));
+            tunnel.url = None;
             Err(format!("Failed to start tunnel: {}", e))
         }
     }
 }
 
 /// POST /tunnel/start — spawn cloudflared quick tunnel
-async fn start_tunnel(State(state): State<AppState>) -> Response {
+async fn start_tunnel(
+    State(state): State<AppState>,
+    Json(request): Json<StartTunnelRequest>,
+) -> Response {
+    let requested_app_id = request
+        .app_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    if let Some(app_id) = requested_app_id.as_deref() {
+        if !is_valid_app_id(app_id) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "Invalid app_id" })),
+            )
+                .into_response();
+        }
+        if state.app_registry.get_dir(app_id).await.is_none() {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "App not found" })),
+            )
+                .into_response();
+        }
+    }
+
     let tunnel_arc = state.tunnel.clone();
     match spawn_tunnel(tunnel_arc.clone()).await {
         Ok(()) => {
+            {
+                let mut tunnel = tunnel_arc.write().await;
+                tunnel.selected_app_id = requested_app_id.clone();
+            }
             // Wait briefly for the URL to appear.
             let mut url: Option<String> = None;
             for _ in 0..12 {
@@ -6658,11 +7408,23 @@ async fn start_tunnel(State(state): State<AppState>) -> Response {
             if let Some(found) = url.as_ref() {
                 let agent = state.agent.read().await;
                 let _ = agent.storage.set("public_base_url", found.as_bytes()).await;
+                match requested_app_id.as_deref() {
+                    Some(app_id) => {
+                        let _ = agent
+                            .storage
+                            .set(PUBLIC_SELECTED_APP_KEY, app_id.as_bytes())
+                            .await;
+                    }
+                    None => {
+                        let _ = agent.storage.delete(PUBLIC_SELECTED_APP_KEY).await;
+                    }
+                }
             }
             let tunnel = tunnel_arc.read().await;
             Json(serde_json::json!({
                 "ok": true,
                 "url": tunnel.url,
+                "selected_app_id": tunnel.selected_app_id,
                 "message": if tunnel.url.is_some() { "Tunnel started" } else { "Tunnel starting, URL pending..." }
             })).into_response()
         }
@@ -6676,8 +7438,7 @@ async fn start_tunnel(State(state): State<AppState>) -> Response {
     }
 }
 
-/// POST /tunnel/stop — kill the cloudflared process
-async fn stop_tunnel(State(state): State<AppState>) -> Json<serde_json::Value> {
+async fn stop_tunnel_internal(state: &AppState) {
     let mut tunnel = state.tunnel.write().await;
     if let Some(ref mut child) = tunnel.process {
         let _ = child.kill().await;
@@ -6685,12 +7446,19 @@ async fn stop_tunnel(State(state): State<AppState>) -> Json<serde_json::Value> {
     tunnel.process = None;
     tunnel.active = false;
     tunnel.url = None;
+    tunnel.selected_app_id = None;
     tunnel.error = None;
     tracing::info!("Tunnel stopped by user");
     {
         let agent = state.agent.read().await;
         let _ = agent.storage.delete("public_base_url").await;
+        let _ = agent.storage.delete(PUBLIC_SELECTED_APP_KEY).await;
     }
+}
+
+/// POST /tunnel/stop — kill the cloudflared process
+async fn stop_tunnel(State(state): State<AppState>) -> Json<serde_json::Value> {
+    stop_tunnel_internal(&state).await;
     Json(serde_json::json!({ "ok": true, "message": "Tunnel stopped" }))
 }
 
@@ -6889,6 +7657,481 @@ async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
 }
 
 // ==================== ArkPulse Log ====================
+
+#[derive(Debug, Deserialize)]
+struct RunArkPulseFixRequest {
+    #[serde(default)]
+    fix_command: String,
+    #[serde(default)]
+    remediation: Option<crate::sentinel::DoctorRemediationSpec>,
+    #[serde(default)]
+    issue_title: Option<String>,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    event_timestamp: Option<String>,
+    #[serde(default)]
+    finding_index: Option<usize>,
+}
+
+enum ArkPulseFixPlan {
+    TunnelStartVerify,
+    TunnelRestartVerify,
+    ShellCommand(String),
+}
+
+fn arkpulse_fix_plan_from_remediation(
+    remediation: &crate::sentinel::DoctorRemediationSpec,
+    allow_shell_command: bool,
+) -> Option<ArkPulseFixPlan> {
+    match remediation {
+        crate::sentinel::DoctorRemediationSpec::TunnelStartVerify => {
+            Some(ArkPulseFixPlan::TunnelStartVerify)
+        }
+        crate::sentinel::DoctorRemediationSpec::TunnelRestartVerify => {
+            Some(ArkPulseFixPlan::TunnelRestartVerify)
+        }
+        crate::sentinel::DoctorRemediationSpec::ShellCommand { command } if allow_shell_command => {
+            let normalized = command.trim();
+            if normalized.is_empty() {
+                None
+            } else {
+                Some(ArkPulseFixPlan::ShellCommand(normalized.to_string()))
+            }
+        }
+        crate::sentinel::DoctorRemediationSpec::ShellCommand { .. } => None,
+    }
+}
+
+fn is_supported_arkpulse_shell_segment(segment: &str) -> bool {
+    let lower = segment.trim().to_ascii_lowercase();
+    lower.starts_with("pip-compile requirements.txt")
+        || lower.starts_with("rg -n ")
+        || lower == "cargo generate-lockfile"
+        || lower.starts_with("npm pkg delete ")
+        || lower.starts_with("mv .env ")
+}
+
+fn parse_supported_arkpulse_shell_command(command: &str) -> Option<String> {
+    let normalized = command.trim();
+    if normalized.is_empty() {
+        return None;
+    }
+    let lower = normalized.to_ascii_lowercase();
+    if lower.contains('\n')
+        || lower.contains('\r')
+        || lower.contains("||")
+        || lower.contains(';')
+        || lower.contains('`')
+        || lower.contains("$(")
+    {
+        return None;
+    }
+
+    let segments: Vec<&str> = normalized
+        .split("&&")
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if segments.len() < 2 {
+        return None;
+    }
+
+    let cd_segment = segments[0];
+    let cd_prefix = cd_segment
+        .strip_prefix("cd ")
+        .or_else(|| cd_segment.strip_prefix("cd\t"))?;
+    let cd_target = cd_prefix.trim();
+    if !cd_target.starts_with("/app/data/apps/") {
+        return None;
+    }
+
+    if segments
+        .iter()
+        .skip(1)
+        .all(|segment| is_supported_arkpulse_shell_segment(segment))
+    {
+        Some(normalized.to_string())
+    } else {
+        None
+    }
+}
+
+fn classify_arkpulse_fix_plan(command: &str) -> Option<ArkPulseFixPlan> {
+    let normalized = command.trim();
+    if normalized.is_empty() {
+        return None;
+    }
+    let lower = normalized.to_ascii_lowercase();
+    if lower.contains("start tunnel") && lower.contains("/tunnel/status") {
+        return Some(ArkPulseFixPlan::TunnelStartVerify);
+    }
+    if lower.contains("restart") && lower.contains("tunnel") {
+        return Some(ArkPulseFixPlan::TunnelRestartVerify);
+    }
+    parse_supported_arkpulse_shell_command(normalized).map(ArkPulseFixPlan::ShellCommand)
+}
+
+async fn wait_for_tunnel_url(
+    tunnel_arc: Arc<RwLock<TunnelState>>,
+    attempts: usize,
+) -> Option<String> {
+    for _ in 0..attempts {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let tunnel = tunnel_arc.read().await;
+        if let Some(url) = tunnel
+            .url
+            .as_ref()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+        {
+            return Some(url);
+        }
+    }
+    None
+}
+
+fn truncate_for_response(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    input.chars().take(max_chars).collect::<String>() + "..."
+}
+
+fn describe_arkpulse_remediation(
+    remediation: Option<&crate::sentinel::DoctorRemediationSpec>,
+    fix_command: &str,
+) -> String {
+    let normalized = fix_command.trim();
+    if !normalized.is_empty() {
+        return normalized.to_string();
+    }
+    match remediation {
+        Some(crate::sentinel::DoctorRemediationSpec::TunnelStartVerify) => {
+            "Start tunnel and verify /tunnel/status returns active + URL".to_string()
+        }
+        Some(crate::sentinel::DoctorRemediationSpec::TunnelRestartVerify) => {
+            "Restart tunnel and verify public reachability".to_string()
+        }
+        Some(crate::sentinel::DoctorRemediationSpec::ShellCommand { command }) => {
+            command.trim().to_string()
+        }
+        None => String::new(),
+    }
+}
+
+/// Execute a supported ArkPulse remediation directly (without going through Chat).
+async fn run_arkpulse_fix(
+    State(state): State<AppState>,
+    Json(request): Json<RunArkPulseFixRequest>,
+) -> Response {
+    let RunArkPulseFixRequest {
+        fix_command,
+        remediation,
+        issue_title,
+        target,
+        event_timestamp,
+        finding_index,
+    } = request;
+
+    let request_fix_command = fix_command.trim().to_string();
+    if request_fix_command.is_empty() && remediation.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "remediation or fix_command is required".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let mut effective_fix_command = request_fix_command.clone();
+    let mut effective_remediation = remediation.clone();
+
+    let plan = if event_timestamp.is_some() || finding_index.is_some() {
+        let event_timestamp = event_timestamp
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let Some(event_timestamp) = event_timestamp else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "event_timestamp is required when finding_index is provided".to_string(),
+                }),
+            )
+                .into_response();
+        };
+        let Some(finding_index) = finding_index else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "finding_index is required when event_timestamp is provided".to_string(),
+                }),
+            )
+                .into_response();
+        };
+
+        let agent = state.agent.read().await;
+        let events = crate::sentinel::get_pulse_log(&agent).await;
+        let Some(event) = events
+            .iter()
+            .find(|event| event.timestamp == event_timestamp)
+        else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "ArkPulse event not found".to_string(),
+                }),
+            )
+                .into_response();
+        };
+        let Some(finding) = event.details.doctor_findings.get(finding_index) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "ArkPulse finding index is out of range".to_string(),
+                }),
+            )
+                .into_response();
+        };
+        if !finding.user_actionable {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "This ArkPulse finding is advisory-only and must be fixed manually"
+                        .to_string(),
+                }),
+            )
+                .into_response();
+        }
+        if !request_fix_command.is_empty() && finding.fix_command.trim() != request_fix_command {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "fix_command does not match the selected ArkPulse finding".to_string(),
+                }),
+            )
+                .into_response();
+        }
+        if let (Some(requested_remediation), Some(stored_remediation)) =
+            (remediation.as_ref(), finding.remediation.as_ref())
+        {
+            if stored_remediation != requested_remediation {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "remediation does not match the selected ArkPulse finding"
+                            .to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+        effective_fix_command = finding.fix_command.trim().to_string();
+        effective_remediation = finding.remediation.clone();
+        effective_remediation
+            .as_ref()
+            .and_then(|value| arkpulse_fix_plan_from_remediation(value, true))
+            .or_else(|| classify_arkpulse_fix_plan(&effective_fix_command))
+    } else {
+        effective_remediation
+            .as_ref()
+            .and_then(|value| arkpulse_fix_plan_from_remediation(value, false))
+            .or_else(|| classify_arkpulse_fix_plan(&request_fix_command))
+    };
+
+    let Some(plan) = plan else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error:
+                    "This fix cannot be auto-run directly. Copy the remediation and run it manually."
+                        .to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let issue_title = issue_title.unwrap_or_default();
+    let target = target.unwrap_or_default();
+    let fix_summary =
+        describe_arkpulse_remediation(effective_remediation.as_ref(), &effective_fix_command);
+    tracing::info!(
+        "ArkPulse fix requested: issue='{}' target='{}' command='{}'",
+        issue_title,
+        target,
+        truncate_for_response(&fix_summary, 220)
+    );
+
+    match plan {
+        ArkPulseFixPlan::TunnelStartVerify => {
+            let tunnel_arc = state.tunnel.clone();
+            if let Err(error) = spawn_tunnel(tunnel_arc.clone()).await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse { error }),
+                )
+                    .into_response();
+            }
+
+            let discovered_url = wait_for_tunnel_url(tunnel_arc.clone(), 12).await;
+            if let Some(url) = discovered_url.as_ref() {
+                let agent = state.agent.read().await;
+                let _ = agent.storage.set("public_base_url", url.as_bytes()).await;
+            }
+
+            let tunnel = tunnel_arc.read().await;
+            let active = tunnel.active;
+            let url = tunnel.url.clone();
+            let message = if active && url.as_ref().is_some_and(|value| !value.trim().is_empty()) {
+                format!(
+                    "Tunnel is active and publicly reachable at {}.",
+                    url.clone().unwrap_or_default()
+                )
+            } else {
+                "Tunnel start requested. URL is pending; re-check /tunnel/status shortly."
+                    .to_string()
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "ok",
+                    "mode": "tunnel_start_verify",
+                    "message": message,
+                    "active": active,
+                    "url": url
+                })),
+            )
+                .into_response()
+        }
+        ArkPulseFixPlan::TunnelRestartVerify => {
+            stop_tunnel_internal(&state).await;
+            let tunnel_arc = state.tunnel.clone();
+            if let Err(error) = spawn_tunnel(tunnel_arc.clone()).await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse { error }),
+                )
+                    .into_response();
+            }
+
+            let discovered_url = wait_for_tunnel_url(tunnel_arc.clone(), 12).await;
+            if let Some(url) = discovered_url.as_ref() {
+                let agent = state.agent.read().await;
+                let _ = agent.storage.set("public_base_url", url.as_bytes()).await;
+            }
+
+            let tunnel = tunnel_arc.read().await;
+            let active = tunnel.active;
+            let url = tunnel.url.clone();
+            let message = if active && url.as_ref().is_some_and(|value| !value.trim().is_empty()) {
+                format!(
+                    "Tunnel restarted successfully and is reachable at {}.",
+                    url.clone().unwrap_or_default()
+                )
+            } else {
+                "Tunnel restart requested. URL is pending; re-check /tunnel/status shortly."
+                    .to_string()
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "ok",
+                    "mode": "tunnel_restart_verify",
+                    "message": message,
+                    "active": active,
+                    "url": url
+                })),
+            )
+                .into_response()
+        }
+        ArkPulseFixPlan::ShellCommand(command) => {
+            let started_at = Instant::now();
+            let mut process = if cfg!(windows) {
+                let mut cmd = tokio::process::Command::new("cmd");
+                cmd.arg("/C").arg(&command);
+                cmd
+            } else {
+                let mut cmd = tokio::process::Command::new("sh");
+                cmd.arg("-lc").arg(&command);
+                cmd
+            };
+            let exec = process
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .output();
+
+            let output = match tokio::time::timeout(Duration::from_secs(120), exec).await {
+                Ok(Ok(output)) => output,
+                Ok(Err(error)) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!("Failed to run fix command: {}", error),
+                        }),
+                    )
+                        .into_response();
+                }
+                Err(_) => {
+                    return (
+                        StatusCode::REQUEST_TIMEOUT,
+                        Json(ErrorResponse {
+                            error: "Fix command timed out after 120s".to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+            };
+
+            let elapsed_ms = started_at.elapsed().as_millis() as u64;
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let combined = if stdout.is_empty() && stderr.is_empty() {
+                "(no output)".to_string()
+            } else if stderr.is_empty() {
+                stdout.clone()
+            } else if stdout.is_empty() {
+                stderr.clone()
+            } else {
+                format!("{}\n\nstderr:\n{}", stdout, stderr)
+            };
+            let output_preview = truncate_for_response(&combined, 4000);
+
+            if output.status.success() {
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "status": "ok",
+                        "mode": "shell",
+                        "message": "ArkPulse fix command executed successfully.",
+                        "command": command,
+                        "duration_ms": elapsed_ms,
+                        "output": output_preview
+                    })),
+                )
+                    .into_response()
+            } else {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "status": "error",
+                        "mode": "shell",
+                        "error": format!(
+                            "Fix command failed with exit code {}",
+                            output.status.code().unwrap_or(-1)
+                        ),
+                        "command": command,
+                        "duration_ms": elapsed_ms,
+                        "output": output_preview
+                    })),
+                )
+                    .into_response()
+            }
+        }
+    }
+}
 
 /// Return the ArkPulse event log (last 100 events)
 async fn get_pulse_log(
@@ -7119,7 +8362,7 @@ async fn chat(
             (
                 agent.config_dir.clone(),
                 agent.data_dir.clone(),
-                agent.config.llm.app_env_vars(),
+                agent.app_model_env_vars(),
             )
         };
         let Some(value) = llm_env.get(&key).cloned().filter(|v| !v.trim().is_empty()) else {
@@ -7301,6 +8544,200 @@ async fn chat(
 }
 
 /// Chat with the agent via SSE — streams thinking steps in real-time
+fn stream_detail_looks_like_html_payload(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("<!doctype html")
+        || lower.starts_with("<html")
+        || (lower.contains("<html") && (lower.contains("</html>") || lower.contains("</body>")))
+}
+
+fn stream_detail_looks_like_source_payload(text: &str) -> bool {
+    let sample = text.trim().lines().take(12).collect::<Vec<_>>().join("\n");
+    if sample.is_empty() {
+        return false;
+    }
+    let lower = sample.to_ascii_lowercase();
+    lower.contains("from fastapi import")
+        || lower.contains("import asyncio")
+        || lower.contains("import httpx")
+        || lower.contains("function ")
+        || lower.contains("const ")
+        || lower.contains("let ")
+        || lower.contains("class ")
+        || lower.contains("def ")
+        || lower.contains("async def ")
+        || lower.contains("#include ")
+}
+
+fn summarize_stream_tool_activity_content(content: &str) -> String {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if stream_detail_looks_like_html_payload(trimmed) {
+        if let Some(start) = trimmed.to_ascii_lowercase().find("<title>") {
+            let rest = &trimmed[start + "<title>".len()..];
+            if let Some(end) = rest.to_ascii_lowercase().find("</title>") {
+                let title = rest[..end].trim();
+                if !title.is_empty() {
+                    return format!("Read HTML document: {}.", title);
+                }
+            }
+        }
+        return "Read HTML document.".to_string();
+    }
+
+    let json_like = (trimmed.starts_with('{') && trimmed.ends_with('}'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']'));
+    if json_like {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Some(obj) = value.as_object() {
+                if let Some(title) = obj
+                    .get("matched_app")
+                    .and_then(|v| v.get("title"))
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                {
+                    return format!("Matched app and loaded metadata for {}.", title);
+                }
+                let keys = obj.keys().take(4).cloned().collect::<Vec<_>>().join(", ");
+                if !keys.is_empty() {
+                    return format!("Returned structured data: {}.", keys);
+                }
+            } else if let Some(items) = value.as_array() {
+                return format!(
+                    "Returned list with {} item{}.",
+                    items.len(),
+                    if items.len() == 1 { "" } else { "s" }
+                );
+            }
+        }
+    }
+
+    if stream_detail_looks_like_source_payload(trimmed) {
+        let line_count = trimmed.lines().count();
+        return format!(
+            "Read source file contents ({} line{}).",
+            line_count,
+            if line_count == 1 { "" } else { "s" }
+        );
+    }
+
+    if trimmed.len() > 240
+        && trimmed
+            .chars()
+            .any(|ch| matches!(ch, '{' | '}' | '<' | '>' | ';'))
+    {
+        return "Returned verbose tool output.".to_string();
+    }
+
+    trimmed.chars().take(240).collect::<String>()
+}
+
+fn normalize_stream_heartbeat_status(status: &str) -> String {
+    let trimmed = status.trim();
+    if trimmed.is_empty() {
+        return "Still processing. No new output yet.".to_string();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("memory") || lower.contains("context") || lower.contains("mem0") {
+        return "Memory/context setup in progress. No new output yet.".to_string();
+    }
+    if lower.contains("tool") {
+        return "Waiting on tool execution. No new output yet.".to_string();
+    }
+    if lower.contains("respond") || lower.contains("generating") || lower.contains("model") {
+        return "Waiting on model response. No new output yet.".to_string();
+    }
+    "Still processing. No new output yet.".to_string()
+}
+
+fn normalize_stream_event_for_sse(
+    ev: crate::core::StreamEvent,
+    last_thinking_detail: &str,
+) -> (Option<(&'static str, serde_json::Value)>, String) {
+    match ev {
+        crate::core::StreamEvent::Token(content) => (
+            Some(("token", serde_json::json!({ "content": content }))),
+            String::new(),
+        ),
+        crate::core::StreamEvent::Thinking(status) => {
+            let detail = normalize_stream_heartbeat_status(&status);
+            if detail == last_thinking_detail {
+                (None, detail)
+            } else {
+                (
+                    Some((
+                        "thinking",
+                        serde_json::json!({
+                            "step_type": "heartbeat",
+                            "title": "Still Working",
+                            "detail": detail
+                        }),
+                    )),
+                    detail,
+                )
+            }
+        }
+        crate::core::StreamEvent::ToolStart { name, payload } => {
+            let payload_json = if let Some(payload) = payload {
+                if let Some(obj) = payload.as_object() {
+                    let mut merged = serde_json::Map::new();
+                    merged.insert("name".to_string(), serde_json::json!(name));
+                    for (k, v) in obj {
+                        merged.insert(k.clone(), v.clone());
+                    }
+                    serde_json::Value::Object(merged)
+                } else {
+                    serde_json::json!({ "name": name, "payload": payload })
+                }
+            } else {
+                serde_json::json!({ "name": name })
+            };
+            (Some(("tool_start", payload_json)), String::new())
+        }
+        crate::core::StreamEvent::ToolResult { name, content } => {
+            let content = summarize_stream_tool_activity_content(&content);
+            (
+                Some((
+                    "tool_result",
+                    serde_json::json!({ "name": name, "content": content }),
+                )),
+                String::new(),
+            )
+        }
+        crate::core::StreamEvent::ToolProgress {
+            name,
+            content,
+            payload,
+        } => {
+            let content = summarize_stream_tool_activity_content(&content);
+            let payload_json = if let Some(payload) = payload {
+                if let Some(obj) = payload.as_object() {
+                    let mut merged = serde_json::Map::new();
+                    merged.insert("name".to_string(), serde_json::json!(name));
+                    merged.insert("content".to_string(), serde_json::json!(content));
+                    for (k, v) in obj {
+                        merged.insert(k.clone(), v.clone());
+                    }
+                    serde_json::Value::Object(merged)
+                } else {
+                    serde_json::json!({ "name": name, "content": content, "payload": payload })
+                }
+            } else {
+                serde_json::json!({ "name": name, "content": content })
+            };
+            (Some(("tool_progress", payload_json)), String::new())
+        }
+    }
+}
+
 async fn chat_stream(
     State(state): State<AppState>,
     ConnectInfo(_addr): ConnectInfo<SocketAddr>,
@@ -7376,7 +8813,7 @@ async fn chat_stream(
             (
                 agent.config_dir.clone(),
                 agent.data_dir.clone(),
-                agent.config.llm.app_env_vars(),
+                agent.app_model_env_vars(),
             )
         };
         let payload = if let Some(value) =
@@ -7570,55 +9007,13 @@ async fn chat_stream(
         let stream_forwarder = {
             let tx = tx.clone();
             tokio::spawn(async move {
+                let mut last_thinking_detail = String::new();
                 while let Some(ev) = stream_rx.recv().await {
-                    let (event_name, payload) = match ev {
-                        crate::core::StreamEvent::Token(content) => {
-                            ("token", serde_json::json!({ "content": content }))
-                        }
-                        crate::core::StreamEvent::ToolStart { name, payload } => {
-                            let payload_json = if let Some(payload) = payload {
-                                if let Some(obj) = payload.as_object() {
-                                    let mut merged = serde_json::Map::new();
-                                    merged.insert("name".to_string(), serde_json::json!(name));
-                                    for (k, v) in obj {
-                                        merged.insert(k.clone(), v.clone());
-                                    }
-                                    serde_json::Value::Object(merged)
-                                } else {
-                                    serde_json::json!({ "name": name, "payload": payload })
-                                }
-                            } else {
-                                serde_json::json!({ "name": name })
-                            };
-                            ("tool_start", payload_json)
-                        }
-                        crate::core::StreamEvent::ToolResult { name, content } => (
-                            "tool_result",
-                            serde_json::json!({ "name": name, "content": content }),
-                        ),
-                        crate::core::StreamEvent::ToolProgress {
-                            name,
-                            content,
-                            payload,
-                        } => {
-                            let payload_json = if let Some(payload) = payload {
-                                if let Some(obj) = payload.as_object() {
-                                    let mut merged = serde_json::Map::new();
-                                    merged.insert("name".to_string(), serde_json::json!(name));
-                                    merged
-                                        .insert("content".to_string(), serde_json::json!(content));
-                                    for (k, v) in obj {
-                                        merged.insert(k.clone(), v.clone());
-                                    }
-                                    serde_json::Value::Object(merged)
-                                } else {
-                                    serde_json::json!({ "name": name, "content": content, "payload": payload })
-                                }
-                            } else {
-                                serde_json::json!({ "name": name, "content": content })
-                            };
-                            ("tool_progress", payload_json)
-                        }
+                    let (maybe_event, next_thinking_detail) =
+                        normalize_stream_event_for_sse(ev, &last_thinking_detail);
+                    last_thinking_detail = next_thinking_detail;
+                    let Some((event_name, payload)) = maybe_event else {
+                        continue;
                     };
                     let event = Event::default()
                         .event(event_name)
@@ -7682,7 +9077,15 @@ async fn chat_stream(
                                     || title.contains("context")
                                     || detail.contains("context")
                                 {
-                                    "Memory/context setup in progress (embedding model warmup/download can take a few minutes on first run)."
+                                    if detail.contains("mem0 pending") {
+                                        "Memory layer is starting up (first run may include embedding warmup)."
+                                    } else if detail.contains("mem0 active") {
+                                        "Retrieving semantic memory/context."
+                                    } else if detail.contains("warmup") {
+                                        "Memory layer warmup in progress."
+                                    } else {
+                                        "Memory/context setup in progress."
+                                    }
                                 } else if title.contains("repairing deploy payload")
                                     || detail.contains("deploy payload")
                                     || detail.contains("files payload")
@@ -7699,10 +9102,10 @@ async fn chat_stream(
                             .unwrap_or("Still processing.");
                         let event_data = serde_json::json!({
                             "icon": "[wait]",
-                            "title": "Still working",
-                            "detail": format!("{} No new output yet ({}s idle).", phase_hint, idle_secs),
-                            "step_type": "thinking",
-                            "data": null
+                            "title": "Still Working",
+                            "detail": format!("{} No new output yet.", phase_hint),
+                            "step_type": "heartbeat",
+                            "data": serde_json::json!({ "idle_secs": idle_secs })
                         });
                         let event = Event::default()
                             .event("thinking")
@@ -8156,15 +9559,23 @@ fn compute_import_risk_summary(
 
     match static_analysis.threat_level {
         crate::security::action_guard::ThreatLevel::Malicious => {
-            score = score.max(8.5);
+            // When most findings are standard integration patterns (env refs,
+            // placeholder keys, curl/https), don't force the score to 8.5.
+            if contextual_ratio >= 0.8 {
+                score = score.max(4.0);
+            } else {
+                score = score.max(8.5);
+            }
         }
         crate::security::action_guard::ThreatLevel::Suspicious => {
             score = score.max(5.0);
         }
         crate::security::action_guard::ThreatLevel::Clean => {}
     }
-    if blocked {
+    if blocked && contextual_ratio < 0.8 {
         score = score.max(8.5);
+    } else if blocked {
+        score = score.max(5.0);
     }
     let score_10 = ((score.clamp(0.0, 10.0)) * 10.0).round() / 10.0;
     let band = if score_10 < 5.0 {
@@ -9655,6 +11066,146 @@ async fn import_action(
         crate::integrations::github::GitHubConnector::load_token_from(&config_dir)
     };
     let gh_tok = github_token.as_deref();
+
+    // Explicit selected URL mode (bulk confirmation flow):
+    // Import exactly the provided child skill URLs in a single request.
+    if let Some(raw_selected) = request.selected_urls.as_ref() {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut selected_urls: Vec<String> = Vec::new();
+        for entry in raw_selected {
+            let trimmed = entry.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if seen.insert(trimmed.to_string()) {
+                selected_urls.push(trimmed.to_string());
+            }
+        }
+
+        if selected_urls.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "selected_urls was provided but no valid URLs were included."
+                        .to_string(),
+                }),
+            )
+                .into_response();
+        }
+
+        let mut imported: Vec<serde_json::Value> = Vec::new();
+        let mut failed: Vec<serde_json::Value> = Vec::new();
+
+        for file_url in selected_urls {
+            let validated = match validate_import_fetch_url(&file_url).await {
+                Ok(v) => v,
+                Err(reason) => {
+                    failed.push(serde_json::json!({
+                        "url": file_url,
+                        "error": reason,
+                    }));
+                    continue;
+                }
+            };
+            let text = match fetch_text_with_redirects(&client, validated, 3).await {
+                Ok(t) => t,
+                Err(e) => {
+                    failed.push(serde_json::json!({
+                        "url": file_url,
+                        "error": e,
+                    }));
+                    continue;
+                }
+            };
+            match import_action_from_content(
+                &state,
+                &file_url,
+                text,
+                None,
+                request.force,
+                request.model.as_deref(),
+                request.preview_only,
+            )
+            .await
+            {
+                Ok(result) => {
+                    imported.push(serde_json::json!({
+                        "url": file_url,
+                        "result": result,
+                    }));
+                }
+                Err(e) => {
+                    failed.push(serde_json::json!({
+                        "url": file_url,
+                        "error": e,
+                    }));
+                }
+            }
+        }
+
+        if imported.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!(
+                        "No skills could be imported from selected_urls. Failures: {}",
+                        serde_json::to_string(&failed).unwrap_or_else(|_| "[]".to_string())
+                    ),
+                }),
+            )
+                .into_response();
+        }
+
+        let status = if request.preview_only {
+            if failed.is_empty() {
+                "preview"
+            } else {
+                "preview_partial"
+            }
+        } else if failed.is_empty() {
+            "ok"
+        } else {
+            "partial"
+        };
+        let base_name = request
+            .name
+            .clone()
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| "bulk-import".to_string());
+
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": status,
+                "name": base_name,
+                "message": if request.preview_only {
+                    if failed.is_empty() {
+                        format!("Previewed {} selected action(s)", imported.len())
+                    } else {
+                        format!(
+                            "Previewed {} selected action(s) ({} failed)",
+                            imported.len(),
+                            failed.len()
+                        )
+                    }
+                } else if failed.is_empty() {
+                    format!("Imported {} selected action(s)", imported.len())
+                } else {
+                    format!(
+                        "Imported {} selected action(s) ({} failed)",
+                        imported.len(),
+                        failed.len()
+                    )
+                },
+                "source_url": url,
+                "imported_count": imported.len(),
+                "failed_count": failed.len(),
+                "imported": imported,
+                "failed": failed,
+            })),
+        )
+            .into_response();
+    }
 
     // Collection URL support: one GitHub folder/repo URL can contain many SKILL.md/ACTION.md files.
     let mut single_url_override: Option<String> = None;
@@ -12736,11 +14287,37 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
         )
     };
     let profile = state.user_profile.read().await;
+    let daily_brief_task = {
+        let tasks = state.tasks.read().await;
+        tasks
+            .all()
+            .iter()
+            .find(|task| task.action == "daily_brief")
+            .cloned()
+    };
     let moltbook_settings = load_moltbook_settings(&storage).await;
-    let daily_brief_channel = match storage.get("daily_brief_channel").await {
+    let daily_brief_channel = match storage.get(DAILY_BRIEF_CHANNEL_KEY).await {
         Ok(Some(bytes)) => String::from_utf8(bytes).unwrap_or_else(|_| "telegram".to_string()),
         _ => "telegram".to_string(),
     };
+    let stored_daily_brief_enabled =
+        parse_bool_pref(storage.get(DAILY_BRIEF_ENABLED_KEY).await.ok().flatten());
+    let stored_daily_brief_time = storage
+        .get(DAILY_BRIEF_TIME_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|value| normalize_daily_brief_time(&value));
+    let daily_brief_time = stored_daily_brief_time
+        .or_else(|| {
+            daily_brief_task
+                .as_ref()
+                .and_then(|task| task.cron.as_deref())
+                .and_then(daily_brief_time_from_cron)
+        })
+        .unwrap_or_else(|| DEFAULT_DAILY_BRIEF_TIME.to_string());
+    let daily_brief_enabled = stored_daily_brief_enabled || daily_brief_task.is_some();
     let moltbook_last_run_at = storage
         .get(MOLTBOOK_LAST_RUN_KEY)
         .await
@@ -12943,6 +14520,8 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
         language: profile.language.clone(),
         tone: profile.tone.clone(),
         email_format: profile.email_format.clone(),
+        daily_brief_enabled,
+        daily_brief_time,
         daily_brief_channel,
         llm_provider: provider,
         llm_model: model,
@@ -13093,9 +14672,64 @@ async fn update_settings(
     };
     let mut deferred_profile_bytes: Option<Vec<u8>> = None;
     let mut deferred_daily_brief_channel: Option<String> = None;
-    let mut deferred_daily_brief_task_update: Option<(String, String)> = None;
+    let mut deferred_daily_brief_enabled: Option<bool> = None;
+    let mut deferred_daily_brief_time: Option<String> = None;
     let mut deferred_search_config_dir: Option<PathBuf> = None;
     let mut deferred_moltbook_settings: Option<MoltbookSettings> = None;
+    let existing_daily_brief_tasks = {
+        let tasks = state.tasks.read().await;
+        tasks
+            .all()
+            .iter()
+            .filter(|task| task.action == "daily_brief")
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let stored_daily_brief_enabled = parse_bool_pref(
+        deferred_storage
+            .get(DAILY_BRIEF_ENABLED_KEY)
+            .await
+            .ok()
+            .flatten(),
+    );
+    let stored_daily_brief_time = deferred_storage
+        .get(DAILY_BRIEF_TIME_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|value| normalize_daily_brief_time(&value))
+        .or_else(|| {
+            existing_daily_brief_tasks
+                .first()
+                .and_then(|task| task.cron.as_deref())
+                .and_then(daily_brief_time_from_cron)
+        })
+        .unwrap_or_else(|| DEFAULT_DAILY_BRIEF_TIME.to_string());
+    let stored_daily_brief_channel = deferred_storage
+        .get(DAILY_BRIEF_CHANNEL_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_else(|| "telegram".to_string());
+    let requested_daily_brief_time = if let Some(value) = settings.daily_brief_time.as_ref() {
+        let Some(normalized) = normalize_daily_brief_time(value) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Daily brief time must use HH:MM in 24-hour format".to_string(),
+                }),
+            )
+                .into_response();
+        };
+        normalized
+    } else {
+        stored_daily_brief_time
+    };
+    let requested_daily_brief_enabled = settings
+        .daily_brief_enabled
+        .unwrap_or(!existing_daily_brief_tasks.is_empty() || stored_daily_brief_enabled);
 
     if let Some(timezone) = settings.timezone.as_ref() {
         if !timezone.trim().is_empty() && timezone.parse::<chrono_tz::Tz>().is_err() {
@@ -13148,7 +14782,8 @@ async fn update_settings(
         }
     }
 
-    if let Some(channel) = settings.daily_brief_channel.as_ref() {
+    let requested_daily_brief_channel = if let Some(channel) = settings.daily_brief_channel.as_ref()
+    {
         let normalized = channel.trim().to_lowercase();
         if normalized != "telegram" && normalized != "whatsapp" && normalized != "email" {
             return (
@@ -13160,24 +14795,13 @@ async fn update_settings(
             )
                 .into_response();
         }
-
-        deferred_daily_brief_channel = Some(normalized.clone());
-
-        let mut queue = state.tasks.write().await;
-        let task_id = queue
-            .all()
-            .iter()
-            .find(|t| t.action == "daily_brief")
-            .map(|t| t.id);
-        if let Some(id) = task_id {
-            if let Some(task) = queue.get_mut(id) {
-                task.arguments = serde_json::json!({ "report_to": normalized });
-            }
-            let args = serde_json::to_string(&serde_json::json!({ "report_to": normalized }))
-                .unwrap_or_else(|_| "{}".to_string());
-            deferred_daily_brief_task_update = Some((id.to_string(), args));
-        }
-    }
+        normalized
+    } else {
+        stored_daily_brief_channel
+    };
+    deferred_daily_brief_channel = Some(requested_daily_brief_channel.clone());
+    deferred_daily_brief_enabled = Some(requested_daily_brief_enabled);
+    deferred_daily_brief_time = Some(requested_daily_brief_time.clone());
 
     if settings.moltbook_enabled.is_some()
         || settings.moltbook_mode.is_some()
@@ -13789,18 +15413,27 @@ async fn update_settings(
     }
     if let Some(channel) = deferred_daily_brief_channel.as_ref() {
         if let Err(e) = deferred_storage
-            .set("daily_brief_channel", channel.as_bytes())
+            .set(DAILY_BRIEF_CHANNEL_KEY, channel.as_bytes())
             .await
         {
             tracing::warn!("Failed to persist daily brief channel: {}", e);
         }
     }
-    if let Some((task_id, args)) = deferred_daily_brief_task_update.as_ref() {
+    if let Some(enabled) = deferred_daily_brief_enabled {
+        let stored_value = if enabled { "true" } else { "false" };
         if let Err(e) = deferred_storage
-            .update_task(task_id, None, Some(args.clone()), None, None)
+            .set(DAILY_BRIEF_ENABLED_KEY, stored_value.as_bytes())
             .await
         {
-            tracing::warn!("Failed to persist daily brief task update: {}", e);
+            tracing::warn!("Failed to persist daily brief enabled flag: {}", e);
+        }
+    }
+    if let Some(time_value) = deferred_daily_brief_time.as_ref() {
+        if let Err(e) = deferred_storage
+            .set(DAILY_BRIEF_TIME_KEY, time_value.as_bytes())
+            .await
+        {
+            tracing::warn!("Failed to persist daily brief time: {}", e);
         }
     }
 
@@ -13924,6 +15557,53 @@ async fn update_settings(
                         tracing::warn!("LLM provider connectivity probe failed after save: {}", e);
                     }
                 });
+            }
+
+            for task in &existing_daily_brief_tasks {
+                if let Err(e) = deferred_storage.delete_task(&task.id.to_string()).await {
+                    tracing::warn!(
+                        "Failed to delete previous daily brief task {}: {}",
+                        task.id,
+                        e
+                    );
+                }
+            }
+            {
+                let mut queue = state.tasks.write().await;
+                for task in &existing_daily_brief_tasks {
+                    queue.remove(task.id);
+                }
+            }
+            if requested_daily_brief_enabled {
+                let Some(daily_brief_cron) =
+                    daily_brief_cron_from_time(&requested_daily_brief_time)
+                else {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: "Failed to build the daily brief schedule".to_string(),
+                        }),
+                    )
+                        .into_response();
+                };
+                let mut task = Task::new(
+                    "Morning summary brief".to_string(),
+                    "daily_brief".to_string(),
+                    serde_json::json!({ "report_to": requested_daily_brief_channel.clone() }),
+                );
+                task.capabilities = vec!["daily_brief".to_string()];
+                task.cron = Some(daily_brief_cron);
+                if let Err(e) = deferred_storage.insert_task(&task).await {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!("Failed to save daily brief schedule: {}", e),
+                        }),
+                    )
+                        .into_response();
+                }
+                let mut queue = state.tasks.write().await;
+                queue.add(task);
             }
 
             // Handle WhatsApp bridge lifecycle (no full process restart needed)
@@ -14058,6 +15738,13 @@ async fn get_trace(
         .and_then(|s| s.parse().ok())
         .unwrap_or(0usize);
 
+    let agent = state.agent.read().await;
+    let persisted_history = agent
+        .storage
+        .list_execution_traces(history_limit as u64 + history_offset as u64 + 100, 0)
+        .await
+        .unwrap_or_default();
+
     // Access trace data directly without locking agent
     let last_trace = state.last_trace.read().await;
     let trace_history = state.trace_history.read().await;
@@ -14072,11 +15759,7 @@ async fn get_trace(
             detail: step.detail.clone(),
             step_type: step.step_type.clone(),
             data: step.data.clone(),
-            time: if let Some(ms) = step.duration_ms {
-                format!("{} ({}ms)", step.timestamp.format("%H:%M:%S"), ms)
-            } else {
-                step.timestamp.format("%H:%M:%S").to_string()
-            },
+            time: format_trace_step_time(step),
         })
         .collect();
 
@@ -14099,38 +15782,33 @@ async fn get_trace(
     };
 
     // Build trace history summaries (paginated)
-    let history_total = trace_history.len();
-    let history: Vec<TraceSummary> = trace_history
-        .iter()
+    let mut history_by_id = std::collections::BTreeMap::<String, (String, TraceSummary)>::new();
+    for item in persisted_history.iter() {
+        history_by_id.insert(
+            item.id.clone(),
+            (
+                trace_sort_key_from_persisted(item),
+                format_trace_summary_from_persisted(item),
+            ),
+        );
+    }
+    for item in trace_history.iter() {
+        history_by_id.insert(
+            item.id.clone(),
+            (
+                trace_sort_key_from_memory(item),
+                format_trace_summary_from_memory(item),
+            ),
+        );
+    }
+    let mut history_all: Vec<(String, TraceSummary)> = history_by_id.into_values().collect();
+    history_all.sort_by(|a, b| b.0.cmp(&a.0));
+    let history_total = history_all.len();
+    let history: Vec<TraceSummary> = history_all
+        .into_iter()
         .skip(history_offset)
         .take(history_limit)
-        .map(|t| {
-            let duration_ms = t.started_at.and_then(|start| {
-                t.completed_at
-                    .map(|end| (end - start).num_milliseconds() as u64)
-            });
-            let status = if t.completed_at.is_some() {
-                "completed"
-            } else {
-                "running"
-            };
-            TraceSummary {
-                id: t.id.clone(),
-                message_preview: if t.message.len() > 40 {
-                    format!("{}...", &t.message[..40])
-                } else {
-                    t.message.clone()
-                },
-                channel: t.channel.clone(),
-                status: status.to_string(),
-                step_count: t.steps.len(),
-                started_at: t
-                    .started_at
-                    .map(|s| s.format("%H:%M:%S").to_string())
-                    .unwrap_or_default(),
-                duration_ms,
-            }
-        })
+        .map(|(_, summary)| summary)
         .collect();
 
     Json(TraceResponse {
@@ -14151,56 +15829,30 @@ async fn get_trace_detail(State(state): State<AppState>, Path(id): Path<String>)
     let trace = trace_history.iter().find(|t| t.id == id);
 
     match trace {
-        Some(t) => {
-            let duration_ms = t.started_at.and_then(|start| {
-                t.completed_at
-                    .map(|end| (end - start).num_milliseconds() as u64)
-            });
-
-            let steps: Vec<TraceStep> = t
-                .steps
-                .iter()
-                .map(|step| TraceStep {
-                    icon: step.icon.clone(),
-                    title: step.title.clone(),
-                    detail: step.detail.clone(),
-                    step_type: step.step_type.clone(),
-                    data: step.data.clone(),
-                    time: if let Some(ms) = step.duration_ms {
-                        format!("{} ({}ms)", step.timestamp.format("%H:%M:%S"), ms)
-                    } else {
-                        step.timestamp.format("%H:%M:%S").to_string()
-                    },
-                })
-                .collect();
-
-            (
-                StatusCode::OK,
-                Json(TraceDetailResponse {
-                    id: t.id.clone(),
-                    message: t.message.clone(),
-                    channel: t.channel.clone(),
-                    started_at: t
-                        .started_at
-                        .map(|s| s.format("%Y-%m-%d %H:%M:%S").to_string()),
-                    completed_at: t
-                        .completed_at
-                        .map(|c| c.format("%Y-%m-%d %H:%M:%S").to_string()),
-                    duration_ms,
-                    steps,
-                    response: t.response.clone(),
-                    proof_id: t.proof_id.clone(),
-                }),
-            )
-                .into_response()
+        Some(t) => (StatusCode::OK, Json(format_trace_detail_from_memory(t))).into_response(),
+        None => {
+            drop(trace_history);
+            let agent = state.agent.read().await;
+            match agent.storage.get_execution_trace(&id).await {
+                Ok(Some(t)) => {
+                    (StatusCode::OK, Json(format_trace_detail_from_persisted(&t))).into_response()
+                }
+                Ok(None) => (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        error: format!("Trace '{}' not found", id),
+                    }),
+                )
+                    .into_response(),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to load trace '{}': {}", id, e),
+                    }),
+                )
+                    .into_response(),
+            }
         }
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("Trace '{}' not found", id),
-            }),
-        )
-            .into_response(),
     }
 }
 
@@ -19932,13 +21584,17 @@ fn parse_analytics_datetime_param(input: Option<&String>) -> Option<chrono::Date
         .or_else(|| {
             chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M")
                 .ok()
-                .map(|dt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc))
+                .map(|dt| {
+                    chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc)
+                })
         })
         .or_else(|| {
             chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d")
                 .ok()
                 .and_then(|d| d.and_hms_opt(0, 0, 0))
-                .map(|dt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc))
+                .map(|dt| {
+                    chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc)
+                })
         })
 }
 
@@ -22983,5 +24639,84 @@ async fn remove_master_password(
             })),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summarize_stream_tool_activity_content_hides_html_payloads() {
+        let summary = summarize_stream_tool_activity_content(
+            "<!DOCTYPE html><html><head><title>arXiv Research Monitor | RL & Time-Series</title></head><body><div>demo</div></body></html>",
+        );
+
+        assert_eq!(
+            summary,
+            "Read HTML document: arXiv Research Monitor | RL & Time-Series."
+        );
+        assert!(!summary.contains("<!DOCTYPE html>"));
+    }
+
+    #[test]
+    fn normalize_stream_heartbeat_status_collapses_model_and_memory_messages() {
+        assert_eq!(
+            normalize_stream_heartbeat_status("Waiting for z-ai/glm-5 to respond (15s)..."),
+            "Waiting on model response. No new output yet."
+        );
+        assert_eq!(
+            normalize_stream_heartbeat_status("Mem0 active | Scope: channel:web | Channel: web"),
+            "Memory/context setup in progress. No new output yet."
+        );
+    }
+
+    #[test]
+    fn normalize_stream_event_for_sse_suppresses_duplicate_heartbeat_updates() {
+        let (first_event, first_state) = normalize_stream_event_for_sse(
+            crate::core::StreamEvent::Thinking(
+                "Waiting for z-ai/glm-5 to respond (5s)...".to_string(),
+            ),
+            "",
+        );
+        let Some((event_name, payload)) = first_event else {
+            panic!("expected first heartbeat event");
+        };
+        assert_eq!(event_name, "thinking");
+        assert_eq!(
+            payload.get("detail").and_then(|v| v.as_str()),
+            Some("Waiting on model response. No new output yet.")
+        );
+
+        let (second_event, second_state) = normalize_stream_event_for_sse(
+            crate::core::StreamEvent::Thinking(
+                "Model z-ai/glm-5 is generating (10s elapsed)...".to_string(),
+            ),
+            &first_state,
+        );
+        assert!(second_event.is_none());
+        assert_eq!(second_state, first_state);
+    }
+
+    #[test]
+    fn normalize_stream_event_for_sse_summarizes_tool_results() {
+        let (event, next_state) = normalize_stream_event_for_sse(
+            crate::core::StreamEvent::ToolResult {
+                name: "file_read".to_string(),
+                content:
+                    "<!DOCTYPE html><html><head><title>Demo</title></head><body></body></html>"
+                        .to_string(),
+            },
+            "Waiting on model response. No new output yet.",
+        );
+        assert!(next_state.is_empty());
+        let Some((event_name, payload)) = event else {
+            panic!("expected tool_result event");
+        };
+        assert_eq!(event_name, "tool_result");
+        assert_eq!(
+            payload.get("content").and_then(|v| v.as_str()),
+            Some("Read HTML document: Demo.")
+        );
     }
 }

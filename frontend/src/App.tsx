@@ -56,6 +56,7 @@ type ViewKey =
   | "skills"
   | "tasks"
   | "apps"
+  | "arkpulse"
   | "memory"
   | "goals"
   | "autonomy"
@@ -90,6 +91,14 @@ const NAV_GROUPS: NavGroup[] = [
     ]
   },
   {
+    id: "operations",
+    label: "Operations",
+    items: [
+      { key: "arkpulse", label: "ArkPulse", icon: <MonitorHeartRoundedIcon fontSize="small" /> },
+      { key: "trace", label: "Trace", icon: <HubRoundedIcon fontSize="small" /> }
+    ]
+  },
+  {
     id: "data",
     label: "Data",
     items: [
@@ -107,6 +116,7 @@ const VIEW_PATH_SEGMENTS: Record<ViewKey, string> = {
   skills: "skills",
   tasks: "tasks",
   apps: "apps",
+  arkpulse: "arkpulse",
   memory: "memory",
   goals: "goals",
   autonomy: "autonomy",
@@ -146,7 +156,6 @@ function resolveViewFromPath(pathname: string): { view: ViewKey; matched: boolea
     const segment = normalized.slice("/ui/".length).split("/")[0]?.toLowerCase() || "";
     if (segment === "actions") return { view: "skills", matched: true };
     if (segment === "integrations") return { view: "settings", matched: true };
-    if (segment === "trace") return { view: "settings", matched: true };
     if (segment === "memory") return { view: "settings", matched: true };
     const view = PATH_SEGMENT_TO_VIEW[segment];
     if (view) {
@@ -178,6 +187,10 @@ function formatMetaValue(value: unknown): { text: string; href?: string } {
   return { text: String(value) };
 }
 
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+}
+
 function isAutomationFailureNotification(notification: {
   title?: string;
   body?: string;
@@ -207,6 +220,25 @@ function isAutomationFailureNotification(notification: {
   return failureSignal && automationSignal;
 }
 
+function shouldSurfaceNotification(notification: {
+  title?: string;
+  body?: string;
+  source?: string;
+  level?: string;
+}): boolean {
+  const source = (notification.source || "").toLowerCase();
+  if (!source.includes("arkpulse")) return true;
+  const title = (notification.title || "").toLowerCase();
+  const body = (notification.body || "").toLowerCase();
+  const level = (notification.level || "").toLowerCase();
+  return (
+    level === "critical" ||
+    title.includes("critical") ||
+    body.includes("critical") ||
+    body.includes("immediate action")
+  );
+}
+
 export default function App() {
   const queryClient = useQueryClient();
   const autoRefresh = useUiStore((s) => s.autoRefresh);
@@ -215,6 +247,7 @@ export default function App() {
   const closeNotification = useUiStore((s) => s.closeNotification);
   const [view, setViewState] = useState<ViewKey>(() => resolveViewFromPath(window.location.pathname).view);
   const [lastNonSettingsView, setLastNonSettingsView] = useState<ViewKey>("overview");
+  const [settingsInitialTab, setSettingsInitialTab] = useState<number | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
     try {
       return window.localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1";
@@ -333,6 +366,10 @@ export default function App() {
     refetchInterval: autoRefresh ? REFRESH_MS : false
   });
   const notifications = Array.isArray(notificationsQ.data) ? notificationsQ.data : [];
+  const visibleNotifications = useMemo(
+    () => notifications.filter((n) => shouldSurfaceNotification(n)),
+    [notifications]
+  );
   const unreadCountFromEndpointRaw =
     notificationsCountQ.data && typeof notificationsCountQ.data === "object"
       ? (notificationsCountQ.data as Record<string, unknown>).unread
@@ -343,23 +380,24 @@ export default function App() {
       : typeof unreadCountFromEndpointRaw === "string"
         ? Number(unreadCountFromEndpointRaw)
         : Number.NaN;
+  const visibleUnreadCount = visibleNotifications.filter((n) => !n.read).length;
   const unreadCount = Number.isFinite(unreadCountFromEndpoint)
-    ? Math.max(0, Math.round(unreadCountFromEndpoint))
-    : notifications.filter((n) => !n.read).length;
+    ? Math.max(0, Math.min(Math.round(unreadCountFromEndpoint), visibleUnreadCount))
+    : visibleUnreadCount;
   const filteredNotifications = useMemo(() => {
-    if (notifFilter === "all") return notifications;
-    if (notifFilter === "unread") return notifications.filter((n) => !n.read);
+    if (notifFilter === "all") return visibleNotifications;
+    if (notifFilter === "unread") return visibleNotifications.filter((n) => !n.read);
     if (notifFilter === "errors") {
-      return notifications.filter((n) => {
+      return visibleNotifications.filter((n) => {
         const level = (n.level || "").toLowerCase();
         return level === "error" || level === "critical";
       });
     }
-    return notifications.filter((n) => isAutomationFailureNotification(n));
-  }, [notifications, notifFilter]);
+    return visibleNotifications.filter((n) => isAutomationFailureNotification(n));
+  }, [visibleNotifications, notifFilter]);
   const notificationsMuted = notificationsMuteUntilMs > Date.now();
-  let selectedNotification: (typeof notifications)[number] | null = null;
-  for (const n of notifications) {
+  let selectedNotification: (typeof visibleNotifications)[number] | null = null;
+  for (const n of visibleNotifications) {
     if (n.id === selectedNotificationId) {
       selectedNotification = n;
       break;
@@ -480,12 +518,20 @@ export default function App() {
     }
   });
 
+  const openSettingsView = (route: "settings" | "arkpulse", initialTab: number | null = null) => {
+    setSettingsInitialTab(initialTab);
+    navigateToView(route);
+  };
+
   const closeSettingsModal = () => {
+    setSettingsInitialTab(null);
     const fallback = lastNonSettingsView === "settings" ? "overview" : lastNonSettingsView;
     navigateToView(fallback, true);
   };
 
-  const activeView: ViewKey = view === "settings" ? lastNonSettingsView : view;
+  const settingsModalOpen = view === "settings";
+  const activeView: ViewKey = settingsModalOpen ? lastNonSettingsView : view;
+  const workspaceView = activeView as Exclude<ViewKey, "overview" | "settings">;
 
   return (
       <Box className="agi-shell">
@@ -533,7 +579,7 @@ export default function App() {
             </IconButton>
           </Tooltip>
           <Tooltip title="Settings">
-            <IconButton color="primary" onClick={() => navigateToView("settings")}>
+            <IconButton color="primary" onClick={() => openSettingsView("settings")}>
               <SettingsRoundedIcon />
             </IconButton>
           </Tooltip>
@@ -607,8 +653,8 @@ export default function App() {
               />
             ) : (
             <NativeWorkspace
-              view={activeView as Exclude<ViewKey, "overview">}
-              autoRefresh={autoRefresh}
+              view={workspaceView}
+              autoRefresh={settingsModalOpen ? false : autoRefresh}
               showAdvanced={showAdvanced}
             />
           )}
@@ -616,7 +662,7 @@ export default function App() {
       </Box>
 
       <Dialog
-        open={view === "settings"}
+        open={settingsModalOpen}
         onClose={closeSettingsModal}
         fullWidth
         maxWidth={false}
@@ -651,7 +697,12 @@ export default function App() {
           </IconButton>
         </DialogTitle>
         <DialogContent sx={{ p: 0, height: "100%", overflow: "hidden" }}>
-          <NativeWorkspace view="settings" autoRefresh={autoRefresh} showAdvanced={showAdvanced} />
+          <NativeWorkspace
+            view="settings"
+            autoRefresh={false}
+            showAdvanced={showAdvanced}
+            settingsInitialTab={settingsInitialTab}
+          />
         </DialogContent>
       </Dialog>
 
@@ -683,7 +734,7 @@ export default function App() {
             <Button
               size="small"
               onClick={() => markAllMutation.mutate()}
-              disabled={markAllMutation.isPending || notifications.length === 0}
+              disabled={markAllMutation.isPending || visibleNotifications.length === 0}
               sx={{
                 textTransform: "none",
                 fontSize: "0.75rem",
@@ -760,7 +811,7 @@ export default function App() {
           {filteredNotifications.length === 0 ? (
             <Box sx={{ p: 1.25 }}>
               <Typography variant="body2" color="text.secondary">
-                {notifications.length === 0 ? "No notifications yet." : "No notifications match this filter."}
+                {visibleNotifications.length === 0 ? "No notifications yet." : "No notifications match this filter."}
               </Typography>
             </Box>
           ) : (
