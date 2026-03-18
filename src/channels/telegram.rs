@@ -881,7 +881,9 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
                 /todo - View todo list\n\
                 /todo add <item> - Add todo\n\
                 /note <text> - Save a note\n\
-                /tasks - View pending tasks\n\n\
+                /tasks - View pending tasks\n\
+                /approve-task <task_id> - Approve a waiting task\n\
+                /reject-task <task_id> - Reject a waiting task\n\n\
                 🔍 Utilities:\n\
                 /weather [location] - Get weather\n\
                 /translate <text> - Translate\n\
@@ -1223,11 +1225,54 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
                             TaskStatus::Pending => "📌",
                             _ => "•",
                         };
-                        format!("{} {}", status, t.description)
+                        if matches!(t.status, TaskStatus::AwaitingApproval) {
+                            format!("{} {} [{}]", status, t.description, t.id)
+                        } else {
+                            format!("{} {}", status, t.description)
+                        }
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
                 format!("📋 Pending Tasks:\n\n{}", list)
+            }
+        }
+
+        "/approve-task" => {
+            if args.is_empty() {
+                "Usage: /approve-task <task_id>".to_string()
+            } else {
+                let Ok(task_id) = uuid::Uuid::parse_str(args) else {
+                    return "Invalid task id. Use the full task UUID shown in /tasks or the approval notification.".to_string();
+                };
+                let agent = agent.read().await;
+                match agent.approve_task_request(task_id, "telegram").await {
+                    Ok(Some(task)) => format!("âœ… Approved: {}", task.description),
+                    Ok(None) => "Task not found or is not awaiting approval.".to_string(),
+                    Err(e) => format!("âŒ Failed to approve task: {}", e),
+                }
+            }
+        }
+
+        "/reject-task" => {
+            if args.is_empty() {
+                "Usage: /reject-task <task_id>".to_string()
+            } else {
+                let Ok(task_id) = uuid::Uuid::parse_str(args) else {
+                    return "Invalid task id. Use the full task UUID shown in /tasks or the approval notification.".to_string();
+                };
+                let agent = agent.read().await;
+                match agent
+                    .reject_task_request(
+                        task_id,
+                        "telegram",
+                        "Task was rejected from Telegram and will not be executed.",
+                    )
+                    .await
+                {
+                    Ok(Some(task)) => format!("âœ… Rejected: {}", task.description),
+                    Ok(None) => "Task not found or is not awaiting approval.".to_string(),
+                    Err(e) => format!("âŒ Failed to reject task: {}", e),
+                }
             }
         }
 

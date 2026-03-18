@@ -99,6 +99,58 @@ fn merge_chat_visible_progress_payload(
     Some(serde_json::Value::Object(merged))
 }
 
+fn trace_json_data(value: serde_json::Value) -> Option<String> {
+    if value.is_null() {
+        None
+    } else {
+        serde_json::to_string_pretty(&value).ok()
+    }
+}
+
+async fn push_trace_step(
+    trace_ref: &Arc<RwLock<ExecutionTrace>>,
+    icon: &str,
+    title: impl Into<String>,
+    detail: impl Into<String>,
+    step_type: &str,
+    data: Option<serde_json::Value>,
+    duration_ms: Option<u64>,
+) {
+    trace_ref.write().await.steps.push(ExecutionStep {
+        icon: icon.to_string(),
+        title: title.into(),
+        detail: detail.into(),
+        step_type: step_type.to_string(),
+        data: data.and_then(trace_json_data),
+        timestamp: chrono::Utc::now(),
+        duration_ms,
+    });
+}
+
+fn json_changed_keys(previous_raw: Option<&[u8]>, next: &serde_json::Value) -> Vec<String> {
+    let previous = previous_raw
+        .and_then(|raw| serde_json::from_slice::<serde_json::Value>(raw).ok())
+        .unwrap_or(serde_json::Value::Null);
+
+    let (Some(previous_obj), Some(next_obj)) = (previous.as_object(), next.as_object()) else {
+        if previous == *next {
+            return Vec::new();
+        }
+        return vec!["policy".to_string()];
+    };
+
+    let mut changed = previous_obj
+        .keys()
+        .chain(next_obj.keys())
+        .cloned()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .filter(|key| previous_obj.get(key) != next_obj.get(key))
+        .collect::<Vec<_>>();
+    changed.sort();
+    changed
+}
+
 async fn send_app_deploy_progress_to_conversation(
     request_channel: &str,
     conversation_id: Option<&str>,
@@ -392,6 +444,45 @@ impl Agent {
         let canonical_args = Self::canonicalize_json_value(&call.arguments);
         let args = serde_json::to_string(&canonical_args).unwrap_or_else(|_| "{}".to_string());
         format!("{}:{}", normalized_name, args)
+    }
+
+    fn classify_self_tune_tool_output(output: &str) -> Option<bool> {
+        let lowered = output.trim().to_ascii_lowercase();
+        if lowered.is_empty()
+            || lowered.contains("blocked by safety policy")
+            || lowered.contains("blocked by saved user rule")
+        {
+            return None;
+        }
+        Some(!(lowered.starts_with("error ") || lowered.starts_with("error:")))
+    }
+
+    pub(crate) async fn record_self_tune_tool_outcome(
+        &self,
+        tool_name: &str,
+        success: bool,
+        latency_ms: u64,
+    ) {
+        if tool_name.trim().is_empty() {
+            return;
+        }
+        crate::core::self_tune::record_tool_outcome(&self.storage, tool_name, success, latency_ms)
+            .await;
+    }
+
+    async fn record_self_tune_tool_output(&self, tool_name: &str, output: &str, latency_ms: u64) {
+        if let Some(success) = Self::classify_self_tune_tool_output(output) {
+            self.record_self_tune_tool_outcome(tool_name, success, latency_ms)
+                .await;
+        }
+    }
+
+    pub(crate) async fn record_self_tune_autonomous_success(&self) {
+        crate::core::self_tune::record_autonomous_success(&self.storage).await;
+    }
+
+    pub(crate) async fn record_self_tune_user_rejection(&self) {
+        crate::core::self_tune::record_user_rejection(&self.storage).await;
     }
 
     fn find_json_object_bounds(raw: &str) -> Option<(usize, usize)> {
@@ -2142,6 +2233,43 @@ Do not include any extra prose.",
     }
 
     async fn load_public_base_url(&self) -> Option<String> {
+        let config_base = self
+            .config
+            .public_apps
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.trim_end_matches('/').to_string());
+        if config_base.is_some() {
+            return config_base;
+        }
+        if self.config.deployment_mode == crate::core::config::DeploymentMode::InternetFacing {
+            if let Some(bind_addr) = self
+                .config
+                .public_apps
+                .bind_addr
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                let normalized = if bind_addr.starts_with("0.0.0.0:") {
+                    format!("localhost:{}", bind_addr.trim_start_matches("0.0.0.0:"))
+                } else if bind_addr == "0.0.0.0" {
+                    "localhost".to_string()
+                } else if bind_addr.starts_with("[::]:") {
+                    format!("localhost:{}", bind_addr.trim_start_matches("[::]:"))
+                } else if bind_addr == "[::]" || bind_addr == "::" {
+                    "localhost".to_string()
+                } else if bind_addr.starts_with("127.0.0.1:") || bind_addr == "127.0.0.1" {
+                    bind_addr.replacen("127.0.0.1", "localhost", 1)
+                } else {
+                    bind_addr.to_string()
+                };
+                return Some(format!("http://{}", normalized.trim_end_matches('/')));
+            }
+        }
+
         self.storage
             .get("public_base_url")
             .await
@@ -2156,6 +2284,34 @@ Do not include any extra prose.",
                     .map(|s| s.trim().trim_end_matches('/').to_string())
                     .filter(|s| !s.is_empty())
             })
+    }
+
+    fn has_configured_public_base_url(&self) -> bool {
+        self.config
+            .public_apps
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+            || (self.config.deployment_mode == crate::core::config::DeploymentMode::InternetFacing
+                && self
+                    .config
+                    .public_apps
+                    .bind_addr
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|value| !value.is_empty()))
+    }
+
+    async fn load_public_selected_app_id(&self) -> Option<String> {
+        self.storage
+            .get("public_selected_app_id")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
     }
 
     fn internal_api_base_url() -> String {
@@ -2182,10 +2338,21 @@ Do not include any extra prose.",
 
     async fn ensure_public_tunnel_base_url(
         &self,
+        app_id: Option<&str>,
         stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
     ) -> Option<String> {
         if let Some(existing) = self.load_public_base_url().await {
-            return Some(existing);
+            if self.has_configured_public_base_url() {
+                return Some(existing);
+            }
+            let selected_app_id = self.load_public_selected_app_id().await;
+            let requested_app_id = app_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_string());
+            if requested_app_id.is_none() || selected_app_id == requested_app_id {
+                return Some(existing);
+            }
         }
         let client = match Self::build_internal_control_client() {
             Ok(c) => c,
@@ -2200,6 +2367,15 @@ Do not include any extra prose.",
         if let Some(key) = self.api_key.as_ref().filter(|k| !k.trim().is_empty()) {
             start_req = start_req.bearer_auth(key);
         }
+        let requested_app_id = app_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
+        let start_payload = match requested_app_id.as_deref() {
+            Some(app_id) => serde_json::json!({ "app_id": app_id }),
+            None => serde_json::json!({}),
+        };
+        start_req = start_req.json(&start_payload);
         let start_accepted = match start_req.send().await {
             Ok(resp) => {
                 if !resp.status().is_success() {
@@ -2235,12 +2411,26 @@ Do not include any extra prose.",
             if let Ok(resp) = status_req.send().await {
                 if resp.status().is_success() {
                     if let Ok(payload) = resp.json::<serde_json::Value>().await {
+                        let selected_app_matches = match requested_app_id.as_deref() {
+                            Some(app_id) => {
+                                payload
+                                    .get("selected_app_id")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::trim)
+                                    == Some(app_id)
+                            }
+                            None => true,
+                        };
                         if let Some(url) = payload
                             .get("url")
                             .and_then(|v| v.as_str())
                             .map(|v| v.trim().trim_end_matches('/').to_string())
                             .filter(|v| !v.is_empty())
                         {
+                            if !selected_app_matches {
+                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                continue;
+                            }
                             let _ = self.storage.set("public_base_url", url.as_bytes()).await;
                             return Some(url);
                         }
@@ -2250,7 +2440,16 @@ Do not include any extra prose.",
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
 
-        self.load_public_base_url().await
+        if let Some(existing) = self.load_public_base_url().await {
+            if self.has_configured_public_base_url() {
+                return Some(existing);
+            }
+            let selected_app_id = self.load_public_selected_app_id().await;
+            if requested_app_id.is_none() || selected_app_id == requested_app_id {
+                return Some(existing);
+            }
+        }
+        None
     }
 
     fn trigger_arkpulse_refresh(&self, reason: &'static str) {
@@ -2622,6 +2821,7 @@ Do not include any extra prose.",
         stream_tx: Option<tokio::sync::mpsc::Sender<StreamEvent>>,
         request_channel: &str,
     ) -> Result<String> {
+        let call_started = std::time::Instant::now();
         let synthetic = crate::core::llm::LlmResponse {
             content: String::new(),
             tool_calls: vec![call.clone()],
@@ -2630,8 +2830,29 @@ Do not include any extra prose.",
             provider: "internal".to_string(),
             model: "tool_dispatch".to_string(),
         };
-        self.execute_tool_calls_legacy(&synthetic, trace_ref, stream_tx, request_channel)
+        match self
+            .execute_tool_calls_legacy(&synthetic, trace_ref, stream_tx, request_channel)
             .await
+        {
+            Ok(output) => {
+                self.record_self_tune_tool_output(
+                    &call.name,
+                    &output,
+                    call_started.elapsed().as_millis() as u64,
+                )
+                .await;
+                Ok(output)
+            }
+            Err(error) => {
+                self.record_self_tune_tool_outcome(
+                    &call.name,
+                    false,
+                    call_started.elapsed().as_millis() as u64,
+                )
+                .await;
+                Err(error)
+            }
+        }
     }
 
     pub(crate) async fn handle_generate_image_tool_call(
@@ -2679,7 +2900,10 @@ Do not include any extra prose.",
         .await
     }
 
-    async fn restart_deployed_app_from_metadata(&self, app_id: &str) -> Result<serde_json::Value> {
+    pub(crate) async fn restart_deployed_app_from_metadata(
+        &self,
+        app_id: &str,
+    ) -> Result<serde_json::Value> {
         let app_id = app_id.trim();
         if app_id.is_empty() {
             anyhow::bail!("Missing app_id");
@@ -4242,6 +4466,7 @@ Do not include any extra prose.",
     pub(crate) async fn handle_self_evolve_tool_call(
         &self,
         call: &crate::core::llm::ToolCall,
+        trace_ref: &Arc<RwLock<ExecutionTrace>>,
         stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
     ) -> Result<String> {
         let request = call
@@ -4307,6 +4532,35 @@ Do not include any extra prose.",
             .map(|v| v.clamp(100, 100_000))
             .unwrap_or(4_000);
 
+        push_trace_step(
+            trace_ref,
+            "[evolve]",
+            "Self-Evolve Request",
+            format!(
+                "Requested {} evolution for AgentArk.",
+                if mode == "code" || mode == "codebase" {
+                    "code"
+                } else {
+                    "policy"
+                }
+            ),
+            "thinking",
+            Some(serde_json::json!({
+                "trace_kind": "self_evolve.request",
+                "request": request.clone(),
+                "mode": mode.clone(),
+                "allow_code_writes": allow_code_writes,
+                "apply_promotion": apply_promotion,
+                "canary_rollout_percent": canary_rollout_percent,
+                "canary_min_samples_per_version": canary_min_samples_per_version,
+                "canary_min_success_gain": canary_min_success_gain,
+                "canary_max_sign_test_p_value": canary_max_sign_test_p_value,
+                "replay_log_limit": replay_log_limit,
+            })),
+            None,
+        )
+        .await;
+
         if let Some(tx) = stream_tx {
             let _ = tx.try_send(StreamEvent::ToolStart {
                 name: "self_evolve".to_string(),
@@ -4325,6 +4579,7 @@ Do not include any extra prose.",
 
         match mode.as_str() {
             "policy" | "strategy" | "policy_strategy" => {
+                let policy_start = std::time::Instant::now();
                 let current_policy_raw = self
                     .storage
                     .get(crate::core::self_evolve::ROUTING_COMPLEXITY_POLICY_KEY)
@@ -4342,8 +4597,9 @@ Do not include any extra prose.",
                     .await?;
 
                 let mut promotion_applied = false;
-                let mut canary_state: Option<crate::core::self_evolve::strategy_runtime::CanaryRolloutState> =
-                    None;
+                let mut canary_state: Option<
+                    crate::core::self_evolve::strategy_runtime::CanaryRolloutState,
+                > = None;
                 let mut replay_result: Option<
                     crate::core::self_evolve::strategy_runtime::ReplayEvaluationResult,
                 > = None;
@@ -4376,7 +4632,8 @@ Do not include any extra prose.",
                                 .map(|s| s.baseline_version)
                             })
                             .unwrap_or_else(|| "routing-policy-default-v1".to_string());
-                        let candidate_version = format!("routing-candidate-{}", result.lineage_entry_id);
+                        let candidate_version =
+                            format!("routing-candidate-{}", result.lineage_entry_id);
 
                         self.storage
                             .set(
@@ -4384,16 +4641,17 @@ Do not include any extra prose.",
                                 &candidate_serialized,
                             )
                             .await?;
-                        let state = crate::core::self_evolve::strategy_runtime::CanaryRolloutState {
-                            enabled: true,
-                            baseline_version: baseline_version.clone(),
-                            candidate_version: candidate_version.clone(),
-                            rollout_percent: canary_rollout_percent,
-                            min_samples_per_version: canary_min_samples_per_version,
-                            min_success_gain: canary_min_success_gain,
-                            max_sign_test_p_value: canary_max_sign_test_p_value,
-                            activated_at: Some(chrono::Utc::now().to_rfc3339()),
-                        };
+                        let state =
+                            crate::core::self_evolve::strategy_runtime::CanaryRolloutState {
+                                enabled: true,
+                                baseline_version: baseline_version.clone(),
+                                candidate_version: candidate_version.clone(),
+                                rollout_percent: canary_rollout_percent,
+                                min_samples_per_version: canary_min_samples_per_version,
+                                min_success_gain: canary_min_success_gain,
+                                max_sign_test_p_value: canary_max_sign_test_p_value,
+                                activated_at: Some(chrono::Utc::now().to_rfc3339()),
+                            };
                         let state_bytes = serde_json::to_vec(&state)?;
                         self.storage
                             .set(
@@ -4479,6 +4737,107 @@ Do not include any extra prose.",
                     });
                 }
 
+                let changed_fields = result
+                    .promoted_policy
+                    .as_ref()
+                    .map(|policy| json_changed_keys(current_policy_raw.as_deref(), policy))
+                    .unwrap_or_default();
+                let policy_step_type = if result.success && result.promoted {
+                    "success"
+                } else if result.success {
+                    "info"
+                } else {
+                    "error"
+                };
+                let policy_detail = if result.success {
+                    format!(
+                        "Evaluated {} candidate policies. Accuracy {:.0}% → {:.0}% with gate `{}`.",
+                        result.evaluated_candidates,
+                        result.baseline_accuracy * 100.0,
+                        result.best_candidate_accuracy * 100.0,
+                        result.promotion_gate
+                    )
+                } else {
+                    format!(
+                        "Policy evolution failed: {}",
+                        result.error.as_deref().unwrap_or("unknown error")
+                    )
+                };
+                push_trace_step(
+                    trace_ref,
+                    "[evolve]",
+                    "Policy Evolution Evaluated",
+                    policy_detail,
+                    policy_step_type,
+                    Some(serde_json::json!({
+                        "trace_kind": "self_evolve.policy.result",
+                        "request": request.clone(),
+                        "mode": "policy",
+                        "target_key": result.target_key.clone(),
+                        "success": result.success,
+                        "promoted": result.promoted,
+                        "evaluated_candidates": result.evaluated_candidates,
+                        "baseline_accuracy": result.baseline_accuracy,
+                        "best_candidate_accuracy": result.best_candidate_accuracy,
+                        "accuracy_gain": result.accuracy_gain,
+                        "wins": result.wins,
+                        "losses": result.losses,
+                        "p_value": result.p_value,
+                        "candidate_source": result.candidate_source.clone(),
+                        "promotion_gate": result.promotion_gate.clone(),
+                        "lineage_entry_id": result.lineage_entry_id.clone(),
+                        "lineage_archive_path": result.lineage_archive_path.clone(),
+                        "notes": result.notes.clone(),
+                        "error": result.error.clone(),
+                        "changed_fields": changed_fields.clone(),
+                        "promoted_policy": result.promoted_policy.clone(),
+                    })),
+                    Some(policy_start.elapsed().as_millis() as u64),
+                )
+                .await;
+
+                let promotion_mode = if promoted_directly_to_baseline {
+                    "baseline"
+                } else if promotion_applied {
+                    "canary"
+                } else {
+                    "none"
+                };
+                let promotion_detail = if promoted_directly_to_baseline {
+                    "Replay evaluation promoted the candidate directly to baseline.".to_string()
+                } else if promotion_applied {
+                    format!(
+                        "Candidate activated in canary mode at {}% rollout.",
+                        canary_state
+                            .as_ref()
+                            .map(|state| state.rollout_percent)
+                            .unwrap_or(canary_rollout_percent)
+                    )
+                } else if result.promoted {
+                    "Candidate passed the promotion gate but was not applied.".to_string()
+                } else {
+                    format!("No promotion applied because `{}`.", result.promotion_gate)
+                };
+                push_trace_step(
+                    trace_ref,
+                    if promotion_applied { "[ok]" } else { "[info]" },
+                    "Policy Promotion Decision",
+                    promotion_detail,
+                    if promotion_applied { "success" } else { "info" },
+                    Some(serde_json::json!({
+                        "trace_kind": "self_evolve.policy.promotion",
+                        "request": request.clone(),
+                        "promotion_applied": promotion_applied,
+                        "apply_promotion_requested": apply_promotion,
+                        "promotion_mode": promotion_mode,
+                        "promoted_directly_to_baseline": promoted_directly_to_baseline,
+                        "canary_state": canary_state.clone(),
+                        "replay_evaluation": replay_result.clone(),
+                    })),
+                    None,
+                )
+                .await;
+
                 let mut value = serde_json::to_value(&result)?;
                 if let serde_json::Value::Object(obj) = &mut value {
                     obj.insert("mode".to_string(), serde_json::json!("policy"));
@@ -4560,6 +4919,21 @@ Do not include any extra prose.",
             }
             "code" | "codebase" => {
                 if !allow_code_writes {
+                    push_trace_step(
+                        trace_ref,
+                        "[warn]",
+                        "Code Evolution Blocked",
+                        "Code evolution requires explicit `allow_code_writes=true` before AgentArk will modify its own code.",
+                        "warning",
+                        Some(serde_json::json!({
+                            "trace_kind": "self_evolve.code.blocked",
+                            "request": request.clone(),
+                            "mode": "code",
+                            "allow_code_writes": allow_code_writes,
+                        })),
+                        None,
+                    )
+                    .await;
                     return Ok(serde_json::json!({
                         "status": "blocked",
                         "mode": "code",
@@ -4568,6 +4942,7 @@ Do not include any extra prose.",
                     .to_string());
                 }
 
+                let code_start = std::time::Instant::now();
                 let config = crate::core::self_evolve::SelfEvolveConfig {
                     max_iterations: 25,
                     max_build_fix_cycles: 5,
@@ -4601,16 +4976,70 @@ Do not include any extra prose.",
                     });
                 }
 
+                push_trace_step(
+                    trace_ref,
+                    if result.success { "[ok]" } else { "[error]" },
+                    if result.success {
+                        "Code Evolution Completed"
+                    } else {
+                        "Code Evolution Failed"
+                    },
+                    if result.success {
+                        format!(
+                            "Changed {} files over {} iteration(s).",
+                            result.files_changed.len(),
+                            result.iterations_used
+                        )
+                    } else {
+                        format!(
+                            "Code evolution failed after {} iteration(s).",
+                            result.iterations_used
+                        )
+                    },
+                    if result.success { "success" } else { "error" },
+                    Some(serde_json::json!({
+                        "trace_kind": "self_evolve.code.result",
+                        "request": request.clone(),
+                        "mode": "code",
+                        "success": result.success,
+                        "diff_summary": result.diff_summary.clone(),
+                        "files_changed": result.files_changed.clone(),
+                        "iterations_used": result.iterations_used,
+                        "error": result.error.clone(),
+                        "security_warnings": result.security_warnings.clone(),
+                        "push_recommended": result.push_recommended,
+                        "push_suggestion": result.push_suggestion.clone(),
+                    })),
+                    Some(code_start.elapsed().as_millis() as u64),
+                )
+                .await;
+
                 Ok(serde_json::to_string_pretty(&result)?)
             }
-            _ => Ok(serde_json::json!({
-                "status": "error",
-                "message": format!(
-                    "Unsupported self_evolve mode '{}'. Use mode='policy' (default) or mode='code'.",
-                    mode
-                ),
-            })
-            .to_string()),
+            _ => {
+                push_trace_step(
+                    trace_ref,
+                    "[error]",
+                    "Self-Evolve Mode Rejected",
+                    format!("Unsupported self_evolve mode '{}'.", mode),
+                    "error",
+                    Some(serde_json::json!({
+                        "trace_kind": "self_evolve.mode_error",
+                        "request": request.clone(),
+                        "mode": mode.clone(),
+                    })),
+                    None,
+                )
+                .await;
+                Ok(serde_json::json!({
+                    "status": "error",
+                    "message": format!(
+                        "Unsupported self_evolve mode '{}'. Use mode='policy' (default) or mode='code'.",
+                        mode
+                    ),
+                })
+                .to_string())
+            }
         }
     }
     /// Determine the project root (where Cargo.toml lives).
@@ -4756,6 +5185,7 @@ Do not include any extra prose.",
                 tracing::debug!("Tool '{}' handled by '{}'", call.name, handler.id());
                 match handler.handle(self, call, &ctx).await {
                     Ok(Some(output)) => {
+                        let latency_ms = call_started.elapsed().as_millis() as u64;
                         let lowered = output.trim().to_ascii_lowercase();
                         let blocked = lowered.contains("blocked by safety policy");
                         let success = !(lowered.starts_with("error ")
@@ -4780,7 +5210,7 @@ Do not include any extra prose.",
                             trace_id,
                             conversation_id,
                             tool_name: Some(&call.name),
-                            latency_ms: Some(call_started.elapsed().as_millis() as u64),
+                            latency_ms: Some(latency_ms),
                             arguments: Some(&call.arguments),
                             payload: Some(&payload),
                             strategy_version,
@@ -4789,6 +5219,10 @@ Do not include any extra prose.",
                             model_slot,
                         })
                         .await;
+                        if !blocked {
+                            self.record_self_tune_tool_outcome(&call.name, success, latency_ms)
+                                .await;
+                        }
                         results.push(ToolCallOutput {
                             name: call.name.clone(),
                             content: output,
@@ -4798,6 +5232,7 @@ Do not include any extra prose.",
                     }
                     Ok(None) => continue,
                     Err(e) => {
+                        let latency_ms = call_started.elapsed().as_millis() as u64;
                         let error_text = e.to_string();
                         let payload = serde_json::json!({
                             "handler": handler.id(),
@@ -4811,7 +5246,7 @@ Do not include any extra prose.",
                             trace_id,
                             conversation_id,
                             tool_name: Some(&call.name),
-                            latency_ms: Some(call_started.elapsed().as_millis() as u64),
+                            latency_ms: Some(latency_ms),
                             arguments: Some(&call.arguments),
                             payload: Some(&payload),
                             strategy_version,
@@ -4820,12 +5255,15 @@ Do not include any extra prose.",
                             model_slot,
                         })
                         .await;
+                        self.record_self_tune_tool_outcome(&call.name, false, latency_ms)
+                            .await;
                         return Err(e);
                     }
                 }
             }
 
             if !handled {
+                let latency_ms = call_started.elapsed().as_millis() as u64;
                 let msg = format!("No handler registered for tool '{}'", call.name);
                 let payload = serde_json::json!({
                     "handler": "none",
@@ -4839,7 +5277,7 @@ Do not include any extra prose.",
                     trace_id,
                     conversation_id,
                     tool_name: Some(&call.name),
-                    latency_ms: Some(call_started.elapsed().as_millis() as u64),
+                    latency_ms: Some(latency_ms),
                     arguments: Some(&call.arguments),
                     payload: Some(&payload),
                     strategy_version,
@@ -4848,6 +5286,8 @@ Do not include any extra prose.",
                     model_slot,
                 })
                 .await;
+                self.record_self_tune_tool_outcome(&call.name, false, latency_ms)
+                    .await;
                 if let Some(ref tx) = stream_tx {
                     let _ = tx.try_send(StreamEvent::ToolResult {
                         name: call.name.clone(),
@@ -4878,6 +5318,8 @@ Do not include any extra prose.",
         }
 
         let mut results = Vec::new();
+        let conversation_id = self.last_conversation_id.read().await.clone();
+        let conversation_id = conversation_id.as_deref();
         let sanitize_stream = |s: &str| -> String { self.sanitize_stream_preview(s) };
         let public_base_url = self.load_public_base_url().await;
         let integration_aliases = self.load_tool_integration_aliases().await;
@@ -4909,15 +5351,7 @@ Do not include any extra prose.",
             }
 
             // Check safety policy
-            let allowed = if self.should_auto_approve_action(&call.name) {
-                tracing::info!(
-                    "Auto-approving command-like action '{}' for AgentArk",
-                    call.name
-                );
-                true
-            } else {
-                self.safety.is_allowed(&call.name, &call.arguments).await?
-            };
+            let allowed = self.safety.is_allowed(&call.name, &call.arguments).await?;
             if !allowed {
                 let blocked = format!("Tool '{}' blocked by safety policy", call.name);
                 if let Some(ref tx) = stream_tx {
@@ -5251,6 +5685,7 @@ Do not include any extra prose.",
                     let notify_channel = channel.to_string();
                     let agent_config = self.config.clone();
                     let storage_clone = self.storage.clone();
+                    let encrypted_storage_clone = self.encrypted_storage.clone();
                     let notify_conversation_id = call
                         .arguments
                         .get("conversation_id")
@@ -5264,6 +5699,7 @@ Do not include any extra prose.",
                             let channel = notify_channel.clone();
                             let chat_id = chat_id.clone();
                             let storage = storage_clone.clone();
+                            let encrypted_storage = encrypted_storage_clone.clone();
                             let conversation_id = notify_conversation_id.clone();
                             let _screenshot = screenshot; // screenshots sent via channel-specific methods
                             tokio::spawn(async move {
@@ -5294,7 +5730,8 @@ Do not include any extra prose.",
                                         model_used: Some("browser_auto".to_string()),
                                         trace_id: None,
                                     };
-                                    let _ = storage.insert_message(&asst_msg).await;
+                                    let _ =
+                                        encrypted_storage.insert_message_encrypted(&asst_msg).await;
                                 }
 
                                 // Send to Telegram if configured
@@ -5685,7 +6122,10 @@ Do not include any extra prose.",
                                     )
                                 };
                                 let public_access_note = if expose_public_requested {
-                                    match self.ensure_public_tunnel_base_url(stream_tx.as_ref()).await {
+                                    match self
+                                        .ensure_public_tunnel_base_url(Some(&app_id), stream_tx.as_ref())
+                                        .await
+                                    {
                                         Some(base) => {
                                             format!("\nPublic access URL: {}/apps/{}/", base, app_id)
                                         }
@@ -5711,6 +6151,28 @@ Do not include any extra prose.",
                                      app_id,
                                      public_access_note
                                 );
+                                if let Some(cid) =
+                                    conversation_id.filter(|value| !value.trim().is_empty())
+                                {
+                                    self.remember_pending_secret_followup(
+                                        cid,
+                                        PendingSecretFollowupKind::RestartApp {
+                                            app_id: app_id.to_string(),
+                                            title: title.to_string(),
+                                            missing_env: parsed
+                                                .get("missing_env")
+                                                .and_then(|v| v.as_array())
+                                                .map(|arr| {
+                                                    arr.iter()
+                                                        .filter_map(|v| v.as_str())
+                                                        .map(|value| value.to_string())
+                                                        .collect::<Vec<_>>()
+                                                })
+                                                .unwrap_or_default(),
+                                        },
+                                    )
+                                    .await;
+                                }
                                 if let Some(ref tx) = stream_tx {
                                     let _ = tx.try_send(StreamEvent::ToolResult {
                                         name: call.name.clone(),
@@ -5750,10 +6212,9 @@ Do not include any extra prose.",
                                     .get("access_guard_enabled")
                                     .and_then(|v| v.as_bool())
                                     .unwrap_or(!access_key.is_empty());
-                                let mut url_with_key = parsed
-                                    .get("access_url")
+                                let canonical_relative_url = parsed
+                                    .get("url")
                                     .and_then(|v| v.as_str())
-                                    .or_else(|| parsed.get("url").and_then(|v| v.as_str()))
                                     .map(|s| s.to_string())
                                     .unwrap_or_else(|| {
                                         if !app_id_raw.is_empty() {
@@ -5762,6 +6223,11 @@ Do not include any extra prose.",
                                             "/apps/".to_string()
                                         }
                                     });
+                                let mut url_with_key = parsed
+                                    .get("access_url")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_else(|| canonical_relative_url.clone());
                                 if access_guard_enabled
                                     && !access_key.is_empty()
                                     && !url_with_key.contains("key=")
@@ -5773,9 +6239,12 @@ Do not include any extra prose.",
                                     url_with_key.push_str(&access_key);
                                 }
                                 let mut public_base_for_app = if expose_public_requested {
-                                    self.ensure_public_tunnel_base_url(stream_tx.as_ref())
-                                        .await
-                                        .or_else(|| public_base_url.clone())
+                                    self.ensure_public_tunnel_base_url(
+                                        Some(&app_id),
+                                        stream_tx.as_ref(),
+                                    )
+                                    .await
+                                    .or_else(|| public_base_url.clone())
                                 } else {
                                     public_base_url.clone()
                                 };
@@ -5798,34 +6267,31 @@ Do not include any extra prose.",
                                     // Re-run discovery here so the final chat reply includes the
                                     // public link whenever it is already available.
                                     public_base_for_app = self
-                                        .ensure_public_tunnel_base_url(None)
+                                        .ensure_public_tunnel_base_url(Some(&app_id), None)
                                         .await
                                         .or_else(|| public_base_url.clone());
-                                    if public_base_for_app.is_none() {
-                                        public_base_for_app = self.load_public_base_url().await;
-                                    }
                                 }
                                 if expose_public_requested && !had_public_base {
                                     if let (Some(public_base), Some(tx)) =
                                         (public_base_for_app.as_deref(), stream_tx.as_ref())
                                     {
-                                        let public_access_url = Self::absolutize_public_url(
+                                        let public_open_url = Self::absolutize_public_url(
                                             Some(public_base),
-                                            &url_with_key,
+                                            &canonical_relative_url,
                                         );
                                         let _ = tx.try_send(StreamEvent::ToolResult {
                                             name: call.name.clone(),
                                             content: format!(
                                                 "Public URL ready: {}",
-                                                public_access_url
+                                                public_open_url
                                             ),
                                         });
                                     }
                                 }
                                 let local_base_url = Self::user_facing_local_base_url();
-                                let local_access_url = Self::absolutize_public_url(
+                                let local_open_url = Self::absolutize_public_url(
                                     Some(local_base_url.as_str()),
-                                    &url_with_key,
+                                    &canonical_relative_url,
                                 );
                                 if let Some(cid) = call
                                     .arguments
@@ -5883,44 +6349,62 @@ Do not include any extra prose.",
                                 if verified {
                                     app_message_lines.push(format!(
                                         "- Local: [Open local app]({})",
-                                        local_access_url
+                                        local_open_url
                                     ));
                                 } else {
                                     app_message_lines.push(format!(
                                         "- Local (unverified): [Open local app]({})",
-                                        local_access_url
+                                        local_open_url
                                     ));
                                 }
                                 if let Some(public_base) = public_base_for_app.as_deref() {
-                                    let public_access_url = Self::absolutize_public_url(
+                                    let public_open_url = Self::absolutize_public_url(
                                         Some(public_base),
-                                        &url_with_key,
+                                        &canonical_relative_url,
                                     );
-                                    if public_access_url != local_access_url {
+                                    if public_open_url != local_open_url {
                                         if verified {
                                             app_message_lines.push(format!(
                                                 "- Public: [Open public app]({})",
-                                                public_access_url
+                                                public_open_url
                                             ));
                                         } else {
                                             app_message_lines.push(format!(
                                                 "- Public (unverified): [Open public app]({})",
-                                                public_access_url
+                                                public_open_url
                                             ));
                                         }
                                     }
                                 } else if expose_public_requested {
-                                    app_message_lines
-                                        .push("- Public: pending tunnel readiness.".to_string());
+                                    app_message_lines.push(
+                                        "- Public: pending tunnel readiness for this app."
+                                            .to_string(),
+                                    );
                                 }
 
                                 if access_guard_enabled {
                                     app_message_lines.push("- Access guard: enabled.".to_string());
+                                    if !access_key.trim().is_empty() {
+                                        app_message_lines
+                                            .push(format!("- Access key: `{}`", access_key.trim()));
+                                        app_message_lines.push(
+                                            "- Open the link above and enter the access key if prompted."
+                                                .to_string(),
+                                        );
+                                    }
                                 } else {
                                     app_message_lines
                                         .push("- Access guard: not enabled.".to_string());
                                 }
 
+                                app_message_lines.push(format!(
+                                    "- Webpage status: {}",
+                                    if verified {
+                                        "reachable and validated."
+                                    } else {
+                                        "deployed, but validation has not passed yet."
+                                    }
+                                ));
                                 app_message_lines.push(format!(
                                     "- Deployment validation: {} (attempts: {}).",
                                     if verified { "passed" } else { "failed" },
@@ -6048,8 +6532,8 @@ Do not include any extra prose.",
                         let mut current_args = call.arguments.clone();
 
                         // Self-heal loop: retry on execution errors
-                        const MAX_SAME_ERROR_RETRIES: usize = 3;
-                        const MAX_TOTAL_RETRIES: usize = 7;
+                        const MAX_SAME_ERROR_RETRIES: usize = 2;
+                        const MAX_TOTAL_RETRIES: usize = 3;
                         let mut total_retries = 0usize;
                         let mut last_error_sig = String::new();
                         let mut same_error_count = 0usize;
@@ -6108,6 +6592,20 @@ Do not include any extra prose.",
                                 parsed.get("error").and_then(|v| v.as_str()).unwrap_or("");
                             let output_text =
                                 parsed.get("output").and_then(|v| v.as_str()).unwrap_or("");
+
+                            // Bail immediately on sandbox-environment errors that retries cannot fix
+                            let combined_for_check = format!("{}\n{}", error_text, output_text);
+                            let is_sandbox_unreachable = combined_for_check
+                                .contains("No such file or directory")
+                                && (combined_for_check.contains("/app/data/")
+                                    || combined_for_check.contains("os.chdir"));
+                            if is_sandbox_unreachable {
+                                self_heal_stop_reason = Some(
+                                    "sandbox cannot access app data paths — use file_write/file_read tools instead".to_string(),
+                                );
+                                break;
+                            }
+
                             // Build error signature for same-error detection
                             let error_combined = format!("{}\n{}", error_text, output_text);
                             let error_sig = error_combined
@@ -6575,6 +7073,19 @@ Do not include any extra prose.",
                     }
 
                     if let Some(payload) = parse_workflow_missing_inputs_marker(&result) {
+                        if !Self::sensitive_like_input_keys(&payload.missing).is_empty() {
+                            if let Some(cid) =
+                                conversation_id.filter(|value| !value.trim().is_empty())
+                            {
+                                self.remember_pending_secret_followup(
+                                    cid,
+                                    PendingSecretFollowupKind::RetryWorkflow {
+                                        payload: payload.clone(),
+                                    },
+                                )
+                                .await;
+                            }
+                        }
                         let prompt = Self::format_missing_inputs_prompt(&payload);
                         if let Some(ref tx) = stream_tx {
                             let _ = tx.try_send(StreamEvent::ToolResult {

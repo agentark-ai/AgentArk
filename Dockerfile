@@ -63,6 +63,7 @@ FROM node:20-slim AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm pkg delete devDependencies.@rollup/rollup-win32-x64-msvc 2>/dev/null; npm ci || npm install
+ARG FRONTEND_CACHEBUST=0
 COPY frontend/src ./src
 COPY frontend/index.html frontend/tsconfig.json frontend/tsconfig.node.json frontend/vite.config.ts ./
 RUN npm run build
@@ -135,6 +136,12 @@ COPY --chown=agent:agent services/mem0-bridge/app.py /app/mem0-bridge/
 # Pinned version for reproducible builds — update deliberately after testing.
 ADD https://github.com/cloudflare/cloudflared/releases/download/2026.2.0/cloudflared-linux-amd64 /usr/local/bin/cloudflared
 RUN chmod +x /usr/local/bin/cloudflared
+
+# Download Lightpanda for fast headless content extraction (~6MB vs ~1.5GB Chromium)
+# Used as fast-path for http_get, web search scraping, and research content fetching.
+# Playwright remains for screenshots and complex SPA interaction.
+ADD https://github.com/lightpanda-io/browser/releases/download/nightly/lightpanda-x86_64-linux /usr/local/bin/lightpanda
+RUN chmod +x /usr/local/bin/lightpanda
 
 # Copy pre-built bridges with node_modules (owned by agent)
 COPY --from=node-builder --chown=agent:agent /bridge/whatsapp-bridge /app/whatsapp-bridge

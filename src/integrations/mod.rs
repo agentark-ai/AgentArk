@@ -5,6 +5,7 @@
 
 pub mod browser;
 pub mod calendar;
+pub mod lightpanda;
 pub mod ga4;
 pub mod garmin;
 pub mod github;

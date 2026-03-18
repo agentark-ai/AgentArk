@@ -14,6 +14,7 @@ import {
   DialogActions,
   DialogContent,
   DialogTitle,
+  Drawer,
   Divider,
   FormControlLabel,
   Grid2,
@@ -44,6 +45,7 @@ import AttachFileRoundedIcon from "@mui/icons-material/AttachFileRounded";
 import ChevronLeftRoundedIcon from "@mui/icons-material/ChevronLeftRounded";
 import ChevronRightRoundedIcon from "@mui/icons-material/ChevronRightRounded";
 import ContentCopyRoundedIcon from "@mui/icons-material/ContentCopyRounded";
+import FileDownloadRoundedIcon from "@mui/icons-material/FileDownloadRounded";
 import MoreVertIcon from "@mui/icons-material/MoreVert";
 import ArrowUpwardRoundedIcon from "@mui/icons-material/ArrowUpwardRounded";
 import StopRoundedIcon from "@mui/icons-material/StopRounded";
@@ -673,6 +675,11 @@ function parseArkPulseRemediationSpec(value: unknown): ArkPulseRemediationSpec |
   if (kind === "tunnel_restart_verify") {
     return { kind: "tunnel_restart_verify" };
   }
+  if (kind === "app_restart") {
+    const appId = str(row.app_id, "").trim();
+    if (!appId) return null;
+    return { kind: "app_restart", app_id: appId };
+  }
   if (kind === "shell_command") {
     const command = str(row.command, "").trim();
     if (!command) return null;
@@ -689,6 +696,9 @@ function describeArkPulseRemediation(remediation: ArkPulseRemediationSpec | null
   if (remediation.kind === "tunnel_restart_verify") {
     return "Restart tunnel and verify public reachability";
   }
+  if (remediation.kind === "app_restart") {
+    return `Restart app ${remediation.app_id} and re-check health`;
+  }
   return remediation.command.trim() || "-";
 }
 
@@ -703,6 +713,10 @@ function classifyLegacyRunnableArkPulseFixCommand(value: string): ArkPulseRemedi
   }
   if (lower.includes("restart") && lower.includes("tunnel")) {
     return { kind: "tunnel_restart_verify" };
+  }
+  const appRestartMatch = normalized.match(/^POST\s+\/api\/apps\/([A-Za-z0-9_-]+)\/restart$/i);
+  if (appRestartMatch?.[1]) {
+    return { kind: "app_restart", app_id: appRestartMatch[1] };
   }
 
   if (
@@ -747,9 +761,11 @@ function getRunnableArkPulseRemediation(value: unknown): ArkPulseRemediationSpec
 
 function getArkPulseFixText(value: unknown): string {
   const row = asRecord(value);
+  const remediation = parseArkPulseRemediationSpec(row.remediation);
+  if (remediation) return describeArkPulseRemediation(remediation);
   const fix = str(row.fix_command, "").trim();
   if (fix) return fix;
-  return describeArkPulseRemediation(parseArkPulseRemediationSpec(row.remediation));
+  return "-";
 }
 
 function parseChatMarkdown(source: string): ChatMarkdownBlock[] {
@@ -935,47 +951,80 @@ function renderMarkdownLineBreaks(text: string): ReactNode[] {
   return out;
 }
 
-function renderChatMarkdown(text: string): ReactNode {
-  const blocks = parseChatMarkdown(text || "");
-  if (blocks.length === 0) return null;
+// Async-loaded react-markdown for proper GFM rendering
+let _ReactMarkdown: React.ComponentType<{ children: string; remarkPlugins?: unknown[]; components?: Record<string, unknown> }> | null = null;
+let _remarkGfm: unknown = null;
+let _mdReady = false;
+let _mdLoadPromise: Promise<void> | null = null;
 
+function ensureMarkdownLoaded(): Promise<void> {
+  if (_mdReady) return Promise.resolve();
+  if (_mdLoadPromise) return _mdLoadPromise;
+  _mdLoadPromise = Promise.all([
+    import("react-markdown").then((m) => { _ReactMarkdown = m.default as typeof _ReactMarkdown; }),
+    import("remark-gfm").then((m) => { _remarkGfm = m.default; }),
+  ]).then(() => { _mdReady = true; });
+  return _mdLoadPromise;
+}
+
+// Eagerly start loading
+ensureMarkdownLoaded();
+
+function MarkdownBody({ text }: { text: string }) {
+  const [ready, setReady] = useState(_mdReady);
+  useEffect(() => { if (!ready) ensureMarkdownLoaded().then(() => setReady(true)); }, [ready]);
+
+  if (!ready || !_ReactMarkdown) {
+    return <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>{text}</Typography>;
+  }
+
+  const Md = _ReactMarkdown;
+  return (
+    <Md
+      remarkPlugins={_remarkGfm ? [_remarkGfm as never] : []}
+      components={{
+        h1: ({ children }: { children?: React.ReactNode }) => <Typography className="chat-md-heading chat-md-h1">{children}</Typography>,
+        h2: ({ children }: { children?: React.ReactNode }) => <Typography className="chat-md-heading chat-md-h2">{children}</Typography>,
+        h3: ({ children }: { children?: React.ReactNode }) => <Typography className="chat-md-heading chat-md-h3">{children}</Typography>,
+        h4: ({ children }: { children?: React.ReactNode }) => <Typography className="chat-md-heading chat-md-h4">{children}</Typography>,
+        p: ({ children }: { children?: React.ReactNode }) => <Typography variant="body2" className="chat-md-paragraph">{children}</Typography>,
+        a: ({ href, children }: { href?: string; children?: React.ReactNode }) => <a className="chat-md-link" href={href} target="_blank" rel="noopener noreferrer">{children}</a>,
+        code: ({ className, children }: { className?: string; children?: React.ReactNode }) => {
+          const isBlock = className?.startsWith("language-");
+          if (!isBlock) return <code className="chat-md-inline-code">{children}</code>;
+          const lang = className?.replace("language-", "") || "";
+          return (
+            <Box className="chat-md-code-wrap">
+              {lang ? <div className="chat-md-code-lang">{lang}</div> : null}
+              <pre className="chat-md-code"><code>{children}</code></pre>
+            </Box>
+          );
+        },
+        ul: ({ children }: { children?: React.ReactNode }) => <Box component="ul" className="chat-md-list">{children}</Box>,
+        ol: ({ children }: { children?: React.ReactNode }) => <Box component="ol" className="chat-md-list">{children}</Box>,
+        table: ({ children }: { children?: React.ReactNode }) => (
+          <Box sx={{ overflowX: "auto", my: 1 }}>
+            <table style={{ borderCollapse: "collapse", width: "100%", fontSize: "0.85rem" }}>{children}</table>
+          </Box>
+        ),
+        th: ({ children }: { children?: React.ReactNode }) => <th style={{ border: "1px solid rgba(255,255,255,0.12)", padding: "6px 10px", textAlign: "left", fontWeight: 600 }}>{children}</th>,
+        td: ({ children }: { children?: React.ReactNode }) => <td style={{ border: "1px solid rgba(255,255,255,0.08)", padding: "6px 10px" }}>{children}</td>,
+        blockquote: ({ children }: { children?: React.ReactNode }) => (
+          <Box sx={{ borderLeft: "3px solid rgba(47,212,255,0.4)", pl: 1.5, my: 0.5, color: "text.secondary" }}>{children}</Box>
+        ),
+        hr: () => <Box component="hr" sx={{ border: "none", borderTop: "1px solid rgba(255,255,255,0.08)", my: 1 }} />,
+      } as Record<string, unknown>}
+    >
+      {text}
+    </Md>
+  );
+}
+
+function renderChatMarkdown(text: string): ReactNode {
+  if (!text?.trim()) return null;
   return (
     <Box className="chat-markdown">
-      {blocks.map((block, idx) => {
-        const key = `${block.type}-${idx}`;
-        if (block.type === "heading") {
-          return (
-            <Typography key={key} className={`chat-md-heading chat-md-h${Math.min(6, Math.max(1, block.level))}`}>
-              {renderInlineMarkdown(block.text)}
-            </Typography>
-          );
-        }
-        if (block.type === "code") {
-          return (
-            <Box key={key} className="chat-md-code-wrap">
-              {block.language ? <div className="chat-md-code-lang">{block.language}</div> : null}
-              <pre className="chat-md-code">
-                <code>{block.content}</code>
-              </pre>
-            </Box>
-          );
-        }
-        if (block.type === "ul" || block.type === "ol") {
-          const ListTag = block.type === "ul" ? "ul" : "ol";
-          return (
-            <Box key={key} component={ListTag} className="chat-md-list">
-              {block.items.map((item, itemIdx) => (
-                <li key={`${key}-item-${itemIdx}`}>{renderInlineMarkdown(item)}</li>
-              ))}
-            </Box>
-          );
-        }
-        return (
-          <Typography key={key} variant="body2" className="chat-md-paragraph">
-            {renderMarkdownLineBreaks(block.text)}
-          </Typography>
-        );
-      })}
+      <MarkdownBody text={text} />
     </Box>
   );
 }
@@ -1499,6 +1548,18 @@ function toAbsoluteAppUrl(pathOrUrl: string, baseOrigin: string): string {
   return `${base}/${value}`;
 }
 
+function extractAccessKeyFromUrl(pathOrUrl: string, baseOrigin: string): string {
+  const value = (pathOrUrl || "").trim();
+  if (!value) return "";
+  try {
+    const fallbackBase = (baseOrigin || "http://localhost").trim();
+    const parsed = new URL(value, fallbackBase);
+    return (parsed.searchParams.get("key") || "").trim();
+  } catch {
+    return "";
+  }
+}
+
 function dedupeLinkTargets(targets: Array<{ label: string; url: string }>): Array<{ label: string; url: string }> {
   const seen = new Set<string>();
   const out: Array<{ label: string; url: string }> = [];
@@ -1536,6 +1597,23 @@ function formatTimestampForHumans(value: string): { label: string; tooltip: stri
     minute: "2-digit"
   });
   return { label: fmt.format(dt), tooltip: value };
+}
+
+/** Format a trace step time string to local human-readable.
+ *  Input: ISO timestamp like "2026-03-16T09:02:40Z" or "2026-03-16T09:02:40Z (1396ms)"
+ *  Output: "12 Mar, 2:32 PM (1396ms)" — local time with optional duration
+ */
+function formatTraceStepTime(raw: string): string {
+  if (!raw) return "";
+  // Split off optional "(Xms)" suffix
+  const match = raw.match(/^(.+?)(\s*\(\d+ms\))?$/);
+  if (!match) return raw;
+  const isopart = match[1].trim();
+  const durationPart = match[2]?.trim() || "";
+  const dt = new Date(isopart);
+  if (Number.isNaN(dt.getTime())) return raw;
+  const time = dt.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit", second: "2-digit" });
+  return durationPart ? `${time} ${durationPart}` : time;
 }
 
 function formatRelativeTimeFromNow(date: Date): string {
@@ -3079,6 +3157,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
   const [streamingProgressMessages, setStreamingProgressMessages] = useState<string[]>([]);
   const [streamTraceOpen, setStreamTraceOpen] = useState(false);
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
+  const [conversationSidebarOpen, setConversationSidebarOpen] = useState(false);
   const [activityAutoFollow, setActivityAutoFollow] = useState(true);
   const [secretHelperMode, setSecretHelperMode] = useState<"reuse" | "manual">("reuse");
   const [secretHelperKey, setSecretHelperKey] = useState("OPENAI_API_KEY");
@@ -3246,8 +3325,11 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
           pending.streamingSteps.length > 0 &&
           streamingStepsRef.current.length === 0
         ) {
-          setStreamingSteps(pending.streamingSteps);
-          streamingStepsRef.current = pending.streamingSteps;
+          const restoredSteps = pending.streamingSteps.map((step) =>
+            ensureActivityStepTime(asRecord(step))
+          );
+          setStreamingSteps(restoredSteps);
+          streamingStepsRef.current = restoredSteps;
         }
         return;
       }
@@ -3758,7 +3840,11 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
   const parseTraceSteps = (payload: unknown): JsonRecord[] => {
     const rec = asRecord(payload);
     const raw = Array.isArray(rec.steps) ? rec.steps : Array.isArray(rec.trace) ? rec.trace : [];
-    return compressActivitySteps(raw.filter((x) => x && typeof x === "object") as JsonRecord[]);
+    return compressActivitySteps(
+      raw
+        .filter((x) => x && typeof x === "object")
+        .map((x) => normalizeActivityStepTime(asRecord(x)))
+    );
   };
 
   const loadTraceForId = async (traceId: string) => {
@@ -3844,6 +3930,9 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     setStreamTraceOpen(false);
     setMessageTraceOpen({});
     setConversationId(id);
+    if (typeof window !== "undefined" && window.innerWidth < 980) {
+      setConversationSidebarOpen(false);
+    }
     if (pendingRunSnapshot?.conversationId === id) {
       if (pendingRunSnapshot.message) {
         setPendingUserMessage(pendingRunSnapshot.message);
@@ -4105,16 +4194,53 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
         lines.push(content);
         lines.push("");
       }
-      const blob = new Blob([lines.join("\n")], { type: "text/plain;charset=utf-8" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `${safe}-${stamp}.txt`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
+      downloadTextFile(`${safe}-${stamp}.txt`, lines.join("\n"), "text/plain;charset=utf-8");
       setChatNotice("Chat exported.");
+    } catch (err) {
+      setChatError(normalizeChatError(errMessage(err)));
+    }
+  };
+
+  const downloadTextFile = (filename: string, content: string, mimeType = "text/plain;charset=utf-8") => {
+    const blob = new Blob([content], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const exportAssistantMessage = async (message: JsonRecord, previousUserPrompt?: string) => {
+    try {
+      const content = str(message.content, "").trim();
+      if (!content) throw new Error("Nothing to export.");
+      const prompt = (previousUserPrompt || "").trim();
+      const conversationTitle = str(selectedConversation?.title, "").trim() || "research";
+      const heading = prompt || conversationTitle || "research";
+      const safe = heading.replace(/[^\w.-]+/g, "_").replace(/^_+|_+$/g, "").toLowerCase() || "research";
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const timestamp = str(message.timestamp, "").trim();
+      const traceId = str(message.trace_id, "").trim();
+      const lines: string[] = [];
+      lines.push(`# ${heading}`);
+      if (conversationId) lines.push(`conversation_id: ${conversationId}`);
+      if (timestamp) lines.push(`assistant_timestamp: ${timestamp}`);
+      if (traceId) lines.push(`trace_id: ${traceId}`);
+      lines.push(`exported_at: ${new Date().toISOString()}`);
+      lines.push("");
+      if (prompt) {
+        lines.push("## Prompt");
+        lines.push(prompt);
+        lines.push("");
+      }
+      lines.push("## Response");
+      lines.push(content);
+      lines.push("");
+      downloadTextFile(`${safe}-${stamp}.md`, lines.join("\n"), "text/markdown;charset=utf-8");
+      setChatNotice("Reply exported.");
     } catch (err) {
       setChatError(normalizeChatError(errMessage(err)));
     }
@@ -4163,19 +4289,46 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     setConversationMenuTarget(null);
   };
 
+  const normalizeActivityStepTime = (step: JsonRecord): JsonRecord => {
+    const directTime =
+      str(step.time, "").trim() ||
+      str(step.timestamp, "").trim() ||
+      str(step.created_at, "").trim() ||
+      str(step.createdAt, "").trim() ||
+      str(step.at, "").trim();
+    if (!directTime) return step;
+    if (str(step.time, "").trim() === directTime) return step;
+    return {
+      ...step,
+      time: directTime
+    };
+  };
+
+  const ensureActivityStepTime = (step: JsonRecord, fallbackTime?: string): JsonRecord => {
+    const normalized = normalizeActivityStepTime(step);
+    if (str(normalized.time, "").trim()) return normalized;
+    const stamp = (fallbackTime || new Date().toISOString()).trim();
+    if (!stamp) return normalized;
+    return {
+      ...normalized,
+      time: stamp
+    };
+  };
+
   const normalizeActivityStepForDisplay = (step: JsonRecord): JsonRecord => {
-    if (isHeartbeatStreamingStep(step)) {
+    const timedStep = normalizeActivityStepTime(step);
+    if (isHeartbeatStreamingStep(timedStep)) {
       return {
-        ...step,
+        ...timedStep,
         step_type: "heartbeat",
         title: "Still Working",
-        detail: normalizeHeartbeatDetailText(str(step.detail, ""))
+        detail: normalizeHeartbeatDetailText(str(timedStep.detail, ""))
       };
     }
 
-    const title = str(step.title, "");
-    const stepType = normalizeStatusText(str(step.step_type, str(step.type, "")));
-    const detail = str(step.detail, "").trim();
+    const title = str(timedStep.title, "");
+    const stepType = normalizeStatusText(str(timedStep.step_type, str(timedStep.type, "")));
+    const detail = str(timedStep.detail, "").trim();
     const lowerTitle = title.toLowerCase();
     const isToolActivity =
       stepType.includes("tool_progress") ||
@@ -4183,11 +4336,11 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
       lowerTitle.startsWith("tool progress:") ||
       lowerTitle.startsWith("tool finished:");
 
-    if (!isToolActivity || !detail) return step;
+    if (!isToolActivity || !detail) return timedStep;
     const summarized = simplifyConsoleDetail(summarizeActivityDetail(detail));
-    if (!summarized || summarized === detail) return step;
+    if (!summarized || summarized === detail) return timedStep;
     return {
-      ...step,
+      ...timedStep,
       detail: summarized
     };
   };
@@ -4254,7 +4407,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
 
   const pushStreamingStep = (step: JsonRecord) => {
     setStreamingSteps((prev) => {
-      const normalizedStep = normalizeActivityStepForDisplay(step);
+      const normalizedStep = ensureActivityStepTime(normalizeActivityStepForDisplay(step));
       const incomingHeartbeat = isHeartbeatStreamingStep(normalizedStep);
       let next: JsonRecord[];
       if (incomingHeartbeat) {
@@ -4746,6 +4899,25 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     visibleStreamingResponse.trim()
   );
   const hasRenderableThread = messages.length > 0 || hasLiveThreadActivity;
+  const showEmptyHero =
+    !hasRenderableThread &&
+    !showStreamingAssistant &&
+    !visiblePendingUserMessage &&
+    !visibleFailedUserMessage;
+  const starterPrompts = [
+    {
+      label: "Review recent changes",
+      prompt: "Review recent changes and list only the critical risks."
+    },
+    {
+      label: "Plan a UI cleanup",
+      prompt: "Plan and implement a cleaner UI that fits the viewport better."
+    },
+    {
+      label: "Summarize the project",
+      prompt: "Summarize the current project architecture and suggest the next steps."
+    }
+  ];
   const origin = typeof window !== "undefined" ? window.location.origin : "";
   const latestAssistantMessageText = str(
     [...messages].reverse().find((m) => str(m.role, "").toLowerCase() === "assistant")?.content,
@@ -4904,6 +5076,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     return { label: "No app runtime yet", tone: "default" as const };
   })();
   const showWorkspacePanel = workspaceOpen;
+  const showConversationSidebar = conversationSidebarOpen;
   const chatErrorLower = (chatError || "").toLowerCase();
   const chatErrorNormalized = chatError ? normalizeChatError(chatError).toLowerCase() : "";
   const apiKeyActionNeeded =
@@ -5060,115 +5233,131 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
         display: "grid",
         gridTemplateColumns: {
           xs: "1fr",
-          md: "228px minmax(0,1fr)",
           lg: showWorkspacePanel
-            ? "228px minmax(0,1fr) clamp(300px, 24vw, 340px)"
-            : "228px minmax(0,1fr)"
+            ? "minmax(0,1fr) clamp(300px, 24vw, 340px)"
+            : "minmax(0,1fr)",
+          xl: showWorkspacePanel
+            ? showConversationSidebar
+              ? "clamp(210px, 16vw, 232px) minmax(0,1fr) clamp(300px, 24vw, 340px)"
+              : "minmax(0,1fr) clamp(300px, 24vw, 340px)"
+            : showConversationSidebar
+              ? "clamp(210px, 16vw, 232px) minmax(0,1fr)"
+              : "minmax(0,1fr)"
         },
         gap: 1
       }}
     >
-      <Box className="list-shell chat-sidebar" sx={{ minHeight: 0, display: "flex", flexDirection: "column" }}>
-        <Stack direction="row" justifyContent="space-between" alignItems="center" mb={1}>
-          <Typography variant="h6">Conversations</Typography>
-          <Button size="small" onClick={startNewConversation}>
-            New
-          </Button>
-        </Stack>
-
-        <Box sx={{ flex: 1, minHeight: 0, overflow: "auto", pr: 0.5 }}>
-          <Stack spacing={0.5} className="conversation-list">
-            {conversations.length === 0 ? (
-              <Typography variant="body2" color="text.secondary">
-                No conversations yet.
-              </Typography>
-            ) : (
-              conversations.map((conv) => {
-                const id = str(conv.id, "");
-                const active = conversationId === id;
-                const title = str(conv.title, "Untitled")
-                  .replace(/\s+/g, " ")
-                  .trim() || "Untitled";
-                return (
-                  <Box
-                    key={id}
-                    className={active ? "conversation-card active" : "conversation-card"}
-                    onClick={() => {
-                      openConversationById(id);
-                    }}
-                    role="button"
-                    tabIndex={0}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" || e.key === " ") {
-                        openConversationById(id);
-                      }
-                    }}
-                  >
-                    <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={0.5}>
-                      <Box sx={{ minWidth: 0, flex: 1 }}>
-                        <div className="conversation-card-title" title={title}>
-                          {title}
-                        </div>
-                        {(() => {
-                          const updatedAt = str(conv.updated_at, "");
-                          if (!updatedAt) return null;
-                          const parsed = formatChatTimestamp(updatedAt);
-                          return (
-                            <Typography
-                              variant="caption"
-                              color="text.secondary"
-                              sx={{ display: "block", mt: 0.15, opacity: 0.88 }}
-                              title={parsed.tooltip}
-                            >
-                              {parsed.label}
-                            </Typography>
-                          );
-                        })()}
-                      </Box>
-                      <Tooltip title="Chat options">
-                        <span>
-                          <IconButton
-                            size="small"
-                            className="conversation-card-menu"
-                            onClick={(e) => {
-                              openConversationMenu(e, conv);
-                            }}
-                            disabled={deleteConversationMutation.isPending}
-                          >
-                            <MoreVertIcon fontSize="small" />
-                          </IconButton>
-                        </span>
-                      </Tooltip>
-                    </Stack>
-                  </Box>
-                );
-              })
-            )}
+      {showConversationSidebar ? (
+        <Box
+          className="list-shell chat-sidebar"
+          sx={{
+            minHeight: 0,
+            display: "flex",
+            flexDirection: "column",
+            maxHeight: { xs: 280, xl: "none" }
+          }}
+        >
+          <Stack direction="row" justifyContent="space-between" alignItems="center" mb={1}>
+            <Typography variant="h6">Conversations</Typography>
+            <Button size="small" onClick={startNewConversation}>
+              New
+            </Button>
           </Stack>
+
+          <Box sx={{ flex: 1, minHeight: 0, overflow: "auto", pr: 0.5 }}>
+            <Stack spacing={0.5} className="conversation-list">
+              {conversations.length === 0 ? (
+                <Typography variant="body2" color="text.secondary">
+                  No conversations yet.
+                </Typography>
+              ) : (
+                conversations.map((conv) => {
+                  const id = str(conv.id, "");
+                  const active = conversationId === id;
+                  const title = str(conv.title, "Untitled")
+                    .replace(/\s+/g, " ")
+                    .trim() || "Untitled";
+                  return (
+                    <Box
+                      key={id}
+                      className={active ? "conversation-card active" : "conversation-card"}
+                      onClick={() => {
+                        openConversationById(id);
+                      }}
+                      role="button"
+                      tabIndex={0}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          openConversationById(id);
+                        }
+                      }}
+                    >
+                      <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={0.5}>
+                        <Box sx={{ minWidth: 0, flex: 1 }}>
+                          <div className="conversation-card-title" title={title}>
+                            {title}
+                          </div>
+                          {(() => {
+                            const updatedAt = str(conv.updated_at, "");
+                            if (!updatedAt) return null;
+                            const parsed = formatChatTimestamp(updatedAt);
+                            return (
+                              <Typography
+                                variant="caption"
+                                color="text.secondary"
+                                sx={{ display: "block", mt: 0.15, opacity: 0.88 }}
+                                title={parsed.tooltip}
+                              >
+                                {parsed.label}
+                              </Typography>
+                            );
+                          })()}
+                        </Box>
+                        <Tooltip title="Chat options">
+                          <span>
+                            <IconButton
+                              size="small"
+                              className="conversation-card-menu"
+                              onClick={(e) => {
+                                openConversationMenu(e, conv);
+                              }}
+                              disabled={deleteConversationMutation.isPending}
+                            >
+                              <MoreVertIcon fontSize="small" />
+                            </IconButton>
+                          </span>
+                        </Tooltip>
+                      </Stack>
+                    </Box>
+                  );
+                })
+              )}
+            </Stack>
+          </Box>
+          <Menu anchorEl={conversationMenuAnchor} open={Boolean(conversationMenuAnchor)} onClose={closeConversationMenu}>
+            <MenuItem
+              onClick={() => {
+                const id = str(conversationMenuTarget?.id, "");
+                const title = str(conversationMenuTarget?.title, "chat");
+                closeConversationMenu();
+                if (id) void exportConversationById(id, title);
+              }}
+            >
+              Export chat
+            </MenuItem>
+            <MenuItem
+              disabled={isStreaming || deleteConversationMutation.isPending}
+              onClick={() => {
+                const id = str(conversationMenuTarget?.id, "");
+                closeConversationMenu();
+                if (id) void deleteConversation(id);
+              }}
+            >
+              Delete chat
+            </MenuItem>
+          </Menu>
         </Box>
-        <Menu anchorEl={conversationMenuAnchor} open={Boolean(conversationMenuAnchor)} onClose={closeConversationMenu}>
-          <MenuItem
-            onClick={() => {
-              const id = str(conversationMenuTarget?.id, "");
-              const title = str(conversationMenuTarget?.title, "chat");
-              closeConversationMenu();
-              if (id) void exportConversationById(id, title);
-            }}
-          >
-            Export chat
-          </MenuItem>
-          <MenuItem
-            disabled={isStreaming || deleteConversationMutation.isPending}
-            onClick={() => {
-              const id = str(conversationMenuTarget?.id, "");
-              closeConversationMenu();
-              if (id) void deleteConversation(id);
-            }}
-          >
-            Delete chat
-          </MenuItem>
-        </Menu>
-      </Box>
+      ) : null}
 
       <Box
         className={`list-shell chat-shell chat-density-immersive${isDragOverChat ? " chat-shell-drop-active" : ""}`}
@@ -5178,12 +5367,26 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
         onDragLeave={handleChatDragLeave}
         onDrop={handleChatDrop}
       >
-        <Stack direction="row" justifyContent="space-between" alignItems="center" mb={1}>
-          <Stack direction="row" spacing={1} alignItems="center">
+        <Stack direction={{ xs: "column", sm: "row" }} justifyContent="space-between" alignItems={{ xs: "stretch", sm: "center" }} spacing={1} mb={1}>
+          <Stack direction="row" spacing={1} alignItems="center" sx={{ minWidth: 0, flexWrap: "wrap" }} useFlexGap>
+            <Button
+              size="small"
+              variant={showConversationSidebar ? "contained" : "outlined"}
+              startIcon={showConversationSidebar ? <ChevronLeftRoundedIcon fontSize="small" /> : <ChevronRightRoundedIcon fontSize="small" />}
+              onClick={() => setConversationSidebarOpen((prev) => !prev)}
+              sx={{ textTransform: "none", borderRadius: 999 }}
+            >
+              {showConversationSidebar ? "Hide conversations" : "Conversations"}
+            </Button>
             <Avatar src={AgentLogo} variant="rounded" sx={{ width: 28, height: 28, bgcolor: "rgba(12,22,40,0.85)" }} />
-            <Typography variant="h6">Chat</Typography>
+            <Box sx={{ minWidth: 0 }}>
+              <Typography variant="h6">Chat</Typography>
+              <Typography variant="caption" color="text.secondary">
+                Keep the active task centered.
+              </Typography>
+            </Box>
           </Stack>
-          <Stack direction="row" spacing={1} alignItems="center">
+          <Stack direction="row" spacing={1} alignItems="center" sx={{ minWidth: 0, flexWrap: "wrap", justifyContent: { xs: "flex-start", sm: "flex-end" } }} useFlexGap>
             <Tooltip title={showWorkspacePanel ? "Hide agent activity" : "Show agent activity"}>
               <span
                 className={`activity-toggle-pill${showWorkspacePanel ? " active" : ""}${isStreamingForCurrentConversation ? " streaming" : ""}`}
@@ -5205,48 +5408,76 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
             )}
           </Stack>
         </Stack>
-        <Stack direction={{ xs: "column", md: "row" }} spacing={1} sx={{ mb: 1 }}>
-          <TextField
-            fullWidth
-            size="small"
-            select
-            label="Project"
-            value={selectedConversationProjectId || draftProjectId}
-            onChange={(e) => setDraftProjectId(e.target.value)}
-            disabled={Boolean(selectedConversation)}
-            helperText={
-              selectedConversation
-                ? "Project is fixed for this conversation."
-                : "Optional. Leave as No project for general chat."
-            }
-          >
-            <MenuItem value="">No project</MenuItem>
-            {projects.map((project) => {
-              const id = str(project.id, "");
-              if (!id) return null;
-              return (
-                <MenuItem key={id} value={id}>
-                  {str(project.name, id)}
-                </MenuItem>
-              );
-            })}
-          </TextField>
-        </Stack>
-
         <Box
-          ref={threadRef}
-          sx={{ flex: 1, minHeight: 0, overflow: "auto" }}
-          className="chat-thread chat-thread-immersive"
+          className="chat-main-column"
+          sx={{
+            flex: 1,
+            minHeight: 0,
+            width: "100%",
+            display: "flex",
+            flexDirection: "column"
+          }}
         >
-          {conversationId == null && !hasRenderableThread ? (
-            <Typography variant="body2" color="text.secondary">
-              Start with a message to open a new conversation.
-            </Typography>
-          ) : !hasRenderableThread ? (
-            <Typography variant="body2" color="text.secondary">
-              No messages in this conversation yet.
-            </Typography>
-          ) : (
+          <Stack direction={{ xs: "column", md: "row" }} spacing={1} sx={{ mb: 1 }}>
+            <TextField
+              fullWidth
+              size="small"
+              select
+              label="Project Scope"
+              value={selectedConversationProjectId || draftProjectId}
+              onChange={(e) => setDraftProjectId(e.target.value)}
+              disabled={Boolean(selectedConversation)}
+              sx={{ maxWidth: { xs: "100%", md: 360 } }}
+            >
+              <MenuItem value="">No project</MenuItem>
+              {projects.map((project) => {
+                const id = str(project.id, "");
+                if (!id) return null;
+                return (
+                  <MenuItem key={id} value={id}>
+                    {str(project.name, id)}
+                  </MenuItem>
+                );
+              })}
+            </TextField>
+          </Stack>
+
+          <Box
+            ref={threadRef}
+            sx={{ flex: 1, minHeight: 0, overflow: "auto" }}
+            className={`chat-thread chat-thread-immersive${showEmptyHero ? " chat-thread-empty" : ""}`}
+          >
+            {showEmptyHero ? (
+              <Box className="chat-empty-state">
+                <Typography variant="overline" className="chat-empty-kicker">
+                  {conversationId ? "Draft Conversation" : "Focused Chat"}
+                </Typography>
+                <Typography variant="h4" className="chat-empty-title">
+                  {conversationId ? "This conversation is ready for its first task." : "Tell AgentArk the outcome you want."}
+                </Typography>
+                <Typography variant="body2" color="text.secondary" sx={{ maxWidth: 520 }}>
+                  {conversationId
+                    ? "Send one message and AgentArk will turn this draft into a working run."
+                    : "Start from the result, not the implementation details. The workspace is shaped to keep that request centered."}
+                </Typography>
+                <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" justifyContent="center">
+                  {starterPrompts.map((item) => (
+                    <Button
+                      key={item.label}
+                      size="small"
+                      variant="outlined"
+                      className="chat-quick-cmd-btn"
+                      onClick={() => {
+                        setPrompt(item.prompt);
+                        setChatError(null);
+                      }}
+                    >
+                      {item.label}
+                    </Button>
+                  ))}
+                </Stack>
+              </Box>
+            ) : (
             <Stack spacing={1.2}>
               {messages.map((message, idx) => {
                 const role = str(message.role, "").toLowerCase();
@@ -5262,6 +5493,16 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                 const ts = tsRaw ? formatChatTimestamp(tsRaw) : null;
                 const content = str(message.content);
                 const renderedContent = isUser ? stripAttachmentContextMarker(content) : content;
+                const previousUserPrompt = !isUser
+                  ? (() => {
+                      for (let cursor = idx - 1; cursor >= 0; cursor -= 1) {
+                        const candidate = asRecord(messages[cursor]);
+                        if (str(candidate.role, "").toLowerCase() !== "user") continue;
+                        return stripAttachmentContextMarker(str(candidate.content, ""));
+                      }
+                      return "";
+                    })()
+                  : "";
                 const traceId = str(message.trace_id, "").trim();
                 const hasTrace = !isUser && !!traceId;
                 const traceLoading = hasTrace ? Boolean(traceLoadingById[traceId]) : false;
@@ -5290,17 +5531,32 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                         >
                           {isUser ? "You" : "AgentArk"}{ts ? ` | ${ts.label}` : ""}
                         </Typography>
-                        <Tooltip title="Copy message">
-                          <IconButton
-                            size="small"
-                            onClick={() => {
-                              void copyMessage(message);
-                            }}
-                            sx={{ color: "rgba(189, 216, 249, 0.9)" }}
-                          >
-                            <ContentCopyRoundedIcon fontSize="small" />
-                          </IconButton>
-                        </Tooltip>
+                        <Stack direction="row" spacing={0.25} alignItems="center">
+                          {!isUser ? (
+                            <Tooltip title="Download reply">
+                              <IconButton
+                                size="small"
+                                onClick={() => {
+                                  void exportAssistantMessage(message, previousUserPrompt);
+                                }}
+                                sx={{ color: "rgba(189, 216, 249, 0.9)" }}
+                              >
+                                <FileDownloadRoundedIcon fontSize="small" />
+                              </IconButton>
+                            </Tooltip>
+                          ) : null}
+                          <Tooltip title="Copy message">
+                            <IconButton
+                              size="small"
+                              onClick={() => {
+                                void copyMessage(message);
+                              }}
+                              sx={{ color: "rgba(189, 216, 249, 0.9)" }}
+                            >
+                              <ContentCopyRoundedIcon fontSize="small" />
+                            </IconButton>
+                          </Tooltip>
+                        </Stack>
                       </Stack>
                       {/* Trace steps shown in Activity panel on the right */}
                       {isUser ? (
@@ -5543,27 +5799,23 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
           />
           <div className="chat-composer-actions">
             <Tooltip title={deepResearchEnabled ? "Deep Research enabled — slower, source-backed" : "Enable Deep Research"}>
-              <Button
-                size="small"
-                variant={deepResearchEnabled ? "contained" : "text"}
-                disabled={isStreaming}
-                onClick={() => setDeepResearchEnabled((prev) => !prev)}
-                sx={{
-                  minWidth: 0,
-                  px: 1,
-                  py: 0.25,
-                  fontSize: "0.65rem",
-                  fontWeight: 600,
-                  textTransform: "none",
-                  borderRadius: "6px",
-                  color: deepResearchEnabled ? "#fff" : "text.secondary",
-                  bgcolor: deepResearchEnabled ? "rgba(47, 212, 255, 0.25)" : "transparent",
-                  border: deepResearchEnabled ? "1px solid rgba(47, 212, 255, 0.4)" : "1px solid rgba(108,156,212,0.2)",
-                  "&:hover": { bgcolor: deepResearchEnabled ? "rgba(47, 212, 255, 0.35)" : "rgba(108,156,212,0.1)" },
-                }}
-              >
-                {deepResearchEnabled ? "Research" : "Research"}
-              </Button>
+              <FormControlLabel
+                control={
+                  <Switch
+                    size="small"
+                    checked={deepResearchEnabled}
+                    onChange={() => setDeepResearchEnabled((prev) => !prev)}
+                    disabled={isStreaming}
+                    sx={{
+                      "& .MuiSwitch-switchBase.Mui-checked": { color: "#2fd4ff" },
+                      "& .MuiSwitch-switchBase.Mui-checked + .MuiSwitch-track": { backgroundColor: "rgba(47, 212, 255, 0.4)" },
+                    }}
+                  />
+                }
+                label="Research"
+                slotProps={{ typography: { sx: { fontSize: "0.7rem", fontWeight: 600, color: deepResearchEnabled ? "#2fd4ff" : "text.secondary" } } }}
+                sx={{ ml: 0, mr: 0.5 }}
+              />
             </Tooltip>
             <Tooltip title="Attach files">
               <IconButton
@@ -5604,6 +5856,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
               </IconButton>
             )}
           </div>
+        </Box>
         </Box>
       </Box>
 
@@ -5675,7 +5928,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                             <span className="term-prompt" style={{ color: lineTone }}>•</span>
                             <Box className="term-content">
                               <span className={`term-label${isActive ? " term-typewriter" : ""}`} style={{ color: lineTone }}>
-                                {row.time ? `[${row.time}] ` : ""}{row.label}
+                                {row.time ? `[${formatTraceStepTime(row.time)}] ` : ""}{row.label}
                               </span>
                               {(row.detailFull || row.detail) ? (
                                 <span className="term-detail">{row.detailFull || row.detail || ""}</span>
@@ -5894,6 +6147,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
 }
 function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
   const queryClient = useQueryClient();
+  const [createTaskOpen, setCreateTaskOpen] = useState(false);
   const [quickIntent, setQuickIntent] = useState("");
   const [schedulePreset, setSchedulePreset] = useState("once");
   const [customCron, setCustomCron] = useState("");
@@ -5906,6 +6160,25 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
   const [approval, setApproval] = useState("auto");
   const [formError, setFormError] = useState<string | null>(null);
   const [selectedTask, setSelectedTask] = useState<JsonRecord | null>(null);
+
+  function resetTaskCreateForm(): void {
+    setQuickIntent("");
+    setSchedulePreset("once");
+    setCustomCron("");
+    setRequireApproval(false);
+    setManualOpen(false);
+    setDescription("");
+    setAction("daily_brief");
+    setArgumentsJson("{}");
+    setCron("");
+    setApproval("auto");
+    setFormError(null);
+  }
+
+  function closeCreateTaskDialog(): void {
+    setCreateTaskOpen(false);
+    setFormError(null);
+  }
 
   function statusLabel(raw: string): string {
     const s = (raw || "").toLowerCase();
@@ -5992,8 +6265,8 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
       });
     },
     onSuccess: async () => {
-      setQuickIntent("");
-      setFormError(null);
+      resetTaskCreateForm();
+      setCreateTaskOpen(false);
       await queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
     }
   });
@@ -6015,10 +6288,25 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
   return (
     <Stack spacing={2}>
       <Box className="list-shell">
-        <Typography variant="h6">Tasks</Typography>
-        <Typography variant="body2" color="text.secondary">
-          Describe what you want in plain English. AgentArk can generate a runnable task for you.
-        </Typography>
+        <Stack
+          direction={{ xs: "column", sm: "row" }}
+          spacing={1.5}
+          alignItems={{ xs: "flex-start", sm: "center" }}
+          justifyContent="space-between"
+        >
+          <Box>
+            <Typography variant="h6">Tasks</Typography>
+            <Typography variant="body2" color="text.secondary">
+              Describe what you want in plain English. AgentArk can generate a runnable task for you.
+            </Typography>
+          </Box>
+          <Button variant="contained" onClick={() => {
+            setFormError(null);
+            setCreateTaskOpen(true);
+          }}>
+            Create Task
+          </Button>
+        </Stack>
       </Box>
 
       <Grid2 container spacing={2}>
@@ -6053,133 +6341,6 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
           </Box>
         </Grid2>
       </Grid2>
-
-      <Box className="list-shell">
-        <Typography variant="h6" mb={1}>
-          Create Task (Easy)
-        </Typography>
-        <Grid2 container spacing={1}>
-          <Grid2 size={{ xs: 12 }}>
-            <TextField
-              fullWidth
-              multiline
-              minRows={2}
-              label="What should AgentArk do?"
-              placeholder="Example: Every weekday at 9am send me a daily brief in Telegram."
-              value={quickIntent}
-              onChange={(e) => setQuickIntent(e.target.value)}
-            />
-          </Grid2>
-          <Grid2 size={{ xs: 12, md: 4 }}>
-            <TextField
-              fullWidth
-              size="small"
-              select
-              label="When"
-              value={schedulePreset}
-              onChange={(e) => setSchedulePreset(e.target.value)}
-            >
-              <MenuItem value="once">One-time (run once)</MenuItem>
-              <MenuItem value="every_15">Every 15 minutes</MenuItem>
-              <MenuItem value="hourly">Hourly</MenuItem>
-              <MenuItem value="daily_9">Daily at 9:00</MenuItem>
-              <MenuItem value="weekday_9">Weekdays at 9:00</MenuItem>
-              <MenuItem value="custom">Custom cron</MenuItem>
-            </TextField>
-          </Grid2>
-          {schedulePreset === "custom" ? (
-            <Grid2 size={{ xs: 12, md: 8 }}>
-              <TextField
-                fullWidth
-                size="small"
-                label="Custom cron"
-                placeholder="*/10 * * * *"
-                value={customCron}
-                onChange={(e) => setCustomCron(e.target.value)}
-                helperText="Use 5 fields (min hour day month weekday)."
-              />
-            </Grid2>
-          ) : null}
-          <Grid2 size={{ xs: 12 }}>
-            <FormControlLabel
-              control={<Switch checked={requireApproval} onChange={(e) => setRequireApproval(e.target.checked)} />}
-              label="Require approval before execution"
-            />
-          </Grid2>
-          <Grid2 size={{ xs: 12 }}>
-            <Button
-              variant="contained"
-              disabled={aiCreateMutation.isPending || opMutation.isPending || !quickIntent.trim()}
-              onClick={async () => {
-                setFormError(null);
-                try {
-                  await aiCreateMutation.mutateAsync();
-                } catch (e) {
-                  const msg = errMessage(e);
-                  if (msg.toLowerCase().includes("llm planning failed")) {
-                    setFormError("AI planner needs an active LLM model. Configure one in Settings > Models, or use Manual mode below.");
-                  } else {
-                    setFormError(msg);
-                  }
-                }
-              }}
-            >
-              {aiCreateMutation.isPending ? "Creating..." : "Create with AI"}
-            </Button>
-          </Grid2>
-        </Grid2>
-        {formError ? <Alert severity="error" sx={{ mt: 1 }}>{formError}</Alert> : null}
-      </Box>
-
-      <Accordion expanded={manualOpen} onChange={() => setManualOpen((p) => !p)} className="accordion-shell">
-        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-          <Typography variant="body2" sx={{ fontWeight: 600 }}>Manual Mode (Optional)</Typography>
-        </AccordionSummary>
-        <AccordionDetails>
-          <Grid2 container spacing={1}>
-            <Grid2 size={{ xs: 12, md: 4 }}>
-              <TextField fullWidth size="small" label="Description" value={description} onChange={(e) => setDescription(e.target.value)} />
-            </Grid2>
-            <Grid2 size={{ xs: 12, md: 2 }}>
-              <TextField fullWidth size="small" label="Action" value={action} onChange={(e) => setAction(e.target.value)} />
-            </Grid2>
-            <Grid2 size={{ xs: 12, md: 3 }}>
-              <TextField fullWidth size="small" label="Cron" value={cron} onChange={(e) => setCron(e.target.value)} placeholder="*/10 * * * *" />
-            </Grid2>
-            <Grid2 size={{ xs: 12, md: 3 }}>
-              <TextField fullWidth size="small" select label="Approval" value={approval} onChange={(e) => setApproval(e.target.value)}>
-                <MenuItem value="auto">auto</MenuItem>
-                <MenuItem value="require">require</MenuItem>
-              </TextField>
-            </Grid2>
-            <Grid2 size={{ xs: 12 }}>
-              <TextField fullWidth multiline minRows={2} label="Arguments JSON" value={argumentsJson} onChange={(e) => setArgumentsJson(e.target.value)} />
-            </Grid2>
-            <Grid2 size={{ xs: 12 }}>
-              <Button
-                variant="outlined"
-                disabled={opMutation.isPending || !description.trim()}
-                onClick={async () => {
-                  setFormError(null);
-                  try {
-                    const parsed = JSON.parse(argumentsJson || "{}");
-                    await opMutation.mutateAsync({
-                      path: "/tasks",
-                      method: "POST",
-                      payload: { description: description.trim(), action: action.trim(), arguments: parsed, cron: cron.trim() || null, approval }
-                    });
-                    setDescription("");
-                  } catch (e) {
-                    setFormError(errMessage(e));
-                  }
-                }}
-              >
-                Add Manual Task
-              </Button>
-            </Grid2>
-          </Grid2>
-        </AccordionDetails>
-      </Accordion>
 
       <Box className="list-shell">
         <Typography variant="h6" mb={1}>
@@ -6334,6 +6495,141 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
           </Stack>
         </DialogContent>
       </Dialog>
+
+      <Dialog open={createTaskOpen} onClose={closeCreateTaskDialog} maxWidth="md" fullWidth>
+        <DialogTitle>Create Task</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ pt: 0.5 }}>
+            <Box className="list-shell">
+              <Typography variant="h6" mb={1}>
+                Create Task (Easy)
+              </Typography>
+              <Grid2 container spacing={1}>
+                <Grid2 size={{ xs: 12 }}>
+                  <TextField
+                    fullWidth
+                    multiline
+                    minRows={2}
+                    label="What should AgentArk do?"
+                    placeholder="Example: Every weekday at 9am send me a daily brief in Telegram."
+                    value={quickIntent}
+                    onChange={(e) => setQuickIntent(e.target.value)}
+                  />
+                </Grid2>
+                <Grid2 size={{ xs: 12, md: 4 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    select
+                    label="When"
+                    value={schedulePreset}
+                    onChange={(e) => setSchedulePreset(e.target.value)}
+                  >
+                    <MenuItem value="once">One-time (run once)</MenuItem>
+                    <MenuItem value="every_15">Every 15 minutes</MenuItem>
+                    <MenuItem value="hourly">Hourly</MenuItem>
+                    <MenuItem value="daily_9">Daily at 9:00</MenuItem>
+                    <MenuItem value="weekday_9">Weekdays at 9:00</MenuItem>
+                    <MenuItem value="custom">Custom cron</MenuItem>
+                  </TextField>
+                </Grid2>
+                {schedulePreset === "custom" ? (
+                  <Grid2 size={{ xs: 12, md: 8 }}>
+                    <TextField
+                      fullWidth
+                      size="small"
+                      label="Custom cron"
+                      placeholder="*/10 * * * *"
+                      value={customCron}
+                      onChange={(e) => setCustomCron(e.target.value)}
+                      helperText="Use 5 fields (min hour day month weekday)."
+                    />
+                  </Grid2>
+                ) : null}
+                <Grid2 size={{ xs: 12 }}>
+                  <FormControlLabel
+                    control={<Switch checked={requireApproval} onChange={(e) => setRequireApproval(e.target.checked)} />}
+                    label="Require approval before execution"
+                  />
+                </Grid2>
+                <Grid2 size={{ xs: 12 }}>
+                  <Button
+                    variant="contained"
+                    disabled={aiCreateMutation.isPending || opMutation.isPending || !quickIntent.trim()}
+                    onClick={async () => {
+                      setFormError(null);
+                      try {
+                        await aiCreateMutation.mutateAsync();
+                      } catch (e) {
+                        const msg = errMessage(e);
+                        if (msg.toLowerCase().includes("llm planning failed")) {
+                          setFormError("AI planner needs an active LLM model. Configure one in Settings > Models, or use Manual mode below.");
+                        } else {
+                          setFormError(msg);
+                        }
+                      }
+                    }}
+                  >
+                    {aiCreateMutation.isPending ? "Creating..." : "Create with AI"}
+                  </Button>
+                </Grid2>
+              </Grid2>
+              {formError ? <Alert severity="error" sx={{ mt: 1 }}>{formError}</Alert> : null}
+            </Box>
+
+            <Accordion expanded={manualOpen} onChange={() => setManualOpen((p) => !p)} className="accordion-shell">
+              <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+                <Typography variant="body2" sx={{ fontWeight: 600 }}>Manual Mode (Optional)</Typography>
+              </AccordionSummary>
+              <AccordionDetails>
+                <Grid2 container spacing={1}>
+                  <Grid2 size={{ xs: 12, md: 4 }}>
+                    <TextField fullWidth size="small" label="Description" value={description} onChange={(e) => setDescription(e.target.value)} />
+                  </Grid2>
+                  <Grid2 size={{ xs: 12, md: 2 }}>
+                    <TextField fullWidth size="small" label="Action" value={action} onChange={(e) => setAction(e.target.value)} />
+                  </Grid2>
+                  <Grid2 size={{ xs: 12, md: 3 }}>
+                    <TextField fullWidth size="small" label="Cron" value={cron} onChange={(e) => setCron(e.target.value)} placeholder="*/10 * * * *" />
+                  </Grid2>
+                  <Grid2 size={{ xs: 12, md: 3 }}>
+                    <TextField fullWidth size="small" select label="Approval" value={approval} onChange={(e) => setApproval(e.target.value)}>
+                      <MenuItem value="auto">auto</MenuItem>
+                      <MenuItem value="require">require</MenuItem>
+                    </TextField>
+                  </Grid2>
+                  <Grid2 size={{ xs: 12 }}>
+                    <TextField fullWidth multiline minRows={2} label="Arguments JSON" value={argumentsJson} onChange={(e) => setArgumentsJson(e.target.value)} />
+                  </Grid2>
+                  <Grid2 size={{ xs: 12 }}>
+                    <Button
+                      variant="outlined"
+                      disabled={opMutation.isPending || !description.trim()}
+                      onClick={async () => {
+                        setFormError(null);
+                        try {
+                          const parsed = JSON.parse(argumentsJson || "{}");
+                          await opMutation.mutateAsync({
+                            path: "/tasks",
+                            method: "POST",
+                            payload: { description: description.trim(), action: action.trim(), arguments: parsed, cron: cron.trim() || null, approval }
+                          });
+                          resetTaskCreateForm();
+                          setCreateTaskOpen(false);
+                        } catch (e) {
+                          setFormError(errMessage(e));
+                        }
+                      }}
+                    >
+                      Add Manual Task
+                    </Button>
+                  </Grid2>
+                </Grid2>
+              </AccordionDetails>
+            </Accordion>
+          </Stack>
+        </DialogContent>
+      </Dialog>
     </Stack>
   );
 }
@@ -6366,6 +6662,8 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
   const [aiNameHint, setAiNameHint] = useState("");
   const [aiError, setAiError] = useState<string | null>(null);
   const [skillsTab, setSkillsTab] = useState<"manage" | "system">("manage");
+  const [skillSearch, setSkillSearch] = useState("");
+  const [skillSort, setSkillSort] = useState<"name" | "imported">("name");
   const [secretsName, setSecretsName] = useState<string | null>(null);
   const [hooksOpen, setHooksOpen] = useState(false);
   const [hooksTargetAction, setHooksTargetAction] = useState<string | null>(null);
@@ -6478,9 +6776,25 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
   const hooksForSelectedAction = hooksTargetAction
     ? hooks.filter((h) => isHookRecordAttachedToAction(h, hooksTargetAction))
     : hooks;
-  const systemSkills = skills.filter((a) => str(a.source).toLowerCase() === "system");
-  const bundledSkills = skills.filter((a) => str(a.source).toLowerCase() === "bundled");
-  const customSkills = skills.filter((a) => str(a.source).toLowerCase() === "custom");
+  const skillSearchFilter = (a: JsonRecord) => {
+    if (!skillSearch.trim()) return true;
+    const q = skillSearch.toLowerCase();
+    return str(a.name, "").toLowerCase().includes(q) || str(a.description, "").toLowerCase().includes(q);
+  };
+  const skillSortFn = (a: JsonRecord, b: JsonRecord) => {
+    if (skillSort === "imported") {
+      const ta = str(a.imported_at, "");
+      const tb = str(b.imported_at, "");
+      if (tb && ta) return tb.localeCompare(ta);
+      if (tb) return 1;
+      if (ta) return -1;
+      return str(a.name, "").localeCompare(str(b.name, ""));
+    }
+    return str(a.name, "").localeCompare(str(b.name, ""));
+  };
+  const systemSkills = skills.filter((a) => str(a.source).toLowerCase() === "system").filter(skillSearchFilter).sort(skillSortFn);
+  const bundledSkills = skills.filter((a) => str(a.source).toLowerCase() === "bundled").filter(skillSearchFilter).sort(skillSortFn);
+  const customSkills = skills.filter((a) => str(a.source).toLowerCase() === "custom").filter(skillSearchFilter).sort(skillSortFn);
   const availableToolNames = dedupeStrings(systemSkills.map((a) => str(a.name, "").trim()).filter(Boolean));
   const allSkillNames = dedupeStrings(skills.map((a) => str(a.name, "").trim()).filter(Boolean));
   const hookLastRunById = useMemo(() => {
@@ -6949,9 +7263,27 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
           <Tab value="manage" label="My Skills" />
           <Tab value="system" label="System Skills" />
         </Tabs>
-        <Typography variant="caption" color="text.secondary" sx={{ mt: 1 }}>
-          These are pre-built skills. You can always chat with the agent to build anything custom on your own.
-        </Typography>
+        <Stack direction="row" spacing={1} alignItems="center" sx={{ mt: 1.5 }}>
+          <TextField
+            size="small"
+            placeholder="Search skills by name or description..."
+            value={skillSearch}
+            onChange={(e) => setSkillSearch(e.target.value)}
+            sx={{ flex: 1 }}
+            slotProps={{ input: { sx: { fontSize: "0.85rem" } } }}
+          />
+          <TextField
+            select
+            size="small"
+            value={skillSort}
+            onChange={(e) => setSkillSort(e.target.value as "name" | "imported")}
+            sx={{ minWidth: 140 }}
+            slotProps={{ input: { sx: { fontSize: "0.85rem" } } }}
+          >
+            <MenuItem value="name">Sort: Name</MenuItem>
+            <MenuItem value="imported">Sort: Newest</MenuItem>
+          </TextField>
+        </Stack>
       </Box>
 
       {skillsTab === "manage" ? (
@@ -7787,21 +8119,25 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
                   const id = str(appItem.id, "");
                   const url = str(appItem.url, "");
                   const accessUrl = str(appItem.access_url, "");
+                  const accessKey = str(appItem.access_key, "").trim() || extractAccessKeyFromUrl(accessUrl, origin);
                   const localUrl = toAbsoluteAppUrl(url, origin);
                   const localAccessUrl = toAbsoluteAppUrl(accessUrl || url, origin);
-                  const isSelectedPublicApp = !selectedPublicAppId || selectedPublicAppId === id;
+                  const isSelectedPublicApp = selectedPublicAppId === id;
                   const publicUrl = tunnelBaseUrl && isSelectedPublicApp ? toAbsoluteAppUrl(url, tunnelBaseUrl) : "";
                   const publicAccessUrl =
                     tunnelBaseUrl && isSelectedPublicApp ? toAbsoluteAppUrl(accessUrl || url, tunnelBaseUrl) : "";
                   const hasProtectedVariant = !!accessUrl && localAccessUrl !== localUrl;
-                  const publicShareUrl = publicAccessUrl || publicUrl;
-                  const localShareUrl = localAccessUrl || localUrl;
+                  const genericTunnelOnly = tunnelActive && !!tunnelBaseUrl && !selectedPublicAppId;
+                  const publicTunnelTargetsAnotherApp =
+                    tunnelActive && !!selectedPublicAppId && selectedPublicAppId !== id;
+                  const publicShareUrl = publicUrl;
+                  const localShareUrl = localUrl;
                   const shareUrl = publicShareUrl || localShareUrl;
                   const openTargets = dedupeLinkTargets([
                     { label: "Open Local", url: localUrl },
-                    { label: "Open Local (Key)", url: hasProtectedVariant ? localAccessUrl : "" },
+                    { label: "Open Local (Guarded)", url: hasProtectedVariant ? localAccessUrl : "" },
                     { label: "Open Public", url: publicUrl },
-                    { label: "Open Public (Key)", url: hasProtectedVariant ? publicAccessUrl : "" }
+                    { label: "Open Public (Guarded)", url: hasProtectedVariant ? publicAccessUrl : "" }
                   ]);
                   return (
                     <TableRow key={id}>
@@ -7823,11 +8159,8 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
                             </Typography>
                           )}
                           {hasProtectedVariant ? (
-                            <Typography variant="caption" component="div" noWrap title={localAccessUrl}>
-                              Local (Key):{" "}
-                              <Link href={localAccessUrl} target="_blank" rel="noopener noreferrer" underline="hover">
-                                {localAccessUrl}
-                              </Link>
+                            <Typography variant="caption" component="div" noWrap title={accessKey || localAccessUrl}>
+                              Access Key: {accessKey || "-"}
                             </Typography>
                           ) : null}
                           {publicUrl ? (
@@ -7837,7 +8170,7 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
                                 {publicUrl}
                               </Link>
                             </Typography>
-                          ) : tunnelStarting && (tunnelActionAppId === id || (!tunnelActionAppId && isSelectedPublicApp)) ? (
+                          ) : tunnelStarting && tunnelActionAppId === id ? (
                             <Typography variant="caption" component="div" color="info.main">
                               Public: starting tunnel...
                             </Typography>
@@ -7845,19 +8178,19 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
                             <Typography variant="caption" component="div" color="text.secondary">
                               Public: stopping tunnel...
                             </Typography>
+                          ) : genericTunnelOnly ? (
+                            <Typography variant="caption" component="div" color="text.secondary">
+                              Public: control-plane tunnel active. Expose this app publicly to get a working app link.
+                            </Typography>
+                          ) : publicTunnelTargetsAnotherApp ? (
+                            <Typography variant="caption" component="div" color="text.secondary">
+                              Public: another app is currently exposed on the tunnel.
+                            </Typography>
                           ) : (
                             <Typography variant="caption" component="div" color="text.secondary">
                               Public: tunnel inactive
                             </Typography>
                           )}
-                          {hasProtectedVariant && publicAccessUrl && publicAccessUrl !== publicUrl ? (
-                            <Typography variant="caption" component="div" color="info.main" noWrap title={publicAccessUrl}>
-                              Public (Key):{" "}
-                              <Link href={publicAccessUrl} target="_blank" rel="noopener noreferrer" underline="hover">
-                                {publicAccessUrl}
-                              </Link>
-                            </Typography>
-                          ) : null}
                         </Stack>
                       </TableCell>
                       <TableCell align="right">
@@ -7883,6 +8216,18 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
                                 }
                               }
                             },
+                            ...(accessKey
+                              ? [{
+                                  label: "Copy Access Key",
+                                  onClick: async () => {
+                                    try {
+                                      await navigator.clipboard.writeText(accessKey);
+                                    } catch {
+                                      window.prompt("Copy this access key", accessKey);
+                                    }
+                                  }
+                                }]
+                              : []),
                             {
                               label:
                                 tunnelStarting
@@ -11146,22 +11491,173 @@ function buildTraceStepConsoleView(trace: JsonRecord, steps: JsonRecord[], step:
   };
 }
 
+function parseTraceDataRecord(value: unknown): JsonRecord {
+  if (isRecord(value)) return value;
+  if (typeof value !== "string") return {};
+  const trimmed = value.trim();
+  if (!trimmed) return {};
+  try {
+    return asRecord(JSON.parse(trimmed));
+  } catch {
+    return {};
+  }
+}
+
+function stringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => str(item, "").trim())
+    .filter(Boolean);
+}
+
+function percentageLabel(value: unknown, digits = 1): string {
+  const parsed = num(value, Number.NaN);
+  if (!Number.isFinite(parsed)) return "";
+  return `${(parsed * 100).toFixed(digits)}%`;
+}
+
+type EvolutionReviewCard = {
+  key: string;
+  title: string;
+  status: string;
+  detail: string;
+  chips: string[];
+  rationale?: string;
+  evidence?: string;
+};
+
+function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewCard[] {
+  const cards: EvolutionReviewCard[] = [];
+  steps.forEach((step, idx) => {
+    const data = parseTraceDataRecord(step.data);
+    const traceKind = str(data.trace_kind, "").trim().toLowerCase();
+    if (!traceKind.startsWith("self_evolve.")) return;
+
+    const status = str(step.type, str(step.step_type, "info")).trim() || "info";
+    const title = str(step.title, "Evolution").trim();
+    const detail = str(step.detail, "").trim();
+    const chips: string[] = [];
+    const evidence: string[] = [];
+    let rationale = "";
+
+    if (traceKind === "self_evolve.request") {
+      const mode = str(data.mode, "policy");
+      const request = str(data.request, "").trim();
+      chips.push(`Mode ${mode}`);
+      if (toBool(data.apply_promotion)) chips.push("Promotion enabled");
+      if (toBool(data.allow_code_writes)) chips.push("Code writes allowed");
+      const canaryRollout = num(data.canary_rollout_percent, -1);
+      if (canaryRollout > 0) chips.push(`Canary ${canaryRollout}%`);
+      rationale = request;
+    } else if (traceKind === "self_evolve.policy.result") {
+      const evaluatedCandidates = num(data.evaluated_candidates, 0);
+      const baselineAccuracy = percentageLabel(data.baseline_accuracy, 0);
+      const candidateAccuracy = percentageLabel(data.best_candidate_accuracy, 0);
+      const gain = num(data.accuracy_gain, Number.NaN);
+      const candidateSource = str(data.candidate_source, "").trim();
+      const changedFields = stringList(data.changed_fields);
+      const notes = stringList(data.notes);
+      chips.push(`${evaluatedCandidates} candidate${evaluatedCandidates === 1 ? "" : "s"}`);
+      if (baselineAccuracy || candidateAccuracy) {
+        chips.push(`${baselineAccuracy || "?"} -> ${candidateAccuracy || "?"}`);
+      }
+      if (Number.isFinite(gain)) chips.push(`Gain ${gain >= 0 ? "+" : ""}${(gain * 100).toFixed(1)} pts`);
+      if (candidateSource) chips.push(candidateSource);
+      rationale = `Gate: ${str(data.promotion_gate, "unknown")}`;
+      if (num(data.wins, -1) >= 0 || num(data.losses, -1) >= 0) {
+        evidence.push(`Wins/Losses: ${num(data.wins, 0)} / ${num(data.losses, 0)}`);
+      }
+      const pValue = num(data.p_value, Number.NaN);
+      if (Number.isFinite(pValue)) evidence.push(`P-value: ${pValue.toFixed(4)}`);
+      if (changedFields.length) evidence.push(`Changed fields: ${changedFields.join(", ")}`);
+      if (notes.length) evidence.push(`Why: ${notes.join(" | ")}`);
+      const lineageId = str(data.lineage_entry_id, "").trim();
+      if (lineageId) evidence.push(`Lineage: ${lineageId}`);
+    } else if (traceKind === "self_evolve.policy.promotion") {
+      const promotionMode = str(data.promotion_mode, "none").trim();
+      const canaryState = asRecord(data.canary_state);
+      const replay = asRecord(data.replay_evaluation);
+      chips.push(`Promotion ${promotionMode}`);
+      if (toBool(data.promotion_applied)) chips.push("Applied");
+      const rollout = num(canaryState.rollout_percent, -1);
+      if (rollout > 0) chips.push(`Rollout ${rollout}%`);
+      const baselineVersion = str(canaryState.baseline_version, "").trim();
+      const candidateVersion = str(canaryState.candidate_version, "").trim();
+      if (baselineVersion || candidateVersion) {
+        evidence.push(`Versions: ${baselineVersion || "baseline"} -> ${candidateVersion || "candidate"}`);
+      }
+      const replayReason = str(replay.reason, "").trim();
+      if (replayReason) rationale = replayReason;
+      const baselineSamples = num(asRecord(replay.baseline).samples, -1);
+      const candidateSamples = num(asRecord(replay.candidate).samples, -1);
+      if (baselineSamples >= 0 || candidateSamples >= 0) {
+        evidence.push(`Replay samples: baseline ${Math.max(0, baselineSamples)} | candidate ${Math.max(0, candidateSamples)}`);
+      }
+      const successGain = num(replay.success_gain, Number.NaN);
+      if (Number.isFinite(successGain)) evidence.push(`Replay gain: ${(successGain * 100).toFixed(1)} pts`);
+    } else if (traceKind === "self_evolve.code.blocked") {
+      chips.push("Code evolution");
+      chips.push("Blocked");
+      rationale = str(data.request, "").trim();
+    } else if (traceKind === "self_evolve.code.result") {
+      const filesChanged = stringList(data.files_changed);
+      const securityWarnings = stringList(data.security_warnings);
+      const iterations = num(data.iterations_used, 0);
+      chips.push(`${filesChanged.length} file${filesChanged.length === 1 ? "" : "s"}`);
+      chips.push(`${iterations} iteration${iterations === 1 ? "" : "s"}`);
+      if (toBool(data.push_recommended)) chips.push("Push suggested");
+      rationale = str(data.diff_summary, "").trim();
+      if (filesChanged.length) evidence.push(`Files changed: ${filesChanged.join(", ")}`);
+      if (securityWarnings.length) evidence.push(`Security warnings: ${securityWarnings.join(" | ")}`);
+      const error = str(data.error, "").trim();
+      if (error) evidence.push(`Error: ${error}`);
+    } else if (traceKind === "self_evolve.manual_action.result" || traceKind === "self_evolve.manual_action.request") {
+      const action = str(data.action, "").trim().replace(/_/g, " ");
+      const canaryState = asRecord(data.canary_state);
+      chips.push(action || "Manual action");
+      if (Object.keys(canaryState).length > 0) {
+        chips.push(toBool(canaryState.enabled) ? "Canary enabled" : "Canary disabled");
+      }
+      rationale = str(data.message, detail).trim();
+      const baselineVersion = str(canaryState.baseline_version, "").trim();
+      const candidateVersion = str(canaryState.candidate_version, "").trim();
+      if (baselineVersion || candidateVersion) {
+        evidence.push(`Versions: ${baselineVersion || "baseline"} -> ${candidateVersion || "candidate"}`);
+      }
+      const rollout = num(canaryState.rollout_percent, -1);
+      if (rollout > 0) evidence.push(`Rollout: ${rollout}%`);
+    }
+
+    cards.push({
+      key: `${traceKind}-${idx}`,
+      title,
+      status,
+      detail,
+      chips,
+      rationale: rationale || undefined,
+      evidence: evidence.join("\n") || undefined
+    });
+  });
+  return cards;
+}
+
+function evolutionTraceIdHint(payload: unknown): string {
+  const traceId = str(asRecord(payload).trace_id, "").trim();
+  return traceId ? ` Trace ${traceId.slice(0, 8)} recorded.` : "";
+}
+
 function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
   const [selectedTraceId, setSelectedTraceId] = useState<string | null>(null);
 
   const traceQ = useQuery({ queryKey: ["trace-manager"], queryFn: () => api.rawGet("/trace?limit=40"), refetchInterval: autoRefresh ? REFRESH_MS : false });
   const traceDetailQ = useQuery({ queryKey: ["trace-detail", selectedTraceId], queryFn: () => api.rawGet(`/trace/${encodeURIComponent(selectedTraceId || "")}`), enabled: !!selectedTraceId });
-  const approvalsQ = useQuery({
-    queryKey: ["approvals-log"],
-    queryFn: () => api.rawGet("/approvals/log?limit=40"),
-    refetchInterval: autoRefresh ? REFRESH_MS : false
-  });
+  const exportLogsQ = useQuery({ queryKey: ["settings-observability-logs"], queryFn: () => api.rawGet("/settings/observability/logs"), refetchInterval: autoRefresh ? 30000 : false });
+  const exportLogs = pickRecords(asRecord(exportLogsQ.data), "logs");
 
   const traceData = asRecord(traceQ.data);
   const history = pickRecords(traceData, "history");
   const selectedTrace = asRecord(traceDetailQ.data);
   const steps = pickRecords(traceDetailQ.data, "steps");
-  const approvals = pickRecords(approvalsQ.data, "approvals");
   const historyTotal = num(traceData.history_total, history.length);
   const selectedTraceStatus = str(selectedTrace.status, selectedTraceId ? "running" : "-");
   const selectedTraceProofId = str(selectedTrace.proof_id, "");
@@ -11169,6 +11665,7 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
   const selectedTraceResponse = str(selectedTrace.response, "").trim();
   const traceEvidence = buildTraceEvidenceItems(steps);
   const traceArtifacts = extractTraceArtifacts(selectedTrace, steps);
+  const evolutionReviewCards = useMemo(() => buildEvolutionReviewCards(steps), [steps]);
   const traceOutcomeSummary =
     selectedTraceStatus === "completed"
       ? `Completed successfully in ${formatTraceDuration(selectedTrace.duration_ms)}`
@@ -11253,44 +11750,8 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
         )}
       </Box>
 
-      <Box className="list-shell">
-        <Typography variant="h6" mb={1}>Approval History</Typography>
-        {approvals.length === 0 ? (
-          <Typography variant="body2" color="text.secondary">No approval events yet.</Typography>
-        ) : (
-          <TableContainer className="table-shell">
-            <Table size="small">
-              <TableHead>
-                <TableRow>
-                  <TableCell>Action</TableCell>
-                  <TableCell>Rule</TableCell>
-                  <TableCell>Status</TableCell>
-                  <TableCell>Requested</TableCell>
-                  <TableCell>Resolved By</TableCell>
-                </TableRow>
-              </TableHead>
-              <TableBody>
-                {approvals.map((item, idx) => (
-                  <TableRow key={str(item.id, `approval-${idx}`)}>
-                    <TableCell sx={{ maxWidth: 280 }}>
-                      <Typography variant="body2" noWrap title={str(item.action_name, "-")}>
-                        {str(item.action_name, "-")}
-                      </Typography>
-                    </TableCell>
-                    <TableCell>{str(item.rule_name, "-")}</TableCell>
-                    <TableCell>{str(item.status, "-")}</TableCell>
-                    <TableCell>{str(item.requested_at, "-")}</TableCell>
-                    <TableCell>{str(item.resolved_by, "-")}</TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </TableContainer>
-        )}
-      </Box>
-
-      {traceQ.error || traceDetailQ.error || approvalsQ.error ? (
-        <Alert severity="error">{errMessage(traceQ.error || traceDetailQ.error || approvalsQ.error)}</Alert>
+      {traceQ.error || traceDetailQ.error ? (
+        <Alert severity="error">{errMessage(traceQ.error || traceDetailQ.error)}</Alert>
       ) : null}
 
       <Dialog open={selectedTraceId != null} onClose={() => setSelectedTraceId(null)} maxWidth="lg" fullWidth>
@@ -11309,173 +11770,131 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
           {traceDetailQ.isLoading ? (
             <Typography variant="body2" color="text.secondary">Loading trace...</Typography>
           ) : (
-            <Stack spacing={2}>
-              <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+            <Stack spacing={1.5}>
+              {/* Summary bar */}
+              <Stack direction="row" spacing={1} alignItems="center" useFlexGap flexWrap="wrap">
                 <Chip size="small" color={traceStatusColor(selectedTraceStatus)} label={selectedTraceStatus} />
-                <Chip size="small" variant="outlined" label={`${num(selectedTrace.step_count, steps.length)} steps`} />
-                <Chip size="small" variant="outlined" label={formatTraceDuration(selectedTrace.duration_ms)} />
-                {selectedTraceProofId ? <Chip size="small" variant="outlined" label="Verification record available" /> : null}
+                <Typography variant="body2" color="text.secondary">
+                  {num(selectedTrace.step_count, steps.length)} steps | {formatTraceDuration(selectedTrace.duration_ms)}
+                  {selectedTrace.total_tokens ? ` | ${num(selectedTrace.total_tokens, 0)} tokens` : ""}
+                  {str(selectedTrace.model) ? ` | ${str(selectedTrace.model)}` : ""}
+                </Typography>
+                {selectedTraceProofId ? (
+                  <Typography variant="caption" sx={{ fontFamily: "monospace", color: "text.secondary" }}>
+                    ID: {selectedTraceProofId.slice(0, 12)}...
+                  </Typography>
+                ) : null}
               </Stack>
 
-              {selectedTraceProofId ? (
-                <Box className="list-shell">
-                  <Stack direction="row" alignItems="center" spacing={1} useFlexGap flexWrap="wrap" mb={1}>
-                    <Typography variant="subtitle2">Execution Proof</Typography>
-                    <Chip size="small" color={traceStatusColor(selectedTraceStatus)} label={selectedTraceStatus === "failed" ? "Failure evidence available" : "Run evidence available"} />
-                  </Stack>
-                  <Alert severity={selectedTraceStatus === "failed" ? "warning" : "info"} sx={{ mb: 1.5 }}>
-                    The proof ID is the reference for this run. What matters to you is the evidence below: what the agent attempted, how the run ended, and what outputs or artifacts were produced.
-                  </Alert>
-                  <Stack spacing={1.25}>
-                    <Box>
-                      <Typography variant="caption" color="text.secondary">Verification ID</Typography>
-                      <Typography variant="body2" sx={{ fontFamily: "monospace", wordBreak: "break-all" }}>
-                        {selectedTraceProofId}
-                      </Typography>
-                    </Box>
-                    <Box>
-                      <Typography variant="caption" color="text.secondary">Action attempted</Typography>
-                      <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
-                        {str(selectedTrace.message)}
-                      </Typography>
-                    </Box>
-                    <Box>
-                      <Typography variant="caption" color="text.secondary">Outcome</Typography>
-                      <Typography variant="body2">
-                        {traceOutcomeSummary}
-                      </Typography>
-                    </Box>
-                    {selectedTraceResponse ? (
-                      <Box>
-                        <Typography variant="caption" color="text.secondary">Final result</Typography>
-                        <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
-                          {truncateTraceEvidence(selectedTraceResponse, 400)}
-                        </Typography>
-                      </Box>
-                    ) : null}
-                    {traceArtifacts.length > 0 ? (
-                      <Box>
-                        <Typography variant="caption" color="text.secondary">Artifacts or external outputs spotted</Typography>
-                        <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap" sx={{ mt: 0.75 }}>
-                          {traceArtifacts.map((artifact) => (
-                            <Chip key={artifact} size="small" variant="outlined" label={artifact} />
+              {/* User message */}
+              <Box sx={{ p: 1.25, borderRadius: 1.5, bgcolor: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.08)" }}>
+                <Typography variant="caption" color="text.secondary" sx={{ mb: 0.25, display: "block" }}>Input</Typography>
+                <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>{str(selectedTrace.message)}</Typography>
+              </Box>
+
+              {/* Response (collapsed if long) */}
+              {selectedTraceResponse ? (
+                <Box sx={{ p: 1.25, borderRadius: 1.5, bgcolor: "rgba(70,174,255,0.05)", border: "1px solid rgba(70,174,255,0.15)" }}>
+                  <Typography variant="caption" color="text.secondary" sx={{ mb: 0.25, display: "block" }}>Output</Typography>
+                  <Typography variant="body2" sx={{ whiteSpace: "pre-wrap", maxHeight: 200, overflow: "auto" }}>
+                    {selectedTraceResponse}
+                  </Typography>
+                </Box>
+              ) : null}
+
+              {evolutionReviewCards.length > 0 ? (
+                <Box sx={{ p: 1.25, borderRadius: 1.5, bgcolor: "rgba(120, 166, 255, 0.05)", border: "1px solid rgba(120, 166, 255, 0.16)" }}>
+                  <Typography variant="subtitle2" sx={{ mb: 1 }}>Evolution Review</Typography>
+                  <Stack spacing={1}>
+                    {evolutionReviewCards.map((card) => (
+                      <Box
+                        key={card.key}
+                        sx={{
+                          p: 1,
+                          borderRadius: 1.25,
+                          bgcolor: "rgba(255,255,255,0.025)",
+                          border: "1px solid rgba(255,255,255,0.06)"
+                        }}
+                      >
+                        <Stack direction="row" spacing={1} alignItems="center" useFlexGap flexWrap="wrap" sx={{ mb: 0.5 }}>
+                          <Typography variant="body2" fontWeight={700}>{card.title}</Typography>
+                          <Chip size="small" color={traceStepColor(card.status)} label={card.status} />
+                          {card.chips.map((chip) => (
+                            <Chip key={`${card.key}-${chip}`} size="small" variant="outlined" label={chip} />
                           ))}
                         </Stack>
+                        {card.detail ? (
+                          <Typography variant="body2" color="text.secondary" sx={{ whiteSpace: "pre-wrap" }}>
+                            {card.detail}
+                          </Typography>
+                        ) : null}
+                        {card.rationale ? (
+                          <Typography variant="caption" sx={{ display: "block", mt: 0.75, whiteSpace: "pre-wrap" }}>
+                            Why: {card.rationale}
+                          </Typography>
+                        ) : null}
+                        {card.evidence ? (
+                          <Box
+                            component="pre"
+                            sx={{
+                              mt: 0.75,
+                              mb: 0,
+                              p: 0.75,
+                              whiteSpace: "pre-wrap",
+                              wordBreak: "break-word",
+                              fontSize: 11,
+                              borderRadius: 1,
+                              bgcolor: "rgba(255,255,255,0.03)",
+                              border: "1px solid rgba(255,255,255,0.06)"
+                            }}
+                          >
+                            {card.evidence}
+                          </Box>
+                        ) : null}
                       </Box>
-                    ) : null}
-                    <Box>
-                      <Typography variant="caption" color="text.secondary">Key evidence from the run</Typography>
-                      {traceEvidence.length === 0 ? (
-                        <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                          Open the advanced trace below for the full step-by-step record.
-                        </Typography>
-                      ) : (
-                        <Stack spacing={1} sx={{ mt: 0.75 }}>
-                          {traceEvidence.map((item, idx) => (
-                            <Box key={`${item.title}-${idx}`} sx={{ p: 1, borderRadius: 1.5, bgcolor: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.08)" }}>
-                              <Stack direction="row" alignItems="center" spacing={1} useFlexGap flexWrap="wrap" sx={{ mb: 0.35 }}>
-                                <Chip size="small" color={traceStepColor(item.type)} label={item.type} />
-                                <Typography variant="body2" fontWeight={600}>{item.title}</Typography>
-                              </Stack>
-                              <Typography variant="caption" color="text.secondary" sx={{ whiteSpace: "pre-wrap" }}>
-                                {item.detail}
-                              </Typography>
-                            </Box>
-                          ))}
-                        </Stack>
-                      )}
-                    </Box>
+                    ))}
                   </Stack>
                 </Box>
               ) : null}
 
-              <Box className="list-shell">
-                <Typography variant="subtitle2" mb={1}>Conversation</Typography>
-                <Stack spacing={1.25}>
-                  <Box
-                    sx={{
-                      maxWidth: "82%",
-                      p: 1.25,
-                      borderRadius: 2,
-                      bgcolor: "rgba(255,255,255,0.03)",
-                      border: "1px solid rgba(255,255,255,0.08)"
-                    }}
-                  >
-                    <Stack direction="row" alignItems="center" spacing={1} useFlexGap flexWrap="wrap" sx={{ mb: 0.5 }}>
-                      <Chip size="small" variant="outlined" label={selectedTraceChannel} />
-                      <Typography variant="caption" color="text.secondary">user</Typography>
-                    </Stack>
-                    <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
-                      {str(selectedTrace.message)}
-                    </Typography>
-                  </Box>
-
-                  {selectedTrace.response ? (
-                    <Box sx={{ display: "flex", justifyContent: "flex-end" }}>
-                      <Box
-                        sx={{
-                          maxWidth: "82%",
-                          p: 1.25,
-                          borderRadius: 2,
-                          bgcolor: "rgba(70, 174, 255, 0.08)",
-                          border: "1px solid rgba(70, 174, 255, 0.22)"
-                        }}
-                      >
-                        <Stack direction="row" alignItems="center" spacing={1} useFlexGap flexWrap="wrap" sx={{ mb: 0.5 }}>
-                          <Chip size="small" color="info" variant="outlined" label="AgentArk" />
-                          <Typography variant="caption" color="text.secondary">assistant</Typography>
-                        </Stack>
-                        <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
-                          {str(selectedTrace.response)}
-                        </Typography>
-                      </Box>
-                    </Box>
-                  ) : null}
+              {/* Artifacts */}
+              {traceArtifacts.length > 0 ? (
+                <Stack direction="row" spacing={0.5} useFlexGap flexWrap="wrap" alignItems="center">
+                  <Typography variant="caption" color="text.secondary">Artifacts:</Typography>
+                  {traceArtifacts.map((a) => <Chip key={a} size="small" variant="outlined" label={a} />)}
                 </Stack>
-                <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 1.25 }}>
-                  Started: <span title={humanTs(str(selectedTrace.started_at)).tip}>{humanTs(str(selectedTrace.started_at)).label}</span>{selectedTrace.completed_at ? <>{" | Completed: "}<span title={humanTs(str(selectedTrace.completed_at)).tip}>{humanTs(str(selectedTrace.completed_at)).label}</span></> : ""}
-                </Typography>
-              </Box>
+              ) : null}
 
-              <Box className="list-shell">
-                <Typography variant="subtitle2" mb={1}>Advanced Trace</Typography>
-                <Box className="metadata-box" sx={{ maxHeight: 440 }}>
+              {/* Execution steps — the main view */}
+              <Box>
+                <Typography variant="subtitle2" sx={{ mb: 0.75 }}>Execution Steps</Typography>
+                <Box className="metadata-box" sx={{ maxHeight: 500 }}>
                   {steps.length === 0 ? (
-                    <Typography variant="body2" color="text.secondary">No steps.</Typography>
+                    <Typography variant="body2" color="text.secondary">No steps recorded.</Typography>
                   ) : (
-                    <Stack spacing={1}>
+                    <Stack spacing={0.5}>
                       {steps.map((step, idx) => {
                         const consoleView = buildTraceStepConsoleView(selectedTrace, steps, step);
+                        const stepTime = formatTraceStepTime(str(step.time));
                         return (
-                          <Box key={`${str(step.time, "step")}-${idx}`} className="console-line">
-                            <Stack spacing={0.75}>
-                              <Stack direction="row" alignItems="center" spacing={1} useFlexGap flexWrap="wrap">
-                                <Chip size="small" color={traceStepColor(str(step.type))} label={str(step.type, "step")} />
-                                <Typography variant="caption" color="text.secondary">{str(step.time)}</Typography>
-                              </Stack>
-                              <Typography variant="body2" fontWeight={600}>{str(step.title)}</Typography>
-                              <Typography variant="caption" color="text.secondary" sx={{ whiteSpace: "pre-wrap" }}>
+                          <Box key={`${str(step.time, "step")}-${idx}`} sx={{ py: 0.5, px: 1, borderRadius: 1, "&:hover": { bgcolor: "rgba(255,255,255,0.03)" } }}>
+                            <Stack direction="row" spacing={1} alignItems="baseline" useFlexGap flexWrap="wrap">
+                              <Typography variant="caption" color="text.secondary" sx={{ minWidth: 70, fontFamily: "monospace", fontSize: "0.7rem" }}>
+                                {stepTime}
+                              </Typography>
+                              <Box component="span" sx={{ width: 6, height: 6, borderRadius: "50%", flexShrink: 0, mt: 0.5, bgcolor: str(step.type).includes("error") || str(step.type).includes("fail") ? "rgba(255,100,100,0.85)" : str(step.type).includes("success") || str(step.type).includes("complete") ? "rgba(74,210,157,0.85)" : str(step.type).includes("think") || str(step.type).includes("reason") ? "rgba(255,211,106,0.85)" : "rgba(120,160,210,0.5)" }} />
+                              <Typography variant="body2" fontWeight={600} sx={{ flex: 1 }}>{str(step.title)}</Typography>
+                            </Stack>
+                            {consoleView.detail ? (
+                              <Typography variant="caption" color="text.secondary" sx={{ pl: "86px", display: "block", whiteSpace: "pre-wrap" }}>
                                 {consoleView.detail}
                               </Typography>
-                              {consoleView.dataText ? (
-                                <Box
-                                  component="pre"
-                                  sx={{
-                                    m: 0,
-                                    p: 1.25,
-                                    whiteSpace: "pre-wrap",
-                                    wordBreak: "break-word",
-                                    overflowX: "auto",
-                                    fontSize: 12,
-                                    borderRadius: 1,
-                                    bgcolor: "rgba(255,255,255,0.03)",
-                                    border: "1px solid rgba(255,255,255,0.08)"
-                                  }}
-                                >
-                                  {consoleView.dataText}
-                                </Box>
-                              ) : null}
-                            </Stack>
+                            ) : null}
+                            {consoleView.dataText ? (
+                              <Box component="pre" sx={{ ml: "86px", mt: 0.25, mb: 0, p: 0.75, whiteSpace: "pre-wrap", wordBreak: "break-word", fontSize: 11, borderRadius: 1, bgcolor: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)", maxHeight: 120, overflow: "auto" }}>
+                                {consoleView.dataText}
+                              </Box>
+                            ) : null}
                           </Box>
                         );
                       })}
@@ -11483,6 +11902,12 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
                   )}
                 </Box>
               </Box>
+
+              {/* Timing footer */}
+              <Typography variant="caption" color="text.secondary">
+                Started: <span title={humanTs(str(selectedTrace.started_at)).tip}>{humanTs(str(selectedTrace.started_at)).label}</span>
+                {selectedTrace.completed_at ? <>{" | Completed: "}<span title={humanTs(str(selectedTrace.completed_at)).tip}>{humanTs(str(selectedTrace.completed_at)).label}</span></> : ""}
+              </Typography>
             </Stack>
           )}
         </DialogContent>
@@ -11490,6 +11915,65 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
           <Button onClick={() => setSelectedTraceId(null)}>Close</Button>
         </DialogActions>
       </Dialog>
+
+      {/* Observability Export Delivery Logs */}
+      {exportLogs.length > 0 ? (
+        <Box className="list-shell">
+          <Stack spacing={0.5} mb={1}>
+            <Typography variant="h6">Export Delivery</Typography>
+            <Typography variant="caption" color="text.secondary">
+              Recent pushes to the observability platform.
+            </Typography>
+          </Stack>
+          <TableContainer className="table-shell">
+            <Table size="small">
+              <TableHead>
+                <TableRow>
+                  <TableCell>Time</TableCell>
+                  <TableCell>Status</TableCell>
+                  <TableCell>Event</TableCell>
+                  <TableCell>Message</TableCell>
+                  <TableCell>Trace</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {exportLogs.slice(0, 20).map((entry, idx) => {
+                  const level = str(entry.level, "").toLowerCase();
+                  const ts = humanTs(str(entry.timestamp, ""));
+                  const traceId = str(entry.trace_id, "").trim();
+                  return (
+                    <TableRow
+                      key={`exp-${str(entry.id, "log")}-${idx}`}
+                      hover
+                      onClick={() => { if (traceId) setSelectedTraceId(traceId); }}
+                      sx={{ cursor: traceId ? "pointer" : "default" }}
+                    >
+                      <TableCell sx={{ whiteSpace: "nowrap" }}>
+                        <Typography variant="body2" noWrap title={ts.tip}>{ts.label}</Typography>
+                      </TableCell>
+                      <TableCell>
+                        <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.75 }}>
+                          <Box component="span" sx={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, bgcolor: level === "error" ? "rgba(255,100,100,0.85)" : level === "success" ? "rgba(74,210,157,0.85)" : "rgba(180,200,220,0.5)" }} />
+                          <Typography variant="body2" color="text.secondary" noWrap>{level || "info"}</Typography>
+                        </Box>
+                      </TableCell>
+                      <TableCell><Typography variant="body2" noWrap>{str(entry.event, "-")}</Typography></TableCell>
+                      <TableCell sx={{ maxWidth: 520 }}>
+                        <Typography variant="body2" color={level === "error" ? "error" : "text.secondary"} noWrap title={str(entry.message, "-")}>
+                          {str(entry.message, "-")}
+                        </Typography>
+                      </TableCell>
+                      <TableCell sx={{ fontFamily: "monospace", fontSize: "0.76rem" }}>
+                        {traceId ? traceId.slice(0, 8) : "-"}
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          </TableContainer>
+        </Box>
+      ) : null}
     </Stack>
   );
 }
@@ -11860,6 +12344,7 @@ function WatchersManager({ autoRefresh }: { autoRefresh: boolean }) {
                   const statusLower = rawStatus.toLowerCase();
                   const isActive = statusLower.includes("active");
                   const isPaused = statusLower.includes("paused");
+                  const isHistoryOnly = toBool(w.history_only);
                   const lastPollAt = str(w.last_poll_at, "").trim();
                   const createdAt = str(w.created_at, "").trim();
                   const lastPollLabel = lastPollAt ? formatTimestampForHumans(lastPollAt).label : "Never";
@@ -11868,6 +12353,8 @@ function WatchersManager({ autoRefresh }: { autoRefresh: boolean }) {
                   const lastResult = str(w.last_result, "").trim();
                   const lastError = str(w.last_error, "").trim() || str(w.status_error, "").trim();
                   const lastOutcome = str(w.last_poll_outcome, "").trim();
+                  const intervalLabel = isHistoryOnly ? "-" : formatDurationFromSeconds(num(w.interval_secs, 0));
+                  const timeoutLabel = isHistoryOnly ? "-" : formatDurationFromSeconds(num(w.timeout_secs, 0));
                   const notificationAttempts = asRecords(w.notification_attempts);
                   const latestAttempt = notificationAttempts.length
                     ? notificationAttempts[notificationAttempts.length - 1]
@@ -11888,7 +12375,7 @@ function WatchersManager({ autoRefresh }: { autoRefresh: boolean }) {
                       </TableCell>
                       <TableCell>
                         <Typography variant="body2" noWrap>{str(w.poll_action, "-")}</Typography>
-                        <Typography variant="caption" color="text.secondary">{formatDurationFromSeconds(num(w.interval_secs, 0))}</Typography>
+                        <Typography variant="caption" color="text.secondary">{intervalLabel}</Typography>
                       </TableCell>
                       <TableCell sx={{ maxWidth: 200 }}>
                         <Typography variant="body2" noWrap title={watcherConditionSummary(w.condition)}>
@@ -11896,11 +12383,16 @@ function WatchersManager({ autoRefresh }: { autoRefresh: boolean }) {
                         </Typography>
                       </TableCell>
                       <TableCell>
-                        <Chip
-                          size="small"
-                          label={watcherStatusLabel(rawStatus)}
-                          color={watcherStatusColor(rawStatus)}
-                        />
+                        <Stack direction="row" spacing={0.75} alignItems="center" useFlexGap flexWrap="wrap">
+                          <Chip
+                            size="small"
+                            label={watcherStatusLabel(rawStatus)}
+                            color={watcherStatusColor(rawStatus)}
+                          />
+                          {isHistoryOnly ? (
+                            <Chip size="small" variant="outlined" label="History" />
+                          ) : null}
+                        </Stack>
                       </TableCell>
                       <TableCell>
                         <Stack direction="row" spacing={0.75} alignItems="center">
@@ -11923,18 +12415,18 @@ function WatchersManager({ autoRefresh }: { autoRefresh: boolean }) {
                             },
                             {
                               label: "Pause",
-                              disabled: !isActive || pauseMutation.isPending,
+                              disabled: isHistoryOnly || !isActive || pauseMutation.isPending,
                               onClick: async () => { setError(null); try { await pauseMutation.mutateAsync(id); } catch (e) { setError(errMessage(e)); } },
                             },
                             {
                               label: "Resume",
-                              disabled: !isPaused || resumeMutation.isPending,
+                              disabled: isHistoryOnly || !isPaused || resumeMutation.isPending,
                               onClick: async () => { setError(null); try { await resumeMutation.mutateAsync(id); } catch (e) { setError(errMessage(e)); } },
                             },
                             {
                               label: "Stop",
                               tone: "warning",
-                              disabled: (!isActive && !isPaused) || cancelMutation.isPending,
+                              disabled: isHistoryOnly || (!isActive && !isPaused) || cancelMutation.isPending,
                               onClick: async () => { setError(null); try { await cancelMutation.mutateAsync(id); } catch (e) { setError(errMessage(e)); } },
                             },
                             {
@@ -11984,6 +12476,9 @@ function WatchersManager({ autoRefresh }: { autoRefresh: boolean }) {
               label={watcherStatusLabel(selectedWatcher?.status)}
               color={watcherStatusColor(selectedWatcher?.status)}
             />
+            {toBool(selectedWatcher?.history_only) ? (
+              <Chip size="small" variant="outlined" label="History" />
+            ) : null}
             {str(selectedWatcher?.last_poll_outcome, "").trim() ? (
               <Chip
                 size="small"
@@ -12003,8 +12498,8 @@ function WatchersManager({ autoRefresh }: { autoRefresh: boolean }) {
             <Stack spacing={0.75}>
               {[
                 { label: "Action", value: str(selectedWatcher?.poll_action, "-") },
-                { label: "Interval", value: formatDurationFromSeconds(num(selectedWatcher?.interval_secs, 0)) },
-                { label: "Timeout", value: formatDurationFromSeconds(num(selectedWatcher?.timeout_secs, 0)) },
+                { label: "Interval", value: toBool(selectedWatcher?.history_only) ? "-" : formatDurationFromSeconds(num(selectedWatcher?.interval_secs, 0)) },
+                { label: "Timeout", value: toBool(selectedWatcher?.history_only) ? "-" : formatDurationFromSeconds(num(selectedWatcher?.timeout_secs, 0)) },
                 { label: "Notify", value: str(selectedWatcher?.notify_channel, "-") },
                 { label: "Polls", value: String(num(selectedWatcher?.poll_count, 0)) },
                 { label: "Created", value: humanTs(str(selectedWatcher?.created_at, "-")).label, tip: humanTs(str(selectedWatcher?.created_at, "-")).tip },
@@ -12232,6 +12727,7 @@ function SettingsManager({
   const [activePulseFixId, setActivePulseFixId] = useState<string | null>(null);
   const [selectedMoltbookEvent, setSelectedMoltbookEvent] = useState<JsonRecord | null>(null);
   const [pulsePollState, setPulsePollState] = useState<{ baselineEventId: string; deadlineAt: number } | null>(null);
+  const [moltbookPollState, setMoltbookPollState] = useState<{ baselineEventId: string; deadlineAt: number } | null>(null);
   const [developerModeEnabled, setDeveloperModeEnabledState] = useState(getDeveloperModeEnabled);
   const [trustPresetId, setTrustPresetId] = useState(TRUST_APPROVAL_PRESETS[0]?.id ?? "run_terminal_command");
   const [trustPresetDetail, setTrustPresetDetail] = useState("ls -la");
@@ -12336,13 +12832,13 @@ function SettingsManager({
   const moltbookStatusQ = useQuery({
     queryKey: ["moltbook-status"],
     queryFn: () => api.rawGet("/moltbook/status"),
-    refetchInterval: autoRefresh ? REFRESH_MS : false
+    refetchInterval: moltbookPollState ? 2000 : autoRefresh ? REFRESH_MS : false
   });
-  const moltbookLogQ = useQuery({ 
-    queryKey: ["moltbook-log"], 
-    queryFn: () => api.rawGet("/moltbook/log?limit=40"), 
-    refetchInterval: autoRefresh ? REFRESH_MS : false 
-  }); 
+  const moltbookLogQ = useQuery({
+    queryKey: ["moltbook-log"],
+    queryFn: () => api.rawGet("/moltbook/log?limit=500"),
+    refetchInterval: moltbookPollState ? 2000 : autoRefresh ? REFRESH_MS : false
+  });
   const evolutionQ = useQuery({
     queryKey: ["settings-evolution"],
     queryFn: () => api.rawGet("/settings/evolution"),
@@ -12428,9 +12924,9 @@ function SettingsManager({
     media_key_runway: "",
     media_key_luma: "",
 
-    search_primary: "playwright",
-    search_fallback1: "duckduckgo",
-    search_fallback2: "none",
+    search_primary: "lightpanda",
+    search_fallback1: "playwright",
+    search_fallback2: "duckduckgo",
     search_serper_key: "",
     search_searxng_url: "",
     search_brave_key: "",
@@ -12600,9 +13096,9 @@ function SettingsManager({
       media_key_runway: "",
       media_key_luma: "",
 
-      search_primary: str(settings.search_primary, "playwright"),
-      search_fallback1: str(settings.search_fallback1, "duckduckgo"),
-      search_fallback2: str(settings.search_fallback2, "none"),
+      search_primary: str(settings.search_primary, "lightpanda"),
+      search_fallback1: str(settings.search_fallback1, "playwright"),
+      search_fallback2: str(settings.search_fallback2, "duckduckgo"),
       search_serper_key: "",
       search_searxng_url: str(settings.search_searxng_url, ""),
       search_brave_key: "",
@@ -12747,7 +13243,8 @@ function SettingsManager({
           service_name: form.observability_service_name || "agentark",
           header_name: form.observability_header_name || "x-api-key",
           privacy_mode: form.observability_privacy_mode || "metadata_only",
-          auth_token: form.observability_auth_token
+          // Only send auth_token when user entered a new value — blank means "keep existing"
+          ...(form.observability_auth_token.trim() ? { auth_token: form.observability_auth_token } : {})
         }
       };
 
@@ -12841,6 +13338,9 @@ function SettingsManager({
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["settings-evolution"] });
       await queryClient.invalidateQueries({ queryKey: ["settings-evolution-dev"] });
+      await queryClient.invalidateQueries({ queryKey: ["trace"] });
+      await queryClient.invalidateQueries({ queryKey: ["trace-manager"] });
+      await queryClient.invalidateQueries({ queryKey: ["trace-detail"] });
     }
   });
 
@@ -13278,11 +13778,16 @@ function SettingsManager({
   const usingDefaultMasterPassword = toBool(sec.using_default);
   const hasCustomMasterPassword = toBool(sec.master_password_set) && !usingDefaultMasterPassword;
   const vaultSecrets = pickRecords(vaultSecretsQ.data, "entries");
-  const pulseEvents = pickRecords(pulseQ.data, "events");
+  const pulseEvents = pickRecords(pulseQ.data, "events").sort((a, b) => {
+    const aTs = Date.parse(str(a.timestamp, ""));
+    const bTs = Date.parse(str(b.timestamp, ""));
+    return (Number.isFinite(bTs) ? bTs : 0) - (Number.isFinite(aTs) ? aTs : 0);
+  });
   const pulseMeta = asRecord(pulseQ.data);
   const pulseRunning = toBool(pulseMeta.running);
   const latestPulseEventId = str(asRecord(pulseEvents[0]).id, "");
   const moltbookStatus = asRecord(moltbookStatusQ.data);
+  const latestMoltbookEventId = str(asRecord(moltbookEvents[0]).id, "");
   const moltbookRunRows = buildMoltbookRunRows(moltbookEvents);
   const selectedMoltbookRunId = str(selectedMoltbookEvent?.run_id, "").trim();
   const selectedMoltbookRunEvents = selectedMoltbookRunId
@@ -13306,6 +13811,7 @@ function SettingsManager({
   const selectedMoltbookRunLinks = collectMoltbookRunLinks(selectedMoltbookDialogEvents);
   const selectedMoltbookPostActivity = collectMoltbookRunPostActivity(selectedMoltbookDialogEvents);
   const moltbookRunning = toBool(moltbookStatus.running);
+  const moltbookRunBusy = runMoltbookMutation.isPending || moltbookRunning || Boolean(moltbookPollState);
   const moltbookLastStatus = str(moltbookStatus.last_status, "").toLowerCase();
   const moltbookLastRunStats = asRecord(moltbookStatus.last_run_stats);
   const moltbookNeedsConnection =
@@ -13439,6 +13945,17 @@ function SettingsManager({
       setPulsePollState(null);
     }
   }, [pulsePollState, pulseRunning, latestPulseEventId]);
+
+  useEffect(() => {
+    if (!moltbookPollState) return;
+    if (Date.now() >= moltbookPollState.deadlineAt) {
+      setMoltbookPollState(null);
+      return;
+    }
+    if (!moltbookRunning && latestMoltbookEventId && latestMoltbookEventId !== moltbookPollState.baselineEventId) {
+      setMoltbookPollState(null);
+    }
+  }, [moltbookPollState, moltbookRunning, latestMoltbookEventId]);
 
   function severityChipColor(sev: string): "error" | "warning" | "info" | "success" | "default" {
     const s = (sev || "").toLowerCase();
@@ -14006,6 +14523,16 @@ function collectMoltbookRunTrigger(events: JsonRecord[]): string {
   return "";
 }
 
+function isMoltbookRunGroup(events: JsonRecord[]): boolean {
+  return (
+    Boolean(collectMoltbookRunTrigger(events)) ||
+    events.some((event) => {
+      const action = str(event.action, "").toLowerCase();
+      return action === "run_started" || action === "run_completed";
+    })
+  );
+}
+
 function buildMoltbookRunSummary(events: JsonRecord[]): string {
   const completed = events.find((event) => str(event.action, "").toLowerCase() === "run_completed");
   if (completed) {
@@ -14048,6 +14575,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
     }
   }
   return Array.from(grouped.values())
+    .filter((group) => isMoltbookRunGroup(group))
     .map((group) => pickMoltbookRepresentativeEvent(group))
     .filter((event): event is JsonRecord => event != null)
     .sort((a, b) => moltbookEventTimestampValue(b) - moltbookEventTimestampValue(a));
@@ -14284,12 +14812,29 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
     onSuccess: async (raw) => {
       const message = str(raw.message, "").trim();
       const output = str(raw.output, "").trim();
+      const mode = str(raw.mode, "").trim().toLowerCase();
       if (message && output) {
         setSuccess(`${message}\n\n${output}`);
       } else if (message) {
         setSuccess(message);
       } else {
         setSuccess("ArkPulse fix completed.");
+      }
+      const baselineEventId = latestPulseEventId;
+      setSelectedPulseEvent(null);
+      if (!pulseRunning) {
+        setPulsePollState({
+          baselineEventId,
+          deadlineAt: Date.now() + 2 * 60 * 1000
+        });
+        if (mode !== "app_restart") {
+          try {
+            await api.rawPost("/arkpulse/trigger", {});
+          } catch (e) {
+            setPulsePollState(null);
+            setError(`Fix ran, but ArkPulse refresh failed: ${errMessage(e)}`);
+          }
+        }
       }
       await queryClient.invalidateQueries({ queryKey: ["arkpulse-log"] });
       await queryClient.invalidateQueries({ queryKey: ["tunnel-status"] });
@@ -14734,8 +15279,8 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
           <hr className="settings-divider" />
 
           {/* ── Identity ── */}
-          <Box>
-            <Typography className="settings-section-label">Identity</Typography>
+          <Stack spacing={2}>
+            <Typography className="settings-section-label" sx={{ mb: "0 !important" }}>Identity</Typography>
             <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" }, gap: 1.5 }}>
               <TextField label="Bot Name" value={form.bot_name} onChange={(e) => setField("bot_name", e.target.value)} fullWidth size="small" />
               <TextField
@@ -14773,13 +15318,13 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                 <MenuItem value="creative">Creative</MenuItem>
               </TextField>
             </Box>
-          </Box>
+          </Stack>
 
           <hr className="settings-divider" />
 
           {/* ── Preferences ── */}
-          <Box>
-            <Typography className="settings-section-label">Preferences</Typography>
+          <Stack spacing={2}>
+            <Typography className="settings-section-label" sx={{ mb: "0 !important" }}>Preferences</Typography>
             <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" }, gap: 1.5 }}>
               <Autocomplete
                 freeSolo
@@ -14831,7 +15376,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                 <MenuItem value="narrative">Narrative</MenuItem>
               </TextField>
             </Box>
-          </Box>
+          </Stack>
 
           <hr className="settings-divider" />
 
@@ -15792,7 +16337,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
               </div>
               <div>
                 <div className="adv-group-header-title">Observability</div>
-                <div className="adv-group-header-sub">Optional export of AgentArk traces to Langtrace or OTLP collectors</div>
+                <div className="adv-group-header-sub">Optional export of AgentArk traces to Langtrace, LangSmith, or OTLP collectors</div>
               </div>
             </div>
             <ObservabilityPanel
@@ -16289,9 +16834,18 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                       if (upvoteCount > 0) parts.push(`${upvoteCount} upvote${upvoteCount === 1 ? "" : "s"}`);
                       if (postCount > 0) parts.push(`${postCount} new post${postCount === 1 ? "" : "s"}`);
                       if (commentCount + upvoteCount + postCount === 0) parts.push("no public action taken");
-                      const decisionSummary = str(out.decision_summary, "").trim();
-                      setSuccess(`Moltbook run completed. ${parts.join(", ")}.${decisionSummary ? ` ${decisionSummary}` : ""}`);
+                      setSuccess(`Moltbook run completed. ${parts.join(", ")}.`);
+                    } else if (status === "started") {
+                      setMoltbookPollState({
+                        baselineEventId: latestMoltbookEventId,
+                        deadlineAt: Date.now() + 3 * 60 * 1000
+                      });
+                      setSuccess("Moltbook run started in the background. Watch Connector status or Moltbook Activity for completion.");
                     } else if (status === "running") {
+                      setMoltbookPollState({
+                        baselineEventId: latestMoltbookEventId,
+                        deadlineAt: Date.now() + 3 * 60 * 1000
+                      });
                       setSuccess(str(out.message, "Moltbook run is already in progress."));
                     } else if (status === "not_connected") {
                       setError("Not connected. Save your API key first, then run.");
@@ -16310,9 +16864,9 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                     setError(errMessage(e));
                   }
                 }}
-                disabled={!form.moltbook_enabled || runMoltbookMutation.isPending || moltbookRunning}
+                disabled={!form.moltbook_enabled || moltbookRunBusy}
               >
-                {runMoltbookMutation.isPending || moltbookRunning ? "Running..." : "Run now"}
+                {moltbookRunBusy ? "Running..." : "Run now"}
               </Button>
             </Stack>
 
@@ -16338,24 +16892,16 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                 </Box>
               </Typography>
             </Stack>
-            {form.moltbook_enabled && str(moltbookLastRunStats.decision_summary, "").trim() ? (
-              <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, display: "block" }}>
-                Decision: <Box component="span" sx={{ color: "text.primary" }}>{str(moltbookLastRunStats.decision_summary, "").trim()}</Box>
-              </Typography>
-            ) : null}
           </Box>
 
           <Box className="list-shell" sx={{ minHeight: 0 }}>
             <Stack direction="row" justifyContent="space-between" alignItems="center" mb={1}>
               <Typography variant="h6">Moltbook Activity</Typography>
-              <Typography variant="caption" color="text.secondary">
-                One row per run. Open View for the full step-by-step log and links.
-              </Typography>
             </Stack>
             {moltbookLogQ.error ? <Alert severity="error">{errMessage(moltbookLogQ.error)}</Alert> : null}
             {moltbookRunRows.length === 0 ? (
               <Typography variant="body2" color="text.secondary">
-                No Moltbook events yet.
+                No Moltbook runs yet.
               </Typography>
             ) : (
               <TableContainer className="table-shell">
@@ -16748,8 +17294,8 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                               setError(null);
                               setSuccess(null);
                               try {
-                                await runEvolutionDevActionMutation.mutateAsync("disable_canary");
-                                setSuccess("Canary disabled.");
+                                const result = await runEvolutionDevActionMutation.mutateAsync("disable_canary");
+                                setSuccess(`Canary disabled.${evolutionTraceIdHint(result)}`);
                               } catch (e) {
                                 setError(errMessage(e));
                               }
@@ -16771,8 +17317,8 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                               setError(null);
                               setSuccess(null);
                               try {
-                                await runEvolutionDevActionMutation.mutateAsync("promote_candidate");
-                                setSuccess("Candidate promoted to baseline.");
+                                const result = await runEvolutionDevActionMutation.mutateAsync("promote_candidate");
+                                setSuccess(`Candidate promoted to baseline.${evolutionTraceIdHint(result)}`);
                               } catch (e) {
                                 setError(errMessage(e));
                               }
@@ -16794,8 +17340,8 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                               setError(null);
                               setSuccess(null);
                               try {
-                                await runEvolutionDevActionMutation.mutateAsync("rollback_baseline");
-                                setSuccess("Rolled back to baseline snapshot.");
+                                const result = await runEvolutionDevActionMutation.mutateAsync("rollback_baseline");
+                                setSuccess(`Rolled back to baseline snapshot.${evolutionTraceIdHint(result)}`);
                               } catch (e) {
                                 setError(errMessage(e));
                               }
@@ -17084,7 +17630,9 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                   const cause = str(fr.root_cause, "-");
                   const typedRemediation = parseArkPulseRemediationSpec(fr.remediation);
                   const runnableRemediation = typedRemediation ?? getRunnableArkPulseRemediation(fr);
-                  const fix = getArkPulseFixText(fr);
+                  const rawFixCommand = str(fr.fix_command, "").trim();
+                  const displayRemediation = typedRemediation ?? runnableRemediation;
+                  const fix = displayRemediation ? describeArkPulseRemediation(displayRemediation) : getArkPulseFixText(fr);
                   const canCopyFix = fix.trim().length > 0 && fix.trim() !== "-";
                   const canRunFix = runnableRemediation != null;
                   const fixActionId = `${title}:${target}:${idx}`;
@@ -17153,7 +17701,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                               setActivePulseFixId(fixActionId);
                               try {
                                 await runPulseFixMutation.mutateAsync({
-                                  fixCommand: fix,
+                                  fixCommand: rawFixCommand,
                                   remediation: typedRemediation,
                                   issueTitle: title,
                                   target,
@@ -17715,8 +18263,29 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
 /* ───────────── Analytics (top-level page) ───────────── */
 
 function AnalyticsManager({ autoRefresh }: { autoRefresh: boolean }) {
-  type AnalyticsRange = "24h" | "30d" | "90d" | "custom";
+  type AnalyticsRange = "1h" | "2h" | "6h" | "24h" | "3d" | "7d" | "14d" | "21d" | "30d" | "45d" | "60d" | "90d" | "custom";
   type BreakdownView = "model" | "channel" | "purpose";
+
+  const RANGE_PRESETS: { value: AnalyticsRange; label: string; hours: number }[] = [
+    { value: "1h", label: "1 hour", hours: 1 },
+    { value: "2h", label: "2 hours", hours: 2 },
+    { value: "6h", label: "6 hours", hours: 6 },
+    { value: "24h", label: "24 hours", hours: 24 },
+    { value: "3d", label: "3 days", hours: 72 },
+    { value: "7d", label: "7 days", hours: 168 },
+    { value: "14d", label: "14 days", hours: 336 },
+    { value: "21d", label: "21 days", hours: 504 },
+    { value: "30d", label: "30 days", hours: 720 },
+    { value: "45d", label: "45 days", hours: 1080 },
+    { value: "60d", label: "60 days", hours: 1440 },
+    { value: "90d", label: "90 days", hours: 2160 },
+  ];
+
+  function bucketForHours(hours: number): "hour" | "day" | "week" {
+    if (hours <= 72) return "hour";
+    if (hours <= 24 * 120) return "day";
+    return "week";
+  }
 
   function toLocalDatetimeInput(date: Date): string {
     const pad = (n: number) => String(n).padStart(2, "0");
@@ -17744,6 +18313,7 @@ function AnalyticsManager({ autoRefresh }: { autoRefresh: boolean }) {
 
   const [activeRange, setActiveRange] = useState<AnalyticsRange>("24h");
   const [breakdownView, setBreakdownView] = useState<BreakdownView>("model");
+  const [customDialogOpen, setCustomDialogOpen] = useState(false);
   const defaultCustomTo = useMemo(() => toLocalDatetimeInput(new Date()), []);
   const defaultCustomFrom = useMemo(
     () => toLocalDatetimeInput(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)),
@@ -17762,66 +18332,65 @@ function AnalyticsManager({ autoRefresh }: { autoRefresh: boolean }) {
     !customFromDate ||
     !customToDate ||
     customFromDate.getTime() >= customToDate.getTime();
-  const customBucket = useMemo(() => {
-    if (!appliedFromDate || !appliedToDate) return "day";
-    const diffMs = appliedToDate.getTime() - appliedFromDate.getTime();
-    const diffHours = diffMs / (1000 * 60 * 60);
-    if (diffHours <= 72) return "hour";
-    if (diffHours <= 24 * 120) return "day";
-    return "week";
-  }, [appliedFromDate, appliedToDate]);
 
-  const hourQ = useQuery({
-    queryKey: ["llm-analytics", "24h", "hour"],
-    queryFn: () => api.getLlmAnalytics({ range: "24h", bucket: "hour" }),
-    refetchInterval: autoRefresh ? 30000 : false
+  // Compute effective from/to ISO strings and bucket for the active range
+  const { effectiveFrom, effectiveTo, effectiveBucket } = useMemo(() => {
+    if (activeRange === "custom") {
+      const from = appliedFromDate?.toISOString() ?? "";
+      const to = appliedToDate?.toISOString() ?? "";
+      const diffMs = (appliedToDate?.getTime() ?? 0) - (appliedFromDate?.getTime() ?? 0);
+      const diffHours = diffMs / (1000 * 60 * 60);
+      return { effectiveFrom: from, effectiveTo: to, effectiveBucket: bucketForHours(diffHours) };
+    }
+    const preset = RANGE_PRESETS.find((p) => p.value === activeRange);
+    const hours = preset?.hours ?? 24;
+    const now = new Date();
+    const from = new Date(now.getTime() - hours * 60 * 60 * 1000);
+    return {
+      effectiveFrom: from.toISOString(),
+      effectiveTo: now.toISOString(),
+      effectiveBucket: bucketForHours(hours),
+    };
+  }, [activeRange, appliedFromDate, appliedToDate]);
+
+  const analyticsQ = useQuery({
+    queryKey: ["llm-analytics", activeRange, effectiveFrom, effectiveTo, effectiveBucket],
+    queryFn: () =>
+      api.getLlmAnalytics({
+        range: activeRange === "custom" ? "custom" : activeRange,
+        bucket: effectiveBucket,
+        from: effectiveFrom || undefined,
+        to: effectiveTo || undefined,
+      }),
+    enabled: activeRange !== "custom" || Boolean(appliedFromDate && appliedToDate),
+    refetchInterval: autoRefresh ? (effectiveBucket === "hour" ? 30000 : 120000) : false,
   });
-  const dayQ = useQuery({
-    queryKey: ["llm-analytics", "30d", "day"],
-    queryFn: () => api.getLlmAnalytics({ range: "30d", bucket: "day" }),
-    refetchInterval: autoRefresh ? 120000 : false
-  });
-  const weekQ = useQuery({
-    queryKey: ["llm-analytics", "90d", "week"],
-    queryFn: () => api.getLlmAnalytics({ range: "90d", bucket: "week" }),
-    refetchInterval: autoRefresh ? 300000 : false
-  });
-  const customQ = useQuery({
-    queryKey: ["llm-analytics", "custom", appliedCustomFrom, appliedCustomTo, customBucket],
-    queryFn: async () => {
-      if (!appliedFromDate || !appliedToDate) {
-        throw new Error("Custom date range is invalid.");
-      }
-      return api.getLlmAnalytics({
-        range: "24h",
-        bucket: customBucket,
-        from: appliedFromDate.toISOString(),
-        to: appliedToDate.toISOString()
-      });
-    },
-    enabled: activeRange === "custom" && Boolean(appliedFromDate && appliedToDate),
-    refetchInterval: autoRefresh ? 120000 : false
-  });
+
+  const handleRangeChange = (range: AnalyticsRange) => {
+    if (range === "custom") {
+      setCustomFrom(defaultCustomFrom);
+      setCustomTo(toLocalDatetimeInput(new Date()));
+      setCustomDialogOpen(true);
+      return;
+    }
+    setActiveRange(range);
+  };
+
+  const applyCustomRange = () => {
+    if (customRangeInvalid) return;
+    setAppliedCustomFrom(customFrom);
+    setAppliedCustomTo(customTo);
+    setActiveRange("custom");
+    setCustomDialogOpen(false);
+  };
   const policyMetricsQ = useQuery({
     queryKey: ["analytics-policy-metrics"],
     queryFn: () => api.rawGet("/settings/evolution/dev?limit=5000"),
     refetchInterval: autoRefresh ? 120000 : false
   });
 
-  const dataMap: Record<AnalyticsRange, LlmAnalyticsResponse | undefined> = {
-    "24h": hourQ.data as LlmAnalyticsResponse | undefined,
-    "30d": dayQ.data as LlmAnalyticsResponse | undefined,
-    "90d": weekQ.data as LlmAnalyticsResponse | undefined,
-    custom: customQ.data as LlmAnalyticsResponse | undefined
-  };
-  const errorMap: Record<AnalyticsRange, unknown> = {
-    "24h": hourQ.error,
-    "30d": dayQ.error,
-    "90d": weekQ.error,
-    custom: customQ.error
-  };
-  const resp = dataMap[activeRange];
-  const activeError = errorMap[activeRange];
+  const resp = analyticsQ.data as LlmAnalyticsResponse | undefined;
+  const activeError = analyticsQ.error;
   const totals = resp?.totals;
   const policyMetricsPayload = asRecord(policyMetricsQ.data);
   const policyMetricsRows = pickRecords(policyMetricsPayload, "policy_metrics")
@@ -17967,57 +18536,71 @@ function AnalyticsManager({ autoRefresh }: { autoRefresh: boolean }) {
           select
           size="small"
           value={activeRange}
-          onChange={(e) => setActiveRange((e.target.value as AnalyticsRange) || "24h")}
-          sx={{ minWidth: 120 }}
+          onChange={(e) => {
+            const val = e.target.value as AnalyticsRange | "open_custom";
+            if (val === "open_custom") {
+              handleRangeChange("custom");
+            } else {
+              handleRangeChange(val);
+            }
+          }}
+          sx={{ minWidth: 180 }}
         >
-          <MenuItem value="24h">24 h</MenuItem>
-          <MenuItem value="30d">30 d</MenuItem>
-          <MenuItem value="90d">90 d</MenuItem>
-          <MenuItem value="custom">Custom</MenuItem>
+          <MenuItem disabled sx={{ fontSize: "0.75rem", opacity: 0.6, py: 0.25 }}>Hours</MenuItem>
+          <MenuItem value="1h">1 hour</MenuItem>
+          <MenuItem value="2h">2 hours</MenuItem>
+          <MenuItem value="6h">6 hours</MenuItem>
+          <MenuItem value="24h">24 hours</MenuItem>
+          <MenuItem disabled sx={{ fontSize: "0.75rem", opacity: 0.6, py: 0.25 }}>Days</MenuItem>
+          <MenuItem value="3d">3 days</MenuItem>
+          <MenuItem value="7d">7 days</MenuItem>
+          <MenuItem value="14d">14 days</MenuItem>
+          <MenuItem value="21d">21 days</MenuItem>
+          <MenuItem value="30d">30 days</MenuItem>
+          <MenuItem value="45d">45 days</MenuItem>
+          <MenuItem value="60d">60 days</MenuItem>
+          <MenuItem value="90d">90 days</MenuItem>
+          <Divider />
+          {activeRange === "custom" ? (
+            <MenuItem value="custom">Custom ({appliedCustomFrom.replace("T", " ")} — {appliedCustomTo.replace("T", " ")})</MenuItem>
+          ) : null}
+          <MenuItem value={"open_custom" as string}>Custom range...</MenuItem>
         </TextField>
       </Stack>
 
-      {activeRange === "custom" ? (
-        <Stack
-          direction={{ xs: "column", md: "row" }}
-          spacing={1}
-          alignItems={{ xs: "stretch", md: "center" }}
-          className="list-shell"
-          sx={{ p: 1.2 }}
-        >
-          <TextField
-            size="small"
-            label="From"
-            type="datetime-local"
-            value={customFrom}
-            onChange={(e) => setCustomFrom(e.target.value)}
-            InputLabelProps={{ shrink: true }}
-            sx={{ minWidth: 220 }}
-          />
-          <TextField
-            size="small"
-            label="To"
-            type="datetime-local"
-            value={customTo}
-            onChange={(e) => setCustomTo(e.target.value)}
-            InputLabelProps={{ shrink: true }}
-            sx={{ minWidth: 220 }}
-            error={customRangeInvalid}
-            helperText={customRangeInvalid ? "To must be later than From." : "Choose any custom date/time range."}
-          />
-          <Button
-            variant="contained"
-            onClick={() => {
-              if (customRangeInvalid) return;
-              setAppliedCustomFrom(customFrom);
-              setAppliedCustomTo(customTo);
-            }}
-            disabled={customRangeInvalid || customQ.isFetching}
-          >
-            {customQ.isFetching ? "Applying..." : "Apply"}
+      <Dialog open={customDialogOpen} onClose={() => setCustomDialogOpen(false)} maxWidth="xs" fullWidth>
+        <DialogTitle>Custom Date Range</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ mt: 1 }}>
+            <TextField
+              size="small"
+              label="From"
+              type="datetime-local"
+              value={customFrom}
+              onChange={(e) => setCustomFrom(e.target.value)}
+              InputLabelProps={{ shrink: true }}
+              fullWidth
+            />
+            <TextField
+              size="small"
+              label="To"
+              type="datetime-local"
+              value={customTo}
+              onChange={(e) => setCustomTo(e.target.value)}
+              InputLabelProps={{ shrink: true }}
+              fullWidth
+              error={customRangeInvalid}
+              helperText={customRangeInvalid ? "To must be later than From." : undefined}
+            />
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setCustomDialogOpen(false)}>Cancel</Button>
+          <Button variant="contained" onClick={applyCustomRange} disabled={customRangeInvalid}>
+            Apply
           </Button>
-        </Stack>
-      ) : null}
+        </DialogActions>
+      </Dialog>
 
       {activeError ? <Alert severity="error">{String(activeError)}</Alert> : null}
 
@@ -18092,17 +18675,56 @@ function AnalyticsManager({ autoRefresh }: { autoRefresh: boolean }) {
           </Grid2>
           <Grid2 size={{ xs: 12, lg: 6 }}>
             <Box className="list-shell" sx={{ p: 1.6 }}>
-              <Typography variant="subtitle1" sx={{ color: "#e8f4ff", fontWeight: 600, mb: 0.5 }}>Tokens Over Time</Typography>
+              <Typography variant="subtitle1" sx={{ color: "#e8f4ff", fontWeight: 600, mb: 0.25 }}>Tokens Over Time</Typography>
+              <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 0.75 }}>
+                All LLM traffic, split into primary response generation vs helper/classifier passes.
+              </Typography>
               <ReactECharts style={{ height: 220 }} option={{
                 backgroundColor: "transparent",
                 animationDuration: 400,
                 grid: { left: 56, right: 16, top: 16, bottom: 32 },
+                legend: {
+                  top: 0,
+                  textStyle: { color: "#9fc3e6", fontSize: 11 }
+                },
                 tooltip: { trigger: "axis", backgroundColor: "rgba(6,14,28,0.95)", borderColor: "rgba(84,198,255,0.25)", textStyle: { color: "#d8edff" } },
                 xAxis: { type: "category", data: (resp?.series || []).map((p) => p.bucket_start.slice(5, 16).replace("T", " ")), axisLabel: { color: "#8fb2d1", fontSize: 10 }, axisLine: { lineStyle: { color: "rgba(108,156,212,0.25)" } } },
                 yAxis: { type: "value", axisLabel: { color: "#8fb2d1" }, splitLine: { lineStyle: { color: "rgba(108,156,212,0.10)" } } },
                 series: [
-                  { type: "line", name: "Prompt", data: (resp?.series || []).map((p) => p.prompt_tokens), smooth: true, areaStyle: { opacity: 0.15 }, lineStyle: { color: "#14f195", width: 2 }, itemStyle: { color: "#14f195" } },
-                  { type: "line", name: "Completion", data: (resp?.series || []).map((p) => p.completion_tokens), smooth: true, areaStyle: { opacity: 0.15 }, lineStyle: { color: "#2fd4ff", width: 2 }, itemStyle: { color: "#2fd4ff" } }
+                  {
+                    type: "line",
+                    name: "Primary prompt",
+                    data: (resp?.series || []).map((p) => p.primary_prompt_tokens),
+                    smooth: true,
+                    areaStyle: { opacity: 0.12 },
+                    lineStyle: { color: "#14f195", width: 2 },
+                    itemStyle: { color: "#14f195" }
+                  },
+                  {
+                    type: "line",
+                    name: "Primary completion",
+                    data: (resp?.series || []).map((p) => p.primary_completion_tokens),
+                    smooth: true,
+                    areaStyle: { opacity: 0.12 },
+                    lineStyle: { color: "#2fd4ff", width: 2 },
+                    itemStyle: { color: "#2fd4ff" }
+                  },
+                  {
+                    type: "line",
+                    name: "Helper prompt",
+                    data: (resp?.series || []).map((p) => p.helper_prompt_tokens),
+                    smooth: true,
+                    lineStyle: { color: "#fbbf24", width: 2, type: "dashed" },
+                    itemStyle: { color: "#fbbf24" }
+                  },
+                  {
+                    type: "line",
+                    name: "Helper completion",
+                    data: (resp?.series || []).map((p) => p.helper_completion_tokens),
+                    smooth: true,
+                    lineStyle: { color: "#c084fc", width: 2, type: "dashed" },
+                    itemStyle: { color: "#c084fc" }
+                  }
                 ]
               }} />
             </Box>
@@ -18260,8 +18882,8 @@ export function NativeWorkspace({
   return (
     <Box
       sx={{
-        p: 0.75,
-        height: "calc(100vh - var(--appbar-height) - 8px)",
+        p: { xs: 0.5, md: 0.75 },
+        height: "100%",
         overflow: isChat ? "hidden" : "auto",
         display: "flex",
         flexDirection: "column",

@@ -1268,6 +1268,8 @@ async fn handle_command(text: &str, agent: &SharedAgent, from: &str) -> String {
                  /install <url> - Install a skill from URL\n\
                  /run <skill> [query] - Run a custom/bundled skill\n\
                  /tasks - View pending tasks\n\
+                 /approve-task <task_id> - Approve a waiting task\n\
+                 /reject-task <task_id> - Reject a waiting task\n\
                  /search <query> - Web search\n\
                  /image <prompt> - Generate an image\n\
                  /tunnel [start|stop|status] - Manage public UI tunnel\n\
@@ -1491,11 +1493,54 @@ async fn handle_command(text: &str, agent: &SharedAgent, from: &str) -> String {
                             TaskStatus::Pending => "[pending]",
                             _ => "[-]",
                         };
-                        format!("{} {}", marker, t.description)
+                        if matches!(t.status, TaskStatus::AwaitingApproval) {
+                            format!("{} {} [{}]", marker, t.description, t.id)
+                        } else {
+                            format!("{} {}", marker, t.description)
+                        }
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
                 format!("*Pending Tasks*\n\n{}", list)
+            }
+        }
+
+        "/approve-task" => {
+            if args.is_empty() {
+                "Usage: /approve-task <task_id>".to_string()
+            } else {
+                let Ok(task_id) = uuid::Uuid::parse_str(args) else {
+                    return "Invalid task id. Use the full task UUID shown in /tasks or the approval notification.".to_string();
+                };
+                let agent = agent.read().await;
+                match agent.approve_task_request(task_id, "whatsapp").await {
+                    Ok(Some(task)) => format!("Approved: {}", task.description),
+                    Ok(None) => "Task not found or is not awaiting approval.".to_string(),
+                    Err(e) => format!("Failed to approve task: {}", e),
+                }
+            }
+        }
+
+        "/reject-task" => {
+            if args.is_empty() {
+                "Usage: /reject-task <task_id>".to_string()
+            } else {
+                let Ok(task_id) = uuid::Uuid::parse_str(args) else {
+                    return "Invalid task id. Use the full task UUID shown in /tasks or the approval notification.".to_string();
+                };
+                let agent = agent.read().await;
+                match agent
+                    .reject_task_request(
+                        task_id,
+                        "whatsapp",
+                        "Task was rejected from WhatsApp and will not be executed.",
+                    )
+                    .await
+                {
+                    Ok(Some(task)) => format!("Rejected: {}", task.description),
+                    Ok(None) => "Task not found or is not awaiting approval.".to_string(),
+                    Err(e) => format!("Failed to reject task: {}", e),
+                }
             }
         }
 

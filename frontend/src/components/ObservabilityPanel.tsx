@@ -68,11 +68,13 @@ export function ObservabilityPanel({
   onTest
 }: ObservabilityPanelProps) {
   const provider = (values.provider || "langtrace").trim().toLowerCase();
-  const endpointLabel = provider === "langtrace" ? "Langtrace Base URL" : "OTLP Endpoint";
+  const endpointLabel = provider === "langtrace" ? "Langtrace Base URL" : provider === "langsmith" ? "LangSmith Endpoint" : "OTLP Endpoint";
   const endpointHelper =
     provider === "langtrace"
       ? "Use the Langtrace host URL. AgentArk will push JSON traces to /api/trace."
-      : "Use the OTLP/HTTP traces endpoint. AgentArk will append /v1/traces when needed.";
+      : provider === "langsmith"
+        ? "Use the LangSmith API endpoint (e.g. https://eu.api.smith.langchain.com). AgentArk will append /otel/v1/traces."
+        : "Use the OTLP/HTTP traces endpoint. AgentArk will append /v1/traces when needed.";
   const statusChip = !values.enabled
     ? { label: "Off", color: "default" as const }
     : values.endpoint.trim() && values.authTokenConfigured
@@ -90,7 +92,7 @@ export function ObservabilityPanel({
       </Stack>
 
       <Typography variant="caption" color="text.secondary">
-        Optional. When enabled and configured, AgentArk exports completed run traces to Langtrace or any OTLP-compatible backend.
+        Optional. When enabled and configured, AgentArk exports completed run traces to Langtrace, LangSmith, or any OTLP-compatible backend.
       </Typography>
 
       <FormControlLabel
@@ -114,20 +116,22 @@ export function ObservabilityPanel({
             const nextProvider = e.target.value;
             onValueChange({
               provider: nextProvider,
-              headerName: nextProvider === "langtrace" ? "x-api-key" : values.headerName
+              headerName: nextProvider === "langtrace" ? "x-api-key" : nextProvider === "langsmith" ? "x-api-key" : values.headerName
             });
           }}
         >
           <MenuItem value="langtrace">Langtrace</MenuItem>
+          <MenuItem value="langsmith">LangSmith</MenuItem>
           <MenuItem value="generic_otlp">Generic OTLP</MenuItem>
         </TextField>
         <TextField
-          label="Service Name"
+          label={provider === "langsmith" ? "Project Name" : "Service Name"}
           size="small"
           fullWidth
           value={values.serviceName}
           onChange={(e) => onValueChange({ serviceName: e.target.value })}
           placeholder="agentark"
+          helperText={provider === "langsmith" ? "Maps to LANGSMITH_PROJECT. Traces go to this project in LangSmith." : undefined}
         />
       </Stack>
 
@@ -137,7 +141,7 @@ export function ObservabilityPanel({
         fullWidth
         value={values.endpoint}
         onChange={(e) => onValueChange({ endpoint: e.target.value })}
-        placeholder={provider === "langtrace" ? "https://app.langtrace.ai" : "https://collector.example.com"}
+        placeholder={provider === "langtrace" ? "https://app.langtrace.ai" : provider === "langsmith" ? "https://eu.api.smith.langchain.com" : "https://collector.example.com"}
         helperText={endpointHelper}
       />
 
@@ -199,76 +203,9 @@ export function ObservabilityPanel({
 
       <Divider />
 
-      <Box className="list-shell" sx={{ minHeight: 0 }}>
-        <Stack direction={{ xs: "column", sm: "row" }} justifyContent="space-between" spacing={1}>
-          <Stack spacing={0.2}>
-            <Typography variant="subtitle2">Recent Export Delivery</Typography>
-            <Typography variant="caption" color="text.secondary">
-              Shows recent pushes to the observability platform, including failures and API errors.
-            </Typography>
-          </Stack>
-        </Stack>
-
-        {logsError ? (
-          <Alert severity="error" sx={{ mt: 1 }}>{logsError}</Alert>
-        ) : logsLoading ? (
-          <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
-            Loading export logs...
-          </Typography>
-        ) : logs.length === 0 ? (
-          <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
-            No export attempts yet.
-          </Typography>
-        ) : (
-          <TableContainer className="table-shell" sx={{ mt: 1 }}>
-            <Table size="small">
-              <TableHead>
-                <TableRow>
-                  <TableCell>Time</TableCell>
-                  <TableCell>Status</TableCell>
-                  <TableCell>Event</TableCell>
-                  <TableCell>Message</TableCell>
-                  <TableCell>Trace</TableCell>
-                </TableRow>
-              </TableHead>
-              <TableBody>
-                {logs.map((entry, idx) => {
-                  const level = str(entry.level, "").toLowerCase();
-                  const timestamp = humanTs(str(entry.timestamp, ""));
-                  const traceId = str(entry.trace_id, "").trim();
-                  const message = str(entry.message, "-");
-                  return (
-                    <TableRow key={`${str(entry.id, "log")}-${idx}`}>
-                      <TableCell sx={{ whiteSpace: "nowrap" }}>
-                        <Typography variant="body2" title={timestamp.tip}>
-                          {timestamp.label}
-                        </Typography>
-                      </TableCell>
-                      <TableCell>
-                        <Chip
-                          size="small"
-                          label={level || "info"}
-                          color={level === "error" ? "error" : level === "success" ? "success" : "warning"}
-                          variant={level === "success" ? "filled" : "outlined"}
-                        />
-                      </TableCell>
-                      <TableCell>{str(entry.event, "-")}</TableCell>
-                      <TableCell sx={{ maxWidth: 520 }}>
-                        <Typography variant="body2" color={level === "error" ? "error" : "text.secondary"} title={message}>
-                          {message}
-                        </Typography>
-                      </TableCell>
-                      <TableCell sx={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: "0.76rem" }}>
-                        {traceId ? traceId.slice(0, 8) : "-"}
-                      </TableCell>
-                    </TableRow>
-                  );
-                })}
-              </TableBody>
-            </Table>
-          </TableContainer>
-        )}
-      </Box>
+      <Typography variant="caption" color="text.secondary">
+        Export delivery logs are shown on the Trace page.
+      </Typography>
     </Stack>
   );
 }

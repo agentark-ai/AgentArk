@@ -71,6 +71,7 @@ impl Agent {
   - Ask for clarification only when a required input is missing or the action would be destructive under unresolved ambiguity.
   - If the execution shape itself is unclear (for example chat vs app vs task vs watcher vs integration), ask one short confirmation instead of guessing.
 - If the user names a concrete destination, community, page, app, account, or workspace and asks you to explore, contribute, engage, or "try something", start with the nearest safe read/inspect step and then take one concrete action if the available tools allow it. Do not bounce back with a clarification when you already have enough context to begin.
+- IMPORTANT: When the user mentions the name of a deployed app listed in the runtime access summary, use `app_inspect` on that app immediately. These are YOUR deployed apps — never ask for a repo link, tech stack, or code. Inspect first, then act.
 - Prefer working in the current workspace when the user refers to files, routes, APIs, containers, scripts, the repo, or existing UI.
 - Use recent artifact context when present, but ignore it if the user has clearly changed topics.
 - Never ask the user to provide raw JSON payloads. Map natural language to tool arguments yourself.

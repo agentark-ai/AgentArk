@@ -40,6 +40,8 @@ pub enum SearchBackend {
     DuckDuckGo,
     /// Playwright browser automation (headless Chromium via bridge sidecar)
     Playwright { bridge_url: String },
+    /// Lightpanda fast headless browser (CLI-based, no sidecar needed)
+    Lightpanda,
 }
 
 /// Web search client
@@ -75,6 +77,7 @@ impl SearchClient {
             SearchBackend::Playwright { bridge_url } => {
                 self.search_playwright(bridge_url, query, num_results).await
             }
+            SearchBackend::Lightpanda => self.search_lightpanda(query, num_results).await,
         }
     }
 
@@ -488,8 +491,8 @@ impl SearchClient {
     /// Extract a snippet from body text near a given title string
     fn extract_snippet_near(body_text: &str, title: &str) -> String {
         // Find the title (or a substring) in the body text
-        let search_term = if title.len() > 20 {
-            &title[..20]
+        let search_term = if title.chars().count() > 20 {
+            &title[..title.char_indices().nth(20).map(|(i, _)| i).unwrap_or(title.len())]
         } else {
             title
         };
@@ -509,6 +512,100 @@ impl SearchClient {
         }
         String::new()
     }
+
+    /// Search using Lightpanda + DuckDuckGo HTML
+    async fn search_lightpanda(
+        &self,
+        query: &str,
+        num_results: usize,
+    ) -> Result<SearchResponse> {
+        let search_url = format!(
+            "https://html.duckduckgo.com/html/?q={}",
+            urlencoding::encode(query)
+        );
+
+        let html = crate::integrations::lightpanda::fetch_html(&search_url).await?;
+
+        let mut results = Vec::new();
+        for chunk in html.split("class=\"result__a\"") {
+            if results.len() >= num_results {
+                break;
+            }
+            let href = chunk
+                .split("href=\"")
+                .nth(1)
+                .and_then(|s| s.split('"').next())
+                .unwrap_or("")
+                .to_string();
+            if href.is_empty() || href.starts_with('#') || href.contains("duckduckgo.com") {
+                continue;
+            }
+            let url = if href.contains("uddg=") {
+                urlencoding::decode(
+                    href.split("uddg=")
+                        .nth(1)
+                        .unwrap_or(&href)
+                        .split('&')
+                        .next()
+                        .unwrap_or(&href),
+                )
+                .unwrap_or_default()
+                .to_string()
+            } else {
+                href
+            };
+            if url.is_empty() || !url.starts_with("http") {
+                continue;
+            }
+            let title = chunk
+                .split('>')
+                .nth(1)
+                .and_then(|s| s.split("</").next())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let snippet = chunk
+                .split("result__snippet")
+                .nth(1)
+                .and_then(|s| s.split('>').nth(1))
+                .and_then(|s| s.split("</").next())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+
+            results.push(SearchResult {
+                title: strip_html_tags(&title),
+                url,
+                snippet: strip_html_tags(&snippet),
+                source: "lightpanda".to_string(),
+            });
+        }
+
+        Ok(SearchResponse {
+            query: query.to_string(),
+            results,
+            backend: "lightpanda".to_string(),
+        })
+    }
+}
+
+fn strip_html_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        if ch == '<' {
+            in_tag = true;
+            continue;
+        }
+        if ch == '>' {
+            in_tag = false;
+            continue;
+        }
+        if !in_tag {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// Simple HTML entity decoder
@@ -657,6 +754,7 @@ impl SearchConfig {
             "searxng" => self.searxng.clone(),
             "brave_api" | "brave" => self.brave.clone(),
             "duckduckgo" => Some(SearchBackend::DuckDuckGo),
+            "lightpanda" => Some(SearchBackend::Lightpanda),
             _ => None,
         }
     }

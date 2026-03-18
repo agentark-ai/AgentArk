@@ -23,7 +23,6 @@ import { WelcomeHero } from "./WelcomeHero";
 import { NeedsAttentionInbox } from "./NeedsAttentionInbox";
 import { TodaysHighlights } from "./TodaysHighlights";
 import { SmartSuggestions } from "./SmartSuggestions";
-import { QuickActionsStrip } from "./QuickActionsStrip";
 import { ActivityFeed } from "./ActivityFeed";
 import type { RecommendedSkill } from "../types";
 
@@ -330,46 +329,117 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
     automationQ.error ||
     automationRunsQ.error
   );
+  const failingSources = [
+    tasksQ.error ? "tasks" : null,
+    traceQ.error ? "trace" : null,
+    briefingQ.error ? "briefing" : null,
+    autonomySettingsQ.error ? "autonomy settings" : null,
+    automationQ.error ? "automation objects" : null,
+    automationRunsQ.error ? "automation runs" : null,
+  ].filter(Boolean) as string[];
+  const dataSourceErrorSummary =
+    failingSources.length === 0
+      ? ""
+      : failingSources.length === 1
+        ? `${failingSources[0]} failed to load. Retrying automatically.`
+        : `${failingSources.join(", ")} failed to load. Retrying automatically.`;
 
   return (
     <Box
       data-tour-target="overview-dashboard"
-      sx={{
-        height: "auto",
-        p: { xs: 1, md: 1.25 },
-        overflow: "visible",
-        display: "flex",
-        flexDirection: "column",
-        gap: 1.25,
-      }}
+      className="overview-shell"
     >
       <Box data-tour-target="welcome-hero">
-        <WelcomeHero onGoChat={() => navigateToView("chat")} />
+        <WelcomeHero
+          onGoChat={() => navigateToView("chat")}
+          onRunBriefing={() => runBriefingMutation.mutate()}
+          onViewTasks={() => navigateToView("tasks")}
+          onTogglePause={() => {
+            void handleTogglePause();
+          }}
+          agentPaused={agentPaused}
+          briefingLoading={runBriefingMutation.isPending}
+          pauseLoading={pauseMutation.isPending}
+        />
       </Box>
 
-      <AgentStatusBar
-        serverStatus={serverStatus}
-        serverError={serverError}
-        serverLoading={serverLoading}
-        currentTaskDesc={currentTask}
-      />
+      {hasErrors ? (
+        <Alert severity="error">
+          {dataSourceErrorSummary}
+        </Alert>
+      ) : null}
 
-      <NeedsAttentionInbox
-        tasks={tasks}
-        notifications={notifications}
-        securityLogs={securityLogs}
-        settingsLoaded={!settingsQ.isLoading}
-        hasLlmConfigured={hasLlmConfigured}
-        onApprove={(id) => approveMutation.mutate(id)}
-        onReject={(id) => rejectMutation.mutate(id)}
-        onRetry={(id) => retryMutation.mutate(id)}
-        onNavigate={navigateToView}
-        approving={approveMutation.isPending}
-        rejecting={rejectMutation.isPending}
-        retrying={retryMutation.isPending}
-      />
+      <Box className="overview-stage">
+        <NeedsAttentionInbox
+          tasks={tasks}
+          notifications={notifications}
+          securityLogs={securityLogs}
+          settingsLoaded={!settingsQ.isLoading}
+          hasLlmConfigured={hasLlmConfigured}
+          onApprove={(id) => approveMutation.mutate(id)}
+          onReject={(id) => rejectMutation.mutate(id)}
+          onRetry={(id) => retryMutation.mutate(id)}
+          onNavigate={navigateToView}
+          approving={approveMutation.isPending}
+          rejecting={rejectMutation.isPending}
+          retrying={retryMutation.isPending}
+        />
 
-      <Grid2 container spacing={1.2} alignItems="stretch">
+        <Stack className="overview-command-stack">
+          <AgentStatusBar
+            serverStatus={serverStatus}
+            serverError={serverError}
+            serverLoading={serverLoading}
+            currentTaskDesc={currentTask}
+          />
+
+          <Box className="overview-action-card">
+            <Stack spacing={1.25}>
+              <Box>
+                <Typography
+                  variant="overline"
+                  sx={{
+                    color: "rgba(140, 190, 236, 0.8)",
+                    letterSpacing: "0.12em",
+                    display: "block",
+                    mb: 0.35
+                  }}
+                >
+                  Live Surface
+                </Typography>
+                <Typography variant="h6" sx={{ fontWeight: 600, mb: 0.45 }}>
+                  Keep the first screen focused.
+                </Typography>
+                <Typography variant="body2" color="text.secondary">
+                  Open the deeper operational views only when you need them. The landing view should stay clean and readable.
+                </Typography>
+              </Box>
+
+              <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                <Chip size="small" label={`${automationCounts.tasks} tasks`} />
+                <Chip size="small" label={`${automationCounts.watchers} watchers`} />
+                <Chip size="small" label={`${automationCounts.apps} apps`} />
+                <Chip size="small" label={`${automationCounts.integrations} integrations`} />
+                <Chip size="small" label={`${traces.length} traces`} />
+              </Stack>
+
+              <Stack direction={{ xs: "column", sm: "row" }} spacing={1}>
+                <Button variant="outlined" size="small" onClick={() => setInventoryOpen(true)}>
+                  Automation Inventory
+                </Button>
+                <Button variant="outlined" size="small" onClick={() => setActivityOpen(true)}>
+                  Recent Activity
+                </Button>
+                <Button variant="text" size="small" onClick={() => navigateToView("trace")}>
+                  Open Trace
+                </Button>
+              </Stack>
+            </Stack>
+          </Box>
+        </Stack>
+      </Box>
+
+      <Grid2 container spacing={1.2} className="overview-secondary-grid">
         <Grid2 size={{ xs: 12, lg: 7 }}>
           <TodaysHighlights tasks={tasks} traces={traces} />
         </Grid2>
@@ -385,55 +455,6 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
           />
         </Grid2>
       </Grid2>
-
-      <QuickActionsStrip
-        agentPaused={agentPaused}
-        onAskAgent={() => navigateToView("chat")}
-        onRunBriefing={() => runBriefingMutation.mutate()}
-        onTogglePause={() => {
-          void handleTogglePause();
-        }}
-        onViewTasks={() => navigateToView("tasks")}
-        briefingLoading={runBriefingMutation.isPending}
-        pauseLoading={pauseMutation.isPending}
-      />
-
-      {/* Collapsed Automation Inventory row */}
-      <Box
-        className="action-row"
-        onClick={() => setInventoryOpen(true)}
-        sx={{ cursor: "pointer", py: 1.25, px: 1.5 }}
-      >
-        <Stack direction="row" justifyContent="space-between" alignItems="center">
-          <Stack direction="row" spacing={1} alignItems="center">
-            <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
-              Automation Inventory
-            </Typography>
-            <Chip size="small" label={`${automationCounts.tasks} tasks`} />
-            <Chip size="small" label={`${automationCounts.watchers} watchers`} />
-            <Chip size="small" label={`${automationCounts.apps} apps`} />
-            <Chip size="small" label={`${automationCounts.integrations} integrations`} />
-          </Stack>
-          <Typography variant="caption" color="text.secondary">Expand</Typography>
-        </Stack>
-      </Box>
-
-      {/* Collapsed Recent Activity row */}
-      <Box
-        className="action-row"
-        onClick={() => setActivityOpen(true)}
-        sx={{ cursor: "pointer", py: 1.25, px: 1.5 }}
-      >
-        <Stack direction="row" justifyContent="space-between" alignItems="center">
-          <Stack direction="row" spacing={1} alignItems="center">
-            <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
-              Recent Activity
-            </Typography>
-            <Chip size="small" label={`${traces.length} traces`} />
-          </Stack>
-          <Typography variant="caption" color="text.secondary">Expand</Typography>
-        </Stack>
-      </Box>
 
       {/* Automation Inventory Dialog */}
       <Dialog
@@ -618,12 +639,6 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
           <Button onClick={() => setActivityOpen(false)}>Close</Button>
         </DialogActions>
       </Dialog>
-
-      {hasErrors ? (
-        <Alert severity="error">
-          One or more data sources failed to load. Retrying automatically.
-        </Alert>
-      ) : null}
 
       <Dialog
         open={pauseDialogOpen}

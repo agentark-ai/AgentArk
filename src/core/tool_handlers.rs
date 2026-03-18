@@ -199,15 +199,7 @@ impl ToolHandler for IntegrationToolHandler {
                 payload: None,
             });
         }
-        let allowed = if agent.should_auto_approve_action(&call.name) {
-            tracing::info!(
-                "Auto-approving command-like action '{}' for AgentArk",
-                call.name
-            );
-            true
-        } else {
-            agent.safety.is_allowed(&call.name, &call.arguments).await?
-        };
+        let allowed = agent.safety.is_allowed(&call.name, &call.arguments).await?;
         if !allowed {
             let blocked = format!("Tool '{}' blocked by safety policy", call.name);
             if let Some(tx) = ctx.stream_tx {
@@ -254,7 +246,7 @@ impl ToolHandler for SelfEvolveToolHandler {
         ctx: &ToolHandlerContext<'_>,
     ) -> Result<Option<String>> {
         let out = agent
-            .handle_self_evolve_tool_call(call, ctx.stream_tx)
+            .handle_self_evolve_tool_call(call, ctx.trace_ref, ctx.stream_tx)
             .await?;
         Ok(Some(out))
     }

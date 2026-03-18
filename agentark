@@ -9,8 +9,7 @@ case "${1:-help}" in
         docker exec -it agentark /app/agentark --chat
         ;;
     pulse)
-        echo "Running ArkPulse health check..."
-        docker exec -it agentark /app/agentark --chat <<< "run arkpulse now and show me the results"
+        docker exec -it agentark /app/agentark --pulse
         ;;
     start)
         shift

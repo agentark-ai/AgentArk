@@ -50,7 +50,7 @@ services:
     container_name: agentark
     restart: unless-stopped
     ports:
-      - "8990:8990"
+      - "127.0.0.1:8990:8990"
     volumes:
       - agentark-data:/app/data
       - agentark-config:/app/config
@@ -122,7 +122,89 @@ networks:
 Set-Content -Path "$InstallDir\docker-compose.yml" -Value $composeContent -Encoding UTF8
 Write-Host "[3/4] Configuration created at $InstallDir" -ForegroundColor Green
 
-# ── Step 4: Pull image and start ────────────────────────────────────────────
+# ── Step 4: Create agentark.cmd CLI wrapper ───────────────────────────────────
+
+$cliContent = @'
+@echo off
+REM AgentArk CLI — simple commands for your AI agent
+REM Usage: agentark chat | pulse | start | stop | logs | status | update
+
+set "CMD=%~1"
+if "%CMD%"=="" set "CMD=help"
+
+if "%CMD%"=="chat" (
+    docker exec -it agentark /app/agentark --chat
+    goto :eof
+)
+if "%CMD%"=="pulse" (
+    docker exec agentark /app/agentark --pulse
+    goto :eof
+)
+if "%CMD%"=="start" (
+    docker compose -f "%~dp0docker-compose.yml" up -d
+    echo.
+    echo AgentArk is running!
+    echo   Web UI: http://localhost:8990
+    goto :eof
+)
+if "%CMD%"=="stop" (
+    docker compose -f "%~dp0docker-compose.yml" down
+    echo Stopped. Your data is preserved.
+    goto :eof
+)
+if "%CMD%"=="restart" (
+    docker compose -f "%~dp0docker-compose.yml" down
+    docker compose -f "%~dp0docker-compose.yml" up -d
+    goto :eof
+)
+if "%CMD%"=="logs" (
+    docker compose -f "%~dp0docker-compose.yml" logs -f --tail=100
+    goto :eof
+)
+if "%CMD%"=="status" (
+    docker compose -f "%~dp0docker-compose.yml" ps
+    goto :eof
+)
+if "%CMD%"=="update" (
+    docker compose -f "%~dp0docker-compose.yml" pull agentark
+    docker compose -f "%~dp0docker-compose.yml" up -d agentark
+    echo Update complete!
+    goto :eof
+)
+if "%CMD%"=="setup" (
+    docker exec -it agentark /app/agentark --setup
+    goto :eof
+)
+
+echo AgentArk CLI
+echo.
+echo Usage: agentark ^<command^>
+echo.
+echo   chat       Interactive CLI chat with your agent
+echo   pulse      Run ArkPulse health check
+echo   start      Start AgentArk
+echo   stop       Stop AgentArk
+echo   restart    Restart AgentArk
+echo   logs       View live logs
+echo   status     Show running containers
+echo   update     Pull latest image and restart
+echo   setup      Run setup wizard
+'@
+
+Set-Content -Path "$InstallDir\agentark.cmd" -Value $cliContent -Encoding ASCII
+
+# Add install dir to user PATH so 'agentark' works from anywhere
+$userPath = [Environment]::GetEnvironmentVariable("PATH", "User")
+if ($userPath -notlike "*$InstallDir*") {
+    [Environment]::SetEnvironmentVariable("PATH", "$userPath;$InstallDir", "User")
+    $env:PATH = "$env:PATH;$InstallDir"
+    Write-Host "Added $InstallDir to your PATH." -ForegroundColor Green
+    Write-Host "  (Open a new terminal if 'agentark' isn't recognized immediately)" -ForegroundColor Yellow
+}
+
+Write-Host "[3/4] CLI installed." -ForegroundColor Green
+
+# ── Step 5: Pull image and start ────────────────────────────────────────────
 
 Write-Host "Pulling AgentArk image (this may take a minute)..." -ForegroundColor Cyan
 Push-Location $InstallDir
@@ -142,11 +224,13 @@ Write-Host "━━━━━━━━━━━━━━━━━━━━━━�
 Write-Host ""
 Write-Host "  Web UI:  http://localhost:8990" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "  Manage:"
-Write-Host "    docker compose -f $InstallDir\docker-compose.yml up -d       Start"
-Write-Host "    docker compose -f $InstallDir\docker-compose.yml down        Stop"
-Write-Host "    docker compose -f $InstallDir\docker-compose.yml pull        Update"
-Write-Host "    docker compose -f $InstallDir\docker-compose.yml logs -f     Logs"
+Write-Host "  Commands (run from anywhere):" -ForegroundColor White
+Write-Host "    agentark chat       Interactive CLI chat"
+Write-Host "    agentark pulse      Run ArkPulse health check"
+Write-Host "    agentark stop       Stop AgentArk"
+Write-Host "    agentark update     Pull latest and restart"
+Write-Host "    agentark logs       View logs"
+Write-Host "    agentark status     Show status"
 Write-Host ""
 Write-Host "  Your data is stored in Docker volumes and survives updates." -ForegroundColor Yellow
 Write-Host ""

@@ -12,6 +12,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::Path;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::core::ToolCall;
@@ -117,10 +118,17 @@ pub struct ProofEngine {
 
     /// Storage path
     data_dir: std::path::PathBuf,
+
+    /// Optional encryption key for on-disk trace persistence.
+    trace_encryption_key: Option<Arc<crate::crypto::KeyManager>>,
 }
 
 impl ProofEngine {
-    pub fn new(data_dir: &Path, signing_key: &SigningKey) -> Result<Self> {
+    pub fn new(
+        data_dir: &Path,
+        signing_key: &SigningKey,
+        trace_encryption_key: Option<Arc<crate::crypto::KeyManager>>,
+    ) -> Result<Self> {
         let verifying_key = signing_key.verifying_key();
         let public_key_bytes = verifying_key.to_bytes();
 
@@ -130,19 +138,14 @@ impl ProofEngine {
         let agent_did = format!("did:key:z{}", bs58::encode(&multicodec_key).into_string());
 
         // Load existing trace if present
-        let trace_path = data_dir.join("execution_trace.json");
-        let trace = if trace_path.exists() {
-            let content = std::fs::read_to_string(&trace_path)?;
-            serde_json::from_str(&content)?
-        } else {
-            ExecutionTrace::new()
-        };
+        let trace = Self::load_trace(data_dir, trace_encryption_key.as_deref())?;
 
         Ok(Self {
             signing_key: signing_key.clone(),
             agent_did,
             trace: std::sync::Mutex::new(trace),
             data_dir: data_dir.to_path_buf(),
+            trace_encryption_key,
         })
     }
 
@@ -214,14 +217,47 @@ impl ProofEngine {
 
     /// Save trace to disk
     fn save_trace(&self) -> Result<()> {
-        let trace_path = self.data_dir.join("execution_trace.json");
         let trace = self
             .trace
             .lock()
             .map_err(|e| anyhow::anyhow!("Trace lock poisoned: {}", e))?;
         let content = serde_json::to_string_pretty(&*trace)?;
-        std::fs::write(trace_path, content)?;
+        if let Some(key_manager) = self.trace_encryption_key.as_ref() {
+            let encrypted = key_manager.encrypt(content.as_bytes())?;
+            let encrypted_path = self.data_dir.join("execution_trace.enc");
+            std::fs::write(encrypted_path, encrypted)?;
+            let legacy_path = self.data_dir.join("execution_trace.json");
+            if legacy_path.exists() {
+                let _ = std::fs::remove_file(legacy_path);
+            }
+        } else {
+            let trace_path = self.data_dir.join("execution_trace.json");
+            std::fs::write(trace_path, content)?;
+        }
         Ok(())
+    }
+
+    fn load_trace(
+        data_dir: &Path,
+        trace_encryption_key: Option<&crate::crypto::KeyManager>,
+    ) -> Result<ExecutionTrace> {
+        let encrypted_path = data_dir.join("execution_trace.enc");
+        if encrypted_path.exists() {
+            let payload = std::fs::read(&encrypted_path)?;
+            if let Some(key_manager) = trace_encryption_key {
+                let decrypted = key_manager.decrypt(&payload)?;
+                return Ok(serde_json::from_slice(&decrypted)?);
+            }
+            anyhow::bail!("Encrypted proof trace exists but no trace encryption key is available");
+        }
+
+        let legacy_path = data_dir.join("execution_trace.json");
+        if legacy_path.exists() {
+            let content = std::fs::read_to_string(&legacy_path)?;
+            return Ok(serde_json::from_str(&content)?);
+        }
+
+        Ok(ExecutionTrace::new())
     }
 
     /// Get a clone of the current execution trace

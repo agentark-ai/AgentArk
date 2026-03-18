@@ -3,10 +3,6 @@ use chrono::{DateTime, Duration, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
-
-const AUTOMATION_RUNS_KEY: &str = "automation_runs_v1";
-const AUTOMATION_SUPERVISOR_STATES_KEY: &str = "automation_supervisor_states_v1";
 const AUTOMATION_RUNS_LIMIT: usize = 600;
 const AUTOMATION_MAX_ATTEMPTS_CAP: u32 = 12;
 const AUTOMATION_MAX_STALL_TIMEOUT_SECS: u64 = 365 * 24 * 60 * 60;
@@ -166,16 +162,15 @@ pub struct AutomationSupervisorState {
     pub stalled_count: u32,
     #[serde(default)]
     pub origin: AutomationOriginContext,
+    #[serde(default)]
+    pub created_at: Option<String>,
 }
 
 pub async fn list_runs(
     storage: &crate::storage::Storage,
     limit: usize,
 ) -> Result<Vec<AutomationRunRecord>> {
-    let raw = storage.get(AUTOMATION_RUNS_KEY).await?;
-    let mut runs = raw
-        .and_then(|bytes| serde_json::from_slice::<Vec<AutomationRunRecord>>(&bytes).ok())
-        .unwrap_or_default();
+    let mut runs = storage.list_automation_runs(limit).await?;
     runs.sort_by(|a, b| b.started_at.cmp(&a.started_at));
     if runs.len() > limit {
         runs.truncate(limit);
@@ -183,68 +178,41 @@ pub async fn list_runs(
     Ok(runs)
 }
 
-pub async fn append_run(
-    storage: &crate::storage::Storage,
-    run: AutomationRunRecord,
-) -> Result<()> {
-    let raw = storage.get(AUTOMATION_RUNS_KEY).await?;
-    let mut runs = raw
-        .and_then(|bytes| serde_json::from_slice::<Vec<AutomationRunRecord>>(&bytes).ok())
-        .unwrap_or_default();
-    runs.push(run);
-    if runs.len() > AUTOMATION_RUNS_LIMIT {
-        let overflow = runs.len() - AUTOMATION_RUNS_LIMIT;
-        runs.drain(0..overflow);
-    }
+pub async fn append_run(storage: &crate::storage::Storage, run: AutomationRunRecord) -> Result<()> {
     storage
-        .set(AUTOMATION_RUNS_KEY, &serde_json::to_vec(&runs)?)
-        .await?;
-    Ok(())
+        .append_automation_run(&run, AUTOMATION_RUNS_LIMIT)
+        .await
 }
 
 pub async fn list_supervisor_states(
     storage: &crate::storage::Storage,
 ) -> Result<Vec<AutomationSupervisorState>> {
-    let raw = storage.get(AUTOMATION_SUPERVISOR_STATES_KEY).await?;
-    let map = raw
-        .and_then(|bytes| {
-            serde_json::from_slice::<HashMap<String, AutomationSupervisorState>>(&bytes).ok()
-        })
-        .unwrap_or_default();
-    Ok(map.into_values().collect())
+    storage.list_automation_supervisor_states().await
 }
 
 pub async fn load_supervisor_state(
     storage: &crate::storage::Storage,
     automation_id: &str,
 ) -> Result<Option<AutomationSupervisorState>> {
-    let raw = storage.get(AUTOMATION_SUPERVISOR_STATES_KEY).await?;
-    let map = raw
-        .and_then(|bytes| {
-            serde_json::from_slice::<HashMap<String, AutomationSupervisorState>>(&bytes).ok()
-        })
-        .unwrap_or_default();
-    Ok(map.get(automation_id).cloned())
+    storage
+        .load_automation_supervisor_state(automation_id)
+        .await
 }
 
 pub async fn upsert_supervisor_state(
     storage: &crate::storage::Storage,
     state: AutomationSupervisorState,
 ) -> Result<()> {
-    let raw = storage.get(AUTOMATION_SUPERVISOR_STATES_KEY).await?;
-    let mut map = raw
-        .and_then(|bytes| {
-            serde_json::from_slice::<HashMap<String, AutomationSupervisorState>>(&bytes).ok()
-        })
-        .unwrap_or_default();
-    map.insert(state.automation_id.clone(), state);
+    storage.upsert_automation_supervisor_state(&state).await
+}
+
+pub async fn delete_supervisor_state(
+    storage: &crate::storage::Storage,
+    automation_id: &str,
+) -> Result<bool> {
     storage
-        .set(
-            AUTOMATION_SUPERVISOR_STATES_KEY,
-            &serde_json::to_vec(&map)?,
-        )
-        .await?;
-    Ok(())
+        .delete_automation_supervisor_state(automation_id)
+        .await
 }
 
 pub fn inject_context(
@@ -266,7 +234,10 @@ pub fn inject_context(
         .unwrap_or_default();
     let mut meta = serde_json::Map::from_iter(existing_meta);
     if !meta.contains_key("origin") {
-        meta.insert("origin".to_string(), serde_json::to_value(origin).unwrap_or(Value::Null));
+        meta.insert(
+            "origin".to_string(),
+            serde_json::to_value(origin).unwrap_or(Value::Null),
+        );
     }
     if !meta.contains_key("policy") {
         meta.insert(
@@ -326,7 +297,10 @@ pub fn policy_from_request_argument(
         .and_then(|value| serde_json::from_value::<AutomationExecutionPolicy>(value).ok())
         .unwrap_or_else(|| default_policy.normalized());
 
-    if let Some(max_attempts) = arguments.get("max_attempts").and_then(|value| value.as_u64()) {
+    if let Some(max_attempts) = arguments
+        .get("max_attempts")
+        .and_then(|value| value.as_u64())
+    {
         policy.max_attempts = max_attempts.clamp(1, AUTOMATION_MAX_ATTEMPTS_CAP as u64) as u32;
     }
     if let Some(stall_timeout_secs) = arguments
@@ -399,7 +373,10 @@ pub fn validate_result(validation: &AutomationValidation, output: &str) -> bool 
                     .get("success")
                     .and_then(|item| item.as_bool())
                     .unwrap_or(false)
-                    || value.get("ok").and_then(|item| item.as_bool()).unwrap_or(false)
+                    || value
+                        .get("ok")
+                        .and_then(|item| item.as_bool())
+                        .unwrap_or(false)
                 {
                     return true;
                 }
@@ -411,8 +388,7 @@ pub fn validate_result(validation: &AutomationValidation, output: &str) -> bool 
                     .to_ascii_lowercase();
                 return matches!(
                     status.as_str(),
-                    "ok"
-                        | "success"
+                    "ok" | "success"
                         | "connected"
                         | "completed"
                         | "running"
@@ -442,7 +418,13 @@ pub fn validate_result(validation: &AutomationValidation, output: &str) -> bool 
             .as_ref()
             .or(normalized.text.as_ref())
             .and_then(|pattern| Regex::new(pattern).ok())
-            .map(|regex| regex.is_match(&validation_target_text(&normalized, trimmed, parsed_json.as_ref())))
+            .map(|regex| {
+                regex.is_match(&validation_target_text(
+                    &normalized,
+                    trimmed,
+                    parsed_json.as_ref(),
+                ))
+            })
             .unwrap_or(false),
         AutomationValidationMode::JsonFieldExists => parsed_json
             .as_ref()
@@ -589,7 +571,11 @@ fn normalize_optional_text(value: Option<&str>) -> Option<String> {
 
 fn json_value_at_path<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
     let mut current = root;
-    for segment in path.split('.').map(str::trim).filter(|segment| !segment.is_empty()) {
+    for segment in path
+        .split('.')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+    {
         if let Ok(index) = segment.parse::<usize>() {
             current = current.as_array()?.get(index)?;
         } else {

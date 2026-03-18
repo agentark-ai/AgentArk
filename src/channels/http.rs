@@ -42,11 +42,12 @@ mod trace;
 mod tunnel;
 mod tunnel_auth;
 
+pub(crate) use self::actions::import_action_from_url_shared;
 use self::moltbook::MoltbookSettings;
 
 use crate::core::config::{
-    TelegramConfig, TunnelCloudflareConfig, TunnelConfig, TunnelNgrokConfig, TunnelProviderKind,
-    TunnelTailscaleConfig,
+    DeploymentMode, TelegramConfig, TunnelCloudflareConfig, TunnelConfig, TunnelNgrokConfig,
+    TunnelProviderKind, TunnelTailscaleConfig,
 };
 use crate::core::{
     score_action_risk, Agent, AutonomySettings, AutopilotMode, ConversationScope, ExecutionTrace,
@@ -63,6 +64,12 @@ static MISSING_API_KEY_WARNED: AtomicBool = AtomicBool::new(false);
 static CHAT_SUGGESTION_SCAN_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CODEX_OAUTH_RUNTIME: OnceLock<Arc<RwLock<CodexOAuthRuntimeState>>> = OnceLock::new();
 const OAUTH_STATE_TTL_SECS: i64 = 10 * 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpServerRole {
+    ControlPlane,
+    PublicApps,
+}
 
 #[derive(Debug, Clone, Serialize)]
 struct ErrorResponse {
@@ -424,6 +431,14 @@ pub struct AppState {
     pub security_events: Arc<crate::core::SecurityEvents>,
     /// App registry for deployed apps (static + dynamic)
     pub app_registry: crate::actions::app::AppRegistry,
+    /// Deployment posture of the control plane.
+    pub deployment_mode: DeploymentMode,
+    /// Which surface this listener serves.
+    pub server_role: HttpServerRole,
+    /// Optional dedicated bind address for public apps.
+    pub public_app_bind_addr: Option<String>,
+    /// Optional externally visible base URL for public apps.
+    pub public_app_base_url: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -948,16 +963,104 @@ fn generate_ephemeral_token() -> String {
     base64::engine::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
 }
 
-fn bind_addr_is_local_only(bind_addr: &str) -> bool {
-    let normalized = bind_addr.trim().to_ascii_lowercase();
-    normalized.starts_with("127.0.0.1:")
-        || normalized == "127.0.0.1"
-        || normalized.starts_with("localhost:")
-        || normalized == "localhost"
-        || normalized.starts_with("[::1]:")
-        || normalized == "[::1]"
-        || normalized.starts_with("::1:")
-        || normalized == "::1"
+fn parse_env_truthy(key: &str) -> Option<bool> {
+    std::env::var(key).ok().and_then(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else if trimmed.eq_ignore_ascii_case("true") || trimmed == "1" {
+            Some(true)
+        } else if trimmed.eq_ignore_ascii_case("false") || trimmed == "0" {
+            Some(false)
+        } else {
+            None
+        }
+    })
+}
+
+fn normalize_optional_url(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_end_matches('/').to_string())
+}
+
+fn deployment_mode_from_config(config: &crate::core::config::AgentConfig) -> DeploymentMode {
+    if let Some(force_mode) = std::env::var("AGENTARK_DEPLOYMENT_MODE")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+    {
+        if force_mode == "internet_facing" || force_mode == "internet-facing" {
+            return DeploymentMode::InternetFacing;
+        }
+        if force_mode == "trusted_local" || force_mode == "trusted-local" {
+            return DeploymentMode::TrustedLocal;
+        }
+    }
+    config.deployment_mode
+}
+
+fn public_app_bind_addr_from_config(
+    config: &crate::core::config::AgentConfig,
+    deployment_mode: DeploymentMode,
+) -> Option<String> {
+    normalize_optional_url(std::env::var("AGENTARK_PUBLIC_APP_BIND").ok().as_deref())
+        .or_else(|| {
+            config
+                .public_apps
+                .bind_addr
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            if deployment_mode == DeploymentMode::InternetFacing {
+                Some("127.0.0.1:8992".to_string())
+            } else {
+                None
+            }
+        })
+}
+
+fn public_app_base_url_from_config(config: &crate::core::config::AgentConfig) -> Option<String> {
+    normalize_optional_url(
+        std::env::var("AGENTARK_PUBLIC_APP_BASE_URL")
+            .ok()
+            .as_deref(),
+    )
+    .or_else(|| normalize_optional_url(config.public_apps.base_url.as_deref()))
+}
+
+fn default_base_url_for_bind_addr(bind_addr: &str) -> Option<String> {
+    let trimmed = bind_addr.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized = if trimmed.starts_with("0.0.0.0:") {
+        format!("localhost:{}", trimmed.trim_start_matches("0.0.0.0:"))
+    } else if trimmed == "0.0.0.0" {
+        "localhost".to_string()
+    } else if trimmed.starts_with("[::]:") {
+        format!("localhost:{}", trimmed.trim_start_matches("[::]:"))
+    } else if trimmed == "[::]" || trimmed == "::" {
+        "localhost".to_string()
+    } else if trimmed.starts_with("127.0.0.1:") || trimmed == "127.0.0.1" {
+        trimmed.replacen("127.0.0.1", "localhost", 1)
+    } else {
+        trimmed.to_string()
+    };
+    Some(format!("http://{}", normalized.trim_end_matches('/')))
+}
+
+fn internet_facing_apps_should_be_isolated(
+    deployment_mode: DeploymentMode,
+    public_app_bind_addr: Option<&str>,
+) -> bool {
+    deployment_mode == DeploymentMode::InternetFacing
+        && public_app_bind_addr
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
 }
 
 fn escape_html(text: &str) -> String {
@@ -1222,15 +1325,25 @@ async fn handle_autonomy_quick_command(
             if trust.requires_approval || require_approval {
                 let mut approval_task = Task::new(
                     format!("Delegation approval: {}", task),
-                    "plan".to_string(),
+                    "delegate".to_string(),
                     serde_json::json!({
-                        "steps": [],
-                        "delegation_task": task,
+                        "task": task,
+                        "context": "",
+                        "_approval": {
+                            "title": format!("Delegate: {}", task),
+                            "summary": "This delegation will spawn specialist/background work on your behalf.",
+                            "reason": trust.reasons.join("; "),
+                            "rule_name": "elevated_action_requires_explicit_approval",
+                            "risk_level": risk_level_label(&trust.level),
+                            "risk_score": trust.score,
+                            "source": "autonomy_quick_command"
+                        }
                     }),
                 );
                 approval_task.status = TaskStatus::AwaitingApproval;
                 approval_task.approval = TaskApproval::RequireApproval;
-                if let Err(e) = agent.add_task(approval_task).await {
+                let queued = agent.add_or_update_similar_task(approval_task, false).await;
+                if let Err(e) = queued {
                     return Err(format!("Failed to queue delegation approval: {}", e));
                 }
                 return Ok(format!(
@@ -1310,6 +1423,11 @@ async fn handle_autonomy_quick_command(
                     "Invalid watcher id. Expected format: watcher:<uuid>".to_string()
                 })?;
                 if agent.watcher_manager.cancel(uuid).await {
+                    if let Some(watcher) = agent.watcher_manager.get(uuid).await {
+                        agent
+                            .sync_watcher_supervisor_state(&watcher, Some("cancelled"), None)
+                            .await;
+                    }
                     return Ok("Rollback applied: watcher cancelled.".to_string());
                 }
                 return Err("Watcher not found or not cancellable.".to_string());
@@ -1544,6 +1662,9 @@ pub struct SettingsResponse {
     pub moltbook_last_run_at: Option<String>,
     pub moltbook_last_status: Option<String>,
     pub tunnel_active: bool,
+    pub deployment_mode: String,
+    pub public_app_bind_addr: Option<String>,
+    pub public_app_base_url: Option<String>,
     // Memory retention (episodic pruning; disabled by default)
     pub memory_retention_enabled: bool,
     pub memory_retention_min_age_days: u64,
@@ -1634,6 +1755,12 @@ pub struct SettingsUpdate {
     /// Actions that run without approval
     #[serde(default)]
     pub auto_approve: Option<Vec<String>>,
+    #[serde(default)]
+    pub deployment_mode: Option<String>,
+    #[serde(default)]
+    pub public_app_bind_addr: Option<String>,
+    #[serde(default)]
+    pub public_app_base_url: Option<String>,
     /// Media generation provider API keys (all stored encrypted)
     #[serde(default)]
     pub media_providers: std::collections::HashMap<String, String>,
@@ -1861,7 +1988,6 @@ struct EvolutionDevActionRequest {
     action: String,
 }
 
-const AUTONOMY_SETTINGS_KEY: &str = "autonomy_settings_v1";
 const AUTONOMY_LAST_BRIEF_KEY: &str = "autonomy_last_brief_v1";
 const AUTONOMY_NUDGE_FEEDBACK_KEY: &str = "autonomy_nudge_feedback_v1";
 const AUTONOMY_NUDGE_NOTIFIED_KEY: &str = "autonomy_nudge_notified_v1";
@@ -2737,7 +2863,6 @@ pub async fn serve(
 ) -> Result<()> {
     let tiered_rate_limiter = TieredRateLimiter::new();
     let bind_addr = std::env::var("AGENTARK_BIND").unwrap_or_else(|_| "127.0.0.1:8990".to_string());
-    let local_ui_bootstrap_enabled = bind_addr_is_local_only(&bind_addr);
 
     // Spawn a background task to periodically clean up expired rate-limit entries
     {
@@ -2759,12 +2884,26 @@ pub async fn serve(
     // Clone Arc handles for independent access (avoids blocking during long operations)
     let state = {
         let agent_guard = agent.read().await;
-        let allow_insecure_no_auth = std::env::var("AGENTARK_INSECURE_NO_AUTH")
-            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-            .unwrap_or(false);
+        let deployment_mode = deployment_mode_from_config(&agent_guard.config);
+        let public_app_bind_addr =
+            public_app_bind_addr_from_config(&agent_guard.config, deployment_mode);
+        let public_app_base_url =
+            public_app_base_url_from_config(&agent_guard.config).or_else(|| {
+                public_app_bind_addr
+                    .as_deref()
+                    .and_then(default_base_url_for_bind_addr)
+            });
+        let allow_insecure_no_auth = parse_env_truthy("AGENTARK_INSECURE_NO_AUTH").unwrap_or(false)
+            && deployment_mode == DeploymentMode::TrustedLocal;
         if allow_insecure_no_auth {
             tracing::warn!(
                 "AGENTARK_INSECURE_NO_AUTH is enabled: protected routes can run without API auth"
+            );
+        } else if parse_env_truthy("AGENTARK_INSECURE_NO_AUTH").unwrap_or(false)
+            && deployment_mode == DeploymentMode::InternetFacing
+        {
+            tracing::warn!(
+                "Ignoring AGENTARK_INSECURE_NO_AUTH because deployment_mode=internet_facing"
             );
         }
         let api_key_info = crate::core::config::SecureConfigManager::new_with_data_dir(
@@ -2795,6 +2934,7 @@ pub async fn serve(
                 false
             }
         };
+        let local_ui_bootstrap_enabled = deployment_mode == DeploymentMode::TrustedLocal;
         AppState {
             agent: agent.clone(),
             trace_history: agent_guard.trace_history.clone(),
@@ -2815,6 +2955,10 @@ pub async fn serve(
             whatsapp_bridge: Arc::new(RwLock::new(WhatsAppBridgeState::new())),
             security_events: agent_guard.security_events.clone(),
             app_registry: agent_guard.app_registry.clone(),
+            deployment_mode,
+            server_role: HttpServerRole::ControlPlane,
+            public_app_bind_addr,
+            public_app_base_url,
         }
     };
 
@@ -3096,6 +3240,7 @@ pub async fn serve(
         )
         // Notification routes
         .route("/notifications", get(list_notifications_endpoint))
+        .route("/notifications/stream", get(notification_stream_endpoint))
         .route("/notifications/read-all", post(mark_all_read_endpoint))
         .route("/notifications/{id}/read", post(mark_read_endpoint))
         .route("/notifications/count", get(notification_count_endpoint))
@@ -3228,6 +3373,7 @@ pub async fn serve(
                 .collect::<HashSet<String>>()
         })
         .unwrap_or_default();
+    let deployment_mode_for_cors = state.deployment_mode;
     if !explicit_origins.is_empty() {
         tracing::info!(
             "Additional allowed CORS origins configured: {}",
@@ -3237,7 +3383,9 @@ pub async fn serve(
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(move |origin, _| {
             if let Ok(origin_str) = origin.to_str() {
-                if is_local_origin(origin_str) {
+                if deployment_mode_for_cors == DeploymentMode::TrustedLocal
+                    && is_local_origin(origin_str)
+                {
                     return true;
                 }
 
@@ -3285,6 +3433,52 @@ pub async fn serve(
             tunnel_exposure_middleware,
         ))
         .layer(cors);
+
+    let isolate_public_apps = internet_facing_apps_should_be_isolated(
+        state.deployment_mode,
+        state.public_app_bind_addr.as_deref(),
+    );
+    let mut public_app_server: Option<tokio::task::JoinHandle<()>> = None;
+    if isolate_public_apps {
+        let mut public_app_state = state.clone();
+        public_app_state.server_role = HttpServerRole::PublicApps;
+        public_app_state.local_ui_bootstrap_enabled = false;
+        public_app_state.allow_insecure_no_auth = false;
+        let public_app_routes = Router::new()
+            .route("/health", get(health))
+            .route("/public/proxy/raw", get(public_proxy_raw))
+            .route("/apps/{app_id}", any(serve_app_root))
+            .route("/apps/{app_id}/", any(serve_app_root))
+            .route("/apps/{app_id}/{*path}", any(serve_app_path))
+            .with_state(public_app_state.clone());
+        let public_app_bind_addr = state
+            .public_app_bind_addr
+            .clone()
+            .unwrap_or_else(|| "127.0.0.1:8992".to_string());
+        let public_app_listener = tokio::net::TcpListener::bind(&public_app_bind_addr).await?;
+        let mut app_shutdown = shutdown_rx.clone();
+        public_app_server = Some(tokio::spawn(async move {
+            tracing::info!(
+                "Public app server listening on http://{}",
+                public_app_bind_addr
+            );
+            if let Err(error) = axum::serve(
+                public_app_listener,
+                public_app_routes.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = app_shutdown.changed().await;
+            })
+            .await
+            {
+                tracing::error!(
+                    "Public app server on {} exited with error: {}",
+                    public_app_bind_addr,
+                    error
+                );
+            }
+        }));
+    }
 
     // Auto-start tunnel if AGENTARK_TUNNEL=true (for VPS users who can't access the UI)
     let auto_tunnel = std::env::var("AGENTARK_TUNNEL")
@@ -3516,6 +3710,18 @@ pub async fn serve(
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await?;
         let _ = shutdown_task.await;
+        if let Some(mut handle) = public_app_server {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), &mut handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!("Public app server join failed during shutdown: {}", error)
+                }
+                Err(_) => {
+                    tracing::warn!("Public app server did not stop within 10s; aborting task");
+                    handle.abort();
+                }
+            }
+        }
         return Ok(());
     }
 
@@ -3544,6 +3750,19 @@ pub async fn serve(
         let _ = http_shutdown.changed().await;
     })
     .await?;
+
+    if let Some(mut handle) = public_app_server {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), &mut handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!("Public app server join failed during shutdown: {}", error)
+            }
+            Err(_) => {
+                tracing::warn!("Public app server did not stop within 10s; aborting task");
+                handle.abort();
+            }
+        }
+    }
 
     Ok(())
 }
@@ -4142,6 +4361,12 @@ fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value> {
         "/notifications/count",
         "GET",
         "Notification count",
+        "Notifications",
+    );
+    add(
+        "/notifications/stream",
+        "GET",
+        "Live notification stream (SSE)",
         "Notifications",
     );
     add(
@@ -4858,7 +5083,41 @@ fn guess_content_type(filename: &str) -> String {
 
 /// List all deployed apps
 async fn list_apps(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let apps = state.app_registry.list().await;
+    let apps = state
+        .app_registry
+        .list()
+        .await
+        .into_iter()
+        .map(|mut row| {
+            let Some(obj) = row.as_object_mut() else {
+                return row;
+            };
+            let Some(app_id) = obj
+                .get("id")
+                .and_then(|value| value.as_str())
+                .map(|s| s.to_string())
+            else {
+                return row;
+            };
+            let access_key = obj
+                .get("access_url")
+                .and_then(|value| value.as_str())
+                .and_then(access_key_from_access_url);
+            obj.insert(
+                "url".to_string(),
+                serde_json::Value::String(app_root_url_for_state(&state, &app_id)),
+            );
+            obj.insert(
+                "access_url".to_string(),
+                serde_json::Value::String(app_access_url_for_state(
+                    &state,
+                    &app_id,
+                    access_key.as_deref(),
+                )),
+            );
+            row
+        })
+        .collect::<Vec<_>>();
     Json(serde_json::json!({ "apps": apps }))
 }
 
@@ -5551,6 +5810,42 @@ fn build_app_url(app_id: &str, path: &str, query: Option<&str>) -> String {
     url
 }
 
+fn build_absolute_app_url(
+    base_url: Option<&str>,
+    app_id: &str,
+    path: &str,
+    query: Option<&str>,
+) -> String {
+    let relative = build_app_url(app_id, path, query);
+    match base_url {
+        Some(base) if !base.trim().is_empty() => {
+            format!("{}{}", base.trim_end_matches('/'), relative)
+        }
+        _ => relative,
+    }
+}
+
+fn app_root_url_for_state(state: &AppState, app_id: &str) -> String {
+    build_absolute_app_url(state.public_app_base_url.as_deref(), app_id, "", None)
+}
+
+fn app_access_url_for_state(state: &AppState, app_id: &str, access_key: Option<&str>) -> String {
+    match access_key.filter(|value| !value.trim().is_empty()) {
+        Some(value) => format!(
+            "{}?key={}",
+            app_root_url_for_state(state, app_id),
+            urlencoding::encode(value)
+        ),
+        None => app_root_url_for_state(state, app_id),
+    }
+}
+
+fn access_key_from_access_url(access_url: &str) -> Option<String> {
+    access_url
+        .split_once('?')
+        .and_then(|(_, query)| extract_query_param(Some(query), "key"))
+}
+
 fn is_hop_by_hop_header(header_name: &str) -> bool {
     matches!(
         header_name,
@@ -5785,6 +6080,32 @@ async fn serve_app_file_inner(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
+    if state.server_role == HttpServerRole::ControlPlane
+        && internet_facing_apps_should_be_isolated(
+            state.deployment_mode,
+            state.public_app_bind_addr.as_deref(),
+        )
+    {
+        let target = build_absolute_app_url(
+            state.public_app_base_url.as_deref(),
+            app_id,
+            path,
+            uri.query(),
+        );
+        if target.starts_with("http://") || target.starts_with("https://") {
+            return Response::builder()
+                .status(StatusCode::TEMPORARY_REDIRECT)
+                .header(header::LOCATION, target)
+                .body(axum::body::Body::empty())
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Public apps are isolated onto a dedicated app origin in internet-facing mode.",
+        )
+            .into_response();
+    }
+
     // Check app existence first so unknown IDs return 404 instead of auth form.
     let Some(app_dir) = state.app_registry.get_dir(app_id).await else {
         return StatusCode::NOT_FOUND.into_response();
@@ -5814,6 +6135,16 @@ async fn serve_app_file_inner(
     } else {
         None
     };
+    let key_from_header = if access_guard_enabled {
+        headers
+            .get("x-agentark-app-key")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    } else {
+        None
+    };
     let is_ws_request = is_websocket_upgrade(&headers);
 
     if access_guard_enabled {
@@ -5825,13 +6156,18 @@ async fn serve_app_file_inner(
             Some(key) => state.app_registry.verify_key(app_id, key).await,
             None => false,
         };
+        let header_valid = match key_from_header.as_deref() {
+            Some(key) => state.app_registry.verify_key(app_id, key).await,
+            None => false,
+        };
 
-        if !query_valid && !cookie_valid {
+        if !query_valid && !cookie_valid && !header_valid {
             return app_access_denied_page(app_id);
         }
 
         // First successful key entry: set cookie and redirect to clean URL.
-        if query_valid && !cookie_valid && method == Method::GET && !is_ws_request {
+        if query_valid && !cookie_valid && !header_valid && method == Method::GET && !is_ws_request
+        {
             if let Some(key) = key_from_query {
                 let request_proto = headers
                     .get("x-forwarded-proto")
@@ -6411,17 +6747,23 @@ async fn restart_app(State(state): State<AppState>, Path(app_id): Path<String>) 
                         .into_response();
                 }
                 trigger_arkpulse_after_app_change(&state, "app_restart").await;
+                let app_url =
+                    build_absolute_app_url(state.public_app_base_url.as_deref(), &app_id, "", None);
+                let app_access_query = access_guard_enabled
+                    .then(|| format!("key={}", urlencoding::encode(&access_key)));
+                let app_access_url = build_absolute_app_url(
+                    state.public_app_base_url.as_deref(),
+                    &app_id,
+                    "",
+                    app_access_query.as_deref(),
+                );
                 Json(serde_json::json!({
                     "status": "restarted",
                     "type": "dynamic",
                     "app_id": app_id,
                     "title": title,
-                    "url": format!("/apps/{}/", app_id),
-                    "access_url": if access_guard_enabled {
-                        format!("/apps/{}/?key={}", app_id, access_key)
-                    } else {
-                        format!("/apps/{}/", app_id)
-                    },
+                    "url": app_url,
+                    "access_url": app_access_url,
                     "access_guard_enabled": access_guard_enabled,
                     "port": port,
                     "runtime_preference": runtime_preference.as_str(),
@@ -6446,17 +6788,23 @@ async fn restart_app(State(state): State<AppState>, Path(app_id): Path<String>) 
             )
             .await;
         trigger_arkpulse_after_app_change(&state, "app_restart").await;
+        let app_url =
+            build_absolute_app_url(state.public_app_base_url.as_deref(), &app_id, "", None);
+        let app_access_query =
+            access_guard_enabled.then(|| format!("key={}", urlencoding::encode(&access_key)));
+        let app_access_url = build_absolute_app_url(
+            state.public_app_base_url.as_deref(),
+            &app_id,
+            "",
+            app_access_query.as_deref(),
+        );
         Json(serde_json::json!({
             "status": "restarted",
             "type": "static",
             "app_id": app_id,
             "title": title,
-            "url": format!("/apps/{}/", app_id),
-            "access_url": if access_guard_enabled {
-                format!("/apps/{}/?key={}", app_id, access_key)
-            } else {
-                format!("/apps/{}/", app_id)
-            },
+            "url": app_url,
+            "access_url": app_access_url,
             "access_guard_enabled": access_guard_enabled,
             "runtime_preference": runtime_preference.as_str(),
         }))
@@ -6642,8 +6990,134 @@ async fn serve_upload_file(
 }
 
 /// Health check endpoint
-async fn health() -> &'static str {
-    "OK"
+async fn health(State(state): State<AppState>) -> Response {
+    let storage = { state.agent.read().await.storage.clone() };
+    let storage_ok = storage.get("__health_probe").await.is_ok();
+    let sqlite_quick_check = storage.sqlite_quick_check().await.ok();
+    let sqlite_ok = sqlite_quick_check
+        .as_deref()
+        .map(|value| value.eq_ignore_ascii_case("ok"))
+        .unwrap_or(false);
+    let scheduler_heartbeat = storage
+        .get(crate::sentinel::SENTINEL_SCHEDULER_HEARTBEAT_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| String::from_utf8(raw).ok());
+    let watcher_heartbeat = storage
+        .get(crate::sentinel::SENTINEL_WATCHER_HEARTBEAT_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| String::from_utf8(raw).ok());
+    let heartbeat_recent = |value: Option<&String>| {
+        value
+            .and_then(|raw| parse_utc_rfc3339(raw))
+            .map(|ts| (chrono::Utc::now() - ts).num_seconds() <= 5 * 60)
+            .unwrap_or(false)
+    };
+    let scheduler_loop_ok = if state.server_role == HttpServerRole::ControlPlane {
+        heartbeat_recent(scheduler_heartbeat.as_ref())
+    } else {
+        true
+    };
+    let watcher_loop_ok = if state.server_role == HttpServerRole::ControlPlane {
+        heartbeat_recent(watcher_heartbeat.as_ref())
+    } else {
+        true
+    };
+    let (mem0_enabled, mem0_url, playwright_url, public_app_base_url_configured) = {
+        let agent = state.agent.read().await;
+        (
+            agent.config.mem0.enabled,
+            agent.config.mem0.bridge_url.clone(),
+            agent.config.browser.bridge_url.clone(),
+            agent
+                .config
+                .public_apps
+                .base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_some(),
+        )
+    };
+    let health_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .ok();
+    let mem0_ok = if state.server_role == HttpServerRole::ControlPlane && mem0_enabled {
+        if let Some(client) = health_client.as_ref() {
+            client
+                .get(format!("{}/health", mem0_url.trim_end_matches('/')))
+                .send()
+                .await
+                .map(|resp| resp.status().is_success())
+                .unwrap_or(false)
+        } else {
+            false
+        }
+    } else {
+        true
+    };
+    let playwright_ok = if state.server_role == HttpServerRole::ControlPlane {
+        if let Some(client) = health_client.as_ref() {
+            client
+                .get(format!("{}/health", playwright_url.trim_end_matches('/')))
+                .send()
+                .await
+                .map(|resp| resp.status().is_success())
+                .unwrap_or(false)
+        } else {
+            false
+        }
+    } else {
+        true
+    };
+    let whatsapp_active = state.whatsapp_bridge.read().await.active;
+    let tunnel_active = state.tunnel.read().await.active;
+    let public_app_origin_ok = if state.server_role == HttpServerRole::ControlPlane
+        && state.deployment_mode == DeploymentMode::InternetFacing
+    {
+        public_app_base_url_configured
+    } else {
+        true
+    };
+    let healthy = storage_ok
+        && sqlite_ok
+        && mem0_ok
+        && playwright_ok
+        && public_app_origin_ok
+        && scheduler_loop_ok
+        && watcher_loop_ok;
+    (
+        if healthy {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(serde_json::json!({
+            "status": if healthy { "ok" } else { "degraded" },
+            "server_role": match state.server_role {
+                HttpServerRole::ControlPlane => "control_plane",
+                HttpServerRole::PublicApps => "public_apps",
+            },
+            "deployment_mode": state.deployment_mode.as_str(),
+            "checks": {
+                "storage": storage_ok,
+                "sqlite_quick_check": sqlite_quick_check.unwrap_or_else(|| "unavailable".to_string()),
+                "sqlite_ok": sqlite_ok,
+                "mem0_bridge": mem0_ok,
+                "playwright_bridge": playwright_ok,
+                "whatsapp_bridge": whatsapp_active,
+                "tunnel": tunnel_active,
+                "scheduler_loop": scheduler_loop_ok,
+                "watcher_loop": watcher_loop_ok,
+                "public_app_origin_ready": public_app_origin_ok,
+            }
+        })),
+    )
+        .into_response()
 }
 
 // - WhatsApp Webhook -
@@ -6875,7 +7349,11 @@ async fn get_approval_log(
         .and_then(|s| s.parse().ok())
         .unwrap_or(0u64);
     let agent = state.agent.read().await;
-    match agent.storage.get_approval_log(limit, offset).await {
+    match agent
+        .encrypted_storage
+        .get_approval_log_decrypted(limit, offset)
+        .await
+    {
         Ok(log) => Json(serde_json::json!({ "approvals": log, "limit": limit, "offset": offset }))
             .into_response(),
         Err(e) => (
@@ -7005,9 +7483,17 @@ async fn stop_whatsapp_bridge(bridge_arc: Arc<RwLock<WhatsAppBridgeState>>) {
 
 /// List active watchers
 async fn get_watchers(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let agent = state.agent.read().await;
-    let watchers = agent.watcher_manager.list().await;
-    let watcher_list: Vec<serde_json::Value> = watchers
+    let (watchers, supervisor_states) = {
+        let agent = state.agent.read().await;
+        (
+            agent.watcher_manager.list().await,
+            crate::core::list_automation_supervisor_states(&agent.storage)
+                .await
+                .unwrap_or_default(),
+        )
+    };
+    let live_ids: HashSet<String> = watchers.iter().map(|w| w.id.to_string()).collect();
+    let mut watcher_list: Vec<serde_json::Value> = watchers
         .iter()
         .map(|w| {
             let status_error = match &w.status {
@@ -7034,9 +7520,64 @@ async fn get_watchers(State(state): State<AppState>) -> Json<serde_json::Value> 
                 "last_error": w.last_error,
                 "last_poll_outcome": w.last_poll_outcome,
                 "notification_attempts": w.notification_attempts,
+                "history_only": false,
             })
         })
         .collect();
+    watcher_list.extend(
+        supervisor_states
+            .into_iter()
+            .filter(|state| {
+                state.automation_kind == "watcher" && !live_ids.contains(&state.automation_id)
+            })
+            .map(|state| {
+                let created_at = state
+                    .created_at
+                    .clone()
+                    .or_else(|| state.last_run_at.clone())
+                    .or_else(|| state.last_success_at.clone());
+                let status = state.status.clone();
+                let status_error = state.last_error.clone();
+                let last_poll_outcome = match status.as_str() {
+                    "triggered" => Some("matched"),
+                    "failed" | "timed_out" => Some("error"),
+                    _ => None,
+                };
+                serde_json::json!({
+                    "id": state.automation_id,
+                    "description": state.title,
+                    "poll_action": state.action,
+                    "poll_arguments": serde_json::Value::Null,
+                    "condition": serde_json::Value::Null,
+                    "status": status,
+                    "status_error": status_error,
+                    "interval_secs": serde_json::Value::Null,
+                    "timeout_secs": serde_json::Value::Null,
+                    "poll_count": serde_json::Value::Null,
+                    "created_at": created_at,
+                    "last_poll_at": state.last_run_at,
+                    "notify_channel": serde_json::Value::Null,
+                    "on_trigger": serde_json::Value::Null,
+                    "trigger_result": serde_json::Value::Null,
+                    "last_result": serde_json::Value::Null,
+                    "last_error": state.last_error,
+                    "last_poll_outcome": last_poll_outcome,
+                    "notification_attempts": Vec::<serde_json::Value>::new(),
+                    "history_only": true,
+                })
+            }),
+    );
+    watcher_list.sort_by(|left, right| {
+        let left_created = left
+            .get("created_at")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let right_created = right
+            .get("created_at")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        right_created.cmp(left_created)
+    });
     Json(serde_json::json!({ "watchers": watcher_list }))
 }
 
@@ -7048,6 +7589,13 @@ async fn cancel_watcher(
     let agent = state.agent.read().await;
     if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
         let cancelled = agent.watcher_manager.cancel(uuid).await;
+        if cancelled {
+            if let Some(watcher) = agent.watcher_manager.get(uuid).await {
+                agent
+                    .sync_watcher_supervisor_state(&watcher, Some("cancelled"), None)
+                    .await;
+            }
+        }
         Json(serde_json::json!({ "cancelled": cancelled }))
     } else {
         Json(serde_json::json!({ "error": "Invalid watcher ID" }))
@@ -7061,6 +7609,13 @@ async fn pause_watcher(
     let agent = state.agent.read().await;
     if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
         let paused = agent.watcher_manager.pause(uuid).await;
+        if paused {
+            if let Some(watcher) = agent.watcher_manager.get(uuid).await {
+                agent
+                    .sync_watcher_supervisor_state(&watcher, Some("paused"), None)
+                    .await;
+            }
+        }
         Json(serde_json::json!({ "paused": paused }))
     } else {
         Json(serde_json::json!({ "error": "Invalid watcher ID" }))
@@ -7074,6 +7629,13 @@ async fn resume_watcher(
     let agent = state.agent.read().await;
     if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
         let resumed = agent.watcher_manager.resume(uuid).await;
+        if resumed {
+            if let Some(watcher) = agent.watcher_manager.get(uuid).await {
+                agent
+                    .sync_watcher_supervisor_state(&watcher, Some("active"), None)
+                    .await;
+            }
+        }
         Json(serde_json::json!({ "resumed": resumed }))
     } else {
         Json(serde_json::json!({ "error": "Invalid watcher ID" }))
@@ -7086,7 +7648,9 @@ async fn delete_watcher(
 ) -> Json<serde_json::Value> {
     let agent = state.agent.read().await;
     if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
-        let deleted = agent.watcher_manager.delete(uuid).await;
+        let deleted_live = agent.watcher_manager.delete(uuid).await;
+        let deleted_history = agent.clear_watcher_supervisor_state(&id).await;
+        let deleted = deleted_live || deleted_history;
         Json(serde_json::json!({ "deleted": deleted }))
     } else {
         Json(serde_json::json!({ "error": "Invalid watcher ID" }))
@@ -7212,6 +7776,7 @@ struct RunArkPulseFixRequest {
 enum ArkPulseFixPlan {
     TunnelStartVerify,
     TunnelRestartVerify,
+    AppRestart(String),
     ShellCommand(String),
 }
 
@@ -7226,6 +7791,13 @@ fn arkpulse_fix_plan_from_remediation(
         crate::sentinel::DoctorRemediationSpec::TunnelRestartVerify => {
             Some(ArkPulseFixPlan::TunnelRestartVerify)
         }
+        crate::sentinel::DoctorRemediationSpec::AppRestart { app_id } => {
+            if is_valid_app_id(app_id) {
+                Some(ArkPulseFixPlan::AppRestart(app_id.clone()))
+            } else {
+                None
+            }
+        }
         crate::sentinel::DoctorRemediationSpec::ShellCommand { command } if allow_shell_command => {
             let normalized = command.trim();
             if normalized.is_empty() {
@@ -7235,6 +7807,20 @@ fn arkpulse_fix_plan_from_remediation(
             }
         }
         crate::sentinel::DoctorRemediationSpec::ShellCommand { .. } => None,
+    }
+}
+
+fn parse_arkpulse_app_restart(command: &str) -> Option<String> {
+    let normalized = command.trim();
+    let path = normalized
+        .strip_prefix("POST ")
+        .or_else(|| normalized.strip_prefix("post "))?
+        .trim();
+    let app_id = path.strip_prefix("/api/apps/")?.strip_suffix("/restart")?;
+    if is_valid_app_id(app_id) {
+        Some(app_id.to_string())
+    } else {
+        None
     }
 }
 
@@ -7304,6 +7890,9 @@ fn classify_arkpulse_fix_plan(command: &str) -> Option<ArkPulseFixPlan> {
     if lower.contains("restart") && lower.contains("tunnel") {
         return Some(ArkPulseFixPlan::TunnelRestartVerify);
     }
+    if let Some(app_id) = parse_arkpulse_app_restart(normalized) {
+        return Some(ArkPulseFixPlan::AppRestart(app_id));
+    }
     parse_supported_arkpulse_shell_command(normalized).map(ArkPulseFixPlan::ShellCommand)
 }
 
@@ -7329,11 +7918,77 @@ fn describe_arkpulse_remediation(
         Some(crate::sentinel::DoctorRemediationSpec::TunnelRestartVerify) => {
             "Restart tunnel and verify public reachability".to_string()
         }
+        Some(crate::sentinel::DoctorRemediationSpec::AppRestart { app_id }) => {
+            format!("Restart app {} and re-check health", app_id)
+        }
         Some(crate::sentinel::DoctorRemediationSpec::ShellCommand { command }) => {
             command.trim().to_string()
         }
         None => String::new(),
     }
+}
+
+async fn run_arkpulse_app_restart_fix(state: &AppState, app_id: &str) -> Response {
+    let response = restart_app(State(state.clone()), Path(app_id.to_string())).await;
+    let status = response.status();
+    let body = response.into_body();
+    let body_bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to read app restart response: {}", error),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let payload = serde_json::from_slice::<serde_json::Value>(&body_bytes).unwrap_or_else(|_| {
+        serde_json::json!({
+            "raw": String::from_utf8_lossy(&body_bytes).to_string()
+        })
+    });
+
+    if !status.is_success() {
+        let error = payload
+            .get("error")
+            .and_then(|value| value.as_str())
+            .or_else(|| payload.get("message").and_then(|value| value.as_str()))
+            .unwrap_or("Failed to restart app");
+        return (
+            status,
+            Json(serde_json::json!({
+                "status": "error",
+                "mode": "app_restart",
+                "app_id": app_id,
+                "error": error,
+                "details": payload,
+            })),
+        )
+            .into_response();
+    }
+
+    let title = payload
+        .get("title")
+        .and_then(|value| value.as_str())
+        .unwrap_or(app_id);
+    let url = payload
+        .get("url")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "mode": "app_restart",
+            "app_id": app_id,
+            "message": format!("Restarted app {} and queued a fresh ArkPulse run.", title),
+            "url": url,
+            "details": payload,
+        })),
+    )
+        .into_response()
 }
 
 /// Execute a supported ArkPulse remediation directly (without going through Chat).
@@ -7560,6 +8215,7 @@ async fn run_arkpulse_fix(
             )
                 .into_response()
         }
+        ArkPulseFixPlan::AppRestart(app_id) => run_arkpulse_app_restart_fix(&state, &app_id).await,
         ArkPulseFixPlan::ShellCommand(command) => {
             let started_at = Instant::now();
             let mut process = if cfg!(windows) {
@@ -7661,7 +8317,16 @@ async fn get_pulse_log(
         .and_then(|s| s.parse().ok())
         .unwrap_or(0usize);
     let agent = state.agent.read().await;
-    let all_events = crate::sentinel::get_pulse_log(&agent).await;
+    let mut all_events = crate::sentinel::get_pulse_log(&agent).await;
+    all_events.sort_by(|a, b| {
+        let a_ts = chrono::DateTime::parse_from_rfc3339(&a.timestamp)
+            .map(|ts| ts.timestamp_millis())
+            .unwrap_or(0);
+        let b_ts = chrono::DateTime::parse_from_rfc3339(&b.timestamp)
+            .map(|ts| ts.timestamp_millis())
+            .unwrap_or(0);
+        b_ts.cmp(&a_ts)
+    });
     let total = all_events.len();
     let events: Vec<_> = all_events.into_iter().skip(offset).take(limit).collect();
     Json(serde_json::json!({
@@ -8498,6 +9163,8 @@ async fn chat_stream(
                                 "detail": step.detail,
                                 "step_type": step.step_type,
                                 "data": step.data,
+                                "time": step.timestamp.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                                "duration_ms": step.duration_ms,
                             });
                             let event = Event::default()
                                 .event("thinking")
@@ -9453,7 +10120,7 @@ async fn create_task(
     State(state): State<AppState>,
     Json(request): Json<CreateTaskRequest>,
 ) -> Response {
-    use crate::core::{Task, TaskApproval, TaskStatus};
+    use crate::core::{status_for_task_approval, Task, TaskApproval};
 
     // Convert and validate cron expression if provided
     // Standard 5-field cron is converted to 6-field (with seconds) for Rust cron crate
@@ -9479,15 +10146,11 @@ async fn create_task(
 
     let approval = match request.approval.as_deref() {
         Some("require") => TaskApproval::RequireApproval,
-        Some("notify") => TaskApproval::NotifyThenExecute { delay_seconds: 60 },
+        Some("notify") => TaskApproval::RequireApproval,
         _ => TaskApproval::Auto,
     };
 
-    let status = if matches!(approval, TaskApproval::RequireApproval) {
-        TaskStatus::AwaitingApproval
-    } else {
-        TaskStatus::Pending
-    };
+    let status = status_for_task_approval(&approval);
 
     let task = Task {
         id: uuid::Uuid::new_v4(),
@@ -9709,40 +10372,24 @@ async fn approve_task(State(state): State<AppState>, Path(id): Path<String>) -> 
         }
     };
 
-    let mut tasks = state.tasks.write().await;
-    let Some(task) = tasks.get_mut(uuid) else {
-        return (
+    let agent = state.agent.read().await;
+    match agent.approve_task_request(uuid, "api").await {
+        Ok(Some(_)) => (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response(),
+        Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
-                error: "Task not found".to_string(),
+                error: "Task not found or is not awaiting approval".to_string(),
             }),
         )
-            .into_response();
-    };
-
-    task.status = TaskStatus::Pending;
-    let save_result = {
-        let agent = state.agent.read().await;
-        agent
-            .storage
-            .update_task_status(
-                &id,
-                &serde_json::to_string(&task.status).unwrap_or_else(|_| "Pending".to_string()),
-            )
-            .await
-    };
-
-    if let Err(e) = save_result {
-        return (
+            .into_response(),
+        Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
                 error: format!("Failed to approve task: {}", e),
             }),
         )
-            .into_response();
+            .into_response(),
     }
-
-    (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response()
 }
 
 /// Reject a task
@@ -9760,40 +10407,27 @@ async fn reject_task(State(state): State<AppState>, Path(id): Path<String>) -> R
         }
     };
 
-    let mut tasks = state.tasks.write().await;
-    let Some(task) = tasks.get_mut(uuid) else {
-        return (
+    let agent = state.agent.read().await;
+    match agent
+        .reject_task_request(uuid, "api", "Task was rejected and will not be executed.")
+        .await
+    {
+        Ok(Some(_)) => (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response(),
+        Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
-                error: "Task not found".to_string(),
+                error: "Task not found or is not awaiting approval".to_string(),
             }),
         )
-            .into_response();
-    };
-
-    task.status = TaskStatus::Cancelled;
-    let save_result = {
-        let agent = state.agent.read().await;
-        agent
-            .storage
-            .update_task_status(
-                &id,
-                &serde_json::to_string(&task.status).unwrap_or_else(|_| "Cancelled".to_string()),
-            )
-            .await
-    };
-
-    if let Err(e) = save_result {
-        return (
+            .into_response(),
+        Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
                 error: format!("Failed to reject task: {}", e),
             }),
         )
-            .into_response();
+            .into_response(),
     }
-
-    (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response()
 }
 
 /// Cancel a queued or running task.
@@ -10309,21 +10943,11 @@ fn risk_level_label(level: &RiskLevel) -> &'static str {
 }
 
 async fn load_autonomy_settings(agent: &Agent) -> AutonomySettings {
-    if let Ok(Some(raw)) = agent.storage.get(AUTONOMY_SETTINGS_KEY).await {
-        if let Ok(parsed) = serde_json::from_slice::<AutonomySettings>(&raw) {
-            return parsed;
-        }
-    }
-    AutonomySettings::default()
+    agent.load_autonomy_settings().await
 }
 
 async fn save_autonomy_settings(agent: &Agent, settings: &AutonomySettings) -> Result<(), String> {
-    let json = serde_json::to_vec(settings).map_err(|e| e.to_string())?;
-    agent
-        .storage
-        .set(AUTONOMY_SETTINGS_KEY, &json)
-        .await
-        .map_err(|e| e.to_string())
+    agent.save_autonomy_settings(settings).await
 }
 
 fn recommendation(
@@ -10350,212 +10974,7 @@ async fn apply_autopilot_mode(
     settings: &mut AutonomySettings,
     mode_id: &str,
 ) -> Result<serde_json::Value, String> {
-    let Some(mode) = settings.modes.iter().find(|m| m.id == mode_id).cloned() else {
-        return Err("Mode not found".to_string());
-    };
-
-    let available_actions: HashSet<String> = agent
-        .runtime
-        .list_actions()
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|a| a.name)
-        .collect();
-
-    let mut routines_created = 0usize;
-    let mut watchers_created = 0usize;
-    let mut skipped: Vec<String> = Vec::new();
-    let existing_tasks = {
-        let tasks = agent.tasks.read().await;
-        tasks.all().to_vec()
-    };
-    let existing_watchers = agent.watcher_manager.list().await;
-    let approval_key = |approval: &TaskApproval| match approval {
-        TaskApproval::RequireApproval => "require",
-        TaskApproval::NotifyThenExecute { .. } => "notify",
-        TaskApproval::Auto => "auto",
-    };
-    let mut seen_routine_signatures: HashSet<String> = existing_tasks
-        .iter()
-        .filter(|task| {
-            matches!(
-                task.status,
-                TaskStatus::Pending
-                    | TaskStatus::AwaitingApproval
-                    | TaskStatus::Paused
-                    | TaskStatus::InProgress
-            )
-        })
-        .map(|task| {
-            format!(
-                "{}|{}|{}|{}|{}",
-                task.description,
-                task.action,
-                task.arguments,
-                task.cron.clone().unwrap_or_default(),
-                approval_key(&task.approval)
-            )
-        })
-        .collect();
-    let mut seen_watcher_signatures: HashSet<String> = existing_watchers
-        .iter()
-        .filter(|watcher| watcher.status == crate::core::watcher::WatcherStatus::Active)
-        .map(|watcher| {
-            let condition_signature = match &watcher.condition {
-                crate::core::watcher::WatchCondition::NotEmpty => {
-                    serde_json::json!({"not_empty": true})
-                }
-                crate::core::watcher::WatchCondition::Contains { keyword } => {
-                    serde_json::json!({"contains": keyword})
-                }
-                crate::core::watcher::WatchCondition::Matches { pattern } => {
-                    serde_json::json!({"matches": pattern})
-                }
-                crate::core::watcher::WatchCondition::Custom { description } => {
-                    serde_json::json!({"custom": description})
-                }
-            };
-            format!(
-                "{}|{}|{}|{}|{}|{}|{}|{}",
-                watcher.description,
-                watcher.poll_action,
-                watcher.poll_arguments,
-                watcher.interval_secs,
-                watcher.timeout_secs,
-                watcher.on_trigger,
-                watcher.notify_channel,
-                condition_signature
-            )
-        })
-        .collect();
-
-    for routine in &mode.routines {
-        let builtin_action = routine.action == "daily_brief"
-            || routine.action == "goal_progress_report"
-            || routine.action == "plan";
-        if !builtin_action && !available_actions.contains(&routine.action) {
-            skipped.push(format!(
-                "routine '{}' skipped (missing action '{}')",
-                routine.description, routine.action
-            ));
-            continue;
-        }
-        let desired_approval_key = match routine.approval.as_deref().unwrap_or("auto") {
-            "require" | "require_approval" => "require",
-            "notify" | "notify_then_execute" => "notify",
-            _ => "auto",
-        };
-        let routine_signature = format!(
-            "{}|{}|{}|{}|{}",
-            routine.description,
-            routine.action,
-            routine.arguments,
-            routine.cron.clone().unwrap_or_default(),
-            desired_approval_key
-        );
-        if seen_routine_signatures.contains(&routine_signature) {
-            skipped.push(format!("routine '{}' already exists", routine.description));
-            continue;
-        }
-        let mut task = Task::new(
-            routine.description.clone(),
-            routine.action.clone(),
-            routine.arguments.clone(),
-        );
-        task.cron = routine.cron.clone();
-        task.status = TaskStatus::Pending;
-        task.approval = match routine.approval.as_deref().unwrap_or("auto") {
-            "require" | "require_approval" => TaskApproval::RequireApproval,
-            _ => TaskApproval::Auto,
-        };
-        if matches!(task.approval, TaskApproval::RequireApproval) {
-            task.status = TaskStatus::AwaitingApproval;
-        }
-        if let Err(e) = agent.add_task(task).await {
-            skipped.push(format!("routine '{}' failed: {}", routine.description, e));
-            continue;
-        }
-        seen_routine_signatures.insert(routine_signature);
-        routines_created += 1;
-    }
-
-    for watcher in &mode.watchers {
-        if !available_actions.contains(&watcher.poll_action) {
-            skipped.push(format!(
-                "watcher '{}' skipped (missing poll action '{}')",
-                watcher.description, watcher.poll_action
-            ));
-            continue;
-        }
-        let desired_condition = if let Some(value) = watcher.condition_contains.as_ref() {
-            serde_json::json!({"contains": value})
-        } else if let Some(value) = watcher.condition_matches.as_ref() {
-            serde_json::json!({"matches": value})
-        } else if let Some(value) = watcher.condition_custom.as_ref() {
-            serde_json::json!({"custom": value})
-        } else {
-            serde_json::json!({"not_empty": true})
-        };
-        let watcher_signature = format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}",
-            watcher.description,
-            watcher.poll_action,
-            watcher.poll_arguments,
-            watcher.interval_secs,
-            watcher.timeout_secs,
-            watcher.on_trigger,
-            watcher.notify_channel,
-            desired_condition
-        );
-        if seen_watcher_signatures.contains(&watcher_signature) {
-            skipped.push(format!("watcher '{}' already exists", watcher.description));
-            continue;
-        }
-        let mut args = serde_json::json!({
-            "description": watcher.description,
-            "poll_action": watcher.poll_action,
-            "poll_arguments": watcher.poll_arguments,
-            "interval_secs": watcher.interval_secs,
-            "timeout_secs": watcher.timeout_secs,
-            "on_trigger": watcher.on_trigger,
-            "notify_channel": watcher.notify_channel,
-        });
-        if let Some(value) = watcher.condition_contains.as_ref() {
-            args["condition_contains"] = serde_json::json!(value);
-        }
-        if let Some(value) = watcher.condition_matches.as_ref() {
-            args["condition_matches"] = serde_json::json!(value);
-        }
-        if let Some(value) = watcher.condition_custom.as_ref() {
-            args["condition_custom"] = serde_json::json!(value);
-        }
-
-        if agent
-            .handle_watch(&args, "autonomy", None, None)
-            .await
-            .is_none()
-        {
-            skipped.push(format!(
-                "watcher '{}' failed to initialize",
-                watcher.description
-            ));
-            continue;
-        }
-        seen_watcher_signatures.insert(watcher_signature);
-        watchers_created += 1;
-    }
-
-    settings.active_mode_id = Some(mode.id.clone());
-    save_autonomy_settings(agent, settings).await?;
-
-    Ok(serde_json::json!({
-        "mode_id": mode.id,
-        "mode_name": mode.name,
-        "routines_created": routines_created,
-        "watchers_created": watchers_created,
-        "skipped": skipped,
-    }))
+    agent.apply_autopilot_mode(settings, mode_id).await
 }
 
 async fn run_chat_suggestion_scan(state: &AppState, trigger: &str) -> serde_json::Value {
@@ -10566,7 +10985,10 @@ async fn run_chat_suggestion_scan(state: &AppState, trigger: &str) -> serde_json
         });
     };
 
-    let storage = { state.agent.read().await.storage.clone() };
+    let (storage, encrypted_storage) = {
+        let agent = state.agent.read().await;
+        (agent.storage.clone(), agent.encrypted_storage.clone())
+    };
     let now = chrono::Utc::now();
     let now_rfc3339 = now.to_rfc3339();
     let mut scan_state = load_chat_suggestion_scan_state(&storage).await;
@@ -10669,8 +11091,8 @@ async fn run_chat_suggestion_scan(state: &AppState, trigger: &str) -> serde_json
             continue;
         }
 
-        let recent_messages = storage
-            .get_recent_messages(
+        let recent_messages = encrypted_storage
+            .get_recent_messages_decrypted(
                 &conversation.id,
                 CHAT_SUGGESTION_RECENT_MESSAGES_PER_CHAT as u64,
             )
@@ -11229,7 +11651,6 @@ async fn run_recommended_action(
     settings: &mut AutonomySettings,
     action: &RecommendedAction,
     dry_run: bool,
-    agent_initiated: bool,
 ) -> Result<serde_json::Value, String> {
     let trust = score_action_risk(&action.action_kind, &action.payload, &settings.trust_policy);
     if trust
@@ -11244,159 +11665,51 @@ async fn run_recommended_action(
         return Ok(serde_json::json!({
             "dry_run": true,
             "action_id": action.id,
-            "agent_initiated": agent_initiated,
-            "approval_bypassed": agent_initiated && trust.requires_approval,
             "risk": { "level": risk_level_label(&trust.level), "score": trust.score, "requires_approval": trust.requires_approval, "reasons": trust.reasons },
         }));
     }
 
-    if trust.requires_approval && !agent_initiated {
+    if trust.requires_approval {
         let mut approval_task = Task::new(
             format!("Approval required: {}", action.title),
-            "plan".to_string(),
+            "autonomy_action".to_string(),
             serde_json::json!({
-                "steps": [],
-                "autonomy_action": action.payload,
-                "autonomy_action_kind": action.action_kind,
+                "autonomy_action_kind": action.action_kind.clone(),
+                "autonomy_action_payload": action.payload.clone(),
+                "_approval": {
+                    "title": action.title.clone(),
+                    "summary": action.description.clone(),
+                    "reason": trust.reasons.join("; "),
+                    "rule_name": "elevated_action_requires_explicit_approval",
+                    "risk_level": risk_level_label(&trust.level),
+                    "risk_score": trust.score,
+                    "source": "autonomy"
+                }
             }),
         );
         approval_task.approval = TaskApproval::RequireApproval;
         approval_task.status = TaskStatus::AwaitingApproval;
-        agent
-            .add_task(approval_task)
+        let (task_id, reused_existing, removed_duplicates) = agent
+            .add_or_update_similar_task(approval_task, false)
             .await
             .map_err(|e| e.to_string())?;
         return Ok(serde_json::json!({
             "status": "queued_for_approval",
             "action_id": action.id,
+            "task_id": task_id,
+            "reused_existing": reused_existing,
+            "removed_duplicates": removed_duplicates,
             "risk": { "level": risk_level_label(&trust.level), "score": trust.score },
         }));
     }
 
-    match action.action_kind.as_str() {
-        "daily_brief_now" => {
-            let brief = agent
-                .run_daily_brief_and_notify()
-                .await
-                .map_err(|e| e.to_string())?;
-            Ok(serde_json::json!({
-                "status":"executed",
-                "kind":"daily_brief_now",
-                "brief": crate::security::redact_pii(&brief),
-            }))
-        }
-        "chat_prompt" => {
-            let prompt = action
-                .payload
-                .get("prompt")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let response = agent
-                .process_message_with_meta(prompt, "autonomy", None, None)
-                .await
-                .map_err(|e| e.to_string())?;
-            Ok(serde_json::json!({
-                "status":"executed",
-                "kind":"chat_prompt",
-                "conversation_id": response.conversation_id,
-                "response": crate::security::redact_pii(&response.response),
-            }))
-        }
-        "create_task" => {
-            let description = action
-                .payload
-                .get("description")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Autonomy task");
-            let action_name = action
-                .payload
-                .get("action")
-                .and_then(|v| v.as_str())
-                .unwrap_or("daily_brief");
-            let arguments = action
-                .payload
-                .get("arguments")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({}));
-            let mut task = Task::new(description.to_string(), action_name.to_string(), arguments);
-            if agent_initiated {
-                task.approval = TaskApproval::Auto;
-                task.status = TaskStatus::Pending;
-            } else {
-                task.approval = match action
-                    .payload
-                    .get("approval")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("auto")
-                {
-                    "require" | "require_approval" => TaskApproval::RequireApproval,
-                    _ => TaskApproval::Auto,
-                };
-                if matches!(task.approval, TaskApproval::RequireApproval) {
-                    task.status = TaskStatus::AwaitingApproval;
-                }
-            }
-            if let Some(cron) = action.payload.get("cron").and_then(|v| v.as_str()) {
-                task.cron = Some(cron.to_string());
-            }
-            let task_id = task.id.to_string();
-            agent.add_task(task).await.map_err(|e| e.to_string())?;
-            Ok(serde_json::json!({"status":"executed","kind":"create_task","task_id": task_id}))
-        }
-        "activate_mode" => {
-            let mode_id = action
-                .payload
-                .get("mode_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let info = apply_autopilot_mode(agent, settings, mode_id).await?;
-            Ok(serde_json::json!({"status":"executed","kind":"activate_mode","result":info}))
-        }
-        "delegate" => {
-            let task = action
-                .payload
-                .get("task")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if task.trim().is_empty() {
-                return Err("Delegation payload missing task".to_string());
-            }
-            if let Some(ref swarm) = agent.swarm {
-                let context = action
-                    .payload
-                    .get("context")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let actions = agent.runtime.list_actions().await.unwrap_or_default();
-                let result = swarm
-                    .delegate(task, context, &agent.llm, &[], &actions)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let delegation = crate::storage::entities::swarm_delegation::Model {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    parent_task_id: None,
-                    agent_id: result.agents_used.join(","),
-                    task_description: task.to_string(),
-                    result: Some(result.final_result.clone()),
-                    success: 1,
-                    confidence: Some(0.8),
-                    execution_time_ms: Some(result.total_time_ms as i32),
-                    created_at: chrono::Utc::now().to_rfc3339(),
-                    completed_at: Some(chrono::Utc::now().to_rfc3339()),
-                };
-                let _ = agent.storage.insert_swarm_delegation(&delegation).await;
-                return Ok(serde_json::json!({
-                    "status":"executed",
-                    "kind":"delegate",
-                    "final_result": crate::security::redact_pii(&result.final_result),
-                    "agents_used": result.agents_used,
-                    "total_time_ms": result.total_time_ms,
-                }));
-            }
-            Err("Swarm is not enabled".to_string())
-        }
-        _ => Err(format!("Unsupported skill kind {}", action.action_kind)),
+    let result = agent
+        .execute_autonomy_action_payload(settings, &action.action_kind, &action.payload)
+        .await;
+    if result.is_ok() {
+        agent.record_self_tune_autonomous_success().await;
     }
+    result
 }
 
 async fn start_codex_cli_oauth() -> Response {
@@ -12317,6 +12630,63 @@ async fn get_evolution_dev(
     Json(build_evolution_dev_response(&storage, limit).await).into_response()
 }
 
+async fn persist_evolution_action_trace(
+    state: &AppState,
+    action: &str,
+    message: &str,
+    detail_payload: serde_json::Value,
+) -> Option<String> {
+    let started_at = chrono::Utc::now();
+    let trace_id = uuid::Uuid::new_v4().to_string();
+    let detail_data = serde_json::to_string_pretty(&detail_payload).ok();
+    let trace_ref = Arc::new(RwLock::new(ExecutionTrace {
+        id: trace_id.clone(),
+        message: format!("Evolution action: {}", action),
+        channel: "evolution".to_string(),
+        started_at: Some(started_at),
+        completed_at: Some(started_at),
+        steps: vec![
+            crate::core::ExecutionStep {
+                icon: "[evolve]".to_string(),
+                title: "Evolution Manual Action".to_string(),
+                detail: "Applied a manual evolution control from the Evolution panel.".to_string(),
+                step_type: "info".to_string(),
+                data: Some(
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "trace_kind": "self_evolve.manual_action.request",
+                        "action": action,
+                        "message": message,
+                    }))
+                    .unwrap_or_default(),
+                ),
+                timestamp: started_at,
+                duration_ms: Some(0),
+            },
+            crate::core::ExecutionStep {
+                icon: "[ok]".to_string(),
+                title: "Evolution Decision Applied".to_string(),
+                detail: message.to_string(),
+                step_type: "success".to_string(),
+                data: detail_data,
+                timestamp: started_at,
+                duration_ms: Some(0),
+            },
+        ],
+        proof_id: None,
+        response: Some(message.to_string()),
+        model: Some("internal:evolution".to_string()),
+        input_tokens: 0,
+        output_tokens: 0,
+        total_tokens: 0,
+        cost_usd: 0.0,
+        complexity: Some("evolution".to_string()),
+    }));
+
+    let agent = state.agent.read().await;
+    agent.persist_completed_trace(&trace_ref).await;
+    Some(trace_id)
+}
+
 async fn run_evolution_dev_action(
     State(state): State<AppState>,
     Json(request): Json<EvolutionDevActionRequest>,
@@ -12476,9 +12846,25 @@ async fn run_evolution_dev_action(
 
     let evolution = build_evolution_settings_response(&storage).await;
     let dev = build_evolution_dev_response(&storage, 5000).await;
+    let trace_id = persist_evolution_action_trace(
+        &state,
+        &action,
+        &message,
+        serde_json::json!({
+            "trace_kind": "self_evolve.manual_action.result",
+            "action": action.clone(),
+            "message": message.clone(),
+            "self_evolve_enabled": evolution.self_evolve_enabled,
+            "deploy_guard_default": evolution.deploy_guard_default,
+            "canary_state": dev.canary_state.clone(),
+            "last_result": dev.last_result.clone(),
+        }),
+    )
+    .await;
     Json(serde_json::json!({
         "status": "ok",
         "message": message,
+        "trace_id": trace_id,
         "evolution": evolution,
         "dev": dev
     }))
@@ -12819,6 +13205,9 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
         moltbook_last_run_at,
         moltbook_last_status,
         tunnel_active: state.tunnel.read().await.active,
+        deployment_mode: config.deployment_mode.as_str().to_string(),
+        public_app_bind_addr: config.public_apps.bind_addr.clone(),
+        public_app_base_url: config.public_apps.base_url.clone(),
         memory_retention_enabled: config.memory.retention_enabled,
         memory_retention_min_age_days: config.memory.retention_min_age_days,
         memory_retention_keep_last: config.memory.retention_keep_last,
@@ -13570,6 +13959,52 @@ async fn update_settings(
                 agent_guard.config.app_deploy_model_id = None;
             } else {
                 agent_guard.config.app_deploy_model_id = Some(trimmed.to_string());
+            }
+        }
+        if let Some(mode) = settings.deployment_mode.as_ref() {
+            let normalized = mode.trim().to_ascii_lowercase();
+            let parsed_mode = match normalized.as_str() {
+                "" | "trusted_local" | "trusted-local" => DeploymentMode::TrustedLocal,
+                "internet_facing" | "internet-facing" => DeploymentMode::InternetFacing,
+                _ => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "deployment_mode must be 'trusted_local' or 'internet_facing'"
+                                .to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+            };
+            if agent_guard.config.deployment_mode != parsed_mode {
+                agent_guard.config.deployment_mode = parsed_mode;
+                needs_restart = true;
+            }
+            if parsed_mode == DeploymentMode::InternetFacing
+                && agent_guard.config.public_apps.bind_addr.is_none()
+            {
+                agent_guard.config.public_apps.bind_addr = Some("127.0.0.1:8992".to_string());
+                needs_restart = true;
+            }
+        }
+        if let Some(bind_addr) = settings.public_app_bind_addr.as_ref() {
+            let normalized = bind_addr.trim();
+            let next = if normalized.is_empty() {
+                None
+            } else {
+                Some(normalized.to_string())
+            };
+            if agent_guard.config.public_apps.bind_addr != next {
+                agent_guard.config.public_apps.bind_addr = next;
+                needs_restart = true;
+            }
+        }
+        if let Some(base_url) = settings.public_app_base_url.as_ref() {
+            let next = normalize_optional_url(Some(base_url.as_str()));
+            if agent_guard.config.public_apps.base_url != next {
+                agent_guard.config.public_apps.base_url = next;
+                needs_restart = true;
             }
         }
 
@@ -15762,7 +16197,11 @@ async fn get_conversation_messages(
         .and_then(|s| s.parse().ok())
         .unwrap_or(0u64);
     let agent = state.agent.read().await;
-    match agent.storage.get_messages(&id, limit, offset).await {
+    match agent
+        .encrypted_storage
+        .get_messages_decrypted(&id, limit, offset)
+        .await
+    {
         Ok(msgs) => {
             let list: Vec<serde_json::Value> = msgs.iter().map(|m| serde_json::json!({
                 "id": m.id, "role": m.role, "content": m.content,
@@ -16294,15 +16733,7 @@ async fn execute_autonomy_action(
 ) -> Response {
     let agent = state.agent.read().await;
     let mut settings = load_autonomy_settings(&agent).await;
-    match run_recommended_action(
-        &agent,
-        &mut settings,
-        &request.action,
-        request.dry_run,
-        false,
-    )
-    .await
-    {
+    match run_recommended_action(&agent, &mut settings, &request.action, request.dry_run).await {
         Ok(result) => {
             let _ = save_autonomy_settings(&agent, &settings).await;
             if !request.dry_run {
@@ -16811,7 +17242,7 @@ async fn execute_incident_playbook(
         )
     };
 
-    match run_recommended_action(&agent, &mut settings, &action, false, true).await {
+    match run_recommended_action(&agent, &mut settings, &action, false).await {
         Ok(result) => (
             StatusCode::OK,
             Json(serde_json::json!({"status":"ok","result":result})),
@@ -17099,6 +17530,11 @@ async fn rollback_timeline_event(
             }
         };
         if agent.watcher_manager.cancel(uuid).await {
+            if let Some(watcher) = agent.watcher_manager.get(uuid).await {
+                agent
+                    .sync_watcher_supervisor_state(&watcher, Some("cancelled"), None)
+                    .await;
+            }
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({"status":"ok","operation":"cancel_watcher"})),
@@ -17991,7 +18427,7 @@ async fn plan_predictive_nudges(
             }
         }
 
-        match run_recommended_action(&agent, &mut settings, &action, request.dry_run, true).await {
+        match run_recommended_action(&agent, &mut settings, &action, request.dry_run).await {
             Ok(result) => {
                 if !request.dry_run {
                     planned_map.insert(nudge.id.clone(), now.to_rfc3339());
@@ -18199,7 +18635,7 @@ async fn handle_voice_command(
                 )
                     .into_response();
             };
-            return match run_recommended_action(&agent, &mut settings, &action, false, true).await {
+            return match run_recommended_action(&agent, &mut settings, &action, false).await {
                 Ok(result) => (
                     StatusCode::OK,
                     Json(serde_json::json!({"status":"ok","result":result})),
@@ -18224,6 +18660,85 @@ async fn handle_voice_command(
 }
 
 // ==================== Notification Endpoints ====================
+
+async fn notification_stream_endpoint(State(state): State<AppState>) -> Response {
+    let mut notification_events = {
+        let agent = state.agent.read().await;
+        agent.subscribe_notification_events()
+    };
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(32);
+    tokio::spawn(async move {
+        let connected = serde_json::json!({
+            "kind": "notifications.connected",
+            "connected_at": chrono::Utc::now().to_rfc3339(),
+        });
+        if tx
+            .send(Ok(Event::default()
+                .event("connected")
+                .data(connected.to_string())))
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        loop {
+            match notification_events.recv().await {
+                Ok(payload) => {
+                    let message = match serde_json::to_string(&payload) {
+                        Ok(message) => message,
+                        Err(error) => {
+                            tracing::warn!(
+                                "Failed to serialize notification stream event: {}",
+                                error
+                            );
+                            continue;
+                        }
+                    };
+                    if tx
+                        .send(Ok(Event::default().event("notification").data(message)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    let resync = serde_json::json!({
+                        "kind": "notifications.resync",
+                        "reason": "lagged",
+                        "skipped": skipped,
+                    });
+                    if tx
+                        .send(Ok(Event::default()
+                            .event("resync")
+                            .data(resync.to_string())))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    let closed = serde_json::json!({
+                        "kind": "notifications.closed",
+                    });
+                    let _ = tx
+                        .send(Ok(Event::default()
+                            .event("closed")
+                            .data(closed.to_string())))
+                        .await;
+                    break;
+                }
+            }
+        }
+    });
+
+    Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
 
 async fn list_notifications_endpoint(
     State(state): State<AppState>,
@@ -18399,6 +18914,14 @@ struct LlmAnalyticsPoint {
     completion_tokens: i64,
     total_tokens: i64,
     request_count: i64,
+    primary_prompt_tokens: i64,
+    primary_completion_tokens: i64,
+    primary_total_tokens: i64,
+    primary_request_count: i64,
+    helper_prompt_tokens: i64,
+    helper_completion_tokens: i64,
+    helper_total_tokens: i64,
+    helper_request_count: i64,
     cost_usd: Option<f64>,
 }
 
@@ -18751,6 +19274,49 @@ fn estimate_cost_usd(
     Some(cost)
 }
 
+fn analytics_purpose_kind(channel: &str, purpose: &str) -> &'static str {
+    let channel = channel.trim().to_ascii_lowercase();
+    let purpose = purpose.trim().to_ascii_lowercase();
+    if purpose.is_empty() {
+        return "primary";
+    }
+
+    let helper_exact = [
+        "title",
+        "smalltalk_classifier",
+        "request_shape",
+        "action_selector",
+        "explicit_approval_classifier",
+        "skill_import_override_classifier",
+        "user_fact_fast_path",
+        "user_fact_memory_capture",
+        "argument_inference",
+        "custom_condition",
+    ];
+
+    if helper_exact.contains(&purpose.as_str())
+        || purpose.contains("classifier")
+        || purpose.ends_with("_selector")
+        || purpose.contains("request_shape")
+        || purpose.contains("memory_capture")
+        || purpose.contains("argument_inference")
+        || purpose.contains("custom_condition")
+    {
+        return "helper";
+    }
+
+    if matches!(channel.as_str(), "system" | "watcher" | "automation")
+        && !matches!(
+            purpose.as_str(),
+            "chat" | "chat_tool_followup" | "chat_tool_synthesis" | "chat_tool_repair"
+        )
+    {
+        return "helper";
+    }
+
+    "primary"
+}
+
 async fn llm_analytics_endpoint(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -18854,12 +19420,34 @@ async fn llm_analytics_endpoint(
                 completion_tokens: 0,
                 total_tokens: 0,
                 request_count: 0,
+                primary_prompt_tokens: 0,
+                primary_completion_tokens: 0,
+                primary_total_tokens: 0,
+                primary_request_count: 0,
+                helper_prompt_tokens: 0,
+                helper_completion_tokens: 0,
+                helper_total_tokens: 0,
+                helper_request_count: 0,
                 cost_usd: Some(0.0),
             });
         entry.prompt_tokens += r.prompt_tokens;
         entry.completion_tokens += r.completion_tokens;
         entry.total_tokens += r.total_tokens;
         entry.request_count += 1;
+        match analytics_purpose_kind(&r.channel, &r.purpose) {
+            "helper" => {
+                entry.helper_prompt_tokens += r.prompt_tokens;
+                entry.helper_completion_tokens += r.completion_tokens;
+                entry.helper_total_tokens += r.total_tokens;
+                entry.helper_request_count += 1;
+            }
+            _ => {
+                entry.primary_prompt_tokens += r.prompt_tokens;
+                entry.primary_completion_tokens += r.completion_tokens;
+                entry.primary_total_tokens += r.total_tokens;
+                entry.primary_request_count += 1;
+            }
+        }
         match (&mut entry.cost_usd, cost) {
             (Some(sum), Some(c)) => *sum += c,
             (Some(_), None) => entry.cost_usd = None,

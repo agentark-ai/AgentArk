@@ -155,6 +155,7 @@ pub struct Watcher {
 /// Manages all active watchers with persistent storage
 pub struct WatcherManager {
     watchers: Arc<RwLock<HashMap<Uuid, Watcher>>>,
+    storage: Option<crate::storage::Storage>,
     storage_path: Option<PathBuf>,
 }
 
@@ -329,11 +330,70 @@ pub fn watcher_tool_call_signature_from_arguments(arguments: &serde_json::Value)
 }
 
 impl WatcherManager {
-    pub fn new(data_dir: Option<&std::path::Path>) -> Self {
+    pub async fn new(
+        data_dir: Option<&std::path::Path>,
+        storage: Option<crate::storage::Storage>,
+    ) -> Self {
         let storage_path = data_dir.map(|d| d.join("watchers.json"));
 
-        // Load persisted watchers
-        let watchers = if let Some(ref path) = storage_path {
+        // Load persisted watchers, preferring DB-backed state.
+        let mut restored_from_legacy_file = false;
+        let watchers = if let Some(storage_ref) = storage.as_ref() {
+            match storage_ref.list_watchers().await {
+                Ok(loaded) => {
+                    let restored = loaded
+                        .into_iter()
+                        .filter(|watcher| {
+                            matches!(
+                                watcher.status,
+                                WatcherStatus::Active | WatcherStatus::Paused
+                            )
+                        })
+                        .map(|watcher| (watcher.id, watcher))
+                        .collect::<HashMap<_, _>>();
+                    if !restored.is_empty() {
+                        restored
+                    } else if let Some(ref path) = storage_path {
+                        match std::fs::read_to_string(path) {
+                            Ok(contents) => {
+                                match serde_json::from_str::<HashMap<Uuid, Watcher>>(&contents) {
+                                    Ok(mut legacy) => {
+                                        let now = Utc::now();
+                                        legacy.retain(|_, watcher| {
+                                            if !matches!(
+                                                watcher.status,
+                                                WatcherStatus::Active | WatcherStatus::Paused
+                                            ) {
+                                                return false;
+                                            }
+                                            if watcher.status == WatcherStatus::Paused {
+                                                return true;
+                                            }
+                                            let elapsed =
+                                                (now - watcher.created_at).num_seconds() as u64;
+                                            elapsed < watcher.timeout_secs
+                                        });
+                                        restored_from_legacy_file = !legacy.is_empty();
+                                        legacy
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("Failed to parse watchers.json: {}", e);
+                                        HashMap::new()
+                                    }
+                                }
+                            }
+                            Err(_) => HashMap::new(),
+                        }
+                    } else {
+                        HashMap::new()
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load watchers from DB: {}", e);
+                    HashMap::new()
+                }
+            }
+        } else if let Some(ref path) = storage_path {
             match std::fs::read_to_string(path) {
                 Ok(contents) => {
                     match serde_json::from_str::<HashMap<Uuid, Watcher>>(&contents) {
@@ -357,6 +417,7 @@ impl WatcherManager {
                             if count > 0 {
                                 tracing::info!("Restored {} active watcher(s) from disk", count);
                             }
+                            restored_from_legacy_file = true;
                             loaded
                         }
                         Err(e) => {
@@ -371,10 +432,17 @@ impl WatcherManager {
             HashMap::new()
         };
 
-        Self {
+        let manager = Self {
             watchers: Arc::new(RwLock::new(watchers)),
+            storage,
             storage_path,
+        };
+
+        if restored_from_legacy_file {
+            manager.persist().await;
         }
+
+        manager
     }
 
     /// Persist current watchers to disk
@@ -397,8 +465,22 @@ impl WatcherManager {
 
     /// Save watchers to disk (only Active ones)
     async fn persist(&self) {
-        if let Some(ref path) = self.storage_path {
-            let watchers = self.watchers.read().await;
+        let watchers = self.watchers.read().await;
+        if let Some(storage) = self.storage.as_ref() {
+            let active = watchers
+                .values()
+                .filter(|watcher| {
+                    matches!(
+                        watcher.status,
+                        WatcherStatus::Active | WatcherStatus::Paused
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if let Err(e) = storage.replace_active_watchers(&active).await {
+                tracing::warn!("Failed to persist watchers to DB: {}", e);
+            }
+        } else if let Some(ref path) = self.storage_path {
             Self::save_sync(path, &watchers);
         }
     }
@@ -504,6 +586,11 @@ impl WatcherManager {
     /// Get all watchers
     pub async fn list(&self) -> Vec<Watcher> {
         self.watchers.read().await.values().cloned().collect()
+    }
+
+    /// Get a watcher by ID.
+    pub async fn get(&self, id: Uuid) -> Option<Watcher> {
+        self.watchers.read().await.get(&id).cloned()
     }
 
     /// Get active watchers that need polling

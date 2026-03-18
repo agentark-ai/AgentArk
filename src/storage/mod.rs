@@ -13,6 +13,7 @@ use sea_orm::{
     Statement, TransactionTrait, TryGetable, Unchanged,
 };
 use std::path::Path;
+use std::sync::{Arc, OnceLock, RwLock};
 
 pub use entities::*;
 
@@ -20,6 +21,81 @@ pub use entities::*;
 #[derive(Clone)]
 pub struct Storage {
     db: DatabaseConnection,
+}
+
+static STORAGE_KEY_MANAGER: OnceLock<RwLock<Option<Arc<KeyManager>>>> = OnceLock::new();
+
+fn storage_key_manager_slot() -> &'static RwLock<Option<Arc<KeyManager>>> {
+    STORAGE_KEY_MANAGER.get_or_init(|| RwLock::new(None))
+}
+
+pub fn install_storage_key_manager(key_manager: Arc<KeyManager>) {
+    if let Ok(mut guard) = storage_key_manager_slot().write() {
+        *guard = Some(key_manager);
+    }
+}
+
+fn current_storage_key_manager() -> Option<Arc<KeyManager>> {
+    storage_key_manager_slot()
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+fn encrypt_storage_string(value: &str) -> Result<String> {
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    if let Some(key_manager) = current_storage_key_manager() {
+        Ok(key_manager.encrypt_string(value)?)
+    } else {
+        Ok(value.to_string())
+    }
+}
+
+fn decrypt_storage_string(value: &str) -> String {
+    if value.is_empty() {
+        return String::new();
+    }
+    if let Some(key_manager) = current_storage_key_manager() {
+        key_manager
+            .decrypt_string(value)
+            .unwrap_or_else(|_| value.to_string())
+    } else {
+        value.to_string()
+    }
+}
+
+fn encrypt_optional_storage_string(value: Option<&str>) -> Result<Option<String>> {
+    value.map(encrypt_storage_string).transpose()
+}
+
+fn decrypt_optional_storage_string(value: Option<String>) -> Option<String> {
+    value.map(|inner| decrypt_storage_string(&inner))
+}
+
+fn encrypt_storage_bytes(value: &[u8]) -> Result<Vec<u8>> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    if let Some(key_manager) = current_storage_key_manager() {
+        key_manager.encrypt(value)
+    } else {
+        Ok(value.to_vec())
+    }
+}
+
+fn decrypt_storage_bytes(value: &[u8]) -> Vec<u8> {
+    if value.is_empty() {
+        return Vec::new();
+    }
+    if let Some(key_manager) = current_storage_key_manager() {
+        key_manager
+            .decrypt(value)
+            .unwrap_or_else(|_| value.to_vec())
+    } else {
+        value.to_vec()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -38,12 +114,18 @@ impl Storage {
     const EXECUTION_TRACE_RETENTION_DAYS: i64 = 30;
     const EXECUTION_PROOF_RETENTION_DAYS: i64 = 30;
     const OPERATIONAL_LOG_RETENTION_DAYS: i64 = 30;
+    const SECURITY_LOG_RETENTION_DAYS: i64 = 30;
     const APPROVAL_LOG_RETENTION_DAYS: i64 = 30;
+    const SWARM_DELEGATION_RETENTION_DAYS: i64 = 30;
+    const LLM_USAGE_RETENTION_DAYS: i64 = 30;
+    const TERMINAL_TASK_RETENTION_DAYS: i64 = 90;
     const MESSAGE_RETENTION_DAYS: i64 = 365;
     const HOUSEKEEPING_PURGE_MIN_INTERVAL_SECS: i64 = 3600;
     const HOUSEKEEPING_PURGE_LAST_RUN_KEY: &'static str = "storage_housekeeping_last_purge_v1";
     const MAX_EPISODES_FOR_SCORING: u64 = 10_000;
     const MAX_DOCUMENT_CHUNKS_FOR_SEARCH: u64 = 20_000;
+    const SENSITIVE_PAYLOAD_BACKFILL_MARKER_KEY: &'static str =
+        "storage_sensitive_payload_backfill_v4";
 
     fn preference_row_id(key: &str, project_id: Option<&str>) -> String {
         let normalized_key = key.trim().to_ascii_lowercase();
@@ -90,6 +172,7 @@ impl Storage {
 
         // Create tables if they don't exist
         Self::create_tables(&db).await?;
+        Self::validate_sqlite_schema(&db).await?;
 
         Ok(Self { db })
     }
@@ -179,14 +262,19 @@ PRAGMA busy_timeout = 5000;\n",
                 step_count INTEGER NOT NULL DEFAULT 0,
                 steps_json TEXT NOT NULL,
                 response TEXT,
-                proof_id TEXT,
+                proof_id TEXT REFERENCES execution_proofs(id) ON DELETE SET NULL,
                 model TEXT,
                 input_tokens INTEGER NOT NULL DEFAULT 0,
                 output_tokens INTEGER NOT NULL DEFAULT 0,
                 total_tokens INTEGER NOT NULL DEFAULT 0,
                 cost_usd REAL NOT NULL DEFAULT 0.0,
                 complexity TEXT,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                CHECK(step_count >= 0),
+                CHECK(input_tokens >= 0),
+                CHECK(output_tokens >= 0),
+                CHECK(total_tokens >= 0),
+                CHECK(cost_usd >= 0.0)
             );
 
             CREATE TABLE IF NOT EXISTS tasks (
@@ -200,11 +288,13 @@ PRAGMA busy_timeout = 5000;\n",
                 scheduled_for TEXT,
                 cron TEXT,
                 result TEXT,
-                proof_id TEXT,
+                proof_id TEXT REFERENCES execution_proofs(id) ON DELETE SET NULL,
                 priority REAL,
                 urgency REAL,
                 importance REAL,
-                eisenhower_quadrant INTEGER
+                eisenhower_quadrant INTEGER,
+                CHECK(length(trim(action)) > 0),
+                CHECK(eisenhower_quadrant IS NULL OR eisenhower_quadrant BETWEEN 1 AND 4)
             );
 
             CREATE TABLE IF NOT EXISTS swarm_agents (
@@ -215,41 +305,45 @@ PRAGMA busy_timeout = 5000;\n",
                 capabilities TEXT NOT NULL,
                 system_prompt TEXT,
                 enabled INTEGER DEFAULT 1,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                CHECK(enabled IN (0, 1))
             );
 
             CREATE TABLE IF NOT EXISTS swarm_delegations (
                 id TEXT PRIMARY KEY,
-                parent_task_id TEXT,
-                agent_id TEXT NOT NULL,
+                parent_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+                agent_id TEXT NOT NULL REFERENCES swarm_agents(id) ON DELETE CASCADE,
                 task_description TEXT NOT NULL,
                 result TEXT,
                 success INTEGER DEFAULT 0,
                 confidence REAL,
                 execution_time_ms INTEGER,
                 created_at TEXT NOT NULL,
-                completed_at TEXT
+                completed_at TEXT,
+                CHECK(success IN (0, 1))
             );
 
             CREATE TABLE IF NOT EXISTS conversations (
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
                 channel TEXT NOT NULL,
-                project_id TEXT,
+                project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 message_count INTEGER DEFAULT 0,
-                archived INTEGER DEFAULT 0
+                archived INTEGER DEFAULT 0,
+                CHECK(message_count >= 0),
+                CHECK(archived IN (0, 1))
             );
 
             CREATE TABLE IF NOT EXISTS messages (
                 id TEXT PRIMARY KEY,
-                conversation_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
                 timestamp TEXT NOT NULL,
                 model_used TEXT,
-                trace_id TEXT
+                trace_id TEXT REFERENCES execution_traces(id) ON DELETE SET NULL
             );
 
             CREATE TABLE IF NOT EXISTS projects (
@@ -261,25 +355,29 @@ PRAGMA busy_timeout = 5000;\n",
                 tools_filter TEXT,
                 active INTEGER DEFAULT 1,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                CHECK(active IN (0, 1))
             );
 
             CREATE TABLE IF NOT EXISTS documents (
                 id TEXT PRIMARY KEY,
                 filename TEXT NOT NULL,
                 content_type TEXT NOT NULL,
-                project_id TEXT,
+                project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
                 chunk_count INTEGER DEFAULT 0,
                 file_size INTEGER DEFAULT 0,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                CHECK(chunk_count >= 0),
+                CHECK(file_size >= 0)
             );
 
             CREATE TABLE IF NOT EXISTS document_chunks (
                 id TEXT PRIMARY KEY,
-                document_id TEXT NOT NULL,
+                document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
                 chunk_index INTEGER NOT NULL,
                 content TEXT NOT NULL,
-                embedding BLOB
+                embedding BLOB,
+                CHECK(chunk_index >= 0)
             );
 
             CREATE TABLE IF NOT EXISTS notifications (
@@ -289,7 +387,8 @@ PRAGMA busy_timeout = 5000;\n",
                 level TEXT NOT NULL DEFAULT 'info',
                 source TEXT NOT NULL DEFAULT '',
                 read INTEGER DEFAULT 0,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                CHECK(read IN (0, 1))
             );
 
             CREATE TABLE IF NOT EXISTS approval_log (
@@ -300,23 +399,54 @@ PRAGMA busy_timeout = 5000;\n",
                 status TEXT NOT NULL DEFAULT 'pending',
                 requested_at TEXT NOT NULL,
                 resolved_at TEXT,
-                resolved_by TEXT
+                resolved_by TEXT,
+                CHECK(status IN ('pending', 'approved', 'denied', 'expired'))
+            );
+
+            CREATE TABLE IF NOT EXISTS automation_runs (
+                id TEXT PRIMARY KEY,
+                automation_id TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS automation_supervisor_states (
+                automation_id TEXT PRIMARY KEY,
+                updated_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS watchers (
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS idx_episodes_timestamp ON episodes(timestamp);
             CREATE INDEX IF NOT EXISTS idx_proofs_timestamp ON execution_proofs(timestamp);
             CREATE INDEX IF NOT EXISTS idx_execution_traces_created ON execution_traces(created_at);
             CREATE INDEX IF NOT EXISTS idx_execution_traces_started ON execution_traces(started_at);
+            CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+            CREATE INDEX IF NOT EXISTS idx_tasks_scheduled_for ON tasks(scheduled_for);
+            CREATE INDEX IF NOT EXISTS idx_tasks_status_scheduled ON tasks(status, scheduled_for);
+            CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at);
             CREATE INDEX IF NOT EXISTS idx_swarm_delegations_agent ON swarm_delegations(agent_id);
             CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);
             CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_messages_role_timestamp ON messages(role, timestamp);
             CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at);
             CREATE INDEX IF NOT EXISTS idx_conversations_project ON conversations(project_id);
             CREATE INDEX IF NOT EXISTS idx_documents_project ON documents(project_id);
             CREATE INDEX IF NOT EXISTS idx_document_chunks_doc ON document_chunks(document_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_document_chunks_doc_chunk ON document_chunks(document_id, chunk_index);
             CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications(created_at);
             CREATE INDEX IF NOT EXISTS idx_approval_log_status ON approval_log(status);
             CREATE INDEX IF NOT EXISTS idx_approval_log_requested ON approval_log(requested_at);
+            CREATE INDEX IF NOT EXISTS idx_automation_runs_started ON automation_runs(started_at);
+            CREATE INDEX IF NOT EXISTS idx_automation_runs_automation_id ON automation_runs(automation_id);
+            CREATE INDEX IF NOT EXISTS idx_watchers_status ON watchers(status);
+            CREATE INDEX IF NOT EXISTS idx_watchers_created ON watchers(created_at);
             CREATE TABLE IF NOT EXISTS expenses (
                 id TEXT PRIMARY KEY,
                 amount REAL NOT NULL,
@@ -345,8 +475,8 @@ PRAGMA busy_timeout = 5000;\n",
             CREATE TABLE IF NOT EXISTS operational_logs (
                 id TEXT PRIMARY KEY,
                 created_at TEXT NOT NULL,
-                trace_id TEXT,
-                conversation_id TEXT,
+                trace_id TEXT REFERENCES execution_traces(id) ON DELETE SET NULL,
+                conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
                 channel TEXT NOT NULL DEFAULT '',
                 event_type TEXT NOT NULL,
                 success INTEGER NOT NULL DEFAULT 0,
@@ -358,7 +488,8 @@ PRAGMA busy_timeout = 5000;\n",
                 strategy_version TEXT,
                 policy_version TEXT,
                 prompt_version TEXT,
-                model_slot TEXT
+                model_slot TEXT,
+                CHECK(success IN (0, 1))
             );
 
             CREATE TABLE IF NOT EXISTS llm_usage (
@@ -371,7 +502,11 @@ PRAGMA busy_timeout = 5000;\n",
                 prompt_tokens INTEGER NOT NULL,
                 completion_tokens INTEGER NOT NULL,
                 total_tokens INTEGER NOT NULL,
-                estimated INTEGER NOT NULL DEFAULT 1
+                estimated INTEGER NOT NULL DEFAULT 1,
+                CHECK(prompt_tokens >= 0),
+                CHECK(completion_tokens >= 0),
+                CHECK(total_tokens >= 0),
+                CHECK(estimated IN (0, 1))
             );
 
             CREATE TABLE IF NOT EXISTS user_preferences (
@@ -380,9 +515,10 @@ PRAGMA busy_timeout = 5000;\n",
                 value TEXT NOT NULL,
                 confidence REAL NOT NULL DEFAULT 0.8,
                 source TEXT,
-                project_id TEXT,
+                project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                CHECK(confidence >= 0.0 AND confidence <= 1.0)
             );
 
             CREATE TABLE IF NOT EXISTS user_data_items (
@@ -392,11 +528,12 @@ PRAGMA busy_timeout = 5000;\n",
                 content TEXT NOT NULL,
                 url TEXT,
                 source_channel TEXT,
-                conversation_id TEXT,
-                project_id TEXT,
+                conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+                project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
                 pinned INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                CHECK(pinned IN (0, 1))
             );
 
             CREATE TABLE IF NOT EXISTS knowledge_items (
@@ -406,7 +543,7 @@ PRAGMA busy_timeout = 5000;\n",
                 source TEXT,
                 url TEXT,
                 tags TEXT,
-                project_id TEXT,
+                project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -423,7 +560,6 @@ PRAGMA busy_timeout = 5000;\n",
             CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications(created_at);
             CREATE INDEX IF NOT EXISTS idx_approval_log_status ON approval_log(status);
             CREATE INDEX IF NOT EXISTS idx_approval_log_requested ON approval_log(requested_at);
-            CREATE INDEX IF NOT EXISTS idx_episodes_project ON episodes(context);
             CREATE INDEX IF NOT EXISTS idx_episodes_project_id ON episodes(project_id);
             CREATE INDEX IF NOT EXISTS idx_facts_project_id ON semantic_facts(project_id);
             CREATE INDEX IF NOT EXISTS idx_security_logs_created ON security_logs(created_at);
@@ -441,6 +577,7 @@ PRAGMA busy_timeout = 5000;\n",
             CREATE INDEX IF NOT EXISTS idx_user_preferences_key ON user_preferences(key);
             CREATE INDEX IF NOT EXISTS idx_user_preferences_project ON user_preferences(project_id);
             CREATE INDEX IF NOT EXISTS idx_user_data_kind ON user_data_items(kind);
+            CREATE INDEX IF NOT EXISTS idx_user_data_conversation ON user_data_items(conversation_id);
             CREATE INDEX IF NOT EXISTS idx_user_data_url ON user_data_items(url);
             CREATE INDEX IF NOT EXISTS idx_user_data_project ON user_data_items(project_id);
             CREATE INDEX IF NOT EXISTS idx_user_data_updated ON user_data_items(updated_at);
@@ -451,9 +588,12 @@ PRAGMA busy_timeout = 5000;\n",
         .await?;
 
         // ── Migrations for existing databases ──────────────────────────────
-        // SQLite silently ignores ALTER TABLE ADD COLUMN if the column already exists
-        // when we wrap each in a try-catch. We use a helper approach: attempt each
-        // ALTER and ignore "duplicate column" errors.
+        // Migrations for existing databases.
+        // Only "duplicate column name" is treated as safe/expected.
+        // Any other migration error now fails startup.
+        db.execute_unprepared("DROP INDEX IF EXISTS idx_episodes_project;")
+            .await?;
+
         let alter_stmts = vec![
             "ALTER TABLE execution_traces ADD COLUMN model TEXT",
             "ALTER TABLE execution_traces ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0",
@@ -463,8 +603,66 @@ PRAGMA busy_timeout = 5000;\n",
             "ALTER TABLE execution_traces ADD COLUMN complexity TEXT",
         ];
         for stmt in alter_stmts {
-            // Ignore errors — column already exists on fresh DBs or after first migration
-            let _ = db.execute_unprepared(stmt).await;
+            Self::apply_sqlite_add_column_migration(db, stmt).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn apply_sqlite_add_column_migration(db: &DatabaseConnection, stmt: &str) -> Result<()> {
+        match db.execute_unprepared(stmt).await {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let message = error.to_string().to_ascii_lowercase();
+                if message.contains("duplicate column name") {
+                    Ok(())
+                } else {
+                    Err(error.into())
+                }
+            }
+        }
+    }
+
+    async fn validate_sqlite_schema(db: &DatabaseConnection) -> Result<()> {
+        if db.get_database_backend() != DbBackend::Sqlite {
+            return Ok(());
+        }
+
+        let quick_check = db
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "PRAGMA quick_check".to_string(),
+            ))
+            .await?
+            .and_then(|row| row.try_get::<String>("", "quick_check").ok())
+            .unwrap_or_else(|| "unknown".to_string());
+        if !quick_check.eq_ignore_ascii_case("ok") {
+            anyhow::bail!("SQLite quick_check failed: {}", quick_check);
+        }
+
+        let fk_violations = db
+            .query_all(Statement::from_string(
+                DbBackend::Sqlite,
+                "PRAGMA foreign_key_check".to_string(),
+            ))
+            .await?;
+        if let Some(row) = fk_violations.first() {
+            let table = row
+                .try_get::<String>("", "table")
+                .unwrap_or_else(|_| "unknown".to_string());
+            let rowid = row
+                .try_get::<i64>("", "rowid")
+                .map(|value| value.to_string())
+                .unwrap_or_else(|_| "?".to_string());
+            let parent = row
+                .try_get::<String>("", "parent")
+                .unwrap_or_else(|_| "unknown".to_string());
+            anyhow::bail!(
+                "SQLite foreign_key_check failed: table={} rowid={} parent={}",
+                table,
+                rowid,
+                parent
+            );
         }
 
         Ok(())
@@ -523,6 +721,18 @@ PRAGMA busy_timeout = 5000;\n",
         Ok(())
     }
 
+    pub async fn get_encrypted(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .get(key)
+            .await?
+            .map(|value| decrypt_storage_bytes(&value)))
+    }
+
+    pub async fn set_encrypted(&self, key: &str, value: &[u8]) -> Result<()> {
+        let encrypted = encrypt_storage_bytes(value)?;
+        self.set(key, &encrypted).await
+    }
+
     pub async fn reencrypt_sensitive_payloads(
         &self,
         old_key: &KeyManager,
@@ -561,6 +771,329 @@ PRAGMA busy_timeout = 5000;\n",
             .await?;
         }
 
+        let messages = message::Entity::find().all(&txn).await?;
+        for row in messages {
+            let plaintext = old_key
+                .decrypt_string(&row.content)
+                .unwrap_or_else(|_| row.content.clone());
+            let encrypted = new_key.encrypt_string(&plaintext)?;
+            message::ActiveModel {
+                id: Unchanged(row.id),
+                content: Set(encrypted),
+                ..Default::default()
+            }
+            .update(&txn)
+            .await?;
+        }
+
+        let tasks = task::Entity::find().all(&txn).await?;
+        for row in tasks {
+            let description = new_key.encrypt_string(
+                &old_key
+                    .decrypt_string(&row.description)
+                    .unwrap_or_else(|_| row.description.clone()),
+            )?;
+            let arguments = new_key.encrypt_string(
+                &old_key
+                    .decrypt_string(&row.arguments)
+                    .unwrap_or_else(|_| row.arguments.clone()),
+            )?;
+            let approval = new_key.encrypt_string(
+                &old_key
+                    .decrypt_string(&row.approval)
+                    .unwrap_or_else(|_| row.approval.clone()),
+            )?;
+            let result = row.result.map(|value| {
+                let plaintext = old_key
+                    .decrypt_string(&value)
+                    .unwrap_or_else(|_| value.clone());
+                new_key.encrypt_string(&plaintext)
+            });
+            task::ActiveModel {
+                id: Unchanged(row.id),
+                description: Set(description),
+                arguments: Set(arguments),
+                approval: Set(approval),
+                result: Set(result.transpose()?),
+                ..Default::default()
+            }
+            .update(&txn)
+            .await?;
+        }
+
+        let approvals = approval_log::Entity::find().all(&txn).await?;
+        for row in approvals {
+            let plaintext = old_key
+                .decrypt_string(&row.arguments)
+                .unwrap_or_else(|_| row.arguments.clone());
+            let encrypted = new_key.encrypt_string(&plaintext)?;
+            approval_log::ActiveModel {
+                id: Unchanged(row.id),
+                arguments: Set(encrypted),
+                ..Default::default()
+            }
+            .update(&txn)
+            .await?;
+        }
+
+        let traces = execution_trace::Entity::find().all(&txn).await?;
+        for row in traces {
+            let message = new_key.encrypt_string(
+                &old_key
+                    .decrypt_string(&row.message)
+                    .unwrap_or_else(|_| row.message.clone()),
+            )?;
+            let steps_json = new_key.encrypt_string(
+                &old_key
+                    .decrypt_string(&row.steps_json)
+                    .unwrap_or_else(|_| row.steps_json.clone()),
+            )?;
+            let response = row.response.map(|value| {
+                let plaintext = old_key
+                    .decrypt_string(&value)
+                    .unwrap_or_else(|_| value.clone());
+                new_key.encrypt_string(&plaintext)
+            });
+            execution_trace::ActiveModel {
+                id: Unchanged(row.id),
+                message: Set(message),
+                steps_json: Set(steps_json),
+                response: Set(response.transpose()?),
+                ..Default::default()
+            }
+            .update(&txn)
+            .await?;
+        }
+
+        let user_data_items = user_data_item::Entity::find().all(&txn).await?;
+        for row in user_data_items {
+            let title = new_key.encrypt_string(
+                &old_key
+                    .decrypt_string(&row.title)
+                    .unwrap_or_else(|_| row.title.clone()),
+            )?;
+            let content = new_key.encrypt_string(
+                &old_key
+                    .decrypt_string(&row.content)
+                    .unwrap_or_else(|_| row.content.clone()),
+            )?;
+            user_data_item::ActiveModel {
+                id: Unchanged(row.id),
+                title: Set(title),
+                content: Set(content),
+                ..Default::default()
+            }
+            .update(&txn)
+            .await?;
+        }
+
+        let knowledge_items = knowledge_item::Entity::find().all(&txn).await?;
+        for row in knowledge_items {
+            let title = new_key.encrypt_string(
+                &old_key
+                    .decrypt_string(&row.title)
+                    .unwrap_or_else(|_| row.title.clone()),
+            )?;
+            let content = new_key.encrypt_string(
+                &old_key
+                    .decrypt_string(&row.content)
+                    .unwrap_or_else(|_| row.content.clone()),
+            )?;
+            knowledge_item::ActiveModel {
+                id: Unchanged(row.id),
+                title: Set(title),
+                content: Set(content),
+                ..Default::default()
+            }
+            .update(&txn)
+            .await?;
+        }
+
+        let user_preferences = user_preference::Entity::find().all(&txn).await?;
+        for row in user_preferences {
+            let plaintext = old_key
+                .decrypt_string(&row.value)
+                .unwrap_or_else(|_| row.value.clone());
+            let encrypted = new_key.encrypt_string(&plaintext)?;
+            user_preference::ActiveModel {
+                id: Unchanged(row.id),
+                value: Set(encrypted),
+                ..Default::default()
+            }
+            .update(&txn)
+            .await?;
+        }
+
+        let document_chunks = document_chunk::Entity::find().all(&txn).await?;
+        for row in document_chunks {
+            let plaintext = old_key
+                .decrypt_string(&row.content)
+                .unwrap_or_else(|_| row.content.clone());
+            let encrypted = new_key.encrypt_string(&plaintext)?;
+            document_chunk::ActiveModel {
+                id: Unchanged(row.id),
+                content: Set(encrypted),
+                ..Default::default()
+            }
+            .update(&txn)
+            .await?;
+        }
+
+        let documents = document::Entity::find().all(&txn).await?;
+        for row in documents {
+            let plaintext = old_key
+                .decrypt_string(&row.filename)
+                .unwrap_or_else(|_| row.filename.clone());
+            let encrypted = new_key.encrypt_string(&plaintext)?;
+            document::ActiveModel {
+                id: Unchanged(row.id),
+                filename: Set(encrypted),
+                ..Default::default()
+            }
+            .update(&txn)
+            .await?;
+        }
+
+        let notifications = notification::Entity::find().all(&txn).await?;
+        for row in notifications {
+            let title_plaintext = old_key
+                .decrypt_string(&row.title)
+                .unwrap_or_else(|_| row.title.clone());
+            let body_plaintext = old_key
+                .decrypt_string(&row.body)
+                .unwrap_or_else(|_| row.body.clone());
+            let encrypted_title = new_key.encrypt_string(&title_plaintext)?;
+            let encrypted_body = new_key.encrypt_string(&body_plaintext)?;
+            notification::ActiveModel {
+                id: Unchanged(row.id),
+                title: Set(encrypted_title),
+                body: Set(encrypted_body),
+                ..Default::default()
+            }
+            .update(&txn)
+            .await?;
+        }
+
+        let security_logs = security_log::Entity::find().all(&txn).await?;
+        for row in security_logs {
+            let message = new_key.encrypt_string(
+                &old_key
+                    .decrypt_string(&row.message)
+                    .unwrap_or_else(|_| row.message.clone()),
+            )?;
+            let source = row.source.map(|value| {
+                let plaintext = old_key
+                    .decrypt_string(&value)
+                    .unwrap_or_else(|_| value.clone());
+                new_key.encrypt_string(&plaintext)
+            });
+            security_log::ActiveModel {
+                id: Unchanged(row.id),
+                message: Set(message),
+                source: Set(source.transpose()?),
+                ..Default::default()
+            }
+            .update(&txn)
+            .await?;
+        }
+
+        let operational_logs = operational_log::Entity::find().all(&txn).await?;
+        for row in operational_logs {
+            let outcome = new_key.encrypt_string(
+                &old_key
+                    .decrypt_string(&row.outcome)
+                    .unwrap_or_else(|_| row.outcome.clone()),
+            )?;
+            let arguments = row.arguments.map(|value| {
+                let plaintext = old_key
+                    .decrypt_string(&value)
+                    .unwrap_or_else(|_| value.clone());
+                new_key.encrypt_string(&plaintext)
+            });
+            let payload = row.payload.map(|value| {
+                let plaintext = old_key
+                    .decrypt_string(&value)
+                    .unwrap_or_else(|_| value.clone());
+                new_key.encrypt_string(&plaintext)
+            });
+            operational_log::ActiveModel {
+                id: Unchanged(row.id),
+                outcome: Set(outcome),
+                arguments: Set(arguments.transpose()?),
+                payload: Set(payload.transpose()?),
+                ..Default::default()
+            }
+            .update(&txn)
+            .await?;
+        }
+
+        let delegations = swarm_delegation::Entity::find().all(&txn).await?;
+        for row in delegations {
+            let task_description = new_key.encrypt_string(
+                &old_key
+                    .decrypt_string(&row.task_description)
+                    .unwrap_or_else(|_| row.task_description.clone()),
+            )?;
+            let result = row.result.map(|value| {
+                let plaintext = old_key
+                    .decrypt_string(&value)
+                    .unwrap_or_else(|_| value.clone());
+                new_key.encrypt_string(&plaintext)
+            });
+            swarm_delegation::ActiveModel {
+                id: Unchanged(row.id),
+                task_description: Set(task_description),
+                result: Set(result.transpose()?),
+                ..Default::default()
+            }
+            .update(&txn)
+            .await?;
+        }
+
+        let backend = txn.get_database_backend();
+        let automation_runs = txn
+            .query_all(Statement::from_string(
+                backend,
+                "SELECT id, payload FROM automation_runs".to_string(),
+            ))
+            .await?;
+        for row in automation_runs {
+            let id: String = row.try_get("", "id")?;
+            let payload: String = row.try_get("", "payload")?;
+            let plaintext = old_key
+                .decrypt_string(&payload)
+                .unwrap_or_else(|_| payload.clone());
+            let encrypted = new_key.encrypt_string(&plaintext)?;
+            txn.execute(Statement::from_sql_and_values(
+                backend,
+                "UPDATE automation_runs SET payload = ? WHERE id = ?".to_string(),
+                vec![encrypted.into(), id.into()],
+            ))
+            .await?;
+        }
+
+        let automation_states = txn
+            .query_all(Statement::from_string(
+                backend,
+                "SELECT automation_id, payload FROM automation_supervisor_states".to_string(),
+            ))
+            .await?;
+        for row in automation_states {
+            let automation_id: String = row.try_get("", "automation_id")?;
+            let payload: String = row.try_get("", "payload")?;
+            let plaintext = old_key
+                .decrypt_string(&payload)
+                .unwrap_or_else(|_| payload.clone());
+            let encrypted = new_key.encrypt_string(&plaintext)?;
+            txn.execute(Statement::from_sql_and_values(
+                backend,
+                "UPDATE automation_supervisor_states SET payload = ? WHERE automation_id = ?"
+                    .to_string(),
+                vec![encrypted.into(), automation_id.into()],
+            ))
+            .await?;
+        }
+
         if !encrypted_kv_keys.is_empty() {
             let keys = encrypted_kv_keys
                 .iter()
@@ -591,6 +1124,27 @@ PRAGMA busy_timeout = 5000;\n",
         Ok(())
     }
 
+    pub async fn ensure_sensitive_payloads_encrypted(
+        &self,
+        key_manager: &KeyManager,
+        encrypted_kv_keys: &[&str],
+    ) -> Result<bool> {
+        let already_backfilled = self
+            .get(Self::SENSITIVE_PAYLOAD_BACKFILL_MARKER_KEY)
+            .await?
+            .map(|bytes| bytes == b"done")
+            .unwrap_or(false);
+        if already_backfilled {
+            return Ok(false);
+        }
+
+        self.reencrypt_sensitive_payloads(key_manager, key_manager, encrypted_kv_keys)
+            .await?;
+        self.set(Self::SENSITIVE_PAYLOAD_BACKFILL_MARKER_KEY, b"done")
+            .await?;
+        Ok(true)
+    }
+
     // ==================== LLM Usage ====================
 
     /// Insert an LLM usage record for analytics (tokens/cost estimation).
@@ -609,6 +1163,12 @@ PRAGMA busy_timeout = 5000;\n",
         }
         .insert(&self.db)
         .await?;
+        if let Err(e) = self.maybe_purge_housekeeping_tables().await {
+            tracing::warn!(
+                "Storage housekeeping purge failed after llm usage insert: {}",
+                e
+            );
+        }
         Ok(())
     }
 
@@ -879,6 +1439,7 @@ PRAGMA busy_timeout = 5000;\n",
         let id = Self::preference_row_id(key, project_id);
         let now = chrono::Utc::now().to_rfc3339();
         let bounded_confidence = confidence.clamp(0.0, 1.0);
+        let encrypted_value = encrypt_storage_string(value)?;
         let normalized_project = project_id
             .map(|p| p.trim())
             .filter(|p| !p.is_empty())
@@ -890,17 +1451,19 @@ PRAGMA busy_timeout = 5000;\n",
         {
             let mut model: user_preference::ActiveModel = existing.into();
             model.key = Set(key.to_ascii_lowercase());
-            model.value = Set(value.to_string());
+            model.value = Set(encrypted_value.clone());
             model.confidence = Set(bounded_confidence);
             model.source = Set(source.map(|s| s.to_string()));
             model.project_id = Set(normalized_project);
             model.updated_at = Set(now);
-            Ok(model.update(&self.db).await?)
+            let mut updated = model.update(&self.db).await?;
+            updated.value = decrypt_storage_string(&updated.value);
+            Ok(updated)
         } else {
             let model = user_preference::ActiveModel {
                 id: Set(id),
                 key: Set(key.to_ascii_lowercase()),
-                value: Set(value.to_string()),
+                value: Set(encrypted_value),
                 confidence: Set(bounded_confidence),
                 source: Set(source.map(|s| s.to_string())),
                 project_id: Set(normalized_project),
@@ -909,6 +1472,8 @@ PRAGMA busy_timeout = 5000;\n",
             }
             .insert(&self.db)
             .await?;
+            let mut model = model;
+            model.value = decrypt_storage_string(&model.value);
             Ok(model)
         }
     }
@@ -925,7 +1490,10 @@ PRAGMA busy_timeout = 5000;\n",
         if let Some(pid) = project_id {
             query = query.filter(user_preference::Column::ProjectId.eq(pid));
         }
-        let rows = query.limit(limit).offset(offset).all(&self.db).await?;
+        let mut rows = query.limit(limit).offset(offset).all(&self.db).await?;
+        for row in &mut rows {
+            row.value = decrypt_storage_string(&row.value);
+        }
         Ok(rows)
     }
 
@@ -959,11 +1527,13 @@ PRAGMA busy_timeout = 5000;\n",
         item: NewUserDataItem<'_>,
     ) -> Result<user_data_item::Model> {
         let now = chrono::Utc::now().to_rfc3339();
+        let title = encrypt_storage_string(item.title.trim())?;
+        let content = encrypt_storage_string(item.content)?;
         let model = user_data_item::ActiveModel {
             id: Set(uuid::Uuid::new_v4().to_string()),
             kind: Set(item.kind.trim().to_string()),
-            title: Set(item.title.trim().to_string()),
-            content: Set(item.content.to_string()),
+            title: Set(title),
+            content: Set(content),
             url: Set(item
                 .url
                 .map(|v| v.trim().to_string())
@@ -977,6 +1547,9 @@ PRAGMA busy_timeout = 5000;\n",
         }
         .insert(&self.db)
         .await?;
+        let mut model = model;
+        model.title = decrypt_storage_string(&model.title);
+        model.content = decrypt_storage_string(&model.content);
         Ok(model)
     }
 
@@ -1012,7 +1585,10 @@ PRAGMA busy_timeout = 5000;\n",
             model.source_channel = Set(source_channel.map(|v| v.to_string()));
             model.conversation_id = Set(conversation_id.map(|v| v.to_string()));
             model.updated_at = Set(now);
-            Ok(model.update(&self.db).await?)
+            let mut updated = model.update(&self.db).await?;
+            updated.title = decrypt_storage_string(&updated.title);
+            updated.content = decrypt_storage_string(&updated.content);
+            Ok(updated)
         } else {
             let title = Self::default_link_title(normalized_url);
             self.create_user_data_item(NewUserDataItem {
@@ -1045,7 +1621,11 @@ PRAGMA busy_timeout = 5000;\n",
         if let Some(kind_value) = kind.map(|v| v.trim()).filter(|v| !v.is_empty()) {
             query = query.filter(user_data_item::Column::Kind.eq(kind_value));
         }
-        let rows = query.limit(limit).offset(offset).all(&self.db).await?;
+        let mut rows = query.limit(limit).offset(offset).all(&self.db).await?;
+        for row in &mut rows {
+            row.title = decrypt_storage_string(&row.title);
+            row.content = decrypt_storage_string(&row.content);
+        }
         Ok(rows)
     }
 
@@ -1086,10 +1666,12 @@ PRAGMA busy_timeout = 5000;\n",
         project_id: Option<&str>,
     ) -> Result<knowledge_item::Model> {
         let now = chrono::Utc::now().to_rfc3339();
+        let title = encrypt_storage_string(title.trim())?;
+        let content = encrypt_storage_string(content)?;
         let model = knowledge_item::ActiveModel {
             id: Set(uuid::Uuid::new_v4().to_string()),
-            title: Set(title.trim().to_string()),
-            content: Set(content.to_string()),
+            title: Set(title),
+            content: Set(content),
             source: Set(source.map(|v| v.to_string())),
             url: Set(url.map(|v| v.to_string())),
             tags: Set(tags.map(|v| v.to_string())),
@@ -1099,6 +1681,9 @@ PRAGMA busy_timeout = 5000;\n",
         }
         .insert(&self.db)
         .await?;
+        let mut model = model;
+        model.title = decrypt_storage_string(&model.title);
+        model.content = decrypt_storage_string(&model.content);
         Ok(model)
     }
 
@@ -1114,7 +1699,11 @@ PRAGMA busy_timeout = 5000;\n",
         if let Some(pid) = project_id {
             query = query.filter(knowledge_item::Column::ProjectId.eq(pid));
         }
-        let rows = query.limit(limit).offset(offset).all(&self.db).await?;
+        let mut rows = query.limit(limit).offset(offset).all(&self.db).await?;
+        for row in &mut rows {
+            row.title = decrypt_storage_string(&row.title);
+            row.content = decrypt_storage_string(&row.content);
+        }
         Ok(rows)
     }
 
@@ -1137,17 +1726,21 @@ PRAGMA busy_timeout = 5000;\n",
 
     /// Insert a task
     pub async fn insert_task(&self, task: &crate::core::Task) -> Result<()> {
+        let description = encrypt_storage_string(&task.description)?;
+        let arguments = encrypt_storage_string(&serde_json::to_string(&task.arguments)?)?;
+        let approval = encrypt_storage_string(&serde_json::to_string(&task.approval)?)?;
+        let result = encrypt_optional_storage_string(task.result.as_deref())?;
         task::ActiveModel {
             id: Set(task.id.to_string()),
-            description: Set(task.description.clone()),
+            description: Set(description),
             action: Set(task.action.clone()),
-            arguments: Set(serde_json::to_string(&task.arguments)?),
-            approval: Set(serde_json::to_string(&task.approval)?),
+            arguments: Set(arguments),
+            approval: Set(approval),
             status: Set(serde_json::to_string(&task.status)?),
             created_at: Set(task.created_at.to_rfc3339()),
             scheduled_for: Set(task.scheduled_for.map(|t| t.to_rfc3339())),
             cron: Set(task.cron.clone()),
-            result: Set(task.result.clone()),
+            result: Set(result),
             proof_id: Set(task.proof_id.map(|id| id.to_string())),
             priority: Set(task.priority.map(|v| v as f64)),
             urgency: Set(task.urgency.map(|v| v as f64)),
@@ -1188,10 +1781,10 @@ PRAGMA busy_timeout = 5000;\n",
         };
 
         if let Some(desc) = description {
-            model.description = Set(desc);
+            model.description = Set(encrypt_storage_string(&desc)?);
         }
         if let Some(args) = arguments {
-            model.arguments = Set(args);
+            model.arguments = Set(encrypt_storage_string(&args)?);
         }
         if cron.is_some() {
             model.cron = Set(cron);
@@ -1216,7 +1809,7 @@ PRAGMA busy_timeout = 5000;\n",
             ..Default::default()
         };
         if let Some(res) = result {
-            model.result = Set(Some(res.to_string()));
+            model.result = Set(Some(encrypt_storage_string(res)?));
         }
         model.update(&self.db).await?;
         Ok(())
@@ -1253,8 +1846,210 @@ PRAGMA busy_timeout = 5000;\n",
 
     /// Get all tasks
     pub async fn get_tasks(&self) -> Result<Vec<task::Model>> {
-        let tasks = task::Entity::find().all(&self.db).await?;
+        let mut tasks = task::Entity::find().all(&self.db).await?;
+        for task in &mut tasks {
+            task.description = decrypt_storage_string(&task.description);
+            task.arguments = decrypt_storage_string(&task.arguments);
+            task.approval = decrypt_storage_string(&task.approval);
+            task.result = decrypt_optional_storage_string(task.result.take());
+        }
         Ok(tasks)
+    }
+
+    pub async fn list_automation_runs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::core::automation::AutomationRunRecord>> {
+        let backend = self.db.get_database_backend();
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                backend,
+                "SELECT payload FROM automation_runs ORDER BY started_at DESC LIMIT ?".to_string(),
+                vec![(limit.max(1) as i64).into()],
+            ))
+            .await?;
+        let mut runs = Vec::new();
+        for row in rows {
+            let payload = decrypt_storage_string(&row.try_get::<String>("", "payload")?);
+            if let Ok(run) =
+                serde_json::from_str::<crate::core::automation::AutomationRunRecord>(&payload)
+            {
+                runs.push(run);
+            }
+        }
+        Ok(runs)
+    }
+
+    pub async fn append_automation_run(
+        &self,
+        run: &crate::core::automation::AutomationRunRecord,
+        max_records: usize,
+    ) -> Result<()> {
+        let backend = self.db.get_database_backend();
+        self.db
+            .execute(Statement::from_sql_and_values(
+                backend,
+                "INSERT INTO automation_runs (id, automation_id, started_at, payload) VALUES (?, ?, ?, ?) \
+                 ON CONFLICT(id) DO UPDATE SET automation_id=excluded.automation_id, started_at=excluded.started_at, payload=excluded.payload"
+                    .to_string(),
+                vec![
+                    run.id.clone().into(),
+                    run.automation_id.clone().into(),
+                    run.started_at.clone().into(),
+                    encrypt_storage_string(&serde_json::to_string(run)?)?.into(),
+                ],
+            ))
+            .await?;
+        self.db
+            .execute(Statement::from_sql_and_values(
+                backend,
+                "DELETE FROM automation_runs WHERE id NOT IN (SELECT id FROM automation_runs ORDER BY started_at DESC LIMIT ?)"
+                    .to_string(),
+                vec![(max_records.max(1) as i64).into()],
+            ))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_automation_supervisor_states(
+        &self,
+    ) -> Result<Vec<crate::core::automation::AutomationSupervisorState>> {
+        let backend = self.db.get_database_backend();
+        let rows = self
+            .db
+            .query_all(Statement::from_string(
+                backend,
+                "SELECT payload FROM automation_supervisor_states ORDER BY updated_at DESC"
+                    .to_string(),
+            ))
+            .await?;
+        let mut states = Vec::new();
+        for row in rows {
+            let payload = decrypt_storage_string(&row.try_get::<String>("", "payload")?);
+            if let Ok(state) =
+                serde_json::from_str::<crate::core::automation::AutomationSupervisorState>(&payload)
+            {
+                states.push(state);
+            }
+        }
+        Ok(states)
+    }
+
+    pub async fn load_automation_supervisor_state(
+        &self,
+        automation_id: &str,
+    ) -> Result<Option<crate::core::automation::AutomationSupervisorState>> {
+        let backend = self.db.get_database_backend();
+        let row = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                backend,
+                "SELECT payload FROM automation_supervisor_states WHERE automation_id = ?"
+                    .to_string(),
+                vec![automation_id.to_string().into()],
+            ))
+            .await?;
+        Ok(row
+            .and_then(|row| row.try_get::<String>("", "payload").ok())
+            .map(|payload| decrypt_storage_string(&payload))
+            .and_then(|payload| {
+                serde_json::from_str::<crate::core::automation::AutomationSupervisorState>(&payload)
+                    .ok()
+            }))
+    }
+
+    pub async fn upsert_automation_supervisor_state(
+        &self,
+        state: &crate::core::automation::AutomationSupervisorState,
+    ) -> Result<()> {
+        let backend = self.db.get_database_backend();
+        let updated_at = state
+            .last_run_at
+            .clone()
+            .or_else(|| state.created_at.clone())
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+        self.db
+            .execute(Statement::from_sql_and_values(
+                backend,
+                "INSERT INTO automation_supervisor_states (automation_id, updated_at, payload) VALUES (?, ?, ?) \
+                 ON CONFLICT(automation_id) DO UPDATE SET updated_at=excluded.updated_at, payload=excluded.payload"
+                    .to_string(),
+                vec![
+                    state.automation_id.clone().into(),
+                    updated_at.into(),
+                    encrypt_storage_string(&serde_json::to_string(state)?)?.into(),
+                ],
+            ))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_automation_supervisor_state(&self, automation_id: &str) -> Result<bool> {
+        let result = self
+            .db
+            .execute(Statement::from_sql_and_values(
+                self.db.get_database_backend(),
+                "DELETE FROM automation_supervisor_states WHERE automation_id = ?".to_string(),
+                vec![automation_id.to_string().into()],
+            ))
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn list_watchers(&self) -> Result<Vec<crate::core::watcher::Watcher>> {
+        let rows = self
+            .db
+            .query_all(Statement::from_string(
+                self.db.get_database_backend(),
+                "SELECT payload FROM watchers ORDER BY created_at ASC".to_string(),
+            ))
+            .await?;
+        let mut watchers = Vec::new();
+        for row in rows {
+            let payload: String = row.try_get("", "payload")?;
+            if let Ok(watcher) = serde_json::from_str::<crate::core::watcher::Watcher>(&payload) {
+                watchers.push(watcher);
+            }
+        }
+        Ok(watchers)
+    }
+
+    pub async fn replace_active_watchers(
+        &self,
+        watchers: &[crate::core::watcher::Watcher],
+    ) -> Result<()> {
+        let backend = self.db.get_database_backend();
+        let txn = self.db.begin().await?;
+        txn.execute(Statement::from_string(
+            backend,
+            "DELETE FROM watchers".to_string(),
+        ))
+        .await?;
+        for watcher in watchers {
+            let status = match &watcher.status {
+                crate::core::watcher::WatcherStatus::Active => "active",
+                crate::core::watcher::WatcherStatus::Paused => "paused",
+                crate::core::watcher::WatcherStatus::Triggered => "triggered",
+                crate::core::watcher::WatcherStatus::TimedOut => "timed_out",
+                crate::core::watcher::WatcherStatus::Cancelled => "cancelled",
+                crate::core::watcher::WatcherStatus::Failed { .. } => "failed",
+            };
+            txn.execute(Statement::from_sql_and_values(
+                backend,
+                "INSERT INTO watchers (id, status, created_at, payload) VALUES (?, ?, ?, ?)"
+                    .to_string(),
+                vec![
+                    watcher.id.to_string().into(),
+                    status.into(),
+                    watcher.created_at.to_rfc3339().into(),
+                    serde_json::to_string(watcher)?.into(),
+                ],
+            ))
+            .await?;
+        }
+        txn.commit().await?;
+        Ok(())
     }
 
     // ==================== Expenses ====================
@@ -1449,20 +2244,28 @@ PRAGMA busy_timeout = 5000;\n",
 
     /// Get recent swarm delegations
     pub async fn get_recent_delegations(&self, limit: u64) -> Result<Vec<swarm_delegation::Model>> {
-        let delegations = swarm_delegation::Entity::find()
+        let mut delegations = swarm_delegation::Entity::find()
             .order_by_desc(swarm_delegation::Column::CreatedAt)
             .limit(limit)
             .all(&self.db)
             .await?;
+        for delegation in &mut delegations {
+            delegation.task_description = decrypt_storage_string(&delegation.task_description);
+            delegation.result = decrypt_optional_storage_string(delegation.result.clone());
+        }
         Ok(delegations)
     }
 
     /// Get all swarm delegations
     pub async fn get_all_delegations(&self) -> Result<Vec<swarm_delegation::Model>> {
-        let delegations = swarm_delegation::Entity::find()
+        let mut delegations = swarm_delegation::Entity::find()
             .order_by_desc(swarm_delegation::Column::CreatedAt)
             .all(&self.db)
             .await?;
+        for delegation in &mut delegations {
+            delegation.task_description = decrypt_storage_string(&delegation.task_description);
+            delegation.result = decrypt_optional_storage_string(delegation.result.clone());
+        }
         Ok(delegations)
     }
 
@@ -1475,8 +2278,10 @@ PRAGMA busy_timeout = 5000;\n",
             id: Set(delegation.id.clone()),
             parent_task_id: Set(delegation.parent_task_id.clone()),
             agent_id: Set(delegation.agent_id.clone()),
-            task_description: Set(delegation.task_description.clone()),
-            result: Set(delegation.result.clone()),
+            task_description: Set(encrypt_storage_string(&delegation.task_description)?),
+            result: Set(encrypt_optional_storage_string(
+                delegation.result.as_deref(),
+            )?),
             success: Set(delegation.success),
             confidence: Set(delegation.confidence),
             execution_time_ms: Set(delegation.execution_time_ms),
@@ -1485,6 +2290,12 @@ PRAGMA busy_timeout = 5000;\n",
         }
         .insert(&self.db)
         .await?;
+        if let Err(e) = self.maybe_purge_housekeeping_tables().await {
+            tracing::warn!(
+                "Storage housekeeping purge failed after delegation insert: {}",
+                e
+            );
+        }
         Ok(())
     }
 
@@ -1617,11 +2428,12 @@ PRAGMA busy_timeout = 5000;\n",
 
     /// Insert a message
     pub async fn insert_message(&self, msg: &message::Model) -> Result<()> {
+        let content = encrypt_storage_string(&msg.content)?;
         message::ActiveModel {
             id: Set(msg.id.clone()),
             conversation_id: Set(msg.conversation_id.clone()),
             role: Set(msg.role.clone()),
-            content: Set(msg.content.clone()),
+            content: Set(content),
             timestamp: Set(msg.timestamp.clone()),
             model_used: Set(msg.model_used.clone()),
             trace_id: Set(msg.trace_id.clone()),
@@ -1658,13 +2470,16 @@ PRAGMA busy_timeout = 5000;\n",
         limit: u64,
         offset: u64,
     ) -> Result<Vec<message::Model>> {
-        let msgs = message::Entity::find()
+        let mut msgs = message::Entity::find()
             .filter(message::Column::ConversationId.eq(conversation_id))
             .order_by_asc(message::Column::Timestamp)
             .limit(limit)
             .offset(offset)
             .all(&self.db)
             .await?;
+        for msg in &mut msgs {
+            msg.content = decrypt_storage_string(&msg.content);
+        }
         Ok(msgs)
     }
 
@@ -1681,17 +2496,23 @@ PRAGMA busy_timeout = 5000;\n",
             .all(&self.db)
             .await?;
         msgs.reverse();
+        for msg in &mut msgs {
+            msg.content = decrypt_storage_string(&msg.content);
+        }
         Ok(msgs)
     }
 
     /// Get most recent user-authored chat messages across conversations.
     pub async fn get_recent_user_messages(&self, limit: u64) -> Result<Vec<message::Model>> {
-        let msgs = message::Entity::find()
+        let mut msgs = message::Entity::find()
             .filter(message::Column::Role.eq("user"))
             .order_by_desc(message::Column::Timestamp)
             .limit(limit)
             .all(&self.db)
             .await?;
+        for msg in &mut msgs {
+            msg.content = decrypt_storage_string(&msg.content);
+        }
         Ok(msgs)
     }
 
@@ -1842,9 +2663,10 @@ PRAGMA busy_timeout = 5000;\n",
 
     /// Insert a document record
     pub async fn insert_document(&self, doc: &document::Model) -> Result<()> {
+        let filename = encrypt_storage_string(&doc.filename)?;
         document::ActiveModel {
             id: Set(doc.id.clone()),
-            filename: Set(doc.filename.clone()),
+            filename: Set(filename),
             content_type: Set(doc.content_type.clone()),
             project_id: Set(doc.project_id.clone()),
             chunk_count: Set(doc.chunk_count),
@@ -1858,11 +2680,12 @@ PRAGMA busy_timeout = 5000;\n",
 
     /// Insert a document chunk
     pub async fn insert_document_chunk(&self, chunk: &document_chunk::Model) -> Result<()> {
+        let content = encrypt_storage_string(&chunk.content)?;
         document_chunk::ActiveModel {
             id: Set(chunk.id.clone()),
             document_id: Set(chunk.document_id.clone()),
             chunk_index: Set(chunk.chunk_index),
-            content: Set(chunk.content.clone()),
+            content: Set(content),
             embedding: Set(chunk.embedding.clone()),
         }
         .insert(&self.db)
@@ -1881,7 +2704,10 @@ PRAGMA busy_timeout = 5000;\n",
         if let Some(pid) = project_id {
             query = query.filter(document::Column::ProjectId.eq(pid));
         }
-        let docs = query.limit(limit).offset(offset).all(&self.db).await?;
+        let mut docs = query.limit(limit).offset(offset).all(&self.db).await?;
+        for doc in &mut docs {
+            doc.filename = decrypt_storage_string(&doc.filename);
+        }
         Ok(docs)
     }
 
@@ -1899,22 +2725,28 @@ PRAGMA busy_timeout = 5000;\n",
         &self,
         document_id: &str,
     ) -> Result<Vec<document_chunk::Model>> {
-        let chunks = document_chunk::Entity::find()
+        let mut chunks = document_chunk::Entity::find()
             .filter(document_chunk::Column::DocumentId.eq(document_id))
             .order_by_asc(document_chunk::Column::ChunkIndex)
             .all(&self.db)
             .await?;
+        for chunk in &mut chunks {
+            chunk.content = decrypt_storage_string(&chunk.content);
+        }
         Ok(chunks)
     }
 
     /// Get all chunks (across all documents, for search)
     pub async fn get_all_document_chunks(&self) -> Result<Vec<document_chunk::Model>> {
-        let chunks = document_chunk::Entity::find()
+        let mut chunks = document_chunk::Entity::find()
             .order_by_asc(document_chunk::Column::DocumentId)
             .order_by_asc(document_chunk::Column::ChunkIndex)
             .limit(Self::MAX_DOCUMENT_CHUNKS_FOR_SEARCH)
             .all(&self.db)
             .await?;
+        for chunk in &mut chunks {
+            chunk.content = decrypt_storage_string(&chunk.content);
+        }
         Ok(chunks)
     }
 
@@ -2088,6 +2920,8 @@ PRAGMA busy_timeout = 5000;\n",
         // Normalize fields to improve dedup reliability (avoid whitespace/case variants).
         let title_clean = notif.title.trim().to_string();
         let body_clean = notif.body.trim().to_string();
+        let encrypted_title = encrypt_storage_string(&title_clean)?;
+        let encrypted_body = encrypt_storage_string(&body_clean)?;
         let level_clean = notif.level.trim().to_string();
         let source_clean = notif.source.trim().to_string();
 
@@ -2114,7 +2948,6 @@ PRAGMA busy_timeout = 5000;\n",
             match notification::Entity::find()
                 .filter(notification::Column::CreatedAt.gte(cutoff))
                 .filter(notification::Column::Source.eq(source_clean.clone()))
-                .filter(notification::Column::Title.eq(title_clean.clone()))
                 .order_by_desc(notification::Column::CreatedAt)
                 .limit(50)
                 .all(&self.db)
@@ -2122,7 +2955,11 @@ PRAGMA busy_timeout = 5000;\n",
             {
                 Ok(recent) => {
                     for existing in recent {
-                        if Self::notification_body_signature(&existing.body) == sig {
+                        let existing_title = decrypt_storage_string(&existing.title);
+                        let existing_body = decrypt_storage_string(&existing.body);
+                        if existing_title == title_clean
+                            && Self::notification_body_signature(&existing_body) == sig
+                        {
                             // Suppress duplicates within the cooldown window.
                             return Ok(());
                         }
@@ -2136,8 +2973,8 @@ PRAGMA busy_timeout = 5000;\n",
 
         notification::ActiveModel {
             id: Set(notif.id.clone()),
-            title: Set(title_clean),
-            body: Set(body_clean),
+            title: Set(encrypted_title),
+            body: Set(encrypted_body),
             level: Set(level_clean),
             source: Set(source_clean),
             read: Set(notif.read),
@@ -2162,7 +2999,11 @@ PRAGMA busy_timeout = 5000;\n",
         if unread_only {
             query = query.filter(notification::Column::Read.eq(false));
         }
-        let notifs = query.limit(limit).offset(offset).all(&self.db).await?;
+        let mut notifs = query.limit(limit).offset(offset).all(&self.db).await?;
+        for notif in &mut notifs {
+            notif.title = decrypt_storage_string(&notif.title);
+            notif.body = decrypt_storage_string(&notif.body);
+        }
         Ok(Self::collapse_recent_arkpulse_notifications(notifs))
     }
 
@@ -2229,13 +3070,23 @@ PRAGMA busy_timeout = 5000;\n",
         let source_filter = Condition::any()
             .add(notification::Column::Source.contains("goal"))
             .add(notification::Column::Source.eq("autonomy_goal_loop"));
-        let text_filter = Condition::any()
-            .add(notification::Column::Title.contains(trimmed))
-            .add(notification::Column::Body.contains(trimmed));
-
-        let result = notification::Entity::delete_many()
+        let candidates = notification::Entity::find()
             .filter(source_filter)
-            .filter(text_filter)
+            .all(&self.db)
+            .await?;
+        let matching_ids = candidates
+            .into_iter()
+            .filter(|notif| {
+                decrypt_storage_string(&notif.title).contains(trimmed)
+                    || decrypt_storage_string(&notif.body).contains(trimmed)
+            })
+            .map(|notif| notif.id)
+            .collect::<Vec<_>>();
+        if matching_ids.is_empty() {
+            return Ok(0);
+        }
+        let result = notification::Entity::delete_many()
+            .filter(notification::Column::Id.is_in(matching_ids))
             .exec(&self.db)
             .await?;
         Ok(result.rows_affected)
@@ -2256,19 +3107,31 @@ PRAGMA busy_timeout = 5000;\n",
             .add(notification::Column::Source.contains("app"))
             .add(notification::Column::Title.contains("App"))
             .add(notification::Column::Title.contains("app"));
-
-        let mut text_filter = Condition::any()
-            .add(notification::Column::Title.contains(id_trimmed))
-            .add(notification::Column::Body.contains(id_trimmed));
-        if let Some(title) = app_title.map(str::trim).filter(|s| !s.is_empty()) {
-            text_filter = text_filter
-                .add(notification::Column::Title.contains(title))
-                .add(notification::Column::Body.contains(title));
-        }
-
-        let result = notification::Entity::delete_many()
+        let titles = app_title
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|title| vec![id_trimmed.to_string(), title.to_string()])
+            .unwrap_or_else(|| vec![id_trimmed.to_string()]);
+        let candidates = notification::Entity::find()
             .filter(source_filter)
-            .filter(text_filter)
+            .all(&self.db)
+            .await?;
+        let matching_ids = candidates
+            .into_iter()
+            .filter(|notif| {
+                let title = decrypt_storage_string(&notif.title);
+                let body = decrypt_storage_string(&notif.body);
+                titles
+                    .iter()
+                    .any(|needle| title.contains(needle) || body.contains(needle))
+            })
+            .map(|notif| notif.id)
+            .collect::<Vec<_>>();
+        if matching_ids.is_empty() {
+            return Ok(0);
+        }
+        let result = notification::Entity::delete_many()
+            .filter(notification::Column::Id.is_in(matching_ids))
             .exec(&self.db)
             .await?;
         Ok(result.rows_affected)
@@ -2326,13 +3189,84 @@ PRAGMA busy_timeout = 5000;\n",
         limit: u64,
         offset: u64,
     ) -> Result<Vec<approval_log::Model>> {
-        let log = approval_log::Entity::find()
+        let mut log = approval_log::Entity::find()
             .order_by_desc(approval_log::Column::RequestedAt)
             .limit(limit)
             .offset(offset)
             .all(&self.db)
             .await?;
+        for row in &mut log {
+            row.arguments = decrypt_storage_string(&row.arguments);
+        }
         Ok(log)
+    }
+
+    /// Create or refresh a pending approval request entry.
+    pub async fn upsert_approval_request(
+        &self,
+        id: &str,
+        action_name: &str,
+        arguments: &str,
+        rule_name: &str,
+        requested_at: &str,
+    ) -> Result<()> {
+        let arguments = encrypt_storage_string(arguments)?;
+        let existing = approval_log::Entity::find_by_id(id.to_string())
+            .one(&self.db)
+            .await?;
+        if existing.is_some() {
+            approval_log::ActiveModel {
+                id: Set(id.to_string()),
+                action_name: Set(action_name.to_string()),
+                arguments: Set(arguments.clone()),
+                rule_name: Set(rule_name.to_string()),
+                status: Set("pending".to_string()),
+                requested_at: Set(requested_at.to_string()),
+                resolved_at: Set(None),
+                resolved_by: Set(None),
+            }
+            .update(&self.db)
+            .await?;
+        } else {
+            approval_log::ActiveModel {
+                id: Set(id.to_string()),
+                action_name: Set(action_name.to_string()),
+                arguments: Set(arguments),
+                rule_name: Set(rule_name.to_string()),
+                status: Set("pending".to_string()),
+                requested_at: Set(requested_at.to_string()),
+                resolved_at: Set(None),
+                resolved_by: Set(None),
+            }
+            .insert(&self.db)
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Resolve an approval request entry.
+    pub async fn resolve_approval_request(
+        &self,
+        id: &str,
+        status: &str,
+        resolved_by: &str,
+    ) -> Result<()> {
+        let existing = approval_log::Entity::find_by_id(id.to_string())
+            .one(&self.db)
+            .await?;
+        if existing.is_none() {
+            return Ok(());
+        }
+        approval_log::ActiveModel {
+            id: Set(id.to_string()),
+            status: Set(status.to_string()),
+            resolved_at: Set(Some(chrono::Utc::now().to_rfc3339())),
+            resolved_by: Set(Some(resolved_by.to_string())),
+            ..Default::default()
+        }
+        .update(&self.db)
+        .await?;
+        Ok(())
     }
 
     // ==================== Execution Traces ====================
@@ -2351,18 +3285,20 @@ PRAGMA busy_timeout = 5000;\n",
             .or(trace.started_at)
             .unwrap_or_else(chrono::Utc::now)
             .to_rfc3339();
-        let steps_json = serde_json::to_string(&trace.steps)?;
+        let message = encrypt_storage_string(&trace.message)?;
+        let steps_json = encrypt_storage_string(&serde_json::to_string(&trace.steps)?)?;
+        let response = encrypt_optional_storage_string(trace.response.as_deref())?;
 
         crate::storage::entities::execution_trace::ActiveModel {
             id: Set(trace.id.clone()),
-            message: Set(trace.message.clone()),
+            message: Set(message),
             channel: Set(trace.channel.clone()),
             started_at: Set(started_at),
             completed_at: Set(completed_at),
             duration_ms: Set(duration_ms),
             step_count: Set(trace.steps.len() as i64),
             steps_json: Set(steps_json),
-            response: Set(trace.response.clone()),
+            response: Set(response),
             proof_id: Set(trace.proof_id.clone()),
             model: Set(trace.model.clone()),
             input_tokens: Set(trace.input_tokens),
@@ -2389,12 +3325,17 @@ PRAGMA busy_timeout = 5000;\n",
         limit: u64,
         offset: u64,
     ) -> Result<Vec<crate::storage::entities::execution_trace::Model>> {
-        let traces = crate::storage::entities::execution_trace::Entity::find()
+        let mut traces = crate::storage::entities::execution_trace::Entity::find()
             .order_by_desc(crate::storage::entities::execution_trace::Column::CreatedAt)
             .limit(limit)
             .offset(offset)
             .all(&self.db)
             .await?;
+        for trace in &mut traces {
+            trace.message = decrypt_storage_string(&trace.message);
+            trace.steps_json = decrypt_storage_string(&trace.steps_json);
+            trace.response = decrypt_optional_storage_string(trace.response.take());
+        }
         Ok(traces)
     }
 
@@ -2403,9 +3344,15 @@ PRAGMA busy_timeout = 5000;\n",
         &self,
         id: &str,
     ) -> Result<Option<crate::storage::entities::execution_trace::Model>> {
-        let trace = crate::storage::entities::execution_trace::Entity::find_by_id(id.to_string())
-            .one(&self.db)
-            .await?;
+        let mut trace =
+            crate::storage::entities::execution_trace::Entity::find_by_id(id.to_string())
+                .one(&self.db)
+                .await?;
+        if let Some(row) = trace.as_mut() {
+            row.message = decrypt_storage_string(&row.message);
+            row.steps_json = decrypt_storage_string(&row.steps_json);
+            row.response = decrypt_optional_storage_string(row.response.take());
+        }
         Ok(trace)
     }
 
@@ -2417,23 +3364,33 @@ PRAGMA busy_timeout = 5000;\n",
             id: Set(log.id.clone()),
             event_type: Set(log.event_type.clone()),
             severity: Set(log.severity.clone()),
-            message: Set(log.message.clone()),
-            source: Set(log.source.clone()),
+            message: Set(encrypt_storage_string(&log.message)?),
+            source: Set(encrypt_optional_storage_string(log.source.as_deref())?),
             count: Set(log.count),
             created_at: Set(log.created_at.clone()),
         }
         .insert(&self.db)
         .await?;
+        if let Err(e) = self.maybe_purge_housekeeping_tables().await {
+            tracing::warn!(
+                "Storage housekeeping purge failed after security log insert: {}",
+                e
+            );
+        }
         Ok(())
     }
 
     /// List recent security logs (newest first)
     pub async fn list_security_logs(&self, limit: u64) -> Result<Vec<security_log::Model>> {
-        let logs = security_log::Entity::find()
+        let mut logs = security_log::Entity::find()
             .order_by_desc(security_log::Column::CreatedAt)
             .limit(limit)
             .all(&self.db)
             .await?;
+        for log in &mut logs {
+            log.message = decrypt_storage_string(&log.message);
+            log.source = decrypt_optional_storage_string(log.source.clone());
+        }
         Ok(logs)
     }
 
@@ -2450,7 +3407,11 @@ PRAGMA busy_timeout = 5000;\n",
             query = query.filter(security_log::Column::EventType.eq(et.trim().to_string()));
         }
 
-        let logs = query.limit(limit).offset(offset).all(&self.db).await?;
+        let mut logs = query.limit(limit).offset(offset).all(&self.db).await?;
+        for log in &mut logs {
+            log.message = decrypt_storage_string(&log.message);
+            log.source = decrypt_optional_storage_string(log.source.clone());
+        }
         Ok(logs)
     }
 
@@ -2485,11 +3446,11 @@ PRAGMA busy_timeout = 5000;\n",
             channel: Set(log.channel.clone()),
             event_type: Set(log.event_type.clone()),
             success: Set(log.success),
-            outcome: Set(log.outcome.clone()),
+            outcome: Set(encrypt_storage_string(&log.outcome)?),
             tool_name: Set(log.tool_name.clone()),
             latency_ms: Set(log.latency_ms),
-            arguments: Set(log.arguments.clone()),
-            payload: Set(log.payload.clone()),
+            arguments: Set(encrypt_optional_storage_string(log.arguments.as_deref())?),
+            payload: Set(encrypt_optional_storage_string(log.payload.as_deref())?),
             strategy_version: Set(log.strategy_version.clone()),
             policy_version: Set(log.policy_version.clone()),
             prompt_version: Set(log.prompt_version.clone()),
@@ -2512,12 +3473,17 @@ PRAGMA busy_timeout = 5000;\n",
         event_type: &str,
         limit: u64,
     ) -> Result<Vec<operational_log::Model>> {
-        let rows = operational_log::Entity::find()
+        let mut rows = operational_log::Entity::find()
             .filter(operational_log::Column::EventType.eq(event_type.to_string()))
             .order_by_desc(operational_log::Column::CreatedAt)
             .limit(limit)
             .all(&self.db)
             .await?;
+        for row in &mut rows {
+            row.outcome = decrypt_storage_string(&row.outcome);
+            row.arguments = decrypt_optional_storage_string(row.arguments.clone());
+            row.payload = decrypt_optional_storage_string(row.payload.clone());
+        }
         Ok(rows)
     }
 
@@ -2559,8 +3525,16 @@ PRAGMA busy_timeout = 5000;\n",
             (now - chrono::Duration::days(Self::EXECUTION_PROOF_RETENTION_DAYS)).to_rfc3339();
         let operational_cutoff =
             (now - chrono::Duration::days(Self::OPERATIONAL_LOG_RETENTION_DAYS)).to_rfc3339();
+        let security_cutoff =
+            (now - chrono::Duration::days(Self::SECURITY_LOG_RETENTION_DAYS)).to_rfc3339();
         let approval_cutoff =
             (now - chrono::Duration::days(Self::APPROVAL_LOG_RETENTION_DAYS)).to_rfc3339();
+        let delegation_cutoff =
+            (now - chrono::Duration::days(Self::SWARM_DELEGATION_RETENTION_DAYS)).to_rfc3339();
+        let llm_usage_cutoff =
+            (now - chrono::Duration::days(Self::LLM_USAGE_RETENTION_DAYS)).to_rfc3339();
+        let terminal_task_cutoff =
+            (now - chrono::Duration::days(Self::TERMINAL_TASK_RETENTION_DAYS)).to_rfc3339();
         let message_cutoff =
             (now - chrono::Duration::days(Self::MESSAGE_RETENTION_DAYS)).to_rfc3339();
 
@@ -2593,11 +3567,45 @@ PRAGMA busy_timeout = 5000;\n",
             .filter(operational_log::Column::CreatedAt.lt(operational_cutoff))
             .exec(&txn)
             .await?;
+        security_log::Entity::delete_many()
+            .filter(security_log::Column::CreatedAt.lt(security_cutoff))
+            .exec(&txn)
+            .await?;
         approval_log::Entity::delete_many()
             .filter(approval_log::Column::RequestedAt.lt(approval_cutoff))
             .filter(approval_log::Column::Status.ne("pending"))
             .exec(&txn)
             .await?;
+        swarm_delegation::Entity::delete_many()
+            .filter(swarm_delegation::Column::CreatedAt.lt(delegation_cutoff))
+            .exec(&txn)
+            .await?;
+        llm_usage::Entity::delete_many()
+            .filter(llm_usage::Column::CreatedAt.lt(llm_usage_cutoff))
+            .exec(&txn)
+            .await?;
+
+        let stale_tasks = task::Entity::find()
+            .filter(task::Column::CreatedAt.lt(terminal_task_cutoff))
+            .all(&txn)
+            .await?;
+        for stale_task in stale_tasks {
+            if stale_task.cron.is_some() {
+                continue;
+            }
+            let status = serde_json::from_str::<crate::core::TaskStatus>(&stale_task.status)
+                .unwrap_or(crate::core::TaskStatus::Pending);
+            let terminal = matches!(
+                status,
+                crate::core::TaskStatus::Completed
+                    | crate::core::TaskStatus::Cancelled
+                    | crate::core::TaskStatus::Failed { .. }
+            );
+            if !terminal {
+                continue;
+            }
+            task::Entity::delete_by_id(stale_task.id).exec(&txn).await?;
+        }
         txn.commit().await?;
 
         self.set(

@@ -230,6 +230,35 @@ impl Default for ObservabilityConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentMode {
+    #[default]
+    TrustedLocal,
+    InternetFacing,
+}
+
+impl DeploymentMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TrustedLocal => "trusted_local",
+            Self::InternetFacing => "internet_facing",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PublicAppsConfig {
+    /// Optional dedicated bind address for the public app listener.
+    /// When unset, trusted-local mode continues to serve apps from the control plane.
+    #[serde(default)]
+    pub bind_addr: Option<String>,
+    /// Optional externally reachable base URL for public apps.
+    /// Example: https://apps.example.com or http://localhost:8992
+    #[serde(default)]
+    pub base_url: Option<String>,
+}
+
 /// Main agent configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -273,6 +302,12 @@ pub struct AgentConfig {
     /// Optional external trace export
     #[serde(default)]
     pub observability: ObservabilityConfig,
+    /// Deployment/security posture for the control plane.
+    #[serde(default)]
+    pub deployment_mode: DeploymentMode,
+    /// Dedicated public-app exposure settings.
+    #[serde(default)]
+    pub public_apps: PublicAppsConfig,
     /// Mem0 memory layer configuration
     #[serde(default)]
     pub mem0: Mem0Config,
@@ -310,6 +345,8 @@ impl Default for AgentConfig {
             browser: BrowserConfig::default(),
             tunnel: TunnelConfig::default(),
             observability: ObservabilityConfig::default(),
+            deployment_mode: DeploymentMode::default(),
+            public_apps: PublicAppsConfig::default(),
             mem0: Mem0Config::default(),
             mcp: McpConfig::default(),
             tls_cert_path: None,

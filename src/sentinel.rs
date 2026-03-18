@@ -23,7 +23,7 @@ use crate::core::{Agent, TaskStatus};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 
 type SharedAgent = Arc<RwLock<Agent>>;
 
@@ -32,6 +32,31 @@ const MAINTENANCE_MAX_DEFERS: u32 = 3;
 const PULSE_DEFER_MINUTES: i64 = 5;
 const PULSE_MAX_DEFERS: u32 = 3;
 static PULSE_RUNNING: AtomicBool = AtomicBool::new(false);
+static SCHEDULED_TASK_PERMITS: Lazy<Arc<Semaphore>> = Lazy::new(|| {
+    Arc::new(Semaphore::new(
+        std::env::var("AGENTARK_TASK_WORKER_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(4),
+    ))
+});
+static WATCHER_TRIGGER_PERMITS: Lazy<Arc<Semaphore>> = Lazy::new(|| {
+    Arc::new(Semaphore::new(
+        std::env::var("AGENTARK_WATCHER_TRIGGER_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(4),
+    ))
+});
+static WATCHER_POLL_TIMEOUT_SECS: Lazy<u64> = Lazy::new(|| {
+    std::env::var("AGENTARK_WATCHER_POLL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(30)
+});
 
 struct PulseRunGuard;
 
@@ -193,6 +218,7 @@ pub struct HealthCheck {
 pub enum DoctorRemediationSpec {
     TunnelStartVerify,
     TunnelRestartVerify,
+    AppRestart { app_id: String },
     ShellCommand { command: String },
 }
 
@@ -215,13 +241,15 @@ fn default_user_actionable_true() -> bool {
     true
 }
 
-const PULSE_LOG_KEY: &str = "arkpulse_log";
+pub const PULSE_LOG_KEY: &str = "arkpulse_log";
 const MAX_PULSE_EVENTS: usize = 100;
 const MAX_PULSE_EVENT_AGE_DAYS: i64 = 30;
 const ARKPULSE_LAST_RUN_AT_KEY: &str = "arkpulse_last_run_at";
 const ARKPULSE_CRITICAL_LAST_SIG_KEY: &str = "arkpulse_critical_last_sig_v1";
 const ARKPULSE_CRITICAL_LAST_SENT_KEY: &str = "arkpulse_critical_last_sent_v1";
 const ARKPULSE_CRITICAL_NOTIFY_COOLDOWN_SECS: i64 = 24 * 3600;
+pub const SENTINEL_SCHEDULER_HEARTBEAT_KEY: &str = "sentinel_scheduler_heartbeat_v1";
+pub const SENTINEL_WATCHER_HEARTBEAT_KEY: &str = "sentinel_watcher_heartbeat_v1";
 
 fn normalize_arkpulse_alert_signature(text: &str) -> String {
     let mut out = String::with_capacity(text.len().min(240));
@@ -299,29 +327,72 @@ fn control_plane_bases() -> (String, String) {
     )
 }
 
+fn websocket_base_from_http_base(http_base: &str) -> String {
+    if let Some(rest) = http_base.strip_prefix("https://") {
+        format!("wss://{}", rest)
+    } else if let Some(rest) = http_base.strip_prefix("http://") {
+        format!("ws://{}", rest)
+    } else {
+        http_base.to_string()
+    }
+}
+
+fn default_http_base_for_bind_addr(bind_addr: &str) -> Option<String> {
+    let trimmed = bind_addr.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized = if trimmed.starts_with("0.0.0.0:") {
+        trimmed.replacen("0.0.0.0", "127.0.0.1", 1)
+    } else if trimmed == "0.0.0.0" {
+        "127.0.0.1".to_string()
+    } else if trimmed.starts_with("[::]:") {
+        trimmed.replacen("[::]", "127.0.0.1", 1)
+    } else if trimmed == "[::]" || trimmed == "::" {
+        "127.0.0.1".to_string()
+    } else {
+        trimmed.to_string()
+    };
+    Some(format!("http://{}", normalized.trim_end_matches('/')))
+}
+
+fn public_base_url_is_local(base_url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(base_url) else {
+        return false;
+    };
+    matches!(
+        parsed
+            .host_str()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "localhost" | "127.0.0.1" | "::1"
+    )
+}
+
 /// Append a pulse event to the persistent log (capped at MAX_PULSE_EVENTS)
 async fn log_pulse_event(agent: &Agent, event: PulseEvent) {
-    let mut events: Vec<PulseEvent> = match agent.storage.get(PULSE_LOG_KEY).await {
+    let mut events: Vec<PulseEvent> = match agent.storage.get_encrypted(PULSE_LOG_KEY).await {
         Ok(Some(data)) => serde_json::from_slice(&data).unwrap_or_default(),
         _ => Vec::new(),
     };
     events.push(event);
     events = prune_pulse_events(events);
     if let Ok(json) = serde_json::to_vec(&events) {
-        let _ = agent.storage.set(PULSE_LOG_KEY, &json).await;
+        let _ = agent.storage.set_encrypted(PULSE_LOG_KEY, &json).await;
     }
 }
 
 /// Get the ArkPulse log from storage
 pub async fn get_pulse_log(agent: &Agent) -> Vec<PulseEvent> {
-    let raw: Vec<PulseEvent> = match agent.storage.get(PULSE_LOG_KEY).await {
+    let raw: Vec<PulseEvent> = match agent.storage.get_encrypted(PULSE_LOG_KEY).await {
         Ok(Some(data)) => serde_json::from_slice(&data).unwrap_or_default(),
         _ => Vec::new(),
     };
     let pruned = prune_pulse_events(raw.clone());
     if pruned.len() != raw.len() {
         if let Ok(json) = serde_json::to_vec(&pruned) {
-            let _ = agent.storage.set(PULSE_LOG_KEY, &json).await;
+            let _ = agent.storage.set_encrypted(PULSE_LOG_KEY, &json).await;
         }
     }
     pruned
@@ -453,6 +524,41 @@ fn parse_access_key(access_url: &str) -> Option<String> {
             None
         }
     })
+}
+
+fn strip_access_key(access_url: &str) -> String {
+    let mut parsed = if access_url.starts_with("http://") || access_url.starts_with("https://") {
+        match url::Url::parse(access_url) {
+            Ok(url) => url,
+            Err(_) => return access_url.to_string(),
+        }
+    } else {
+        match url::Url::parse(&format!("http://local{}", access_url)) {
+            Ok(url) => url,
+            Err(_) => return access_url.to_string(),
+        }
+    };
+    let filtered: Vec<(String, String)> = parsed
+        .query_pairs()
+        .filter(|(key, _)| key != "key")
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    if filtered.is_empty() {
+        parsed.set_query(None);
+    } else {
+        let joined = filtered
+            .iter()
+            .map(|(key, value)| format!("{}={}", key, value))
+            .collect::<Vec<_>>()
+            .join("&");
+        parsed.set_query(Some(&joined));
+    }
+    let mut value = parsed.path().to_string();
+    if let Some(query) = parsed.query() {
+        value.push('?');
+        value.push_str(query);
+    }
+    value
 }
 
 fn is_scan_text_file(path: &Path) -> bool {
@@ -866,7 +972,7 @@ async fn run_attack_surface_checks(
     http_client: &reqwest::Client,
     http_base: &str,
     has_deployed_apps: bool,
-    public_base_url: Option<&str>,
+    configured_public_base_url: Option<&str>,
     api_key: Option<&str>,
     findings: &mut Vec<DoctorFinding>,
 ) {
@@ -949,149 +1055,176 @@ async fn run_attack_surface_checks(
         }
     }
 
-    if has_deployed_apps {
-        let public_base = public_base_url
-            .map(|v| v.trim().trim_end_matches('/').to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| {
+    if !has_deployed_apps {
+        return;
+    }
+
+    let mut tunnel_status_req = http_client.get(format!("{}/tunnel/status", http_base));
+    if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
+        tunnel_status_req = tunnel_status_req.bearer_auth(key);
+    }
+
+    let mut tunnel_active = false;
+    let mut tunnel_url: Option<String> = None;
+    let mut tunnel_url_present = false;
+    match tunnel_status_req.send().await {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(payload) = resp.json::<serde_json::Value>().await {
+                tunnel_active = payload
+                    .get("active")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                tunnel_url = payload
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.trim_end_matches('/').to_string());
+                tunnel_url_present = tunnel_url.is_some();
+            }
+        }
+        Ok(resp) => {
+            push_finding!(
+                findings,
+                "medium",
+                "attack_surface",
+                "/tunnel/status",
+                "Tunnel status probe failed",
+                format!("Authenticated status probe returned {}", resp.status()),
+                "ArkPulse could not verify managed tunnel state from control plane.",
+                "Verify API auth and tunnel control endpoints".to_string(),
+            );
+        }
+        Err(e) => {
+            push_finding!(
+                findings,
+                "medium",
+                "attack_surface",
+                "/tunnel/status",
+                "Tunnel status probe request failed",
+                e.to_string(),
+                "ArkPulse could not verify tunnel process state.",
+                "Check local control plane reachability".to_string(),
+            );
+        }
+    }
+
+    let explicit_public_base = configured_public_base_url
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .filter(|value| !public_base_url_is_local(value));
+    let managed_tunnel_base = tunnel_url.clone();
+    let uses_managed_tunnel = explicit_public_base.is_none() && managed_tunnel_base.is_some();
+    let public_probe_base = explicit_public_base
+        .clone()
+        .or_else(|| managed_tunnel_base.clone());
+
+    let Some(public_base) = public_probe_base else {
+        return;
+    };
+
+    let public_health_url = format!("{}/health", public_base);
+    match http_client.get(&public_health_url).send().await {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) => {
+            if uses_managed_tunnel {
                 push_finding!(
                     findings,
                     "high",
                     "attack_surface",
-                    "public_base_url",
-                    "Public tunnel URL missing for deployed apps",
-                    "No active public tunnel base URL found while apps are deployed".to_string(),
-                    "Apps are not publicly reachable through the managed Cloudflare tunnel.",
-                    "Start tunnel and verify /tunnel/status returns active + URL".to_string(),
-                    DoctorRemediationSpec::TunnelStartVerify,
+                    public_health_url.clone(),
+                    "Public tunnel health probe failed",
+                    format!("GET {} returned {}", public_health_url, resp.status()),
+                    "Tunnel endpoint is reachable but unhealthy for public traffic.",
+                    "Restart tunnel and inspect cloudflared logs".to_string(),
+                    DoctorRemediationSpec::TunnelRestartVerify,
                 );
-                String::new()
-            });
-        if !public_base.is_empty() {
-            let public_health_url = format!("{}/health", public_base);
-            match http_client.get(&public_health_url).send().await {
-                Ok(resp) if resp.status().is_success() => {}
-                Ok(resp) => {
-                    push_finding!(
-                        findings,
-                        "high",
-                        "attack_surface",
-                        public_health_url.clone(),
-                        "Public tunnel health probe failed",
-                        format!("GET {} returned {}", public_health_url, resp.status()),
-                        "Tunnel endpoint is reachable but unhealthy for public traffic.",
-                        "Restart tunnel and inspect cloudflared logs".to_string(),
-                        DoctorRemediationSpec::TunnelRestartVerify,
-                    );
-                }
-                Err(e) => {
-                    push_finding!(
-                        findings,
-                        "high",
-                        "attack_surface",
-                        public_health_url.clone(),
-                        "Public tunnel unreachable",
-                        e.to_string(),
-                        "Cannot reach service through the configured public tunnel URL.",
-                        "Restart tunnel and verify DNS/TLS connectivity".to_string(),
-                        DoctorRemediationSpec::TunnelRestartVerify,
-                    );
-                }
-            }
-        }
-
-        let mut tunnel_status_req = http_client.get(format!("{}/tunnel/status", http_base));
-        if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
-            tunnel_status_req = tunnel_status_req.bearer_auth(key);
-        }
-        match tunnel_status_req.send().await {
-            Ok(resp) if resp.status().is_success() => {
-                if let Ok(payload) = resp.json::<serde_json::Value>().await {
-                    let active = payload
-                        .get("active")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    let url_present = payload
-                        .get("url")
-                        .and_then(|v| v.as_str())
-                        .map(|v| !v.trim().is_empty())
-                        .unwrap_or(false);
-                    if !active || !url_present {
-                        push_finding!(
-                            findings,
-                            "high",
-                            "attack_surface",
-                            "/tunnel/status",
-                            "Tunnel status degraded while apps are deployed",
-                            format!(
-                                "active={}, url_present={}",
-                                active,
-                                url_present
-                            ),
-                            "Managed tunnel should stay active while deployed apps need public access.",
-                            "Restart the tunnel and confirm URL discovery".to_string(),
-                            DoctorRemediationSpec::TunnelRestartVerify,
-                        );
-                    }
-                }
-            }
-            Ok(resp) => {
+            } else {
                 push_finding!(
                     findings,
-                    "medium",
+                    "high",
                     "attack_surface",
-                    "/tunnel/status",
-                    "Tunnel status probe failed",
-                    format!("Authenticated status probe returned {}", resp.status()),
-                    "ArkPulse could not verify managed tunnel state from control plane.",
-                    "Verify API auth and tunnel control endpoints".to_string(),
+                    public_health_url.clone(),
+                    "Public app endpoint health probe failed",
+                    format!("GET {} returned {}", public_health_url, resp.status()),
+                    "Configured public app endpoint is reachable but unhealthy.",
+                    "Verify public_apps.base_url and the upstream reverse proxy".to_string(),
                 );
             }
-            Err(e) => {
+        }
+        Err(e) => {
+            if uses_managed_tunnel {
                 push_finding!(
                     findings,
-                    "medium",
+                    "high",
                     "attack_surface",
-                    "/tunnel/status",
-                    "Tunnel status probe request failed",
+                    public_health_url.clone(),
+                    "Public tunnel unreachable",
                     e.to_string(),
-                    "ArkPulse could not verify tunnel process state.",
-                    "Check local control plane reachability".to_string(),
+                    "Cannot reach service through the currently active public tunnel URL.",
+                    "Restart tunnel and verify DNS/TLS connectivity".to_string(),
+                    DoctorRemediationSpec::TunnelRestartVerify,
+                );
+            } else {
+                push_finding!(
+                    findings,
+                    "high",
+                    "attack_surface",
+                    public_health_url.clone(),
+                    "Configured public app endpoint unreachable",
+                    e.to_string(),
+                    "Configured public app base URL is unreachable from the control plane.",
+                    "Verify public_apps.base_url and external proxy/DNS reachability".to_string(),
                 );
             }
         }
+    }
 
-        if !public_base.is_empty() {
-            let tunnel_apps_probe = format!("{}/api/apps", public_base);
-            match http_client.get(&tunnel_apps_probe).send().await {
-                Ok(resp) => {
-                    let code = resp.status().as_u16();
-                    if code != 401 && code != 403 {
-                        push_finding!(
-                            findings,
-                            "critical",
-                            "attack_surface",
-                            tunnel_apps_probe,
-                            "Public tunnel exposed protected app inventory endpoint",
-                            format!("GET /api/apps over tunnel returned {}", code),
-                            "Sensitive management endpoint is reachable from public tunnel without auth.",
-                            "Require auth middleware for tunneled management routes".to_string(),
-                        );
-                    }
-                }
-                Err(e) => {
-                    push_finding!(
-                        findings,
-                        "low",
-                        "attack_surface",
-                        "/api/apps",
-                        "Public tunnel app-inventory auth probe failed",
-                        e.to_string(),
-                        "Could not verify auth enforcement of /api/apps over public tunnel.",
-                        "Retry when tunnel stabilizes".to_string(),
-                    );
-                }
+    if uses_managed_tunnel && (!tunnel_active || !tunnel_url_present) {
+        push_finding!(
+            findings,
+            "high",
+            "attack_surface",
+            "/tunnel/status",
+            "Tunnel status degraded while apps are deployed",
+            format!(
+                "active={}, url_present={}",
+                tunnel_active, tunnel_url_present
+            ),
+            "Managed tunnel should stay active while public app access is in use.",
+            "Restart the tunnel and confirm URL discovery".to_string(),
+            DoctorRemediationSpec::TunnelRestartVerify,
+        );
+    }
+
+    let public_apps_probe = format!("{}/api/apps", public_base);
+    match http_client.get(&public_apps_probe).send().await {
+        Ok(resp) => {
+            let code = resp.status().as_u16();
+            if code != 401 && code != 403 {
+                push_finding!(
+                    findings,
+                    "critical",
+                    "attack_surface",
+                    public_apps_probe,
+                    "Public app surface exposed protected inventory endpoint",
+                    format!("GET /api/apps over public surface returned {}", code),
+                    "Sensitive management endpoint is reachable from the public app surface without auth.",
+                    "Require auth middleware for publicly reachable management routes".to_string(),
+                );
             }
+        }
+        Err(e) => {
+            push_finding!(
+                findings,
+                "low",
+                "attack_surface",
+                "/api/apps",
+                "Public app-inventory auth probe failed",
+                e.to_string(),
+                "Could not verify auth enforcement of /api/apps over the public app surface.",
+                "Retry when the public app surface is stable".to_string(),
+            );
         }
     }
 }
@@ -1167,8 +1300,13 @@ async fn run_runtime_hardening_checks(
             continue;
         };
         for payload in traversal_payloads {
-            let traversal_url = format!("{}/apps/{}/{}?key={}", http_base, app.id, payload, key);
-            if let Ok(resp) = http_client.get(&traversal_url).send().await {
+            let traversal_url = format!("{}/apps/{}/{}", http_base, app.id, payload);
+            if let Ok(resp) = http_client
+                .get(&traversal_url)
+                .header("x-agentark-app-key", key.clone())
+                .send()
+                .await
+            {
                 let status = resp.status();
                 if status.is_success() {
                     let body = resp.text().await.unwrap_or_default();
@@ -1628,10 +1766,17 @@ async fn run_app_health_checks(
     http_client: &reqwest::Client,
     http_base: &str,
     ws_base: &str,
+    app_probe_base_url: Option<&str>,
     app_endpoints: &[AppEndpoint],
     deployed_apps: &[AppPulseInfo],
     findings: &mut Vec<DoctorFinding>,
 ) {
+    let effective_http_base = app_probe_base_url
+        .unwrap_or(http_base)
+        .trim_end_matches('/');
+    let effective_ws_base = app_probe_base_url
+        .map(websocket_base_from_http_base)
+        .unwrap_or_else(|| ws_base.to_string());
     let app_state: HashMap<String, &AppPulseInfo> =
         deployed_apps.iter().map(|a| (a.id.clone(), a)).collect();
 
@@ -1647,14 +1792,22 @@ async fn run_app_health_checks(
                     format!("{} ({}) is not running", app.title, app.id),
                     "Runtime process exited or crashed.",
                     format!("POST /api/apps/{}/restart", app.id),
+                    DoctorRemediationSpec::AppRestart {
+                        app_id: app.id.clone(),
+                    },
                 );
             }
         }
 
-        let root_url = format!("{}{}", http_base, app.access_url);
+        let access_key = parse_access_key(&app.access_url);
+        let sanitized_access_url = strip_access_key(&app.access_url);
+        let root_url = format!("{}{}", effective_http_base, sanitized_access_url);
         let started = Instant::now();
-        match tokio::time::timeout(Duration::from_secs(5), http_client.get(&root_url).send()).await
-        {
+        let mut root_request = http_client.get(&root_url);
+        if let Some(key) = access_key.as_deref() {
+            root_request = root_request.header("x-agentark-app-key", key);
+        }
+        match tokio::time::timeout(Duration::from_secs(5), root_request.send()).await {
             Ok(Ok(resp)) => {
                 let elapsed_ms = started.elapsed().as_millis();
                 if resp.status().as_u16() >= 500 {
@@ -1667,6 +1820,9 @@ async fn run_app_health_checks(
                         format!("HTTP {} in {} ms", resp.status(), elapsed_ms),
                         "App endpoint returns server-side errors.",
                         format!("POST /api/apps/{}/restart", app.id),
+                        DoctorRemediationSpec::AppRestart {
+                            app_id: app.id.clone(),
+                        },
                     );
                 } else if elapsed_ms > 2500 {
                     push_finding!(
@@ -1691,6 +1847,9 @@ async fn run_app_health_checks(
                     e.to_string(),
                     "App endpoint is unreachable from control plane.",
                     format!("POST /api/apps/{}/restart", app.id),
+                    DoctorRemediationSpec::AppRestart {
+                        app_id: app.id.clone(),
+                    },
                 );
             }
             Err(_) => {
@@ -1703,15 +1862,23 @@ async fn run_app_health_checks(
                     "Timed out after 5s".to_string(),
                     "App endpoint is unresponsive.",
                     format!("POST /api/apps/{}/restart", app.id),
+                    DoctorRemediationSpec::AppRestart {
+                        app_id: app.id.clone(),
+                    },
                 );
             }
         }
 
-        if let Some(key) = parse_access_key(&app.access_url) {
-            let health_url = format!("{}/apps/{}/health?key={}", http_base, app.id, key);
-            if let Ok(Ok(resp)) =
-                tokio::time::timeout(Duration::from_secs(4), http_client.get(&health_url).send())
-                    .await
+        if let Some(key) = access_key {
+            let health_url = format!("{}/apps/{}/health", effective_http_base, app.id);
+            if let Ok(Ok(resp)) = tokio::time::timeout(
+                Duration::from_secs(4),
+                http_client
+                    .get(&health_url)
+                    .header("x-agentark-app-key", key.clone())
+                    .send(),
+            )
+            .await
             {
                 if resp.status().as_u16() >= 500 {
                     push_finding!(
@@ -1723,16 +1890,36 @@ async fn run_app_health_checks(
                         format!("HTTP {}", resp.status()),
                         "Health endpoint reports degraded runtime state.",
                         format!("POST /api/apps/{}/restart", app.id),
+                        DoctorRemediationSpec::AppRestart {
+                            app_id: app.id.clone(),
+                        },
                     );
                 }
             }
 
             if !app.is_static && detect_ws_hint(&app.app_dir) {
-                let ws_url = format!("{}/apps/{}/ws?key={}", ws_base, app.id, key);
-                match tokio::time::timeout(
-                    Duration::from_secs(4),
-                    tokio_tungstenite::connect_async(&ws_url),
-                )
+                let ws_url = format!("{}/apps/{}/ws", effective_ws_base, app.id);
+                let ws_request = match tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
+                    ws_url.clone(),
+                ) {
+                    Ok(mut request) => {
+                        if let Ok(value) =
+                            axum::http::HeaderValue::from_str(&key)
+                        {
+                            request
+                                .headers_mut()
+                                .insert("x-agentark-app-key", value);
+                        }
+                        Some(request)
+                    }
+                    Err(_) => None,
+                };
+                match tokio::time::timeout(Duration::from_secs(4), async {
+                    match ws_request {
+                        Some(request) => tokio_tungstenite::connect_async(request).await,
+                        None => tokio_tungstenite::connect_async(&ws_url).await,
+                    }
+                })
                 .await
                 {
                     Ok(Ok((mut stream, _))) => {
@@ -1782,22 +1969,29 @@ async fn run_doctor_checks(
     let app_endpoints = parse_app_endpoints(&app_rows, &data_dir);
     let (http_base, ws_base) = control_plane_bases();
     let has_deployed_apps = !deployed_apps.is_empty();
-    let public_base_url = agent
-        .storage
-        .get("public_base_url")
-        .await
-        .ok()
-        .flatten()
-        .and_then(|raw| String::from_utf8(raw).ok())
-        .map(|s| s.trim().trim_end_matches('/').to_string())
-        .filter(|s| !s.is_empty());
+    let configured_public_base_url = agent
+        .config
+        .public_apps
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|configured| configured.trim_end_matches('/').to_string());
+    let app_probe_base_url = configured_public_base_url.clone().or_else(|| {
+        agent
+            .config
+            .public_apps
+            .bind_addr
+            .as_deref()
+            .and_then(default_http_base_for_bind_addr)
+    });
     let api_key = agent.api_key.as_deref();
 
     run_attack_surface_checks(
         http_client,
         &http_base,
         has_deployed_apps,
-        public_base_url.as_deref(),
+        configured_public_base_url.as_deref(),
         api_key,
         &mut findings,
     )
@@ -1821,6 +2015,7 @@ async fn run_doctor_checks(
         http_client,
         &http_base,
         &ws_base,
+        app_probe_base_url.as_deref(),
         &app_endpoints,
         deployed_apps,
         &mut findings,
@@ -1913,6 +2108,7 @@ pub fn start(
                 if !tick_or_shutdown(&mut interval, &mut shutdown).await {
                     break;
                 }
+                record_loop_heartbeat(&agent, SENTINEL_SCHEDULER_HEARTBEAT_KEY).await;
                 if is_agent_autonomy_paused(&agent).await {
                     continue;
                 }
@@ -1932,6 +2128,7 @@ pub fn start(
                 if !tick_or_shutdown(&mut interval, &mut shutdown).await {
                     break;
                 }
+                record_loop_heartbeat(&agent, SENTINEL_WATCHER_HEARTBEAT_KEY).await;
                 if is_agent_autonomy_paused(&agent).await {
                     continue;
                 }
@@ -2257,9 +2454,12 @@ async fn run_scheduler(agent: &SharedAgent) {
             task.action
         );
         let agent = Arc::clone(agent);
+        let permits = Arc::clone(&SCHEDULED_TASK_PERMITS);
         tokio::spawn(async move {
-            let agent_guard = agent.read().await;
-            agent_guard.execute_task_supervised(task).await;
+            let Ok(_permit) = permits.acquire_owned().await else {
+                return;
+            };
+            crate::core::Agent::execute_task_supervised_shared(&agent, task).await;
         });
     }
 }
@@ -2267,6 +2467,14 @@ async fn run_scheduler(agent: &SharedAgent) {
 // ═══════════════════════════════════════════════════════════════════════════
 // Watcher Poller — check conditions and fire triggers
 // ═══════════════════════════════════════════════════════════════════════════
+
+async fn record_loop_heartbeat(agent: &SharedAgent, key: &str) {
+    let storage = { agent.read().await.storage.clone() };
+    let now = chrono::Utc::now().to_rfc3339();
+    if let Err(error) = storage.set(key, now.as_bytes()).await {
+        tracing::debug!("Failed to persist sentinel heartbeat '{}': {}", key, error);
+    }
+}
 
 async fn persist_watcher_notification_attempt(
     agent: &crate::core::Agent,
@@ -2351,6 +2559,9 @@ async fn run_watchers(agent: &SharedAgent) {
                 .await;
             }
         }
+        agent
+            .sync_watcher_supervisor_state(w, Some("timed_out"), None)
+            .await;
     }
 
     // Poll due watchers
@@ -2362,10 +2573,20 @@ async fn run_watchers(agent: &SharedAgent) {
     for watcher in due_watchers {
         let poll_result = {
             let agent = agent.read().await;
-            agent
-                .runtime
-                .execute_action(&watcher.poll_action, &watcher.poll_arguments)
-                .await
+            match tokio::time::timeout(
+                Duration::from_secs(*WATCHER_POLL_TIMEOUT_SECS),
+                agent
+                    .runtime
+                    .execute_action(&watcher.poll_action, &watcher.poll_arguments),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!(
+                    "Watcher poll timed out after {} seconds",
+                    *WATCHER_POLL_TIMEOUT_SECS
+                )),
+            }
         };
 
         let new_count = watcher.poll_count + 1;
@@ -2410,7 +2631,11 @@ async fn run_watchers(agent: &SharedAgent) {
                     }
 
                     let agent = Arc::clone(agent);
+                    let permits = Arc::clone(&WATCHER_TRIGGER_PERMITS);
                     tokio::spawn(async move {
+                        let Ok(_permit) = permits.acquire_owned().await else {
+                            return;
+                        };
                         let agent_guard = agent.read().await;
                         agent_guard
                             .handle_watcher_trigger_supervised(watcher, result)
@@ -2462,8 +2687,19 @@ async fn run_consolidation(agent: &SharedAgent) {
 
 async fn run_approval_expiry(agent: &SharedAgent) {
     let agent = agent.read().await;
-    if let Err(e) = agent.storage.expire_old_approvals(3600).await {
+    const APPROVAL_EXPIRY_SECS: i64 = 7 * 24 * 60 * 60;
+    if let Err(e) = agent
+        .storage
+        .expire_old_approvals(APPROVAL_EXPIRY_SECS)
+        .await
+    {
         tracing::debug!("ArkSentinel: approval expiry check: {}", e);
+    }
+    if let Err(e) = agent
+        .expire_stale_approval_tasks(APPROVAL_EXPIRY_SECS)
+        .await
+    {
+        tracing::debug!("ArkSentinel: stale approval task expiry check: {}", e);
     }
     agent.safety.clear_expired_approvals();
 }

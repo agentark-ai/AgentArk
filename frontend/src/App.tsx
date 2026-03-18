@@ -45,13 +45,14 @@ import { api } from "./api/client";
 import { GuidedTour } from "./components/GuidedTour";
 import { NativeWorkspace } from "./components/NativeWorkspace";
 import { OverviewPane } from "./components/OverviewPane";
+import { ApprovalPromptOverlay } from "./components/ApprovalPromptOverlay";
 import { useUiStore } from "./store/uiStore";
+import type { Task } from "./types";
 
 const REFRESH_MS = 8000;
 const PING_STALE_MS = 30_000;
+const APPROVAL_FALLBACK_POLL_MS = 2500;
 const SIDEBAR_COLLAPSED_KEY = "agentark.sidebar.collapsed";
-const NOTIFICATIONS_MUTE_UNTIL_KEY = "agentark.notifications.mute_until_v1";
-
 type ViewKey =
   | "overview"
   | "chat"
@@ -73,6 +74,11 @@ type ViewKey =
 
 type NavItem = { key: ViewKey; label: string; icon: ReactNode };
 type NavGroup = { id: string; label: string; items: NavItem[] };
+type NotificationStreamPayload = {
+  kind?: string;
+  source?: string;
+  title?: string;
+};
 
 const NAV_GROUPS: NavGroup[] = [
   {
@@ -196,6 +202,12 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
 }
 
+function pickTasks(value: unknown): Task[] {
+  if (Array.isArray(value)) return value as Task[];
+  const record = asRecord(value);
+  return Array.isArray(record.tasks) ? (record.tasks as Task[]) : [];
+}
+
 function notifTimeAgo(raw?: string | null): { label: string; tip: string } {
   if (!raw) return { label: "", tip: "" };
   const dt = new Date(raw);
@@ -268,6 +280,18 @@ function shouldSurfaceNotification(notification: {
   );
 }
 
+function notificationEventAffectsApprovals(payload: NotificationStreamPayload): boolean {
+  const kind = (payload.kind || "").toLowerCase();
+  const source = (payload.source || "").toLowerCase();
+  const title = (payload.title || "").toLowerCase();
+  return (
+    kind.includes("resync") ||
+    source.includes("approval") ||
+    source.includes("task") ||
+    title.includes("approval")
+  );
+}
+
 export default function App() {
   const queryClient = useQueryClient();
   const autoRefresh = useUiStore((s) => s.autoRefresh);
@@ -305,17 +329,9 @@ export default function App() {
   const [notifAnchorEl, setNotifAnchorEl] = useState<HTMLElement | null>(null);
   const notifListOpen = Boolean(notifAnchorEl);
   const [notifFilter, setNotifFilter] = useState<"all" | "unread" | "errors" | "automation_failures">("all");
-  const [notificationControlNotice, setNotificationControlNotice] = useState<string | null>(null);
-  const [notificationsMuteUntilMs, setNotificationsMuteUntilMs] = useState<number>(() => {
-    try {
-      const raw = window.localStorage.getItem(NOTIFICATIONS_MUTE_UNTIL_KEY);
-      const parsed = raw ? Number(raw) : Number.NaN;
-      return Number.isFinite(parsed) ? parsed : 0;
-    } catch {
-      return 0;
-    }
-  });
-
+  const [notificationsStreamConnected, setNotificationsStreamConnected] = useState(false);
+  const [approvalBusyTaskId, setApprovalBusyTaskId] = useState<string | null>(null);
+  const [approvalPopupError, setApprovalPopupError] = useState<string | null>(null);
   const navigateToView = (nextView: ViewKey, replace = false) => {
     const nextPath = viewPath(nextView);
     if (window.location.pathname !== nextPath) {
@@ -383,16 +399,22 @@ export default function App() {
     refetchInterval: autoRefresh ? REFRESH_MS : false,
     retry: 0
   });
+  const approvalTasksQ = useQuery({
+    queryKey: ["approval-popup-tasks"],
+    queryFn: () => api.rawGet("/tasks?limit=200"),
+    refetchInterval: notificationsStreamConnected ? false : APPROVAL_FALLBACK_POLL_MS,
+    refetchIntervalInBackground: !notificationsStreamConnected
+  });
 
   const notificationsQ = useQuery({
     queryKey: ["notifications"],
     queryFn: api.getNotifications,
-    refetchInterval: autoRefresh ? REFRESH_MS : false
+    refetchInterval: autoRefresh && !notificationsStreamConnected ? REFRESH_MS : false
   });
   const notificationsCountQ = useQuery({
     queryKey: ["notifications-count"],
     queryFn: () => api.rawGet("/notifications/count"),
-    refetchInterval: autoRefresh ? REFRESH_MS : false
+    refetchInterval: autoRefresh && !notificationsStreamConnected ? REFRESH_MS : false
   });
   const notifications = Array.isArray(notificationsQ.data) ? notificationsQ.data : [];
   const visibleNotifications = useMemo(
@@ -424,7 +446,70 @@ export default function App() {
     }
     return visibleNotifications.filter((n) => isAutomationFailureNotification(n));
   }, [visibleNotifications, notifFilter]);
-  const notificationsMuted = notificationsMuteUntilMs > Date.now();
+  const approvalTasks = useMemo(() => pickTasks(approvalTasksQ.data), [approvalTasksQ.data]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+
+    const invalidateNotificationViews = (includeApprovalTasks: boolean) => {
+      void queryClient.invalidateQueries({ queryKey: ["notifications"] });
+      void queryClient.invalidateQueries({ queryKey: ["notifications-count"] });
+      void queryClient.invalidateQueries({ queryKey: ["autonomy-unread-notifications"] });
+      if (includeApprovalTasks) {
+        void queryClient.invalidateQueries({ queryKey: ["approval-popup-tasks"] });
+        void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+        void queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
+      }
+    };
+
+    const stream = new EventSource("/notifications/stream", { withCredentials: true });
+
+    const handleConnected = () => {
+      setNotificationsStreamConnected(true);
+      invalidateNotificationViews(true);
+    };
+
+    const handleNotification = (event: Event) => {
+      setNotificationsStreamConnected(true);
+      let payload: NotificationStreamPayload = {};
+      const raw = (event as MessageEvent<string>).data;
+      if (typeof raw === "string" && raw.trim()) {
+        try {
+          payload = JSON.parse(raw) as NotificationStreamPayload;
+        } catch {
+          payload = {};
+        }
+      }
+      invalidateNotificationViews(notificationEventAffectsApprovals(payload));
+    };
+
+    const handleResync = () => {
+      setNotificationsStreamConnected(true);
+      invalidateNotificationViews(true);
+    };
+
+    const handleClosed = () => {
+      setNotificationsStreamConnected(false);
+    };
+
+    stream.onopen = handleConnected;
+    stream.onerror = () => {
+      setNotificationsStreamConnected(false);
+    };
+    stream.addEventListener("connected", handleConnected);
+    stream.addEventListener("notification", handleNotification);
+    stream.addEventListener("resync", handleResync);
+    stream.addEventListener("closed", handleClosed);
+
+    return () => {
+      stream.close();
+      stream.removeEventListener("connected", handleConnected);
+      stream.removeEventListener("notification", handleNotification);
+      stream.removeEventListener("resync", handleResync);
+      stream.removeEventListener("closed", handleClosed);
+    };
+  }, [queryClient]);
+
   let selectedNotification: (typeof visibleNotifications)[number] | null = null;
   for (const n of visibleNotifications) {
     if (n.id === selectedNotificationId) {
@@ -432,27 +517,6 @@ export default function App() {
       break;
     }
   }
-
-  useEffect(() => {
-    try {
-      if (notificationsMuteUntilMs > Date.now()) {
-        window.localStorage.setItem(
-          NOTIFICATIONS_MUTE_UNTIL_KEY,
-          String(notificationsMuteUntilMs)
-        );
-      } else {
-        window.localStorage.removeItem(NOTIFICATIONS_MUTE_UNTIL_KEY);
-      }
-    } catch {
-      // ignore storage failures
-    }
-  }, [notificationsMuteUntilMs]);
-
-  useEffect(() => {
-    if (!notificationControlNotice) return;
-    const t = window.setTimeout(() => setNotificationControlNotice(null), 3500);
-    return () => window.clearTimeout(t);
-  }, [notificationControlNotice]);
 
   const now = Date.now();
   const lastPingAt = serverQ.data?.at ?? 0;
@@ -518,34 +582,35 @@ export default function App() {
     }
   });
 
-  const notificationControlMutation = useMutation({
-    mutationFn: async (command: "stop notifications" | "resume notifications") => {
-      const out = await api.chat({ message: command, channel: "web" });
-      const rec = out as unknown as Record<string, unknown>;
-      const text =
-        (typeof rec.response === "string" ? rec.response : "") ||
-        (typeof rec.message === "string" ? rec.message : "");
-      return { text: text.trim(), command };
+  const approvalDecisionMutation = useMutation({
+    mutationFn: async (payload: { id: string; decision: "approve" | "reject" }) => {
+      if (payload.decision === "approve") return api.approveTask(payload.id);
+      return api.rejectTask(payload.id);
     },
-    onSuccess: async ({ text, command }) => {
-      if (command === "stop notifications") {
-        setNotificationsMuteUntilMs(Date.now() + 24 * 60 * 60 * 1000);
-      } else {
-        setNotificationsMuteUntilMs(0);
-      }
-      setNotificationControlNotice(
-        text || (command === "stop notifications" ? "Alerts paused for 24h." : "Alerts resumed.")
-      );
+    onSuccess: async () => {
+      setApprovalPopupError(null);
+      await queryClient.invalidateQueries({ queryKey: ["approval-popup-tasks"] });
+      await queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      await queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
+      await queryClient.invalidateQueries({ queryKey: ["briefing"] });
+      await queryClient.invalidateQueries({ queryKey: ["autonomy-briefing"] });
       await queryClient.invalidateQueries({ queryKey: ["notifications"] });
       await queryClient.invalidateQueries({ queryKey: ["notifications-count"] });
       await queryClient.invalidateQueries({ queryKey: ["autonomy-unread-notifications"] });
     },
-    onError: (err) => {
-      setNotificationControlNotice(
-        `Alert setting failed: ${err instanceof Error ? err.message : "unknown error"}`
-      );
+    onError: (error) => {
+      setApprovalPopupError(error instanceof Error ? error.message : "Failed to update approval.");
+    },
+    onSettled: () => {
+      setApprovalBusyTaskId(null);
     }
   });
+
+  const handleApprovalDecision = (id: string, decision: "approve" | "reject") => {
+    setApprovalPopupError(null);
+    setApprovalBusyTaskId(id);
+    approvalDecisionMutation.mutate({ id, decision });
+  };
 
   const openSettingsView = (route: "settings" | "arkpulse", initialTab: number | null = null) => {
     setSettingsInitialTab(initialTab);
@@ -561,134 +626,169 @@ export default function App() {
   const settingsModalOpen = view === "settings";
   const activeView: ViewKey = settingsModalOpen ? lastNonSettingsView : view;
   const workspaceView = activeView as Exclude<ViewKey, "overview" | "settings">;
+  const stageClassName = [
+    "workspace-stage",
+    activeView === "overview"
+      ? "workspace-stage-overview"
+      : activeView === "chat"
+        ? "workspace-stage-chat"
+        : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const mainPaneClassName = `main-pane main-pane-${activeView}`;
 
   return (
-      <Box className="agi-shell">
-        <Box className="bg-orb orb-a" />
-        <Box className="bg-orb orb-b" />
-      <AppBar position="sticky" elevation={0} color="transparent" className="glass-appbar">
-        <Toolbar sx={{ minHeight: "var(--appbar-height)", px: 1.25 }}>
-          <Stack direction="row" alignItems="center" spacing={0.75} sx={{ flexGrow: 1 }}>
-            <img src="/logo.svg" alt="AgentArk" width={42} height={42} />
-            <Typography variant="h6">AgentArk Console</Typography>
-            <Tooltip title={serverTooltip} arrow>
-              <Box
-                onClick={() => serverQ.refetch()}
-                sx={{
-                  width: 10,
-                  height: 10,
-                  borderRadius: "50%",
-                  backgroundColor: serverDotColor,
-                  cursor: "pointer",
-                  ml: 0.5,
-                  boxShadow: serverPulse ? `0 0 6px 2px ${serverDotColor}` : "none",
-                  animation: serverPulse ? "pulse-dot 2s ease-in-out infinite" : "none",
-                  "@keyframes pulse-dot": {
-                    "0%, 100%": { boxShadow: `0 0 4px 1px ${serverDotColor}` },
-                    "50%": { boxShadow: `0 0 8px 3px ${serverDotColor}` },
-                  },
-                }}
-              />
-            </Tooltip>
-          </Stack>
-          <Tooltip title="Notifications">
-            <IconButton
-              color="primary"
-              onClick={(e) => setNotifAnchorEl(e.currentTarget)}
-              aria-label="Open notifications"
-            >
-              <Badge badgeContent={unreadCount} color="warning" max={99}>
-                <NotificationsNoneRoundedIcon />
-              </Badge>
-            </IconButton>
-          </Tooltip>
-          <Tooltip title="Projects">
-            <IconButton color="primary" onClick={() => navigateToView("projects")}>
-              <FolderRoundedIcon />
-            </IconButton>
-          </Tooltip>
-          <Tooltip title="Settings">
-            <IconButton color="primary" onClick={() => openSettingsView("settings")}>
-              <SettingsRoundedIcon />
-            </IconButton>
-          </Tooltip>
-        </Toolbar>
-      </AppBar>
-
-      <Box className={`main-grid${sidebarCollapsed ? " nav-collapsed" : ""}`}>
-        <Box className={`side-nav${sidebarCollapsed ? " collapsed" : ""}`}>
-          <Stack direction="row" alignItems="center" justifyContent={sidebarCollapsed ? "center" : "space-between"} sx={{ px: 0.5, mb: 1 }}>
-            {!sidebarCollapsed ? (
-              <Typography variant="caption" className="nav-label">
-                Navigation
-              </Typography>
-            ) : null}
-            <Tooltip title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}>
-              <IconButton
-                size="small"
-                className="nav-collapse-btn"
-                onClick={() => setSidebarCollapsed((prev) => !prev)}
-                aria-label={sidebarCollapsed ? "Expand navigation sidebar" : "Collapse navigation sidebar"}
-              >
-                {sidebarCollapsed ? <ChevronRightRoundedIcon fontSize="small" /> : <ChevronLeftRoundedIcon fontSize="small" />}
-              </IconButton>
-            </Tooltip>
-          </Stack>
-          <List dense>
-            {NAV_GROUPS.map((group, groupIdx) => (
-              <Box key={group.id} className="nav-group">
-                {!sidebarCollapsed ? (
-                  <Typography variant="overline" className="nav-group-label">
-                    {group.label}
-                  </Typography>
-                ) : null}
-                {group.items.map((item) => (
-                  <Tooltip
-                    key={item.key}
-                    title={item.label}
-                    placement="right"
-                    disableHoverListener={!sidebarCollapsed}
-                  >
-                    <ListItemButton
-                      selected={view === item.key}
-                      onClick={() => navigateToView(item.key)}
-                      className={`nav-item${sidebarCollapsed ? " collapsed" : ""}`}
-                      data-tour-target={`nav-${item.key}`}
-                    >
-                      <ListItemIcon className="nav-item-icon">{item.icon}</ListItemIcon>
-                      <ListItemText
-                        className={`nav-item-text${sidebarCollapsed ? " collapsed" : ""}`}
-                        primary={item.label}
-                        primaryTypographyProps={{ noWrap: true }}
-                      />
-                    </ListItemButton>
-                  </Tooltip>
-                ))}
-                {groupIdx < NAV_GROUPS.length - 1 ? (
-                  <Divider className="nav-group-divider" />
-                ) : null}
+    <Box className="agi-shell">
+      <Box className="bg-orb orb-a" />
+      <Box className="bg-orb orb-b" />
+      <Box className="app-frame">
+        <AppBar position="static" elevation={0} color="transparent" className="glass-appbar shell-appbar">
+          <Toolbar className="shell-toolbar" sx={{ minHeight: "var(--appbar-height)", px: 1.5 }}>
+            <Stack direction="row" alignItems="center" spacing={1} sx={{ flexGrow: 1, minWidth: 0 }}>
+              <Box className="shell-brand-mark">
+                <img src="/logo.svg" alt="AgentArk" width={36} height={36} />
               </Box>
-            ))}
-          </List>
-        </Box>
+              <Box sx={{ minWidth: 0 }}>
+                <Typography variant="caption" className="shell-kicker">
+                  AgentArk
+                </Typography>
+                <Typography variant="subtitle1" className="shell-title" noWrap>
+                  Operator Console
+                </Typography>
+              </Box>
+              <Tooltip title={serverTooltip} arrow>
+                <Box
+                  onClick={() => serverQ.refetch()}
+                  sx={{
+                    width: 10,
+                    height: 10,
+                    borderRadius: "50%",
+                    backgroundColor: serverDotColor,
+                    cursor: "pointer",
+                    ml: 0.75,
+                    boxShadow: serverPulse ? `0 0 6px 2px ${serverDotColor}` : "none",
+                    animation: serverPulse ? "pulse-dot 2s ease-in-out infinite" : "none",
+                    "@keyframes pulse-dot": {
+                      "0%, 100%": { boxShadow: `0 0 4px 1px ${serverDotColor}` },
+                      "50%": { boxShadow: `0 0 8px 3px ${serverDotColor}` },
+                    },
+                  }}
+                />
+              </Tooltip>
+            </Stack>
+            <Stack direction="row" spacing={0.5} alignItems="center" className="shell-actions">
+              <Tooltip title="Notifications">
+                <IconButton
+                  color="primary"
+                  onClick={(e) => setNotifAnchorEl(e.currentTarget)}
+                  aria-label="Open notifications"
+                >
+                  <Badge badgeContent={unreadCount} color="warning" max={99}>
+                    <NotificationsNoneRoundedIcon />
+                  </Badge>
+                </IconButton>
+              </Tooltip>
+              <Tooltip title="Projects">
+                <IconButton color="primary" onClick={() => navigateToView("projects")}>
+                  <FolderRoundedIcon />
+                </IconButton>
+              </Tooltip>
+              <Tooltip title="Settings">
+                <IconButton color="primary" onClick={() => openSettingsView("settings")}>
+                  <SettingsRoundedIcon />
+                </IconButton>
+              </Tooltip>
+            </Stack>
+          </Toolbar>
+        </AppBar>
 
-        <Box className="main-pane">
-            {activeView === "overview" ? (
-              <OverviewPane
-                navigateToView={navigateToView as (view: string, replace?: boolean) => void}
-                serverStatus={serverQ.data}
-                serverError={serverQ.isError}
-                serverLoading={serverQ.isLoading && !serverQ.data}
-              />
-            ) : (
-            <NativeWorkspace
-              view={workspaceView}
-              autoRefresh={settingsModalOpen ? false : autoRefresh}
-              showAdvanced={showAdvanced}
-            />
-          )}
+        <Box className={`main-grid${sidebarCollapsed ? " nav-collapsed" : ""}`}>
+          <Box className={`side-nav${sidebarCollapsed ? " collapsed" : ""}`}>
+            <Stack direction="row" alignItems="center" justifyContent={sidebarCollapsed ? "center" : "space-between"} sx={{ px: 0.5, mb: 1 }}>
+              {!sidebarCollapsed ? (
+                <Typography variant="caption" className="nav-label">
+                  Navigate
+                </Typography>
+              ) : null}
+              <Tooltip title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}>
+                <IconButton
+                  size="small"
+                  className="nav-collapse-btn"
+                  onClick={() => setSidebarCollapsed((prev) => !prev)}
+                  aria-label={sidebarCollapsed ? "Expand navigation sidebar" : "Collapse navigation sidebar"}
+                >
+                  {sidebarCollapsed ? <ChevronRightRoundedIcon fontSize="small" /> : <ChevronLeftRoundedIcon fontSize="small" />}
+                </IconButton>
+              </Tooltip>
+            </Stack>
+            <List dense>
+              {NAV_GROUPS.map((group, groupIdx) => (
+                <Box key={group.id} className="nav-group">
+                  {!sidebarCollapsed ? (
+                    <Typography variant="overline" className="nav-group-label">
+                      {group.label}
+                    </Typography>
+                  ) : null}
+                  {group.items.map((item) => (
+                    <Tooltip
+                      key={item.key}
+                      title={item.label}
+                      placement="right"
+                      disableHoverListener={!sidebarCollapsed}
+                    >
+                      <ListItemButton
+                        selected={view === item.key}
+                        onClick={() => navigateToView(item.key)}
+                        className={`nav-item${sidebarCollapsed ? " collapsed" : ""}`}
+                        data-tour-target={`nav-${item.key}`}
+                      >
+                        <ListItemIcon className="nav-item-icon">{item.icon}</ListItemIcon>
+                        <ListItemText
+                          className={`nav-item-text${sidebarCollapsed ? " collapsed" : ""}`}
+                          primary={item.label}
+                          primaryTypographyProps={{ noWrap: true }}
+                        />
+                      </ListItemButton>
+                    </Tooltip>
+                  ))}
+                  {groupIdx < NAV_GROUPS.length - 1 ? (
+                    <Divider className="nav-group-divider" />
+                  ) : null}
+                </Box>
+              ))}
+            </List>
+          </Box>
+
+          <Box className={mainPaneClassName}>
+            <Box className={stageClassName}>
+              {activeView === "overview" ? (
+                <OverviewPane
+                  navigateToView={navigateToView as (view: string, replace?: boolean) => void}
+                  serverStatus={serverQ.data}
+                  serverError={serverQ.isError}
+                  serverLoading={serverQ.isLoading && !serverQ.data}
+                />
+              ) : (
+                <NativeWorkspace
+                  view={workspaceView}
+                  autoRefresh={settingsModalOpen ? false : autoRefresh}
+                  showAdvanced={showAdvanced}
+                />
+              )}
+            </Box>
+          </Box>
         </Box>
       </Box>
+
+      <ApprovalPromptOverlay
+        tasks={approvalTasks}
+        busyTaskId={approvalBusyTaskId}
+        errorMessage={approvalPopupError}
+        onApprove={(id) => handleApprovalDecision(id, "approve")}
+        onReject={(id) => handleApprovalDecision(id, "reject")}
+        onOpenTasks={() => navigateToView("tasks")}
+      />
 
       <Dialog
         open={settingsModalOpen}
@@ -777,33 +877,6 @@ export default function App() {
               Mark all read
             </Button>
           </Stack>
-          <Stack direction="row" spacing={0.75} sx={{ mt: 0.75, flexWrap: "wrap" }} useFlexGap>
-            <Button
-              size="small"
-              variant={notificationsMuted ? "contained" : "outlined"}
-              disabled={notificationControlMutation.isPending}
-              onClick={() => notificationControlMutation.mutate("stop notifications")}
-            >
-              Snooze 24h
-            </Button>
-            <Button
-              size="small"
-              variant={!notificationsMuted ? "contained" : "outlined"}
-              disabled={notificationControlMutation.isPending}
-              onClick={() => notificationControlMutation.mutate("resume notifications")}
-            >
-              Resume
-            </Button>
-          </Stack>
-          {notificationControlNotice ? (
-            <Typography variant="caption" sx={{ display: "block", mt: 0.6, color: "rgba(195, 221, 252, 0.7)" }}>
-              {notificationControlNotice}
-            </Typography>
-          ) : notificationsMuted ? (
-            <Typography variant="caption" sx={{ display: "block", mt: 0.6, color: "rgba(195, 221, 252, 0.7)" }}>
-              Notifications paused until {new Date(notificationsMuteUntilMs).toLocaleString()}
-            </Typography>
-          ) : null}
           <Stack direction="row" spacing={0.75} sx={{ mt: 0.75, flexWrap: "wrap" }} useFlexGap>
             <Button
               size="small"

@@ -5,7 +5,7 @@
 //! are encrypted with AES-256-GCM before storage and decrypted on retrieval.
 //! Non-content fields (timestamps, IDs, metadata) remain in plaintext for querying.
 
-use super::entities::{episode, semantic_fact};
+use super::entities::{approval_log, episode, execution_trace, message, semantic_fact};
 use super::Storage;
 use crate::crypto::KeyManager;
 use anyhow::Result;
@@ -23,6 +23,7 @@ pub struct EncryptedStorage {
 impl EncryptedStorage {
     /// Create a new encrypted storage
     pub fn new(storage: Storage, key_manager: Arc<KeyManager>) -> Self {
+        crate::storage::install_storage_key_manager(key_manager.clone());
         Self {
             storage,
             key_manager: Arc::new(RwLock::new(key_manager)),
@@ -34,6 +35,7 @@ impl EncryptedStorage {
     }
 
     pub fn replace_key_manager(&self, key_manager: Arc<KeyManager>) {
+        crate::storage::install_storage_key_manager(key_manager.clone());
         *self.key_manager.write() = key_manager;
     }
 
@@ -208,6 +210,87 @@ impl EncryptedStorage {
             }
             None => Ok(None),
         }
+    }
+
+    // ==================== Encrypted Messages ====================
+
+    pub async fn insert_message_encrypted(&self, msg: &message::Model) -> Result<()> {
+        self.storage.insert_message(msg).await
+    }
+
+    pub async fn get_messages_decrypted(
+        &self,
+        conversation_id: &str,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<message::Model>> {
+        self.storage
+            .get_messages(conversation_id, limit, offset)
+            .await
+    }
+
+    pub async fn get_recent_messages_decrypted(
+        &self,
+        conversation_id: &str,
+        limit: u64,
+    ) -> Result<Vec<message::Model>> {
+        self.storage
+            .get_recent_messages(conversation_id, limit)
+            .await
+    }
+
+    pub async fn get_recent_user_messages_decrypted(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<message::Model>> {
+        self.storage.get_recent_user_messages(limit).await
+    }
+
+    // ==================== Encrypted Approval Log ====================
+
+    pub async fn upsert_approval_request_encrypted(
+        &self,
+        id: &str,
+        action_name: &str,
+        arguments: &str,
+        rule_name: &str,
+        requested_at: &str,
+    ) -> Result<()> {
+        self.storage
+            .upsert_approval_request(id, action_name, arguments, rule_name, requested_at)
+            .await
+    }
+
+    pub async fn get_approval_log_decrypted(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<approval_log::Model>> {
+        self.storage.get_approval_log(limit, offset).await
+    }
+
+    // ==================== Encrypted Execution Traces ====================
+
+    pub async fn insert_execution_trace_encrypted(
+        &self,
+        trace: &crate::core::ExecutionTrace,
+    ) -> Result<()> {
+        self.storage.insert_execution_trace(trace).await
+    }
+
+    pub async fn list_execution_traces_decrypted(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<execution_trace::Model>> {
+        self.storage.list_execution_traces(limit, offset).await
+    }
+
+    pub async fn get_execution_trace_decrypted(
+        &self,
+        id: &str,
+    ) -> Result<Option<execution_trace::Model>> {
+        self.storage.get_execution_trace(id).await
     }
 }
 

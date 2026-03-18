@@ -37,11 +37,13 @@ export function AgentStatusBar({ serverStatus, serverError, serverLoading, curre
       className="status-bar"
       sx={{
         display: "flex",
-        alignItems: "center",
+        alignItems: { xs: "flex-start", sm: "center" },
         justifyContent: "space-between",
+        flexDirection: { xs: "column", sm: "row" },
+        gap: { xs: 1, sm: 1.5 },
         minHeight: 48,
         px: 2,
-        py: 0.75,
+        py: 1,
       }}
     >
       <Stack direction="row" alignItems="center" spacing={1.25}>
@@ -66,7 +68,7 @@ export function AgentStatusBar({ serverStatus, serverError, serverLoading, curre
       </Stack>
 
       {status ? (
-        <Stack direction="row" spacing={2}>
+        <Stack direction="row" spacing={2} useFlexGap flexWrap="wrap">
           <Typography variant="caption" color="text.secondary">
             {status.memory_entries} memories
           </Typography>

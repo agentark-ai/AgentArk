@@ -4243,6 +4243,30 @@ print(result["text"])
                     .ok_or_else(|| anyhow::anyhow!("Missing url"))?;
                 let parsed_url = self.validate_http_get_url(url).await?;
 
+                // Fast-path: try Lightpanda for external URLs (returns clean markdown)
+                let has_custom_headers = arguments
+                    .get("headers")
+                    .and_then(|v| v.as_object())
+                    .map(|h| !h.is_empty())
+                    .unwrap_or(false);
+                let is_loopback = parsed_url
+                    .host_str()
+                    .map(|h| h == "localhost" || h == "127.0.0.1" || h == "::1")
+                    .unwrap_or(true);
+                if !is_loopback && !has_custom_headers {
+                    match crate::integrations::lightpanda::fetch_markdown(parsed_url.as_str()).await
+                    {
+                        Ok(markdown) => return Ok(markdown),
+                        Err(e) => {
+                            tracing::debug!(
+                                "Lightpanda fast-path skipped for {}: {}",
+                                url,
+                                e
+                            );
+                        }
+                    }
+                }
+
                 let client = reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(HTTP_GET_TIMEOUT_SECS))
                     .redirect(reqwest::redirect::Policy::limited(5))
@@ -7432,6 +7456,25 @@ async fn build_search_config(config_dir: &Path) -> crate::actions::SearchConfig 
                 Some(crate::actions::search::SearchBackend::Playwright { bridge_url });
         } else {
             tracing::debug!("Playwright bridge unavailable, falling back to DuckDuckGo");
+        }
+    }
+
+    // Auto-inject Lightpanda into the search chain if available and not already present.
+    // Lightpanda is fast (~50ms), needs no API key, and should be tried first.
+    {
+        let chain = [
+            config.primary.as_deref(),
+            config.fallback1.as_deref(),
+            config.fallback2.as_deref(),
+        ];
+        let has_lightpanda = chain.iter().any(|v| v == &Some("lightpanda"));
+        if !has_lightpanda {
+            // Shift existing chain down and insert lightpanda as primary
+            let old_primary = config.primary.take();
+            let old_fb1 = config.fallback1.take();
+            config.primary = Some("lightpanda".to_string());
+            config.fallback1 = old_primary;
+            config.fallback2 = old_fb1;
         }
     }
 

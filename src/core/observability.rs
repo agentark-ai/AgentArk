@@ -45,6 +45,7 @@ impl ObservabilityPrivacyMode {
 pub fn normalize_observability_provider(value: &str) -> String {
     match value.trim().to_ascii_lowercase().as_str() {
         "langtrace" => "langtrace".to_string(),
+        "langsmith" | "langchain" => "langsmith".to_string(),
         "generic_otlp" | "otlp" | "otlp_http" => "generic_otlp".to_string(),
         _ => "langtrace".to_string(),
     }
@@ -83,6 +84,13 @@ pub fn normalize_observability_endpoint(provider: &str, endpoint: &str) -> Strin
         } else {
             format!("{}/api/trace", trimmed)
         }
+    } else if normalized_provider == "langsmith" {
+        // LangSmith supports OTLP at /otel/v1/traces
+        if trimmed.ends_with("/otel/v1/traces") || trimmed.ends_with("/v1/traces") {
+            trimmed
+        } else {
+            format!("{}/otel/v1/traces", trimmed)
+        }
     } else if trimmed.ends_with("/v1/traces") {
         trimmed
     } else {
@@ -94,7 +102,8 @@ pub fn has_observability_auth_token(
     config_dir: &Path,
     data_dir: Option<&Path>,
 ) -> anyhow::Result<bool> {
-    let manager = crate::core::config::SecureConfigManager::new_with_data_dir(config_dir, data_dir)?;
+    let manager =
+        crate::core::config::SecureConfigManager::new_with_data_dir(config_dir, data_dir)?;
     Ok(manager
         .get_custom_secret(OBSERVABILITY_AUTH_TOKEN_SECRET_KEY)?
         .map(|value| !value.trim().is_empty())
@@ -105,7 +114,8 @@ pub fn load_observability_auth_token(
     config_dir: &Path,
     data_dir: Option<&Path>,
 ) -> anyhow::Result<Option<String>> {
-    let manager = crate::core::config::SecureConfigManager::new_with_data_dir(config_dir, data_dir)?;
+    let manager =
+        crate::core::config::SecureConfigManager::new_with_data_dir(config_dir, data_dir)?;
     Ok(manager
         .get_custom_secret(OBSERVABILITY_AUTH_TOKEN_SECRET_KEY)?
         .map(|value| value.trim().to_string())
@@ -113,7 +123,7 @@ pub fn load_observability_auth_token(
 }
 
 pub async fn load_delivery_logs(storage: &Storage) -> Vec<ObservabilityDeliveryLog> {
-    let raw = match storage.get(OBSERVABILITY_LOG_KEY).await {
+    let raw = match storage.get_encrypted(OBSERVABILITY_LOG_KEY).await {
         Ok(Some(bytes)) => bytes,
         _ => return Vec::new(),
     };
@@ -127,21 +137,20 @@ pub async fn append_delivery_log(storage: &Storage, entry: ObservabilityDelivery
         logs.truncate(OBSERVABILITY_LOG_LIMIT);
     }
     if let Ok(bytes) = serde_json::to_vec(&logs) {
-        let _ = storage.set(OBSERVABILITY_LOG_KEY, &bytes).await;
+        let _ = storage.set_encrypted(OBSERVABILITY_LOG_KEY, &bytes).await;
     }
 }
 
-pub fn observability_is_ready(
-    config: &AgentConfig,
-    auth_token: Option<&str>,
-) -> bool {
+pub fn observability_is_ready(config: &AgentConfig, auth_token: Option<&str>) -> bool {
     config.observability.enabled
         && !normalize_observability_endpoint(
             &config.observability.provider,
             &config.observability.endpoint,
         )
         .is_empty()
-        && auth_token.map(|value| !value.trim().is_empty()).unwrap_or(false)
+        && auth_token
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
 }
 
 fn truncate_text(value: &str, max_chars: usize) -> String {
@@ -183,14 +192,18 @@ fn redact_by_mode(mode: ObservabilityPrivacyMode, value: &str, max_chars: usize)
     }
     match mode {
         ObservabilityPrivacyMode::MetadataOnly => None,
-        ObservabilityPrivacyMode::RedactedContent => {
-            Some(truncate_text(&crate::security::redact_pii(trimmed), max_chars))
-        }
+        ObservabilityPrivacyMode::RedactedContent => Some(truncate_text(
+            &crate::security::redact_pii(trimmed),
+            max_chars,
+        )),
         ObservabilityPrivacyMode::FullContent => Some(truncate_text(trimmed, max_chars)),
     }
 }
 
-fn build_trace_attributes(trace: &ExecutionTrace, mode: ObservabilityPrivacyMode) -> Vec<serde_json::Value> {
+fn build_trace_attributes(
+    trace: &ExecutionTrace,
+    mode: ObservabilityPrivacyMode,
+) -> Vec<serde_json::Value> {
     let mut attributes = vec![
         otel_attribute_string("agentark.trace_id", trace.id.clone()),
         otel_attribute_string("agentark.channel", trace.channel.clone()),
@@ -205,7 +218,11 @@ fn build_trace_attributes(trace: &ExecutionTrace, mode: ObservabilityPrivacyMode
             },
         ),
     ];
-    if let Some(model) = trace.model.as_ref().filter(|value| !value.trim().is_empty()) {
+    if let Some(model) = trace
+        .model
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
         attributes.push(otel_attribute_string("agentark.model", model.clone()));
     }
     if let Some(complexity) = trace
@@ -219,7 +236,10 @@ fn build_trace_attributes(trace: &ExecutionTrace, mode: ObservabilityPrivacyMode
         ));
     }
     if let Some(message) = redact_by_mode(mode, &trace.message, 1200) {
-        attributes.push(otel_attribute_string("agentark.message", message));
+        attributes.push(otel_attribute_string("agentark.message", message.clone()));
+        // LangSmith reads these for the Input/Output panels
+        attributes.push(otel_attribute_string("gen_ai.prompt", message.clone()));
+        attributes.push(otel_attribute_string("input", message));
     } else {
         attributes.push(otel_attribute_int(
             "agentark.message_chars",
@@ -228,7 +248,9 @@ fn build_trace_attributes(trace: &ExecutionTrace, mode: ObservabilityPrivacyMode
     }
     if let Some(response) = trace.response.as_ref() {
         if let Some(rendered) = redact_by_mode(mode, response, 2400) {
-            attributes.push(otel_attribute_string("agentark.response", rendered));
+            attributes.push(otel_attribute_string("agentark.response", rendered.clone()));
+            attributes.push(otel_attribute_string("gen_ai.completion", rendered.clone()));
+            attributes.push(otel_attribute_string("output", rendered));
         } else {
             attributes.push(otel_attribute_int(
                 "agentark.response_chars",
@@ -255,12 +277,15 @@ fn build_step_attributes(
             duration_ms as i64,
         ));
     }
+    // LangSmith: populate input/output on step spans so tool calls show data
     if let Some(detail) = redact_by_mode(mode, &step.detail, 2000) {
-        attributes.push(otel_attribute_string("agentark.detail", detail));
+        attributes.push(otel_attribute_string("agentark.detail", detail.clone()));
+        attributes.push(otel_attribute_string("input", detail));
     }
     if let Some(data) = step.data.as_ref() {
         if let Some(rendered) = redact_by_mode(mode, data, 3000) {
-            attributes.push(otel_attribute_string("agentark.data", rendered));
+            attributes.push(otel_attribute_string("agentark.data", rendered.clone()));
+            attributes.push(otel_attribute_string("output", rendered));
         } else {
             attributes.push(otel_attribute_int(
                 "agentark.data_chars",
@@ -271,16 +296,18 @@ fn build_step_attributes(
     attributes
 }
 
-fn build_otlp_trace_payload(
-    config: &AgentConfig,
-    trace: &ExecutionTrace,
-) -> serde_json::Value {
-    let mode = parse_observability_privacy_mode(&config.observability.privacy_mode);
+fn build_otlp_trace_payload(config: &AgentConfig, trace: &ExecutionTrace) -> serde_json::Value {
+    let requested_mode = parse_observability_privacy_mode(&config.observability.privacy_mode);
+    let mode = if config.deployment_mode == crate::core::config::DeploymentMode::InternetFacing
+        && requested_mode == ObservabilityPrivacyMode::FullContent
+    {
+        ObservabilityPrivacyMode::RedactedContent
+    } else {
+        requested_mode
+    };
     let trace_id = hash_hex(&trace.id, 32);
     let root_span_id = hash_hex(&format!("{}:root", trace.id), 16);
-    let start_time = trace
-        .started_at
-        .unwrap_or_else(chrono::Utc::now);
+    let start_time = trace.started_at.unwrap_or_else(chrono::Utc::now);
     let end_time = trace.completed_at.unwrap_or_else(chrono::Utc::now);
     let mut spans = vec![json!({
         "traceId": trace_id,
@@ -292,12 +319,18 @@ fn build_otlp_trace_payload(
     })];
 
     for (index, step) in trace.steps.iter().enumerate() {
-        let step_end = step.timestamp;
-        let duration_ms = step.duration_ms.unwrap_or(0) as i64;
-        let step_start = if duration_ms > 0 {
-            step_end - chrono::Duration::milliseconds(duration_ms)
+        let step_end = if index + 1 < trace.steps.len() {
+            trace.steps[index + 1].timestamp
         } else {
-            step_end
+            end_time
+        };
+        let step_start = step.timestamp;
+        // Use explicit duration if available, otherwise infer from next step timestamp
+        let (effective_start, effective_end) = if let Some(ms) = step.duration_ms {
+            let dur_start = step.timestamp - chrono::Duration::milliseconds(ms as i64);
+            (dur_start, step.timestamp)
+        } else {
+            (step_start, step_end)
         };
         let step_span_id = hash_hex(&format!("{}:step:{}", trace.id, index), 16);
         spans.push(json!({
@@ -305,8 +338,8 @@ fn build_otlp_trace_payload(
             "spanId": step_span_id,
             "parentSpanId": root_span_id,
             "name": truncate_text(&step.title, 120),
-            "startTimeUnixNano": datetime_to_unix_nanos(step_start),
-            "endTimeUnixNano": datetime_to_unix_nanos(step_end),
+            "startTimeUnixNano": datetime_to_unix_nanos(effective_start),
+            "endTimeUnixNano": datetime_to_unix_nanos(effective_end),
             "attributes": build_step_attributes(trace, step, mode),
         }));
     }
@@ -346,6 +379,7 @@ async fn post_export_payload(
     endpoint: &str,
     header_name: &str,
     auth_token: &str,
+    service_name: &str,
     payload: &serde_json::Value,
 ) -> anyhow::Result<reqwest::Response> {
     let client = reqwest::Client::builder()
@@ -357,6 +391,12 @@ async fn post_export_payload(
         .json(payload);
     if !header_name.trim().is_empty() && !auth_token.trim().is_empty() {
         request = request.header(header_name.trim(), auth_token.trim());
+    }
+    // LangSmith requires project name header for OTLP ingestion
+    if endpoint.contains("smith.langchain") || endpoint.contains("langsmith") {
+        let project = if service_name.trim().is_empty() { "default" } else { service_name.trim() };
+        tracing::info!("LangSmith export: project='{}', endpoint='{}'", project, endpoint);
+        request = request.header("X-LangSmith-Project", project);
     }
     Ok(request.send().await?)
 }
@@ -390,10 +430,16 @@ pub async fn export_execution_trace(
 
     let payload = build_otlp_trace_payload(config, trace);
     let provider = normalize_observability_provider(&config.observability.provider);
+    let service_name = if config.observability.service_name.trim().is_empty() {
+        "agentark"
+    } else {
+        config.observability.service_name.trim()
+    };
     match post_export_payload(
         &endpoint,
         &normalize_observability_header_name(&config.observability.header_name),
         &auth_token,
+        service_name,
         &payload,
     )
     .await
@@ -443,7 +489,10 @@ pub async fn export_execution_trace(
                     },
                 )
                 .await;
-                Err(anyhow!("Observability export failed with HTTP {}", status.as_u16()))
+                Err(anyhow!(
+                    "Observability export failed with HTTP {}",
+                    status.as_u16()
+                ))
             }
         }
         Err(error) => {
@@ -517,15 +566,22 @@ pub async fn export_test_trace(
 }
 
 pub fn summarize_log_issues(logs: &[ObservabilityDeliveryLog]) -> Vec<String> {
+    // Only show errors that are more recent than the last success.
+    // Logs are ordered newest-first.
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    for log in logs.iter().filter(|entry| entry.level == "error") {
-        let key = format!("{}|{}", log.event, log.message);
-        if seen.insert(key) {
-            out.push(log.message.clone());
+    for log in logs {
+        if log.level == "success" {
+            break; // A success clears all older errors
         }
-        if out.len() >= 5 {
-            break;
+        if log.level == "error" {
+            let key = format!("{}|{}", log.event, log.message);
+            if seen.insert(key) {
+                out.push(log.message.clone());
+            }
+            if out.len() >= 5 {
+                break;
+            }
         }
     }
     out

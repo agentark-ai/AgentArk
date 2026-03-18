@@ -368,6 +368,18 @@ impl ResearchClient {
 
     /// Fetch content from a URL
     async fn fetch_content(&self, url: &str) -> Result<String> {
+        // Fast-path: Lightpanda returns clean markdown (no HTML stripping needed)
+        match crate::integrations::lightpanda::fetch_markdown(url).await {
+            Ok(markdown) => return Ok(markdown),
+            Err(e) => {
+                tracing::debug!(
+                    "Lightpanda unavailable for research fetch, falling back to reqwest: {}",
+                    e
+                );
+            }
+        }
+
+        // Fallback: raw HTTP + HTML text extraction
         let response = self.http_client.get(url).send().await?;
 
         if !response.status().is_success() {

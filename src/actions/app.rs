@@ -554,6 +554,24 @@ async fn run_docker(
         .map_err(|e| anyhow::anyhow!("failed to execute docker: {}", e))
 }
 
+/// Rewrite absolute `/app/` paths in entry commands to be relative to `app_dir`.
+/// Container-authored commands use `/app/server.py` etc., but when running as a
+/// local process the cwd is already `app_dir`, so `/app/server.py` should become
+/// `./server.py` (or the actual file in `app_dir`).
+fn localize_app_entry_command(command: &str, app_dir: &Path) -> String {
+    let mut parts: Vec<String> = command.split_whitespace().map(|s| s.to_string()).collect();
+    for part in &mut parts {
+        if part.starts_with("/app/") {
+            let relative = &part[5..]; // strip "/app/"
+            let candidate = app_dir.join(relative);
+            if candidate.exists() {
+                *part = format!("./{}", relative);
+            }
+        }
+    }
+    parts.join(" ")
+}
+
 fn split_command_args(command: &str, label: &str) -> Result<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -1144,8 +1162,11 @@ pub async fn launch_dynamic_process(
     extra_env: &HashMap<String, String>,
     stream_tx: Option<Sender<StreamEvent>>,
 ) -> Result<tokio::process::Child> {
+    // Normalize absolute /app/ paths to relative — entry commands are often authored
+    // for container context where the app lives at /app/, but for local process runtime
+    // the cwd is already app_dir so these should be relative.
     let entry_command = validate_app_command(
-        &entry_command.replace("{PORT}", &port.to_string()),
+        &localize_app_entry_command(entry_command, app_dir).replace("{PORT}", &port.to_string()),
         "entry_command",
     )?;
 
@@ -1580,6 +1601,11 @@ impl AppRegistry {
                     format!("/apps/{}/?key={}", id, app.access_key)
                 } else {
                     format!("/apps/{}/", id)
+                },
+                "access_key": if app.access_guard_enabled {
+                    app.access_key.clone()
+                } else {
+                    String::new()
                 },
                 "access_guard_enabled": app.access_guard_enabled,
             }));

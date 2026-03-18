@@ -128,10 +128,17 @@ fn trace_status_from_steps(steps: &[crate::core::ExecutionStep], completed: bool
 }
 
 fn format_trace_step_time(step: &crate::core::ExecutionStep) -> String {
+    // Send full ISO timestamp — frontend converts to local time
     if let Some(ms) = step.duration_ms {
-        format!("{} ({}ms)", step.timestamp.format("%H:%M:%S"), ms)
+        format!(
+            "{} ({}ms)",
+            step.timestamp
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            ms
+        )
     } else {
-        step.timestamp.format("%H:%M:%S").to_string()
+        step.timestamp
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
     }
 }
 
@@ -209,22 +216,23 @@ fn parse_persisted_trace_steps(
 }
 
 fn parse_rfc3339_to_local_display(value: &Option<String>) -> Option<String> {
+    // Send full ISO timestamp — frontend converts to local time
     value.as_deref().and_then(|raw| {
-        chrono::DateTime::parse_from_rfc3339(raw)
-            .ok()
-            .map(|dt| dt.with_timezone(&chrono::Utc))
-            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        chrono::DateTime::parse_from_rfc3339(raw).ok().map(|dt| {
+            dt.with_timezone(&chrono::Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        })
     })
 }
 
 fn parse_rfc3339_to_time_display(value: &Option<String>) -> String {
+    // Send full ISO timestamp — frontend converts to local relative time
     value
         .as_deref()
         .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
         .map(|dt| {
             dt.with_timezone(&chrono::Utc)
-                .format("%H:%M:%S")
-                .to_string()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
         })
         .unwrap_or_default()
 }
@@ -320,8 +328,8 @@ pub(super) async fn get_trace(
 
     let agent = state.agent.read().await;
     let persisted_history = agent
-        .storage
-        .list_execution_traces(history_limit as u64 + history_offset as u64 + 100, 0)
+        .encrypted_storage
+        .list_execution_traces_decrypted(history_limit as u64 + history_offset as u64 + 100, 0)
         .await
         .unwrap_or_default();
 
@@ -407,7 +415,11 @@ pub(super) async fn get_trace_detail(
         None => {
             drop(trace_history);
             let agent = state.agent.read().await;
-            match agent.storage.get_execution_trace(&id).await {
+            match agent
+                .encrypted_storage
+                .get_execution_trace_decrypted(&id)
+                .await
+            {
                 Ok(Some(t)) => {
                     (StatusCode::OK, Json(format_trace_detail_from_persisted(&t))).into_response()
                 }

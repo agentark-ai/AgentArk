@@ -10,7 +10,7 @@ use uuid::Uuid;
 pub enum TaskApproval {
     /// Execute immediately without approval
     Auto,
-    /// Notify user, wait for duration, then execute
+    /// Legacy mode retained for compatibility; normalized to explicit approval at runtime
     NotifyThenExecute { delay_seconds: u64 },
     /// Require explicit user approval
     RequireApproval,
@@ -58,7 +58,7 @@ fn strip_automation_meta(value: &serde_json::Value) -> serde_json::Value {
         serde_json::Value::Object(map) => {
             let mut next = serde_json::Map::new();
             for (key, inner) in map {
-                if key == "_automation" {
+                if key == "_automation" || key == "_approval" {
                     continue;
                 }
                 next.insert(key.clone(), strip_automation_meta(inner));
@@ -147,6 +147,30 @@ pub fn task_semantic_signature(task: &Task) -> String {
         task_report_channel(&cleaned),
         task_topic_signature(&cleaned, &task.description)
     )
+}
+
+pub fn normalized_task_approval(approval: &TaskApproval) -> TaskApproval {
+    match approval {
+        TaskApproval::Auto => TaskApproval::Auto,
+        TaskApproval::RequireApproval | TaskApproval::NotifyThenExecute { .. } => {
+            TaskApproval::RequireApproval
+        }
+    }
+}
+
+pub fn task_requires_explicit_approval(approval: &TaskApproval) -> bool {
+    matches!(
+        normalized_task_approval(approval),
+        TaskApproval::RequireApproval
+    )
+}
+
+pub fn status_for_task_approval(approval: &TaskApproval) -> TaskStatus {
+    if task_requires_explicit_approval(approval) {
+        TaskStatus::AwaitingApproval
+    } else {
+        TaskStatus::Pending
+    }
 }
 
 pub fn task_request_signature_from_fields(
@@ -247,5 +271,42 @@ impl TaskQueue {
 impl Default for TaskQueue {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalized_task_approval_maps_notify_to_require() {
+        assert!(matches!(
+            normalized_task_approval(&TaskApproval::NotifyThenExecute { delay_seconds: 30 }),
+            TaskApproval::RequireApproval
+        ));
+    }
+
+    #[test]
+    fn task_signature_ignores_approval_metadata() {
+        let mut task = Task::new(
+            "Delete junk email".to_string(),
+            "gmail_delete".to_string(),
+            serde_json::json!({
+                "query": "label:junk older_than:30d",
+                "_approval": {
+                    "title": "Delete junk email",
+                    "reason": "External mailbox mutation"
+                }
+            }),
+        );
+        task.approval = TaskApproval::RequireApproval;
+        let left = task_semantic_signature(&task);
+
+        task.arguments = serde_json::json!({
+            "query": "label:junk older_than:30d"
+        });
+        let right = task_semantic_signature(&task);
+
+        assert_eq!(left, right);
     }
 }

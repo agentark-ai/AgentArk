@@ -17,6 +17,7 @@ pub mod pipeline;
 pub mod prompt_policy;
 pub mod secrets;
 pub mod self_evolve;
+pub mod self_tune;
 pub mod swarm;
 mod task;
 pub mod task_router;
@@ -24,14 +25,12 @@ mod tool_handlers;
 pub mod watcher;
 
 pub use agent::{
-    Agent, ConversationMessage, ExecutionStep, ExecutionTrace, SecurityEvents, SecuritySnapshot,
-    StreamEvent, UserProfile, RequestExecutionHints,
+    Agent, ConversationMessage, ExecutionStep, ExecutionTrace, RequestExecutionHints,
+    SecurityEvents, SecuritySnapshot, StreamEvent, UserProfile,
 };
 pub use automation::{
-    list_runs as list_automation_runs,
-    list_supervisor_states as list_automation_supervisor_states,
-    AutomationRunStatus,
-    AutomationSupervisorState,
+    list_runs as list_automation_runs, list_supervisor_states as list_automation_supervisor_states,
+    AutomationRunStatus, AutomationSupervisorState,
 };
 pub use autonomy::{
     score_action_risk, AutonomySettings, AutopilotMode, ConversationScope, RecommendedAction,
@@ -39,4 +38,4 @@ pub use autonomy::{
 };
 pub use config::{AgentConfig, ModelRole, ModelSlot};
 pub use llm::{LlmClient, LlmProvider, ToolCall};
-pub use task::{Task, TaskApproval, TaskQueue, TaskStatus};
+pub use task::{status_for_task_approval, Task, TaskApproval, TaskQueue, TaskStatus};

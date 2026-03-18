@@ -29,7 +29,7 @@ services:
     container_name: agentark
     restart: unless-stopped
     ports:
-      - "8990:8990"
+      - "127.0.0.1:8990:8990"
     volumes:
       # === PERSISTENT DATA VOLUMES ===
       # These volumes are managed by Docker and NEVER deleted on rebuild

@@ -38,3 +38,10 @@ tests/e2e/test-results/
 /remotion*
 nul
 asda
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Docs
+docs/

@@ -29,6 +29,7 @@ export type Notification = {
 export type ArkPulseRemediationSpec =
   | { kind: "tunnel_start_verify" }
   | { kind: "tunnel_restart_verify" }
+  | { kind: "app_restart"; app_id: string }
   | { kind: "shell_command"; command: string };
 
 export type ArkPulseDoctorFinding = {
@@ -134,6 +135,14 @@ export type LlmAnalyticsPoint = {
   completion_tokens: number;
   total_tokens: number;
   request_count: number;
+  primary_prompt_tokens: number;
+  primary_completion_tokens: number;
+  primary_total_tokens: number;
+  primary_request_count: number;
+  helper_prompt_tokens: number;
+  helper_completion_tokens: number;
+  helper_total_tokens: number;
+  helper_request_count: number;
   cost_usd?: number | null;
 };
 

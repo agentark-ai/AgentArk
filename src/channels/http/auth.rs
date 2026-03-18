@@ -1,4 +1,6 @@
 use super::*;
+use std::net::IpAddr;
+use std::sync::OnceLock;
 
 const LOCAL_UI_BOOTSTRAP_TTL_SECS: i64 = 2 * 60;
 const LOCAL_UI_BOOTSTRAP_MAX_TOKENS: usize = 128;
@@ -76,7 +78,9 @@ pub(super) async fn sync_http_api_key_state(
     }
     {
         let mut session_guard = state.session_token.write().await;
-        if info.is_some() {
+        if info.is_some()
+            || state.deployment_mode == crate::core::config::DeploymentMode::TrustedLocal
+        {
             if session_guard.is_none() {
                 *session_guard = Some(generate_ephemeral_token());
             }
@@ -92,12 +96,17 @@ pub(super) async fn current_ui_session_token(state: &AppState) -> Option<String>
     state.session_token.read().await.clone()
 }
 
-async fn create_local_ui_bootstrap_token(state: &AppState, headers: &HeaderMap) -> Option<String> {
-    if !is_local_request_host(headers) {
+async fn create_local_ui_bootstrap_token(
+    state: &AppState,
+    headers: &HeaderMap,
+    addr: SocketAddr,
+) -> Option<String> {
+    if !state.local_ui_bootstrap_enabled || !is_trusted_local_ui_request(headers, addr) {
         return None;
     }
     let (info, _rotated) = sync_http_api_key_state(state, false).await.ok()?;
-    if info.is_none() {
+    if info.is_none() && state.deployment_mode != crate::core::config::DeploymentMode::TrustedLocal
+    {
         return None;
     }
 
@@ -177,7 +186,38 @@ pub(super) fn is_local_request_host(headers: &HeaderMap) -> bool {
 }
 
 pub(super) fn is_trusted_local_ui_request(headers: &HeaderMap, addr: SocketAddr) -> bool {
-    addr.ip().is_loopback() && is_local_request_host(headers)
+    if !is_local_request_host(headers) {
+        return false;
+    }
+    let ip = addr.ip();
+    ip.is_loopback() || is_container_host_gateway_ip(ip)
+}
+
+fn is_container_host_gateway_ip(ip: IpAddr) -> bool {
+    static CONTAINER_GATEWAY_IP: OnceLock<Option<IpAddr>> = OnceLock::new();
+    *CONTAINER_GATEWAY_IP.get_or_init(detect_container_default_gateway_ip) == Some(ip)
+}
+
+fn detect_container_default_gateway_ip() -> Option<IpAddr> {
+    if let Ok(value) = std::env::var("AGENTARK_DOCKER_HOST_GATEWAY_IP") {
+        if let Ok(parsed) = value.trim().parse::<IpAddr>() {
+            return Some(parsed);
+        }
+    }
+
+    let routes = std::fs::read_to_string("/proc/net/route").ok()?;
+    for line in routes.lines().skip(1) {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 3 || fields[1] != "00000000" {
+            continue;
+        }
+        let gateway = u32::from_str_radix(fields[2], 16).ok()?;
+        let octets = gateway.to_le_bytes();
+        return Some(IpAddr::V4(std::net::Ipv4Addr::new(
+            octets[0], octets[1], octets[2], octets[3],
+        )));
+    }
+    None
 }
 
 pub(super) async fn should_issue_ui_session_cookie(
@@ -262,6 +302,14 @@ pub(super) async fn auth_middleware(
 
     // If API key is missing, fail closed unless explicitly overridden.
     let Some(expected_key) = expected_key else {
+        let session_token = current_ui_session_token(&state).await;
+        if state.deployment_mode == crate::core::config::DeploymentMode::TrustedLocal
+            && is_trusted_local_ui_request(request.headers(), addr)
+            && has_valid_ui_session_cookie(request.headers(), session_token.as_deref())
+        {
+            return next.run(request).await;
+        }
+
         if state.allow_insecure_no_auth {
             if !MISSING_API_KEY_WARNED.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
@@ -291,8 +339,15 @@ pub(super) async fn auth_middleware(
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {
-                error: "API authentication is not configured. Regenerate an API key from a trusted session, or set AGENTARK_INSECURE_NO_AUTH=true temporarily."
-                    .to_string(),
+                error: if state.deployment_mode
+                    == crate::core::config::DeploymentMode::TrustedLocal
+                {
+                    "API authentication is not configured. Regenerate an API key from a trusted session, or set AGENTARK_INSECURE_NO_AUTH=true temporarily."
+                        .to_string()
+                } else {
+                    "API authentication is not configured. Regenerate an API key from a trusted session."
+                        .to_string()
+                },
             }),
         )
             .into_response();
@@ -403,9 +458,10 @@ pub(super) async fn bootstrap_ui_session(
 
 pub(super) async fn issue_local_ui_bootstrap_token(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    if !is_local_request_host(&headers) {
+    if !state.local_ui_bootstrap_enabled || !is_trusted_local_ui_request(&headers, addr) {
         return (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -416,7 +472,7 @@ pub(super) async fn issue_local_ui_bootstrap_token(
             .into_response();
     }
 
-    match create_local_ui_bootstrap_token(&state, &headers).await {
+    match create_local_ui_bootstrap_token(&state, &headers, addr).await {
         Some(token) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -438,10 +494,11 @@ pub(super) async fn issue_local_ui_bootstrap_token(
 
 pub(super) async fn bootstrap_local_ui_session(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(request): Json<LocalUiBootstrapRequest>,
 ) -> Response {
-    if !is_local_request_host(&headers) {
+    if !state.local_ui_bootstrap_enabled || !is_trusted_local_ui_request(&headers, addr) {
         return (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -464,7 +521,8 @@ pub(super) async fn bootstrap_local_ui_session(
                 .into_response();
         }
     };
-    if info.is_none() {
+    if info.is_none() && state.deployment_mode != crate::core::config::DeploymentMode::TrustedLocal
+    {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {

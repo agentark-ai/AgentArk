@@ -31,7 +31,9 @@ mod gui;
 
 use anyhow::Result;
 use clap::Parser;
-use std::io::{BufRead, Write};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -66,6 +68,10 @@ struct Args {
     /// Interactive CLI chat mode (like OpenClaw)
     #[arg(long)]
     chat: bool,
+
+    /// Run one ArkPulse health check and print the latest snapshot
+    #[arg(long)]
+    pulse: bool,
 }
 
 #[tokio::main]
@@ -283,6 +289,10 @@ async fn main() -> Result<()> {
         return run_chat_repl(agent).await;
     }
 
+    if args.pulse {
+        return run_cli_pulse(agent).await;
+    }
+
     if args.headless {
         run_headless(agent).await
     } else {
@@ -300,8 +310,13 @@ async fn main() -> Result<()> {
 
 /// Interactive CLI chat mode — talk to the agent from your terminal.
 async fn run_chat_repl(agent: core::Agent) -> Result<()> {
+    if !std::io::stdin().is_terminal() {
+        return run_chat_repl_noninteractive(agent).await;
+    }
+
     let agent = std::sync::Arc::new(agent);
     let conversation_id = uuid::Uuid::new_v4().to_string();
+    let mut auto_show_trace = false;
 
     println!();
     println!("╔═══════════════════════════════════════════════════════════╗");
@@ -315,22 +330,48 @@ async fn run_chat_repl(agent: core::Agent) -> Result<()> {
     println!("╚═══════════════════════════════════════════════════════════╝");
     println!();
 
+    println!("Shortcuts: Ctrl+T toggles trace mode, Ctrl+D exits the chat.");
+    println!("When trace mode is enabled, the full trace prints before each agent reply.");
+    println!();
+
     let mut conv_id = conversation_id;
 
     loop {
-        print!("\x1b[36myou ➜\x1b[0m ");
-        std::io::Write::flush(&mut std::io::stdout())?;
-
-        let mut input = String::new();
-        if std::io::stdin().lock().read_line(&mut input)? == 0 {
-            break; // EOF
-        }
-        let input = input.trim();
+        let input = match read_cli_input_line().await? {
+            CliReadAction::Exit => break,
+            CliReadAction::ToggleTrace => {
+                auto_show_trace = !auto_show_trace;
+                println!();
+                if auto_show_trace {
+                    println!(
+                        "\x1b[3;35mTrace mode enabled.\x1b[0m \x1b[3;90mFull traces will print before each agent reply.\x1b[0m"
+                    );
+                } else {
+                    println!("\x1b[3;35mTrace mode disabled.\x1b[0m");
+                }
+                println!();
+                continue;
+            }
+            CliReadAction::Submit(value) => value,
+        };
         if input.is_empty() {
             continue;
         }
+        let lowered = input.to_ascii_lowercase();
 
-        match input {
+        if matches!(
+            lowered.as_str(),
+            "/trace" | "/t" | "/trace on" | "/trace off" | "/t on" | "/t off"
+        ) {
+            println!();
+            println!(
+                "\x1b[3;35mTrace mode is controlled with Ctrl+T now.\x1b[0m \x1b[3;90mToggle it on to show the full trace before each reply.\x1b[0m"
+            );
+            println!();
+            continue;
+        }
+
+        match lowered.as_str() {
             "/exit" | "/quit" | "/q" => {
                 println!("Goodbye!");
                 break;
@@ -343,37 +384,504 @@ async fn run_chat_repl(agent: core::Agent) -> Result<()> {
             }
             "/help" => {
                 println!();
-                println!("  /new   — Start a new conversation");
-                println!("  /exit  — Quit the CLI");
-                println!("  /help  — Show this help");
+                println!("  Ctrl+T - Toggle full trace mode before replies");
+                println!("  Ctrl+D - Exit the chat");
+                println!("  Tab    - Autocomplete slash commands");
+                println!("  /new   - Start a new conversation");
+                println!("  /exit  - Quit the CLI");
+                println!("  /help  - Show this help");
                 println!();
                 continue;
             }
             _ => {}
         }
 
-        print!("\x1b[90m⏳ Thinking...\x1b[0m");
-        std::io::Write::flush(&mut std::io::stdout())?;
+        println!("\x1b[3;90mThinking...\x1b[0m");
+        std::io::stdout().flush()?;
 
         match agent
-            .process_message(input, "cli", Some(&conv_id), None)
+            .process_message(input.as_str(), "cli", Some(&conv_id), None)
             .await
         {
             Ok(response) => {
-                // Clear the "Thinking..." text
-                print!("\r\x1b[K");
+                let trace = agent.last_trace.read().await.clone();
+                if auto_show_trace && !trace.id.trim().is_empty() {
+                    print_cli_trace(&trace);
+                    println!();
+                }
                 println!("\x1b[32magentark ➜\x1b[0m {}", response);
-                println!();
             }
             Err(e) => {
-                print!("\r\x1b[K");
                 eprintln!("\x1b[31merror:\x1b[0m {}", e);
-                println!();
+            }
+        }
+        println!();
+    }
+
+    Ok(())
+}
+
+fn pulse_status_color(status: &str) -> &'static str {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "ok" => "\x1b[32m",
+        "alert" | "warning" => "\x1b[33m",
+        "error" | "failed" => "\x1b[31m",
+        _ => "\x1b[36m",
+    }
+}
+
+fn format_pulse_timestamp(raw: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|ts| ts.with_timezone(&chrono::Utc))
+        .map(|ts| ts.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|_| raw.to_string())
+}
+
+fn latest_pulse_event(
+    events: Vec<crate::sentinel::PulseEvent>,
+) -> Option<crate::sentinel::PulseEvent> {
+    events.into_iter().max_by_key(|event| {
+        chrono::DateTime::parse_from_rfc3339(&event.timestamp)
+            .map(|ts| ts.timestamp_millis())
+            .unwrap_or(0)
+    })
+}
+
+fn describe_cli_pulse_remediation(finding: &crate::sentinel::DoctorFinding) -> Option<String> {
+    match finding.remediation.as_ref() {
+        Some(crate::sentinel::DoctorRemediationSpec::TunnelStartVerify) => {
+            Some("Start tunnel and verify /tunnel/status returns active + URL".to_string())
+        }
+        Some(crate::sentinel::DoctorRemediationSpec::TunnelRestartVerify) => {
+            Some("Restart tunnel and verify public reachability".to_string())
+        }
+        Some(crate::sentinel::DoctorRemediationSpec::AppRestart { app_id }) => {
+            Some(format!("Restart app {} and re-check health", app_id))
+        }
+        Some(crate::sentinel::DoctorRemediationSpec::ShellCommand { command }) => {
+            let normalized = command.trim();
+            if normalized.is_empty() {
+                None
+            } else {
+                Some(normalized.to_string())
+            }
+        }
+        None => {
+            let normalized = finding.fix_command.trim();
+            if normalized.is_empty() {
+                None
+            } else {
+                Some(normalized.to_string())
+            }
+        }
+    }
+}
+
+fn print_cli_pulse_event(event: &crate::sentinel::PulseEvent) {
+    let summary = if event.summary.trim().is_empty() {
+        event.message.trim()
+    } else {
+        event.summary.trim()
+    };
+    let details = &event.details;
+    let status = event.status.trim().to_ascii_lowercase();
+    let status_color = pulse_status_color(&status);
+
+    println!(
+        "{}╔═══════════════════════════════════════════════════════════╗\x1b[0m",
+        status_color
+    );
+    println!(
+        "{}║           AgentArk v{} — ArkPulse                 ║\x1b[0m",
+        status_color,
+        env!("CARGO_PKG_VERSION")
+    );
+    println!(
+        "{}╚═══════════════════════════════════════════════════════════╝\x1b[0m",
+        status_color
+    );
+    println!();
+    println!(
+        "\x1b[36mStatus:\x1b[0m {}{}\x1b[0m",
+        status_color,
+        status.to_ascii_uppercase()
+    );
+    println!(
+        "\x1b[36mCaptured:\x1b[0m {}",
+        format_pulse_timestamp(&event.timestamp)
+    );
+    println!("\x1b[36mSummary:\x1b[0m {}", summary);
+    println!(
+        "\x1b[36mTasks:\x1b[0m pending {} | running {} | done {} | total {}",
+        details.pending_tasks, details.running_tasks, details.completed_tasks, details.total_tasks
+    );
+    println!(
+        "\x1b[36mWatchers:\x1b[0m {} active",
+        details.active_watchers
+    );
+    if details.doctor_score > 0 {
+        println!("\x1b[36mHealth score:\x1b[0m {}", details.doctor_score);
+    }
+
+    if !details.health_checks.is_empty() {
+        println!();
+        println!("\x1b[35mHealth checks\x1b[0m");
+        for check in &details.health_checks {
+            let color = pulse_status_color(&check.status);
+            println!(
+                "  - {}{}{}\x1b[0m: {}",
+                color,
+                check.service,
+                if check.status.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", check.status)
+                },
+                check.message
+            );
+        }
+    }
+
+    let findings = details
+        .doctor_findings
+        .iter()
+        .filter(|finding| finding.user_actionable)
+        .take(5)
+        .collect::<Vec<_>>();
+    if !findings.is_empty() {
+        println!();
+        println!("\x1b[35mTop issues\x1b[0m");
+        for finding in findings {
+            let color = pulse_status_color(&finding.severity);
+            println!(
+                "  - {}[{}]\x1b[0m {}",
+                color,
+                finding.severity.to_ascii_uppercase(),
+                finding.title
+            );
+            if !finding.target.trim().is_empty() {
+                println!("      target: {}", finding.target.trim());
+            }
+            if let Some(remediation) = describe_cli_pulse_remediation(finding) {
+                println!("      next: {}", remediation);
             }
         }
     }
 
+    if !details.overdue_list.is_empty() {
+        println!();
+        println!("\x1b[35mOverdue tasks\x1b[0m");
+        for item in details.overdue_list.iter().take(5) {
+            println!("  - {}", item);
+        }
+    }
+
+    if !details.failed_list.is_empty() {
+        println!();
+        println!("\x1b[35mRecent failures\x1b[0m");
+        for item in details.failed_list.iter().take(5) {
+            println!("  - {}", item);
+        }
+    }
+}
+
+async fn run_cli_pulse(agent: core::Agent) -> Result<()> {
+    println!("Running ArkPulse health check...");
+    println!();
+
+    let agent = std::sync::Arc::new(tokio::sync::RwLock::new(agent));
+    crate::sentinel::run_pulse(&agent).await;
+
+    let latest = {
+        let guard = agent.read().await;
+        latest_pulse_event(crate::sentinel::get_pulse_log(&guard).await)
+    };
+
+    if let Some(event) = latest {
+        print_cli_pulse_event(&event);
+    } else {
+        println!("\x1b[3;90mNo ArkPulse snapshot is available yet.\x1b[0m");
+    }
+
     Ok(())
+}
+
+async fn run_chat_repl_noninteractive(agent: core::Agent) -> Result<()> {
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input)?;
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(());
+    }
+
+    let conversation_id = uuid::Uuid::new_v4().to_string();
+    let response = agent
+        .process_message(input, "cli", Some(&conversation_id), None)
+        .await?;
+    println!("{}", response);
+    Ok(())
+}
+
+enum CliReadAction {
+    Submit(String),
+    ToggleTrace,
+    Exit,
+}
+
+struct CliRawModeGuard;
+
+impl CliRawModeGuard {
+    fn enable() -> Result<Self> {
+        enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for CliRawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
+
+fn render_cli_prompt(buffer: &str) -> Result<()> {
+    print!("\r\x1b[K\x1b[36myou ➜\x1b[0m {}", buffer);
+    std::io::stdout().flush()?;
+    Ok(())
+}
+
+const CLI_COMMANDS: &[&str] = &["/exit", "/quit", "/q", "/new", "/help"];
+
+fn common_prefix(left: &str, right: &str) -> String {
+    left.chars()
+        .zip(right.chars())
+        .take_while(|(a, b)| a.eq_ignore_ascii_case(b))
+        .map(|(c, _)| c)
+        .collect()
+}
+
+fn complete_cli_command(buffer: &str) -> Option<String> {
+    let trimmed = buffer.trim_start();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+    let mut matches = CLI_COMMANDS
+        .iter()
+        .copied()
+        .filter(|candidate| candidate.starts_with(&lowered))
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return None;
+    }
+    matches.sort_unstable();
+    if matches.len() == 1 {
+        return Some(matches[0].to_string());
+    }
+    let mut prefix = matches[0].to_string();
+    for candidate in matches.iter().skip(1) {
+        prefix = common_prefix(&prefix, candidate);
+        if prefix.is_empty() {
+            break;
+        }
+    }
+    if prefix.len() > lowered.len() {
+        Some(prefix)
+    } else {
+        None
+    }
+}
+
+fn matching_cli_commands(buffer: &str) -> Vec<&'static str> {
+    let trimmed = buffer.trim_start();
+    if !trimmed.starts_with('/') {
+        return Vec::new();
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+    CLI_COMMANDS
+        .iter()
+        .copied()
+        .filter(|candidate| candidate.starts_with(&lowered))
+        .collect()
+}
+
+async fn read_cli_input_line() -> Result<CliReadAction> {
+    let _raw_mode = CliRawModeGuard::enable()?;
+    let mut buffer = String::new();
+    render_cli_prompt(&buffer)?;
+
+    loop {
+        match event::read()? {
+            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                match (key.code, key.modifiers) {
+                    (KeyCode::Char('d'), modifiers)
+                        if modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        print!("\r\x1b[K");
+                        std::io::stdout().flush()?;
+                        println!("Goodbye!");
+                        return Ok(CliReadAction::Exit);
+                    }
+                    (KeyCode::Char('t'), modifiers)
+                        if modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        print!("\r\x1b[K");
+                        std::io::stdout().flush()?;
+                        return Ok(CliReadAction::ToggleTrace);
+                    }
+                    (KeyCode::Enter, _) => {
+                        print!("\r\x1b[K");
+                        std::io::stdout().flush()?;
+                        println!("\x1b[36myou ➜\x1b[0m {}", buffer);
+                        return Ok(CliReadAction::Submit(buffer.trim().to_string()));
+                    }
+                    (KeyCode::Backspace, _) => {
+                        buffer.pop();
+                        render_cli_prompt(&buffer)?;
+                    }
+                    (KeyCode::Tab, _) => {
+                        if let Some(completed) = complete_cli_command(&buffer) {
+                            buffer = completed;
+                            render_cli_prompt(&buffer)?;
+                        } else {
+                            let matches = matching_cli_commands(&buffer);
+                            if !matches.is_empty() {
+                                print!("\r\x1b[K");
+                                std::io::stdout().flush()?;
+                                println!();
+                                println!("\x1b[90mcommands: {}\x1b[0m", matches.join("  "));
+                                render_cli_prompt(&buffer)?;
+                            }
+                        }
+                    }
+                    (KeyCode::Esc, _) => {
+                        buffer.clear();
+                        render_cli_prompt(&buffer)?;
+                    }
+                    (KeyCode::Char(c), modifiers)
+                        if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        buffer.push(c);
+                        render_cli_prompt(&buffer)?;
+                    }
+                    _ => {}
+                }
+            }
+            Event::Paste(text) => {
+                buffer.push_str(&text);
+                render_cli_prompt(&buffer)?;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn cli_trace_status(trace: &core::ExecutionTrace) -> &'static str {
+    if let Some(last_step) = trace.steps.last() {
+        let title = last_step.title.to_ascii_lowercase();
+        let step_type = last_step.step_type.to_ascii_lowercase();
+        if step_type == "error" || title.contains("failed") {
+            return "failed";
+        }
+        if step_type == "warning" || title.contains("blocked") {
+            return "warning";
+        }
+    }
+    if trace.completed_at.is_some() {
+        "completed"
+    } else {
+        "running"
+    }
+}
+
+fn colorize_trace_status(status: &str) -> String {
+    match status {
+        "completed" => format!("\x1b[32m{}\x1b[0m", status),
+        "failed" => format!("\x1b[31m{}\x1b[0m", status),
+        "warning" => format!("\x1b[33m{}\x1b[0m", status),
+        _ => format!("\x1b[36m{}\x1b[0m", status),
+    }
+}
+
+fn colorize_trace_step_title(step_type: &str, title: &str) -> String {
+    match step_type.to_ascii_lowercase().as_str() {
+        "error" => format!("\x1b[31m{}\x1b[0m", title),
+        "warning" => format!("\x1b[33m{}\x1b[0m", title),
+        "success" => format!("\x1b[32m{}\x1b[0m", title),
+        "thinking" => format!("\x1b[34m{}\x1b[0m", title),
+        _ => format!("\x1b[36m{}\x1b[0m", title),
+    }
+}
+
+fn print_cli_trace(trace: &core::ExecutionTrace) {
+    if trace.id.trim().is_empty() {
+        println!("\x1b[3;90mNo execution trace is available yet.\x1b[0m");
+        return;
+    }
+
+    let started_at = trace
+        .started_at
+        .map(|value| value.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let duration_ms = trace.started_at.and_then(|start| {
+        trace
+            .completed_at
+            .map(|end| (end - start).num_milliseconds().max(0) as u64)
+    });
+
+    println!("\x1b[3;35mTrace\x1b[0m");
+    println!("\x1b[3;36m  ID:\x1b[0m {}", trace.id);
+    println!(
+        "\x1b[3;36m  Status:\x1b[0m {}",
+        colorize_trace_status(cli_trace_status(trace))
+    );
+    println!("\x1b[3;36m  Channel:\x1b[0m {}", trace.channel);
+    println!("\x1b[3;36m  Started:\x1b[0m {}", started_at);
+    println!("\x1b[3;36m  Steps:\x1b[0m {}", trace.steps.len());
+    if let Some(duration_ms) = duration_ms {
+        println!("\x1b[3;36m  Duration:\x1b[0m {} ms", duration_ms);
+    }
+    if let Some(model) = trace.model.as_deref() {
+        println!("\x1b[3;36m  Model:\x1b[0m {}", model);
+    }
+    if trace.total_tokens > 0 {
+        println!(
+            "\x1b[3;36m  Tokens:\x1b[0m in {} | out {} | total {}",
+            trace.input_tokens, trace.output_tokens, trace.total_tokens
+        );
+    }
+    if trace.cost_usd > 0.0 {
+        println!("\x1b[3;36m  Cost:\x1b[0m ${:.6}", trace.cost_usd);
+    }
+    if let Some(complexity) = trace.complexity.as_deref() {
+        println!("\x1b[3;36m  Complexity:\x1b[0m {}", complexity);
+    }
+    println!();
+
+    for (index, step) in trace.steps.iter().enumerate() {
+        println!(
+            "\x1b[3;33m{}. [{}]\x1b[0m {}",
+            index + 1,
+            step.timestamp.format("%H:%M:%S"),
+            colorize_trace_step_title(&step.step_type, &step.title)
+        );
+        if !step.detail.trim().is_empty() {
+            println!("\x1b[3;90m   {}\x1b[0m", step.detail);
+        }
+        if let Some(data) = step
+            .data
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            println!("\x1b[3;90m   Data:\x1b[0m");
+            for line in data.lines() {
+                println!("\x1b[3;90m     {}\x1b[0m", line);
+            }
+        }
+        if let Some(duration_ms) = step.duration_ms {
+            println!("\x1b[3;90m   Duration:\x1b[0m {} ms", duration_ms);
+        }
+    }
 }
 
 /// CLI-based setup wizard for headless mode

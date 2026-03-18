@@ -17,6 +17,8 @@ struct ActionInfo {
     pub editable: bool,
     pub enabled: bool,
     pub file_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imported_at: Option<String>,
 }
 
 /// Action content response
@@ -83,6 +85,15 @@ pub(super) async fn list_actions(State(state): State<AppState>) -> Response {
                 // Only System actions are read-only
                 let editable = s.source != ActionSource::System;
                 let enabled = agent_guard.runtime.is_action_enabled(&s.name).await;
+                let imported_at = s.file_path.as_deref().and_then(|p| {
+                    std::fs::metadata(p)
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .map(|t| {
+                            chrono::DateTime::<chrono::Utc>::from(t)
+                                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                        })
+                });
                 action_infos.push(ActionInfo {
                     name: s.name,
                     description: s.description,
@@ -91,6 +102,7 @@ pub(super) async fn list_actions(State(state): State<AppState>) -> Response {
                     editable,
                     enabled,
                     file_path: s.file_path,
+                    imported_at,
                 });
             }
 
@@ -1610,7 +1622,7 @@ async fn discover_github_collection_urls(
             Ok(urls) if !urls.is_empty() => return Ok(Some(urls)),
             Ok(_) => {
                 last_err = format!(
-                    "No SKILL.md/ACTION.md files found under '{}/{}@{}:{}'",
+                    "No SKILL.md files (or legacy ACTION.md files) were found under '{}/{}@{}:{}'",
                     loc.owner, loc.repo, git_ref, loc.path
                 );
             }
@@ -1623,7 +1635,7 @@ async fn discover_github_collection_urls(
                     Ok(urls) if !urls.is_empty() => return Ok(Some(urls)),
                     Ok(_) => {
                         last_err = format!(
-                            "GitHub API error: {}. Archive fallback found no SKILL.md/ACTION.md under '{}/{}@{}:{}'",
+                            "GitHub API error: {}. Archive fallback found no SKILL.md files (or legacy ACTION.md files) under '{}/{}@{}:{}'",
                             api_err, loc.owner, loc.repo, git_ref, loc.path
                         );
                     }
@@ -1770,8 +1782,8 @@ fn build_import_candidate_urls(source_url: &str) -> Vec<String> {
     out
 }
 
-async fn import_action_from_content(
-    state: &AppState,
+pub(crate) async fn import_action_from_content_with_agent(
+    agent: &Agent,
     source_url: &str,
     mut content: String,
     requested_name: Option<&str>,
@@ -1837,7 +1849,7 @@ async fn import_action_from_content(
         );
     }
 
-    // Guardrail: a common mistake is importing a rendered web page URL instead of raw SKILL.md/ACTION.md.
+    // Guardrail: a common mistake is importing a rendered web page URL instead of raw skill markdown.
     // Creating a skill from HTML leads to "No description" and non-functional workflow tests.
     let trimmed = content.trim_start();
     let looks_like_html = trimmed.starts_with("<!DOCTYPE html")
@@ -1848,11 +1860,11 @@ async fn import_action_from_content(
             source_url.contains("clawhub.ai/") || source_url.contains("openclaw.ai/");
         if is_clawhub_page {
             return Err(
-                "This ClawHub/OpenClaw URL appears to be a web page, not raw SKILL.md. Import the raw SKILL.md/ACTION.md file URL (or install via OpenClaw CLI and start a new session).".to_string(),
+                "This ClawHub/OpenClaw URL appears to be a web page, not raw SKILL.md. Import the raw SKILL.md URL instead (or a legacy ACTION.md if that repo still uses the older format).".to_string(),
             );
         }
         return Err(
-            "Imported content is HTML, not SKILL.md/ACTION.md markdown. Please provide a raw markdown skill URL."
+            "Imported content is HTML, not raw skill markdown. Please provide a raw SKILL.md URL instead (or a legacy ACTION.md URL if that repo still uses the older format)."
                 .to_string(),
         );
     }
@@ -1866,14 +1878,13 @@ async fn import_action_from_content(
         }
     }
 
-    let agent_guard = state.agent.read().await;
     let verdict_result = if preview_only {
-        agent_guard
+        agent
             .runtime
             .preview_action_security(&action_name, &content)
             .await
     } else {
-        agent_guard
+        agent
             .runtime
             .create_action(&action_name, &content, force)
             .await
@@ -1946,8 +1957,8 @@ async fn import_action_from_content(
                 .unwrap_or_default();
             let (missing_env, bindings) = if !required_env.is_empty() {
                 let secrets = crate::core::config::SecureConfigManager::new_with_data_dir(
-                    &agent_guard.config_dir,
-                    Some(&agent_guard.data_dir),
+                    &agent.config_dir,
+                    Some(&agent.data_dir),
                 )
                 .and_then(|mgr| mgr.load_secrets())
                 .map_err(|e| format!("Failed to load encrypted secrets: {}", e))?;
@@ -1961,8 +1972,7 @@ async fn import_action_from_content(
                     if let Some(b) = custom.get(&binding_key) {
                         bindings.insert(env.clone(), b.clone());
                     }
-                    if !env_is_configured_for_action(&agent_guard.config, custom, &action_name, env)
-                    {
+                    if !env_is_configured_for_action(&agent.config, custom, &action_name, env) {
                         missing.push(env.clone());
                     }
                 }
@@ -1975,10 +1985,7 @@ async fn import_action_from_content(
                 status = "needs_secrets";
             }
             if !preview_only && status == "needs_secrets" {
-                let _ = agent_guard
-                    .runtime
-                    .set_action_enabled(&action_name, false)
-                    .await;
+                let _ = agent.runtime.set_action_enabled(&action_name, false).await;
             }
 
             Ok(serde_json::json!({
@@ -2017,6 +2024,126 @@ async fn import_action_from_content(
         }
         Err(e) => Err(e.to_string()),
     }
+}
+
+async fn import_action_from_content(
+    state: &AppState,
+    source_url: &str,
+    content: String,
+    requested_name: Option<&str>,
+    force: bool,
+    model_override: Option<&str>,
+    preview_only: bool,
+) -> Result<serde_json::Value, String> {
+    let agent_guard = state.agent.read().await;
+    import_action_from_content_with_agent(
+        &agent_guard,
+        source_url,
+        content,
+        requested_name,
+        force,
+        model_override,
+        preview_only,
+    )
+    .await
+}
+
+pub(crate) async fn import_action_from_url_shared(
+    agent: &Agent,
+    url: &str,
+    name: Option<&str>,
+    force: bool,
+    model: Option<&str>,
+    preview_only: bool,
+) -> Result<serde_json::Value, String> {
+    let url = url.trim();
+    let _validated = validate_import_fetch_url(url).await?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("Failed to initialize HTTP client: {}", e))?;
+
+    let github_token =
+        crate::integrations::github::GitHubConnector::load_token_from(&agent.config_dir);
+    let gh_tok = github_token.as_deref();
+
+    let mut single_url_override: Option<String> = None;
+    if let Some(loc) = parse_github_location(url) {
+        if loc.directory_hint {
+            match discover_github_collection_urls(&client, url, gh_tok).await {
+                Ok(Some(mut discovered)) => {
+                    discovered.sort();
+                    discovered.dedup();
+                    if discovered.len() > 1 {
+                        return Err(
+                            "That URL resolves to multiple skills. Use the Skills page bulk import flow for collection URLs."
+                                .to_string(),
+                        );
+                    }
+                    single_url_override = discovered.into_iter().next();
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(format!("Failed to scan GitHub collection URL: {}", e));
+                }
+            }
+        }
+    }
+
+    let candidate_source_url = single_url_override.as_deref().unwrap_or(url);
+    let urls_to_try = build_import_candidate_urls(candidate_source_url);
+
+    let mut content = None;
+    let mut fetched_url: Option<String> = None;
+    let mut last_error = String::new();
+    for try_url in &urls_to_try {
+        let validated = match validate_import_fetch_url(try_url).await {
+            Ok(v) => v,
+            Err(reason) => {
+                last_error = reason;
+                continue;
+            }
+        };
+        match fetch_text_with_redirects(&client, validated, 3).await {
+            Ok(text) => {
+                content = Some(text);
+                fetched_url = Some(try_url.clone());
+                break;
+            }
+            Err(e) => last_error = e,
+        }
+    }
+
+    let content = content.ok_or_else(|| {
+        if url.contains("github.com")
+            && (url.contains("/blob/") || url.contains("/tree/"))
+            && !url.contains(".md")
+        {
+            format!(
+                "Failed to fetch skill from URL. If this is a GitHub folder/repo, AgentArk now scans for SKILL.md/ACTION.md automatically. Tried {:?}: {}",
+                urls_to_try, last_error
+            )
+        } else {
+            format!(
+                "Failed to fetch skill from URL (tried {:?}): {}",
+                urls_to_try, last_error
+            )
+        }
+    })?;
+
+    let source_url_for_name = fetched_url.as_deref().unwrap_or(candidate_source_url);
+    import_action_from_content_with_agent(
+        agent,
+        source_url_for_name,
+        content,
+        name,
+        force,
+        model,
+        preview_only,
+    )
+    .await
 }
 
 /// Import an action from a URL (e.g. GitHub raw content)
@@ -2330,67 +2457,11 @@ pub(super) async fn import_action(
         }
     }
 
-    let candidate_source_url = single_url_override.as_deref().unwrap_or(url);
-    let urls_to_try = build_import_candidate_urls(candidate_source_url);
-
-    // Fetch the content try each URL in order
-    let mut content = None;
-    let mut fetched_url: Option<String> = None;
-    let mut last_error = String::new();
-    for try_url in &urls_to_try {
-        let validated = match validate_import_fetch_url(try_url).await {
-            Ok(v) => v,
-            Err(reason) => {
-                last_error = reason;
-                continue;
-            }
-        };
-        match fetch_text_with_redirects(&client, validated, 3).await {
-            Ok(text) => {
-                content = Some(text);
-                fetched_url = Some(try_url.clone());
-                break;
-            }
-            Err(e) => last_error = e,
-        }
-    }
-
-    let content = match content {
-        Some(c) => c,
-        None => {
-            if url.contains("github.com")
-                && (url.contains("/blob/") || url.contains("/tree/"))
-                && !url.contains(".md")
-            {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: format!(
-                            "Failed to fetch skill from URL. If this is a GitHub folder/repo, AgentArk now scans for SKILL.md/ACTION.md automatically. Tried {:?}: {}",
-                            urls_to_try, last_error
-                        ),
-                    }),
-                )
-                    .into_response();
-            }
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: format!(
-                        "Failed to fetch skill from URL (tried {:?}): {}",
-                        urls_to_try, last_error
-                    ),
-                }),
-            )
-                .into_response();
-        }
-    };
-
-    let source_url_for_name = fetched_url.as_deref().unwrap_or(candidate_source_url);
-    match import_action_from_content(
-        &state,
-        source_url_for_name,
-        content,
+    let effective_url = single_url_override.as_deref().unwrap_or(url);
+    let agent_guard = state.agent.read().await;
+    match import_action_from_url_shared(
+        &agent_guard,
+        effective_url,
         request.name.as_deref(),
         request.force,
         request.model.as_deref(),
@@ -2399,11 +2470,7 @@ pub(super) async fn import_action(
     .await
     {
         Ok(payload) => (StatusCode::OK, Json(payload)).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-            .into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })).into_response(),
     }
 }
 

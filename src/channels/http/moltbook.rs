@@ -427,13 +427,20 @@ fn build_moltbook_submolt_context(feed_posts_raw: &[serde_json::Value]) -> serde
 }
 
 pub(super) async fn run_moltbook_cycle(state: &AppState, trigger: &str) -> serde_json::Value {
-    let Some(_run_guard) = try_start_moltbook_run() else {
+    let Some(run_guard) = try_start_moltbook_run() else {
         return serde_json::json!({
             "status": "running",
             "message": "Moltbook run already in progress"
         });
     };
+    run_moltbook_cycle_with_guard(state, trigger, run_guard).await
+}
 
+async fn run_moltbook_cycle_with_guard(
+    state: &AppState,
+    trigger: &str,
+    _run_guard: MoltbookRunGuard,
+) -> serde_json::Value {
     let (storage, config_dir) = {
         let agent = state.agent.read().await;
         (agent.storage.clone(), agent.config_dir.clone())
@@ -1666,7 +1673,7 @@ pub(super) async fn get_moltbook_log(
         .get("limit")
         .and_then(|s| s.parse().ok())
         .unwrap_or(50usize)
-        .min(200);
+        .min(500);
     let offset = params
         .get("offset")
         .and_then(|s| s.parse().ok())
@@ -1685,6 +1692,20 @@ pub(super) async fn get_moltbook_log(
 
 /// Trigger Moltbook run immediately.
 pub(super) async fn run_moltbook_now(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let result = run_moltbook_cycle(&state, "manual").await;
-    Json(result)
+    let Some(run_guard) = try_start_moltbook_run() else {
+        return Json(serde_json::json!({
+            "status": "running",
+            "message": "Moltbook run already in progress"
+        }));
+    };
+
+    let state_for_run = state.clone();
+    tokio::spawn(async move {
+        let _ = run_moltbook_cycle_with_guard(&state_for_run, "manual", run_guard).await;
+    });
+
+    Json(serde_json::json!({
+        "status": "started",
+        "message": "Moltbook run started in the background"
+    }))
 }

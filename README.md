@@ -222,6 +222,14 @@ you ➜ what can you do?
 agentark ➜ I can help with...
 ```
 
+CLI trace flow:
+
+- `Ctrl+T` toggles trace mode on or off without leaving chat
+- When trace mode is on, the full step-by-step trace prints before each agent reply
+- The trace is styled separately from the normal reply, so diagnostics stay distinct from the final answer
+- `Ctrl+D` exits the CLI chat cleanly
+- `Tab` autocompletes slash commands like `/help`, `/new`, and `/exit`
+
 What you can do from CLI:
 
 | Command / Action | Example |
@@ -235,9 +243,14 @@ What you can do from CLI:
 | Send emails (with Gmail integration) | `send an email to ...` |
 | Query documents | `what does the uploaded PDF say about ...` |
 | Start new conversation | `/new` |
+| Toggle full trace mode | `Ctrl+T` |
+| Autocomplete slash commands | `Tab` |
+| Exit quickly | `Ctrl+D` |
 | Exit | `/exit` |
 
 > All capabilities available in the Web UI work in CLI mode - the agent has the same tools, memory, and integrations.
+
+`agentark pulse` is not chat wrapped. It runs a dedicated ArkPulse CLI path, prints the latest health snapshot directly, and avoids the chat banner / stdin quirks that came from piping a prompt into `--chat`.
 
 ### Upcoming: Self-Update
 
@@ -290,6 +303,7 @@ In short:
 | **Parallel Thinking**       | Multiple reasoning paths processed simultaneously - 25-35 % cost reduction                        |
 | **Sub-Agent Orchestration** | Researcher · Coder · Analyst · Writer · Validator - auto-selected per task                        |
 | **Self-Evolve Engine**      | Policy evolution, strategy tuning, and routing benchmarks that improve the agent over time        |
+| **Self-Tune**               | Learns your style, tracks tool success rates, auto-adjusts autonomy confidence — adapts to you over time |
 | **Cognitive Memory**        | Three-tier: Episodic (conversations) · Semantic (facts) · Procedural (actions) with decay scoring |
 | **Live App Deployment**     | Deploy static or dynamic apps from chat - Node, Python, HTML, and more                            |
 | **Goal Autopilot**          | Goal → plan → scheduled execution → recurring progress reports                                    |
@@ -510,6 +524,30 @@ skills/             # Built-in skill definitions
 - **Tests for new features** - add to `tests/` when adding functionality
 - **No secrets in code** - use `SecureConfigManager` for anything sensitive
 - **Format before push** - `cargo fmt` and `cd frontend && npx prettier --write src/`
+
+## Acknowledgments
+
+AgentArk is built on the shoulders of outstanding open-source projects:
+
+| Project | Used for |
+| --- | --- |
+| [Rust](https://www.rust-lang.org/) | Core runtime — memory safety, performance, and fearless concurrency |
+| [Tokio](https://tokio.rs/) | Async runtime powering all concurrent operations |
+| [Axum](https://github.com/tokio-rs/axum) | HTTP server and API framework |
+| [SeaORM](https://www.sea-ql.org/SeaORM/) | Database ORM over SQLite |
+| [React](https://react.dev/) + [MUI](https://mui.com/) | Web UI framework and component library |
+| [Playwright](https://playwright.dev/) | Browser automation for screenshots and complex SPA interaction |
+| [Lightpanda](https://github.com/lightpanda-io/browser) | Fast headless browser for content extraction and web scraping |
+| [Mem0](https://github.com/mem0ai/mem0) | Semantic memory layer with vector search and decay |
+| [Cloudflared](https://github.com/cloudflare/cloudflared) | Zero-config tunnels for remote access |
+| [ECharts](https://echarts.apache.org/) | Analytics charts and data visualization |
+| [Wasmtime](https://wasmtime.dev/) | WebAssembly sandbox for secure code execution |
+| [Bollard](https://github.com/fussybeaver/bollard) | Docker API client for container management |
+| [Russh](https://github.com/warp-tech/russh) | SSH client for remote server operations |
+| [react-markdown](https://github.com/remarkjs/react-markdown) | Markdown rendering in chat |
+| [Teloxide](https://github.com/teloxide/teloxide) | Telegram bot framework |
+
+Thank you to every contributor and maintainer of these projects.
 
 ## License
 

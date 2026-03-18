@@ -369,9 +369,9 @@ export function IntegrationsPanel({
   const [telegramSetupOpen, setTelegramSetupOpen] = useState(false);
   const [whatsAppSetupOpen, setWhatsAppSetupOpen] = useState(false);
   const [channelForm, setChannelForm] = useState<ChannelSettingsForm>({
-    search_primary: "playwright",
-    search_fallback1: "duckduckgo",
-    search_fallback2: "none",
+    search_primary: "lightpanda",
+    search_fallback1: "playwright",
+    search_fallback2: "duckduckgo",
     search_serper_key: "",
     search_searxng_url: "",
     search_brave_key: "",
@@ -676,9 +676,9 @@ export function IntegrationsPanel({
     if (!showIntegrations || !settingsQ.data || channelsDirty) return;
     const next = asRecord(settingsQ.data);
     setChannelForm({
-      search_primary: str(next.search_primary, "playwright"),
-      search_fallback1: str(next.search_fallback1, "duckduckgo"),
-      search_fallback2: str(next.search_fallback2, "none"),
+      search_primary: str(next.search_primary, "lightpanda"),
+      search_fallback1: str(next.search_fallback1, "playwright"),
+      search_fallback2: str(next.search_fallback2, "duckduckgo"),
       search_serper_key: "",
       search_searxng_url: str(next.search_searxng_url, ""),
       search_brave_key: "",
@@ -1267,7 +1267,7 @@ export function IntegrationsPanel({
                   </TableCell>
                   <TableCell>
                     <Typography variant="body2" color="text.secondary" noWrap>
-                      {channelForm.search_primary || "playwright"} → {channelForm.search_fallback1 || "none"} → {channelForm.search_fallback2 || "none"}
+                      {channelForm.search_primary || "lightpanda"} → {channelForm.search_fallback1 || "playwright"} → {channelForm.search_fallback2 || "duckduckgo"}
                     </Typography>
                   </TableCell>
                   <TableCell align="right">
@@ -1645,6 +1645,7 @@ export function IntegrationsPanel({
               value={channelForm.search_primary}
               onChange={(e) => setChannelField("search_primary", e.target.value)}
             >
+              <MenuItem value="lightpanda">lightpanda</MenuItem>
               <MenuItem value="playwright">playwright</MenuItem>
               <MenuItem value="serper">serper</MenuItem>
               <MenuItem value="searxng">searxng</MenuItem>
@@ -1660,6 +1661,7 @@ export function IntegrationsPanel({
               onChange={(e) => setChannelField("search_fallback1", e.target.value)}
             >
               <MenuItem value="none">none</MenuItem>
+              <MenuItem value="lightpanda">lightpanda</MenuItem>
               <MenuItem value="playwright">playwright</MenuItem>
               <MenuItem value="serper">serper</MenuItem>
               <MenuItem value="searxng">searxng</MenuItem>
@@ -1675,6 +1677,7 @@ export function IntegrationsPanel({
               onChange={(e) => setChannelField("search_fallback2", e.target.value)}
             >
               <MenuItem value="none">none</MenuItem>
+              <MenuItem value="lightpanda">lightpanda</MenuItem>
               <MenuItem value="playwright">playwright</MenuItem>
               <MenuItem value="serper">serper</MenuItem>
               <MenuItem value="searxng">searxng</MenuItem>

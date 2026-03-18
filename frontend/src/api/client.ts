@@ -79,8 +79,13 @@ function clearBootstrapTokenFromLocation(): void {
   window.history.replaceState(null, "", nextUrl);
 }
 
-async function redeemLocalBootstrapToken(token: string): Promise<boolean> {
-  if (!token.trim()) return false;
+type LocalBootstrapAttempt = {
+  ok: boolean;
+  error?: string;
+};
+
+async function redeemLocalBootstrapToken(token: string): Promise<LocalBootstrapAttempt> {
+  if (!token.trim()) return { ok: false };
   try {
     const response = await fetch("/session/bootstrap/local", {
       method: "POST",
@@ -89,13 +94,14 @@ async function redeemLocalBootstrapToken(token: string): Promise<boolean> {
       headers: buildHeaders({ Accept: "application/json" }),
       body: JSON.stringify({ token })
     });
-    return response.ok;
+    if (response.ok) return { ok: true };
+    return { ok: false, error: extractErrorMessage(await response.text()) || undefined };
   } catch {
-    return false;
+    return { ok: false };
   }
 }
 
-async function requestLocalBootstrapToken(): Promise<string | null> {
+async function requestLocalBootstrapToken(): Promise<{ token: string | null; error?: string }> {
   try {
     const response = await fetch("/session/bootstrap/local", {
       method: "GET",
@@ -103,23 +109,29 @@ async function requestLocalBootstrapToken(): Promise<string | null> {
       cache: "no-store",
       headers: buildHeaders({ Accept: "application/json" }, { json: false })
     });
-    if (!response.ok) return null;
+    if (!response.ok) {
+      return {
+        token: null,
+        error: extractErrorMessage(await response.text()) || undefined
+      };
+    }
     const payload = (await response.json()) as Record<string, unknown>;
     const token = typeof payload.token === "string" ? payload.token.trim() : "";
-    return token || null;
+    return { token: token || null };
   } catch {
-    return null;
+    return { token: null };
   }
 }
 
-async function trySilentBootstrap(): Promise<boolean> {
+async function trySilentBootstrap(): Promise<LocalBootstrapAttempt> {
   const tokenFromHash = extractBootstrapTokenFromHash();
   const tokenFromWindow = (window.__AGENTARK_BOOTSTRAP_TOKEN__ || "").trim() || null;
-  const token = tokenFromHash || tokenFromWindow || (await requestLocalBootstrapToken());
-  if (!token) return false;
+  const requested = tokenFromHash || tokenFromWindow ? { token: tokenFromHash || tokenFromWindow } : await requestLocalBootstrapToken();
+  const token = requested.token;
+  if (!token) return { ok: false, error: requested.error };
 
   const redeemed = await redeemLocalBootstrapToken(token);
-  if (redeemed) {
+  if (redeemed.ok) {
     clearBootstrapTokenFromLocation();
   }
   try {
@@ -181,7 +193,8 @@ async function refreshUiSessionCookie(): Promise<void> {
   };
 
   sessionRefreshInFlight = (async () => {
-    if (await trySilentBootstrap()) return;
+    const firstSilentBootstrap = await trySilentBootstrap();
+    if (firstSilentBootstrap.ok) return;
 
     try {
       await fetch("/ui/v2", {
@@ -196,7 +209,8 @@ async function refreshUiSessionCookie(): Promise<void> {
 
     if (await probeProtectedSession()) return;
 
-    if (await trySilentBootstrap()) {
+    const secondSilentBootstrap = await trySilentBootstrap();
+    if (secondSilentBootstrap.ok) {
       if (await probeProtectedSession()) return;
     }
 
@@ -209,7 +223,9 @@ async function refreshUiSessionCookie(): Promise<void> {
 
     if (isLocalBrowserHost()) {
       throw new Error(
-        "Could not authorize this local browser session automatically. Restart AgentArk and refresh the page."
+        firstSilentBootstrap.error ||
+          secondSilentBootstrap.error ||
+          "Could not authorize this local browser session automatically. Restart AgentArk and refresh the page."
       );
     }
 

@@ -131,6 +131,7 @@ arboard = "3"
 # Expression evaluation (for safety rules)
 evalexpr = "11"
 tempfile = "3"
+crossterm = "0.28"
 
 [dev-dependencies]
 mockall = "0.13"

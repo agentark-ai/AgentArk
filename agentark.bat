@@ -10,8 +10,7 @@ if "%CMD%"=="chat" (
     goto :eof
 )
 if "%CMD%"=="pulse" (
-    echo Running ArkPulse health check...
-    echo run arkpulse now and show me the results | docker exec -i agentark /app/agentark --chat
+    docker exec agentark /app/agentark --pulse
     goto :eof
 )
 if "%CMD%"=="start" (

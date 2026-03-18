@@ -117,7 +117,7 @@ services:
     container_name: agentark
     restart: unless-stopped
     ports:
-      - "8990:8990"
+      - "127.0.0.1:8990:8990"
     volumes:
       - agentark-data:/app/data
       - agentark-config:/app/config
@@ -194,10 +194,16 @@ COMPOSE_EOF
 
 echo -e "${GREEN}[3/4] Configuration created at $INSTALL_DIR${NC}"
 
-cat > "$INSTALL_DIR/agentark.sh" << 'SCRIPT_EOF'
+cat > "$INSTALL_DIR/agentark" << 'SCRIPT_EOF'
 #!/bin/bash
+# AgentArk CLI — simple commands for your AI agent
+# Usage: agentark chat | pulse | start | stop | logs | status | update
+
 set -e
-cd "$(dirname "$0")"
+
+# Find install dir (resolve symlinks)
+SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+AGENTARK_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -205,58 +211,98 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-case "${1:-start}" in
+compose() {
+    docker compose -f "$AGENTARK_DIR/docker-compose.yml" "$@"
+}
+
+case "${1:-help}" in
+    chat)
+        docker exec -it agentark /app/agentark --chat
+        ;;
+    pulse)
+        echo -e "${CYAN}Running ArkPulse health check...${NC}"
+        docker exec agentark /app/agentark --pulse
+        ;;
     start)
         echo -e "${GREEN}Starting AgentArk...${NC}"
-        docker compose up -d --build
+        compose up -d --build
         echo ""
         echo -e "${GREEN}AgentArk is running!${NC}"
         echo -e "  Web UI:  ${CYAN}http://localhost:8990${NC}"
         ;;
     tunnel)
         echo -e "${GREEN}Starting AgentArk with remote access...${NC}"
-        AGENTARK_TUNNEL=true docker compose up -d --build
+        AGENTARK_TUNNEL=true compose up -d --build
         echo ""
         echo -e "  Local:   ${CYAN}http://localhost:8990${NC}"
         echo -e "  Remote:  ${CYAN}Your Cloudflare URL will appear in the Web UI${NC}"
         ;;
     stop)
         echo -e "${YELLOW}Stopping AgentArk...${NC}"
-        docker compose down
+        compose down
         echo -e "${GREEN}Stopped. Your data is preserved.${NC}"
         ;;
     restart)
-        docker compose up -d agentark
+        compose down && compose up -d
         ;;
     update)
         echo -e "${YELLOW}Updating AgentArk source and rebuilding...${NC}"
-        docker run --rm -v "$(pwd):/work" -w /work alpine/git git -C /work/source pull --ff-only || true
-        docker compose build agentark
-        docker compose up -d agentark
+        docker run --rm -v "$AGENTARK_DIR:/work" -w /work alpine/git git -C /work/source pull --ff-only || true
+        compose build agentark
+        compose up -d agentark
         echo -e "${GREEN}Updated! Your data is intact.${NC}"
         ;;
     logs)
-        docker compose logs -f
+        compose logs -f --tail=100
         ;;
     status)
-        docker compose ps
+        compose ps
+        ;;
+    setup)
+        docker exec -it agentark /app/agentark --setup
         ;;
     uninstall)
         echo -e "${YELLOW}This will stop AgentArk and remove containers.${NC}"
         echo -e "${BOLD}Your data volumes and source checkout will be preserved.${NC}"
         read -p "Continue? [y/N] " confirm
         if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-            docker compose down
-            echo -e "${GREEN}Removed. Data volumes kept. Source remains in ./source.${NC}"
+            compose down
+            rm -f /usr/local/bin/agentark 2>/dev/null || true
+            echo -e "${GREEN}Removed. Data volumes kept. Source remains in $AGENTARK_DIR/source.${NC}"
         fi
         ;;
     *)
-        echo "Usage: ./agentark.sh [start|tunnel|stop|restart|update|logs|status|uninstall]"
+        echo "AgentArk CLI"
+        echo ""
+        echo "Usage: agentark <command>"
+        echo ""
+        echo "  chat       Interactive CLI chat with your agent"
+        echo "  pulse      Run ArkPulse health check"
+        echo "  start      Start AgentArk (or 'tunnel' for remote access)"
+        echo "  stop       Stop AgentArk"
+        echo "  restart    Restart AgentArk"
+        echo "  logs       View live logs"
+        echo "  status     Show running containers"
+        echo "  update     Pull latest and rebuild (preserves data)"
+        echo "  setup      Run setup wizard"
+        echo "  uninstall  Stop and remove containers"
         ;;
 esac
 SCRIPT_EOF
 
-chmod +x "$INSTALL_DIR/agentark.sh"
+chmod +x "$INSTALL_DIR/agentark"
+
+# Install global 'agentark' command on PATH
+if [ -d /usr/local/bin ] && [ -w /usr/local/bin ]; then
+    ln -sf "$INSTALL_DIR/agentark" /usr/local/bin/agentark
+    echo -e "${GREEN}Installed 'agentark' command globally.${NC}"
+elif command -v sudo &>/dev/null; then
+    sudo ln -sf "$INSTALL_DIR/agentark" /usr/local/bin/agentark
+    echo -e "${GREEN}Installed 'agentark' command globally.${NC}"
+else
+    echo -e "${YELLOW}Could not install to /usr/local/bin. Add $INSTALL_DIR to your PATH:${NC}"
+    echo -e "  export PATH=\"$INSTALL_DIR:\$PATH\""
+fi
 
 echo -e "${CYAN}Building AgentArk image from local source (this may take a few minutes)...${NC}"
 cd "$INSTALL_DIR"
@@ -271,15 +317,13 @@ echo -e "${BOLD}=========================================${NC}"
 echo ""
 echo -e "  Web UI:  ${CYAN}http://localhost:8990${NC}"
 echo ""
-echo -e "  Manage:  ${BOLD}cd $INSTALL_DIR && ./agentark.sh${NC}"
-echo ""
-echo -e "  Commands:"
-echo -e "    ./agentark.sh start     Start AgentArk"
-echo -e "    ./agentark.sh tunnel    Start with remote access"
-echo -e "    ./agentark.sh stop      Stop AgentArk"
-echo -e "    ./agentark.sh update    Pull source and rebuild"
-echo -e "    ./agentark.sh logs      View logs"
-echo -e "    ./agentark.sh status    Show status"
+echo -e "  Commands (run from anywhere):"
+echo -e "    ${BOLD}agentark chat${NC}       Interactive CLI chat"
+echo -e "    ${BOLD}agentark pulse${NC}      Run ArkPulse health check"
+echo -e "    ${BOLD}agentark stop${NC}       Stop AgentArk"
+echo -e "    ${BOLD}agentark update${NC}     Pull latest and rebuild"
+echo -e "    ${BOLD}agentark logs${NC}       View logs"
+echo -e "    ${BOLD}agentark status${NC}     Show status"
 echo ""
 echo -e "${YELLOW}Writable source checkout: $SOURCE_DIR${NC}"
 echo -e "${YELLOW}Data is stored in Docker volumes and survives rebuilds.${NC}"
