@@ -3521,6 +3521,24 @@ Do not include any extra prose.",
             .get("include_structured")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
+        let external_sources = call
+            .arguments
+            .get("external_sources")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let include_moltbook_external = external_sources
+            .iter()
+            .any(|source| source.eq_ignore_ascii_case("moltbook"))
+            || query.to_ascii_lowercase().contains("moltbook");
 
         let mut sections: Vec<String> = Vec::new();
 
@@ -3540,6 +3558,9 @@ Do not include any extra prose.",
                     }
                 }
             } else {
+                Vec::new()
+            };
+            let semantic_lines = if semantic_lines.is_empty() {
                 match self
                     .memory
                     .retrieve_relevant(query, limit.min(5), project_id)
@@ -3547,6 +3568,14 @@ Do not include any extra prose.",
                 {
                     Ok(memories) => memories
                         .into_iter()
+                        .filter(|memory| {
+                            include_moltbook_external
+                                || !matches!(
+                                    &memory.memory_type,
+                                    crate::memory::MemoryType::Episodic { context }
+                                        if context.channel.eq_ignore_ascii_case("moltbook")
+                                )
+                        })
                         .take(limit)
                         .map(|m| format!("- {}", safe_truncate(&m.content, 220)))
                         .collect::<Vec<_>>(),
@@ -3555,6 +3584,8 @@ Do not include any extra prose.",
                         Vec::new()
                     }
                 }
+            } else {
+                semantic_lines
             };
 
             if !semantic_lines.is_empty() {
@@ -3563,7 +3594,10 @@ Do not include any extra prose.",
         }
 
         if include_structured {
-            if let Some(domain_ctx) = self.build_memory_domain_context(query, project_id).await {
+            if let Some(domain_ctx) = self
+                .build_memory_domain_context(query, project_id, &external_sources)
+                .await
+            {
                 sections.push(domain_ctx);
             }
         }

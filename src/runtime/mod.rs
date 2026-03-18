@@ -608,7 +608,7 @@ impl ActionRuntime {
 
         self.register_builtin_action(ActionDef {
             name: "memory_lookup".to_string(),
-            description: "Look up relevant user memory on demand. Use when the answer may depend on prior user facts, preferences, saved links/data, or knowledge base context that is not already in the recent conversation.".to_string(),
+            description: "Look up relevant user memory on demand. Use when the answer may depend on prior user facts, preferences, saved links/data, or knowledge base context that is not already in the recent conversation. For source-scoped external learnings such as Moltbook, set `external_sources` only when that source is directly relevant.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -616,7 +616,12 @@ impl ActionRuntime {
                     "query": { "type": "string", "description": "What memory or prior context to look up" },
                     "limit": { "type": "integer", "description": "Maximum number of memory hits to return (default: 5)" },
                     "include_semantic": { "type": "boolean", "description": "Include semantic memory matches (default: true)" },
-                    "include_structured": { "type": "boolean", "description": "Include structured preferences, user data, and knowledge base context (default: true)" }
+                    "include_structured": { "type": "boolean", "description": "Include structured preferences, user data, and knowledge base context (default: true)" },
+                    "external_sources": {
+                        "type": "array",
+                        "description": "Optional source-scoped external memory surfaces to include only when directly relevant, for example [\"moltbook\"]",
+                        "items": { "type": "string" }
+                    }
                 },
                 "required": ["query"]
             }),
@@ -4258,11 +4263,7 @@ print(result["text"])
                     {
                         Ok(markdown) => return Ok(markdown),
                         Err(e) => {
-                            tracing::debug!(
-                                "Lightpanda fast-path skipped for {}: {}",
-                                url,
-                                e
-                            );
+                            tracing::debug!("Lightpanda fast-path skipped for {}: {}", url, e);
                         }
                     }
                 }

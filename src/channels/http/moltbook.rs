@@ -250,6 +250,14 @@ struct MoltbookEngagementAction {
     reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct MoltbookMemoryInsights {
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    insights: Vec<String>,
+}
+
 fn moltbook_write_mode_enabled(settings: &MoltbookSettings, trigger: &str) -> bool {
     if !settings.write_enabled {
         return false;
@@ -287,6 +295,198 @@ fn moltbook_post_preview(post: &serde_json::Value) -> String {
         }
     }
     String::new()
+}
+
+fn moltbook_memory_feed_items(
+    feed_posts_raw: &[serde_json::Value],
+    engaged_post_ids: &[String],
+) -> Vec<serde_json::Value> {
+    let engaged_ids = engaged_post_ids
+        .iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect::<HashSet<_>>();
+
+    feed_posts_raw
+        .iter()
+        .take(6)
+        .filter_map(|post| {
+            let post_id = post
+                .get("id")
+                .and_then(|value| value.as_str())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            let title = post
+                .get("title")
+                .and_then(|value| value.as_str())
+                .map(|value| value.trim().to_string())
+                .unwrap_or_default();
+            let submolt = post
+                .get("submolt")
+                .and_then(|value| {
+                    value
+                        .get("name")
+                        .and_then(|name| name.as_str())
+                        .or_else(|| value.as_str())
+                })
+                .map(|value| value.trim().to_string())
+                .unwrap_or_else(|| "general".to_string());
+            let preview = moltbook_post_preview(post);
+            if title.is_empty() && preview.is_empty() {
+                return None;
+            }
+            let engaged = post_id
+                .as_ref()
+                .map(|id| engaged_ids.contains(id))
+                .unwrap_or(false);
+            Some(serde_json::json!({
+                "id": post_id,
+                "engaged": engaged,
+                "title": title,
+                "submolt": submolt,
+                "preview": preview
+            }))
+        })
+        .collect()
+}
+
+fn format_moltbook_memory_text(insights: &MoltbookMemoryInsights) -> String {
+    let mut lines = Vec::new();
+    let summary = insights.summary.trim();
+    if summary.is_empty() {
+        lines.push("Moltbook community learnings:".to_string());
+    } else {
+        lines.push(format!("Moltbook community learnings: {}", summary));
+    }
+    for insight in insights.insights.iter().take(4) {
+        lines.push(format!("- {}", insight));
+    }
+    lines.join("\n")
+}
+
+fn format_moltbook_external_knowledge_title(insights: &MoltbookMemoryInsights) -> String {
+    let seed = if insights.summary.trim().is_empty() {
+        insights
+            .insights
+            .first()
+            .map(|value| value.as_str())
+            .unwrap_or("Community learning")
+    } else {
+        insights.summary.trim()
+    };
+    format!("Moltbook: {}", moltbook_text_preview(seed, 96))
+}
+
+async fn persist_moltbook_external_knowledge(
+    storage: &crate::storage::Storage,
+    insights: &MoltbookMemoryInsights,
+) -> std::result::Result<crate::storage::entities::knowledge_item::Model, String> {
+    let title = format_moltbook_external_knowledge_title(insights);
+    let content = format_moltbook_memory_text(insights);
+    storage
+        .create_knowledge_item(
+            &title,
+            &content,
+            Some("moltbook"),
+            None,
+            Some("external-source,moltbook,community-learning"),
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn distill_moltbook_memory_insights(
+    state: &AppState,
+    trigger: &str,
+    settings: &MoltbookSettings,
+    feed_posts_raw: &[serde_json::Value],
+    decision_summary: &str,
+    engaged_post_ids: &[String],
+    comment_count: usize,
+    upvote_count: usize,
+    post_count: usize,
+    engagement_failures: &[String],
+    posted_url: Option<&str>,
+) -> std::result::Result<Option<MoltbookMemoryInsights>, String> {
+    if feed_posts_raw.is_empty() && comment_count + upvote_count + post_count == 0 {
+        return Ok(None);
+    }
+
+    let feed_items = moltbook_memory_feed_items(feed_posts_raw, engaged_post_ids);
+    if feed_items.is_empty()
+        && decision_summary.trim().is_empty()
+        && comment_count + upvote_count + post_count == 0
+    {
+        return Ok(None);
+    }
+
+    let (llm, agent_name) = {
+        let agent = state.agent.read().await;
+        (agent.llm.clone(), agent.config.name.clone())
+    };
+
+    let payload = serde_json::json!({
+        "trigger": trigger,
+        "mode": settings.mode.clone(),
+        "agent_name": agent_name,
+        "decision_summary": moltbook_text_preview(decision_summary, 240),
+        "engagement": {
+            "comment_count": comment_count,
+            "upvote_count": upvote_count,
+            "post_count": post_count,
+            "engaged_post_ids": engaged_post_ids,
+            "failures": engagement_failures.iter().take(3).cloned().collect::<Vec<_>>(),
+            "created_post_url": posted_url
+        },
+        "feed": feed_items
+    });
+
+    let prompt = r#"You are extracting durable semantic memory from AgentArk's Moltbook run.
+Return strict JSON only with this shape:
+{"summary":"short string","insights":["insight 1","insight 2"]}
+
+Rules:
+- Capture only reusable learnings from the community feed or the agent's engagement choices.
+- Prefer stable patterns, recurring tensions, practical lessons, or high-signal open questions.
+- Ignore routine operational details, one-off status updates, IDs, timestamps, and pure process notes.
+- Do not include usernames, post IDs, URLs, or private data.
+- Keep 0-4 insights, each one sentence and under 180 characters.
+- If nothing is worth saving for future conversations, return an empty insights array."#;
+
+    let response = llm
+        .chat(prompt, &payload.to_string(), &[], &[])
+        .await
+        .map_err(|e| e.to_string())?;
+    {
+        let agent = state.agent.read().await;
+        agent
+            .record_llm_usage("moltbook", "memory_distiller", &response)
+            .await;
+    }
+
+    let parsed = extract_json(&response.content)
+        .and_then(|value| serde_json::from_value::<MoltbookMemoryInsights>(value).ok())
+        .ok_or_else(|| "Could not parse Moltbook memory distiller response.".to_string())?;
+
+    let mut seen = HashSet::new();
+    let insights = parsed
+        .insights
+        .into_iter()
+        .map(|value| moltbook_text_preview(value.trim(), 180))
+        .filter(|value| !value.is_empty())
+        .filter(|value| seen.insert(value.to_ascii_lowercase()))
+        .take(4)
+        .collect::<Vec<_>>();
+
+    if insights.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(MoltbookMemoryInsights {
+        summary: moltbook_text_preview(parsed.summary.trim(), 180),
+        insights,
+    }))
 }
 
 async fn build_moltbook_recent_activity_context(
@@ -510,7 +710,12 @@ async fn run_moltbook_cycle_with_guard(
         }
     }
 
-    if trigger != "manual" && settings.defer_when_busy && server_under_load(state).await {
+    let busy_reasons = if trigger != "manual" && settings.defer_when_busy {
+        server_load_reasons(state).await
+    } else {
+        Vec::new()
+    };
+    if trigger != "manual" && settings.defer_when_busy && !busy_reasons.is_empty() {
         let defers = storage
             .get(MOLTBOOK_DEFER_COUNT_KEY)
             .await
@@ -521,19 +726,33 @@ async fn run_moltbook_cycle_with_guard(
             .unwrap_or(0);
 
         if defers >= 3 {
-            let _ = storage.delete(MOLTBOOK_NEXT_RUN_KEY).await;
+            let retry_at = std::cmp::max(
+                now + chrono::Duration::minutes(30),
+                moltbook_next_run_at(&settings.sync_frequency, now),
+            );
+            let _ = storage
+                .set(MOLTBOOK_NEXT_RUN_KEY, retry_at.to_rfc3339().as_bytes())
+                .await;
             let _ = storage.delete(MOLTBOOK_DEFER_COUNT_KEY).await;
+            let _ = storage.set(MOLTBOOK_LAST_STATUS_KEY, b"skipped_busy").await;
             append_moltbook_activity(
                 &storage,
                 &run_id,
                 "warning",
                 "skipped_busy_max_defers",
-                serde_json::json!({ "trigger": trigger, "max_defers": 3 }),
+                serde_json::json!({
+                    "trigger": trigger,
+                    "max_defers": 3,
+                    "busy_reasons": busy_reasons,
+                    "retry_at": retry_at.to_rfc3339()
+                }),
             )
             .await;
             return serde_json::json!({
                 "status": "skipped_busy",
                 "run_id": run_id,
+                "busy_reasons": busy_reasons,
+                "retry_at": retry_at.to_rfc3339(),
             });
         }
 
@@ -545,6 +764,9 @@ async fn run_moltbook_cycle_with_guard(
         let _ = storage
             .set(MOLTBOOK_DEFER_COUNT_KEY, new_defers.to_string().as_bytes())
             .await;
+        let _ = storage
+            .set(MOLTBOOK_LAST_STATUS_KEY, b"deferred_busy")
+            .await;
         append_moltbook_activity(
             &storage,
             &run_id,
@@ -554,7 +776,8 @@ async fn run_moltbook_cycle_with_guard(
                 "trigger": trigger,
                 "deferred_to": deferred_to.to_rfc3339(),
                 "attempt": new_defers,
-                "max_defers": 3
+                "max_defers": 3,
+                "busy_reasons": busy_reasons
             }),
         )
         .await;
@@ -563,7 +786,8 @@ async fn run_moltbook_cycle_with_guard(
             "run_id": run_id,
             "deferred_to": deferred_to.to_rfc3339(),
             "attempt": new_defers,
-            "max_defers": 3
+            "max_defers": 3,
+            "busy_reasons": busy_reasons
         });
     }
 
@@ -582,7 +806,6 @@ async fn run_moltbook_cycle_with_guard(
     let connector =
         crate::integrations::moltbook::MoltbookConnector::new_with_config_dir(config_dir);
     let mut read_count = 0usize;
-    let mut memory_episode_id: Option<String> = None;
     let mut posted = false;
     let mut post_count = 0usize;
     let mut comment_count = 0usize;
@@ -742,59 +965,6 @@ async fn run_moltbook_cycle_with_guard(
                 }),
             )
             .await;
-
-            if read_count > 0 {
-                let memory_text = format!(
-                    "Moltbook sync: read {} new post(s). Sample topics: {}",
-                    read_count,
-                    samples.join(" | ")
-                );
-                let memory_preview = memory_text.chars().take(240).collect::<String>();
-                let mem_result = {
-                    let agent = state.agent.read().await;
-                    let ctx = crate::memory::EpisodeContext {
-                        channel: "moltbook".to_string(),
-                        timestamp: chrono::Utc::now(),
-                        location: None,
-                        participants: vec!["moltbook".to_string()],
-                        project_id: None,
-                    };
-                    agent.memory.add_episode(memory_text, ctx, 0.35, None).await
-                };
-                match mem_result {
-                    Ok(mid) => {
-                        memory_episode_id = Some(mid.to_string());
-                        append_moltbook_activity(
-                            &storage,
-                            &run_id,
-                            "info",
-                            "memory_saved",
-                            serde_json::json!({
-                                "action_kind": "memory_write",
-                                "operation": "add_episode",
-                                "memory_target": "episodes",
-                                "episode_id": mid.to_string(),
-                                "summary_preview": memory_preview
-                            }),
-                        )
-                        .await;
-                    }
-                    Err(e) => {
-                        append_moltbook_activity(
-                            &storage,
-                            &run_id,
-                            "warning",
-                            "memory_save_failed",
-                            serde_json::json!({
-                                "action_kind": "memory_write",
-                                "operation": "add_episode",
-                                "error": e.to_string()
-                            }),
-                        )
-                        .await;
-                    }
-                }
-            }
         }
         Err(e) => {
             append_moltbook_activity(
@@ -1548,6 +1718,104 @@ Rules:
         posted_api_url.clone(),
     );
 
+    let external_memory = match distill_moltbook_memory_insights(
+        state,
+        trigger,
+        &settings,
+        &feed_posts_raw,
+        &decision_summary,
+        &engaged_post_ids,
+        comment_count,
+        upvote_count,
+        post_count,
+        &engagement_failures,
+        posted_url.as_deref(),
+    )
+    .await
+    {
+        Ok(Some(insights)) => {
+            match persist_moltbook_external_knowledge(&storage, &insights).await {
+                Ok(item) => {
+                    append_moltbook_activity(
+                        &storage,
+                        &run_id,
+                        "info",
+                        "external_memory_saved",
+                        serde_json::json!({
+                            "knowledge_id": item.id,
+                            "title": item.title,
+                            "source": item.source,
+                            "tags": item.tags,
+                            "summary": insights.summary,
+                            "insights": insights.insights
+                        }),
+                    )
+                    .await;
+                    serde_json::json!({
+                        "status": "saved",
+                        "store": "knowledge",
+                        "knowledge_id": item.id,
+                        "title": item.title,
+                        "source": item.source,
+                        "tags": item.tags,
+                        "summary": insights.summary,
+                        "insights": insights.insights
+                    })
+                }
+                Err(error) => {
+                    append_moltbook_activity(
+                        &storage,
+                        &run_id,
+                        "warning",
+                        "external_memory_save_failed",
+                        serde_json::json!({
+                            "summary": insights.summary,
+                            "insights": insights.insights,
+                            "error": error
+                        }),
+                    )
+                    .await;
+                    serde_json::json!({
+                        "status": "save_failed",
+                        "store": "knowledge",
+                        "summary": insights.summary,
+                        "insights": insights.insights,
+                        "error": error
+                    })
+                }
+            }
+        }
+        Ok(None) => {
+            append_moltbook_activity(
+                &storage,
+                &run_id,
+                "info",
+                "external_memory_skipped",
+                serde_json::json!({
+                    "reason": "No durable Moltbook learnings were identified for source-scoped knowledge."
+                }),
+            )
+            .await;
+            serde_json::json!({ "status": "skipped" })
+        }
+        Err(error) => {
+            append_moltbook_activity(
+                &storage,
+                &run_id,
+                "warning",
+                "external_memory_distill_failed",
+                serde_json::json!({
+                    "error": error
+                }),
+            )
+            .await;
+            serde_json::json!({
+                "status": "distill_failed",
+                "error": error
+            })
+        }
+    };
+
     let next = moltbook_next_run_at(&settings.sync_frequency, now);
     let _ = storage
         .set(MOLTBOOK_NEXT_RUN_KEY, next.to_rfc3339().as_bytes())
@@ -1570,13 +1838,13 @@ Rules:
         "engaged_post_ids": engaged_post_ids,
         "engagement_failures": engagement_failures,
         "decision_summary": decision_summary,
-        "memory_episode_id": memory_episode_id,
         "posted": posted,
         "posted_id": posted_id,
         "post_api_url": posted_api_url,
         "post_url": posted_url,
         "links": run_links,
         "api_links": run_api_links,
+        "external_memory": external_memory,
         "next_run_at": next.to_rfc3339(),
     });
     let _ = storage
@@ -1644,6 +1912,11 @@ pub(super) async fn get_moltbook_status(State(state): State<AppState>) -> Json<s
         .ok()
         .flatten()
         .and_then(|v| serde_json::from_slice::<serde_json::Value>(&v).ok());
+    let busy_reasons = if settings.defer_when_busy {
+        server_load_reasons(&state).await
+    } else {
+        Vec::<String>::new()
+    };
 
     Json(serde_json::json!({
         "enabled": settings.enabled,
@@ -1660,6 +1933,7 @@ pub(super) async fn get_moltbook_status(State(state): State<AppState>) -> Json<s
         "last_upvote_at": last_upvote_at,
         "last_engagement_at": last_engagement_at,
         "last_run_stats": last_run_stats,
+        "busy_reasons": busy_reasons,
         "connector_registered": has_connector,
     }))
 }

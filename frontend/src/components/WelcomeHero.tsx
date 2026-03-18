@@ -4,7 +4,7 @@ import AutoAwesomeRoundedIcon from "@mui/icons-material/AutoAwesomeRounded";
 import PauseCircleOutlineRoundedIcon from "@mui/icons-material/PauseCircleOutlineRounded";
 import PlayCircleOutlineRoundedIcon from "@mui/icons-material/PlayCircleOutlineRounded";
 import ListAltRoundedIcon from "@mui/icons-material/ListAltRounded";
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 type Props = {
   onGoChat?: () => void;
@@ -25,6 +25,16 @@ export function WelcomeHero({
   briefingLoading = false,
   pauseLoading = false,
 }: Props) {
+  const heroPrompts = useMemo(
+    () => [
+      "Review recent changes and list only the critical risks.",
+      "Build a small app to track competitor launches and deploy it.",
+      "Import this skill URL and wire up any required secrets.",
+      "Summarize the current project state and name the next decision.",
+      "Inspect active automations and surface anything that needs intervention.",
+    ],
+    []
+  );
   const greeting = useMemo(() => {
     const h = new Date().getHours();
     if (h < 5) return "Welcome back";
@@ -32,6 +42,40 @@ export function WelcomeHero({
     if (h < 18) return "Good afternoon";
     return "Good evening";
   }, []);
+  const [promptIndex, setPromptIndex] = useState(0);
+  const [typedPrompt, setTypedPrompt] = useState("");
+  const [isDeletingPrompt, setIsDeletingPrompt] = useState(false);
+
+  useEffect(() => {
+    if (typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      setTypedPrompt(heroPrompts[promptIndex] || "");
+      return;
+    }
+
+    const activePrompt = heroPrompts[promptIndex] || "";
+    const nextDelay = isDeletingPrompt ? 16 : 32;
+    const holdDelay = 1700;
+    const resetDelay = 240;
+
+    const timer = window.setTimeout(() => {
+      if (!isDeletingPrompt && typedPrompt !== activePrompt) {
+        setTypedPrompt(activePrompt.slice(0, typedPrompt.length + 1));
+        return;
+      }
+      if (!isDeletingPrompt) {
+        setIsDeletingPrompt(true);
+        return;
+      }
+      if (typedPrompt.length > 0) {
+        setTypedPrompt(activePrompt.slice(0, typedPrompt.length - 1));
+        return;
+      }
+      setIsDeletingPrompt(false);
+      setPromptIndex((prev) => (prev + 1) % heroPrompts.length);
+    }, !isDeletingPrompt && typedPrompt === activePrompt ? holdDelay : typedPrompt.length === 0 && isDeletingPrompt ? resetDelay : nextDelay);
+
+    return () => window.clearTimeout(timer);
+  }, [heroPrompts, isDeletingPrompt, promptIndex, typedPrompt]);
 
   return (
     <Card
@@ -93,7 +137,19 @@ export function WelcomeHero({
                 background: "rgba(8, 19, 34, 0.58)"
               }}
             >
-              Try: "Review recent changes and list only the critical risks."
+              Try: "{typedPrompt || heroPrompts[0]}"
+              <Box
+                component="span"
+                sx={{
+                  display: "inline-block",
+                  width: "0.7ch",
+                  ml: 0.15,
+                  opacity: 0.9,
+                  animation: "welcomeHeroCursorBlink 1s steps(1, end) infinite"
+                }}
+              >
+                |
+              </Box>
             </Typography>
           </Box>
           <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ width: { xs: "100%", sm: "auto" } }}>

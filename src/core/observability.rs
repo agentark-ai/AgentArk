@@ -141,6 +141,7 @@ pub async fn append_delivery_log(storage: &Storage, entry: ObservabilityDelivery
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn observability_is_ready(config: &AgentConfig, auth_token: Option<&str>) -> bool {
     config.observability.enabled
         && !normalize_observability_endpoint(
@@ -171,6 +172,7 @@ fn otel_attribute_string(key: &str, value: String) -> serde_json::Value {
     json!({ "key": key, "value": { "stringValue": value } })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn otel_attribute_bool(key: &str, value: bool) -> serde_json::Value {
     json!({ "key": key, "value": { "boolValue": value } })
 }
@@ -394,8 +396,16 @@ async fn post_export_payload(
     }
     // LangSmith requires project name header for OTLP ingestion
     if endpoint.contains("smith.langchain") || endpoint.contains("langsmith") {
-        let project = if service_name.trim().is_empty() { "default" } else { service_name.trim() };
-        tracing::info!("LangSmith export: project='{}', endpoint='{}'", project, endpoint);
+        let project = if service_name.trim().is_empty() {
+            "default"
+        } else {
+            service_name.trim()
+        };
+        tracing::info!(
+            "LangSmith export: project='{}', endpoint='{}'",
+            project,
+            endpoint
+        );
         request = request.header("X-LangSmith-Project", project);
     }
     Ok(request.send().await?)

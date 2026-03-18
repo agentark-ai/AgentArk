@@ -14,6 +14,7 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_OUTPUT_BYTES: usize = 200_000;
 
 /// Check whether the `lightpanda` binary is available on PATH.
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn is_available() -> bool {
     Command::new("lightpanda")
         .arg("--help")
@@ -77,14 +78,7 @@ pub async fn fetch_markdown(url: &str) -> Result<String> {
 /// Uses `lightpanda fetch --dump html <url>`.
 pub async fn fetch_html(url: &str) -> Result<String> {
     let child = Command::new("lightpanda")
-        .args([
-            "fetch",
-            "--dump",
-            "html",
-            "--http_timeout",
-            "12000",
-            url,
-        ])
+        .args(["fetch", "--dump", "html", "--http_timeout", "12000", url])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)

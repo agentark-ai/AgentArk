@@ -109,6 +109,15 @@ type ChatRunStatusDetail = {
   message: string;
 };
 
+type ChatExecutionMode = "auto" | "chat" | "task";
+
+type ActiveChatTaskState = {
+  id: string;
+  description: string;
+  status: string;
+  workType: string;
+};
+
 const MODEL_FALLBACKS_BY_PROVIDER: Record<string, string[]> = {
   openai: ["gpt-5", "gpt-5-mini", "gpt-4.1", "o4-mini", "o3"],
   "openai-subscription": ["gpt-5", "gpt-5-mini", "gpt-4.1", "o4-mini", "o3"],
@@ -2651,13 +2660,13 @@ function ImportUrlDialog({
           {error && <Alert severity="error">{error}</Alert>}
           {info && <Alert severity="info">{info}</Alert>}
           <Typography variant="caption" color="text.secondary">
-            Supports direct SKILL.md links plus GitHub and ClawHub/OpenClaw skill URLs.
+            Supports direct SKILL.md links plus GitHub and ClawHub/OpenClaw skill page URLs.
           </Typography>
           <Typography variant="caption" color="text.secondary" sx={{ whiteSpace: "pre-line" }}>
             {`Examples:
 1. https://github.com/org/repo/tree/main/skills/market-analysis
 2. https://raw.githubusercontent.com/org/repo/main/skills/market-analysis/SKILL.md
-3. https://clawhub.ai/org/market-analysis`}
+3. https://clawhub.ai/pskoett/self-improving-agent`}
           </Typography>
           <TextField
             fullWidth
@@ -3145,10 +3154,12 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [draftProjectId, setDraftProjectId] = useState("");
   const [prompt, setPrompt] = useState("");
+  const [chatExecutionMode, setChatExecutionMode] = useState<ChatExecutionMode>("auto");
   const [deepResearchEnabled, setDeepResearchEnabled] = useState(false);
   const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
   const [chatError, setChatError] = useState<string | null>(null);
   const [chatNotice, setChatNotice] = useState<string | null>(null);
+  const [activeChatTask, setActiveChatTask] = useState<ActiveChatTaskState | null>(null);
   const [isStreaming, setIsStreaming] = useState(false);
   const [pendingUserMessage, setPendingUserMessage] = useState<string | null>(null);
   const [failedUserMessage, setFailedUserMessage] = useState<string | null>(null);
@@ -4455,6 +4466,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
       projectIdOverride?: string;
       statusSource?: string;
       deepResearch?: boolean;
+      executionMode?: ChatExecutionMode;
     }
   ): Promise<boolean> => {
     const requestedConversationOverride = (opts?.conversationIdOverride || "").trim();
@@ -4474,10 +4486,11 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     if (!activeMessage || isStreaming || streamLockRef.current) return false;
     const now = Date.now();
     const deepResearch = Boolean(opts?.deepResearch);
+    const executionMode = opts?.executionMode || chatExecutionMode;
     const fingerprint = `${targetConversationId || "__new__"}::${targetProjectId || "__no_project__"}::${activeMessage
       .toLowerCase()
       .replace(/\s+/g, " ")
-      .trim()}::${deepResearch ? "research" : "chat"}`;
+      .trim()}::${deepResearch ? "research" : "chat"}::${executionMode}`;
     const lastSend = recentSendRef.current;
     if (lastSend && lastSend.fingerprint === fingerprint && now - lastSend.at < 1500) {
       setChatNotice("Duplicate send ignored.");
@@ -4499,6 +4512,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     setLiveFileWrites({});
     setDeployedFiles([]);
     setCodeViewerFileIdx(0);
+    setActiveChatTask(null);
     setStreamTraceOpen(false);
     setIsStreaming(true);
 
@@ -4550,15 +4564,17 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
           );
         }
       }
-      await api.chatStream(
-        {
-          message: payloadMessage,
-          channel: "web",
-          conversation_id: targetConversationId,
-          project_id: targetProjectId || undefined,
-          deep_research: deepResearch
-        },
-        {
+        await api.chatStream(
+          {
+            message: payloadMessage,
+            channel: "web",
+            conversation_id: targetConversationId,
+            project_id: targetProjectId || undefined,
+            deep_research: deepResearch,
+            execution_mode: executionMode,
+            attachments_present: files.length > 0
+          },
+          {
           onEvent: (_eventName, payload) => {
             absorbConversationId(payload);
           },
@@ -4662,7 +4678,10 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                 });
               }
             }
-            if (name === "app_deploy" && str(payloadObj.kind, "") === "file_write") {
+            const isFileWriteProgress =
+              (name === "app_deploy" && str(payloadObj.kind, "") === "file_write") ||
+              name === "file_write";
+            if (isFileWriteProgress) {
               const fileName = str(payloadObj.file, "").trim();
               if (fileName) {
                 const lineNo = Math.max(0, num(payloadObj.line, 0));
@@ -4703,6 +4722,47 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
               data: Object.keys(payloadObj).length > 0 ? payloadObj : detail || preview
             });
           },
+          onTaskStarted: (payload) => {
+            const taskId = str(payload.task_id, "");
+            const description = str(payload.description, "Task");
+            const workType = str(payload.work_type, "task");
+            if (!taskId) return;
+            setActiveChatTask({
+              id: taskId,
+              description,
+              status: "in_progress",
+              workType
+            });
+            setChatNotice(`Task started: ${description}`);
+            void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+            void queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
+          },
+          onTaskStatus: (payload) => {
+            const taskId = str(payload.task_id, "");
+            const description = str(payload.description, "Task");
+            const status = str(payload.status, "");
+            const workType = str(payload.work_type, "task");
+            if (!taskId || !status) return;
+            setActiveChatTask((prev) => ({
+              id: taskId,
+              description: description || prev?.description || "Task",
+              status,
+              workType: workType || prev?.workType || "task"
+            }));
+            const statusLabel =
+              status === "completed"
+                ? "completed"
+                : status === "failed"
+                  ? "failed"
+                  : status === "paused"
+                    ? "paused"
+                    : status === "awaiting_approval"
+                      ? "awaiting approval"
+                      : status.replace(/_/g, " ");
+            setChatNotice(`Task ${statusLabel}: ${description}`);
+            void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+            void queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
+          },
           onContent: (payload) => {
             const text = str(payload.content, "");
             if (text) setStreamingResponse(text);
@@ -4723,6 +4783,8 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
         }
       }
       await queryClient.invalidateQueries({ queryKey: ["chat-conversations"] });
+      await queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      await queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
       if (!streamError) {
         setFailedUserMessage(null);
         const candidateConversationId = resolvedConversationId || targetConversationId;
@@ -5034,6 +5096,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
   const workspaceApps = pickRecords(appsWorkspaceQ.data, "apps");
   const workspaceTunnel = asRecord(tunnelWorkspaceQ.data);
   const workspaceTunnelBaseUrl = str(workspaceTunnel.url, "").trim().replace(/\/+$/, "");
+  const workspaceSelectedPublicAppId = str(workspaceTunnel.selected_app_id, "").trim();
   const activeWorkspaceApp = useMemo(() => {
     if (workspaceApps.length === 0) return null;
     const running = workspaceApps.find(
@@ -5050,7 +5113,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
   }, [streamingResponse, latestAssistantMessageText]);
   const previewImageUrl = toAbsoluteAppUrl(previewImagePath, origin);
   const publicPreviewUrl =
-    workspaceTunnelBaseUrl && workspaceTunnelBaseUrl !== origin
+    workspaceTunnelBaseUrl && workspaceTunnelBaseUrl !== origin && workspaceSelectedPublicAppId
       ? toAbsoluteAppUrl(previewPath, workspaceTunnelBaseUrl)
       : "";
   const runtimeMode = str(activeWorkspaceApp?.runtime_mode, "").toLowerCase();
@@ -5771,6 +5834,43 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
             ))}
           </Stack>
         ) : null}
+        {activeChatTask ? (
+          <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" alignItems="center" sx={{ mb: 0.5 }}>
+            <Chip
+              size="small"
+              color={
+                activeChatTask.status === "completed"
+                  ? "success"
+                  : activeChatTask.status === "failed"
+                    ? "error"
+                    : activeChatTask.status === "paused" || activeChatTask.status === "awaiting_approval"
+                      ? "warning"
+                      : "info"
+              }
+              label={`Task ${activeChatTask.status === "in_progress" ? "running" : activeChatTask.status.replace(/_/g, " ")}`}
+            />
+            <Chip
+              size="small"
+              variant="outlined"
+              label={
+                activeChatTask.workType === "app"
+                  ? "App"
+                  : activeChatTask.workType === "import"
+                    ? "Import"
+                    : activeChatTask.workType === "automation"
+                      ? "Automation"
+                      : activeChatTask.workType === "workspace"
+                        ? "Workspace"
+                        : activeChatTask.workType === "research"
+                          ? "Research"
+                          : "Task"
+              }
+            />
+            <Typography variant="caption" color="text.secondary" sx={{ minWidth: 0 }}>
+              {activeChatTask.description}
+            </Typography>
+          </Stack>
+        ) : null}
         <Box className="chat-composer-shell">
           <textarea
             className="chat-composer-textarea"
@@ -5791,13 +5891,50 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                 setPrompt("");
                 (e.target as HTMLTextAreaElement).style.height = "auto";
                 setChatError(null);
-                void runStreamingChat(msg, attachedFiles, { deepResearch: deepResearchEnabled });
+                void runStreamingChat(msg, attachedFiles, {
+                  deepResearch: deepResearchEnabled,
+                  executionMode: chatExecutionMode
+                });
               }
             }}
             rows={1}
             disabled={false}
           />
           <div className="chat-composer-actions">
+            <Stack direction="row" spacing={0.5} alignItems="center" sx={{ mr: 0.5 }}>
+              {([
+                {
+                  value: "auto",
+                  label: "Auto",
+                  tip: "Promote tool, file, app, import, research, or repeatable work into a task."
+                },
+                {
+                  value: "chat",
+                  label: "Ask",
+                  tip: "Keep this as a chat-only run."
+                },
+                {
+                  value: "task",
+                  label: "Task",
+                  tip: "Always create a durable task and stream the live work."
+                }
+              ] as Array<{ value: ChatExecutionMode; label: string; tip: string }>).map((mode) => (
+                <Tooltip key={mode.value} title={mode.tip}>
+                  <Chip
+                    size="small"
+                    clickable={!isStreaming}
+                    disabled={isStreaming}
+                    label={mode.label}
+                    variant={chatExecutionMode === mode.value ? "filled" : "outlined"}
+                    color={chatExecutionMode === mode.value ? "primary" : "default"}
+                    onClick={() => {
+                      if (!isStreaming) setChatExecutionMode(mode.value);
+                    }}
+                    sx={{ height: 24 }}
+                  />
+                </Tooltip>
+              ))}
+            </Stack>
             <Tooltip title={deepResearchEnabled ? "Deep Research enabled — slower, source-backed" : "Enable Deep Research"}>
               <FormControlLabel
                 control={
@@ -5849,7 +5986,10 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                   setPrompt("");
                   const ta = document.querySelector(".chat-composer-textarea") as HTMLTextAreaElement | null;
                   if (ta) ta.style.height = "auto";
-                  await runStreamingChat(msg, attachedFiles, { deepResearch: deepResearchEnabled });
+                  await runStreamingChat(msg, attachedFiles, {
+                    deepResearch: deepResearchEnabled,
+                    executionMode: chatExecutionMode
+                  });
                 }}
               >
                 <ArrowUpwardRoundedIcon fontSize="small" />
@@ -8002,14 +8142,30 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
     queryFn: () => api.rawGet("/tunnel/status"),
     refetchInterval: autoRefresh ? REFRESH_MS : false
   });
+  const evolutionQ = useQuery({
+    queryKey: ["settings-evolution"],
+    queryFn: () => api.rawGet("/settings/evolution"),
+    refetchInterval: autoRefresh ? REFRESH_MS : false
+  });
   const [tunnelActionError, setTunnelActionError] = useState<string | null>(null);
   const [tunnelActionState, setTunnelActionState] = useState<"idle" | "starting" | "stopping">("idle");
   const [tunnelActionAppId, setTunnelActionAppId] = useState<string>("");
+  const [appsActionError, setAppsActionError] = useState<string | null>(null);
+  const [appsActionSuccess, setAppsActionSuccess] = useState<string | null>(null);
+  const [appsActionBusy, setAppsActionBusy] = useState<string | null>(null);
 
   const opMutation = useMutation({
-    mutationFn: ({ path, method }: { path: string; method: "POST" | "DELETE" }) => (method === "DELETE" ? api.rawDelete(path) : api.rawPost(path, {})),
+    mutationFn: ({ path, method, body }: { path: string; method: "POST" | "DELETE"; body?: JsonRecord }) =>
+      (method === "DELETE" ? api.rawDelete(path) : api.rawPost(path, body ?? {})),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["apps-manager"] });
+      await queryClient.invalidateQueries({ queryKey: ["apps-manager-tunnel-status"] });
+    }
+  });
+  const updateEvolutionSettingsMutation = useMutation({
+    mutationFn: (payload: JsonRecord) => api.rawPost("/settings/evolution", payload),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["settings-evolution"] });
     }
   });
   const tunnelStartMutation = useMutation({
@@ -8035,6 +8191,8 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
   const tunnelAvailable = toBool(tunnel.available);
   const tunnelErrorText = str(tunnel.error, "").trim();
   const selectedPublicAppId = str(tunnel.selected_app_id, "").trim();
+  const evolution = asRecord(evolutionQ.data);
+  const deployGuardDefault = toBool(evolution.deploy_guard_default);
   const tunnelStarting = tunnelActionState === "starting" || tunnelStartMutation.isPending;
   const tunnelStopping = tunnelActionState === "stopping" || tunnelStopMutation.isPending;
 
@@ -8051,6 +8209,13 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
   }, [tunnelActionState, tunnelBaseUrl, tunnelErrorText, tunnelActive]);
 
   useEffect(() => {
+    if (appsActionSuccess) {
+      const timer = setTimeout(() => setAppsActionSuccess(null), 3500);
+      return () => clearTimeout(timer);
+    }
+  }, [appsActionSuccess]);
+
+  useEffect(() => {
     if (tunnelActionState === "idle") return;
     const timer = setInterval(() => {
       void tunnelQ.refetch();
@@ -8062,6 +8227,36 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
   const refreshLinks = async () => {
     setTunnelActionError(null);
     await Promise.all([appsQ.refetch(), tunnelQ.refetch()]);
+  };
+  const refreshAppState = async () => {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["apps-manager"] }),
+      queryClient.invalidateQueries({ queryKey: ["apps-manager-tunnel-status"] })
+    ]);
+  };
+  const runAppOp = async (opts: { label: string; path: string; method: "POST" | "DELETE"; body?: JsonRecord }) => {
+    setAppsActionError(null);
+    setAppsActionSuccess(null);
+    setAppsActionBusy(opts.label);
+    try {
+      await opMutation.mutateAsync({ path: opts.path, method: opts.method, body: opts.body });
+      await refreshAppState();
+      setAppsActionSuccess(`${opts.label} completed.`);
+    } catch (e) {
+      setAppsActionError(errMessage(e));
+    } finally {
+      setAppsActionBusy(null);
+    }
+  };
+  const setDeployGuardDefault = async (enabled: boolean) => {
+    setAppsActionError(null);
+    setAppsActionSuccess(null);
+    try {
+      await updateEvolutionSettingsMutation.mutateAsync({ deploy_guard_default: enabled });
+      setAppsActionSuccess(`Deploy guard default ${enabled ? "enabled" : "disabled"}.`);
+    } catch (e) {
+      setAppsActionError(errMessage(e));
+    }
   };
   const startTunnel = async (appId?: string) => {
     setTunnelActionError(null);
@@ -8090,10 +8285,39 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
   return (
     <Stack spacing={2}>
       <Box className="list-shell">
-        <Typography variant="h6" mb={1}>Deployed Apps</Typography>
+        <Stack direction={{ xs: "column", md: "row" }} justifyContent="space-between" alignItems={{ xs: "flex-start", md: "center" }} spacing={1} mb={1}>
+          <Box>
+            <Typography variant="h6">Deployed Apps</Typography>
+            <Typography variant="caption" color="text.secondary">
+              Manage app runtime, public exposure, and guard defaults.
+            </Typography>
+          </Box>
+          <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+            <Chip
+              size="small"
+              color={deployGuardDefault ? "warning" : "default"}
+              label={deployGuardDefault ? "Guard default ON" : "Guard default OFF"}
+            />
+            <Tooltip title="Toggle the default access guard behavior used for new app deploys." arrow>
+              <span>
+                <Button
+                  size="small"
+                  variant="outlined"
+                  disabled={updateEvolutionSettingsMutation.isPending}
+                  onClick={() => void setDeployGuardDefault(!deployGuardDefault)}
+                >
+                  {deployGuardDefault ? "Disable Default Guard" : "Enable Default Guard"}
+                </Button>
+              </span>
+            </Tooltip>
+          </Stack>
+        </Stack>
+        {evolutionQ.error ? <Alert severity="error" sx={{ mb: 1 }}>{errMessage(evolutionQ.error)}</Alert> : null}
         {tunnelQ.error ? <Alert severity="error" sx={{ mb: 1 }}>{errMessage(tunnelQ.error)}</Alert> : null}
         {tunnelErrorText ? <Alert severity="error" sx={{ mb: 1 }}>{tunnelErrorText}</Alert> : null}
         {tunnelActionError ? <Alert severity="error" sx={{ mb: 1 }}>{tunnelActionError}</Alert> : null}
+        {appsActionError ? <Alert severity="error" sx={{ mb: 1 }}>{appsActionError}</Alert> : null}
+        {appsActionSuccess ? <Alert severity="success" sx={{ mb: 1 }}>{appsActionSuccess}</Alert> : null}
         <TableContainer className="table-shell">
           <Table size="small">
             <TableHead>
@@ -8123,15 +8347,20 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
                   const localUrl = toAbsoluteAppUrl(url, origin);
                   const localAccessUrl = toAbsoluteAppUrl(accessUrl || url, origin);
                   const isSelectedPublicApp = selectedPublicAppId === id;
-                  const publicUrl = tunnelBaseUrl && isSelectedPublicApp ? toAbsoluteAppUrl(url, tunnelBaseUrl) : "";
+                  const runtimeMode = str(appItem.runtime_mode, "").trim().toLowerCase();
+                  const isStaticApp = runtimeMode === "static";
+                  const isRunning = toBool(appItem.running);
+                  const canStopApp = !isStaticApp && isRunning;
+                  const canRestartApp = !isStaticApp || isRunning;
+                  const appTunnelActive = tunnelActive && !!tunnelBaseUrl && !!selectedPublicAppId;
+                  const publicUrl = appTunnelActive ? toAbsoluteAppUrl(url, tunnelBaseUrl) : "";
                   const publicAccessUrl =
-                    tunnelBaseUrl && isSelectedPublicApp ? toAbsoluteAppUrl(accessUrl || url, tunnelBaseUrl) : "";
+                    appTunnelActive ? toAbsoluteAppUrl(accessUrl || url, tunnelBaseUrl) : "";
                   const hasProtectedVariant = !!accessUrl && localAccessUrl !== localUrl;
-                  const genericTunnelOnly = tunnelActive && !!tunnelBaseUrl && !selectedPublicAppId;
-                  const publicTunnelTargetsAnotherApp =
-                    tunnelActive && !!selectedPublicAppId && selectedPublicAppId !== id;
-                  const publicShareUrl = publicUrl;
-                  const localShareUrl = localUrl;
+                  const controlPlaneTunnelOnly = tunnelActive && !!tunnelBaseUrl && !selectedPublicAppId;
+                  const publicLinkUrl = hasProtectedVariant ? publicAccessUrl || publicUrl : publicUrl;
+                  const publicShareUrl = publicLinkUrl;
+                  const localShareUrl = hasProtectedVariant ? localAccessUrl : localUrl;
                   const shareUrl = publicShareUrl || localShareUrl;
                   const openTargets = dedupeLinkTargets([
                     { label: "Open Local", url: localUrl },
@@ -8163,11 +8392,14 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
                               Access Key: {accessKey || "-"}
                             </Typography>
                           ) : null}
-                          {publicUrl ? (
-                            <Typography variant="caption" component="div" color="info.main" noWrap title={publicUrl}>
+                          <Typography variant="caption" component="div" color={toBool(appItem.access_guard_enabled) ? "warning.main" : "text.secondary"} noWrap>
+                            Guard: {toBool(appItem.access_guard_enabled) ? "enabled" : "disabled"}
+                          </Typography>
+                          {publicLinkUrl ? (
+                            <Typography variant="caption" component="div" color="info.main" noWrap title={publicLinkUrl}>
                               Public:{" "}
-                              <Link href={publicUrl} target="_blank" rel="noopener noreferrer" underline="hover">
-                                {publicUrl}
+                              <Link href={publicLinkUrl} target="_blank" rel="noopener noreferrer" underline="hover">
+                                {publicLinkUrl}
                               </Link>
                             </Typography>
                           ) : tunnelStarting && tunnelActionAppId === id ? (
@@ -8178,13 +8410,9 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
                             <Typography variant="caption" component="div" color="text.secondary">
                               Public: stopping tunnel...
                             </Typography>
-                          ) : genericTunnelOnly ? (
+                          ) : controlPlaneTunnelOnly ? (
                             <Typography variant="caption" component="div" color="text.secondary">
                               Public: control-plane tunnel active. Expose this app publicly to get a working app link.
-                            </Typography>
-                          ) : publicTunnelTargetsAnotherApp ? (
-                            <Typography variant="caption" component="div" color="text.secondary">
-                              Public: another app is currently exposed on the tunnel.
                             </Typography>
                           ) : (
                             <Typography variant="caption" component="div" color="text.secondary">
@@ -8229,13 +8457,38 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
                                 }]
                               : []),
                             {
+                              label: toBool(appItem.access_guard_enabled) ? "Disable App Guard" : "Enable App Guard",
+                              disabled: updateEvolutionSettingsMutation.isPending || appsActionBusy != null,
+                              onClick: () =>
+                                void runAppOp({
+                                  label: toBool(appItem.access_guard_enabled) ? "Disable App Guard" : "Enable App Guard",
+                                  path: `/api/apps/${encodeURIComponent(id)}/access-guard`,
+                                  method: "POST",
+                                  body: { enabled: !toBool(appItem.access_guard_enabled) }
+                                })
+                            },
+                            {
+                              label: "Regenerate Access Key",
+                              disabled:
+                                updateEvolutionSettingsMutation.isPending ||
+                                appsActionBusy != null ||
+                                !toBool(appItem.access_guard_enabled),
+                              onClick: () =>
+                                void runAppOp({
+                                  label: "Regenerate Access Key",
+                                  path: `/api/apps/${encodeURIComponent(id)}/access-guard`,
+                                  method: "POST",
+                                  body: { enabled: true, regenerate_key: true }
+                                })
+                            },
+                            {
                               label:
                                 tunnelStarting
                                   ? "Starting Public Tunnel..."
                                   : tunnelActive && selectedPublicAppId === id
                                     ? "Refresh Public Exposure"
                                     : tunnelActive && selectedPublicAppId && selectedPublicAppId !== id
-                                      ? "Expose This App Publicly"
+                                      ? "Set as Public Landing App"
                                       : "Start Public Tunnel",
                               divider: true,
                               disabled: tunnelStarting || !tunnelAvailable,
@@ -8251,19 +8504,37 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
                               onClick: refreshLinks
                             },
                             {
-                              label: "Stop",
+                              label: !canStopApp ? "Stop Unavailable" : "Stop",
                               divider: true,
-                              onClick: () => opMutation.mutate({ path: `/api/apps/${encodeURIComponent(id)}/stop`, method: "POST" })
+                              disabled: !canStopApp || appsActionBusy != null,
+                              onClick: () =>
+                                void runAppOp({
+                                  label: "Stop App",
+                                  path: `/api/apps/${encodeURIComponent(id)}/stop`,
+                                  method: "POST"
+                                })
                             },
                             {
-                              label: "Restart",
-                              onClick: () => opMutation.mutate({ path: `/api/apps/${encodeURIComponent(id)}/restart`, method: "POST" })
+                              label: isStaticApp ? "Reload Metadata" : isRunning ? "Restart" : "Start App",
+                              disabled: appsActionBusy != null || !canRestartApp,
+                              onClick: () =>
+                                void runAppOp({
+                                  label: isStaticApp ? "Reload Metadata" : isRunning ? "Restart App" : "Start App",
+                                  path: `/api/apps/${encodeURIComponent(id)}/restart`,
+                                  method: "POST"
+                                })
                             },
                             {
                               label: "Delete",
                               tone: "error",
                               divider: true,
-                              onClick: () => opMutation.mutate({ path: `/api/apps/${encodeURIComponent(id)}`, method: "DELETE" })
+                              disabled: appsActionBusy != null,
+                              onClick: () =>
+                                void runAppOp({
+                                  label: "Delete App",
+                                  path: `/api/apps/${encodeURIComponent(id)}`,
+                                  method: "DELETE"
+                                })
                             }
                           ]}
                           ariaLabel="App options"
@@ -12952,6 +13223,27 @@ function SettingsManager({
     return JSON.stringify(value);
   }
 
+  function snapshotObservabilityForm(value: typeof form): string {
+    return JSON.stringify({
+      observability_enabled: value.observability_enabled,
+      observability_provider: value.observability_provider,
+      observability_endpoint: value.observability_endpoint,
+      observability_service_name: value.observability_service_name,
+      observability_header_name: value.observability_header_name,
+      observability_privacy_mode: value.observability_privacy_mode,
+      observability_auth_token: value.observability_auth_token
+    });
+  }
+
+  function parseSavedSettingsSnapshot(): typeof form | null {
+    if (!savedFormSnapshot.trim()) return null;
+    try {
+      return JSON.parse(savedFormSnapshot) as typeof form;
+    } catch {
+      return null;
+    }
+  }
+
   const effectiveDirty = dirty && snapshotSettingsForm(form) !== savedFormSnapshot;
 
   function setField<K extends keyof typeof form>(key: K, value: (typeof form)[K]) {
@@ -13254,7 +13546,12 @@ function SettingsManager({
       setError(null);
       setSuccess("Saved settings.");
       setDirty(false);
+      const savedSnapshot = parseSavedSettingsSnapshot();
+      const observabilityChanged =
+        !savedSnapshot ||
+        snapshotObservabilityForm(form) !== snapshotObservabilityForm(savedSnapshot);
       const shouldTestObservability =
+        observabilityChanged &&
         form.observability_enabled &&
         form.observability_endpoint.trim().length > 0 &&
         (
@@ -18415,22 +18712,30 @@ function AnalyticsManager({ autoRefresh }: { autoRefresh: boolean }) {
     return {
       backgroundColor: "transparent",
       animationDuration: 400,
-      grid: { left: 6, right: 6, top: 8, bottom: 12, containLabel: false },
+      grid: { left: 2, right: 2, top: 10, bottom: 8, containLabel: false },
       tooltip: {
         trigger: "axis",
         backgroundColor: "rgba(6,14,28,0.95)",
         borderColor: "rgba(84,198,255,0.25)",
-        textStyle: { color: "#d8edff" }
+        textStyle: { color: "#d8edff" },
+        axisPointer: {
+          type: "shadow",
+          shadowStyle: {
+            color: "rgba(84,198,255,0.08)"
+          }
+        }
       },
       xAxis: {
         type: "category",
         data: seriesNames,
+        boundaryGap: true,
         axisLine: { show: false },
         axisTick: { show: false },
         axisLabel: { show: false }
       },
       yAxis: {
         type: "value",
+        max: (value: { max: number }) => (value.max > 0 ? value.max * 1.18 : 1),
         splitLine: { show: false },
         axisLine: { show: false },
         axisTick: { show: false },
@@ -18443,10 +18748,20 @@ function AnalyticsManager({ autoRefresh }: { autoRefresh: boolean }) {
             value: v,
             itemStyle: {
               color: palette[idx % palette.length],
-              borderRadius: [6, 6, 0, 0]
+              borderRadius: [999, 999, 0, 0],
+              shadowBlur: 10,
+              shadowColor: "rgba(0,0,0,0.22)"
             }
           })),
-          barWidth: "40%"
+          showBackground: true,
+          backgroundStyle: {
+            color: "rgba(108,156,212,0.08)",
+            borderRadius: [999, 999, 0, 0]
+          },
+          barWidth: 14,
+          barMaxWidth: 14,
+          barMinHeight: 6,
+          barCategoryGap: "62%"
         }
       ]
     };
@@ -18632,7 +18947,7 @@ function AnalyticsManager({ autoRefresh }: { autoRefresh: boolean }) {
             <Typography variant="h4" sx={{ color: "#f3fbff", fontWeight: 700, mb: 0.6 }}>
               {card.value}
             </Typography>
-            <ReactECharts option={miniBarsOption(card.values)} style={{ height: 120 }} />
+            <ReactECharts option={miniBarsOption(card.values)} style={{ height: 104 }} />
             <Stack spacing={0.5} sx={{ mt: 0.8 }}>
               {byModelRows.map((row, idx) => (
                 <Stack key={`${card.title}-legend-${idx}`} direction="row" justifyContent="space-between" alignItems="center">
@@ -18888,7 +19203,8 @@ export function NativeWorkspace({
         display: "flex",
         flexDirection: "column",
         minHeight: 0,
-        minWidth: 0
+        minWidth: 0,
+        width: "100%"
       }}
     >
       <Box sx={{ display: view === "chat" ? "flex" : "none", flex: 1, minHeight: 0, minWidth: 0, width: "100%" }}>

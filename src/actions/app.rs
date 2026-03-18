@@ -1508,6 +1508,26 @@ pub fn generate_access_key() -> String {
     format!("ak_{}", uuid::Uuid::new_v4().simple())
 }
 
+async fn persist_app_access_guard_meta(
+    app_dir: &Path,
+    access_guard_enabled: bool,
+    access_key: &str,
+) -> Result<()> {
+    let meta_path = app_dir.join(".app_meta.json");
+    let mut meta: serde_json::Value = match tokio::fs::read(&meta_path).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|_| serde_json::json!({})),
+        Err(_) => serde_json::json!({}),
+    };
+    if !meta.is_object() {
+        meta = serde_json::json!({});
+    }
+    meta["access_guard_enabled"] = serde_json::Value::Bool(access_guard_enabled);
+    meta["access_key"] = serde_json::Value::String(access_key.to_string());
+    let bytes = serde_json::to_vec_pretty(&meta)?;
+    tokio::fs::write(&meta_path, bytes).await?;
+    Ok(())
+}
+
 /// Snapshot of an app's health for ArkPulse reporting
 pub struct AppHealthSnapshot {
     pub id: String,
@@ -1749,6 +1769,36 @@ impl AppRegistry {
             return app.read().await.access_guard_enabled;
         }
         false
+    }
+
+    /// Toggle access guard for an app and optionally rotate its access key.
+    pub async fn set_access_guard(
+        &self,
+        app_id: &str,
+        enabled: bool,
+        regenerate_key: bool,
+    ) -> Result<String> {
+        let app_handle = {
+            let apps = self.apps.read().await;
+            apps.get(app_id).cloned()
+        }
+        .ok_or_else(|| anyhow::anyhow!("App not found"))?;
+
+        let (app_dir, access_key) = {
+            let mut app = app_handle.write().await;
+            let should_rotate = regenerate_key || app.access_key.trim().is_empty();
+            let next_key = if should_rotate {
+                generate_access_key()
+            } else {
+                app.access_key.clone()
+            };
+            app.access_guard_enabled = enabled;
+            app.access_key = next_key.clone();
+            (app.app_dir.clone(), next_key)
+        };
+
+        persist_app_access_guard_meta(&app_dir, enabled, &access_key).await?;
+        Ok(access_key)
     }
 
     /// Record an access (called when an app is served via HTTP)
@@ -1997,15 +2047,18 @@ impl AppRegistry {
                         .and_then(|m| m.get("access_guard_enabled").and_then(|v| v.as_bool()))
                         .unwrap_or(true);
                     // Restore or regenerate access key only when guard is enabled.
-                    let access_key = if access_guard_enabled {
-                        meta.as_ref()
-                            .and_then(|m| m.get("access_key").and_then(|k| k.as_str()))
-                            .filter(|s| !s.trim().is_empty())
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(generate_access_key)
-                    } else {
-                        String::new()
-                    };
+                    let access_key = meta
+                        .as_ref()
+                        .and_then(|m| m.get("access_key").and_then(|k| k.as_str()))
+                        .filter(|s| !s.trim().is_empty())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| {
+                            if access_guard_enabled {
+                                generate_access_key()
+                            } else {
+                                String::new()
+                            }
+                        });
 
                     if let Some(entry_cmd) = entry_command {
                         // Dynamic app — restart in isolated container runtime

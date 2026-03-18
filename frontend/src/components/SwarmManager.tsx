@@ -329,7 +329,6 @@ export function SwarmManager({ autoRefresh }: Props) {
           <Stack spacing={1.5}>
             <Stack
               direction={{ xs: "column", md: "row" }}
-              justifyContent="space-between"
               alignItems={{ xs: "flex-start", md: "center" }}
               gap={1}
             >
@@ -342,14 +341,6 @@ export function SwarmManager({ autoRefresh }: Props) {
                   and idle specialists stay hidden from this page.
                 </Typography>
               </Box>
-              <Button
-                size="small"
-                variant="outlined"
-                onClick={() => setHistoryOpen(true)}
-                sx={{ textTransform: "none" }}
-              >
-                View history
-              </Button>
             </Stack>
 
             <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">

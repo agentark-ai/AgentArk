@@ -493,6 +493,7 @@ impl WatcherManager {
         id
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn semantic_signature(watcher: &Watcher) -> String {
         format!(
             "{}|{}|{}",

@@ -194,6 +194,7 @@ impl MasterPasswordManager {
 
     /// Remove master password - revert to auto-generated keyfile
     /// Caller is responsible for re-encrypting data with the returned key
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn remove_password(&self) -> Result<Arc<KeyManager>> {
         let km = self.prepare_keyfile_encryption()?;
         self.commit_password_removal()?;

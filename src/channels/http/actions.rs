@@ -283,6 +283,13 @@ fn unique_push(out: &mut Vec<String>, s: String) {
     }
 }
 
+fn is_clawhub_host(host: &str) -> bool {
+    host == "clawhub.ai"
+        || host.ends_with(".clawhub.ai")
+        || host == "openclaw.ai"
+        || host.ends_with(".openclaw.ai")
+}
+
 fn extract_required_envs_from_frontmatter(frontmatter: &str) -> Vec<String> {
     let mut envs: Vec<String> = Vec::new();
 
@@ -1664,12 +1671,10 @@ fn build_import_candidate_urls(source_url: &str) -> Vec<String> {
         Err(_) => return vec![source_url.to_string()],
     };
     let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+    let canonical_host = parsed.host_str().unwrap_or("").trim();
     let path = parsed.path();
     let lower_url = source_url.to_ascii_lowercase();
-    let is_clawhub = host == "clawhub.ai"
-        || host.ends_with(".clawhub.ai")
-        || host == "openclaw.ai"
-        || host.ends_with(".openclaw.ai");
+    let is_clawhub = is_clawhub_host(&host);
 
     if is_clawhub {
         let path_trim = path.trim_matches('/');
@@ -1680,37 +1685,72 @@ fn build_import_candidate_urls(source_url: &str) -> Vec<String> {
                 .split('/')
                 .filter(|segment| !segment.trim().is_empty())
                 .collect();
-            if matches!(segments.first(), Some(first) if first.eq_ignore_ascii_case("skills")) {
+            if matches!(segments.first(), Some(first) if first.eq_ignore_ascii_case("skills") || first.eq_ignore_ascii_case("skill"))
+            {
                 segments.remove(0);
             }
-            if segments.len() >= 2 {
-                let owner = segments[0]
-                    .chars()
-                    .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-                    .collect::<String>()
-                    .to_ascii_lowercase();
-                let name = segments[1]
-                    .chars()
-                    .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-                    .collect::<String>()
-                    .to_ascii_lowercase();
-                if !owner.is_empty() && !name.is_empty() {
-                    let slug = format!("{}/{}", owner, name);
-                    out.push(format!(
-                        "https://clawhub.ai/api/v1/skills/{}/file?path=SKILL.md",
-                        slug
-                    ));
-                    out.push(format!(
-                        "https://clawhub.ai/api/v1/skills/{}/file?path=ACTION.md",
-                        slug
-                    ));
-                    out.push(format!(
-                        "https://clawhub.ai/api/v1/skills/{}/file?path=SKILL.md&tag=latest",
-                        slug
-                    ));
+            if !segments.is_empty() {
+                let mut slugs: Vec<String> = Vec::new();
+                let full_slug = segments.join("/");
+                if !full_slug.trim().is_empty() {
+                    slugs.push(full_slug);
+                }
+                if segments.len() >= 2 {
+                    slugs.push(segments[segments.len() - 2..].join("/"));
+                }
+                if let Some(last) = segments.last() {
+                    slugs.push((*last).to_string());
+                }
+
+                for slug in slugs {
+                    let slug = slug
+                        .chars()
+                        .filter(|c| {
+                            c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '/'
+                        })
+                        .collect::<String>()
+                        .trim_matches('/')
+                        .to_string();
+                    if slug.is_empty() {
+                        continue;
+                    }
+                    unique_push(
+                        &mut out,
+                        format!(
+                            "https://{}/api/v1/skills/{}/file?path=SKILL.md",
+                            canonical_host, slug
+                        ),
+                    );
+                    unique_push(
+                        &mut out,
+                        format!(
+                            "https://{}/api/v1/skills/{}/file?path=ACTION.md",
+                            canonical_host, slug
+                        ),
+                    );
+                    unique_push(
+                        &mut out,
+                        format!(
+                            "https://{}/api/v1/skills/{}/file?path=SKILL.md&tag=latest",
+                            canonical_host, slug
+                        ),
+                    );
+                    unique_push(
+                        &mut out,
+                        format!(
+                            "https://{}/api/v1/skills/{}/file?path=SKILL.md&version=latest",
+                            canonical_host, slug
+                        ),
+                    );
+                    unique_push(
+                        &mut out,
+                        format!(
+                            "https://{}/api/v1/skills/{}/file?path=ACTION.md&version=latest",
+                            canonical_host, slug
+                        ),
+                    );
                 }
             }
-            out.push(source_url.to_string());
         }
     } else if lower_url.contains("github.com") && lower_url.contains("/blob/") {
         if lower_url.ends_with(".md")
@@ -2094,6 +2134,26 @@ pub(crate) async fn import_action_from_url_shared(
 
     let candidate_source_url = single_url_override.as_deref().unwrap_or(url);
     let urls_to_try = build_import_candidate_urls(candidate_source_url);
+    if urls_to_try.is_empty() {
+        if let Ok(parsed) = reqwest::Url::parse(candidate_source_url) {
+            let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+            if is_clawhub_host(&host)
+                && !parsed
+                    .path()
+                    .trim_matches('/')
+                    .to_ascii_lowercase()
+                    .ends_with(".md")
+            {
+                return Err(format!(
+                    "Could not resolve a raw SKILL.md/ACTION.md URL from ClawHub/OpenClaw page URL '{}'. Use the raw file URL instead.",
+                    candidate_source_url
+                ));
+            }
+        }
+        return Err(
+            "Could not derive any raw skill URL candidates from the provided link.".to_string(),
+        );
+    }
 
     let mut content = None;
     let mut fetched_url: Option<String> = None;
@@ -2117,6 +2177,15 @@ pub(crate) async fn import_action_from_url_shared(
     }
 
     let content = content.ok_or_else(|| {
+        if let Ok(parsed) = reqwest::Url::parse(url) {
+            let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+            if is_clawhub_host(&host) && !parsed.path().trim_matches('/').to_ascii_lowercase().ends_with(".md") {
+                return format!(
+                    "Failed to resolve a raw SKILL.md/ACTION.md from this ClawHub/OpenClaw page URL. Tried {:?}: {}",
+                    urls_to_try, last_error
+                );
+            }
+        }
         if url.contains("github.com")
             && (url.contains("/blob/") || url.contains("/tree/"))
             && !url.contains(".md")

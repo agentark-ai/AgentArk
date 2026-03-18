@@ -30,6 +30,70 @@ fn compact_text(text: &str, max_chars: usize) -> String {
     }
 }
 
+const AUTO_AGENT_SCIENTIST_NAMES: &[&str] = &[
+    "Curie",
+    "Turing",
+    "Hopper",
+    "Einstein",
+    "Tesla",
+    "Faraday",
+    "Noether",
+    "Sagan",
+    "Kepler",
+    "Galileo",
+    "Darwin",
+    "Feynman",
+    "Hubble",
+    "Maxwell",
+    "Lovelace",
+    "Bohr",
+    "Franklin",
+    "Planck",
+    "Copernicus",
+    "Mendel",
+    "Raman",
+    "Hawking",
+    "Meitner",
+    "Pasteur",
+    "Newton",
+    "Shannon",
+    "Babbage",
+    "Euler",
+    "Leavitt",
+    "Goodall",
+    "Carson",
+    "Chandrasekhar",
+    "Wu",
+    "Boyle",
+    "Archimedes",
+    "Kapitsa",
+];
+
+fn scientist_name_for_index(index: usize) -> String {
+    AUTO_AGENT_SCIENTIST_NAMES[index % AUTO_AGENT_SCIENTIST_NAMES.len()].to_string()
+}
+
+fn fallback_scientist_name(agent_type: &SubAgentType) -> &'static str {
+    match agent_type {
+        SubAgentType::Researcher => "Curie",
+        SubAgentType::Coder => "Turing",
+        SubAgentType::Analyst => "Noether",
+        SubAgentType::Writer => "Sagan",
+        SubAgentType::Validator => "Franklin",
+        SubAgentType::Planner => "Kepler",
+        SubAgentType::Custom { .. } => "Faraday",
+    }
+}
+
+fn display_name_for_specialist(name: &str, agent_type: &SubAgentType) -> String {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case(&agent_type.name()) {
+        fallback_scientist_name(agent_type).to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// LLM-determined routing decision
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingDecision {
@@ -123,8 +187,8 @@ pub struct AgentExecResult {
     pub task: String,
     /// Whether this was a user-configured specialist or auto-spawned
     pub is_specialist: bool,
-    /// Specialist name (if is_specialist)
-    pub specialist_name: Option<String>,
+    /// Display name shown for the delegated agent.
+    pub agent_name: Option<String>,
     /// Model used
     pub model_name: String,
     /// Response content
@@ -238,19 +302,26 @@ impl TaskRouter {
                 assignments.push(AgentAssignment {
                     spec: spec.clone(),
                     agent_type: agent_type.clone(),
-                    kind: AssignmentKind::Specialist(name, specialist),
+                    display_name: display_name_for_specialist(&name, &agent_type),
+                    kind: AssignmentKind::Specialist(specialist),
                 });
             } else {
                 // Auto-spawn: select LLM from model pool
                 let llm = self.select_llm_for_spec(spec, &agent_type, model_pool, primary_llm);
                 let model_name = llm.model_name().to_string();
+                let auto_agent_name = scientist_name_for_index(assignments.len());
                 // Trace: auto-spawning
                 {
                     let mut t = trace.write().await;
                     t.steps.push(super::agent::ExecutionStep {
                         icon: "\u{1F916}".to_string(), // robot
-                        title: format!("Auto-Agent: {}", agent_type.name()),
-                        detail: format!("Model: {} | Task: {}", model_name, spec.task),
+                        title: format!("Auto-Agent: {}", auto_agent_name),
+                        detail: format!(
+                            "{} | Model: {} | Task: {}",
+                            agent_type.name(),
+                            model_name,
+                            spec.task
+                        ),
                         step_type: "thinking".to_string(),
                         data: None,
                         timestamp: chrono::Utc::now(),
@@ -260,6 +331,7 @@ impl TaskRouter {
                 assignments.push(AgentAssignment {
                     spec: spec.clone(),
                     agent_type: agent_type.clone(),
+                    display_name: auto_agent_name,
                     kind: AssignmentKind::Ephemeral(llm),
                 });
             }
@@ -532,6 +604,7 @@ impl TaskRouter {
                 let assignment = &assignments[idx];
                 let task = assignment.spec.task.clone();
                 let agent_type = assignment.agent_type.clone();
+                let display_name = assignment.display_name.clone();
                 // Keep delegated context compact to control token costs.
                 let sys_prompt = compact_text(system_prompt, 2200);
                 let ctx = context;
@@ -540,13 +613,11 @@ impl TaskRouter {
                 let timeout = self.config.agent_timeout_secs;
 
                 match &assignment.kind {
-                    AssignmentKind::Specialist(name, specialist) => {
+                    AssignmentKind::Specialist(specialist) => {
                         let specialist = specialist.clone();
-                        let name = name.clone();
                         handles.push((
                             idx,
                             true,
-                            Some(name.clone()),
                             tokio::spawn(async move {
                                 let start = std::time::Instant::now();
                                 let result = tokio::time::timeout(
@@ -561,7 +632,7 @@ impl TaskRouter {
                                         agent_type: agent_type.name(),
                                         task,
                                         is_specialist: true,
-                                        specialist_name: Some(name),
+                                        agent_name: Some(display_name),
                                         model_name: model,
                                         content,
                                         llm_response: None,
@@ -578,11 +649,7 @@ impl TaskRouter {
                     AssignmentKind::Ephemeral(llm) => {
                         let llm = llm.clone();
                         let model_name = llm.model_name().to_string();
-                        handles.push((
-                            idx,
-                            false,
-                            None,
-                            tokio::spawn(async move {
+                        handles.push((idx, false, tokio::spawn(async move {
                                 let start = std::time::Instant::now();
                                 let prompt = format!(
                                     "{}\n\n## Inherited Policy\n{}\n\n## Coordinator Context\n{}\n\n## Context from Previous Steps\n{}",
@@ -606,7 +673,7 @@ impl TaskRouter {
                                         agent_type: agent_type.name(),
                                         task,
                                         is_specialist: false,
-                                        specialist_name: None,
+                                        agent_name: Some(display_name),
                                         model_name,
                                         content: resp.content.clone(),
                                         llm_response: Some(resp),
@@ -615,23 +682,31 @@ impl TaskRouter {
                                     Ok(Err(e)) => Err(anyhow!("Agent error: {}", e)),
                                     Err(_) => Err(anyhow!("Agent timed out after {}s", timeout)),
                                 }
-                            }),
-                        ));
+                            })));
                     }
                 }
             }
 
             // Collect results
-            for (idx, is_specialist, name, handle) in handles {
+            for (idx, is_specialist, handle) in handles {
                 match handle.await {
                     Ok(Ok(result)) => {
                         // Trace: agent completed
                         {
                             let mut t = trace.write().await;
                             let tag = if is_specialist {
-                                format!("Specialist: {}", name.as_deref().unwrap_or("?"))
+                                format!(
+                                    "Specialist: {}",
+                                    result.agent_name.as_deref().unwrap_or("?")
+                                )
                             } else {
-                                format!("Auto-Agent: {}", result.agent_type)
+                                format!(
+                                    "Auto-Agent: {}",
+                                    result
+                                        .agent_name
+                                        .as_deref()
+                                        .unwrap_or(result.agent_type.as_str())
+                                )
                             };
                             t.steps.push(super::agent::ExecutionStep {
                                 icon: "\u{26A1}".to_string(), // lightning
@@ -658,7 +733,7 @@ impl TaskRouter {
                             agent_type: assignments[idx].agent_type.name(),
                             task: assignments[idx].spec.task.clone(),
                             is_specialist,
-                            specialist_name: name,
+                            agent_name: Some(assignments[idx].display_name.clone()),
                             model_name: "failed".to_string(),
                             content: format!("Agent failed: {}", e),
                             llm_response: None,
@@ -672,7 +747,7 @@ impl TaskRouter {
                             agent_type: assignments[idx].agent_type.name(),
                             task: assignments[idx].spec.task.clone(),
                             is_specialist,
-                            specialist_name: name,
+                            agent_name: Some(assignments[idx].display_name.clone()),
                             model_name: "panicked".to_string(),
                             content: format!("Agent panicked: {}", e),
                             llm_response: None,
@@ -704,10 +779,14 @@ impl TaskRouter {
                     format!(
                         "{} (Specialist: {})",
                         r.agent_type,
-                        r.specialist_name.as_deref().unwrap_or("?")
+                        r.agent_name.as_deref().unwrap_or("?")
                     )
                 } else {
-                    format!("{} (Auto)", r.agent_type)
+                    format!(
+                        "{} (Auto: {})",
+                        r.agent_type,
+                        r.agent_name.as_deref().unwrap_or("?")
+                    )
                 };
                 format!(
                     "## {} - {}\n{}",
@@ -778,10 +857,11 @@ Be concise and action-oriented.\n\n{}",
 struct AgentAssignment {
     spec: SubAgentSpec,
     agent_type: SubAgentType,
+    display_name: String,
     kind: AssignmentKind,
 }
 
 enum AssignmentKind {
-    Specialist(String, Arc<SpecialistAgent>),
+    Specialist(Arc<SpecialistAgent>),
     Ephemeral(LlmClient),
 }

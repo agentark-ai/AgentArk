@@ -139,6 +139,7 @@ fn task_report_channel(arguments: &serde_json::Value) -> String {
         .to_ascii_lowercase()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn task_semantic_signature(task: &Task) -> String {
     let cleaned = strip_automation_meta(&task.arguments);
     format!(

@@ -299,6 +299,8 @@ type ChatStreamPayload = {
   conversation_id?: string | null;
   project_id?: string | null;
   deep_research?: boolean;
+  execution_mode?: string;
+  attachments_present?: boolean;
 };
 
 type ChatStreamHandlers = {
@@ -308,6 +310,8 @@ type ChatStreamHandlers = {
   onToolStart?: (name: string, payload?: Record<string, unknown>) => void;
   onToolProgress?: (name: string, content: string, payload?: Record<string, unknown>) => void;
   onToolResult?: (name: string, content: string, payload?: Record<string, unknown>) => void;
+  onTaskStarted?: (payload: Record<string, unknown>) => void;
+  onTaskStatus?: (payload: Record<string, unknown>) => void;
   onContent?: (payload: Record<string, unknown>) => void;
   onError?: (message: string, payload?: unknown) => void;
   onDone?: () => void;
@@ -425,6 +429,14 @@ async function streamChat(payload: ChatStreamPayload, handlers: ChatStreamHandle
       const name = asText(obj.name);
       const content = asText(obj.content);
       handlers.onToolProgress?.(name, content, obj);
+      return;
+    }
+    if (eventName === "task_started") {
+      handlers.onTaskStarted?.(asObject(payloadValue));
+      return;
+    }
+    if (eventName === "task_status") {
+      handlers.onTaskStatus?.(asObject(payloadValue));
       return;
     }
     if (eventName === "content") {
@@ -588,7 +600,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ action, dry_run: false })
     }),
-  chat: (payload: { message: string; channel?: string; conversation_id?: string | null; project_id?: string | null; deep_research?: boolean }) =>
+  chat: (payload: { message: string; channel?: string; conversation_id?: string | null; project_id?: string | null; deep_research?: boolean; execution_mode?: string }) =>
     request<{ response: string; proof_id?: string; conversation_id?: string; conversation_title?: string }>(
       "/chat",
       {

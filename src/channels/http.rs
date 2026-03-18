@@ -60,13 +60,15 @@ use crate::memory::MemoryType;
 type SharedAgent = Arc<RwLock<Agent>>;
 const FRONTEND_DIST_DIR: &str = "frontend/dist";
 const DEFAULT_RATE_LIMIT_MAX_TRACKED_IPS: usize = 4096;
+const SERVER_BUSY_TRACE_WINDOW_SECS: i64 = 20 * 60;
+const SERVER_BUSY_TASK_WINDOW_SECS: i64 = 20 * 60;
 static MISSING_API_KEY_WARNED: AtomicBool = AtomicBool::new(false);
 static CHAT_SUGGESTION_SCAN_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CODEX_OAUTH_RUNTIME: OnceLock<Arc<RwLock<CodexOAuthRuntimeState>>> = OnceLock::new();
 const OAUTH_STATE_TTL_SECS: i64 = 10 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HttpServerRole {
+pub(crate) enum HttpServerRole {
     ControlPlane,
     PublicApps,
 }
@@ -457,6 +459,10 @@ pub struct ChatRequest {
     pub project_id: Option<String>,
     #[serde(default)]
     pub deep_research: bool,
+    #[serde(default)]
+    pub execution_mode: Option<String>,
+    #[serde(default)]
+    pub attachments_present: bool,
 }
 
 fn default_channel() -> String {
@@ -1178,21 +1184,52 @@ async fn handle_notification_control_command(
     }
 }
 
-async fn server_under_load(state: &AppState) -> bool {
-    let active_task_count = {
+async fn server_load_reasons(state: &AppState) -> Vec<String> {
+    let now = chrono::Utc::now();
+    let mut reasons = {
         let tasks = state.tasks.read().await;
         tasks
             .all()
             .iter()
             .filter(|task| matches!(task.status, TaskStatus::InProgress))
-            .count()
+            .filter_map(|task| {
+                let age_secs = (now - task.created_at).num_seconds().max(0);
+                if age_secs > SERVER_BUSY_TASK_WINDOW_SECS {
+                    None
+                } else {
+                    Some(format!(
+                        "task '{}' in progress ({}s)",
+                        task.action, age_secs
+                    ))
+                }
+            })
+            .take(3)
+            .collect::<Vec<_>>()
     };
-    if active_task_count > 0 {
-        return true;
+
+    let active_trace_reason = {
+        let last_trace = state.last_trace.read().await;
+        last_trace
+            .started_at
+            .filter(|_| last_trace.completed_at.is_none())
+            .and_then(|started_at| {
+                let age_secs = (now - started_at).num_seconds().max(0);
+                if age_secs > SERVER_BUSY_TRACE_WINDOW_SECS {
+                    None
+                } else {
+                    Some(format!("active trace ({}s)", age_secs))
+                }
+            })
+    };
+    if let Some(reason) = active_trace_reason {
+        reasons.push(reason);
     }
 
-    let last_trace = state.last_trace.read().await;
-    last_trace.started_at.is_some() && last_trace.completed_at.is_none()
+    reasons
+}
+
+async fn server_under_load(state: &AppState) -> bool {
+    !server_load_reasons(state).await.is_empty()
 }
 
 async fn handle_autonomy_quick_command(
@@ -3306,6 +3343,10 @@ pub async fn serve(
         .route("/api/apps", get(list_apps))
         .route("/api/apps/{app_id}/stop", post(stop_app))
         .route("/api/apps/{app_id}/restart", post(restart_app))
+        .route(
+            "/api/apps/{app_id}/access-guard",
+            post(update_app_access_guard),
+        )
         .route("/api/apps/{app_id}", axum::routing::delete(delete_app))
         // Output file serving (code execution artifacts)
         .route("/api/outputs/{exec_id}/{filename}", get(serve_output_file))
@@ -3881,6 +3922,14 @@ fn redirect_to_selected_tunnel_app(app_id: &str) -> Response {
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+fn is_public_app_tunnel_path(path: &str) -> bool {
+    path == "/public/proxy/raw"
+        || path == "/public/proxy/raw/"
+        || path == "/apps"
+        || path == "/apps/"
+        || path.starts_with("/apps/")
+}
+
 async fn tunnel_exposure_middleware(
     State(state): State<AppState>,
     request: Request<axum::body::Body>,
@@ -3901,11 +3950,10 @@ async fn tunnel_exposure_middleware(
         .filter(|id| is_valid_app_id(id))
         .map(ToString::to_string)
     {
-        let selected_root = format!("/apps/{}", selected_app_id);
         if path == "/" || path == "/ui" || path == "/ui/" || path == "/ui/v2" {
             return redirect_to_selected_tunnel_app(&selected_app_id);
         }
-        if path == selected_root || path.starts_with(&format!("{}/", selected_root)) {
+        if is_public_app_tunnel_path(path) {
             return next.run(request).await;
         }
 
@@ -6111,18 +6159,6 @@ async fn serve_app_file_inner(
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let (active_tunnel_url, selected_public_app_id) = {
-        let tunnel = state.tunnel.read().await;
-        (tunnel.url.clone(), tunnel.selected_app_id.clone())
-    };
-    if request_matches_active_tunnel(&headers, active_tunnel_url.as_deref()) {
-        if let Some(selected_app_id) = selected_public_app_id.as_deref() {
-            if selected_app_id != app_id {
-                return StatusCode::NOT_FOUND.into_response();
-            }
-        }
-    }
-
     let access_guard_enabled = state.app_registry.access_guard_enabled(app_id).await;
     let cookie_name = format!("ark_app_{}", app_id);
     let key_from_query = if access_guard_enabled {
@@ -6488,20 +6524,98 @@ button:hover{{background:#6d28d9}}
     Html(html).into_response()
 }
 
+#[derive(Debug, Deserialize)]
+struct AppAccessGuardUpdateRequest {
+    enabled: bool,
+    #[serde(default)]
+    regenerate_key: bool,
+}
+
 /// Stop a running app
-async fn stop_app(
-    State(state): State<AppState>,
-    Path(app_id): Path<String>,
-) -> Json<serde_json::Value> {
+async fn stop_app(State(state): State<AppState>, Path(app_id): Path<String>) -> Response {
     if !is_valid_app_id(&app_id) {
-        return Json(serde_json::json!({ "error": "Invalid app_id" }));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Invalid app_id" })),
+        )
+            .into_response();
+    }
+    if state.app_registry.get_dir(&app_id).await.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "App not found" })),
+        )
+            .into_response();
+    }
+    if state.app_registry.is_static(&app_id).await {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "Static apps cannot be stopped" })),
+        )
+            .into_response();
     }
     match state.app_registry.stop_runtime(&app_id).await {
         Ok(_) => {
             trigger_arkpulse_after_app_change(&state, "app_stop_runtime").await;
-            Json(serde_json::json!({ "status": "stopped", "app_id": app_id }))
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "status": "stopped", "app_id": app_id })),
+            )
+                .into_response()
         }
-        Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn update_app_access_guard(
+    State(state): State<AppState>,
+    Path(app_id): Path<String>,
+    Json(request): Json<AppAccessGuardUpdateRequest>,
+) -> Response {
+    if !is_valid_app_id(&app_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Invalid app_id" })),
+        )
+            .into_response();
+    }
+
+    match state
+        .app_registry
+        .set_access_guard(&app_id, request.enabled, request.regenerate_key)
+        .await
+    {
+        Ok(access_key) => {
+            trigger_arkpulse_after_app_change(&state, "app_access_guard_update").await;
+            let access_url = app_access_url_for_state(
+                &state,
+                &app_id,
+                request.enabled.then_some(access_key.as_str()),
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "ok",
+                    "app_id": app_id,
+                    "access_guard_enabled": request.enabled,
+                    "access_key": if request.enabled { access_key } else { String::new() },
+                    "access_url": access_url,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let status = if e.to_string() == "App not found" {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
+        }
     }
 }
 
@@ -6584,15 +6698,18 @@ async fn restart_app(State(state): State<AppState>, Path(app_id): Path<String>) 
         .get("access_guard_enabled")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    let access_key = if access_guard_enabled {
-        meta.get("access_key")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| s.to_string())
-            .unwrap_or_else(crate::actions::app::generate_access_key)
-    } else {
-        String::new()
-    };
+    let access_key = meta
+        .get("access_key")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            if access_guard_enabled {
+                crate::actions::app::generate_access_key()
+            } else {
+                String::new()
+            }
+        });
 
     if meta.get("access_guard_enabled").is_none()
         || (access_guard_enabled && meta.get("access_key").is_none())
@@ -8850,6 +8967,277 @@ fn normalize_stream_event_for_sse(
     }
 }
 
+fn truncate_stream_task_text(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for (idx, ch) in trimmed.chars().enumerate() {
+        if idx >= max_chars {
+            out.push_str("...");
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn normalized_chat_execution_mode(mode: Option<&str>) -> &'static str {
+    match mode.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "chat" | "ask" => "chat",
+        "task" | "do" | "agent" => "task",
+        _ => "auto",
+    }
+}
+
+fn chat_message_contains_any(lower: &str, tokens: &[&str]) -> bool {
+    tokens.iter().any(|token| lower.contains(token))
+}
+
+fn chat_message_contains_import_source(lower: &str) -> bool {
+    let source_like = [
+        "clawhub.ai/",
+        "openclaw.ai/",
+        "github.com/",
+        "raw.githubusercontent.com/",
+        "/skills/",
+        "skill.md",
+        "action.md",
+    ];
+    chat_message_contains_any(lower, &source_like)
+}
+
+fn chat_message_looks_like_direct_import_source(lower: &str) -> bool {
+    let trimmed = lower.trim();
+    if trimmed.is_empty() || !chat_message_contains_import_source(trimmed) {
+        return false;
+    }
+    trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with("www.")
+        || trimmed.split_whitespace().count() <= 6
+}
+
+fn chat_message_requests_app_work(lower: &str) -> bool {
+    let build_like = [
+        "build",
+        "create",
+        "make",
+        "ship",
+        "deploy",
+        "fix",
+        "debug",
+        "repair",
+        "prototype",
+        "scaffold",
+        "spin up",
+        "stand up",
+        "generate",
+        "turn into",
+        "convert",
+    ];
+    let app_like = [
+        "app",
+        "web app",
+        "site",
+        "website",
+        "dashboard",
+        "landing page",
+        "portal",
+        "interface",
+        "admin panel",
+        "console",
+        "ui",
+        "frontend",
+    ];
+    let explicit_like = [
+        "build me an app",
+        "build an app",
+        "create an app",
+        "make an app",
+        "turn this into an app",
+        "build a dashboard",
+        "build a landing page",
+    ];
+    chat_message_contains_any(lower, &explicit_like)
+        || (chat_message_contains_any(lower, &build_like)
+            && chat_message_contains_any(lower, &app_like))
+}
+
+fn chat_message_requests_import(lower: &str) -> bool {
+    let import_like = [
+        "import", "install", "add", "pull in", "ingest", "load", "set up", "setup", "bring in",
+        "use this", "try this",
+    ];
+    let target_like = [
+        "skill",
+        "skills",
+        "repo",
+        "repository",
+        "url",
+        "template",
+        "document",
+        "doc",
+        "github",
+        "clawhub",
+        "openclaw",
+        "skill.md",
+        "action.md",
+    ];
+    let mentions_source = chat_message_contains_import_source(lower);
+    if mentions_source
+        && (chat_message_looks_like_direct_import_source(lower)
+            || chat_message_contains_any(lower, &import_like)
+            || lower.contains("skill"))
+    {
+        return true;
+    }
+    chat_message_contains_any(lower, &import_like)
+        && (chat_message_contains_any(lower, &target_like) || mentions_source)
+}
+
+fn chat_message_requests_automation(lower: &str) -> bool {
+    let automation_like = [
+        "every day",
+        "every week",
+        "hourly",
+        "daily",
+        "weekly",
+        "schedule",
+        "cron",
+        "remind",
+        "monitor",
+        "watch",
+        "watcher",
+        "automation",
+    ];
+    automation_like.iter().any(|token| lower.contains(token))
+}
+
+fn chat_message_requests_workspace_changes(lower: &str) -> bool {
+    let change_like = [
+        "fix",
+        "debug",
+        "edit",
+        "change",
+        "update",
+        "rewrite",
+        "refactor",
+        "implement",
+        "write files",
+        "modify",
+    ];
+    let workspace_like = [
+        "file",
+        "files",
+        "code",
+        "repo",
+        "repository",
+        "project",
+        "workspace",
+        "app",
+    ];
+    change_like.iter().any(|token| lower.contains(token))
+        && workspace_like.iter().any(|token| lower.contains(token))
+}
+
+fn chat_request_should_create_task(
+    execution_mode: Option<&str>,
+    message: &str,
+    deep_research: bool,
+    attachments_present: bool,
+) -> bool {
+    match normalized_chat_execution_mode(execution_mode) {
+        "chat" => false,
+        "task" => true,
+        _ => {
+            if deep_research || attachments_present {
+                return true;
+            }
+            let lower = message.trim().to_ascii_lowercase();
+            chat_message_requests_app_work(&lower)
+                || chat_message_requests_import(&lower)
+                || chat_message_requests_automation(&lower)
+                || chat_message_requests_workspace_changes(&lower)
+        }
+    }
+}
+
+fn classify_chat_task_work_type(
+    message: &str,
+    deep_research: bool,
+    attachments_present: bool,
+) -> &'static str {
+    if deep_research {
+        return "research";
+    }
+    let lower = message.trim().to_ascii_lowercase();
+    if chat_message_requests_app_work(&lower) {
+        "app"
+    } else if chat_message_requests_import(&lower) {
+        "import"
+    } else if chat_message_requests_automation(&lower) {
+        "automation"
+    } else if attachments_present {
+        "workspace"
+    } else if chat_message_requests_workspace_changes(&lower) {
+        "workspace"
+    } else {
+        "task"
+    }
+}
+
+fn build_chat_task_description(message: &str, work_type: &str) -> String {
+    let trimmed = truncate_stream_task_text(message, 140);
+    if trimmed.is_empty() {
+        return "Run agent task".to_string();
+    }
+    let lower = message.trim().to_ascii_lowercase();
+    let prefix = match work_type {
+        "app" => {
+            if chat_message_contains_any(&lower, &["fix", "debug", "repair", "update", "improve"]) {
+                "App task"
+            } else {
+                "Build app"
+            }
+        }
+        "import" => "Import",
+        "automation" => "Automation",
+        "workspace" => "Workspace task",
+        "research" => "Research",
+        _ => "Task",
+    };
+    format!("{}: {}", prefix, trimmed)
+}
+
+fn chat_task_status_key(status: &crate::core::TaskStatus) -> &'static str {
+    match status {
+        crate::core::TaskStatus::Pending => "pending",
+        crate::core::TaskStatus::AwaitingApproval => "awaiting_approval",
+        crate::core::TaskStatus::Paused => "paused",
+        crate::core::TaskStatus::InProgress => "in_progress",
+        crate::core::TaskStatus::Completed => "completed",
+        crate::core::TaskStatus::Failed { .. } => "failed",
+        crate::core::TaskStatus::Cancelled => "cancelled",
+    }
+}
+
+fn chat_task_terminal_status(response: &str) -> crate::core::TaskStatus {
+    let lower = response.trim().to_ascii_lowercase();
+    if lower.contains("waiting for your approval")
+        || lower.contains("waiting for your input")
+        || lower.contains("reply with approval")
+        || lower.contains("needs your approval")
+        || lower.contains("requires approval")
+        || lower.contains("api key")
+    {
+        crate::core::TaskStatus::Paused
+    } else {
+        crate::core::TaskStatus::Completed
+    }
+}
+
 async fn chat_stream(
     State(state): State<AppState>,
     ConnectInfo(_addr): ConnectInfo<SocketAddr>,
@@ -9111,8 +9499,69 @@ async fn chat_stream(
     let channel = request.channel.clone();
     let conversation_id = request.conversation_id.clone();
     let project_id = request.project_id.clone();
+    let deep_research = request.deep_research;
+    let execution_mode = request.execution_mode.clone();
 
     tokio::spawn(async move {
+        let tracked_task = if chat_request_should_create_task(
+            execution_mode.as_deref(),
+            &message,
+            deep_research,
+            request.attachments_present,
+        ) {
+            let work_type =
+                classify_chat_task_work_type(&message, deep_research, request.attachments_present)
+                    .to_string();
+            let description = build_chat_task_description(&message, &work_type);
+            let mut task = crate::core::Task::new(
+                description.clone(),
+                "chat_request".to_string(),
+                serde_json::json!({
+                    "_task_kind": "chat_request",
+                    "_origin": "chat",
+                    "_execution_mode": normalized_chat_execution_mode(execution_mode.as_deref()),
+                    "_work_type": work_type,
+                    "message": message.clone(),
+                    "channel": channel.clone(),
+                    "conversation_id": conversation_id.clone(),
+                    "project_id": project_id.clone(),
+                    "deep_research": deep_research,
+                    "attachments_present": request.attachments_present,
+                }),
+            );
+            task.status = crate::core::TaskStatus::InProgress;
+            task.approval = crate::core::TaskApproval::Auto;
+
+            let add_result = {
+                let agent_guard = agent_ref.read().await;
+                agent_guard.add_task(task.clone()).await
+            };
+
+            match add_result {
+                Ok(()) => {
+                    let payload = serde_json::json!({
+                        "task_id": task.id.to_string(),
+                        "description": description.clone(),
+                        "status": "in_progress",
+                        "work_type": work_type.clone(),
+                        "conversation_id": conversation_id.clone(),
+                        "project_id": project_id.clone(),
+                    });
+                    let event = Event::default()
+                        .event("task_started")
+                        .data(serde_json::to_string(&payload).unwrap_or_default());
+                    let _ = tx.send(Ok(event)).await;
+                    Some((task, work_type))
+                }
+                Err(error) => {
+                    tracing::warn!("Failed to create chat task anchor: {}", error);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Stream model tokens + tool progress as dedicated SSE events.
         let (stream_tx, mut stream_rx) =
             tokio::sync::mpsc::channel::<crate::core::StreamEvent>(256);
@@ -9263,9 +9712,7 @@ async fn chat_stream(
                     project_id.as_deref(),
                     trace_ref.clone(),
                     stream_tx,
-                    crate::core::RequestExecutionHints {
-                        deep_research: request.deep_research,
-                    },
+                    crate::core::RequestExecutionHints { deep_research },
                 )
                 .await
         };
@@ -9285,6 +9732,48 @@ async fn chat_stream(
         // Emit final response
         match result {
             Ok(processed) => {
+                if let Some((task, work_type)) = tracked_task.as_ref() {
+                    let terminal_status = chat_task_terminal_status(&processed.response);
+                    let result_preview = truncate_stream_task_text(
+                        if processed.response.trim().is_empty() {
+                            "Task completed."
+                        } else {
+                            &processed.response
+                        },
+                        400,
+                    );
+                    {
+                        let agent_guard = agent_ref.read().await;
+                        if let Err(error) = agent_guard
+                            .finalize_task(
+                                task.id,
+                                terminal_status.clone(),
+                                Some(result_preview.clone()),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                "Failed to finalize streamed chat task '{}': {}",
+                                task.id,
+                                error
+                            );
+                        }
+                    }
+                    let status_event = Event::default().event("task_status").data(
+                        serde_json::json!({
+                            "task_id": task.id.to_string(),
+                            "description": task.description,
+                            "status": chat_task_status_key(&terminal_status),
+                            "work_type": work_type,
+                            "result_preview": result_preview,
+                            "conversation_id": processed.conversation_id.clone().or(conversation_id.clone()),
+                            "project_id": project_id.clone(),
+                        })
+                        .to_string(),
+                    );
+                    let _ = tx.send(Ok(status_event)).await;
+                }
+
                 let mut content = serde_json::json!({
                     "content": processed.response,
                     "conversation_id": processed.conversation_id.or(conversation_id),
@@ -9298,6 +9787,42 @@ async fn chat_stream(
                 let _ = tx.send(Ok(event)).await;
             }
             Err(e) => {
+                if let Some((task, work_type)) = tracked_task.as_ref() {
+                    let error_text = e.to_string();
+                    {
+                        let agent_guard = agent_ref.read().await;
+                        if let Err(finalize_error) = agent_guard
+                            .finalize_task(
+                                task.id,
+                                crate::core::TaskStatus::Failed {
+                                    error: error_text.clone(),
+                                },
+                                Some(truncate_stream_task_text(&error_text, 400)),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                "Failed to finalize failed streamed chat task '{}': {}",
+                                task.id,
+                                finalize_error
+                            );
+                        }
+                    }
+                    let status_event = Event::default().event("task_status").data(
+                        serde_json::json!({
+                            "task_id": task.id.to_string(),
+                            "description": task.description,
+                            "status": "failed",
+                            "work_type": work_type,
+                            "result_preview": truncate_stream_task_text(&error_text, 400),
+                            "conversation_id": conversation_id.clone(),
+                            "project_id": project_id.clone(),
+                        })
+                        .to_string(),
+                    );
+                    let _ = tx.send(Ok(status_event)).await;
+                }
+
                 let error = serde_json::json!({ "error": e.to_string() });
                 let event = Event::default()
                     .event("error")
@@ -11807,12 +12332,7 @@ async fn codex_cli_oauth_status() -> Response {
 }
 
 #[derive(Debug, Deserialize)]
-struct SecretsVaultRevealRequest {
-    #[serde(default)]
-    password: Option<String>,
-    #[serde(default)]
-    keys: Option<Vec<String>>,
-}
+struct SecretsVaultRevealRequest {}
 
 #[derive(Debug, Deserialize)]
 struct SecretsVaultUpsertRequest {
@@ -22196,6 +22716,55 @@ mod tests {
         assert_eq!(
             payload.get("content").and_then(|v| v.as_str()),
             Some("Read HTML document: Demo.")
+        );
+    }
+
+    #[test]
+    fn chat_task_classifier_promotes_plain_english_app_requests() {
+        let message = "Spin up an admin console for lead triage and deploy it";
+        assert!(chat_message_requests_app_work(
+            &message.to_ascii_lowercase()
+        ));
+        assert!(chat_request_should_create_task(
+            Some("auto"),
+            message,
+            false,
+            false
+        ));
+        assert_eq!(classify_chat_task_work_type(message, false, false), "app");
+    }
+
+    #[test]
+    fn chat_task_classifier_promotes_direct_import_sources() {
+        let message = "https://clawhub.ai/pskoett/self-improving-agent";
+        assert!(chat_message_requests_import(&message.to_ascii_lowercase()));
+        assert!(chat_request_should_create_task(
+            Some("auto"),
+            message,
+            false,
+            false
+        ));
+        assert_eq!(
+            classify_chat_task_work_type(message, false, false),
+            "import"
+        );
+    }
+
+    #[test]
+    fn chat_task_classifier_promotes_file_backed_runs_in_auto_mode() {
+        assert!(chat_request_should_create_task(
+            Some("auto"),
+            "Please review these files and tell me what matters.",
+            false,
+            true
+        ));
+        assert_eq!(
+            classify_chat_task_work_type(
+                "Please review these files and tell me what matters.",
+                false,
+                true
+            ),
+            "workspace"
         );
     }
 }
