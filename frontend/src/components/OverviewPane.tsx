@@ -431,20 +431,21 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
 
       <Box className="overview-command-grid">
         <Box className="overview-main-column">
-          <WelcomeHero
-            data-tour-target="welcome-hero"
-            onGoChat={() => navigateToView("chat")}
-            onRunBriefing={() => runBriefingMutation.mutate()}
-            onViewTasks={() => navigateToView("tasks")}
-            onTogglePause={() => {
-              void handleTogglePause();
-            }}
-            agentPaused={agentPaused}
-            briefingLoading={runBriefingMutation.isPending}
-            pauseLoading={pauseMutation.isPending}
-            prompts={heroPrompts}
-            currentTaskDesc={currentTask}
-          />
+          <Box data-tour-target="welcome-hero">
+            <WelcomeHero
+              onGoChat={() => navigateToView("chat")}
+              onRunBriefing={() => runBriefingMutation.mutate()}
+              onViewTasks={() => navigateToView("tasks")}
+              onTogglePause={() => {
+                void handleTogglePause();
+              }}
+              agentPaused={agentPaused}
+              briefingLoading={runBriefingMutation.isPending}
+              pauseLoading={pauseMutation.isPending}
+              prompts={heroPrompts}
+              currentTaskDesc={currentTask}
+            />
+          </Box>
 
           {showAttentionPanel ? (
             <NeedsAttentionInbox
@@ -519,18 +520,16 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
                       ].map((item) => (
                         <Box
                           key={item.label}
+                          className="mission-metric-card"
                           sx={{
-                            borderRadius: 2.5,
-                            border: "1px solid rgba(108, 156, 212, 0.16)",
-                            background: "rgba(7, 18, 32, 0.52)",
                             px: 1,
                             py: 0.9,
                           }}
                         >
-                          <Typography variant="caption" color="text.secondary">
+                          <Typography variant="caption" className="mission-metric-card__label">
                             {item.label}
                           </Typography>
-                          <Typography variant="subtitle1" sx={{ mt: 0.2, fontWeight: 700 }}>
+                          <Typography variant="subtitle1" className="mission-metric-card__value" sx={{ mt: 0.2 }}>
                             {item.value}
                           </Typography>
                         </Box>

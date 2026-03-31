@@ -20840,16 +20840,20 @@ async fn get_conversation_endpoint(
 ) -> Response {
     let agent = state.agent.read().await;
     match agent.storage.get_conversation(&id).await {
-        Ok(Some(conv)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "id": conv.id, "title": conv.title, "channel": conv.channel,
-                "project_id": conv.project_id, "created_at": conv.created_at,
-                "updated_at": conv.updated_at, "message_count": conv.message_count,
-                "archived": conv.archived, "starred": conv.starred,
-            })),
-        )
-            .into_response(),
+        Ok(Some(conv)) => {
+            let workspace = agent.load_conversation_workspace_snapshot(&id).await;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "id": conv.id, "title": conv.title, "channel": conv.channel,
+                    "project_id": conv.project_id, "created_at": conv.created_at,
+                    "updated_at": conv.updated_at, "message_count": conv.message_count,
+                    "archived": conv.archived, "starred": conv.starred,
+                    "workspace": workspace,
+                })),
+            )
+                .into_response()
+        }
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {

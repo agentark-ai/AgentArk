@@ -875,6 +875,51 @@ impl ActionRuntime {
         })
         .await;
 
+        self.register_builtin_action(ActionDef {
+            name: "current_time".to_string(),
+            description: "Return the current date and time without using any external integration. Use for date-based reminders, time checks, and internal automation scheduling logic.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "timezone": {
+                        "type": "string",
+                        "description": "Optional IANA timezone such as 'Asia/Kolkata' or 'America/New_York'. Defaults to UTC."
+                    }
+                }
+            }),
+            capabilities: vec!["time".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        })
+        .await;
+
+        self.register_builtin_action(ActionDef {
+            name: "notify_user".to_string(),
+            description: "Return a notification message for internal reminder/scheduler delivery. Use for reminders and nudges that should be delivered through AgentArk's delivery routing instead of an external data source.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "Notification body to deliver"
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Optional title for the reminder"
+                    }
+                },
+                "required": ["message"]
+            }),
+            capabilities: vec!["notify".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        })
+        .await;
+
         // Scheduler
         self.register_builtin_action(ActionDef {
             name: "schedule_task".to_string(),
@@ -4196,6 +4241,58 @@ print(result["text"])
                 }
 
                 Ok(output)
+            }
+            "current_time" => {
+                let timezone_name = arguments
+                    .get("timezone")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let now_utc = chrono::Utc::now();
+                if let Some(timezone_name) = timezone_name {
+                    let timezone = timezone_name.parse::<chrono_tz::Tz>().map_err(|_| {
+                        anyhow::anyhow!("Invalid timezone '{}'. Expected an IANA name such as Asia/Kolkata.", timezone_name)
+                    })?;
+                    let local = now_utc.with_timezone(&timezone);
+                    Ok(format!(
+                        "Timezone: {}\nISO: {}\nDate: {}\nReadable date: {}\nTime: {}\nWeekday: {}\nUnix: {}",
+                        timezone_name,
+                        local.to_rfc3339(),
+                        local.format("%Y-%m-%d"),
+                        local.format("%B %d, %Y"),
+                        local.format("%H:%M:%S %Z"),
+                        local.format("%A"),
+                        now_utc.timestamp()
+                    ))
+                } else {
+                    Ok(format!(
+                        "Timezone: UTC\nISO: {}\nDate: {}\nReadable date: {}\nTime: {}\nWeekday: {}\nUnix: {}",
+                        now_utc.to_rfc3339(),
+                        now_utc.format("%Y-%m-%d"),
+                        now_utc.format("%B %d, %Y"),
+                        now_utc.format("%H:%M:%S UTC"),
+                        now_utc.format("%A"),
+                        now_utc.timestamp()
+                    ))
+                }
+            }
+            "notify_user" => {
+                let message = arguments
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("notify_user requires a non-empty `message`"))?;
+                let title = arguments
+                    .get("title")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                if let Some(title) = title {
+                    Ok(format!("{}\n\n{}", title, message))
+                } else {
+                    Ok(message.to_string())
+                }
             }
             // Google Calendar actions
             "calendar_today" => {

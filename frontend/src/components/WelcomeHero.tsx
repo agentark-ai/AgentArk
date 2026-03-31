@@ -43,9 +43,8 @@ export function WelcomeHero({
     [prompts]
   );
   const [promptIndex, setPromptIndex] = useState(0);
-  const [typedPrompt, setTypedPrompt] = useState("");
-  const [isDeletingPrompt, setIsDeletingPrompt] = useState(false);
   const promptSignature = heroPrompts.join("\n");
+  const activePrompt = heroPrompts[promptIndex] || heroPrompts[0] || "";
   const activeObjective = currentTaskDesc?.trim()
     ? currentTaskDesc.trim()
     : agentPaused
@@ -54,40 +53,21 @@ export function WelcomeHero({
 
   useEffect(() => {
     setPromptIndex(0);
-    setTypedPrompt("");
-    setIsDeletingPrompt(false);
   }, [promptSignature]);
 
   useEffect(() => {
-    if (typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-      setTypedPrompt(heroPrompts[promptIndex] || "");
-      return;
+    if (heroPrompts.length <= 1 || typeof window === "undefined") {
+      return undefined;
     }
 
-    const activePrompt = heroPrompts[promptIndex] || "";
-    const nextDelay = isDeletingPrompt ? 16 : 32;
-    const holdDelay = 1700;
-    const resetDelay = 240;
-
-    const timer = window.setTimeout(() => {
-      if (!isDeletingPrompt && typedPrompt !== activePrompt) {
-        setTypedPrompt(activePrompt.slice(0, typedPrompt.length + 1));
-        return;
-      }
-      if (!isDeletingPrompt) {
-        setIsDeletingPrompt(true);
-        return;
-      }
-      if (typedPrompt.length > 0) {
-        setTypedPrompt(activePrompt.slice(0, typedPrompt.length - 1));
-        return;
-      }
-      setIsDeletingPrompt(false);
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const rotateEveryMs = reduceMotion ? 6400 : 4600;
+    const timer = window.setInterval(() => {
       setPromptIndex((prev) => (prev + 1) % heroPrompts.length);
-    }, !isDeletingPrompt && typedPrompt === activePrompt ? holdDelay : typedPrompt.length === 0 && isDeletingPrompt ? resetDelay : nextDelay);
+    }, rotateEveryMs);
 
-    return () => window.clearTimeout(timer);
-  }, [heroPrompts, isDeletingPrompt, promptIndex, typedPrompt]);
+    return () => window.clearInterval(timer);
+  }, [heroPrompts]);
 
   return (
     <Card
@@ -176,25 +156,32 @@ export function WelcomeHero({
                 background: "rgba(8, 19, 34, 0.58)",
                 px: 1.05,
                 py: 0.85,
-                display: "flex",
-                alignItems: "flex-start",
-                gap: 0.75,
+                display: "grid",
+                gridTemplateColumns: { xs: "1fr", md: "auto minmax(0, 1fr)" },
+                alignItems: "center",
+                columnGap: 0.8,
+                rowGap: 0.45,
                 maxWidth: "100%",
                 minWidth: 0,
                 overflow: "hidden",
+                minHeight: 52,
               }}
             >
               <Typography
                 variant="caption"
-                sx={{ color: "rgba(137, 213, 255, 0.8)", letterSpacing: "0.08em", textTransform: "uppercase", flexShrink: 0, pt: 0.15 }}
+                sx={{
+                  color: "rgba(137, 213, 255, 0.8)",
+                  letterSpacing: "0.08em",
+                  textTransform: "uppercase",
+                  flexShrink: 0,
+                }}
               >
                 Suggested directive
               </Typography>
               <Box
                 sx={{
                   display: "flex",
-                  alignItems: "flex-start",
-                  gap: 0.15,
+                  alignItems: "center",
                   minWidth: 0,
                   flex: 1,
                   color: "rgba(196, 230, 255, 0.96)",
@@ -203,28 +190,18 @@ export function WelcomeHero({
               >
                 <Box
                   component="span"
+                  key={`${promptIndex}-${activePrompt}`}
+                  title={activePrompt}
+                  className="welcome-hero-directive"
                   sx={{
                     minWidth: 0,
-                    display: "-webkit-box",
-                    WebkitBoxOrient: "vertical",
-                    WebkitLineClamp: 2,
+                    display: "block",
                     overflow: "hidden",
-                    wordBreak: "break-word",
+                    whiteSpace: "nowrap",
+                    textOverflow: "ellipsis",
                   }}
                 >
-                  "{typedPrompt || heroPrompts[0]}"
-                </Box>
-                <Box
-                  component="span"
-                  sx={{
-                    display: "inline-block",
-                    width: "0.7ch",
-                    flex: "0 0 auto",
-                    opacity: 0.9,
-                    animation: "welcomeHeroCursorBlink 1s steps(1, end) infinite",
-                  }}
-                >
-                  |
+                  {activePrompt}
                 </Box>
               </Box>
             </Box>

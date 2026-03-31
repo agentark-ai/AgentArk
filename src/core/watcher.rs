@@ -285,20 +285,13 @@ pub fn watcher_request_signature_from_arguments(arguments: &serde_json::Value) -
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
-    let notify_channel = arguments
-        .get("notify_channel")
-        .and_then(|value| value.as_str())
-        .unwrap_or("telegram")
-        .trim()
-        .to_ascii_lowercase();
     let poll_arguments = arguments
         .get("poll_arguments")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
     format!(
-        "{}|{}|{}",
+        "{}|{}",
         poll_action,
-        notify_channel,
         watcher_topic_signature(&poll_arguments, description)
     )
 }
@@ -504,12 +497,6 @@ impl WatcherManager {
         if !existing
             .poll_action
             .eq_ignore_ascii_case(candidate.poll_action.as_str())
-        {
-            return false;
-        }
-        if !existing
-            .notify_channel
-            .eq_ignore_ascii_case(candidate.notify_channel.as_str())
         {
             return false;
         }

@@ -1405,15 +1405,20 @@ impl Agent {
     }
 
     fn detect_app_runtime_error_marker(content: &str) -> Option<&'static str> {
-        let needles: [(&str, &str); 8] = [
+        let needles: [(&str, &str); 13] = [
             ("error loading", "error loading"),
             ("failed to load", "failed to load"),
+            ("failed to fetch", "failed to fetch"),
             ("something went wrong", "something went wrong"),
             ("application error", "application error"),
             ("could not fetch", "could not fetch"),
             ("unable to fetch", "unable to fetch"),
+            ("network error", "network error"),
+            ("cross-origin request blocked", "cross-origin request blocked"),
+            ("cors", "cors"),
             ("please try again", "please try again"),
             ("runtime error", "runtime error"),
+            ("exception", "exception"),
         ];
         for (needle, label) in needles {
             if content.contains(needle) {
@@ -1969,6 +1974,7 @@ impl Agent {
           "entry_command": meta.as_ref().and_then(|m| m.get("entry_command").and_then(|v| v.as_str())),
           "install_command": meta.as_ref().and_then(|m| m.get("install_command").and_then(|v| v.as_str())),
           "runtime_preference": meta.as_ref().and_then(|m| m.get("runtime_preference").and_then(|v| v.as_str())),
+          "expose_public": meta.as_ref().and_then(|m| m.get("expose_public").and_then(|v| v.as_bool())).unwrap_or(false),
             "runtime_image": meta.as_ref().and_then(|m| m.get("runtime_image").and_then(|v| v.as_str())),
             "repo_url": meta.as_ref().and_then(|m| m.get("repo_url").and_then(|v| v.as_str())),
             "repo_ref": meta.as_ref().and_then(|m| m.get("repo_ref").and_then(|v| v.as_str())),
@@ -1998,6 +2004,29 @@ impl Agent {
             }
         }
         Some(out)
+    }
+
+    pub(crate) async fn load_conversation_workspace_snapshot(
+        &self,
+        conversation_id: &str,
+    ) -> Option<serde_json::Value> {
+        let recent_artifact = self.load_recent_artifact_context(conversation_id).await?;
+        if !recent_artifact.artifact_type.eq_ignore_ascii_case("app") {
+            return None;
+        }
+        let target_app_id = recent_artifact.artifact_id.trim();
+        if target_app_id.is_empty() {
+            return None;
+        }
+        let apps = self.app_registry.list().await;
+        let app = apps.iter().find(|candidate| {
+            candidate
+                .get("id")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                == Some(target_app_id)
+        })?;
+        self.build_deployed_app_inspection(app, true, false).await
     }
 
     async fn load_app_metadata(&self, app_id: &str) -> Option<serde_json::Value> {
@@ -2526,21 +2555,69 @@ Requirements:\n\
             // Primary readiness signal: direct HTTP probe to the deployed app URL.
             if let Some(client) = &http_client {
                 match client.get(&internal_probe_url).send().await {
-                    Ok(resp) if !resp.status().is_server_error() => {
+                    Ok(resp) if resp.status().is_success() => {
                         let status = resp.status();
+                        let content_type = resp
+                            .headers()
+                            .get(reqwest::header::CONTENT_TYPE)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or("")
+                            .to_ascii_lowercase();
+                        let body = match resp.text().await {
+                            Ok(body) => body,
+                            Err(error) => {
+                                last_error = format!(
+                                    "HTTP probe succeeded with status {} but response body could not be read: {}",
+                                    status, error
+                                );
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                continue;
+                            }
+                        };
+                        let lower = body.to_lowercase();
+                        let looks_like_html = content_type.contains("html")
+                            || lower.contains("<!doctype html")
+                            || lower.contains("<html")
+                            || lower.contains("<body")
+                            || lower.contains("<div");
+                        if body.trim().is_empty() {
+                            last_error =
+                                format!("HTTP probe returned an empty body with status {}", status);
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            continue;
+                        }
+                        if !looks_like_html {
+                            last_error = format!(
+                                "HTTP probe returned non-HTML content with status {} (content-type: {})",
+                                status,
+                                if content_type.is_empty() {
+                                    "unknown"
+                                } else {
+                                    &content_type
+                                }
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            continue;
+                        }
+                        if let Some(marker) = Self::detect_app_runtime_error_marker(&lower) {
+                            last_error = format!(
+                                "HTTP probe body reports runtime error marker: {}",
+                                marker
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            continue;
+                        }
                         if let Some(integration) = &integration {
                             let sidecar_session = match integration.create_session().await {
                                 Ok(s) => s,
                                 Err(e) => {
-                                    return Ok((
-                                        None,
-                                        true,
-                                        attempt,
-                                        format!(
-                                            "HTTP probe passed on attempt {} (status {}, preview unavailable: create_session failed: {})",
-                                            attempt, status, e
-                                        ),
-                                    ));
+                                    last_error = format!(
+                                        "HTTP probe passed on attempt {} (status {}), but browser validation could not start: {}",
+                                        attempt, status, e
+                                    );
+                                    tokio::time::sleep(std::time::Duration::from_millis(500))
+                                        .await;
+                                    continue;
                                 }
                             };
 
@@ -2589,37 +2666,16 @@ Requirements:\n\
                                     ));
                                 }
                                 Err(e) => {
-                                    let err_text = e.to_string();
-                                    if err_text.contains("runtime error marker")
-                                        || err_text.contains("locked mode")
-                                    {
-                                        last_error = err_text;
-                                        tokio::time::sleep(std::time::Duration::from_millis(500))
-                                            .await;
-                                        continue;
-                                    }
-                                    return Ok((
-                                        None,
-                                        true,
+                                    last_error = format!(
+                                        "HTTP probe passed on attempt {} (status {}), but browser validation failed: {}",
                                         attempt,
-                                        format!(
-                                            "HTTP probe passed on attempt {} (status {}, preview unavailable: {})",
-                                            attempt, status, err_text
-                                        ),
-                                    ));
+                                        status,
+                                        e
+                                    );
+                                    tokio::time::sleep(std::time::Duration::from_millis(500))
+                                        .await;
+                                    continue;
                                 }
-                            }
-                        }
-
-                        if let Ok(body) = resp.text().await {
-                            let lower = body.to_lowercase();
-                            if let Some(marker) = Self::detect_app_runtime_error_marker(&lower) {
-                                last_error = format!(
-                                    "HTTP probe body reports runtime error marker: {}",
-                                    marker
-                                );
-                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                                continue;
                             }
                         }
 
@@ -7364,10 +7420,11 @@ Requirements:\n\
                         let local_base = Self::user_facing_local_base_url();
                         let local_url =
                             Self::absolutize_public_url(Some(local_base.as_str()), existing_url);
-                        let public_url = if expose_public_requested {
-                            self.load_public_base_url().await.map(|base| {
-                                Self::absolutize_public_url(Some(base.as_str()), existing_url)
-                            })
+                        let public_link_note = if expose_public_requested {
+                            Some(
+                                "- Public link requested: I will only share it after validation."
+                                    .to_string(),
+                            )
                         } else {
                             None
                         };
@@ -7384,8 +7441,8 @@ Requirements:\n\
                             ),
                             format!("- Local: {}", local_url),
                         ];
-                        if let Some(public_url) = public_url {
-                            duplicate_msg_lines.push(format!("- Public: {}", public_url));
+                        if let Some(note) = public_link_note {
+                            duplicate_msg_lines.push(note);
                         }
 
                         match Self::resolve_duplicate_app(
@@ -7569,32 +7626,11 @@ Requirements:\n\
                                                     url,
                                                 )
                                             });
-                                        let public_url = if expose_public_requested {
-                                            if let Some(app_id) = result_obj
-                                                .and_then(|result| result.get("app_id"))
-                                                .and_then(|v| v.as_str())
-                                            {
-                                                if let Some(relative_url) = result_obj
-                                                    .and_then(|result| result.get("url"))
-                                                    .and_then(|v| v.as_str())
-                                                {
-                                                    self.ensure_public_tunnel_base_url(
-                                                        Some(app_id),
-                                                        stream_tx.as_ref(),
-                                                    )
-                                                    .await
-                                                    .map(|base| {
-                                                        Self::absolutize_public_url(
-                                                            Some(base.as_str()),
-                                                            relative_url,
-                                                        )
-                                                    })
-                                                } else {
-                                                    None
-                                                }
-                                            } else {
-                                                None
-                                            }
+                                        let public_link_note = if expose_public_requested {
+                                            Some(
+                                                "    Public link requested; final validated link will be shared after deployment."
+                                                    .to_string(),
+                                            )
                                         } else {
                                             None
                                         };
@@ -7615,11 +7651,8 @@ Requirements:\n\
                                                 local_url
                                             ));
                                         }
-                                        if let Some(public_url) = public_url {
-                                            lines.push(format!(
-                                                "    Public: [Open app]({})",
-                                                public_url
-                                            ));
+                                        if let Some(public_link_note) = public_link_note {
+                                            lines.push(public_link_note);
                                         }
                                         if let Some(port) = result_obj
                                             .and_then(|result| result.get("port"))
@@ -7715,10 +7748,8 @@ Requirements:\n\
                                         .ensure_public_tunnel_base_url(Some(app_id), stream_tx.as_ref())
                                         .await
                                     {
-                                        Some(base) => {
-                                            format!("\nPublic access URL: {}/apps/{}/", base, app_id)
-                                        }
-                                        None => "\nPublic tunnel URL is pending; I started tunnel setup and will use it once available.".to_string(),
+                                        Some(_) => "\nPublic link requested. I will share it after the app finishes validation.".to_string(),
+                                        None => "\nPublic link requested. Tunnel setup is pending, and I will share the link only after validation passes.".to_string(),
                                     }
                                 } else {
                                     String::new()
@@ -7842,7 +7873,7 @@ Requirements:\n\
                                     .await
                                     .or_else(|| public_base_url.clone())
                                 } else {
-                                    public_base_url.clone()
+                                    None
                                 };
 
                                 let (preview_url, verified, verify_attempts, verify_detail) = self
@@ -7867,28 +7898,65 @@ Requirements:\n\
                                         .await
                                         .or_else(|| public_base_url.clone());
                                 }
-                                if expose_public_requested && !had_public_base {
-                                    if let (Some(public_base), Some(tx)) =
-                                        (public_base_for_app.as_deref(), stream_tx.as_ref())
-                                    {
-                                        let public_open_url = Self::absolutize_public_url(
-                                            Some(public_base),
-                                            &canonical_relative_url,
-                                        );
-                                        let _ = tx.try_send(StreamEvent::ToolResult {
-                                            name: call.name.clone(),
-                                            content: format!(
-                                                "Public URL ready: {}",
-                                                public_open_url
-                                            ),
-                                        });
-                                    }
-                                }
+                                let _ = had_public_base;
                                 let local_base_url = Self::user_facing_local_base_url();
                                 let local_open_url = Self::absolutize_public_url(
                                     Some(local_base_url.as_str()),
                                     &canonical_relative_url,
                                 );
+                                let mut public_open_url: Option<String> = None;
+                                let mut public_verify_detail: Option<String> = None;
+                                if expose_public_requested && verified {
+                                    if let Some(public_base) = public_base_for_app.as_deref() {
+                                        let public_validate_url = Self::absolutize_public_url(
+                                            Some(public_base),
+                                            &url_with_key,
+                                        );
+                                        let public_display_url = Self::absolutize_public_url(
+                                            Some(public_base),
+                                            &canonical_relative_url,
+                                        );
+                                        if public_display_url != local_open_url {
+                                            let (_, public_verified, public_verify_attempts, detail) =
+                                                self
+                                                    .validate_and_capture_app_preview(
+                                                        &public_validate_url,
+                                                        &app_id,
+                                                        None,
+                                                    )
+                                                    .await
+                                                    .unwrap_or_else(|e| {
+                                                        (
+                                                            None,
+                                                            false,
+                                                            0,
+                                                            format!(
+                                                                "Public link validation helper error: {}",
+                                                                e
+                                                            ),
+                                                        )
+                                                    });
+                                            if public_verified {
+                                                public_open_url = Some(public_display_url);
+                                                public_verify_detail = Some(format!(
+                                                    "validated (attempts: {})",
+                                                    public_verify_attempts
+                                                ));
+                                            } else {
+                                                public_verify_detail = Some(detail);
+                                            }
+                                        }
+                                    } else {
+                                        public_verify_detail = Some(
+                                            "tunnel setup is still pending for this app.".to_string(),
+                                        );
+                                    }
+                                } else if expose_public_requested && !verified {
+                                    public_verify_detail = Some(
+                                        "skipped because local app validation did not pass yet."
+                                            .to_string(),
+                                    );
+                                }
                                 let conversation_scope_id = call
                                     .arguments
                                     .get("conversation_id")
@@ -7954,28 +8022,25 @@ Requirements:\n\
                                         local_open_url
                                     ));
                                 }
-                                if let Some(public_base) = public_base_for_app.as_deref() {
-                                    let public_open_url = Self::absolutize_public_url(
-                                        Some(public_base),
-                                        &canonical_relative_url,
-                                    );
-                                    if public_open_url != local_open_url {
-                                        if verified {
-                                            app_message_lines.push(format!(
-                                                "- Public: [Open public app]({})",
-                                                public_open_url
-                                            ));
-                                        } else {
-                                            app_message_lines.push(format!(
-                                                "- Public (unverified): [Open public app]({})",
-                                                public_open_url
-                                            ));
-                                        }
+                                if let Some(public_open_url) = public_open_url.as_ref() {
+                                    app_message_lines.push(format!(
+                                        "- Public: [Open public app]({})",
+                                        public_open_url
+                                    ));
+                                    if let Some(detail) = public_verify_detail.as_ref() {
+                                        app_message_lines.push(format!(
+                                            "- Public link status: {}",
+                                            detail
+                                        ));
                                     }
                                 } else if expose_public_requested {
                                     app_message_lines.push(
-                                        "- Public: pending tunnel readiness for this app."
-                                            .to_string(),
+                                        format!(
+                                            "- Public link status: {}",
+                                            public_verify_detail.unwrap_or_else(|| {
+                                                "pending tunnel readiness for this app.".to_string()
+                                            })
+                                        ),
                                     );
                                 }
 

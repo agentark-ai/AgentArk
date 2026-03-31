@@ -100,77 +100,93 @@ export function AgentStatusBar({
       sx={{
         display: "flex",
         flexDirection: "column",
-        gap: 1.2,
+        gap: 1.05,
         px: { xs: 1.35, md: 1.5 },
         py: { xs: 1.2, md: 1.35 },
       }}
     >
-      <Stack spacing={0.45}>
-        <Typography
-          variant="overline"
-          sx={{ color: "rgba(142, 191, 234, 0.74)", letterSpacing: "0.12em", display: "block" }}
-        >
-          System Posture
-        </Typography>
-        <Stack direction="row" alignItems="center" spacing={1}>
-          <Box
-            sx={{
-              width: 10,
-              height: 10,
-              borderRadius: "50%",
-              backgroundColor: dotColor,
-              boxShadow: pulse ? `0 0 8px 2px ${dotColor}` : "none",
-              animation: pulse ? "pulse-dot 2s ease-in-out infinite" : "none",
-              flexShrink: 0,
-              "@keyframes pulse-dot": {
-                "0%, 100%": { boxShadow: `0 0 4px 1px ${dotColor}` },
-                "50%": { boxShadow: `0 0 10px 4px ${dotColor}` },
-              },
-            }}
-          />
-          <Typography variant="subtitle1" sx={{ color: "rgba(232, 243, 255, 0.96)", fontWeight: 600 }}>
-            {label}
+      <Stack direction="row" justifyContent="space-between" spacing={1} alignItems="flex-start">
+        <Stack spacing={0.45} sx={{ minWidth: 0, flex: 1 }}>
+          <Typography
+            variant="overline"
+            sx={{ color: "rgba(142, 191, 234, 0.74)", letterSpacing: "0.12em", display: "block" }}
+          >
+            System Posture
+          </Typography>
+          <Stack direction="row" alignItems="center" spacing={1}>
+            <Box
+              sx={{
+                width: 10,
+                height: 10,
+                borderRadius: "50%",
+                backgroundColor: dotColor,
+                boxShadow: pulse ? `0 0 8px 2px ${dotColor}` : "none",
+                animation: pulse ? "pulse-dot 2s ease-in-out infinite" : "none",
+                flexShrink: 0,
+                "@keyframes pulse-dot": {
+                  "0%, 100%": { boxShadow: `0 0 4px 1px ${dotColor}` },
+                  "50%": { boxShadow: `0 0 10px 4px ${dotColor}` },
+                },
+              }}
+            />
+            <Typography variant="subtitle1" sx={{ color: "rgba(232, 243, 255, 0.96)", fontWeight: 700 }}>
+              {label}
+            </Typography>
+          </Stack>
+          <Typography variant="body2" color="text.secondary">
+            Live reasoning posture, queue pressure, model readiness, and runtime health.
           </Typography>
         </Stack>
-        <Typography variant="body2" color="text.secondary">
-          Live operator summary for autonomy, model readiness, queue pressure, and runtime posture.
-        </Typography>
+        <Box
+          sx={{
+            px: 1,
+            py: 0.5,
+            borderRadius: 999,
+            border: "1px solid rgba(108, 156, 212, 0.18)",
+            background: "rgba(8, 18, 34, 0.54)",
+            color: agentPaused ? "#ffbc7c" : "#82f7c1",
+            fontSize: "0.72rem",
+            fontWeight: 700,
+            letterSpacing: "0.08em",
+            textTransform: "uppercase",
+            flexShrink: 0,
+          }}
+        >
+          {agentPaused ? "Paused" : "Ready"}
+        </Box>
       </Stack>
 
-      <Box
-        sx={{
-          display: "grid",
-          gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
-          gap: 1,
-        }}
-      >
+      <Stack spacing={0.75}>
         {postureItems.map((item) => (
-          <Box
+          <Stack
             key={item.label}
+            direction="row"
+            spacing={1}
+            justifyContent="space-between"
+            alignItems="center"
+            className="mission-metric-card mission-metric-card--rail"
             sx={{
-              borderRadius: 2.5,
-              border: "1px solid rgba(108, 156, 212, 0.16)",
-              background: "linear-gradient(180deg, rgba(8, 18, 34, 0.78), rgba(6, 14, 28, 0.68))",
               px: 1.1,
-              py: 0.95,
-              minWidth: 0,
+              py: 0.9,
             }}
           >
-            <Typography
-              variant="caption"
-              sx={{ color: "rgba(138, 177, 212, 0.68)", textTransform: "uppercase", letterSpacing: "0.08em" }}
-            >
-              {item.label}
-            </Typography>
-            <Typography variant="subtitle2" sx={{ mt: 0.25, color: item.tone, fontWeight: 700 }}>
+            <Box sx={{ minWidth: 0, flex: 1 }}>
+              <Typography
+                variant="caption"
+                className="mission-metric-card__label"
+              >
+                {item.label}
+              </Typography>
+              <Typography variant="caption" className="mission-metric-card__detail" sx={{ display: "block", mt: 0.2 }}>
+                {item.detail}
+              </Typography>
+            </Box>
+            <Typography variant="subtitle2" className="mission-metric-card__value" sx={{ color: item.tone, textAlign: "right" }}>
               {item.value}
             </Typography>
-            <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.2 }}>
-              {item.detail}
-            </Typography>
-          </Box>
+          </Stack>
         ))}
-      </Box>
+      </Stack>
 
       <Stack spacing={0.7} sx={{ pt: 0.2 }}>
         {currentTaskDesc ? (

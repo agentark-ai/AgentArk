@@ -134,8 +134,8 @@ export function TodaysHighlights({ tasks, traces }: Props) {
       ];
 
   return (
-    <Card className="mission-panel mission-panel--lower">
-      <CardContent sx={{ p: 1.55, height: "100%", display: "flex", flexDirection: "column" }}>
+    <Card className="mission-panel mission-panel--adaptive">
+      <CardContent sx={{ p: 1.55, display: "flex", flexDirection: "column" }}>
         <Stack spacing={1.15} className="mission-panel-content">
           <Box>
             <Typography variant="h6" sx={{ fontWeight: 700 }}>
@@ -185,19 +185,17 @@ export function TodaysHighlights({ tasks, traces }: Props) {
             {summaryCards.map((row) => (
               <Box
                 key={row.label}
+                className="mission-metric-card"
                 sx={{
                   minWidth: 0,
                   px: 1.05,
                   py: 0.9,
-                  borderRadius: "12px",
-                  border: "1px solid rgba(108,156,212,0.16)",
-                  background: "rgba(7, 18, 32, 0.56)",
                 }}
               >
-                <Typography variant="caption" color="text.secondary">
+                <Typography variant="caption" className="mission-metric-card__label">
                   {row.label}
                 </Typography>
-                <Typography variant="h6" sx={{ mt: 0.2, fontWeight: 700, color: "#f3fbff" }}>
+                <Typography variant="h6" className="mission-metric-card__value" sx={{ mt: 0.2 }}>
                   {row.value}
                 </Typography>
               </Box>

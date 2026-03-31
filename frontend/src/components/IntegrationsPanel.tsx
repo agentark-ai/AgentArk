@@ -3457,9 +3457,9 @@ export function IntegrationsPanel({
               sx={{ width: "100%" }}
             >
               <Box>
-                <Typography variant="subtitle2">Webhooks, APIs & Connectors</Typography>
+                <Typography variant="subtitle2">Prebuilt Connectors</Typography>
                 <Typography variant="caption" color="text.secondary">
-                  Add new event sources, API tools, and prebuilt integrations here.
+                  Connect Google Workspace, GitHub, Jira, Sentry, and other built-in integrations here. Use the dedicated Webhooks & APIs page for custom sources.
                 </Typography>
               </Box>
               <Chip size="small" label={`${integrations.length} available`} sx={sectionCountChipSx} />

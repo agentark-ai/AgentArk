@@ -131,22 +131,12 @@ fn topics_are_similar(left: &str, right: &str) -> bool {
     shared >= 4 && (shared as f32 / largest as f32) >= 0.6
 }
 
-fn task_report_channel(arguments: &serde_json::Value) -> String {
-    strip_automation_meta(arguments)
-        .get("report_to")
-        .and_then(|value| value.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase()
-}
-
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn task_semantic_signature(task: &Task) -> String {
     let cleaned = strip_automation_meta(&task.arguments);
     format!(
-        "{}|{}|{}",
+        "{}|{}",
         task.action.trim().to_ascii_lowercase(),
-        task_report_channel(&cleaned),
         task_topic_signature(&cleaned, &task.description)
     )
 }
@@ -183,12 +173,6 @@ pub fn task_request_signature_from_fields(
     at_time: Option<&str>,
 ) -> String {
     let cleaned = strip_automation_meta(arguments);
-    let report_to = cleaned
-        .get("report_to")
-        .and_then(|value| value.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
     let schedule = if let Some(cron) = cron_expr {
         format!("cron:{}", normalize_signature_text(cron))
     } else if let Some(at) = at_time {
@@ -197,9 +181,8 @@ pub fn task_request_signature_from_fields(
         "once".to_string()
     };
     format!(
-        "{}|{}|{}|{}",
+        "{}|{}|{}",
         action_name.trim().to_ascii_lowercase(),
-        report_to,
         schedule,
         task_topic_signature(&cleaned, description)
     )
@@ -207,9 +190,6 @@ pub fn task_request_signature_from_fields(
 
 pub fn tasks_are_semantically_similar(existing: &Task, candidate: &Task) -> bool {
     if !existing.action.eq_ignore_ascii_case(&candidate.action) {
-        return false;
-    }
-    if task_report_channel(&existing.arguments) != task_report_channel(&candidate.arguments) {
         return false;
     }
 
@@ -306,6 +286,27 @@ mod tests {
 
         task.arguments = serde_json::json!({
             "query": "label:junk older_than:30d"
+        });
+        let right = task_semantic_signature(&task);
+
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn task_signature_ignores_report_channel_rebinding() {
+        let mut task = Task::new(
+            "Bonus reminder".to_string(),
+            "notify_user".to_string(),
+            serde_json::json!({
+                "message": "Bonus date has arrived",
+                "report_to": "preferred"
+            }),
+        );
+        let left = task_semantic_signature(&task);
+
+        task.arguments = serde_json::json!({
+            "message": "Bonus date has arrived",
+            "report_to": "telegram"
         });
         let right = task_semantic_signature(&task);
 

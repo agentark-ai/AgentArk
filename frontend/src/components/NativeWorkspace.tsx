@@ -42,11 +42,15 @@ import {
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import ArrowDropDownRoundedIcon from "@mui/icons-material/ArrowDropDownRounded";
 import AttachFileRoundedIcon from "@mui/icons-material/AttachFileRounded";
+import AutorenewRoundedIcon from "@mui/icons-material/AutorenewRounded";
+import CheckCircleRoundedIcon from "@mui/icons-material/CheckCircleRounded";
 import ChevronLeftRoundedIcon from "@mui/icons-material/ChevronLeftRounded";
 import ChevronRightRoundedIcon from "@mui/icons-material/ChevronRightRounded";
 import ContentCopyRoundedIcon from "@mui/icons-material/ContentCopyRounded";
+import ErrorOutlineRoundedIcon from "@mui/icons-material/ErrorOutlineRounded";
 import FileDownloadRoundedIcon from "@mui/icons-material/FileDownloadRounded";
 import MoreVertIcon from "@mui/icons-material/MoreVert";
+import RadioButtonUncheckedRoundedIcon from "@mui/icons-material/RadioButtonUncheckedRounded";
 import StarBorderRoundedIcon from "@mui/icons-material/StarBorderRounded";
 import StarRoundedIcon from "@mui/icons-material/StarRounded";
 import ArrowUpwardRoundedIcon from "@mui/icons-material/ArrowUpwardRounded";
@@ -54,7 +58,6 @@ import StopRoundedIcon from "@mui/icons-material/StopRounded";
 import CloseIcon from "@mui/icons-material/Close";
 import FilterListRoundedIcon from "@mui/icons-material/FilterListRounded";
 import SettingsRoundedIcon from "@mui/icons-material/SettingsRounded";
-import SmartToyRoundedIcon from "@mui/icons-material/SmartToyRounded";
 import PersonRoundedIcon from "@mui/icons-material/PersonRounded";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Fragment, isValidElement, useEffect, useLayoutEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent, type MouseEvent, type ReactNode } from "react";
@@ -101,7 +104,13 @@ const SHOW_EXPERIMENTAL_AUTONOMY_TOOLS = false;
 const CHAT_LAST_CONVERSATION_STORAGE_KEY = "agentark.chat.lastConversationId";
 const CHAT_PENDING_RUN_STORAGE_KEY = "agentark.chat.pendingRun";
 const CHAT_PENDING_LAUNCH_STORAGE_KEY = "agentark.chat.pendingLaunch";
+const CHAT_WORKSPACE_SNAPSHOTS_STORAGE_KEY = "agentark.chat.workspaceSnapshots";
 const CHAT_PENDING_RUN_TTL_MS = 45 * 60 * 1000;
+const CHAT_WORKSPACE_SNAPSHOT_TTL_MS = 12 * 60 * 60 * 1000;
+const CHAT_WORKSPACE_SNAPSHOT_MAX_CONVERSATIONS = 10;
+const CHAT_WORKSPACE_SNAPSHOT_MAX_FILES = 24;
+const CHAT_WORKSPACE_SNAPSHOT_MAX_FILE_CHARS = 60_000;
+const CHAT_WORKSPACE_SNAPSHOT_MAX_TOTAL_CHARS = 240_000;
 const CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS = 16000;
 const CHAT_PENDING_STREAM_STEPS_MAX = 48;
 const CHAT_LAUNCH_RUN_EVENT = "agentark.chat.launch-run";
@@ -123,6 +132,15 @@ type ChatPendingRunSnapshot = {
   streamingResponse?: string;
   streamingSteps?: JsonRecord[];
   failedUserMessage?: string;
+};
+
+type ChatWorkspaceSnapshot = {
+  conversationId: string;
+  updatedAt: number;
+  deployedFiles: WorkspaceFileEntry[];
+  liveFileWrites: Record<string, LiveFileWriteState>;
+  streamedWorkspaceApp?: JsonRecord | null;
+  codeViewerFileIdx?: number;
 };
 
 type ChatLaunchRunDetail = {
@@ -729,7 +747,7 @@ function canonicalizeLiveFileWrites(
   const next: Record<string, LiveFileWriteState> = {};
   for (const [name, state] of Object.entries(current)) {
     const normalizedName = normalizeWorkspaceFileName(name, appDir);
-    if (!normalizedName) continue;
+    if (!normalizedName || !isLikelyWorkspaceFileName(normalizedName)) continue;
     const existing = next[normalizedName];
     if (!existing) {
       next[normalizedName] = {
@@ -1182,6 +1200,52 @@ function workspaceAppRootName(appDir = ""): string {
   return parts[parts.length - 1] || "";
 }
 
+const WORKSPACE_EXTENSIONLESS_FILE_NAMES = new Set([
+  "cname",
+  "dockerfile",
+  "gemfile",
+  "license",
+  "makefile",
+  "procfile",
+  "rakefile",
+  "readme"
+]);
+
+const WORKSPACE_METADATA_FIELD_NAMES = new Set([
+  "app_id",
+  "cid",
+  "conversation_id",
+  "description",
+  "entry_command",
+  "project_id",
+  "runtime_mode",
+  "session_id",
+  "slug",
+  "start_command",
+  "title",
+  "trace_id"
+]);
+
+function isLikelyWorkspaceFileName(pathOrName: string): boolean {
+  const normalized = (pathOrName || "")
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\/+/, "")
+    .replace(/\/+$/, "");
+  if (!normalized) return false;
+  const parts = normalized.split("/").filter(Boolean);
+  if (parts.length === 0) return false;
+  const base = parts[parts.length - 1].trim();
+  const lowerBase = base.toLowerCase();
+  if (!base || base === "." || base === "..") return false;
+  if (WORKSPACE_METADATA_FIELD_NAMES.has(lowerBase)) return false;
+  if (/[<>:"|?*]/.test(base)) return false;
+  if (parts.length > 1) return true;
+  if (base.startsWith(".")) return true;
+  if (base.includes(".")) return true;
+  return WORKSPACE_EXTENSIONLESS_FILE_NAMES.has(lowerBase);
+}
+
 function isLikelyWorkspaceFileContent(value: string): boolean {
   const trimmed = (value || "").trim();
   if (!trimmed) return false;
@@ -1230,7 +1294,7 @@ function mergeWorkspaceFiles(
   const merged = new Map<string, WorkspaceFileEntry>();
   for (const file of [...current, ...incoming]) {
     const name = normalizeWorkspaceFileName(file.name, appDir);
-    if (!name) continue;
+    if (!name || !isLikelyWorkspaceFileName(name)) continue;
     const existing = merged.get(name);
     if (!existing) {
       merged.set(name, {
@@ -1269,6 +1333,7 @@ function extractWorkspaceAppFromStreamPayload(name: string, payload: unknown): J
     enabled: source.enabled ?? true,
     running: source.running ?? true,
     is_static: source.is_static ?? true,
+    expose_public: source.expose_public ?? false,
     runtime_mode: str(source.runtime_mode, toBool(source.is_static) ? "static" : "unknown")
   };
 }
@@ -1638,6 +1703,165 @@ function generateConversationId(): string {
     return crypto.randomUUID();
   }
   return `conv-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function sanitizeWorkspaceAppSnapshot(value: unknown): JsonRecord | null {
+  const source = asRecord(value);
+  const next: JsonRecord = {};
+  for (const key of [
+    "id",
+    "app_id",
+    "title",
+    "url",
+    "access_url",
+    "local_url",
+    "local_access_url",
+    "app_dir",
+    "runtime_mode",
+    "created_at"
+  ]) {
+    const text = str(source[key], "").trim();
+    if (text) next[key] = text;
+  }
+  for (const key of ["enabled", "running", "is_static", "access_guard_enabled", "expose_public"]) {
+    if (typeof source[key] === "boolean") next[key] = source[key];
+  }
+  if (typeof source.port === "number" && Number.isFinite(source.port)) {
+    next.port = source.port;
+  }
+  return Object.keys(next).length > 0 ? next : null;
+}
+
+function compactWorkspaceFilesForSnapshot(files: WorkspaceFileEntry[]): WorkspaceFileEntry[] {
+  const out: WorkspaceFileEntry[] = [];
+  let totalChars = 0;
+  for (const file of files) {
+    const name = str(file?.name, "").trim();
+    if (!name) continue;
+    const remaining = CHAT_WORKSPACE_SNAPSHOT_MAX_TOTAL_CHARS - totalChars;
+    if (remaining <= 0 || out.length >= CHAT_WORKSPACE_SNAPSHOT_MAX_FILES) break;
+    const content = str(file?.content, "").slice(
+      0,
+      Math.min(CHAT_WORKSPACE_SNAPSHOT_MAX_FILE_CHARS, remaining)
+    );
+    totalChars += content.length;
+    out.push({ name, content });
+  }
+  return out;
+}
+
+function compactLiveFileWritesForSnapshot(
+  liveFileWrites: Record<string, LiveFileWriteState>
+): Record<string, LiveFileWriteState> {
+  const out: Record<string, LiveFileWriteState> = {};
+  let totalChars = 0;
+  for (const [name, state] of Object.entries(liveFileWrites)) {
+    const fileName = str(name, "").trim();
+    if (!fileName) continue;
+    const remaining = CHAT_WORKSPACE_SNAPSHOT_MAX_TOTAL_CHARS - totalChars;
+    if (remaining <= 0 || Object.keys(out).length >= CHAT_WORKSPACE_SNAPSHOT_MAX_FILES) break;
+    const content = str(state?.content, "").slice(
+      0,
+      Math.min(CHAT_WORKSPACE_SNAPSHOT_MAX_FILE_CHARS, remaining)
+    );
+    totalChars += content.length;
+    out[fileName] = {
+      content,
+      line: Math.max(0, num(state?.line, 0)),
+      totalLines: Math.max(0, num(state?.totalLines, 0)),
+      done: toBool(state?.done)
+    };
+  }
+  return out;
+}
+
+function loadStoredChatWorkspaceSnapshots(): Record<string, ChatWorkspaceSnapshot> {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = window.sessionStorage.getItem(CHAT_WORKSPACE_SNAPSHOTS_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = asRecord(JSON.parse(raw));
+    const now = Date.now();
+    const next: Record<string, ChatWorkspaceSnapshot> = {};
+    for (const [conversationId, value] of Object.entries(parsed)) {
+      const entry = asRecord(value);
+      const updatedAt = num(entry.updatedAt, 0);
+      if (!conversationId.trim() || updatedAt <= 0 || now - updatedAt > CHAT_WORKSPACE_SNAPSHOT_TTL_MS) {
+        continue;
+      }
+      const deployedFiles = Array.isArray(entry.deployedFiles)
+        ? compactWorkspaceFilesForSnapshot(
+            entry.deployedFiles.map((row) => ({
+              name: str(asRecord(row).name, ""),
+              content: str(asRecord(row).content, "")
+            }))
+          )
+        : [];
+      const liveFileWrites = compactLiveFileWritesForSnapshot(
+        Object.fromEntries(
+          Object.entries(asRecord(entry.liveFileWrites)).map(([name, row]) => {
+            const state = asRecord(row);
+            return [
+              name,
+              {
+                content: str(state.content, ""),
+                line: Math.max(0, num(state.line, 0)),
+                totalLines: Math.max(0, num(state.totalLines, 0)),
+                done: toBool(state.done)
+              } satisfies LiveFileWriteState
+            ];
+          })
+        )
+      );
+      const streamedWorkspaceApp = sanitizeWorkspaceAppSnapshot(entry.streamedWorkspaceApp);
+      next[conversationId] = {
+        conversationId,
+        updatedAt,
+        deployedFiles,
+        liveFileWrites,
+        streamedWorkspaceApp,
+        codeViewerFileIdx: Math.max(0, num(entry.codeViewerFileIdx, 0))
+      };
+    }
+    return next;
+  } catch {
+    return {};
+  }
+}
+
+function saveStoredChatWorkspaceSnapshots(snapshots: Record<string, ChatWorkspaceSnapshot>): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.sessionStorage.setItem(
+      CHAT_WORKSPACE_SNAPSHOTS_STORAGE_KEY,
+      JSON.stringify(snapshots)
+    );
+  } catch {
+    // Ignore storage quota failures.
+  }
+}
+
+function loadChatWorkspaceSnapshot(conversationId: string): ChatWorkspaceSnapshot | null {
+  if (!conversationId) return null;
+  return loadStoredChatWorkspaceSnapshots()[conversationId] || null;
+}
+
+function storeChatWorkspaceSnapshot(snapshot: ChatWorkspaceSnapshot): void {
+  if (!snapshot.conversationId) return;
+  const snapshots = loadStoredChatWorkspaceSnapshots();
+  snapshots[snapshot.conversationId] = snapshot;
+  const trimmedEntries = Object.entries(snapshots)
+    .sort((a, b) => b[1].updatedAt - a[1].updatedAt)
+    .slice(0, CHAT_WORKSPACE_SNAPSHOT_MAX_CONVERSATIONS);
+  saveStoredChatWorkspaceSnapshots(Object.fromEntries(trimmedEntries));
+}
+
+function clearChatWorkspaceSnapshot(conversationId: string): void {
+  if (!conversationId || typeof window === "undefined") return;
+  const snapshots = loadStoredChatWorkspaceSnapshots();
+  if (!snapshots[conversationId]) return;
+  delete snapshots[conversationId];
+  saveStoredChatWorkspaceSnapshots(snapshots);
 }
 
 function loadChatPendingRunSnapshot(): ChatPendingRunSnapshot | null {
@@ -4486,33 +4710,89 @@ function WorkspaceProjectScopeBar({
   const projectNameById = useMemo(() => buildProjectNameById(projects), [projects]);
   const activeScopeLabel = projectScopeLabel(activeProjectId, projectNameById);
   const hasProjects = projects.length > 0;
+  const [expanded, setExpanded] = useState(false);
+  const scopeModeLabel = activeProjectId ? "Project" : "Global";
+  const scopeSummary = activeProjectId
+    ? "New chats, documents, and memories inherit this project."
+    : "Everything stays global until you explicitly split it into a project.";
 
   return (
-    <Box className="list-shell" sx={{ mb: 1.25, flexShrink: 0 }}>
+    <Box className={`workspace-scope-shell${expanded ? " is-expanded" : ""}`} sx={{ mb: 1.25, flexShrink: 0 }}>
       <Stack
-        direction={{ xs: "column", lg: "row" }}
-        spacing={1.25}
-        alignItems={{ xs: "stretch", lg: "center" }}
+        direction={{ xs: "column", md: "row" }}
+        spacing={1}
+        alignItems={{ xs: "stretch", md: "center" }}
         justifyContent="space-between"
       >
-        <Box sx={{ minWidth: 0 }}>
-          <Typography variant="overline" className="workspace-side-kicker">
-            Workspace Scope
-          </Typography>
-          <Typography variant="body2" sx={{ fontWeight: 650 }}>
+        <Stack spacing={0.45} sx={{ minWidth: 0 }}>
+          <Stack direction="row" spacing={0.75} alignItems="center" useFlexGap flexWrap="wrap">
+            <Typography variant="overline" className="workspace-scope-kicker">
+              Scope
+            </Typography>
+            <Chip
+              size="small"
+              label={scopeModeLabel}
+              className="workspace-scope-chip"
+              sx={{
+                height: 22,
+                borderRadius: 999,
+                bgcolor: activeProjectId ? "rgba(24, 86, 131, 0.28)" : "rgba(10, 33, 54, 0.72)",
+                borderColor: activeProjectId ? "rgba(74, 195, 255, 0.28)" : "rgba(108, 156, 212, 0.18)",
+              }}
+            />
+          </Stack>
+          <Typography variant="body2" className="workspace-scope-title">
             {activeScopeLabel}
           </Typography>
-          <Typography variant="caption" color="text.secondary">
-            {activeProjectId
-              ? "New chats, documents, and memory entries inherit this project automatically."
-              : "Projects stay optional. Leave the workspace global unless you want a separated scope."}
+          <Typography variant="caption" className="workspace-scope-caption">
+            {scopeSummary}
           </Typography>
-        </Box>
+        </Stack>
         <Stack
-          direction={{ xs: "column", sm: "row" }}
+          direction="row"
+          spacing={0.75}
+          alignItems="center"
+          useFlexGap
+          flexWrap="wrap"
+          justifyContent={{ xs: "flex-start", md: "flex-end" }}
+        >
+          {onNavigateToView ? (
+            <Button
+              size="small"
+              variant="outlined"
+              onClick={() => onNavigateToView("projects")}
+              sx={{ whiteSpace: "nowrap" }}
+            >
+              {hasProjects ? "Projects" : "New project"}
+            </Button>
+          ) : null}
+          {hasProjects ? (
+            <Button
+              size="small"
+              variant={expanded ? "contained" : "outlined"}
+              onClick={() => setExpanded((prev) => !prev)}
+              endIcon={
+                <ArrowDropDownRoundedIcon
+                  sx={{
+                    transition: "transform 160ms ease",
+                    transform: expanded ? "rotate(180deg)" : "rotate(0deg)",
+                  }}
+                />
+              }
+              sx={{ whiteSpace: "nowrap" }}
+            >
+              {expanded ? "Hide scope" : "Change scope"}
+            </Button>
+          ) : null}
+        </Stack>
+      </Stack>
+
+      {hasProjects && expanded ? (
+        <Stack
+          direction={{ xs: "column", lg: "row" }}
           spacing={1}
-          alignItems={{ xs: "stretch", sm: "center" }}
-          sx={{ minWidth: { sm: 320 } }}
+          alignItems={{ xs: "stretch", lg: "center" }}
+          className="workspace-scope-controls"
         >
           <TextField
             fullWidth
@@ -4521,6 +4801,7 @@ function WorkspaceProjectScopeBar({
             label="Workspace scope"
             value={activeProjectId}
             onChange={(event) => setActiveProjectId(normalizeProjectId(event.target.value))}
+            sx={{ maxWidth: { lg: 340 } }}
           >
             <MenuItem value="">Global workspace</MenuItem>
             {projects.map((project) => {
@@ -4533,19 +4814,79 @@ function WorkspaceProjectScopeBar({
               );
             })}
           </TextField>
-          {onNavigateToView ? (
-            <Button
-              size="small"
-              variant="outlined"
-              onClick={() => onNavigateToView("projects")}
-              sx={{ whiteSpace: "nowrap" }}
-            >
-              {hasProjects ? "Manage projects" : "Create project"}
-            </Button>
-          ) : null}
+          <Typography variant="caption" className="workspace-scope-caption" sx={{ maxWidth: 520 }}>
+            Switch the active scope only when you want new chats, documents, and memory to stay inside that project.
+          </Typography>
         </Stack>
-      </Stack>
+      ) : null}
     </Box>
+  );
+}
+
+function WorkspaceScopeMenuButton({
+  activeProjectId,
+  projects,
+  onNavigateToView
+}: {
+  activeProjectId: string;
+  projects: JsonRecord[];
+  onNavigateToView?: (view: string, replace?: boolean) => void;
+}) {
+  const setActiveProjectId = useUiStore((s) => s.setActiveProjectId);
+  const projectNameById = useMemo(() => buildProjectNameById(projects), [projects]);
+  const activeScopeLabel = projectScopeLabel(activeProjectId, projectNameById);
+  const hasProjects = projects.length > 0;
+  const [anchorEl, setAnchorEl] = useState<HTMLElement | null>(null);
+  const open = Boolean(anchorEl);
+
+  return (
+    <>
+      <Button
+        size="small"
+        variant="outlined"
+        className="workspace-scope-menu-trigger"
+        endIcon={<ArrowDropDownRoundedIcon sx={{ fontSize: 18 }} />}
+        onClick={(event) => setAnchorEl(event.currentTarget)}
+      >
+        Scope: {activeScopeLabel}
+      </Button>
+      <Menu anchorEl={anchorEl} open={open} onClose={() => setAnchorEl(null)}>
+        <MenuItem
+          selected={!activeProjectId}
+          onClick={() => {
+            setActiveProjectId("");
+            setAnchorEl(null);
+          }}
+        >
+          Global workspace
+        </MenuItem>
+        {projects.map((project) => {
+          const id = normalizeProjectId(project.id);
+          if (!id) return null;
+          return (
+            <MenuItem
+              key={id}
+              selected={id === activeProjectId}
+              onClick={() => {
+                setActiveProjectId(id);
+                setAnchorEl(null);
+              }}
+            >
+              {projectScopeLabel(id, projectNameById)}
+            </MenuItem>
+          );
+        })}
+        <Divider />
+        <MenuItem
+          onClick={() => {
+            setAnchorEl(null);
+            onNavigateToView?.("projects");
+          }}
+        >
+          {hasProjects ? "Manage projects" : "New project"}
+        </MenuItem>
+      </Menu>
+    </>
   );
 }
 
@@ -4589,12 +4930,14 @@ function ChatManager({
   autoRefresh,
   isActive,
   projects,
-  activeProjectId
+  activeProjectId,
+  onNavigateToView
 }: {
   autoRefresh: boolean;
   isActive: boolean;
   projects: JsonRecord[];
   activeProjectId: string;
+  onNavigateToView?: (view: string, replace?: boolean) => void;
 }) {
   const queryClient = useQueryClient();
   const chatAutoRefresh = autoRefresh && isActive;
@@ -4665,6 +5008,7 @@ function ChatManager({
   const lastProgressBubbleCategoryRef = useRef("");
   const lastProgressBubbleAtRef = useRef(0);
   const streamedWorkspaceAppRef = useRef<JsonRecord | null>(null);
+  const lastWorkspaceRestoreSeedRef = useRef("");
   const conversationOffset = conversationPage * CHAT_CONVERSATIONS_PAGE_SIZE;
   const scopedConversationPath = useMemo(
     () =>
@@ -4705,16 +5049,19 @@ function ChatManager({
   const selectedConversationQ = useQuery({
     queryKey: ["chat-conversation", conversationId],
     queryFn: () => api.rawGet(`/conversations/${encodeURIComponent(conversationId || "")}`),
-    enabled: !!conversationId && !sidebarConversationIds.has(conversationId || ""),
+    enabled: !!conversationId,
     refetchInterval: chatAutoRefresh ? REFRESH_MS : false
   });
   const selectedConversation = useMemo(
-    () =>
-      [...starredConversations, ...conversations].find((conv) => str(conv.id, "") === conversationId) ??
-      (() => {
-        const fetched = asRecord(selectedConversationQ.data);
-        return str(fetched.id, "").trim() ? fetched : null;
-      })(),
+    () => {
+      const sidebarMatch =
+        [...starredConversations, ...conversations].find((conv) => str(conv.id, "") === conversationId) ?? null;
+      const fetched = asRecord(selectedConversationQ.data);
+      if (str(fetched.id, "").trim()) {
+        return sidebarMatch ? { ...sidebarMatch, ...fetched } : fetched;
+      }
+      return sidebarMatch;
+    },
     [starredConversations, conversations, conversationId, selectedConversationQ.data]
   );
   const selectedMessageCount = num(selectedConversation?.message_count, 0);
@@ -4752,6 +5099,15 @@ function ChatManager({
   const projectNameById = useMemo(() => buildProjectNameById(projects), [projects]);
   const selectedConversationProjectId = normalizeProjectId(selectedConversation?.project_id);
   const effectiveProjectId = selectedConversationProjectId || activeProjectId;
+  const selectedConversationWorkspace = asRecord(selectedConversation?.workspace);
+  const restoredConversationWorkspaceApp = useMemo(
+    () => extractWorkspaceAppFromStreamPayload("app_inspect", { matched_app: selectedConversationWorkspace }),
+    [selectedConversationWorkspace]
+  );
+  const restoredConversationWorkspaceFiles = useMemo(
+    () => extractWorkspaceFilesFromStreamPayload("app_inspect", { matched_app: selectedConversationWorkspace }),
+    [selectedConversationWorkspace]
+  );
 
   useEffect(() => {
     if (!pendingRunSnapshot) {
@@ -4799,6 +5155,82 @@ function ChatManager({
       // Ignore storage failures.
     }
   }, [conversationId]);
+
+  useEffect(() => {
+    if (!conversationId) {
+      lastWorkspaceRestoreSeedRef.current = "";
+      return;
+    }
+    if (isStreamingForCurrentConversation) return;
+    const cachedSnapshot = loadChatWorkspaceSnapshot(conversationId);
+    const mergedWorkspaceApp = sanitizeWorkspaceAppSnapshot({
+      ...(cachedSnapshot?.streamedWorkspaceApp || {}),
+      ...(restoredConversationWorkspaceApp || {})
+    });
+    const appDir = str(
+      mergedWorkspaceApp?.app_dir,
+      str(cachedSnapshot?.streamedWorkspaceApp?.app_dir, "")
+    ).trim();
+    const mergedFiles = mergeWorkspaceFiles(
+      restoredConversationWorkspaceFiles,
+      cachedSnapshot?.deployedFiles || [],
+      appDir
+    );
+    const mergedLiveWrites = canonicalizeLiveFileWrites(
+      cachedSnapshot?.liveFileWrites || {},
+      appDir
+    );
+    const restoreSeed = JSON.stringify({
+      conversationId,
+      updatedAt: str(selectedConversation?.updated_at, ""),
+      appId: str(mergedWorkspaceApp?.id, str(mergedWorkspaceApp?.app_id, "")),
+      files: mergedFiles.map((file) => file.name),
+      snapshotUpdatedAt: cachedSnapshot?.updatedAt || 0,
+      liveWrites: Object.keys(mergedLiveWrites)
+    });
+    if (lastWorkspaceRestoreSeedRef.current === restoreSeed) return;
+    lastWorkspaceRestoreSeedRef.current = restoreSeed;
+    if (!mergedWorkspaceApp && mergedFiles.length === 0 && Object.keys(mergedLiveWrites).length === 0) {
+      return;
+    }
+    if (mergedWorkspaceApp) {
+      streamedWorkspaceAppRef.current = mergedWorkspaceApp;
+      setStreamedWorkspaceApp(mergedWorkspaceApp);
+    }
+    if (mergedFiles.length > 0) {
+      setDeployedFiles(mergedFiles);
+      const requestedIndex = Math.max(0, num(cachedSnapshot?.codeViewerFileIdx, 0));
+      setCodeViewerFileIdx(Math.min(requestedIndex, Math.max(0, mergedFiles.length - 1)));
+    }
+    if (Object.keys(mergedLiveWrites).length > 0) {
+      setLiveFileWrites(mergedLiveWrites);
+    }
+    setWorkspaceOpen(true);
+  }, [
+    conversationId,
+    isStreamingForCurrentConversation,
+    restoredConversationWorkspaceApp,
+    restoredConversationWorkspaceFiles,
+    selectedConversation?.updated_at
+  ]);
+
+  useEffect(() => {
+    if (!conversationId) return;
+    const compactedFiles = compactWorkspaceFilesForSnapshot(deployedFiles);
+    const compactedLiveWrites = compactLiveFileWritesForSnapshot(liveFileWrites);
+    const compactedApp = sanitizeWorkspaceAppSnapshot(streamedWorkspaceApp);
+    if (!compactedApp && compactedFiles.length === 0 && Object.keys(compactedLiveWrites).length === 0) {
+      return;
+    }
+    storeChatWorkspaceSnapshot({
+      conversationId,
+      updatedAt: Date.now(),
+      deployedFiles: compactedFiles,
+      liveFileWrites: compactedLiveWrites,
+      streamedWorkspaceApp: compactedApp,
+      codeViewerFileIdx: Math.max(0, num(codeViewerFileIdx, 0))
+    });
+  }, [conversationId, deployedFiles, liveFileWrites, streamedWorkspaceApp, codeViewerFileIdx]);
 
   useEffect(() => {
     const maxPage = Math.max(0, conversationPageCount - 1);
@@ -5555,6 +5987,7 @@ function ChatManager({
     setAttachedFiles([]);
     setChatError(null);
     setChatNotice(null);
+    lastWorkspaceRestoreSeedRef.current = "";
       setPendingUserMessage(null);
       setFailedUserMessage(null);
       setStreamingResponse("");
@@ -5591,6 +6024,7 @@ function ChatManager({
     if (!id) return;
     setChatError(null);
     if (conversationId === id) return;
+    lastWorkspaceRestoreSeedRef.current = "";
       setPendingUserMessage(null);
       setFailedUserMessage(null);
       setStreamingResponse("");
@@ -5781,6 +6215,14 @@ function ChatManager({
     }
 
     if (
+      (/localhost:11434/i.test(message) || /127\.0\.0\.1:11434/i.test(message)) &&
+      (/error sending request for url/i.test(message) ||
+        /connection refused/i.test(message) ||
+        /provider instability/i.test(message))
+    ) {
+      return "No working local model is available. If you want Ollama, start it and load a model. Otherwise configure a model in Settings > Models.";
+    }
+    if (
       /missing ['"`]?files['"`]?/i.test(message) ||
       /object mapping filename to content/i.test(message)
     ) {
@@ -5964,6 +6406,7 @@ function ChatManager({
   const deleteConversationMutation = useMutation({
     mutationFn: (id: string) => api.rawDelete(`/conversations/${encodeURIComponent(id)}`),
     onSuccess: async (_data, id) => {
+      clearChatWorkspaceSnapshot(id);
       if (conversationId === id) startNewConversation();
       await queryClient.invalidateQueries({ queryKey: ["chat-conversations"] });
       await queryClient.invalidateQueries({ queryKey: ["chat-messages", id] });
@@ -7114,7 +7557,7 @@ function ChatManager({
     messages.length,
     pendingUserMessage,
     failedUserMessage,
-    streamingResponse.length,
+    Math.floor(streamingResponse.length / 36),
     streamingProgressMessages.length,
     isStreaming
   ]);
@@ -7251,16 +7694,27 @@ function ChatManager({
     !showStreamingAssistant &&
     visibleStreamingProgressMessages.length > 0 &&
     !!completedProgressBeforeMessageId;
+  const renderAgentAvatar = (extraClassName = "") => (
+    <Avatar
+      variant="rounded"
+      className={`chat-avatar chat-avatar-agent${extraClassName ? ` ${extraClassName}` : ""}`}
+      sx={{ width: 32, height: 32 }}
+    >
+      <Box component="img" src={AgentLogo} alt="AgentArk" className="chat-avatar-agent-logo" />
+    </Avatar>
+  );
+  const renderUserAvatar = (extraClassName = "") => (
+    <Avatar
+      className={`chat-avatar chat-avatar-user${extraClassName ? ` ${extraClassName}` : ""}`}
+      sx={{ width: 32, height: 32 }}
+    >
+      <PersonRoundedIcon className="chat-avatar-user-icon" />
+    </Avatar>
+  );
   const renderProgressRows = (keyPrefix: string) =>
     visibleStreamingProgressMessages.map((msg, idx) => (
       <Box className="chat-row" key={`${keyPrefix}-${idx}`}>
-        <Avatar
-          variant="rounded"
-          className="chat-avatar"
-          sx={{ width: 30, height: 30, bgcolor: "rgba(12,22,40,0.85)" }}
-        >
-          <SmartToyRoundedIcon sx={{ fontSize: 16 }} />
-        </Avatar>
+        {renderAgentAvatar(keyPrefix === "stream-progress-live" ? "chat-avatar-working" : "")}
         <Box className="chat-bubble chat-bubble-assistant">
           <Typography variant="caption" color="text.secondary">
             AgentArk | working...
@@ -7445,19 +7899,20 @@ function ChatManager({
   const workspaceTunnelBaseUrl = str(workspaceTunnel.url, "").trim().replace(/\/+$/, "");
   const workspaceSelectedPublicAppId = str(workspaceTunnel.selected_app_id, "").trim();
   const activeWorkspaceApp = useMemo(() => {
-    const hintedAppId = str(streamedWorkspaceApp?.id, str(streamedWorkspaceApp?.app_id, "")).trim();
+    const workspaceAppSeed = streamedWorkspaceApp || restoredConversationWorkspaceApp;
+    const hintedAppId = str(workspaceAppSeed?.id, str(workspaceAppSeed?.app_id, "")).trim();
     if (hintedAppId) {
       const matched = workspaceApps.find((app) => str(app.id, "").trim() === hintedAppId);
       if (matched) {
-        return { ...matched, ...(streamedWorkspaceApp || {}) };
+        return { ...matched, ...(workspaceAppSeed || {}) };
       }
     }
-    if (streamedWorkspaceApp) {
-      return streamedWorkspaceApp;
+    if (workspaceAppSeed) {
+      return workspaceAppSeed;
     }
     // No app deployed in this conversation â€” don't show stale preview from previous ones.
     return null;
-  }, [workspaceApps, streamedWorkspaceApp]);
+  }, [workspaceApps, streamedWorkspaceApp, restoredConversationWorkspaceApp]);
   const activeWorkspaceAppId = str(
     activeWorkspaceApp?.id,
     str(activeWorkspaceApp?.app_id, "")
@@ -7641,15 +8096,6 @@ function ChatManager({
     [liveWriteEntries]
   );
   const activeLiveWriteName = activeLiveWriteEntry?.[0] || "";
-  const activeLiveWriteProgressLabel = activeLiveWriteEntry
-    ? (() => {
-        const state = activeLiveWriteEntry[1];
-        if (state.totalLines > 0) {
-          return `${Math.min(state.line, state.totalLines)}/${state.totalLines} lines${state.done ? " done" : ""}`;
-        }
-        return state.done ? "Write complete" : "Writing...";
-      })()
-    : "";
 
   useEffect(() => {
     if (!activeLiveWriteName) return;
@@ -7683,6 +8129,26 @@ function ChatManager({
         executionPlanPendingCount > 0 ? `${executionPlanPendingCount} pending` : null
       ].filter(Boolean).join(" - ")
     : "";
+  const executionPlanTone =
+    executionPlanFailedCount > 0
+      ? "failed"
+      : executionPlanActiveCount > 0
+        ? "running"
+        : displayedExecutionPlan.length > 0 && executionPlanCompletedCount === displayedExecutionPlan.length
+          ? "done"
+          : "pending";
+  const renderExecutionPlanStatusIcon = (status: string, className = "") => {
+    if (status === "completed") {
+      return <CheckCircleRoundedIcon className={className} />;
+    }
+    if (status === "failed") {
+      return <ErrorOutlineRoundedIcon className={className} />;
+    }
+    if (status === "running") {
+      return <AutorenewRoundedIcon className={className} />;
+    }
+    return <RadioButtonUncheckedRoundedIcon className={className} />;
+  };
   const activeWorkspaceAppTitle = str(
     activeWorkspaceApp?.title,
     str(activeWorkspaceApp?.app_id, str(activeWorkspaceApp?.id, ""))
@@ -7701,15 +8167,6 @@ function ChatManager({
         value: workspaceStatusCopy.line1.replace(/^Status:\s*/i, "").trim() || "Action required",
         detail: workspaceStatusCopy.line2,
         tone: "warning"
-      });
-    }
-
-    if (activePhaseStatus) {
-      rows.push({
-        label: "Phase",
-        value: activePhaseStatus.label,
-        detail: activePhaseStatus.detail,
-        tone: "live"
       });
     }
 
@@ -7742,7 +8199,6 @@ function ChatManager({
     activeWorkspaceApp,
     activeWorkspaceAppId,
     activeWorkspaceAppTitle,
-    activePhaseStatus,
     apiKeyActionNeeded,
     previewUrl,
     publicPreviewUrl,
@@ -7751,42 +8207,6 @@ function ChatManager({
     safetyPolicyBlocked,
     workspaceStatusCopy.line1,
     workspaceStatusCopy.line2
-  ]);
-  const termFooterSignals = useMemo(() => {
-    const rows: Array<{ label: string; value: string }> = [];
-    if (activePhaseStatus) {
-      rows.push({ label: "Phase", value: activePhaseStatus.label });
-      if (activePhaseStatus.toolName) {
-        rows.push({ label: "Tool", value: toHumanToolName(activePhaseStatus.toolName) });
-      }
-      if (activePhaseStatus.elapsedSecs > 0) {
-        rows.push({ label: "Elapsed", value: `${activePhaseStatus.elapsedSecs}s` });
-      }
-    }
-    if (activeLiveWriteName) {
-      rows.push({ label: "File", value: activeLiveWriteName });
-    }
-    if (activeLiveWriteProgressLabel) {
-      rows.push({ label: "Progress", value: activeLiveWriteProgressLabel });
-    }
-    if (activeWorkspaceApp) {
-      rows.push({ label: "Runtime", value: runtimeSummary.label });
-    }
-    if (publicPreviewUrl || previewUrl) {
-      rows.push({
-        label: "Preview",
-        value: publicPreviewUrl ? "Public ready" : "Ready"
-      });
-    }
-    return rows;
-  }, [
-    activeWorkspaceApp,
-    activeLiveWriteName,
-    activeLiveWriteProgressLabel,
-    activePhaseStatus,
-    previewUrl,
-    publicPreviewUrl,
-    runtimeSummary.label
   ]);
 
   const submitSecretHelper = async (modeOverride?: "reuse" | "manual") => {
@@ -8019,6 +8439,11 @@ function ChatManager({
             <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>Agent Workspace</Typography>
           </Stack>
           <Stack direction="row" spacing={1.1} alignItems="center" sx={{ minWidth: 0, flexWrap: "wrap", justifyContent: { xs: "flex-start", sm: "flex-end" } }} useFlexGap>
+            <WorkspaceScopeMenuButton
+              activeProjectId={activeProjectId}
+              projects={projects}
+              onNavigateToView={onNavigateToView}
+            />
             <Tooltip title={showWorkspacePanel ? "Hide workspace panel" : "Show workspace panel"}>
               <span
                 className={`activity-toggle-pill${showWorkspacePanel ? " active" : ""}${isStreamingForCurrentConversation ? " streaming" : ""}`}
@@ -8102,10 +8527,6 @@ function ChatManager({
                 const isUser = role === "user";
                 const isAssistant = role === "assistant";
                 const messageId = str(message.id, String(idx));
-                // Hide the persisted user row for the in-flight run while the pending bubble is active.
-                if (isUser && idx === latestPendingUserMessageIndex) return null;
-                // Hide the persisted assistant row from the current run until the live streaming bubble hands off cleanly.
-                if (isAssistant && idx === latestStreamingAssistantIndex) return null;
                 const tsRaw = str(message.timestamp, "");
                 const ts = tsRaw ? formatChatTimestamp(tsRaw) : null;
                 const content = str(message.content);
@@ -8135,15 +8556,7 @@ function ChatManager({
                   <Fragment key={messageId}>
                     {shouldInsertCompletedProgressBeforeMessage ? renderProgressRows("completed-progress") : null}
                     <Box className={isUser ? "chat-row chat-row-user" : "chat-row"}>
-                      {!isUser ? (
-                        <Avatar
-                          variant="rounded"
-                          className="chat-avatar"
-                          sx={{ width: 30, height: 30, bgcolor: "rgba(12,22,40,0.85)" }}
-                        >
-                          <SmartToyRoundedIcon sx={{ fontSize: 16 }} />
-                        </Avatar>
-                      ) : null}
+                      {!isUser ? renderAgentAvatar() : null}
                       <Box className={isUser ? "chat-bubble chat-bubble-user" : "chat-bubble chat-bubble-assistant"}>
                         <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={0.5}>
                           <Typography
@@ -8192,17 +8605,13 @@ function ChatManager({
                           })
                         )}
                       </Box>
-                      {isUser ? (
-                        <Avatar className="chat-avatar chat-avatar-user" sx={{ width: 30, height: 30, bgcolor: "rgba(47,212,255,0.18)" }}>
-                          <PersonRoundedIcon sx={{ fontSize: 16 }} />
-                        </Avatar>
-                      ) : null}
+                      {isUser ? renderUserAvatar() : null}
                     </Box>
                   </Fragment>
                 );
               })}
 
-              {visiblePendingUserMessage && showStreamingAssistant ? (
+              {visiblePendingUserMessage && showStreamingAssistant && latestPendingUserMessageIndex === -1 ? (
                 <Box className="chat-row chat-row-user">
                   <Box className="chat-bubble chat-bubble-user">
                     <Typography variant="caption" color="text.secondary">
@@ -8212,9 +8621,7 @@ function ChatManager({
                       {visiblePendingUserMessage}
                     </Typography>
                   </Box>
-                  <Avatar className="chat-avatar chat-avatar-user" sx={{ width: 30, height: 30, bgcolor: "rgba(47,212,255,0.18)" }}>
-                    U
-                  </Avatar>
+                  {renderUserAvatar("chat-avatar-pending")}
                 </Box>
               ) : null}
 
@@ -8228,9 +8635,7 @@ function ChatManager({
                       {visibleFailedUserMessage}
                     </Typography>
                   </Box>
-                  <Avatar className="chat-avatar chat-avatar-user" sx={{ width: 30, height: 30, bgcolor: "rgba(47,212,255,0.18)" }}>
-                    U
-                  </Avatar>
+                  {renderUserAvatar()}
                 </Box>
               ) : null}
 
@@ -8241,13 +8646,7 @@ function ChatManager({
 
               {showInterruptedRunCard ? (
                 <Box className="chat-row">
-                  <Avatar
-                    variant="rounded"
-                    className="chat-avatar"
-                    sx={{ width: 30, height: 30, bgcolor: "rgba(12,22,40,0.85)" }}
-                  >
-                    <SmartToyRoundedIcon sx={{ fontSize: 16 }} />
-                  </Avatar>
+                  {renderAgentAvatar()}
                   <Box className="chat-bubble chat-bubble-assistant">
                     <Stack spacing={1}>
                       <Typography variant="caption" color="warning.main">
@@ -8283,15 +8682,9 @@ function ChatManager({
                 </Box>
               ) : null}
 
-              {showStreamingAssistant ? (
+              {showStreamingAssistant && latestStreamingAssistantIndex === -1 ? (
                 <Box className="chat-row">
-                  <Avatar
-                    variant="rounded"
-                    className="chat-avatar"
-                    sx={{ width: 30, height: 30, bgcolor: "rgba(12,22,40,0.85)" }}
-                  >
-                    <SmartToyRoundedIcon sx={{ fontSize: 16 }} />
-                  </Avatar>
+                  {renderAgentAvatar("chat-avatar-working")}
                   <Box className="chat-bubble chat-bubble-assistant chat-bubble-streaming">
                     <Typography variant="caption" color="text.secondary" className="chat-streaming-status">
                       {visibleStreamingResponse.trim() ? "AgentArk is streaming..." : streamingActivity}
@@ -8427,7 +8820,7 @@ function ChatManager({
             ))}
           </Stack>
         ) : null}
-        {displayedExecutionPlan.length > 0 ? (
+        {false ? (
           <Accordion
             expanded={executionPlanExpanded}
             onChange={(_, expanded) => setExecutionPlanExpanded(expanded)}
@@ -8482,7 +8875,85 @@ function ChatManager({
             </AccordionDetails>
           </Accordion>
         ) : null}
-        <Box className="chat-composer-shell">
+        <Box className={`chat-composer-shell${displayedExecutionPlan.length > 0 ? " has-plan" : ""}${executionPlanExpanded ? " plan-expanded" : ""}`}>
+          {displayedExecutionPlan.length > 0 ? (
+            <Box className="chat-composer-plan">
+              <Box
+                className={`chat-composer-plan-toggle status-${executionPlanTone}${executionPlanExpanded ? " expanded" : ""}`}
+                role="button"
+                tabIndex={0}
+                aria-expanded={executionPlanExpanded}
+                onClick={() => setExecutionPlanExpanded((prev) => !prev)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    setExecutionPlanExpanded((prev) => !prev);
+                  }
+                }}
+              >
+                <Stack direction="row" spacing={1} alignItems="center" sx={{ minWidth: 0, flex: 1 }}>
+                  <Box className={`chat-composer-plan-icon status-${executionPlanTone}`}>
+                    {renderExecutionPlanStatusIcon(
+                      executionPlanTone === "done"
+                        ? "completed"
+                        : executionPlanTone === "failed"
+                          ? "failed"
+                          : executionPlanTone === "running"
+                            ? "running"
+                            : "pending",
+                      executionPlanTone === "running" ? "spin" : ""
+                    )}
+                  </Box>
+                  <Box sx={{ minWidth: 0, flex: 1 }}>
+                    <Stack direction="row" spacing={0.8} alignItems="center" useFlexGap flexWrap="wrap">
+                      <Typography variant="caption" className="chat-composer-plan-kicker">
+                        Planner
+                      </Typography>
+                      <Typography variant="caption" className="chat-composer-plan-status">
+                        {executionPlanStatusLabel}
+                      </Typography>
+                    </Stack>
+                    <Typography variant="caption" className="chat-composer-plan-summary">
+                      {executionPlanSummaryText}
+                    </Typography>
+                  </Box>
+                </Stack>
+                <ExpandMoreIcon className="chat-composer-plan-chevron" />
+              </Box>
+              {executionPlanExpanded ? (
+                <Box className="chat-composer-plan-panel">
+                  <Stack spacing={0.9}>
+                    {displayedExecutionPlan.map((step) => {
+                      const isCompleted = step.status === "completed";
+                      const isRunning = step.status === "running";
+                      const isFailed = step.status === "failed";
+                      const detail = str(step.description, "").trim();
+                      return (
+                        <Box
+                          key={step.id}
+                          className={`chat-composer-plan-step${isCompleted ? " done" : ""}${isRunning ? " running" : ""}${isFailed ? " failed" : ""}`}
+                        >
+                          <Box className={`chat-composer-plan-step-icon status-${step.status || "pending"}`}>
+                            {renderExecutionPlanStatusIcon(step.status, isRunning ? "spin" : "")}
+                          </Box>
+                          <Box sx={{ minWidth: 0, flex: 1 }}>
+                            <Typography variant="body2" className="chat-composer-plan-step-title">
+                              {step.id}. {step.title}
+                            </Typography>
+                            {detail && detail !== step.title ? (
+                              <Typography variant="caption" className="chat-composer-plan-step-detail">
+                                {detail}
+                              </Typography>
+                            ) : null}
+                          </Box>
+                        </Box>
+                      );
+                    })}
+                  </Stack>
+                </Box>
+              ) : null}
+            </Box>
+          ) : null}
           <textarea
             className="chat-composer-textarea"
             placeholder="Message (Enter to send, Shift+Enter for newline)"
@@ -8652,13 +9123,8 @@ function ChatManager({
                   <span className="term-tl-dot" style={{ background: "#febc2e" }} />
                   <span className="term-tl-dot" style={{ background: "#28c840" }} />
                   <Typography variant="caption" className="term-titlebar-text">
-                    agentark://console
+                    AgentArk Console
                   </Typography>
-                  {activePhaseStatus ? (
-                    <span className="term-phase-pill" title={activePhaseStatus.detail || activePhaseStatus.label}>
-                      {activePhaseStatus.label}
-                    </span>
-                  ) : null}
                   <Box sx={{ flex: 1 }} />
                   <Typography variant="caption" className="term-titlebar-stats">
                     {progressSummary}
@@ -8710,18 +9176,6 @@ function ChatManager({
                       })
                     )}
                   </Box>
-                  {termFooterSignals.length > 0 ? (
-                    <Box className="term-footer">
-                      <Box className="term-footer-meta">
-                        {termFooterSignals.map((item) => (
-                          <span key={`${item.label}-${item.value}`} className="term-footer-meta-item">
-                            <span className="term-footer-meta-label">{item.label}</span>
-                            <span className="term-footer-meta-value">{item.value}</span>
-                          </span>
-                        ))}
-                      </Box>
-                    </Box>
-                  ) : null}
               </Box>
 
 
@@ -8791,37 +9245,50 @@ function ChatManager({
             {activeWorkspaceCodeEntry ? (
               <Accordion className="chat-workspace-section" disableGutters defaultExpanded>
                 <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ minHeight: 34 }}>
-                  <Stack direction="row" spacing={1} alignItems="center" sx={{ width: "100%", minWidth: 0 }}>
-                    <Typography variant="subtitle2">{isShowingSnippetPreview ? "Code preview" : "Live code"}</Typography>
-                    <Typography
-                      variant="caption"
-                      className="chat-workspace-code-path"
-                      noWrap
-                      title={activeWorkspaceCodePath}
-                    >
-                      {activeWorkspaceCodePath}
-                    </Typography>
-                    <Box sx={{ flex: 1 }} />
-                    {isShowingSnippetPreview ? (
-                      <Typography variant="caption" color="text.secondary" noWrap title={activeWorkspaceCodeSourceLabel}>
-                        {activeWorkspaceCodeSourceLabel}
+                  <Stack direction="row" spacing={1} alignItems="center" className="chat-workspace-code-summary">
+                    <Stack direction="row" spacing={1} alignItems="center" className="chat-workspace-code-heading">
+                      <Typography variant="subtitle2">{isShowingSnippetPreview ? "Code preview" : "Live code"}</Typography>
+                      <Typography
+                        variant="caption"
+                        className="chat-workspace-code-path"
+                        title={activeWorkspaceCodePath}
+                      >
+                        {activeWorkspaceCodePath}
                       </Typography>
-                    ) : codeViewerWriteStatus ? (
-                      <Typography variant="caption" color="text.secondary" noWrap>
-                        {codeViewerWriteStatus}
-                      </Typography>
-                    ) : null}
-                    <Button
-                      size="small"
-                      variant="text"
-                      className="chat-workspace-code-open"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        setCodeViewerOpen(true);
-                      }}
-                    >
-                      Open full screen
-                    </Button>
+                    </Stack>
+                    <Box sx={{ flex: 1, minWidth: 0 }} />
+                    <Stack direction="row" spacing={1} alignItems="center" className="chat-workspace-code-actions">
+                      {isShowingSnippetPreview ? (
+                        <Typography
+                          variant="caption"
+                          color="text.secondary"
+                          className="chat-workspace-code-meta"
+                          title={activeWorkspaceCodeSourceLabel}
+                        >
+                          {activeWorkspaceCodeSourceLabel}
+                        </Typography>
+                      ) : codeViewerWriteStatus ? (
+                        <Typography
+                          variant="caption"
+                          color="text.secondary"
+                          className="chat-workspace-code-meta"
+                          title={codeViewerWriteStatus}
+                        >
+                          {codeViewerWriteStatus}
+                        </Typography>
+                      ) : null}
+                      <Button
+                        size="small"
+                        variant="text"
+                        className="chat-workspace-code-open"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setCodeViewerOpen(true);
+                        }}
+                      >
+                        Open full screen
+                      </Button>
+                    </Stack>
                   </Stack>
                 </AccordionSummary>
                 <AccordionDetails>
@@ -11236,7 +11703,7 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
                   const isRunning = toBool(appItem.running);
                   const canStopApp = isEnabled && !isRestoring;
                   const canRestartApp = !isRestoring && (!isEnabled || !isStaticApp || isRunning);
-                  const appTunnelActive = tunnelActive && !!tunnelBaseUrl && !!selectedPublicAppId;
+                  const appTunnelActive = tunnelActive && !!tunnelBaseUrl && isSelectedPublicApp;
                   const publicUrl = appTunnelActive ? toAbsoluteAppUrl(url, tunnelBaseUrl) : "";
                   const hasProtectedVariant = !!accessUrl && localAccessUrl !== localUrl;
                   const controlPlaneTunnelOnly = tunnelActive && !!tunnelBaseUrl && !selectedPublicAppId;
@@ -25096,17 +25563,18 @@ export function NativeWorkspace({
   const activeProjectId = useUiStore((s) => s.activeProjectId);
   const setActiveProjectId = useUiStore((s) => s.setActiveProjectId);
   const isChat = view === "chat";
-  const showProjectScopeBar = ["chat", "documents", "memory", "projects"].includes(view);
+  const needsProjects = ["chat", "documents", "memory", "projects"].includes(view);
+  const showProjectScopeBar = ["documents", "memory"].includes(view);
   const projectsQ = useQuery({
     queryKey: ["workspace-projects"],
     queryFn: () => api.rawGet("/projects"),
-    enabled: showProjectScopeBar,
-    refetchInterval: autoRefresh && showProjectScopeBar ? REFRESH_MS : false
+    enabled: needsProjects,
+    refetchInterval: autoRefresh && needsProjects ? REFRESH_MS : false
   });
   const projects = pickRecords(projectsQ.data, "projects");
 
   useEffect(() => {
-    if (!showProjectScopeBar || !activeProjectId || !projectsQ.isSuccess || projectsQ.isFetching) return;
+    if (!needsProjects || !activeProjectId || !projectsQ.isSuccess || projectsQ.isFetching) return;
     if (!projects.some((project) => normalizeProjectId(project.id) === activeProjectId)) {
       setActiveProjectId("");
     }
@@ -25116,7 +25584,7 @@ export function NativeWorkspace({
     projectsQ.isFetching,
     projectsQ.isSuccess,
     setActiveProjectId,
-    showProjectScopeBar
+    needsProjects
   ]);
 
   return (
@@ -25150,6 +25618,7 @@ export function NativeWorkspace({
           isActive={view === "chat"}
           projects={projects}
           activeProjectId={activeProjectId}
+          onNavigateToView={onNavigateToView}
         />
       </Box>
       {view === "connections" ? <SettingsManager autoRefresh={autoRefresh} initialTab={2} /> : null}

@@ -1,4 +1,3 @@
-import ContentCopyRoundedIcon from "@mui/icons-material/ContentCopyRounded";
 import { ChannelIcon } from "./IntegrationsPanel";
 import {
   Alert,
@@ -13,7 +12,6 @@ import {
   DialogTitle,
   FormControlLabel,
   Grid2,
-  IconButton,
   MenuItem,
   Stack,
   Switch,
@@ -65,22 +63,6 @@ type CustomApiForm = {
   notes: string[];
 };
 
-type WebhookForm = {
-  name: string;
-  provider: string;
-  auth_mode: string;
-  match_mode: string;
-  secret: string;
-  enabled: boolean;
-  require_approval: boolean;
-  notify_on_queued: boolean;
-  notify_on_success: boolean;
-  notify_on_failure: boolean;
-  output_target: string;
-  output_channel: string;
-  instruction: string;
-};
-
 type IntegrationQuickstartPanelProps = {
   integrations: IntegrationItem[];
   autoRefresh: boolean;
@@ -91,7 +73,6 @@ type IntegrationQuickstartPanelProps = {
   mode?: "all" | "custom-apis-only";
 };
 
-const FEATURED_PREBUILT = ["google_workspace", "github", "jira", "sentry", "notion"];
 const INTEGRATION_SORT_ORDER: Record<string, number> = {
   google_workspace: 0, github: 1, "1password": 2, notion: 3, jira: 4, sentry: 5, linear: 6,
   google_analytics: 10, google_search_console: 11, garmin: 12, shopify: 13, social_analytics: 14,
@@ -121,36 +102,6 @@ function errMessage(error: unknown): string {
   return str(asRecord(error).error, "Request failed");
 }
 
-function defaultWebhookForm(provider = "github"): WebhookForm {
-  return {
-    name:
-      provider === "github"
-        ? "GitHub Events"
-        : provider === "sentry"
-          ? "Sentry Alerts"
-          : provider === "gitlab"
-            ? "GitLab Events"
-            : "Incoming Webhook",
-    provider,
-    auth_mode: provider === "github" ? "hmac_sha256" : "header_token",
-    match_mode: provider === "sentry" ? "failures_only" : "all",
-    secret: "",
-    enabled: true,
-    require_approval: false,
-    notify_on_queued: false,
-    notify_on_success: true,
-    notify_on_failure: true,
-    output_target: "preferred",
-    output_channel: "",
-    instruction:
-      provider === "github"
-        ? "When CI or deployment events arrive, inspect the change or failure and take the next safe action."
-        : provider === "sentry"
-          ? "When alerts arrive, summarize impact, identify likely cause, and take the next safe action."
-          : "Analyze this event and take the next safe action. If it is only informational, summarize it briefly and stop."
-  };
-}
-
 function defaultCustomApiForm(): CustomApiForm {
   return {
     name: "",
@@ -169,40 +120,6 @@ function defaultCustomApiForm(): CustomApiForm {
     operations: [],
     notes: []
   };
-}
-
-function webhookEndpoint(id: string): string {
-  if (typeof window === "undefined") {
-    return `/webhook/inbound/${encodeURIComponent(id)}`;
-  }
-  return `${window.location.origin}/webhook/inbound/${encodeURIComponent(id)}`;
-}
-
-function completionChannelOptions(integrations: IntegrationItem[]): Array<{ id: string; label: string }> {
-  const items = [{ id: "preferred", label: "Preferred channel" }];
-  const seen = new Set<string>(["preferred"]);
-  const push = (id: string, label: string) => {
-    const key = id.trim().toLowerCase();
-    if (!key || seen.has(key)) return;
-    seen.add(key);
-    items.push({ id: key, label });
-  };
-  const labelFallbacks: Record<string, string> = {
-    telegram: "Telegram",
-    slack: "Slack",
-    discord: "Discord",
-    matrix: "Matrix",
-    teams: "Teams",
-    whatsapp: "WhatsApp"
-  };
-  integrations.forEach((item) => {
-    if (item.status !== "connected") return;
-    push(item.id, item.name || labelFallbacks[item.id.trim().toLowerCase()] || item.id);
-  });
-  if (integrations.some((item) => item.id === "google_workspace" && item.status === "connected")) {
-    push("email", "Email");
-  }
-  return items;
 }
 
 type ConnectorDisplayState =
@@ -284,22 +201,13 @@ export function IntegrationQuickstartPanel({
   const showCustomApisOnly = mode === "custom-apis-only";
   const queryClient = useQueryClient();
   const [notice, setNotice] = useState<{ kind: "success" | "error"; text: string } | null>(null);
-  const [prebuiltOpen, setPrebuiltOpen] = useState(false);
-  const [webhookOpen, setWebhookOpen] = useState(false);
   const [customApiOpen, setCustomApiOpen] = useState(false);
-  const [createdWebhookId, setCreatedWebhookId] = useState<string | null>(null);
-  const [webhookForm, setWebhookForm] = useState<WebhookForm>(defaultWebhookForm());
   const [customApiForm, setCustomApiForm] = useState<CustomApiForm>(defaultCustomApiForm());
-
-  const webhooksQ = useQuery({
-    queryKey: ["integrations-quickstart-webhooks"],
-    queryFn: () => api.rawGet("/webhooks/sources"),
-    refetchInterval: autoRefresh ? 8000 : false
-  });
   const customApisQ = useQuery({
     queryKey: ["integrations-quickstart-custom-apis"],
     queryFn: () => api.rawGet("/custom-apis"),
-    refetchInterval: autoRefresh ? 8000 : false
+    enabled: showCustomApisOnly,
+    refetchInterval: autoRefresh && showCustomApisOnly ? 8000 : false
   });
 
   const previewCustomApi = useMutation({
@@ -323,31 +231,16 @@ export function IntegrationQuickstartPanel({
       await queryClient.invalidateQueries({ queryKey: ["integrations-quickstart-custom-apis"] });
     }
   });
-  const createWebhook = useMutation({
-    mutationFn: (payload: JsonRecord) => api.rawPost("/webhooks/sources", payload),
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["integrations-quickstart-webhooks"] });
-      await queryClient.invalidateQueries({ queryKey: ["settings-webhook-events"] });
-    }
-  });
-  const testWebhook = useMutation({
-    mutationFn: (id: string) => api.rawPost(`/webhooks/sources/${encodeURIComponent(id)}/test`, {}),
-    onSettled: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["integrations-quickstart-webhooks"] });
-      await queryClient.invalidateQueries({ queryKey: ["settings-webhook-events"] });
-      await queryClient.invalidateQueries({ queryKey: ["tasks"] });
-      await queryClient.invalidateQueries({ queryKey: ["trace"] });
-    }
-  });
-
-  const webhookSources = useMemo(() => asRecords(asRecord(webhooksQ.data).sources), [webhooksQ.data]);
   const customApis = useMemo(() => asRecords(asRecord(customApisQ.data).custom_apis), [customApisQ.data]);
-  const channelOptions = useMemo(() => completionChannelOptions(integrations), [integrations]);
-  const featuredIntegrations = useMemo(() => {
-    const featured = FEATURED_PREBUILT
-      .map((id) => integrations.find((item) => item.id === id))
-      .filter((item): item is IntegrationItem => Boolean(item));
-    return featured.length > 0 ? featured : integrations.slice(0, 6);
+  const sortedIntegrations = useMemo(() => {
+    return [...integrations].sort((a, b) => {
+      const rankDiff = connectorSortRank(a) - connectorSortRank(b);
+      if (rankDiff !== 0) return rankDiff;
+      const orderA = INTEGRATION_SORT_ORDER[a.id] ?? 50;
+      const orderB = INTEGRATION_SORT_ORDER[b.id] ?? 50;
+      if (orderA !== orderB) return orderA - orderB;
+      return a.name.localeCompare(b.name);
+    });
   }, [integrations]);
   const actionButtonSx = {
     minWidth: 0,
@@ -385,55 +278,6 @@ export function IntegrationQuickstartPanel({
       textTransform: "uppercase"
     }
   } as const;
-
-  async function copyText(value: string, successText: string) {
-    try {
-      await navigator.clipboard.writeText(value);
-      setNotice({ kind: "success", text: successText });
-    } catch {
-      setNotice({ kind: "error", text: "Clipboard copy failed." });
-    }
-  }
-
-  async function handleWebhookSave() {
-    setNotice(null);
-    try {
-      const response = asRecord(
-        await createWebhook.mutateAsync({
-          name: webhookForm.name.trim(),
-          provider: webhookForm.provider,
-          auth_mode: webhookForm.auth_mode,
-          match_mode: webhookForm.match_mode,
-          secret: webhookForm.secret.trim() || undefined,
-          enabled: webhookForm.enabled,
-          require_approval: webhookForm.require_approval,
-          notify_on_queued: webhookForm.notify_on_queued,
-          notify_on_success: webhookForm.notify_on_success,
-          notify_on_failure: webhookForm.notify_on_failure,
-          output_target: webhookForm.output_target,
-          output_channel:
-            webhookForm.output_target === "channel" ? webhookForm.output_channel.trim() : undefined,
-          instruction: webhookForm.instruction.trim()
-        })
-      );
-      const source = asRecord(response.source);
-      const sourceId = str(source.id);
-      setCreatedWebhookId(sourceId || null);
-      setNotice({ kind: "success", text: "Webhook created. Copy the endpoint and run a test." });
-    } catch (error) {
-      setNotice({ kind: "error", text: errMessage(error) });
-    }
-  }
-
-  async function handleWebhookTest(id: string) {
-    setNotice(null);
-    try {
-      await testWebhook.mutateAsync(id);
-      setNotice({ kind: "success", text: "Synthetic webhook test queued." });
-    } catch (error) {
-      setNotice({ kind: "error", text: errMessage(error) });
-    }
-  }
 
   async function handlePreviewCustomApi() {
     setNotice(null);
@@ -524,86 +368,79 @@ export function IntegrationQuickstartPanel({
         <Stack spacing={1.5}>
           {!embedded ? (
             <Box>
-              <Typography variant="subtitle2">Add Connections</Typography>
+              <Typography variant="subtitle2">Prebuilt Connectors</Typography>
               <Typography variant="caption" color="text.secondary">
-                Start here for prebuilt connectors, incoming webhooks, and imported APIs. Secrets stay encrypted and never go to the model.
+                Connect Google Workspace, GitHub, Jira, Sentry, Notion, and other first-party integrations directly here.
               </Typography>
             </Box>
           ) : null}
-          <Grid2 container spacing={1.25}>
-            <Grid2 size={{ xs: 12, md: 6, lg: 4 }}>
-              <Box sx={{ p: 1.5, borderRadius: 1.5, border: "1px solid rgba(112,153,201,0.16)", background: "rgba(7,17,32,0.6)", height: "100%" }}>
-                <Stack spacing={1.25} sx={{ height: "100%", justifyContent: "space-between" }}>
-                  <Box>
-                    <Typography variant="subtitle2">Prebuilt Connector</Typography>
-                    <Typography variant="body2" color="text.secondary">
-                      Pick Google Workspace, GitHub, Jira, Sentry, Notion, Slack, and other ready-made integrations, then connect with OAuth or API keys.
-                    </Typography>
-                  </Box>
-                  <Stack spacing={1}>
-                    <Stack direction="row" spacing={0.75} flexWrap="wrap" useFlexGap>
-                      {featuredIntegrations.slice(0, 4).map((integration) => (
-                        <Chip
-                          key={integration.id}
-                          size="small"
-                          label={integration.name}
-                          onClick={() => onConfigureIntegration(integration)}
-                          clickable
-                          sx={tagChipSx}
-                        />
-                      ))}
-                    </Stack>
-                    <Button variant="contained" sx={actionButtonSx} onClick={() => setPrebuiltOpen(true)}>
-                      Open connectors
-                    </Button>
-                  </Stack>
-                </Stack>
-              </Box>
+          <Stack
+            direction={{ xs: "column", sm: "row" }}
+            spacing={1}
+            justifyContent="space-between"
+            alignItems={{ xs: "flex-start", sm: "center" }}
+          >
+            <Box>
+              <Typography variant="subtitle2">Available Connectors</Typography>
+              <Typography variant="caption" color="text.secondary">
+                Use the dedicated Webhooks & APIs page for incoming event sources and imported custom tools.
+              </Typography>
+            </Box>
+            <Chip size="small" label={`${sortedIntegrations.length} available`} sx={countChipSx} />
+          </Stack>
+          {loadError && sortedIntegrations.length === 0 ? (
+            <Alert severity="error">Failed to load available integrations: {loadError}</Alert>
+          ) : loading && sortedIntegrations.length === 0 ? (
+            <Stack spacing={1.25} alignItems="center" sx={{ py: 4 }}>
+              <CircularProgress size={22} />
+              <Typography variant="body2" color="text.secondary">
+                Loading available integrations...
+              </Typography>
+            </Stack>
+          ) : sortedIntegrations.length === 0 ? (
+            <Alert severity="info">No prebuilt connectors are available yet. Refresh the page and try again.</Alert>
+          ) : (
+            <Grid2 container spacing={1.25}>
+              {sortedIntegrations.map((integration) => {
+                const state = connectorDisplayState(integration);
+                const isConfigured =
+                  state === "connected" || state === "starting" || state === "configured";
+                return (
+                  <Grid2 key={integration.id} size={{ xs: 12, md: 6, lg: 4 }}>
+                    <Box sx={{ p: 1.5, borderRadius: 1.5, border: isConfigured ? "1px solid rgba(64,196,255,0.24)" : "1px solid rgba(112,153,201,0.16)", background: isConfigured ? "rgba(8,24,42,0.56)" : "rgba(7,17,32,0.6)", height: "100%" }}>
+                      <Stack spacing={1.1} sx={{ height: "100%", justifyContent: "space-between" }}>
+                        <Box>
+                          <Stack direction="row" spacing={0.9} alignItems="center" sx={{ mb: 0.75 }}>
+                            <ChannelIcon name={integration.id || integration.name} size={20} />
+                            <Typography variant="subtitle2">{integration.name}</Typography>
+                          </Stack>
+                          <Typography variant="body2" color="text.secondary">
+                            {integration.description}
+                          </Typography>
+                        </Box>
+                        <Stack direction="row" spacing={0.75} alignItems="center" justifyContent="space-between">
+                          <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap>
+                            <Chip size="small" label="Connector" sx={tagChipSx} />
+                            {connectorStatusLabel(integration) ? (
+                              <Chip size="small" label={connectorStatusLabel(integration)} sx={countChipSx} />
+                            ) : null}
+                          </Stack>
+                          <Button
+                            size="small"
+                            variant={state === "available" ? "contained" : "outlined"}
+                            sx={actionButtonSx}
+                            onClick={() => onConfigureIntegration(integration)}
+                          >
+                            {connectorActionLabel(integration)}
+                          </Button>
+                        </Stack>
+                      </Stack>
+                    </Box>
+                  </Grid2>
+                );
+              })}
             </Grid2>
-            <Grid2 size={{ xs: 12, md: 6, lg: 4 }}>
-              <Box sx={{ p: 1.5, borderRadius: 1.5, border: "1px solid rgba(112,153,201,0.16)", background: "rgba(7,17,32,0.6)", height: "100%" }}>
-                <Stack spacing={1.25} sx={{ height: "100%", justifyContent: "space-between" }}>
-                  <Box>
-                    <Typography variant="subtitle2">Incoming Webhook</Typography>
-                    <Typography variant="body2" color="text.secondary">
-                      Choose a GitHub, Sentry, GitLab, or generic template, copy the endpoint, and let AgentArk act when events arrive.
-                    </Typography>
-                  </Box>
-                  <Stack direction="row" alignItems="center" justifyContent="space-between">
-                    <Chip size="small" label={`${webhookSources.length} configured`} sx={countChipSx} />
-                    <Button variant="contained" sx={actionButtonSx} onClick={() => {
-                      setWebhookForm(defaultWebhookForm("github"));
-                      setCreatedWebhookId(null);
-                      setWebhookOpen(true);
-                    }}>
-                      New webhook
-                    </Button>
-                  </Stack>
-                </Stack>
-              </Box>
-            </Grid2>
-            <Grid2 size={{ xs: 12, md: 6, lg: 4 }}>
-              <Box sx={{ p: 1.5, borderRadius: 1.5, border: "1px solid rgba(112,153,201,0.16)", background: "rgba(7,17,32,0.6)", height: "100%" }}>
-                <Stack spacing={1.25} sx={{ height: "100%", justifyContent: "space-between" }}>
-                  <Box>
-                    <Typography variant="subtitle2">Custom API</Typography>
-                    <Typography variant="body2" color="text.secondary">
-                      Import approved API endpoints as tools the agent can use safely.
-                    </Typography>
-                  </Box>
-                  <Stack direction="row" alignItems="center" justifyContent="space-between">
-                    <Chip size="small" label={`${customApis.length} imported`} sx={countChipSx} />
-                    <Button variant="contained" sx={actionButtonSx} onClick={() => {
-                      setCustomApiForm(defaultCustomApiForm());
-                      setCustomApiOpen(true);
-                    }}>
-                      Import API
-                    </Button>
-                  </Stack>
-                </Stack>
-              </Box>
-            </Grid2>
-          </Grid2>
+          )}
         </Stack>
       </Box>
       ) : (
@@ -627,52 +464,7 @@ export function IntegrationQuickstartPanel({
         </Box>
       )}
 
-      {!showCustomApisOnly && webhookSources.length > 0 ? (
-        <Box className="list-shell">
-          <Stack spacing={1}>
-            <Typography variant="subtitle2">Incoming Webhooks</Typography>
-            <Table size="small" sx={{ "& td, & th": { borderColor: "rgba(112,153,201,0.12)", py: 0.75 } }}>
-              <TableHead>
-                <TableRow>
-                  <TableCell>Name</TableCell>
-                  <TableCell>Provider</TableCell>
-                  <TableCell>Trigger</TableCell>
-                  <TableCell>Endpoint</TableCell>
-                  <TableCell align="right">Ops</TableCell>
-                </TableRow>
-              </TableHead>
-              <TableBody>
-                {webhookSources.slice(0, 6).map((source) => {
-                  const sourceId = str(source.id);
-                  const endpoint = webhookEndpoint(sourceId);
-                  return (
-                    <TableRow key={sourceId}>
-                      <TableCell>{str(source.name, sourceId)}</TableCell>
-                      <TableCell>{str(source.provider, "generic")}</TableCell>
-                      <TableCell>{str(source.match_mode, "all").replace(/_/g, " ")}</TableCell>
-                      <TableCell sx={{ fontFamily: "monospace", fontSize: "0.76rem" }}>{endpoint}</TableCell>
-                      <TableCell align="right">
-                        <Stack direction="row" spacing={0.5} justifyContent="flex-end">
-                          <Tooltip title="Copy endpoint">
-                            <IconButton size="small" onClick={() => copyText(endpoint, "Webhook endpoint copied.")}>
-                              <ContentCopyRoundedIcon fontSize="inherit" />
-                            </IconButton>
-                          </Tooltip>
-                          <Button size="small" variant="text" onClick={() => handleWebhookTest(sourceId)}>
-                            Test
-                          </Button>
-                        </Stack>
-                      </TableCell>
-                    </TableRow>
-                  );
-                })}
-              </TableBody>
-            </Table>
-          </Stack>
-        </Box>
-      ) : null}
-
-      {customApis.length > 0 ? (
+      {showCustomApisOnly && customApis.length > 0 ? (
         <Box className="list-shell">
           <Stack spacing={1}>
             <Typography variant="subtitle2">Imported Custom APIs</Typography>
@@ -719,205 +511,6 @@ export function IntegrationQuickstartPanel({
           </Stack>
         </Box>
       ) : null}
-
-      <Dialog open={prebuiltOpen} onClose={() => setPrebuiltOpen(false)} fullWidth maxWidth="sm">
-        <DialogTitle>Add Integration</DialogTitle>
-        <DialogContent dividers>
-          <Stack spacing={1}>
-            <Typography variant="body2" color="text.secondary">
-              Choose a connector, then finish auth, scopes, and triggers in its setup dialog.
-            </Typography>
-            {loadError && integrations.length === 0 ? (
-              <Alert severity="error">Failed to load available integrations: {loadError}</Alert>
-            ) : loading && integrations.length === 0 ? (
-              <Stack spacing={1.25} alignItems="center" sx={{ py: 4 }}>
-                <CircularProgress size={22} />
-                <Typography variant="body2" color="text.secondary">
-                  Loading available integrations...
-                </Typography>
-              </Stack>
-            ) : integrations.length === 0 ? (
-              <Alert severity="info">No integrations are available yet. Refresh the page and try again.</Alert>
-            ) : (
-              [...integrations].sort((a, b) => {
-                const rankDiff = connectorSortRank(a) - connectorSortRank(b);
-                if (rankDiff !== 0) return rankDiff;
-                const orderA = INTEGRATION_SORT_ORDER[a.id] ?? 50;
-                const orderB = INTEGRATION_SORT_ORDER[b.id] ?? 50;
-                if (orderA !== orderB) return orderA - orderB;
-                return a.name.localeCompare(b.name);
-              }).map((integration) => {
-                const state = connectorDisplayState(integration);
-                const isConfigured =
-                  state === "connected" || state === "starting" || state === "configured";
-                return (
-                  <Box
-                    key={integration.id}
-                    sx={{
-                      p: 1.25,
-                      borderRadius: 1.25,
-                      border: isConfigured ? "1px solid rgba(64, 196, 255, 0.24)" : "1px solid rgba(112,153,201,0.16)",
-                      background: isConfigured ? "rgba(8, 24, 42, 0.56)" : "rgba(7,17,32,0.45)"
-                    }}
-                  >
-                    <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
-                      <Box sx={{ minWidth: 0 }}>
-                        <Stack direction="row" spacing={0.75} alignItems="center">
-                          <ChannelIcon name={integration.id || integration.name} size={20} />
-                          <Typography variant="subtitle2" noWrap>{integration.name}</Typography>
-                        </Stack>
-                        <Typography variant="caption" color="text.secondary">
-                          {integration.description}
-                        </Typography>
-                      </Box>
-                      <Stack direction="row" spacing={0.75} alignItems="center" sx={{ flexShrink: 0 }}>
-                        {connectorStatusLabel(integration) ? (
-                          <Chip size="small" label={connectorStatusLabel(integration)} sx={countChipSx} />
-                        ) : null}
-                        <Button
-                          size="small"
-                          variant={state === "available" ? "contained" : "outlined"}
-                          sx={actionButtonSx}
-                          onClick={() => {
-                            setPrebuiltOpen(false);
-                            onConfigureIntegration(integration);
-                          }}
-                        >
-                          {connectorActionLabel(integration)}
-                        </Button>
-                      </Stack>
-                    </Stack>
-                  </Box>
-                );
-              })
-            )}
-          </Stack>
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setPrebuiltOpen(false)}>Close</Button>
-        </DialogActions>
-      </Dialog>
-
-      <Dialog open={webhookOpen} onClose={() => setWebhookOpen(false)} fullWidth maxWidth="md">
-        <DialogTitle>Incoming Webhook</DialogTitle>
-        <DialogContent dividers>
-          <Stack spacing={1.5}>
-            <Stack direction="row" spacing={0.75} flexWrap="wrap" useFlexGap>
-              {["github", "sentry", "gitlab", "generic"].map((template) => (
-                <Chip
-                  key={template}
-                  label={template === "generic" ? "Generic" : template.charAt(0).toUpperCase() + template.slice(1)}
-                  color={webhookForm.provider === template ? "primary" : "default"}
-                  variant={webhookForm.provider === template ? "filled" : "outlined"}
-                  onClick={() => {
-                    setWebhookForm(defaultWebhookForm(template));
-                    setCreatedWebhookId(null);
-                  }}
-                />
-              ))}
-            </Stack>
-            <Stack direction={{ xs: "column", md: "row" }} spacing={1.5}>
-              <TextField label="Name" fullWidth value={webhookForm.name} onChange={(e) => setWebhookForm((current) => ({ ...current, name: e.target.value }))} />
-              <TextField select label="Template" fullWidth value={webhookForm.provider} onChange={(e) => {
-                setWebhookForm(defaultWebhookForm(e.target.value));
-                setCreatedWebhookId(null);
-              }}>
-                <MenuItem value="github">GitHub</MenuItem>
-                <MenuItem value="sentry">Sentry</MenuItem>
-                <MenuItem value="gitlab">GitLab</MenuItem>
-                <MenuItem value="generic">Generic</MenuItem>
-              </TextField>
-            </Stack>
-            <Stack direction={{ xs: "column", md: "row" }} spacing={1.5}>
-              <TextField select label="Auth" fullWidth value={webhookForm.auth_mode} onChange={(e) => setWebhookForm((current) => ({ ...current, auth_mode: e.target.value }))}>
-                <MenuItem value="header_token">Header token</MenuItem>
-                <MenuItem value="hmac_sha256">HMAC SHA-256</MenuItem>
-                <MenuItem value="bearer_token">Bearer token</MenuItem>
-                <MenuItem value="none">None</MenuItem>
-              </TextField>
-              <TextField select label="Trigger" fullWidth value={webhookForm.match_mode} onChange={(e) => setWebhookForm((current) => ({ ...current, match_mode: e.target.value }))}>
-                <MenuItem value="all">All events</MenuItem>
-                <MenuItem value="failures_only">Failures only</MenuItem>
-                <MenuItem value="changes_only">Changes only</MenuItem>
-              </TextField>
-            </Stack>
-            <TextField
-              label="Secret / Token"
-              type="password"
-              fullWidth
-              value={webhookForm.secret}
-              onChange={(e) => setWebhookForm((current) => ({ ...current, secret: e.target.value }))}
-              helperText="Stored encrypted and only used to verify incoming events."
-            />
-            <TextField
-              label="Autonomous Instruction"
-              fullWidth
-              multiline
-              minRows={3}
-              value={webhookForm.instruction}
-              onChange={(e) => setWebhookForm((current) => ({ ...current, instruction: e.target.value }))}
-            />
-            <Stack direction={{ xs: "column", md: "row" }} spacing={1.5}>
-              <TextField
-                select
-                label="Completion Delivery"
-                fullWidth
-                value={webhookForm.output_target}
-                onChange={(e) => setWebhookForm((current) => ({ ...current, output_target: e.target.value }))}
-              >
-                <MenuItem value="preferred">Preferred channel</MenuItem>
-                <MenuItem value="channel">Specific channel</MenuItem>
-              </TextField>
-              <TextField
-                select
-                label="Completion Channel"
-                fullWidth
-                value={webhookForm.output_channel}
-                disabled={webhookForm.output_target !== "channel"}
-                onChange={(e) => setWebhookForm((current) => ({ ...current, output_channel: e.target.value }))}
-              >
-                {channelOptions.filter((item) => item.id !== "preferred").map((item) => (
-                  <MenuItem key={item.id} value={item.id}>{item.label}</MenuItem>
-                ))}
-              </TextField>
-            </Stack>
-            <Stack direction="row" spacing={2} flexWrap="wrap" useFlexGap>
-              <FormControlLabel control={<Switch checked={webhookForm.enabled} onChange={(e) => setWebhookForm((current) => ({ ...current, enabled: e.target.checked }))} />} label="Enabled" />
-              <FormControlLabel control={<Switch checked={webhookForm.require_approval} onChange={(e) => setWebhookForm((current) => ({ ...current, require_approval: e.target.checked }))} />} label="Require approval" />
-              <FormControlLabel control={<Switch checked={webhookForm.notify_on_success} onChange={(e) => setWebhookForm((current) => ({ ...current, notify_on_success: e.target.checked }))} />} label="Notify on success" />
-              <FormControlLabel control={<Switch checked={webhookForm.notify_on_failure} onChange={(e) => setWebhookForm((current) => ({ ...current, notify_on_failure: e.target.checked }))} />} label="Notify on failure" />
-            </Stack>
-            {createdWebhookId ? (
-              <Alert severity="success" action={
-                <Stack direction="row" spacing={1}>
-                  <Button color="inherit" size="small" onClick={() => void copyText(webhookEndpoint(createdWebhookId), "Webhook endpoint copied.")}>
-                    Copy endpoint
-                  </Button>
-                  <Button color="inherit" size="small" onClick={() => void handleWebhookTest(createdWebhookId)}>
-                    Run test
-                  </Button>
-                </Stack>
-              }>
-                Endpoint ready: <Box component="span" sx={{ fontFamily: "monospace" }}>{webhookEndpoint(createdWebhookId)}</Box>
-              </Alert>
-            ) : null}
-          </Stack>
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setWebhookOpen(false)}>Close</Button>
-          <Button
-            variant="contained"
-            onClick={() => void handleWebhookSave()}
-            disabled={
-              createWebhook.isPending ||
-              !webhookForm.name.trim() ||
-              (webhookForm.output_target === "channel" && !webhookForm.output_channel.trim())
-            }
-          >
-            {createWebhook.isPending ? "Saving..." : "Save Webhook"}
-          </Button>
-        </DialogActions>
-      </Dialog>
 
       <Dialog open={customApiOpen} onClose={() => setCustomApiOpen(false)} fullWidth maxWidth="lg">
         <DialogTitle>Import Custom API</DialogTitle>

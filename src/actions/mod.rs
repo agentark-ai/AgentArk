@@ -23,6 +23,265 @@ pub use research::{execute_research, ResearchArgs, ResearchClient, ResearchDepth
 #[allow(unused_imports)]
 pub use search::{SearchBackend, SearchClient, SearchConfig, SearchResponse, SearchResult};
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlannerActionRole {
+    Trigger,
+    Delivery,
+    DataSource,
+    Mutation,
+    Inspection,
+    Orchestration,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlannerIntegrationClass {
+    Internal,
+    Messaging,
+    Workspace,
+    Search,
+    Browser,
+    Filesystem,
+    App,
+    Code,
+    Network,
+    Commerce,
+    Analytics,
+    Media,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlannerCostTier {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlannerSideEffectLevel {
+    None,
+    Notify,
+    Write,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActionPlannerMetadata {
+    pub role: PlannerActionRole,
+    pub requires_auth: bool,
+    pub integration_class: PlannerIntegrationClass,
+    pub cost: PlannerCostTier,
+    pub side_effect_level: PlannerSideEffectLevel,
+}
+
+impl Default for ActionPlannerMetadata {
+    fn default() -> Self {
+        Self {
+            role: PlannerActionRole::Unknown,
+            requires_auth: false,
+            integration_class: PlannerIntegrationClass::Unknown,
+            cost: PlannerCostTier::Medium,
+            side_effect_level: PlannerSideEffectLevel::None,
+        }
+    }
+}
+
+impl ActionDef {
+    pub fn planner_metadata(&self) -> ActionPlannerMetadata {
+        planner_metadata_for_action(self)
+    }
+}
+
+pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata {
+    let name = action.name.trim().to_ascii_lowercase();
+    let capabilities = action
+        .capabilities
+        .iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+
+    let mut meta = ActionPlannerMetadata::default();
+
+    match name.as_str() {
+        "current_time" => {
+            meta.role = PlannerActionRole::Trigger;
+            meta.integration_class = PlannerIntegrationClass::Internal;
+            meta.cost = PlannerCostTier::Low;
+            return meta;
+        }
+        "notify_user" => {
+            meta.role = PlannerActionRole::Delivery;
+            meta.integration_class = PlannerIntegrationClass::Internal;
+            meta.cost = PlannerCostTier::Low;
+            meta.side_effect_level = PlannerSideEffectLevel::Notify;
+            return meta;
+        }
+        "watch" | "schedule_task" => {
+            meta.role = PlannerActionRole::Orchestration;
+            meta.integration_class = PlannerIntegrationClass::Internal;
+            meta.cost = PlannerCostTier::Low;
+            meta.side_effect_level = PlannerSideEffectLevel::Write;
+            return meta;
+        }
+        "gmail_scan" => {
+            meta.role = PlannerActionRole::DataSource;
+            meta.requires_auth = true;
+            meta.integration_class = PlannerIntegrationClass::Workspace;
+            return meta;
+        }
+        "gmail_reply" => {
+            meta.role = PlannerActionRole::Delivery;
+            meta.requires_auth = true;
+            meta.integration_class = PlannerIntegrationClass::Workspace;
+            meta.side_effect_level = PlannerSideEffectLevel::Notify;
+            return meta;
+        }
+        "calendar_today" | "calendar_list" | "calendar_free" => {
+            meta.role = PlannerActionRole::DataSource;
+            meta.requires_auth = true;
+            meta.integration_class = PlannerIntegrationClass::Workspace;
+            return meta;
+        }
+        "calendar_create" => {
+            meta.role = PlannerActionRole::Mutation;
+            meta.requires_auth = true;
+            meta.integration_class = PlannerIntegrationClass::Workspace;
+            meta.side_effect_level = PlannerSideEffectLevel::Write;
+            return meta;
+        }
+        "web_search" | "research" | "page_fetch" => {
+            meta.role = PlannerActionRole::DataSource;
+            meta.integration_class = PlannerIntegrationClass::Search;
+            meta.cost = if name == "research" {
+                PlannerCostTier::High
+            } else {
+                PlannerCostTier::Medium
+            };
+            return meta;
+        }
+        "browser_auto" => {
+            meta.role = PlannerActionRole::Mutation;
+            meta.integration_class = PlannerIntegrationClass::Browser;
+            meta.cost = PlannerCostTier::High;
+            meta.side_effect_level = PlannerSideEffectLevel::Write;
+            return meta;
+        }
+        "file_read" | "list_tasks" | "list_watchers" | "list_integrations" | "app_inspect" => {
+            meta.role = PlannerActionRole::Inspection;
+            meta.integration_class = if name == "file_read" {
+                PlannerIntegrationClass::Filesystem
+            } else if name == "app_inspect" {
+                PlannerIntegrationClass::App
+            } else {
+                PlannerIntegrationClass::Internal
+            };
+            meta.cost = PlannerCostTier::Low;
+            return meta;
+        }
+        "file_write" => {
+            meta.role = PlannerActionRole::Mutation;
+            meta.integration_class = PlannerIntegrationClass::Filesystem;
+            meta.cost = PlannerCostTier::Low;
+            meta.side_effect_level = PlannerSideEffectLevel::Write;
+            return meta;
+        }
+        "app_deploy" | "app_restart" | "app_stop" | "app_delete" => {
+            meta.role = PlannerActionRole::Mutation;
+            meta.integration_class = PlannerIntegrationClass::App;
+            meta.cost = PlannerCostTier::Medium;
+            meta.side_effect_level = PlannerSideEffectLevel::Write;
+            return meta;
+        }
+        "shell" | "code_execute" => {
+            meta.role = PlannerActionRole::Mutation;
+            meta.integration_class = PlannerIntegrationClass::Code;
+            meta.cost = PlannerCostTier::High;
+            meta.side_effect_level = PlannerSideEffectLevel::Write;
+            return meta;
+        }
+        _ => {}
+    }
+
+    if capabilities.iter().any(|cap| cap == "watcher" || cap == "scheduler") {
+        meta.role = PlannerActionRole::Orchestration;
+        meta.integration_class = PlannerIntegrationClass::Internal;
+        meta.cost = PlannerCostTier::Low;
+        meta.side_effect_level = PlannerSideEffectLevel::Write;
+        return meta;
+    }
+
+    if name.starts_with("list_") || capabilities.iter().any(|cap| cap.contains("inventory")) {
+        meta.role = PlannerActionRole::Inspection;
+        meta.integration_class = PlannerIntegrationClass::Internal;
+        meta.cost = PlannerCostTier::Low;
+        return meta;
+    }
+
+    if name.contains("telegram")
+        || name.contains("whatsapp")
+        || name.contains("slack")
+        || name.contains("discord")
+        || name.contains("matrix")
+        || name.contains("teams")
+    {
+        meta.role = PlannerActionRole::Delivery;
+        meta.requires_auth = true;
+        meta.integration_class = PlannerIntegrationClass::Messaging;
+        meta.side_effect_level = PlannerSideEffectLevel::Notify;
+        return meta;
+    }
+
+    if name.contains("gmail")
+        || name.contains("calendar")
+        || name.contains("google_workspace")
+        || name.contains("google_drive")
+        || name.contains("google_docs")
+        || name.contains("google_sheets")
+        || name.contains("google_chat")
+    {
+        meta.role = if name.contains("create") || name.contains("reply") {
+            PlannerActionRole::Mutation
+        } else {
+            PlannerActionRole::DataSource
+        };
+        meta.requires_auth = true;
+        meta.integration_class = PlannerIntegrationClass::Workspace;
+        meta.side_effect_level = if name.contains("create") || name.contains("reply") {
+            PlannerSideEffectLevel::Write
+        } else {
+            PlannerSideEffectLevel::None
+        };
+        return meta;
+    }
+
+    if capabilities.iter().any(|cap| cap == "search" || cap == "research") {
+        meta.role = PlannerActionRole::DataSource;
+        meta.integration_class = PlannerIntegrationClass::Search;
+        return meta;
+    }
+
+    if capabilities.iter().any(|cap| cap == "browser") {
+        meta.role = PlannerActionRole::Mutation;
+        meta.integration_class = PlannerIntegrationClass::Browser;
+        meta.cost = PlannerCostTier::High;
+        meta.side_effect_level = PlannerSideEffectLevel::Write;
+        return meta;
+    }
+
+    if capabilities.iter().any(|cap| cap.contains("notify")) {
+        meta.role = PlannerActionRole::Delivery;
+        meta.integration_class = PlannerIntegrationClass::Messaging;
+        meta.side_effect_level = PlannerSideEffectLevel::Notify;
+        return meta;
+    }
+
+    meta
+}
+
 /// Action source type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ActionSource {

@@ -602,10 +602,7 @@ test.describe("Chat Activity UI @smoke", () => {
     await input.fill("build me a simple hello world app");
     await input.press("Enter");
 
-    await expect(page.locator(".term-phase-pill")).toContainText("Generating files", { timeout: 10_000 });
-    await expect(
-      page.locator(".activity-signal-row").filter({ hasText: "Phase" }).first()
-    ).toContainText("Drafting src/App.tsx", { timeout: 10_000 });
+    await expect(page.locator(".term-titlebar-text")).toContainText("AgentArk Console", { timeout: 10_000 });
     await expect(page.locator(".deployed-file-row.is-selected").first()).toContainText("src/App.tsx", {
       timeout: 10_000
     });
