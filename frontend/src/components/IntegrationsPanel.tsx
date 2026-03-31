@@ -804,8 +804,8 @@ export function IntegrationsPanel({
   const [whatsAppSetupOpen, setWhatsAppSetupOpen] = useState(false);
   const [channelForm, setChannelForm] = useState<ChannelSettingsForm>({
     search_primary: "lightpanda",
-    search_fallback1: "playwright",
-    search_fallback2: "duckduckgo",
+    search_fallback1: "duckduckgo",
+    search_fallback2: "none",
     search_serper_key: "",
     search_searxng_url: "",
     search_brave_key: "",
@@ -1460,8 +1460,8 @@ export function IntegrationsPanel({
     const next = asRecord(settingsQ.data);
     setChannelForm({
       search_primary: str(next.search_primary, "lightpanda"),
-      search_fallback1: str(next.search_fallback1, "playwright"),
-      search_fallback2: str(next.search_fallback2, "duckduckgo"),
+      search_fallback1: str(next.search_fallback1, "duckduckgo"),
+      search_fallback2: str(next.search_fallback2, "none"),
       search_serper_key: "",
       search_searxng_url: str(next.search_searxng_url, ""),
       search_brave_key: "",
@@ -3181,7 +3181,7 @@ export function IntegrationsPanel({
               </TableHead>
               <TableBody>
                 {[
-                  { name: "Web Search", enabled: true, statusRaw: "connected", detail: `${channelForm.search_primary || "lightpanda"} \u2192 ${channelForm.search_fallback1 || "playwright"} \u2192 ${channelForm.search_fallback2 || "duckduckgo"}`, onSetup: openSearchSetup, ready: true },
+                  { name: "Web Search", enabled: true, statusRaw: "connected", detail: `${channelForm.search_primary || "lightpanda"} \u2192 ${channelForm.search_fallback1 || "duckduckgo"} \u2192 ${channelForm.search_fallback2 || "none"}`, onSetup: openSearchSetup, ready: true },
                   { name: "Telegram", enabled: telegramEnabledSaved, statusRaw: telegramConnectionStatusRaw, detail: telegramConnectionDetail || (telegramTokenConfigured ? "Token set" : "Not configured"), onSetup: () => openTelegramSetup(!channelForm.telegram_enabled), ready: telegramDeliveryReady, actionLabel: channelForm.telegram_enabled ? "Setup" : "Enable" },
                   { name: "WhatsApp", enabled: channelForm.whatsapp_enabled, statusRaw: whatsappConnectionStatusRaw, detail: whatsappConnectionDetail || (channelForm.whatsapp_mode === "cloud_api" ? "Cloud API" : "QR pairing"), onSetup: () => openWhatsAppSetup(!channelForm.whatsapp_enabled), ready: toBool(settings.whatsapp_delivery_ready), actionLabel: channelForm.whatsapp_enabled ? "Setup" : "Enable" },
                   { name: "Slack", enabled: toBool(settings.slack_enabled), statusRaw: slackConnectionStatusRaw, detail: slackConnectionDetail || "Not configured", onSetup: () => openSlackSetup(!channelForm.slack_enabled), ready: toBool(settings.slack_delivery_ready), actionLabel: channelForm.slack_enabled ? "Setup" : "Enable" },
@@ -3320,7 +3320,7 @@ export function IntegrationsPanel({
                   </TableCell>
                   <TableCell>
                     <Typography variant="body2" color="text.secondary" noWrap>
-                      {channelForm.search_primary || "lightpanda"} → {channelForm.search_fallback1 || "playwright"} → {channelForm.search_fallback2 || "duckduckgo"}
+                      {channelForm.search_primary || "lightpanda"} → {channelForm.search_fallback1 || "duckduckgo"} → {channelForm.search_fallback2 || "none"}
                     </Typography>
                   </TableCell>
                   <TableCell align="right">

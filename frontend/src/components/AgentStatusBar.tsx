@@ -96,13 +96,11 @@ export function AgentStatusBar({
 
   return (
     <Box
-      className="status-bar"
+      className="status-bar mission-panel mission-panel--adaptive"
       sx={{
         display: "flex",
         flexDirection: "column",
         gap: 1.2,
-        height: "100%",
-        minHeight: { xs: "auto", lg: 0 },
         px: { xs: 1.35, md: 1.5 },
         py: { xs: 1.2, md: 1.35 },
       }}

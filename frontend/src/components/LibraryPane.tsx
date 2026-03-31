@@ -80,7 +80,12 @@ export function LibraryPane({ autoRefresh, showAdvanced, onNavigateToView }: Pro
       </Box>
 
       <Box className="library-stage">
-        <NativeWorkspace view={activeView} autoRefresh={autoRefresh} showAdvanced={showAdvanced} />
+        <NativeWorkspace
+          view={activeView}
+          autoRefresh={autoRefresh}
+          showAdvanced={showAdvanced}
+          onNavigateToView={onNavigateToView}
+        />
       </Box>
     </Box>
   );

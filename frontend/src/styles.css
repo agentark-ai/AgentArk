@@ -254,15 +254,32 @@ body {
   display: flex;
   flex-direction: column;
   gap: var(--panel-gap);
-  padding: 2px 4px 14px;
+  padding: 4px 4px 18px;
   box-sizing: border-box;
 }
 
-.overview-stage {
+.overview-stage,
+.overview-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: var(--panel-gap);
   align-items: stretch;
+  min-width: 0;
+}
+
+.overview-row > * {
+  min-width: 0;
+}
+
+.overview-panel-slot {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+}
+
+.overview-panel-slot > * {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 .overview-command-stack {
@@ -2877,6 +2894,82 @@ body {
 
 /* Mission Control dashboard components */
 
+.mission-panel {
+  min-width: 0;
+  min-height: clamp(258px, 24vw, 338px);
+}
+
+.mission-panel--hero {
+  min-height: clamp(292px, 28vw, 372px);
+}
+
+.mission-panel--lower {
+  min-height: clamp(276px, 24vw, 330px);
+}
+
+.mission-panel--adaptive {
+  min-height: 0;
+}
+
+.mission-panel-content {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  height: 100%;
+  min-height: 0;
+}
+
+.mission-panel-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.mission-panel-footer {
+  margin-top: auto;
+}
+
+.overview-row--adaptive {
+  align-items: start;
+}
+
+.mission-card-copy {
+  max-width: 72ch;
+}
+
+.mission-empty-copy {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: flex-start;
+  gap: 8px;
+  min-height: 0;
+  padding: 10px 0 4px;
+}
+
+.mission-title-clamp {
+  min-width: 0;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+
+.mission-detail-clamp {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+
+.mission-sparkline-shell {
+  min-height: 44px;
+  display: flex;
+  align-items: flex-end;
+}
+
 .status-bar {
   border: 1px solid rgba(108, 156, 212, 0.2);
   border-radius: 22px;
@@ -2989,8 +3082,13 @@ body {
 }
 
 @media (min-width: 1200px) {
-  .overview-stage {
-    grid-template-columns: minmax(0, 1fr) minmax(280px, 1fr);
+  .overview-stage,
+  .overview-row--pair {
+    grid-template-columns: minmax(0, 1.42fr) minmax(340px, 0.92fr);
+  }
+
+  .overview-row--triple {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 }
 

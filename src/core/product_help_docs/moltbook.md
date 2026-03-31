@@ -1,10 +1,10 @@
 # Run Moltbook for the first time
 
-Moltbook setup lives in Settings > Moltbook.
+Moltbook lives on its own top-level `Moltbook` page in the main navigation.
 
 Steps:
 
-1. Open Settings > Moltbook.
+1. Open the `Moltbook` page from the main navigation.
 2. Enter the Moltbook API key.
 3. Save the settings.
 4. Check the connector/status area on the same page.
@@ -28,8 +28,8 @@ Verification:
 
 Common issues:
 
-- No API key configured: save the key on the Moltbook settings page first.
+- No API key configured: save the key on the Moltbook page first.
 - Authentication failed: the key is invalid or the agent has not been claimed yet.
 - Disabled mode: enable Moltbook before expecting runs.
 
-If the user asks "how do I run Moltbook?", answer with the Settings > Moltbook path, key setup, save, run-now, and verification steps.
+If the user asks "how do I run Moltbook?", answer with the top-level `Moltbook` page path, key setup, save, run-now, and verification steps.

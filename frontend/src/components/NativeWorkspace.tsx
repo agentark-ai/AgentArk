@@ -1128,6 +1128,36 @@ function num(value: unknown, fallback = 0): number {
   return fallback;
 }
 
+function normalizeProjectId(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function withProjectScope(path: string, projectId: string): string {
+  const normalizedProjectId = normalizeProjectId(projectId);
+  if (!normalizedProjectId) return path;
+  const [pathname, rawSearch = ""] = path.split("?");
+  const params = new URLSearchParams(rawSearch);
+  params.set("project_id", normalizedProjectId);
+  const search = params.toString();
+  return search ? `${pathname}?${search}` : pathname;
+}
+
+function buildProjectNameById(projects: JsonRecord[]): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const project of projects) {
+    const id = normalizeProjectId(project.id);
+    if (!id) continue;
+    map.set(id, str(project.name, id));
+  }
+  return map;
+}
+
+function projectScopeLabel(projectId: string, projectNameById: Map<string, string>): string {
+  const normalizedProjectId = normalizeProjectId(projectId);
+  if (!normalizedProjectId) return "Global workspace";
+  return projectNameById.get(normalizedProjectId) || normalizedProjectId;
+}
+
 function boolText(value: unknown): string {
   if (typeof value === "boolean") return value ? "true" : "false";
   if (typeof value === "string") return value;
@@ -4443,6 +4473,82 @@ function QueryTable({
   );
 }
 
+function WorkspaceProjectScopeBar({
+  activeProjectId,
+  projects,
+  onNavigateToView
+}: {
+  activeProjectId: string;
+  projects: JsonRecord[];
+  onNavigateToView?: (view: string, replace?: boolean) => void;
+}) {
+  const setActiveProjectId = useUiStore((s) => s.setActiveProjectId);
+  const projectNameById = useMemo(() => buildProjectNameById(projects), [projects]);
+  const activeScopeLabel = projectScopeLabel(activeProjectId, projectNameById);
+  const hasProjects = projects.length > 0;
+
+  return (
+    <Box className="list-shell" sx={{ mb: 1.25, flexShrink: 0 }}>
+      <Stack
+        direction={{ xs: "column", lg: "row" }}
+        spacing={1.25}
+        alignItems={{ xs: "stretch", lg: "center" }}
+        justifyContent="space-between"
+      >
+        <Box sx={{ minWidth: 0 }}>
+          <Typography variant="overline" className="workspace-side-kicker">
+            Workspace Scope
+          </Typography>
+          <Typography variant="body2" sx={{ fontWeight: 650 }}>
+            {activeScopeLabel}
+          </Typography>
+          <Typography variant="caption" color="text.secondary">
+            {activeProjectId
+              ? "New chats, documents, and memory entries inherit this project automatically."
+              : "Projects stay optional. Leave the workspace global unless you want a separated scope."}
+          </Typography>
+        </Box>
+        <Stack
+          direction={{ xs: "column", sm: "row" }}
+          spacing={1}
+          alignItems={{ xs: "stretch", sm: "center" }}
+          sx={{ minWidth: { sm: 320 } }}
+        >
+          <TextField
+            fullWidth
+            size="small"
+            select
+            label="Workspace scope"
+            value={activeProjectId}
+            onChange={(event) => setActiveProjectId(normalizeProjectId(event.target.value))}
+          >
+            <MenuItem value="">Global workspace</MenuItem>
+            {projects.map((project) => {
+              const id = normalizeProjectId(project.id);
+              if (!id) return null;
+              return (
+                <MenuItem key={id} value={id}>
+                  {projectScopeLabel(id, projectNameById)}
+                </MenuItem>
+              );
+            })}
+          </TextField>
+          {onNavigateToView ? (
+            <Button
+              size="small"
+              variant="outlined"
+              onClick={() => onNavigateToView("projects")}
+              sx={{ whiteSpace: "nowrap" }}
+            >
+              {hasProjects ? "Manage projects" : "Create project"}
+            </Button>
+          ) : null}
+        </Stack>
+      </Stack>
+    </Box>
+  );
+}
+
 function RowOpsMenu({ actions, ariaLabel = "Row actions" }: { actions: RowMenuAction[]; ariaLabel?: string }) {
   const [anchorEl, setAnchorEl] = useState<HTMLElement | null>(null);
   const open = Boolean(anchorEl);
@@ -4479,11 +4585,20 @@ function RowOpsMenu({ actions, ariaLabel = "Row actions" }: { actions: RowMenuAc
   );
 }
 
-function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive: boolean }) {
+function ChatManager({
+  autoRefresh,
+  isActive,
+  projects,
+  activeProjectId
+}: {
+  autoRefresh: boolean;
+  isActive: boolean;
+  projects: JsonRecord[];
+  activeProjectId: string;
+}) {
   const queryClient = useQueryClient();
   const chatAutoRefresh = autoRefresh && isActive;
   const [conversationId, setConversationId] = useState<string | null>(null);
-  const [draftProjectId, setDraftProjectId] = useState("");
   const [prompt, setPrompt] = useState("");
   const [chatExecutionMode, setChatExecutionMode] = useState<ChatExecutionMode>("auto");
   const [deepResearchEnabled, setDeepResearchEnabled] = useState(false);
@@ -4551,19 +4666,18 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
   const lastProgressBubbleAtRef = useRef(0);
   const streamedWorkspaceAppRef = useRef<JsonRecord | null>(null);
   const conversationOffset = conversationPage * CHAT_CONVERSATIONS_PAGE_SIZE;
+  const scopedConversationPath = useMemo(
+    () =>
+      withProjectScope(
+        `/conversations?sidebar=1&limit=${CHAT_CONVERSATIONS_PAGE_SIZE}&offset=${conversationOffset}`,
+        activeProjectId
+      ),
+    [activeProjectId, conversationOffset]
+  );
 
   const convQ = useQuery({
-    queryKey: ["chat-conversations", conversationPage],
-    queryFn: () =>
-      api.rawGet(
-        `/conversations?sidebar=1&limit=${CHAT_CONVERSATIONS_PAGE_SIZE}&offset=${conversationOffset}`
-      ),
-    refetchInterval: chatAutoRefresh || chatBackgroundRefresh ? REFRESH_MS : false,
-    refetchIntervalInBackground: chatBackgroundRefresh
-  });
-  const projectsQ = useQuery({
-    queryKey: ["chat-projects"],
-    queryFn: () => api.rawGet("/projects"),
+    queryKey: ["chat-conversations", activeProjectId, conversationPage],
+    queryFn: () => api.rawGet(scopedConversationPath),
     refetchInterval: chatAutoRefresh || chatBackgroundRefresh ? REFRESH_MS : false,
     refetchIntervalInBackground: chatBackgroundRefresh
   });
@@ -4588,7 +4702,6 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     Math.ceil(conversationListTotal / conversationListLimit)
   );
   const conversationPageLabel = `${Math.min(conversationPage + 1, conversationPageCount)}/${conversationPageCount}`;
-  const projects = pickRecords(projectsQ.data, "projects");
   const selectedConversationQ = useQuery({
     queryKey: ["chat-conversation", conversationId],
     queryFn: () => api.rawGet(`/conversations/${encodeURIComponent(conversationId || "")}`),
@@ -4636,17 +4749,9 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     }
     return "";
   }, [messages]);
-  const projectNameById = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const project of projects) {
-      const id = str(project.id, "").trim();
-      if (!id) continue;
-      map.set(id, str(project.name, id));
-    }
-    return map;
-  }, [projects]);
-  const selectedConversationProjectId = str(selectedConversation?.project_id, "").trim();
-  const activeProjectId = selectedConversationProjectId || draftProjectId;
+  const projectNameById = useMemo(() => buildProjectNameById(projects), [projects]);
+  const selectedConversationProjectId = normalizeProjectId(selectedConversation?.project_id);
+  const effectiveProjectId = selectedConversationProjectId || activeProjectId;
 
   useEffect(() => {
     if (!pendingRunSnapshot) {
@@ -4672,7 +4777,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     storeChatPendingRunSnapshot({
       ...pendingRunSnapshot,
       message: pendingUserMessage ?? pendingRunSnapshot.message,
-      projectId: activeProjectId || pendingRunSnapshot.projectId || "",
+      projectId: effectiveProjectId || pendingRunSnapshot.projectId || "",
       streamingResponse: streamingResponse.slice(0, CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS),
       streamingSteps: snapshotSteps,
       failedUserMessage: failedUserMessage ?? ""
@@ -4683,7 +4788,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     failedUserMessage,
     streamingResponse,
     streamingSteps,
-    activeProjectId
+    effectiveProjectId
   ]);
 
   useEffect(() => {
@@ -4701,6 +4806,10 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
       setConversationPage(maxPage);
     }
   }, [conversationPage, conversationPageCount]);
+
+  useEffect(() => {
+    setConversationPage(0);
+  }, [activeProjectId]);
 
   useEffect(() => {
     const pending = pendingRunSnapshot ?? loadChatPendingRunSnapshot();
@@ -5441,7 +5550,6 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     setIsDragOverChat(false);
     setConversationId(null);
     setConversationPage(0);
-    setDraftProjectId("");
     setPrompt("");
     setDeepResearchEnabled(false);
     setAttachedFiles([]);
@@ -5472,6 +5580,12 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     pendingFileReadPathRef.current = "";
     pendingFileWritePathRef.current = "";
   };
+
+  useEffect(() => {
+    if (!conversationId || !activeProjectId || !selectedConversation) return;
+    if (selectedConversationProjectId === activeProjectId) return;
+    startNewConversation();
+  }, [activeProjectId, conversationId, selectedConversation, selectedConversationProjectId]);
 
   const openConversationById = (id: string) => {
     if (!id) return;
@@ -5585,7 +5699,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
 
   const uploadAttachmentsForKnowledge = async (files: File[]) => {
     if (files.length === 0) return [] as Array<{ id: string; filename: string; chunks: number }>;
-    const projectId = activeProjectId.trim();
+    const projectId = effectiveProjectId.trim();
     const uploaded: Array<{ id: string; filename: string; chunks: number }> = [];
     for (const file of files) {
       const formData = new FormData();
@@ -6508,7 +6622,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     const requestedProjectOverride = (opts?.projectIdOverride || "").trim();
     const targetConversationId =
       requestedConversationOverride || conversationId || (isResumeMode ? "" : generateConversationId());
-    const targetProjectId = requestedProjectOverride || activeProjectId || "";
+    const targetProjectId = requestedProjectOverride || effectiveProjectId || "";
     let activeMessage = isResumeMode
       ? ""
       : message.trim() ||
@@ -6577,9 +6691,6 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
 
     if (conversationId !== targetConversationId) {
       setConversationId(targetConversationId);
-    }
-    if (!selectedConversationProjectId && targetProjectId && draftProjectId !== targetProjectId) {
-      setDraftProjectId(targetProjectId);
     }
     const initialPendingSnapshot: ChatPendingRunSnapshot = {
       conversationId: targetConversationId,
@@ -6816,7 +6927,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
         }
         if (!resolvedConversationId) {
           try {
-            const latest = await api.rawGet("/conversations?limit=1");
+            const latest = await api.rawGet(withProjectScope("/conversations?limit=1", targetProjectId));
             const newest = pickRecords(latest, "conversations")[0];
             const newestId = str(newest?.id, "");
             if (newestId) resolvedConversationId = newestId;
@@ -7939,33 +8050,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
             flexDirection: "column"
           }}
         >
-          {!selectedConversation ? (
-            <Stack direction={{ xs: "column", md: "row" }} spacing={1.25} sx={{ mb: 1.25 }} alignItems={{ xs: "stretch", md: "center" }}>
-              <TextField
-                fullWidth
-                size="small"
-                select
-                label="Project (optional)"
-                value={draftProjectId}
-                onChange={(e) => setDraftProjectId(e.target.value)}
-                sx={{ maxWidth: { xs: "100%", md: 360 } }}
-              >
-                <MenuItem value="">Workspace (no project)</MenuItem>
-                {projects.map((project) => {
-                  const id = str(project.id, "");
-                  if (!id) return null;
-                  return (
-                    <MenuItem key={id} value={id}>
-                      {str(project.name, id)}
-                    </MenuItem>
-                  );
-                })}
-              </TextField>
-              <Typography variant="caption" color="text.secondary">
-                Attach a project only if you want this new chat scoped to it.
-              </Typography>
-            </Stack>
-          ) : selectedConversationProjectId ? (
+          {selectedConversationProjectId ? (
             <Stack direction="row" spacing={0.9} alignItems="center" sx={{ mb: 1.25 }} useFlexGap flexWrap="wrap">
               <Chip
                 size="small"
@@ -8182,13 +8267,13 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                           disabled={!str(pendingRunSnapshot?.taskId, "").trim() || isStreaming}
                           onClick={() => {
                             const taskId = str(pendingRunSnapshot?.taskId, "").trim();
-                            if (!taskId) return;
-                            void runStreamingChat("", [], {
-                              conversationIdOverride: conversationId || undefined,
-                              projectIdOverride: activeProjectId || undefined,
-                              resumeTaskId: taskId
-                            });
-                          }}
+                              if (!taskId) return;
+                              void runStreamingChat("", [], {
+                                conversationIdOverride: conversationId || undefined,
+                                projectIdOverride: effectiveProjectId || undefined,
+                                resumeTaskId: taskId
+                              });
+                            }}
                         >
                           Resume
                         </Button>
@@ -13332,25 +13417,38 @@ function AutonomyManager({ autoRefresh }: { autoRefresh: boolean }) {
   );
 }
 
-function DocumentsManager({ autoRefresh }: { autoRefresh: boolean }) {
+function DocumentsManager({
+  autoRefresh,
+  projects,
+  activeProjectId
+}: {
+  autoRefresh: boolean;
+  projects: JsonRecord[];
+  activeProjectId: string;
+}) {
   const queryClient = useQueryClient();
-  const [projectId, setProjectId] = useState("");
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [selectedFileName, setSelectedFileName] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [uploadDialogOpen, setUploadDialogOpen] = useState(false);
   const [uploadSuccess, setUploadSuccess] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const projectMap = useMemo(() => buildProjectNameById(projects), [projects]);
+  const activeScopeLabel = projectScopeLabel(activeProjectId, projectMap);
+  const documentsPath = useMemo(() => withProjectScope("/documents?limit=100", activeProjectId), [activeProjectId]);
 
-  const docsQ = useQuery({ queryKey: ["documents-manager"], queryFn: () => api.rawGet("/documents?limit=100"), refetchInterval: autoRefresh ? REFRESH_MS : false });
-  const projectsQ = useQuery({ queryKey: ["documents-projects"], queryFn: () => api.rawGet("/projects"), refetchInterval: autoRefresh ? REFRESH_MS : false });
+  const docsQ = useQuery({
+    queryKey: ["documents-manager", activeProjectId],
+    queryFn: () => api.rawGet(documentsPath),
+    refetchInterval: autoRefresh ? REFRESH_MS : false
+  });
 
   const uploadFileMutation = useMutation({
     mutationFn: async () => {
       if (!selectedFile) throw new Error("No file selected");
       const formData = new FormData();
       formData.append("file", selectedFile, selectedFile.name);
-      if (projectId.trim()) formData.append("project_id", projectId.trim());
+      if (activeProjectId.trim()) formData.append("project_id", activeProjectId.trim());
       return api.rawPostForm("/documents/upload-file", formData);
     },
     onSuccess: async () => {
@@ -13366,14 +13464,6 @@ function DocumentsManager({ autoRefresh }: { autoRefresh: boolean }) {
   });
 
   const docs = pickRecords(docsQ.data, "documents");
-  const projects = pickRecords(projectsQ.data, "projects");
-  const projectMap = useMemo(() => {
-    const m = new Map<string, string>();
-    projects.forEach((project) => {
-      m.set(str(project.id, ""), str(project.name, "Untitled"));
-    });
-    return m;
-  }, [projects]);
 
   const handleFileSelected = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -13395,9 +13485,12 @@ function DocumentsManager({ autoRefresh }: { autoRefresh: boolean }) {
           onChange={handleFileSelected}
         />
         <Stack direction={{ xs: "column", sm: "row" }} spacing={1} alignItems={{ xs: "flex-start", sm: "center" }} mb={1}>
-          <Typography variant="h6" sx={{ flex: 1 }}>
-            Documents
-          </Typography>
+          <Box sx={{ flex: 1 }}>
+            <Typography variant="h6">Documents</Typography>
+            <Typography variant="body2" color="text.secondary">
+              Showing files for {activeScopeLabel}.
+            </Typography>
+          </Box>
           <Button
             variant="contained"
             size="small"
@@ -13425,21 +13518,9 @@ function DocumentsManager({ autoRefresh }: { autoRefresh: boolean }) {
               {error ? (
                 <Alert severity="error" sx={{ py: 0.5 }}>{error}</Alert>
               ) : null}
-              {projects.length > 0 ? (
-                <TextField
-                  fullWidth
-                  size="small"
-                  select
-                  label="Project (optional)"
-                  value={projectId}
-                  onChange={(e) => setProjectId(e.target.value)}
-                  InputLabelProps={{ shrink: true }}
-                  SelectProps={{ displayEmpty: true }}
-                >
-                  <MenuItem value="">Global</MenuItem>
-                  {projects.map((project) => <MenuItem key={str(project.id, "")} value={str(project.id, "")}>{str(project.name)}</MenuItem>)}
-                </TextField>
-              ) : null}
+              <Alert severity="info" sx={{ py: 0.5 }}>
+                This upload will be added to {activeScopeLabel}.
+              </Alert>
               <Stack direction="row" spacing={1}>
                 <Button
                   variant="outlined"
@@ -13503,7 +13584,9 @@ function DocumentsManager({ autoRefresh }: { autoRefresh: boolean }) {
                 <TableRow>
                   <TableCell colSpan={7}>
                     <Typography variant="body2" color="text.secondary">
-                      No documents yet. Click "Upload Document" to add your first file.
+                      {activeProjectId
+                        ? "No documents in this project yet. Upload a file to start its workspace."
+                        : 'No documents yet. Click "Upload Document" to add your first file.'}
                     </Typography>
                   </TableCell>
                 </TableRow>
@@ -13540,12 +13623,20 @@ function DocumentsManager({ autoRefresh }: { autoRefresh: boolean }) {
         </TableContainer>
       </Box>
 
-      {docsQ.error || projectsQ.error || error ? <Alert severity="error">{error || errMessage(docsQ.error || projectsQ.error)}</Alert> : null}
+      {docsQ.error || error ? <Alert severity="error">{error || errMessage(docsQ.error)}</Alert> : null}
     </Stack>
   );
 }
 
-function MemoryManager({ autoRefresh }: { autoRefresh: boolean }) {
+function MemoryManager({
+  autoRefresh,
+  projects,
+  activeProjectId
+}: {
+  autoRefresh: boolean;
+  projects: JsonRecord[];
+  activeProjectId: string;
+}) {
   const queryClient = useQueryClient();
   const [error, setError] = useState<string | null>(null);
   const [selectedFact, setSelectedFact] = useState<JsonRecord | null>(null);
@@ -13563,6 +13654,8 @@ function MemoryManager({ autoRefresh }: { autoRefresh: boolean }) {
   const [knowledgeSource, setKnowledgeSource] = useState("");
   const [knowledgeUrl, setKnowledgeUrl] = useState("");
   const [knowledgeTags, setKnowledgeTags] = useState("");
+  const projectNameById = useMemo(() => buildProjectNameById(projects), [projects]);
+  const activeScopeLabel = projectScopeLabel(activeProjectId, projectNameById);
 
   const invalidateMemoryQueries = async () => {
     await Promise.all([
@@ -13575,28 +13668,28 @@ function MemoryManager({ autoRefresh }: { autoRefresh: boolean }) {
   };
 
   const statsQ = useQuery({
-    queryKey: ["memory-stats"],
-    queryFn: () => api.rawGet("/memory/stats"),
+    queryKey: ["memory-stats", activeProjectId],
+    queryFn: () => api.rawGet(withProjectScope("/memory/stats", activeProjectId)),
     refetchInterval: autoRefresh ? REFRESH_MS : false
   });
   const factsQ = useQuery({
-    queryKey: ["memory-facts"],
-    queryFn: () => api.rawGet("/memory/facts?limit=50"),
+    queryKey: ["memory-facts", activeProjectId],
+    queryFn: () => api.rawGet(withProjectScope("/memory/facts?limit=50", activeProjectId)),
     refetchInterval: autoRefresh ? REFRESH_MS : false
   });
   const preferencesQ = useQuery({
-    queryKey: ["memory-preferences"],
-    queryFn: () => api.rawGet("/memory/preferences?limit=100"),
+    queryKey: ["memory-preferences", activeProjectId],
+    queryFn: () => api.rawGet(withProjectScope("/memory/preferences?limit=100", activeProjectId)),
     refetchInterval: autoRefresh ? REFRESH_MS : false
   });
   const userDataQ = useQuery({
-    queryKey: ["memory-user-data"],
-    queryFn: () => api.rawGet("/memory/user-data?limit=100"),
+    queryKey: ["memory-user-data", activeProjectId],
+    queryFn: () => api.rawGet(withProjectScope("/memory/user-data?limit=100", activeProjectId)),
     refetchInterval: autoRefresh ? REFRESH_MS : false
   });
   const knowledgeQ = useQuery({
-    queryKey: ["memory-knowledge"],
-    queryFn: () => api.rawGet("/memory/knowledge?limit=100"),
+    queryKey: ["memory-knowledge", activeProjectId],
+    queryFn: () => api.rawGet(withProjectScope("/memory/knowledge?limit=100", activeProjectId)),
     refetchInterval: autoRefresh ? REFRESH_MS : false
   });
 
@@ -13657,6 +13750,9 @@ function MemoryManager({ autoRefresh }: { autoRefresh: boolean }) {
 
   return (
     <Stack spacing={2}>
+      <Alert severity="info">
+        Showing memory for {activeScopeLabel}. New entries inherit this scope automatically.
+      </Alert>
       {/* â”€â”€ Compact stat row â”€â”€ */}
       <Box sx={{ display: "grid", gridTemplateColumns: { xs: "repeat(2, 1fr)", sm: "repeat(3, 1fr)", md: "repeat(5, 1fr)" }, gap: 1.5 }}>
         {[
@@ -13706,7 +13802,7 @@ function MemoryManager({ autoRefresh }: { autoRefresh: boolean }) {
           {factsQ.error ? <Alert severity="error">{errMessage(factsQ.error)}</Alert> : null}
           {facts.length === 0 ? (
             <Typography variant="body2" color="text.secondary">
-              No facts yet.
+              {activeProjectId ? "No facts in this project yet." : "No facts yet."}
             </Typography>
           ) : (
             <TableContainer className="table-shell">
@@ -13786,7 +13882,8 @@ function MemoryManager({ autoRefresh }: { autoRefresh: boolean }) {
                         key: prefKey.trim(),
                         value: prefValue.trim(),
                         confidence: Number.isFinite(parsedConfidence) ? parsedConfidence : 0.85,
-                        source: prefSource.trim() || undefined
+                        source: prefSource.trim() || undefined,
+                        project_id: activeProjectId || undefined
                       });
                       setPrefKey("");
                       setPrefValue("");
@@ -13809,7 +13906,7 @@ function MemoryManager({ autoRefresh }: { autoRefresh: boolean }) {
             {preferencesQ.error ? <Alert severity="error">{errMessage(preferencesQ.error)}</Alert> : null}
             {preferences.length === 0 ? (
               <Typography variant="body2" color="text.secondary">
-                No preferences yet.
+                {activeProjectId ? "No preferences in this project yet." : "No preferences yet."}
               </Typography>
             ) : (
               <TableContainer className="table-shell">
@@ -13842,7 +13939,7 @@ function MemoryManager({ autoRefresh }: { autoRefresh: boolean }) {
                           </TableCell>
                           <TableCell>{num(pref.confidence, 0).toFixed(2)}</TableCell>
                           <TableCell>{str(pref.source, "-")}</TableCell>
-                          <TableCell>{projectId || "Global"}</TableCell>
+                          <TableCell>{projectId ? projectScopeLabel(projectId, projectNameById) : "Global"}</TableCell>
                           <TableCell sx={{ whiteSpace: "nowrap" }} title={humanTs(str(pref.updated_at, "-")).tip}>{humanTs(str(pref.updated_at, "-")).label}</TableCell>
                           <TableCell align="right">
                             <RowOpsMenu
@@ -13905,7 +14002,8 @@ function MemoryManager({ autoRefresh }: { autoRefresh: boolean }) {
                         kind: dataKind.trim(),
                         title: dataTitle.trim(),
                         content: dataContent.trim(),
-                        url: dataUrl.trim() || undefined
+                        url: dataUrl.trim() || undefined,
+                        project_id: activeProjectId || undefined
                       });
                       setDataKind("note");
                       setDataTitle("");
@@ -13929,7 +14027,7 @@ function MemoryManager({ autoRefresh }: { autoRefresh: boolean }) {
             {userDataQ.error ? <Alert severity="error">{errMessage(userDataQ.error)}</Alert> : null}
             {userDataItems.length === 0 ? (
               <Typography variant="body2" color="text.secondary">
-                No user data items yet.
+                {activeProjectId ? "No user data items in this project yet." : "No user data items yet."}
               </Typography>
             ) : (
               <TableContainer className="table-shell">
@@ -13940,6 +14038,7 @@ function MemoryManager({ autoRefresh }: { autoRefresh: boolean }) {
                       <TableCell>Title</TableCell>
                       <TableCell>Content</TableCell>
                       <TableCell>URL</TableCell>
+                      <TableCell>Scope</TableCell>
                       <TableCell>Updated</TableCell>
                       <TableCell align="right">Ops</TableCell>
                     </TableRow>
@@ -13947,6 +14046,7 @@ function MemoryManager({ autoRefresh }: { autoRefresh: boolean }) {
                   <TableBody>
                     {userDataItems.map((item, idx) => {
                       const id = str(item.id, String(idx));
+                      const projectId = normalizeProjectId(item.project_id);
                       const url = str(item.url, "");
                       return (
                         <TableRow key={id}>
@@ -13970,6 +14070,7 @@ function MemoryManager({ autoRefresh }: { autoRefresh: boolean }) {
                               <Typography variant="body2" color="text.secondary">-</Typography>
                             )}
                           </TableCell>
+                          <TableCell>{projectId ? projectScopeLabel(projectId, projectNameById) : "Global"}</TableCell>
                           <TableCell sx={{ whiteSpace: "nowrap" }} title={humanTs(str(item.updated_at, "-")).tip}>{humanTs(str(item.updated_at, "-")).label}</TableCell>
                           <TableCell align="right">
                             <RowOpsMenu
@@ -14037,7 +14138,8 @@ function MemoryManager({ autoRefresh }: { autoRefresh: boolean }) {
                         content: knowledgeContent.trim(),
                         source: knowledgeSource.trim() || undefined,
                         url: knowledgeUrl.trim() || undefined,
-                        tags: knowledgeTags.trim() || undefined
+                        tags: knowledgeTags.trim() || undefined,
+                        project_id: activeProjectId || undefined
                       });
                       setKnowledgeTitle("");
                       setKnowledgeContent("");
@@ -14062,7 +14164,7 @@ function MemoryManager({ autoRefresh }: { autoRefresh: boolean }) {
             {knowledgeQ.error ? <Alert severity="error">{errMessage(knowledgeQ.error)}</Alert> : null}
             {knowledgeItems.length === 0 ? (
               <Typography variant="body2" color="text.secondary">
-                No knowledge items yet.
+                {activeProjectId ? "No knowledge items in this project yet." : "No knowledge items yet."}
               </Typography>
             ) : (
               <TableContainer className="table-shell">
@@ -14073,6 +14175,7 @@ function MemoryManager({ autoRefresh }: { autoRefresh: boolean }) {
                       <TableCell>Content</TableCell>
                       <TableCell>Source</TableCell>
                       <TableCell>Tags</TableCell>
+                      <TableCell>Scope</TableCell>
                       <TableCell>Updated</TableCell>
                       <TableCell align="right">Ops</TableCell>
                     </TableRow>
@@ -14080,6 +14183,7 @@ function MemoryManager({ autoRefresh }: { autoRefresh: boolean }) {
                   <TableBody>
                     {knowledgeItems.map((item, idx) => {
                       const id = str(item.id, String(idx));
+                      const projectId = normalizeProjectId(item.project_id);
                       return (
                         <TableRow key={id}>
                           <TableCell sx={{ maxWidth: 260 }}>
@@ -14094,6 +14198,7 @@ function MemoryManager({ autoRefresh }: { autoRefresh: boolean }) {
                           </TableCell>
                           <TableCell>{str(item.source, "-")}</TableCell>
                           <TableCell>{str(item.tags, "-")}</TableCell>
+                          <TableCell>{projectId ? projectScopeLabel(projectId, projectNameById) : "Global"}</TableCell>
                           <TableCell sx={{ whiteSpace: "nowrap" }} title={humanTs(str(item.updated_at, "-")).tip}>{humanTs(str(item.updated_at, "-")).label}</TableCell>
                           <TableCell align="right">
                             <RowOpsMenu
@@ -14165,8 +14270,19 @@ function MemoryManager({ autoRefresh }: { autoRefresh: boolean }) {
     </Stack>
   );
 }
-function ProjectsManager({ autoRefresh }: { autoRefresh: boolean }) {
+function ProjectsManager({
+  autoRefresh,
+  projects,
+  activeProjectId,
+  onOpenProjectWorkspace
+}: {
+  autoRefresh: boolean;
+  projects: JsonRecord[];
+  activeProjectId: string;
+  onOpenProjectWorkspace: (projectId: string) => void;
+}) {
   const queryClient = useQueryClient();
+  const setActiveProjectId = useUiStore((s) => s.setActiveProjectId);
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [createOpen, setCreateOpen] = useState(false);
@@ -14183,18 +14299,36 @@ function ProjectsManager({ autoRefresh }: { autoRefresh: boolean }) {
     active: true
   });
 
-  const projectsQ = useQuery({ queryKey: ["projects-manager"], queryFn: () => api.rawGet("/projects"), refetchInterval: autoRefresh ? REFRESH_MS : false });
   const conversationsQ = useQuery({ queryKey: ["projects-conversations"], queryFn: () => api.rawGet("/conversations?limit=100"), refetchInterval: autoRefresh ? REFRESH_MS : false });
+  const projectNameById = useMemo(() => buildProjectNameById(projects), [projects]);
+  const activeScopeLabel = projectScopeLabel(activeProjectId, projectNameById);
+  const scopedConversationPath = useMemo(
+    () => withProjectScope("/conversations", activeProjectId),
+    [activeProjectId]
+  );
 
-  const createMutation = useMutation({ mutationFn: () => api.rawPost("/projects", { name: name.trim(), description: description.trim() }), onSuccess: async () => { await queryClient.invalidateQueries({ queryKey: ["projects-manager"] }); } });
+  const createMutation = useMutation({
+    mutationFn: () => api.rawPost("/projects", { name: name.trim(), description: description.trim() }),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["workspace-projects"] });
+      await queryClient.invalidateQueries({ queryKey: ["projects-conversations"] });
+    }
+  });
   const deleteMutation = useMutation({
     mutationFn: (id: string) => api.rawDelete(`/projects/${encodeURIComponent(id)}`),
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["projects-manager"] });
+    onSuccess: async (_data, deletedId) => {
+      await queryClient.invalidateQueries({ queryKey: ["workspace-projects"] });
       await queryClient.invalidateQueries({ queryKey: ["projects-conversations"] });
       await queryClient.invalidateQueries({ queryKey: ["documents-manager"] });
       await queryClient.invalidateQueries({ queryKey: ["memory-stats"] });
       await queryClient.invalidateQueries({ queryKey: ["memory-facts"] });
+      await queryClient.invalidateQueries({ queryKey: ["memory-preferences"] });
+      await queryClient.invalidateQueries({ queryKey: ["memory-user-data"] });
+      await queryClient.invalidateQueries({ queryKey: ["memory-knowledge"] });
+      await queryClient.invalidateQueries({ queryKey: ["chat-conversations"] });
+      if (deletedId === activeProjectId) {
+        setActiveProjectId("");
+      }
       setDeleteProject(null);
       setDeleteConfirm("");
     }
@@ -14203,12 +14337,13 @@ function ProjectsManager({ autoRefresh }: { autoRefresh: boolean }) {
     mutationFn: (payload: { id: string; body: Record<string, unknown> }) =>
       api.rawPut(`/projects/${encodeURIComponent(payload.id)}`, payload.body),
     onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["projects-manager"] });
+      await queryClient.invalidateQueries({ queryKey: ["workspace-projects"] });
+      await queryClient.invalidateQueries({ queryKey: ["projects-conversations"] });
+      await queryClient.invalidateQueries({ queryKey: ["chat-conversations"] });
       setSelectedProject(null);
     }
   });
 
-  const projects = pickRecords(projectsQ.data, "projects");
   const conversations = pickRecords(conversationsQ.data, "conversations");
   const counts = useMemo(() => {
     const map = new Map<string, number>();
@@ -14228,11 +14363,34 @@ function ProjectsManager({ autoRefresh }: { autoRefresh: boolean }) {
           <Stack spacing={2} sx={{ mt: 1 }}>
             <TextField fullWidth size="small" label="Name" value={name} onChange={(e) => setName(e.target.value)} />
             <TextField fullWidth size="small" label="Description" value={description} onChange={(e) => setDescription(e.target.value)} />
+            <Alert severity="info">
+              Creating a project opens its workspace immediately. Global remains available for unscoped work.
+            </Alert>
           </Stack>
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setCreateOpen(false)}>Cancel</Button>
-          <Button variant="contained" disabled={createMutation.isPending || !name.trim()} onClick={async () => { setError(null); try { await createMutation.mutateAsync(); setName(""); setDescription(""); setCreateOpen(false); } catch (e) { setError(errMessage(e)); } }}>Create</Button>
+          <Button
+            variant="contained"
+            disabled={createMutation.isPending || !name.trim()}
+            onClick={async () => {
+              setError(null);
+              try {
+                const created = asRecord(await createMutation.mutateAsync());
+                const createdId = normalizeProjectId(created.id);
+                setName("");
+                setDescription("");
+                setCreateOpen(false);
+                if (createdId) {
+                  onOpenProjectWorkspace(createdId);
+                }
+              } catch (e) {
+                setError(errMessage(e));
+              }
+            }}
+          >
+            Create
+          </Button>
         </DialogActions>
       </Dialog>
 
@@ -14240,7 +14398,12 @@ function ProjectsManager({ autoRefresh }: { autoRefresh: boolean }) {
         <Grid2 size={{ xs: 12, lg: 7 }}>
           <Box className="list-shell">
             <Stack direction="row" justifyContent="space-between" alignItems="center" mb={1}>
-              <Typography variant="h6">Projects</Typography>
+              <Box>
+                <Typography variant="h6">Projects</Typography>
+                <Typography variant="body2" color="text.secondary">
+                  Active workspace: {activeScopeLabel}
+                </Typography>
+              </Box>
               <Button size="small" variant="contained" onClick={() => setCreateOpen(true)}>New Project</Button>
             </Stack>
             <TableContainer className="table-shell">
@@ -14255,58 +14418,92 @@ function ProjectsManager({ autoRefresh }: { autoRefresh: boolean }) {
                   </TableRow>
                 </TableHead>
                 <TableBody>
-                  {projects.map((project) => {
-                    const id = str(project.id, "");
-                    const pname = str(project.name, "");
-                    return (
-                      <TableRow key={id}>
-                        <TableCell>{str(project.name)}</TableCell>
-                        <TableCell>{str(project.description)}</TableCell>
-                        <TableCell>{counts.get(id) || 0}</TableCell>
-                        <TableCell title={humanTs(str(project.updated_at, str(project.created_at))).tip}>{humanTs(str(project.updated_at, str(project.created_at))).label}</TableCell>
-                        <TableCell align="right">
-                          <RowOpsMenu
-                            actions={[
-                              {
-                                label: "Edit",
-                                onClick: () => {
-                                  const pr = asRecord(project);
-                                  setSelectedProject(pr);
-                                  setEditForm({
-                                    name: str(pr.name, ""),
-                                    description: str(pr.description, ""),
-                                    system_prompt: str(pr.system_prompt, ""),
-                                    personality: str(pr.personality, ""),
-                                    tools_filter: str(pr.tools_filter, ""),
-                                    active: pr.active !== false
-                                  });
+                  {projects.length === 0 ? (
+                    <TableRow>
+                      <TableCell colSpan={5}>
+                        <Typography variant="body2" color="text.secondary">
+                          No projects yet. Global workspace stays available until you want a separated project.
+                        </Typography>
+                      </TableCell>
+                    </TableRow>
+                  ) : (
+                    projects.map((project) => {
+                      const id = normalizeProjectId(project.id);
+                      const isActiveProject = id === activeProjectId;
+                      return (
+                        <TableRow key={id} selected={isActiveProject} hover>
+                          <TableCell>
+                            <Stack direction="row" spacing={0.75} alignItems="center" useFlexGap flexWrap="wrap">
+                              <Typography variant="body2">{str(project.name)}</Typography>
+                              {isActiveProject ? <Chip size="small" color="primary" label="Active workspace" /> : null}
+                            </Stack>
+                          </TableCell>
+                          <TableCell>{str(project.description)}</TableCell>
+                          <TableCell>{counts.get(id) || 0}</TableCell>
+                          <TableCell title={humanTs(str(project.updated_at, str(project.created_at))).tip}>{humanTs(str(project.updated_at, str(project.created_at))).label}</TableCell>
+                          <TableCell align="right">
+                            <RowOpsMenu
+                              actions={[
+                                {
+                                  label: isActiveProject ? "Open workspace" : "Set active workspace",
+                                  onClick: () => onOpenProjectWorkspace(id)
+                                },
+                                {
+                                  label: "Edit",
+                                  onClick: () => {
+                                    const pr = asRecord(project);
+                                    setSelectedProject(pr);
+                                    setEditForm({
+                                      name: str(pr.name, ""),
+                                      description: str(pr.description, ""),
+                                      system_prompt: str(pr.system_prompt, ""),
+                                      personality: str(pr.personality, ""),
+                                      tools_filter: str(pr.tools_filter, ""),
+                                      active: pr.active !== false
+                                    });
+                                  }
+                                },
+                                {
+                                  label: "Delete",
+                                  tone: "error",
+                                  divider: true,
+                                  onClick: () => {
+                                    setDeleteProject(asRecord(project));
+                                    setDeleteConfirm("");
+                                  }
                                 }
-                              },
-                              {
-                                label: "Delete",
-                                tone: "error",
-                                divider: true,
-                                onClick: () => {
-                                  setDeleteProject(asRecord(project));
-                                  setDeleteConfirm("");
-                                }
-                              }
-                            ]}
-                            ariaLabel="Project options"
-                          />
-                        </TableCell>
-                      </TableRow>
-                    );
-                  })}
+                              ]}
+                              ariaLabel="Project options"
+                            />
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })
+                  )}
                 </TableBody>
               </Table>
             </TableContainer>
           </Box>
         </Grid2>
-        <Grid2 size={{ xs: 12, lg: 5 }}><QueryTable title="Project Conversations" path="/conversations" arrayKey="conversations" columns={["title", "project_id", "channel", "updated_at"]} autoRefresh={autoRefresh} emptyLabel="No conversations mapped to projects." queryKey="projects-conversation-table" pageSize={20} /></Grid2>
+        <Grid2 size={{ xs: 12, lg: 5 }}>
+          <QueryTable
+            title={activeProjectId ? `Workspace Conversations: ${activeScopeLabel}` : "Recent Conversations"}
+            path={scopedConversationPath}
+            arrayKey="conversations"
+            columns={["title", "project_id", "channel", "updated_at"]}
+            autoRefresh={autoRefresh}
+            emptyLabel={
+              activeProjectId
+                ? "No conversations exist in the active project yet."
+                : "No conversations available yet."
+            }
+            queryKey="projects-conversation-table"
+            pageSize={20}
+          />
+        </Grid2>
       </Grid2>
 
-      {projectsQ.error || conversationsQ.error || error ? <Alert severity="error">{error || errMessage(projectsQ.error || conversationsQ.error)}</Alert> : null}
+      {conversationsQ.error || error ? <Alert severity="error">{error || errMessage(conversationsQ.error)}</Alert> : null}
 
       <Dialog open={selectedProject != null} onClose={() => setSelectedProject(null)} maxWidth="md" fullWidth>
         <DialogTitle>Edit Project</DialogTitle>
@@ -16795,8 +16992,8 @@ function SettingsManager({
     media_key_luma: "",
 
     search_primary: "lightpanda",
-    search_fallback1: "playwright",
-    search_fallback2: "duckduckgo",
+    search_fallback1: "duckduckgo",
+    search_fallback2: "none",
     search_serper_key: "",
     search_searxng_url: "",
     search_brave_key: "",
@@ -17104,8 +17301,8 @@ function SettingsManager({
       media_key_luma: "",
 
       search_primary: str(settings.search_primary, "lightpanda"),
-      search_fallback1: str(settings.search_fallback1, "playwright"),
-      search_fallback2: str(settings.search_fallback2, "duckduckgo"),
+      search_fallback1: str(settings.search_fallback1, "duckduckgo"),
+      search_fallback2: str(settings.search_fallback2, "none"),
       search_serper_key: "",
       search_searxng_url: str(settings.search_searxng_url, ""),
       search_brave_key: "",
@@ -22101,7 +22298,13 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
         </Box>
       ) : null}
 
-      {tab === 12 ? <MemoryManager autoRefresh={autoRefresh} /> : null}
+      {tab === 12 ? (
+        <MemoryManager
+          autoRefresh={autoRefresh}
+          projects={[]}
+          activeProjectId=""
+        />
+      ) : null}
 
       {tab === 9 ? ( 
         <Stack spacing={2}>
@@ -24881,14 +25084,41 @@ export function NativeWorkspace({
   view,
   autoRefresh,
   showAdvanced,
-  settingsInitialTab
+  settingsInitialTab,
+  onNavigateToView
 }: {
   view: WorkspaceView;
   autoRefresh: boolean;
   showAdvanced: boolean;
   settingsInitialTab?: number | null;
+  onNavigateToView?: (view: string, replace?: boolean) => void;
 }) {
+  const activeProjectId = useUiStore((s) => s.activeProjectId);
+  const setActiveProjectId = useUiStore((s) => s.setActiveProjectId);
   const isChat = view === "chat";
+  const showProjectScopeBar = ["chat", "documents", "memory", "projects"].includes(view);
+  const projectsQ = useQuery({
+    queryKey: ["workspace-projects"],
+    queryFn: () => api.rawGet("/projects"),
+    enabled: showProjectScopeBar,
+    refetchInterval: autoRefresh && showProjectScopeBar ? REFRESH_MS : false
+  });
+  const projects = pickRecords(projectsQ.data, "projects");
+
+  useEffect(() => {
+    if (!showProjectScopeBar || !activeProjectId || !projectsQ.isSuccess || projectsQ.isFetching) return;
+    if (!projects.some((project) => normalizeProjectId(project.id) === activeProjectId)) {
+      setActiveProjectId("");
+    }
+  }, [
+    activeProjectId,
+    projects,
+    projectsQ.isFetching,
+    projectsQ.isSuccess,
+    setActiveProjectId,
+    showProjectScopeBar
+  ]);
+
   return (
     <Box
       sx={{
@@ -24902,8 +25132,25 @@ export function NativeWorkspace({
         width: "100%"
       }}
     >
+      {showProjectScopeBar ? (
+        <WorkspaceProjectScopeBar
+          activeProjectId={activeProjectId}
+          projects={projects}
+          onNavigateToView={onNavigateToView}
+        />
+      ) : null}
+      {showProjectScopeBar && projectsQ.error ? (
+        <Alert severity="error" sx={{ mb: 1.25, flexShrink: 0 }}>
+          {errMessage(projectsQ.error)}
+        </Alert>
+      ) : null}
       <Box sx={{ display: view === "chat" ? "flex" : "none", flex: 1, minHeight: 0, minWidth: 0, width: "100%" }}>
-        <ChatManager autoRefresh={autoRefresh} isActive={view === "chat"} />
+        <ChatManager
+          autoRefresh={autoRefresh}
+          isActive={view === "chat"}
+          projects={projects}
+          activeProjectId={activeProjectId}
+        />
       </Box>
       {view === "connections" ? <SettingsManager autoRefresh={autoRefresh} initialTab={2} /> : null}
       {view === "channels" ? <SettingsManager autoRefresh={autoRefresh} initialTab={2} /> : null}
@@ -24923,8 +25170,20 @@ export function NativeWorkspace({
       ) : null}
       {view === "goals" ? <GoalsManager autoRefresh={autoRefresh} /> : null}
       {view === "autonomy" ? <AutonomyManager autoRefresh={autoRefresh} /> : null}
-      {view === "documents" ? <DocumentsManager autoRefresh={autoRefresh} /> : null}
-      {view === "projects" ? <ProjectsManager autoRefresh={autoRefresh} /> : null}
+      {view === "documents" ? (
+        <DocumentsManager autoRefresh={autoRefresh} projects={projects} activeProjectId={activeProjectId} />
+      ) : null}
+      {view === "projects" ? (
+        <ProjectsManager
+          autoRefresh={autoRefresh}
+          projects={projects}
+          activeProjectId={activeProjectId}
+          onOpenProjectWorkspace={(projectId) => {
+            setActiveProjectId(projectId);
+            onNavigateToView?.("chat");
+          }}
+        />
+      ) : null}
       {view === "swarm" ? <SwarmManager autoRefresh={autoRefresh} /> : null}
       {view === "trace" ? <TraceManager autoRefresh={autoRefresh} /> : null}
       {view === "status" ? <WatchersManager autoRefresh={autoRefresh} /> : null}
@@ -24934,6 +25193,9 @@ export function NativeWorkspace({
       ) : null}
       {view === "settings" ? (
         <SettingsManager autoRefresh={autoRefresh} initialTab={settingsInitialTab} />
+      ) : null}
+      {view === "memory" ? (
+        <MemoryManager autoRefresh={autoRefresh} projects={projects} activeProjectId={activeProjectId} />
       ) : null}
       {["tasks", "skills", "apps"].includes(view) ? <Divider sx={{ mt: 2 }} /> : null}
     </Box>

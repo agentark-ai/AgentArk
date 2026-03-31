@@ -1,6 +1,7 @@
 import { create } from "zustand";
 
 const TOUR_COMPLETED_KEY = "agentark.tour.completed";
+const ACTIVE_PROJECT_ID_KEY = "agentark.workspace.activeProjectId";
 
 function isTourCompleted(): boolean {
   try {
@@ -18,13 +19,36 @@ function persistTourCompleted(done: boolean): void {
   }
 }
 
+function loadActiveProjectId(): string {
+  try {
+    return (window.localStorage.getItem(ACTIVE_PROJECT_ID_KEY) || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+function persistActiveProjectId(projectId: string): void {
+  const normalized = projectId.trim();
+  try {
+    if (normalized) {
+      window.localStorage.setItem(ACTIVE_PROJECT_ID_KEY, normalized);
+    } else {
+      window.localStorage.removeItem(ACTIVE_PROJECT_ID_KEY);
+    }
+  } catch {
+    /* ignore storage failures */
+  }
+}
+
 type UiState = {
   autoRefresh: boolean;
+  activeProjectId: string;
   showAdvancedByView: Record<string, boolean>;
   selectedNotificationId: string | null;
   tourActive: boolean;
   tourStep: number;
   tourCompleted: boolean;
+  setActiveProjectId: (projectId: string) => void;
   toggleAdvanced: (viewKey: string) => void;
   openNotification: (id: string) => void;
   closeNotification: () => void;
@@ -37,11 +61,17 @@ type UiState = {
 
 export const useUiStore = create<UiState>((set) => ({
   autoRefresh: true,
+  activeProjectId: loadActiveProjectId(),
   showAdvancedByView: {},
   selectedNotificationId: null,
   tourActive: false,
   tourStep: 0,
   tourCompleted: isTourCompleted(),
+  setActiveProjectId: (projectId) => {
+    const normalized = projectId.trim();
+    persistActiveProjectId(normalized);
+    set({ activeProjectId: normalized });
+  },
   toggleAdvanced: (viewKey) =>
     set((s) => ({
       showAdvancedByView: {

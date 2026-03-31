@@ -638,6 +638,10 @@ fn default_num_results() -> usize {
     5
 }
 
+const DEFAULT_SEARCH_PRIMARY: &str = "lightpanda";
+const DEFAULT_SEARCH_FALLBACK1: &str = "duckduckgo";
+const DEFAULT_SEARCH_FALLBACK2: &str = "none";
+
 /// Execute a web search
 pub async fn execute_search(args: &SearchArgs, config: &SearchConfig) -> Result<String> {
     // When an explicit backend is requested, use it directly (no fallback)
@@ -651,7 +655,7 @@ pub async fn execute_search(args: &SearchArgs, config: &SearchConfig) -> Result<
                 .serper
                 .clone()
                 .ok_or_else(|| anyhow!("Serper not configured"))?,
-            "brave" => config
+            "brave" | "brave_api" => config
                 .brave
                 .clone()
                 .ok_or_else(|| anyhow!("Brave not configured"))?,
@@ -660,6 +664,7 @@ pub async fn execute_search(args: &SearchArgs, config: &SearchConfig) -> Result<
                 .clone()
                 .ok_or_else(|| anyhow!("Playwright not configured"))?,
             "duckduckgo" => SearchBackend::DuckDuckGo,
+            "lightpanda" => SearchBackend::Lightpanda,
             other => return Err(anyhow!("Unknown search backend: {}", other)),
         };
         let client = SearchClient::new(backend);
@@ -668,20 +673,11 @@ pub async fn execute_search(args: &SearchArgs, config: &SearchConfig) -> Result<
     }
 
     // Build fallback chain from config (primary → fallback1 → fallback2)
-    let chain: Vec<&str> = [
-        config.primary.as_deref(),
-        config.fallback1.as_deref(),
-        config.fallback2.as_deref(),
-    ]
-    .iter()
-    .filter_map(|o| *o)
-    .filter(|s| *s != "none")
-    .collect();
+    let chain = config.ordered_backend_names();
 
-    if !chain.is_empty() {
-        let mut last_err = None;
-        for name in &chain {
-            if let Some(backend) = config.resolve_backend(name) {
+    let mut last_err = None;
+    for name in &chain {
+        if let Some(backend) = config.resolve_backend(name) {
                 let client = SearchClient::new(backend);
                 match client.search(&args.query, args.num_results).await {
                     Ok(response) if !response.results.is_empty() => {
@@ -696,20 +692,14 @@ pub async fn execute_search(args: &SearchArgs, config: &SearchConfig) -> Result<
                         last_err = Some(e);
                     }
                 }
-            }
+        } else {
+            tracing::debug!("Search backend '{}' not configured, trying next", name);
         }
-        return Err(last_err.unwrap_or_else(|| anyhow!("All search backends failed")));
-    }
 
     // No chain configured — legacy default: prefer Playwright, fall back to DuckDuckGo
-    let backend = if let Some(pw) = &config.playwright {
-        pw.clone()
-    } else {
-        SearchBackend::DuckDuckGo
-    };
-    let client = SearchClient::new(backend);
-    let response = client.search(&args.query, args.num_results).await?;
-    Ok(format_search_results(&response))
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow!("All search backends failed")))
 }
 
 /// Format search results into a human-readable string
@@ -728,13 +718,13 @@ fn format_search_results(response: &SearchResponse) -> String {
 }
 
 /// Search configuration
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchConfig {
     pub searxng: Option<SearchBackend>,
     pub serper: Option<SearchBackend>,
     pub brave: Option<SearchBackend>,
     pub playwright: Option<SearchBackend>,
-    /// Preferred primary backend name (e.g. "playwright", "serper", "duckduckgo")
+    /// Preferred primary backend name (e.g. "lightpanda", "serper", "duckduckgo")
     #[serde(default)]
     pub primary: Option<String>,
     /// First fallback backend name
@@ -743,6 +733,20 @@ pub struct SearchConfig {
     /// Second fallback backend name
     #[serde(default)]
     pub fallback2: Option<String>,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            searxng: None,
+            serper: None,
+            brave: None,
+            playwright: None,
+            primary: Some(DEFAULT_SEARCH_PRIMARY.to_string()),
+            fallback1: Some(DEFAULT_SEARCH_FALLBACK1.to_string()),
+            fallback2: Some(DEFAULT_SEARCH_FALLBACK2.to_string()),
+        }
+    }
 }
 
 impl SearchConfig {
@@ -756,6 +760,41 @@ impl SearchConfig {
             "duckduckgo" => Some(SearchBackend::DuckDuckGo),
             "lightpanda" => Some(SearchBackend::Lightpanda),
             _ => None,
+        }
+    }
+
+    pub fn ordered_backend_names(&self) -> Vec<&str> {
+        let chain: Vec<&str> = [
+            self.primary.as_deref(),
+            self.fallback1.as_deref(),
+            self.fallback2.as_deref(),
+        ]
+        .iter()
+        .filter_map(|value| *value)
+        .filter(|value| !value.trim().is_empty() && *value != "none")
+        .collect();
+
+        if chain.is_empty() {
+            vec![DEFAULT_SEARCH_PRIMARY, DEFAULT_SEARCH_FALLBACK1]
+        } else {
+            chain
+        }
+    }
+
+    pub fn ensure_default_chain(&mut self) {
+        let has_explicit_chain = [
+            self.primary.as_deref(),
+            self.fallback1.as_deref(),
+            self.fallback2.as_deref(),
+        ]
+        .iter()
+        .filter_map(|value| *value)
+        .any(|value| !value.trim().is_empty() && value != "none");
+
+        if !has_explicit_chain {
+            self.primary = Some(DEFAULT_SEARCH_PRIMARY.to_string());
+            self.fallback1 = Some(DEFAULT_SEARCH_FALLBACK1.to_string());
+            self.fallback2 = Some(DEFAULT_SEARCH_FALLBACK2.to_string());
         }
     }
 }

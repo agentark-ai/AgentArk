@@ -5,14 +5,15 @@ import {
   Button,
   Card,
   CardContent,
+  Chip,
   Stack,
-  Typography
+  Typography,
 } from "@mui/material";
 import CheckCircleOutlineRoundedIcon from "@mui/icons-material/CheckCircleOutlineRounded";
 import WarningAmberRoundedIcon from "@mui/icons-material/WarningAmberRounded";
 import type { Notification, Task } from "../types";
 
-type AttentionItem = {
+export type AttentionItem = {
   id: string;
   kind: "approval" | "failed" | "security" | "setup";
   title: string;
@@ -86,7 +87,7 @@ function isTestArtifactTask(task: Task): boolean {
   return desc.includes("e2e test task") || desc.includes("integration test task");
 }
 
-function buildItems(
+export function buildAttentionItems(
   tasks: Task[],
   notifications: Notification[],
   securityLogs: Array<{ event_type: string; severity: string; message: string }>,
@@ -95,46 +96,42 @@ function buildItems(
 ): AttentionItem[] {
   const items: AttentionItem[] = [];
 
-  // Setup nudge: no LLM model pool configured
   if (settingsLoaded && !hasLlmConfigured) {
     items.push({
       id: "__setup_llm",
       kind: "setup",
       title: "Set up your AI model",
-      detail: "No LLM model is configured yet. Go to Settings > LLM Config to get started."
+      detail: "No LLM model is configured yet. Go to Settings > Models to get started.",
     });
   }
 
-  // Tasks awaiting approval
-  for (const t of tasks) {
-    if (isTestArtifactTask(t)) continue;
-    const s = String(t?.status || "").toLowerCase();
-    if (s.includes("awaitingapproval")) {
+  for (const task of tasks) {
+    if (isTestArtifactTask(task)) continue;
+    const status = String(task?.status || "").toLowerCase();
+    if (status.includes("awaitingapproval")) {
       items.push({
-        id: t.id,
+        id: task.id,
         kind: "approval",
-        title: t.description || "Task needs approval",
+        title: task.description || "Task needs approval",
       });
     }
   }
 
-  // Failed tasks
-  for (const t of tasks) {
-    if (isTestArtifactTask(t)) continue;
-    const s = String(t?.status || "").toLowerCase();
-    if (s.includes("failed")) {
+  for (const task of tasks) {
+    if (isTestArtifactTask(task)) continue;
+    const status = String(task?.status || "").toLowerCase();
+    if (status.includes("failed")) {
       items.push({
-        id: t.id,
+        id: task.id,
         kind: "failed",
-        title: t.description || "Task failed",
+        title: task.description || "Task failed",
       });
     }
   }
 
-  // Critical security alerts
   for (const log of securityLogs) {
-    const sev = (log.severity || "").toLowerCase();
-    if (sev === "high" || sev === "critical") {
+    const severity = (log.severity || "").toLowerCase();
+    if (severity === "high" || severity === "critical") {
       items.push({
         id: `sec_${log.event_type}_${log.message?.slice(0, 20)}`,
         kind: "security",
@@ -144,15 +141,14 @@ function buildItems(
     }
   }
 
-  // Critical unread notifications
-  for (const n of notifications) {
-    if (!n.read && (n.level === "error" || n.level === "critical")) {
+  for (const notification of notifications) {
+    if (!notification.read && (notification.level === "error" || notification.level === "critical")) {
       items.push({
-        id: `notif_${n.id}`,
+        id: `notif_${notification.id}`,
         kind: "security",
-        title: n.title || "Alert",
-        detail: n.body?.slice(0, 80),
-        targetView: notificationTargetView(n),
+        title: notification.title || "Alert",
+        detail: notification.body?.slice(0, 80),
+        targetView: notificationTargetView(notification),
       });
     }
   }
@@ -174,151 +170,163 @@ export function NeedsAttentionInbox({
   rejecting,
   retrying,
 }: Props) {
-  const items = buildItems(tasks, notifications, securityLogs, settingsLoaded, hasLlmConfigured);
+  const items = buildAttentionItems(tasks, notifications, securityLogs, settingsLoaded, hasLlmConfigured);
   const count = items.length;
+  const waitingCount = tasks.filter((task) => {
+    const status = String(task?.status || "").toLowerCase();
+    return status.includes("awaitingapproval") || status.includes("paused");
+  }).length;
+  const failedCount = tasks.filter((task) => String(task?.status || "").toLowerCase().includes("failed")).length;
+  const unreadAlerts = notifications.filter((notification) => !notification.read).length;
 
   return (
-    <Card className="attention-card" sx={{ alignSelf: "stretch", height: "100%" }}>
-      <CardContent sx={{ p: 1.55, height: "100%" }}>
-        <Stack direction="row" alignItems="center" spacing={1} mb={0.45}>
-          <WarningAmberRoundedIcon
-            sx={{ color: count > 0 ? "rgba(255, 167, 38, 0.9)" : "rgba(155, 180, 214, 0.4)", fontSize: 20 }}
-          />
-          <Typography variant="h6" sx={{ flex: 1, fontWeight: 700 }}>
-            Decision Queue
-          </Typography>
-          {count > 0 ? (
-            <Badge badgeContent={count} color="warning" />
-          ) : null}
-        </Stack>
-        <Typography variant="body2" color="text.secondary" sx={{ mb: count > 0 ? 1.25 : 0.9 }}>
-          Blocking approvals, failed runs, security alerts, and setup gaps that require an operator.
-        </Typography>
-
-        {count === 0 ? (
-          <Box className="empty-state" sx={{ py: 3 }}>
-            <CheckCircleOutlineRoundedIcon
-              sx={{ fontSize: 36, color: "rgba(20, 241, 149, 0.6)" }}
-            />
-            <Typography variant="body2" color="text.secondary" sx={{ fontWeight: 600 }}>
-              Operator queue is clear.
+    <Card className="attention-card mission-panel mission-panel--adaptive" data-tour-target="overview-attention">
+      <CardContent sx={{ p: 1.55, display: "flex", flexDirection: "column" }}>
+        <Stack spacing={1.15} className="mission-panel-content">
+          <Box>
+            <Stack direction="row" alignItems="center" spacing={1} mb={0.45}>
+              <WarningAmberRoundedIcon
+                sx={{ color: count > 0 ? "rgba(255, 167, 38, 0.9)" : "rgba(155, 180, 214, 0.4)", fontSize: 20 }}
+              />
+              <Typography variant="h6" sx={{ flex: 1, fontWeight: 700 }}>
+                Needs Attention
+              </Typography>
+              {count > 0 ? <Badge badgeContent={count} color="warning" /> : null}
+            </Stack>
+            <Typography variant="body2" color="text.secondary">
+              One queue for approvals, pauses, failures, urgent alerts, and setup gaps that require an operator.
             </Typography>
           </Box>
-        ) : (
-          <Stack spacing={0.85}>
-            {items.map((item) => {
-              const meta = attentionMeta(item.kind);
-              return (
-              <Box
-                key={item.id}
-                className="action-row"
-                sx={{
-                  p: "10px 12px",
-                  borderLeft: `3px solid ${meta.accent}`,
-                  background: "linear-gradient(180deg, rgba(8, 18, 34, 0.76), rgba(6, 14, 28, 0.72))",
-                }}
-              >
-                <Stack
-                  direction={{ xs: "column", sm: "row" }}
-                  spacing={1}
-                  justifyContent="space-between"
-                  alignItems={{ xs: "flex-start", sm: "flex-start" }}
-                >
-                  <Box sx={{ flex: 1, minWidth: 0 }}>
-                    <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" alignItems="center" sx={{ mb: 0.35 }}>
-                      <Box
-                        sx={{
-                          px: 0.8,
-                          py: 0.2,
-                          borderRadius: 999,
-                          border: `1px solid ${meta.accent}`,
-                          color: meta.accent,
-                          fontSize: "0.68rem",
-                          fontWeight: 700,
-                          letterSpacing: "0.08em",
-                          textTransform: "uppercase",
-                        }}
-                      >
-                        {meta.label}
-                      </Box>
-                      <Typography variant="body2" fontWeight={700} title={item.title}>
-                        {item.title}
-                      </Typography>
-                    </Stack>
-                    <Typography variant="caption" color="text.secondary" sx={{ display: "block", lineHeight: 1.45 }}>
-                      {item.detail || meta.defaultDetail}
-                    </Typography>
-                  </Box>
 
-                  <Stack direction="row" spacing={0.6} flexShrink={0} sx={{ pt: { sm: 0.2 } }}>
-                    {item.kind === "approval" ? (
-                      <>
-                        <Button
-                          variant="contained"
-                          size="small"
-                          color="success"
-                          disabled={approving}
-                          onClick={() => onApprove(item.id)}
-                          sx={{ minWidth: 78, textTransform: "none" }}
-                        >
-                          Approve
-                        </Button>
-                        <Button
-                          variant="outlined"
-                          size="small"
-                          color="warning"
-                          disabled={rejecting}
-                          onClick={() => onReject(item.id)}
-                          sx={{ minWidth: 68, textTransform: "none" }}
-                        >
-                          Reject
-                        </Button>
-                      </>
-                    ) : item.kind === "failed" ? (
-                      <Button
-                        variant="outlined"
-                        size="small"
-                        disabled={retrying}
-                        onClick={() => onRetry(item.id)}
-                        sx={{ textTransform: "none", minWidth: 68 }}
-                      >
-                        Retry
-                      </Button>
-                    ) : item.kind === "setup" ? (
-                      <Button
-                        variant="contained"
-                        size="small"
-                        onClick={() => onNavigate("settings")}
-                        sx={{ textTransform: "none", minWidth: 68 }}
-                      >
-                        Set Up
-                      </Button>
-                    ) : (
-                      <Button
-                        variant="text"
-                        size="small"
-                        onClick={() => onNavigate(item.targetView || "settings")}
-                        sx={{ textTransform: "none", minWidth: 56 }}
-                      >
-                        View
-                      </Button>
-                    )}
-                  </Stack>
-                </Stack>
-              </Box>
-            )})}
-
-            {count >= 5 ? (
-              <Button
-                size="small"
-                onClick={() => onNavigate("tasks")}
-                sx={{ textTransform: "none", alignSelf: "flex-start", mt: 0.5 }}
-              >
-                Open full task queue
-              </Button>
-            ) : null}
+          <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+            <Chip size="small" color={waitingCount > 0 ? "warning" : "default"} label={`${waitingCount} waiting`} />
+            <Chip size="small" color={failedCount > 0 ? "error" : "default"} label={`${failedCount} failed`} />
+            <Chip size="small" color={unreadAlerts > 0 ? "warning" : "default"} label={`${unreadAlerts} unread alerts`} />
           </Stack>
-        )}
+
+          {count === 0 ? (
+            <Box className="empty-state mission-empty-copy" sx={{ py: 3 }}>
+              <CheckCircleOutlineRoundedIcon sx={{ fontSize: 36, color: "rgba(20, 241, 149, 0.6)" }} />
+              <Typography variant="body2" color="text.secondary" sx={{ fontWeight: 600 }}>
+                Operator queue is clear.
+              </Typography>
+            </Box>
+          ) : (
+            <Stack spacing={0.85} className="mission-panel-section">
+              {items.map((item) => {
+                const meta = attentionMeta(item.kind);
+                return (
+                  <Box
+                    key={item.id}
+                    className="action-row"
+                    sx={{
+                      p: "10px 12px",
+                      borderLeft: `3px solid ${meta.accent}`,
+                      background: "linear-gradient(180deg, rgba(8, 18, 34, 0.76), rgba(6, 14, 28, 0.72))",
+                    }}
+                  >
+                    <Stack
+                      direction={{ xs: "column", sm: "row" }}
+                      spacing={1}
+                      justifyContent="space-between"
+                      alignItems={{ xs: "flex-start", sm: "flex-start" }}
+                    >
+                      <Box sx={{ flex: 1, minWidth: 0 }}>
+                        <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" alignItems="center" sx={{ mb: 0.35 }}>
+                          <Box
+                            sx={{
+                              px: 0.8,
+                              py: 0.2,
+                              borderRadius: 999,
+                              border: `1px solid ${meta.accent}`,
+                              color: meta.accent,
+                              fontSize: "0.68rem",
+                              fontWeight: 700,
+                              letterSpacing: "0.08em",
+                              textTransform: "uppercase",
+                            }}
+                          >
+                            {meta.label}
+                          </Box>
+                          <Typography variant="body2" fontWeight={700} title={item.title} className="mission-title-clamp">
+                            {item.title}
+                          </Typography>
+                        </Stack>
+                        <Typography variant="caption" color="text.secondary" sx={{ display: "block", lineHeight: 1.45 }}>
+                          {item.detail || meta.defaultDetail}
+                        </Typography>
+                      </Box>
+
+                      <Stack direction="row" spacing={0.6} flexShrink={0} sx={{ pt: { sm: 0.2 } }}>
+                        {item.kind === "approval" ? (
+                          <>
+                            <Button
+                              variant="contained"
+                              size="small"
+                              color="success"
+                              disabled={approving}
+                              onClick={() => onApprove(item.id)}
+                              sx={{ minWidth: 78, textTransform: "none" }}
+                            >
+                              Approve
+                            </Button>
+                            <Button
+                              variant="outlined"
+                              size="small"
+                              color="warning"
+                              disabled={rejecting}
+                              onClick={() => onReject(item.id)}
+                              sx={{ minWidth: 68, textTransform: "none" }}
+                            >
+                              Reject
+                            </Button>
+                          </>
+                        ) : item.kind === "failed" ? (
+                          <Button
+                            variant="outlined"
+                            size="small"
+                            disabled={retrying}
+                            onClick={() => onRetry(item.id)}
+                            sx={{ textTransform: "none", minWidth: 68 }}
+                          >
+                            Retry
+                          </Button>
+                        ) : item.kind === "setup" ? (
+                          <Button
+                            variant="contained"
+                            size="small"
+                            onClick={() => onNavigate("settings")}
+                            sx={{ textTransform: "none", minWidth: 68 }}
+                          >
+                            Set Up
+                          </Button>
+                        ) : (
+                          <Button
+                            variant="outlined"
+                            size="small"
+                            onClick={() => onNavigate(item.targetView || "settings")}
+                            sx={{ textTransform: "none", minWidth: 62 }}
+                          >
+                            View
+                          </Button>
+                        )}
+                      </Stack>
+                    </Stack>
+                  </Box>
+                );
+              })}
+            </Stack>
+          )}
+
+          <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" className="mission-panel-footer">
+            <Button variant="contained" size="small" onClick={() => onNavigate("tasks")} sx={{ textTransform: "none" }}>
+              Open task queue
+            </Button>
+            <Button size="small" variant="outlined" onClick={() => onNavigate("trace")} sx={{ textTransform: "none" }}>
+              Open trace
+            </Button>
+          </Stack>
+        </Stack>
       </CardContent>
     </Card>
   );

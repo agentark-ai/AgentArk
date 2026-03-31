@@ -2094,11 +2094,58 @@ pub(crate) struct FetchedSkillMarkdown {
     pub content: String,
 }
 
+#[cfg(test)]
+static TEST_SKILL_FETCH_OVERRIDES:
+    std::sync::OnceLock<std::sync::Mutex<HashMap<String, FetchedSkillMarkdown>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn test_skill_fetch_overrides(
+) -> &'static std::sync::Mutex<HashMap<String, FetchedSkillMarkdown>> {
+    TEST_SKILL_FETCH_OVERRIDES
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn register_test_skill_fetch_override(
+    request_url: &str,
+    source_url: &str,
+    content: &str,
+) {
+    let mut overrides = test_skill_fetch_overrides()
+        .lock()
+        .expect("test skill fetch overrides lock");
+    overrides.insert(
+        request_url.trim().to_string(),
+        FetchedSkillMarkdown {
+            source_url: source_url.trim().to_string(),
+            content: content.to_string(),
+        },
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn clear_test_skill_fetch_override(request_url: &str) {
+    let mut overrides = test_skill_fetch_overrides()
+        .lock()
+        .expect("test skill fetch overrides lock");
+    overrides.remove(request_url.trim());
+}
+
 pub(crate) async fn fetch_skill_markdown_from_url_shared(
     agent: &Agent,
     url: &str,
 ) -> Result<FetchedSkillMarkdown, String> {
     let url = url.trim();
+    #[cfg(test)]
+    {
+        let overrides = test_skill_fetch_overrides()
+            .lock()
+            .expect("test skill fetch overrides lock");
+        if let Some(fetched) = overrides.get(url).cloned() {
+            return Ok(fetched);
+        }
+    }
     let _validated = validate_import_fetch_url(url).await?;
 
     let client = reqwest::Client::builder()

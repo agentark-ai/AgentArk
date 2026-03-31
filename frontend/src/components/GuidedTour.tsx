@@ -11,6 +11,7 @@ type TourStepDef = {
   body: string;
   placement: "bottom" | "top" | "left" | "right";
   spotlightPadding?: number;
+  settingsInitialTab?: number;
 };
 
 const TOUR_STEPS: TourStepDef[] = [
@@ -22,6 +23,7 @@ const TOUR_STEPS: TourStepDef[] = [
     body: "AgentArk needs at least one LLM to work. Add an OpenAI, Anthropic, Ollama, or OpenRouter model here. You can configure multiple models for different tasks - primary, fast, code, and more.",
     placement: "left",
     spotlightPadding: 10,
+    settingsInitialTab: 1,
   },
   {
     id: "chat",
@@ -29,15 +31,6 @@ const TOUR_STEPS: TourStepDef[] = [
     targetSelector: "[data-tour-target='nav-chat']",
     title: "Start in chat",
     body: "This is the main working surface. Quick questions stay chat-native, while builds, imports, research, and file-changing work can promote into durable tasks without leaving the thread.",
-    placement: "right",
-    spotlightPadding: 6,
-  },
-  {
-    id: "inbox",
-    view: "inbox",
-    targetSelector: "[data-tour-target='nav-inbox']",
-    title: "Use Inbox for blocked or risky work",
-    body: "Approvals, pauses, failures, and urgent notifications are grouped here so the active workspace can stay clean instead of turning into a dashboard of interruptions.",
     placement: "right",
     spotlightPadding: 6,
   },
@@ -60,6 +53,15 @@ const TOUR_STEPS: TourStepDef[] = [
     spotlightPadding: 6,
   },
   {
+    id: "attention",
+    view: "overview",
+    targetSelector: "[data-tour-target='overview-attention']",
+    title: "Mission Control holds the attention queue",
+    body: "Approvals, pauses, failures, and urgent alerts now land in one needs-attention queue inside Mission Control, with Tasks and Trace handling the deeper follow-up.",
+    placement: "bottom",
+    spotlightPadding: 12,
+  },
+  {
     id: "overview",
     view: "overview",
     targetSelector: "[data-tour-target='overview-dashboard']",
@@ -73,7 +75,7 @@ const TOUR_STEPS: TourStepDef[] = [
     view: "chat",
     targetSelector: "[data-tour-target='workspace-shell']",
     title: "You're all set!",
-    body: "Start in chat, open deeper operational panels only when needed, and use the inbox when the run needs you. You can re-run this tour anytime from Settings > Advanced.",
+    body: "Start in chat, open deeper operational panels only when needed, and use Mission Control when the run needs you. You can re-run this tour anytime from Settings > Advanced.",
     placement: "bottom",
     spotlightPadding: 10,
   },
@@ -137,11 +139,11 @@ function tooltipPosition(
 }
 
 type Props = {
-  navigateToView: (view: string, replace?: boolean) => void;
+  openTourStep: (view: string, options?: { settingsInitialTab?: number }) => void;
   currentView: string;
 };
 
-export function GuidedTour({ navigateToView, currentView }: Props) {
+export function GuidedTour({ openTourStep, currentView }: Props) {
   const tourActive = useUiStore((s) => s.tourActive);
   const tourStep = useUiStore((s) => s.tourStep);
   const nextTourStep = useUiStore((s) => s.nextTourStep);
@@ -157,10 +159,10 @@ export function GuidedTour({ navigateToView, currentView }: Props) {
 
   useEffect(() => {
     if (!tourActive || !stepDef) return;
-    if (currentView !== stepDef.view) {
-      navigateToView(stepDef.view);
-    }
-  }, [tourActive, tourStep, currentView, navigateToView, stepDef]);
+    openTourStep(stepDef.view, {
+      settingsInitialTab: stepDef.settingsInitialTab,
+    });
+  }, [tourActive, tourStep, openTourStep, stepDef]);
 
   useLayoutEffect(() => {
     if (!tourActive || !stepDef) return;

@@ -1210,7 +1210,7 @@ impl ActionRuntime {
                 "properties": {
                     "query": { "type": "string", "description": "Search query" },
                     "num_results": { "type": "integer", "description": "Number of results (default 5)" },
-                    "backend": { "type": "string", "description": "Search backend: duckduckgo, brave, serper, searxng" }
+                    "backend": { "type": "string", "description": "Search backend: lightpanda, duckduckgo, playwright, brave, brave_api, serper, searxng" }
                 },
                 "required": ["query"]
             }),
@@ -1230,6 +1230,7 @@ impl ActionRuntime {
                 "properties": {
                     "query": { "type": "string", "description": "Research topic or question" },
                     "max_sources": { "type": "integer", "description": "Maximum sources to examine (default 5)" },
+                    "backend": { "type": "string", "description": "Optional search backend override: lightpanda, duckduckgo, playwright, brave, brave_api, serper, searxng" },
                     "depth": { "type": "string", "description": "Research depth: quick, standard, deep" },
                     "include_sources": { "type": "boolean", "description": "Include source URLs" }
                 },
@@ -8569,8 +8570,9 @@ required:{required_block}
     }
 }
 
-/// Build search config: loads user settings from search.toml, then auto-detects Playwright.
-/// Priority: user-configured backends from settings + Playwright auto-detection as default.
+/// Build search config: loads user settings from search.toml, injects API-backed
+/// secrets, auto-detects Playwright for explicit opt-in use, and applies the
+/// default Lightpanda -> DuckDuckGo -> none chain only when no chain is saved.
 async fn build_search_config(config_dir: &Path) -> crate::actions::SearchConfig {
     // Load saved search config (from Settings UI)
     let mut config = match std::fs::read_to_string(config_dir.join("search.toml")) {
@@ -8612,7 +8614,8 @@ async fn build_search_config(config_dir: &Path) -> crate::actions::SearchConfig 
         }
     }
 
-    // Auto-detect Playwright bridge if not already set
+    // Auto-detect Playwright bridge if not already set so explicit browser-backed
+    // search remains available on full deployments.
     if config.playwright.is_none() {
         let bridge_url = std::env::var("PLAYWRIGHT_BRIDGE_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:3100".to_string());
@@ -8630,28 +8633,11 @@ async fn build_search_config(config_dir: &Path) -> crate::actions::SearchConfig 
             config.playwright =
                 Some(crate::actions::search::SearchBackend::Playwright { bridge_url });
         } else {
-            tracing::debug!("Playwright bridge unavailable, falling back to DuckDuckGo");
+            tracing::debug!("Playwright bridge unavailable; browser-backed search disabled");
         }
     }
 
-    // Auto-inject Lightpanda into the search chain if available and not already present.
-    // Lightpanda is fast (~50ms), needs no API key, and should be tried first.
-    {
-        let chain = [
-            config.primary.as_deref(),
-            config.fallback1.as_deref(),
-            config.fallback2.as_deref(),
-        ];
-        let has_lightpanda = chain.iter().any(|v| v == &Some("lightpanda"));
-        if !has_lightpanda {
-            // Shift existing chain down and insert lightpanda as primary
-            let old_primary = config.primary.take();
-            let old_fb1 = config.fallback1.take();
-            config.primary = Some("lightpanda".to_string());
-            config.fallback1 = old_primary;
-            config.fallback2 = old_fb1;
-        }
-    }
+    config.ensure_default_chain();
 
     config
 }

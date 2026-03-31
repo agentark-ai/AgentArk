@@ -4,8 +4,8 @@ Recommended path: connect Google Workspace once, then use its Gmail and Calendar
 
 Steps inside AgentArk:
 
-1. Open Settings > Integrations.
-2. Find Google Workspace.
+1. Open Settings > Integrations > Prebuilt Connectors.
+2. Find Google Workspace in the connector list.
 3. Enter the Google OAuth Client ID and Google OAuth Client Secret for this AgentArk instance.
 4. In Workspace Bundles, include at least `gmail`. Add `calendar` too if you also want calendar support. Save the setup.
 5. Click Continue with Google / Connect so AgentArk opens the browser sign-in flow.
@@ -26,7 +26,7 @@ Steps outside AgentArk in Google Cloud:
 
 Verification:
 
-- In Settings > Integrations, Google Workspace should no longer say not configured or needs auth.
+- In Settings > Integrations > Prebuilt Connectors, Google Workspace should no longer say not configured or needs auth.
 - A connection test should pass.
 - AgentArk should be able to list Gmail or use the Google Workspace helper actions without asking for setup again.
 

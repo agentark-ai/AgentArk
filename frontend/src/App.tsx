@@ -24,7 +24,6 @@ import ChatRoundedIcon from "@mui/icons-material/ChatRounded";
 import ChevronLeftRoundedIcon from "@mui/icons-material/ChevronLeftRounded";
 import ChevronRightRoundedIcon from "@mui/icons-material/ChevronRightRounded";
 import DescriptionRoundedIcon from "@mui/icons-material/DescriptionRounded";
-import InboxRoundedIcon from "@mui/icons-material/InboxRounded";
 import ExtensionRoundedIcon from "@mui/icons-material/ExtensionRounded";
 import AppsRoundedIcon from "@mui/icons-material/AppsRounded";
 import HubRoundedIcon from "@mui/icons-material/HubRounded";
@@ -47,7 +46,6 @@ import { GuidedTour } from "./components/GuidedTour";
 import { NativeWorkspace, type WorkspaceView } from "./components/NativeWorkspace";
 import { OverviewPane } from "./components/OverviewPane";
 import { ApprovalPromptOverlay } from "./components/ApprovalPromptOverlay";
-import { InboxPane } from "./components/InboxPane";
 import { LibraryPane } from "./components/LibraryPane";
 import { useUiStore } from "./store/uiStore";
 import type { Task } from "./types";
@@ -57,7 +55,6 @@ const PING_STALE_MS = 30_000;
 const APPROVAL_FALLBACK_POLL_MS = 2500;
 type ViewKey =
   | "overview"
-  | "inbox"
   | "chat"
   | "library"
   | "connections"
@@ -96,7 +93,7 @@ const VIEW_ALIASES: Record<string, ViewKey> = {
   overview: "overview",
   workspace: "chat",
   chat: "chat",
-  inbox: "inbox",
+  inbox: "overview",
   project: "projects",
   projects: "projects",
   library: "library",
@@ -117,7 +114,6 @@ const VIEW_ALIASES: Record<string, ViewKey> = {
 
 const VIEW_KEYS: ReadonlySet<ViewKey> = new Set<ViewKey>([
   "overview",
-  "inbox",
   "chat",
   "library",
   "connections",
@@ -151,7 +147,6 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { key: "overview", label: "Mission Control", icon: <SpaceDashboardRoundedIcon fontSize="small" /> },
       { key: "chat", label: "Chat", icon: <ChatRoundedIcon fontSize="small" /> },
-      { key: "inbox", label: "Inbox", icon: <InboxRoundedIcon fontSize="small" /> },
     ]
   },
   {
@@ -187,7 +182,6 @@ const NAV_GROUPS: NavGroup[] = [
 
 const VIEW_PATH_SEGMENTS: Record<ViewKey, string> = {
   overview: "home",
-  inbox: "inbox",
   chat: "chat",
   library: "library",
   connections: "connections",
@@ -255,6 +249,7 @@ function resolveViewFromPath(pathname: string): { view: ViewKey; matched: boolea
 
   if (normalized.startsWith("/ui/")) {
       const segment = normalized.slice("/ui/".length).split("/")[0]?.toLowerCase() || "";
+      if (segment === "inbox") return { view: "overview", matched: true };
       if (segment === "actions") return { view: "skills", matched: true };
       if (segment === "integrations") return { view: "settings", matched: true };
       if (segment === "memory") return { view: "settings", matched: true };
@@ -683,6 +678,17 @@ export default function App() {
     navigateToView(route);
   };
 
+  const openGuidedTourStep = (
+    targetView: string,
+    options?: { settingsInitialTab?: number }
+  ) => {
+    if (targetView === "settings") {
+      openSettingsView("settings", typeof options?.settingsInitialTab === "number" ? options.settingsInitialTab : null);
+      return;
+    }
+    navigateToView(targetView);
+  };
+
   const closeSettingsModal = () => {
     setSettingsInitialTab(null);
     const fallback = lastNonSettingsView === "settings" ? "overview" : lastNonSettingsView;
@@ -691,7 +697,7 @@ export default function App() {
 
   const settingsModalOpen = view === "settings";
   const activeView: ViewKey = settingsModalOpen ? lastNonSettingsView : view;
-  const workspaceView = activeView as Exclude<ViewKey, "overview" | "settings" | "inbox" | "library">;
+  const workspaceView = activeView as Exclude<ViewKey, "overview" | "settings" | "library">;
   const stageClassName = [
     "workspace-stage",
     activeView === "overview"
@@ -821,17 +827,12 @@ export default function App() {
                     serverError={serverQ.isError}
                     serverLoading={serverQ.isLoading && !serverQ.data}
                   />
-                ) : activeView === "inbox" ? (
-                  <InboxPane
-                    tasks={approvalTasks}
-                    notifications={visibleNotifications}
-                    onNavigateToView={navigateToView as (view: string, replace?: boolean) => void}
-                  />
                 ) : activeView === "chat" ? (
                   <NativeWorkspace
                     view="chat"
                     autoRefresh={settingsModalOpen ? false : autoRefresh}
                     showAdvanced={showAdvanced}
+                    onNavigateToView={navigateToView as (view: string, replace?: boolean) => void}
                   />
                 ) : activeView === "library" ? (
                   <LibraryPane
@@ -844,6 +845,7 @@ export default function App() {
                     view={workspaceView as WorkspaceView}
                     autoRefresh={settingsModalOpen ? false : autoRefresh}
                     showAdvanced={showAdvanced}
+                    onNavigateToView={navigateToView as (view: string, replace?: boolean) => void}
                   />
               )}
             </Box>
@@ -901,6 +903,7 @@ export default function App() {
             autoRefresh={false}
             showAdvanced={showAdvanced}
             settingsInitialTab={settingsInitialTab}
+            onNavigateToView={navigateToView as (view: string, replace?: boolean) => void}
           />
         </DialogContent>
       </Dialog>
@@ -1177,7 +1180,7 @@ export default function App() {
           </Box>
         </Box>
       </Drawer>
-      <GuidedTour navigateToView={navigateToView as (view: string, replace?: boolean) => void} currentView={view} />
+      <GuidedTour openTourStep={openGuidedTourStep} currentView={view} />
     </Box>
   );
 }

@@ -56,6 +56,10 @@ mod webhooks;
 pub(crate) use self::actions::{
     fetch_skill_markdown_from_url_shared, import_action_from_content_with_agent,
 };
+#[cfg(test)]
+pub(crate) use self::actions::{
+    clear_test_skill_fetch_override, register_test_skill_fetch_override,
+};
 use self::moltbook::MoltbookSettings;
 
 use crate::channels::{
@@ -8518,7 +8522,6 @@ async fn health(State(state): State<AppState>) -> Response {
     let healthy = storage_ok
         && schema_ok
         && mem0_ok
-        && playwright_ok
         && public_app_origin_ok
         && scheduler_loop_ok
         && watcher_loop_ok;
@@ -17051,7 +17054,7 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
         search_primary: search_cfg
             .as_ref()
             .and_then(|c| c.primary.clone())
-            .unwrap_or("playwright".to_string()),
+            .unwrap_or("lightpanda".to_string()),
         search_fallback1: search_cfg
             .as_ref()
             .and_then(|c| c.fallback1.clone())

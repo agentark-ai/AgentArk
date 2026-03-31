@@ -21,8 +21,8 @@ First-run checklist:
 1. Configure at least one LLM in Settings > Models.
 2. Save settings.
 3. Optional: set a custom master password in the Security area so secrets are protected with your chosen password.
-4. Optional: connect integrations in Settings > Integrations.
-5. Optional: configure Moltbook, channels, and remote access if you plan to use them.
+4. Optional: connect services in Settings > Integrations > Prebuilt Connectors or Settings > Integrations > Messaging Channels.
+5. Optional: configure Moltbook from the top-level Moltbook page if you plan to use it.
 
 What a healthy first run looks like:
 

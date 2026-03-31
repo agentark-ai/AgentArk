@@ -283,7 +283,6 @@ impl ResearchClient {
         num_results: usize,
         backend_preference: &Option<String>,
     ) -> Result<Vec<SearchResult>> {
-        // Explicit backend requested — use it directly
         if let Some(explicit) = backend_preference.as_deref() {
             let backend = match explicit {
                 "searxng" => self
@@ -296,7 +295,7 @@ impl ResearchClient {
                     .serper
                     .clone()
                     .ok_or_else(|| anyhow!("Serper not configured"))?,
-                "brave" => self
+                "brave" | "brave_api" => self
                     .search_config
                     .brave
                     .clone()
@@ -307,6 +306,7 @@ impl ResearchClient {
                     .clone()
                     .ok_or_else(|| anyhow!("Playwright not configured"))?,
                 "duckduckgo" => SearchBackend::DuckDuckGo,
+                "lightpanda" => SearchBackend::Lightpanda,
                 other => return Err(anyhow!("Unknown search backend: {}", other)),
             };
             let client = SearchClient::new(backend);
@@ -314,56 +314,40 @@ impl ResearchClient {
             return Ok(response.results);
         }
 
-        // Build fallback chain from config
-        let chain: Vec<&str> = [
-            self.search_config.primary.as_deref(),
-            self.search_config.fallback1.as_deref(),
-            self.search_config.fallback2.as_deref(),
-        ]
-        .iter()
-        .filter_map(|o| *o)
-        .filter(|s| *s != "none")
-        .collect();
-
-        if !chain.is_empty() {
-            let mut last_err = None;
-            for name in &chain {
-                if let Some(backend) = self.search_config.resolve_backend(name) {
-                    let client = SearchClient::new(backend);
-                    match client.search(query, num_results).await {
-                        Ok(response) if !response.results.is_empty() => {
-                            return Ok(response.results);
-                        }
-                        Ok(_) => {
-                            tracing::warn!(
-                                "Research: search backend '{}' returned 0 results, trying next",
-                                name
-                            );
-                            last_err = Some(anyhow!("Backend '{}' returned 0 results", name));
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Research: search backend '{}' failed: {}, trying next",
-                                name,
-                                e
-                            );
-                            last_err = Some(e);
-                        }
+        let chain = self.search_config.ordered_backend_names();
+        let mut last_err = None;
+        for name in &chain {
+            if let Some(backend) = self.search_config.resolve_backend(name) {
+                let client = SearchClient::new(backend);
+                match client.search(query, num_results).await {
+                    Ok(response) if !response.results.is_empty() => {
+                        return Ok(response.results);
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            "Research: search backend '{}' returned 0 results, trying next",
+                            name
+                        );
+                        last_err = Some(anyhow!("Backend '{}' returned 0 results", name));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Research: search backend '{}' failed: {}, trying next",
+                            name,
+                            e
+                        );
+                        last_err = Some(e);
                     }
                 }
+            } else {
+                tracing::debug!(
+                    "Research: search backend '{}' not configured, trying next",
+                    name
+                );
             }
-            return Err(last_err.unwrap_or_else(|| anyhow!("All search backends failed")));
         }
 
-        // No chain configured — legacy default
-        let backend = if let Some(pw) = &self.search_config.playwright {
-            pw.clone()
-        } else {
-            SearchBackend::DuckDuckGo
-        };
-        let client = SearchClient::new(backend);
-        let response = client.search(query, num_results).await?;
-        Ok(response.results)
+        Err(last_err.unwrap_or_else(|| anyhow!("All search backends failed")))
     }
 
     /// Fetch content from a URL

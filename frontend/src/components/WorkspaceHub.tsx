@@ -104,7 +104,7 @@ export function WorkspaceHub({
     refetchInterval: interval,
   });
   const projectsQ = useQuery({
-    queryKey: ["chat-projects"],
+    queryKey: ["workspace-projects"],
     queryFn: () => api.rawGet("/projects"),
     refetchInterval: interval,
   });
@@ -224,7 +224,12 @@ export function WorkspaceHub({
 
       <Box className="workspace-hub-grid">
         <Box className="workspace-chat-stage">
-          <NativeWorkspace view="chat" autoRefresh={autoRefresh} showAdvanced={showAdvanced} />
+          <NativeWorkspace
+            view="chat"
+            autoRefresh={autoRefresh}
+            showAdvanced={showAdvanced}
+            onNavigateToView={onNavigateToView}
+          />
         </Box>
 
         <Stack className="workspace-companion-rail" spacing={1.1}>
@@ -271,8 +276,8 @@ export function WorkspaceHub({
                   <Button size="small" variant="outlined" onClick={() => setDrawerView("tasks")} sx={{ textTransform: "none" }}>
                     Open Task Queue
                   </Button>
-                  <Button size="small" variant="text" onClick={() => onNavigateToView("inbox")} sx={{ textTransform: "none" }}>
-                    Open Inbox
+                  <Button size="small" variant="text" onClick={() => onNavigateToView("overview")} sx={{ textTransform: "none" }}>
+                    Mission Control
                   </Button>
                 </Stack>
               </Stack>
@@ -300,7 +305,7 @@ export function WorkspaceHub({
                     <Chip size="small" color="warning" label={`${degradedApps.length} need review`} />
                   ) : null}
                   <Chip size="small" label={`${traces.length} traces`} />
-                  <Chip size="small" color={unreadCount > 0 ? "warning" : "default"} label={`${unreadCount} inbox`} />
+                    <Chip size="small" color={unreadCount > 0 ? "warning" : "default"} label={`${unreadCount} alerts`} />
                 </Stack>
                 <Divider sx={{ borderColor: "rgba(108, 156, 212, 0.12)" }} />
                 <Stack spacing={0.65}>
@@ -361,8 +366,8 @@ export function WorkspaceHub({
                   <Button size="small" variant="outlined" onClick={() => onNavigateToView("library")} sx={{ textTransform: "none" }}>
                     Library
                   </Button>
-                  <Button size="small" variant="text" onClick={() => onNavigateToView("inbox")} sx={{ textTransform: "none" }}>
-                    Inbox
+                  <Button size="small" variant="text" onClick={() => onNavigateToView("overview")} sx={{ textTransform: "none" }}>
+                    Mission Control
                   </Button>
                 </Stack>
               </Stack>
@@ -406,7 +411,12 @@ export function WorkspaceHub({
           </Stack>
           <Box sx={{ flex: 1, minHeight: 0 }}>
             {drawerView ? (
-              <NativeWorkspace view={drawerView} autoRefresh={autoRefresh} showAdvanced={showAdvanced} />
+              <NativeWorkspace
+                view={drawerView}
+                autoRefresh={autoRefresh}
+                showAdvanced={showAdvanced}
+                onNavigateToView={onNavigateToView}
+              />
             ) : null}
           </Box>
         </Box>

@@ -91,8 +91,9 @@ export function WelcomeHero({
 
   return (
     <Card
-      className="welcome-hero-card"
+      className="welcome-hero-card mission-panel mission-panel--hero"
       sx={{
+        height: "100%",
         borderRadius: 4,
         border: "1px solid rgba(108, 156, 212, 0.18)",
         background:
@@ -102,120 +103,134 @@ export function WelcomeHero({
         overflow: "hidden",
       }}
     >
-      <CardContent sx={{ p: { xs: 1.35, md: 1.55 }, position: "relative" }}>
-        <Stack spacing={1.15} sx={{ position: "relative", zIndex: 1 }}>
-          <Stack
-            direction={{ xs: "column", md: "row" }}
-            spacing={1.2}
-            justifyContent="space-between"
-            alignItems={{ xs: "flex-start", md: "flex-start" }}
-          >
-            <Stack spacing={0.95} sx={{ minWidth: 0, flex: 1 }}>
-              <Stack direction="row" spacing={1} alignItems="center" sx={{ minWidth: 0 }}>
-                <Box
-                  component="img"
-                  src="/logo.svg"
-                  alt="AgentArk"
-                  sx={{
-                    width: { xs: 40, md: 46 },
-                    height: { xs: 40, md: 46 },
-                    flexShrink: 0,
-                    filter: "drop-shadow(0 0 14px rgba(47, 212, 255, 0.22))"
-                  }}
-                />
-                <Box sx={{ minWidth: 0 }}>
-                  <Typography
-                    variant="overline"
-                    sx={{ color: "rgba(142, 191, 234, 0.74)", letterSpacing: "0.12em", display: "block" }}
-                  >
-                    Mission Control
-                  </Typography>
-                  <Typography variant="h5" sx={{ fontWeight: 700, lineHeight: 1.1, letterSpacing: "-0.03em" }}>
-                    Direct the agent from outcomes, not menus.
-                  </Typography>
-                </Box>
+      <CardContent sx={{ p: { xs: 1.35, md: 1.55 }, position: "relative", height: "100%" }}>
+        <Stack spacing={1.15} className="mission-panel-content" sx={{ position: "relative", zIndex: 1 }}>
+          <Stack spacing={1.15} className="mission-panel-section">
+            <Stack
+              direction={{ xs: "column", md: "row" }}
+              spacing={1.2}
+              justifyContent="space-between"
+              alignItems={{ xs: "flex-start", md: "flex-start" }}
+            >
+              <Stack spacing={0.95} sx={{ minWidth: 0, flex: 1 }}>
+                <Stack direction="row" spacing={1} alignItems="center" sx={{ minWidth: 0 }}>
+                  <Box
+                    component="img"
+                    src="/logo.svg"
+                    alt="AgentArk"
+                    sx={{
+                      width: { xs: 40, md: 46 },
+                      height: { xs: 40, md: 46 },
+                      flexShrink: 0,
+                      filter: "drop-shadow(0 0 14px rgba(47, 212, 255, 0.22))",
+                    }}
+                  />
+                  <Box sx={{ minWidth: 0 }}>
+                    <Typography
+                      variant="overline"
+                      sx={{ color: "rgba(142, 191, 234, 0.74)", letterSpacing: "0.12em", display: "block" }}
+                    >
+                      Mission Control
+                    </Typography>
+                    <Typography variant="h5" sx={{ fontWeight: 700, lineHeight: 1.1, letterSpacing: "-0.03em" }}>
+                      Direct the agent from outcomes, not menus.
+                    </Typography>
+                  </Box>
+                </Stack>
+                <Typography variant="body2" color="text.secondary" className="mission-card-copy">
+                  This surface should tell you what matters, what the system is doing, and what high-confidence move to make next without drowning you in dashboard chrome.
+                </Typography>
               </Stack>
-              <Typography variant="body2" color="text.secondary" sx={{ maxWidth: 720 }}>
-                This surface should tell you what matters, what the system is doing, and what high-confidence move to make next without drowning you in dashboard chrome.
-              </Typography>
+
+              <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                <Chip size="small" color={agentPaused ? "warning" : "success"} label={agentPaused ? "Autonomy Paused" : "Autonomy Active"} />
+                <Chip size="small" label="Outcome-first" />
+                <Chip size="small" label="Operator cockpit" />
+              </Stack>
             </Stack>
 
-            <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
-              <Chip size="small" color={agentPaused ? "warning" : "success"} label={agentPaused ? "Autonomy Paused" : "Autonomy Active"} />
-              <Chip size="small" label="Outcome-first" />
-              <Chip size="small" label="Operator cockpit" />
-            </Stack>
-          </Stack>
-
-          <Box
-            sx={{
-              borderRadius: 3,
-              border: "1px solid rgba(108, 156, 212, 0.18)",
-              background: "rgba(7, 18, 32, 0.58)",
-              px: 1.15,
-              py: 0.95,
-            }}
-          >
-            <Typography
-              variant="caption"
-              sx={{ color: "rgba(137, 213, 255, 0.8)", letterSpacing: "0.08em", textTransform: "uppercase" }}
-            >
-              Active Objective
-            </Typography>
-            <Typography variant="body2" sx={{ mt: 0.35, color: "rgba(225, 239, 255, 0.96)", fontWeight: 600 }}>
-              {activeObjective}
-            </Typography>
-          </Box>
-
-          <Box
-            sx={{
-              borderRadius: 999,
-              border: "1px solid rgba(108, 156, 212, 0.22)",
-              background: "rgba(8, 19, 34, 0.58)",
-              px: 1.05,
-              py: 0.65,
-              display: "inline-flex",
-              alignItems: "center",
-              maxWidth: "100%",
-              minWidth: 0,
-              overflow: "hidden",
-            }}
-          >
-            <Typography
-              variant="caption"
-              sx={{ color: "rgba(137, 213, 255, 0.8)", letterSpacing: "0.08em", textTransform: "uppercase", mr: 0.75, flexShrink: 0 }}
-            >
-              Suggested directive
-            </Typography>
             <Box
-              component="span"
               sx={{
+                borderRadius: 3,
+                border: "1px solid rgba(108, 156, 212, 0.18)",
+                background: "rgba(7, 18, 32, 0.58)",
+                px: 1.15,
+                py: 0.95,
+              }}
+            >
+              <Typography
+                variant="caption"
+                sx={{ color: "rgba(137, 213, 255, 0.8)", letterSpacing: "0.08em", textTransform: "uppercase" }}
+              >
+                Active Objective
+              </Typography>
+              <Typography variant="body2" sx={{ mt: 0.35, color: "rgba(225, 239, 255, 0.96)", fontWeight: 600 }}>
+                {activeObjective}
+              </Typography>
+            </Box>
+
+            <Box
+              sx={{
+                borderRadius: 3,
+                border: "1px solid rgba(108, 156, 212, 0.22)",
+                background: "rgba(8, 19, 34, 0.58)",
+                px: 1.05,
+                py: 0.85,
+                display: "flex",
+                alignItems: "flex-start",
+                gap: 0.75,
+                maxWidth: "100%",
                 minWidth: 0,
                 overflow: "hidden",
-                textOverflow: "ellipsis",
-                whiteSpace: "nowrap",
-                color: "rgba(196, 230, 255, 0.96)",
-                fontSize: "0.88rem",
               }}
             >
-              “{typedPrompt || heroPrompts[0]}”
+              <Typography
+                variant="caption"
+                sx={{ color: "rgba(137, 213, 255, 0.8)", letterSpacing: "0.08em", textTransform: "uppercase", flexShrink: 0, pt: 0.15 }}
+              >
+                Suggested directive
+              </Typography>
+              <Box
+                sx={{
+                  display: "flex",
+                  alignItems: "flex-start",
+                  gap: 0.15,
+                  minWidth: 0,
+                  flex: 1,
+                  color: "rgba(196, 230, 255, 0.96)",
+                  fontSize: "0.88rem",
+                }}
+              >
+                <Box
+                  component="span"
+                  sx={{
+                    minWidth: 0,
+                    display: "-webkit-box",
+                    WebkitBoxOrient: "vertical",
+                    WebkitLineClamp: 2,
+                    overflow: "hidden",
+                    wordBreak: "break-word",
+                  }}
+                >
+                  "{typedPrompt || heroPrompts[0]}"
+                </Box>
+                <Box
+                  component="span"
+                  sx={{
+                    display: "inline-block",
+                    width: "0.7ch",
+                    flex: "0 0 auto",
+                    opacity: 0.9,
+                    animation: "welcomeHeroCursorBlink 1s steps(1, end) infinite",
+                  }}
+                >
+                  |
+                </Box>
+              </Box>
             </Box>
-            <Box
-              component="span"
-              sx={{
-                display: "inline-block",
-                width: "0.7ch",
-                flex: "0 0 auto",
-                ml: 0.15,
-                opacity: 0.9,
-                animation: "welcomeHeroCursorBlink 1s steps(1, end) infinite"
-              }}
-            >
-              |
-            </Box>
-          </Box>
+          </Stack>
 
-          <Stack direction={{ xs: "column", sm: "row" }} spacing={0.85} sx={{ width: { xs: "100%", sm: "auto" } }}>
+          <Stack direction={{ xs: "column", sm: "row" }} spacing={0.85} className="mission-panel-footer" sx={{ width: { xs: "100%", sm: "auto" } }}>
             {onGoChat ? (
               <Button
                 size="medium"
@@ -250,7 +265,7 @@ export function WelcomeHero({
             {onTogglePause ? (
               <Button
                 size="medium"
-                variant="text"
+                variant="outlined"
                 startIcon={agentPaused ? <PlayCircleOutlineRoundedIcon /> : <PauseCircleOutlineRoundedIcon />}
                 onClick={onTogglePause}
                 disabled={pauseLoading}

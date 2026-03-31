@@ -18,15 +18,15 @@ function Sparkline({ values }: { values: number[] }) {
   const min = Math.min(...values);
   const max = Math.max(...values);
   const range = Math.max(1e-9, max - min);
-  const w = 120;
-  const h = 28;
-  const xs = values.map((_, i) => (w * i) / (values.length - 1));
-  const ys = values.map((v) => 2 + (h - 4) * (1 - (v - min) / range));
-  const line = xs.map((x, i) => `${x.toFixed(1)},${ys[i].toFixed(1)}`).join(" ");
-  const area = `0,${h} ${line} ${w},${h}`;
+  const width = 120;
+  const height = 28;
+  const xs = values.map((_, index) => (width * index) / (values.length - 1));
+  const ys = values.map((value) => 2 + (height - 4) * (1 - (value - min) / range));
+  const line = xs.map((x, index) => `${x.toFixed(1)},${ys[index].toFixed(1)}`).join(" ");
+  const area = `0,${height} ${line} ${width},${height}`;
 
   return (
-    <svg width="100%" height={h} viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" aria-hidden>
+    <svg width="100%" height={height} viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" aria-hidden>
       <polygon points={area} fill="rgba(20, 241, 149, 0.15)" />
       <polyline
         points={line}
@@ -72,74 +72,48 @@ export function TodaysHighlights({ tasks, traces }: Props) {
   const { completedToday, completedList, nextScheduled, trendPct, weekCounts, todayTraceCount } = useMemo(() => {
     const now = new Date();
     const todayStr = now.toISOString().slice(0, 10);
-
-    // Completed tasks (best effort: check status and created_at)
     const allTasks = Array.isArray(tasks) ? tasks : [];
-    const todayCompleted = allTasks.filter((t) => {
-      const s = String(t?.status || "").toLowerCase();
-      return (s.includes("completed") || s.includes("done")) && (t.created_at ? t.created_at.startsWith(todayStr) : false);
+    const todayCompleted = allTasks.filter((task) => {
+      const status = String(task?.status || "").toLowerCase();
+      return (status.includes("completed") || status.includes("done")) && (task.created_at ? task.created_at.startsWith(todayStr) : false);
     });
-    const list = todayCompleted.slice(0, 3);
-
-    // Next scheduled
-    const pending = allTasks.filter((t) => {
-      const s = String(t?.status || "").toLowerCase();
-      return s.includes("pending") && t.cron;
+    const pending = allTasks.filter((task) => {
+      const status = String(task?.status || "").toLowerCase();
+      return status.includes("pending") && task.cron;
     });
-    const next = pending.length > 0 ? pending[0] : null;
-
-    // Weekly trend from traces
     const allTraces = Array.isArray(traces) ? traces : [];
     const dayMs = 86_400_000;
     const counts: number[] = [];
-    for (let d = 6; d >= 0; d--) {
-      const dayStart = new Date(now.getTime() - d * dayMs).toISOString().slice(0, 10);
-      counts.push(allTraces.filter((tr) => (tr.started_at || "").startsWith(dayStart)).length);
+    for (let dayOffset = 6; dayOffset >= 0; dayOffset -= 1) {
+      const dayStart = new Date(now.getTime() - dayOffset * dayMs).toISOString().slice(0, 10);
+      counts.push(allTraces.filter((trace) => (trace.started_at || "").startsWith(dayStart)).length);
     }
-    const recentAvg = counts.slice(0, 6).reduce((a, b) => a + b, 0) / Math.max(1, 6);
+    const recentAvg = counts.slice(0, 6).reduce((sum, value) => sum + value, 0) / Math.max(1, 6);
     const todayCount = counts[counts.length - 1] || 0;
     const pct = recentAvg > 0 ? Math.round(((todayCount - recentAvg) / recentAvg) * 100) : 0;
 
     return {
       completedToday: todayCompleted.length,
-      completedList: list,
-      nextScheduled: next,
+      completedList: todayCompleted.slice(0, 3),
+      nextScheduled: pending.length > 0 ? pending[0] : null,
       trendPct: pct,
       weekCounts: counts,
       todayTraceCount: todayCount,
     };
   }, [tasks, traces]);
 
-  const timeSavedMin = completedToday * 10; // heuristic: ~10min per automated task
+  const timeSavedMin = completedToday * 10;
   const todayAnalytics = todayAnalyticsQ.data as LlmAnalyticsResponse | undefined;
   const analytics30d = analytics30dQ.data as LlmAnalyticsResponse | undefined;
   const todayUsageRows = [
-    {
-      label: "Today spend",
-      value: formatSpend(todayAnalytics?.totals?.cost_usd ?? null),
-    },
-    {
-      label: "Today requests",
-      value: formatCompact(todayAnalytics?.totals?.request_count ?? 0),
-    },
-    {
-      label: "Today tokens",
-      value: formatCompact(todayAnalytics?.totals?.total_tokens ?? 0),
-    },
+    { label: "Today spend", value: formatSpend(todayAnalytics?.totals?.cost_usd ?? null) },
+    { label: "Today requests", value: formatCompact(todayAnalytics?.totals?.request_count ?? 0) },
+    { label: "Today tokens", value: formatCompact(todayAnalytics?.totals?.total_tokens ?? 0) },
   ];
   const fallbackRows = [
-    {
-      label: "Last 30 days spend",
-      value: formatSpend(analytics30d?.totals?.cost_usd ?? null),
-    },
-    {
-      label: "Last 30 days requests",
-      value: formatCompact(analytics30d?.totals?.request_count ?? 0),
-    },
-    {
-      label: "Last 30 days tokens",
-      value: formatCompact(analytics30d?.totals?.total_tokens ?? 0),
-    },
+    { label: "Last 30 days spend", value: formatSpend(analytics30d?.totals?.cost_usd ?? null) },
+    { label: "Last 30 days requests", value: formatCompact(analytics30d?.totals?.request_count ?? 0) },
+    { label: "Last 30 days tokens", value: formatCompact(analytics30d?.totals?.total_tokens ?? 0) },
   ];
   const todayUsagePresent =
     (todayAnalytics?.totals?.request_count ?? 0) > 0 ||
@@ -149,14 +123,8 @@ export function TodaysHighlights({ tasks, traces }: Props) {
   const summaryCards = noTodayData
     ? fallbackRows
     : [
-        {
-          label: "Completed",
-          value: formatCompact(completedToday),
-        },
-        {
-          label: "Live runs",
-          value: formatCompact(todayTraceCount),
-        },
+        { label: "Completed", value: formatCompact(completedToday) },
+        { label: "Live runs", value: formatCompact(todayTraceCount) },
         {
           label: todayUsagePresent ? "Today spend" : "Requests",
           value: todayUsagePresent
@@ -166,15 +134,15 @@ export function TodaysHighlights({ tasks, traces }: Props) {
       ];
 
   return (
-    <Card sx={{ height: "100%" }}>
-      <CardContent sx={{ p: 1.55 }}>
-        <Stack spacing={1.15}>
+    <Card className="mission-panel mission-panel--lower">
+      <CardContent sx={{ p: 1.55, height: "100%", display: "flex", flexDirection: "column" }}>
+        <Stack spacing={1.15} className="mission-panel-content">
           <Box>
             <Typography variant="h6" sx={{ fontWeight: 700 }}>
               Operational Summary
             </Typography>
             <Typography variant="body2" color="text.secondary">
-              Compact view of today’s completion pace, runtime activity, and usage footprint.
+              Compact view of today's completion pace, runtime activity, and usage footprint.
             </Typography>
           </Box>
 
@@ -199,7 +167,8 @@ export function TodaysHighlights({ tasks, traces }: Props) {
                     fontWeight={700}
                     sx={{ color: trendPct > 0 ? "#14f195" : "#ff9800" }}
                   >
-                    {trendPct > 0 ? "+" : ""}{trendPct}% vs avg
+                    {trendPct > 0 ? "+" : ""}
+                    {trendPct}% vs avg
                   </Typography>
                 </Stack>
               ) : null}
@@ -209,7 +178,7 @@ export function TodaysHighlights({ tasks, traces }: Props) {
           <Box
             sx={{
               display: "grid",
-              gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+              gridTemplateColumns: { xs: "repeat(2, minmax(0, 1fr))", sm: "repeat(3, minmax(0, 1fr))" },
               gap: 1,
             }}
           >
@@ -236,20 +205,22 @@ export function TodaysHighlights({ tasks, traces }: Props) {
           </Box>
 
           {completedList.length > 0 ? (
-            <Stack spacing={0.55}>
-              {completedList.map((t, idx) => (
-                <Stack key={t.id || idx} direction="row" spacing={0.75} alignItems="center">
+            <Stack spacing={0.55} className="mission-panel-section">
+              {completedList.map((task, index) => (
+                <Stack key={task.id || index} direction="row" spacing={0.75} alignItems="center">
                   <CheckCircleRoundedIcon sx={{ fontSize: 14, color: "#14f195", flexShrink: 0 }} />
-                  <Typography variant="body2" noWrap title={String(t.description || "")}>
-                    {String(t.description || "Task completed")}
+                  <Typography variant="body2" noWrap sx={{ minWidth: 0 }} title={String(task.description || "")}>
+                    {String(task.description || "Task completed")}
                   </Typography>
                 </Stack>
               ))}
             </Stack>
           ) : (
-            <Typography variant="body2" color="text.secondary">
-              No completed tasks have landed yet today.
-            </Typography>
+            <Box className="mission-empty-copy" sx={{ justifyContent: "flex-start", py: 0.35 }}>
+              <Typography variant="body2" color="text.secondary">
+                No completed tasks have landed yet today.
+              </Typography>
+            </Box>
           )}
 
           {todayUsagePresent ? (
@@ -271,15 +242,15 @@ export function TodaysHighlights({ tasks, traces }: Props) {
             </Stack>
           ) : null}
 
-          <Box sx={{ opacity: 0.9 }}>
+          <Box className="mission-sparkline-shell" sx={{ opacity: 0.9 }}>
             <Sparkline values={weekCounts} />
           </Box>
 
-          {timeSavedMin > 0 ? (
-            <Typography variant="caption" color="text.secondary" display="block">
-              Estimated operator time reclaimed today: ~{timeSavedMin} min
-            </Typography>
-          ) : null}
+          <Typography variant="caption" color="text.secondary" display="block">
+            {timeSavedMin > 0
+              ? `Estimated operator time reclaimed today: ~${timeSavedMin} min`
+              : "Time reclaimed will appear here as automated work completes."}
+          </Typography>
         </Stack>
       </CardContent>
     </Card>
