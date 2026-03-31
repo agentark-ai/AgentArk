@@ -181,6 +181,10 @@ static SPECS: &[IntegrationConnectSpec] = &[
     },
 ];
 
+pub fn all_specs() -> &'static [IntegrationConnectSpec] {
+    SPECS
+}
+
 pub fn spec_by_id(id: &str) -> Option<&'static IntegrationConnectSpec> {
     SPECS.iter().find(|s| s.id == id)
 }

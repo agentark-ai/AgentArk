@@ -57,7 +57,7 @@ import SettingsRoundedIcon from "@mui/icons-material/SettingsRounded";
 import SmartToyRoundedIcon from "@mui/icons-material/SmartToyRounded";
 import PersonRoundedIcon from "@mui/icons-material/PersonRounded";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent, type MouseEvent, type ReactNode } from "react";
+import { Fragment, isValidElement, useEffect, useLayoutEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent, type MouseEvent, type ReactNode } from "react";
 import ReactECharts from "echarts-for-react";
 import { api } from "../api/client";
 import AgentLogo from "../assets/logo.svg";
@@ -159,6 +159,23 @@ type ChatExecutionMode = "auto" | "chat" | "task";
 type WorkspaceFileEntry = {
   name: string;
   content: string;
+};
+
+type WorkspaceSnippetEntry = {
+  id: string;
+  name: string;
+  displayName: string;
+  content: string;
+  languageHint: string;
+  sourceMessageId: string;
+  sourceLabel: string;
+};
+
+type CodePreviewOpenRequest = {
+  snippetId?: string;
+  fileName?: string;
+  code?: string;
+  languageHint?: string;
 };
 
 const MODEL_FALLBACKS_BY_PROVIDER: Record<string, string[]> = {
@@ -467,6 +484,242 @@ function renderCodeBlockLines(
       </span>
     );
   });
+}
+
+const CODE_PREVIEW_LANGUAGE_LABELS: Record<string, string> = {
+  bash: "Bash",
+  c: "C",
+  cpp: "C++",
+  csharp: "C#",
+  css: "CSS",
+  go: "Go",
+  html: "HTML",
+  java: "Java",
+  javascript: "JavaScript",
+  json: "JSON",
+  jsx: "JSX",
+  kotlin: "Kotlin",
+  less: "Less",
+  markdown: "Markdown",
+  php: "PHP",
+  powershell: "PowerShell",
+  python: "Python",
+  ruby: "Ruby",
+  rust: "Rust",
+  scss: "SCSS",
+  sql: "SQL",
+  toml: "TOML",
+  tsx: "TSX",
+  typescript: "TypeScript",
+  xml: "XML",
+  yaml: "YAML"
+};
+
+function normalizeCodeFenceLanguage(raw = ""): string {
+  const normalized = raw.trim().replace(/^language-/i, "").toLowerCase();
+  if (!normalized) return "";
+  const aliases: Record<string, string> = {
+    cjs: "javascript",
+    env: "toml",
+    htm: "html",
+    js: "javascript",
+    md: "markdown",
+    ps1: "powershell",
+    py: "python",
+    rs: "rust",
+    sh: "bash",
+    shell: "bash",
+    ts: "typescript",
+    yml: "yaml",
+    zsh: "bash",
+  };
+  return aliases[normalized] || normalized;
+}
+
+function inferCodePreviewFileName(languageHint = "", code = ""): string {
+  const normalized = normalizeCodeFenceLanguage(languageHint);
+  switch (normalized) {
+    case "html":
+    case "xml":
+      return "index.html";
+    case "css":
+      return "styles.css";
+    case "scss":
+      return "styles.scss";
+    case "less":
+      return "styles.less";
+    case "json":
+      return "data.json";
+    case "python":
+      return "main.py";
+    case "sql":
+      return "query.sql";
+    case "bash":
+      return "script.sh";
+    case "powershell":
+      return "script.ps1";
+    case "markdown":
+      return "README.md";
+    case "yaml":
+      return "config.yml";
+    case "toml":
+      return "config.toml";
+    case "typescript":
+      return "main.ts";
+    case "tsx":
+      return "App.tsx";
+    case "javascript":
+      return "main.js";
+    case "jsx":
+      return "App.jsx";
+    case "go":
+      return "main.go";
+    case "java":
+      return "Main.java";
+    case "kotlin":
+      return "Main.kt";
+    case "php":
+      return "index.php";
+    case "ruby":
+      return "main.rb";
+    case "rust":
+      return "main.rs";
+    case "c":
+      return "main.c";
+    case "cpp":
+      return "main.cpp";
+    case "csharp":
+      return "Program.cs";
+    default:
+      break;
+  }
+
+  switch (guessCodeLanguage("", code)) {
+    case "markup":
+      return "index.html";
+    case "css":
+      return "styles.css";
+    case "json":
+      return "data.json";
+    case "python":
+      return "main.py";
+    case "sql":
+      return "query.sql";
+    case "shell":
+      return "script.sh";
+    case "markdown":
+      return "README.md";
+    case "config":
+      return "config.toml";
+    case "script":
+      return "main.ts";
+    default:
+      return "snippet.txt";
+  }
+}
+
+function formatCodePreviewLanguage(languageHint = "", fileName = "", code = ""): string {
+  const normalized = normalizeCodeFenceLanguage(languageHint);
+  if (normalized) return CODE_PREVIEW_LANGUAGE_LABELS[normalized] || normalized.toUpperCase();
+
+  switch (guessCodeLanguage(fileName, code)) {
+    case "markup":
+      return "HTML";
+    case "css":
+      return "CSS";
+    case "json":
+      return "JSON";
+    case "python":
+      return "Python";
+    case "sql":
+      return "SQL";
+    case "shell":
+      return "Shell";
+    case "markdown":
+      return "Markdown";
+    case "config":
+      return "Config";
+    case "script":
+      return "Code";
+    default:
+      return "Text";
+  }
+}
+
+function reactNodeToPlainText(node: ReactNode): string {
+  if (node == null || typeof node === "boolean") return "";
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map((child) => reactNodeToPlainText(child)).join("");
+  return "";
+}
+
+function extractMarkdownCodeBlock(children: ReactNode): { className?: string; code: string } | null {
+  const nodes = Array.isArray(children) ? children : [children];
+  for (const node of nodes) {
+    if (!isValidElement<{ className?: string; children?: ReactNode }>(node)) continue;
+    const code = reactNodeToPlainText(node.props.children).replace(/\r\n/g, "\n").replace(/\n$/, "");
+    if (!code) continue;
+    return {
+      className: str(node.props.className, ""),
+      code,
+    };
+  }
+  return null;
+}
+
+function InlineCodePreview({
+  code,
+  languageHint,
+  fileName,
+  snippetId,
+  onOpenInWorkspace,
+}: {
+  code: string;
+  languageHint?: string;
+  fileName?: string;
+  snippetId?: string;
+  onOpenInWorkspace?: (request: CodePreviewOpenRequest) => void;
+}) {
+  const normalizedCode = (code || "").replace(/\r\n/g, "\n").replace(/\n$/, "");
+  if (!normalizedCode) return null;
+
+  const resolvedFileName = fileName || inferCodePreviewFileName(languageHint, normalizedCode);
+  const languageLabel = formatCodePreviewLanguage(languageHint, resolvedFileName, normalizedCode);
+
+  return (
+    <Box className="chat-md-ide">
+      <Box className="chat-md-ide-bar">
+        <Box className="chat-md-ide-controls" aria-hidden="true">
+          <span className="chat-md-ide-dot chat-md-ide-dot-close" />
+          <span className="chat-md-ide-dot chat-md-ide-dot-minimize" />
+          <span className="chat-md-ide-dot chat-md-ide-dot-expand" />
+        </Box>
+        <span className="chat-md-ide-tab" title={resolvedFileName}>
+          {resolvedFileName}
+        </span>
+        <span className="chat-md-ide-meta">{languageLabel}</span>
+        {onOpenInWorkspace ? (
+          <button
+            type="button"
+            className="chat-md-ide-open"
+            onClick={() =>
+              onOpenInWorkspace({
+                snippetId,
+                fileName: resolvedFileName,
+                code: normalizedCode,
+                languageHint
+              })
+            }
+          >
+            Open in workspace
+          </button>
+        ) : null}
+      </Box>
+      <pre className="code-viewer-pre chat-md-ide-pre">
+        <code>{renderCodeBlockLines(normalizedCode, { fileName: resolvedFileName })}</code>
+      </pre>
+    </Box>
+  );
 }
 
 function canonicalizeLiveFileWrites(
@@ -1925,7 +2178,15 @@ function ensureMarkdownLoaded(): Promise<void> {
 // Eagerly start loading
 ensureMarkdownLoaded();
 
-function MarkdownBody({ text }: { text: string }) {
+function MarkdownBody({
+  text,
+  snippetNamespace,
+  onOpenSnippet,
+}: {
+  text: string;
+  snippetNamespace?: string;
+  onOpenSnippet?: (request: CodePreviewOpenRequest) => void;
+}) {
   const [ready, setReady] = useState(_mdReady);
   useEffect(() => { if (!ready) ensureMarkdownLoaded().then(() => setReady(true)); }, [ready]);
 
@@ -1934,6 +2195,7 @@ function MarkdownBody({ text }: { text: string }) {
   }
 
   const Md = _ReactMarkdown;
+  let blockIndex = 0;
   return (
     <Md
       remarkPlugins={_remarkGfm ? [_remarkGfm as never] : []}
@@ -1944,17 +2206,25 @@ function MarkdownBody({ text }: { text: string }) {
         h4: ({ children }: { children?: React.ReactNode }) => <Typography className="chat-md-heading chat-md-h4">{children}</Typography>,
         p: ({ children }: { children?: React.ReactNode }) => <Typography variant="body2" className="chat-md-paragraph">{children}</Typography>,
         a: ({ href, children }: { href?: string; children?: React.ReactNode }) => <a className="chat-md-link" href={href} target="_blank" rel="noopener noreferrer">{children}</a>,
-        code: ({ className, children }: { className?: string; children?: React.ReactNode }) => {
-          const isBlock = className?.startsWith("language-");
-          if (!isBlock) return <code className="chat-md-inline-code">{children}</code>;
-          const lang = className?.replace("language-", "") || "";
+        pre: ({ children }: { children?: React.ReactNode }) => {
+          const extracted = extractMarkdownCodeBlock(children);
+          if (!extracted) {
+            return <pre className="chat-md-code">{reactNodeToPlainText(children)}</pre>;
+          }
+          const snippetIndex = blockIndex++;
+          const fileName = inferCodePreviewFileName(extracted.className, extracted.code);
+          const snippetId = snippetNamespace ? `${snippetNamespace}::snippet::${snippetIndex}` : undefined;
           return (
-            <Box className="chat-md-code-wrap">
-              {lang ? <div className="chat-md-code-lang">{lang}</div> : null}
-              <pre className="chat-md-code"><code>{children}</code></pre>
-            </Box>
+            <InlineCodePreview
+              code={extracted.code}
+              languageHint={extracted.className}
+              fileName={fileName}
+              snippetId={snippetId}
+              onOpenInWorkspace={onOpenSnippet}
+            />
           );
         },
+        code: ({ children }: { children?: React.ReactNode }) => <code className="chat-md-inline-code">{children}</code>,
         ul: ({ children }: { children?: React.ReactNode }) => <Box component="ul" className="chat-md-list">{children}</Box>,
         ol: ({ children }: { children?: React.ReactNode }) => <Box component="ol" className="chat-md-list">{children}</Box>,
         table: ({ children }: { children?: React.ReactNode }) => (
@@ -1975,21 +2245,73 @@ function MarkdownBody({ text }: { text: string }) {
   );
 }
 
-function renderChatMarkdown(text: string): ReactNode {
-  if (!text?.trim()) return null;
-  return (
-    <Box className="chat-markdown">
-      <MarkdownBody text={text} />
-    </Box>
-  );
+function extractCodeFences(text: string): Array<{ languageHint: string; code: string }> {
+  const source = (text || "").trim();
+  if (!source) return [];
+  const out: Array<{ languageHint: string; code: string }> = [];
+  const regex = /```([^\n`]*)\n([\s\S]*?)```/g;
+  let match: RegExpExecArray | null = null;
+  while ((match = regex.exec(source)) !== null) {
+    const code = str(match[2], "").replace(/\r\n/g, "\n").replace(/\n$/, "");
+    if (!code.trim()) continue;
+    out.push({
+      languageHint: str(match[1], "").trim(),
+      code
+    });
+  }
+  return out;
 }
 
 function extractFirstCodeFence(text: string): string {
-  const source = (text || "").trim();
-  if (!source) return "";
-  const match = source.match(/```[a-zA-Z0-9_+-]*\n([\s\S]*?)```/);
-  if (match && match[1]) return match[1].trim();
-  return "";
+  const first = extractCodeFences(text)[0];
+  return first?.code.trim() || "";
+}
+
+function buildWorkspaceSnippetFiles(messages: unknown[]): WorkspaceSnippetEntry[] {
+  const out: WorkspaceSnippetEntry[] = [];
+  let replyIndex = 0;
+  let globalSnippetIndex = 0;
+  messages.forEach((message, idx) => {
+    const record = asRecord(message);
+    if (str(record.role, "").toLowerCase() !== "assistant") return;
+    const messageId = str(record.id, String(idx));
+    const snippets = extractCodeFences(str(record.content, ""));
+    if (snippets.length === 0) return;
+    replyIndex += 1;
+    snippets.forEach((snippet, snippetIndex) => {
+      globalSnippetIndex += 1;
+      const displayName = inferCodePreviewFileName(snippet.languageHint, snippet.code);
+      out.push({
+        id: `${messageId}::snippet::${snippetIndex}`,
+        name: `snippet-${globalSnippetIndex}-${displayName}`,
+        displayName,
+        content: snippet.code,
+        languageHint: normalizeCodeFenceLanguage(snippet.languageHint),
+        sourceMessageId: messageId,
+        sourceLabel: snippets.length > 1 ? `Reply ${replyIndex} · block ${snippetIndex + 1}` : `Reply ${replyIndex}`
+      });
+    });
+  });
+  return out;
+}
+
+function renderChatMarkdown(
+  text: string,
+  options?: {
+    snippetNamespace?: string;
+    onOpenSnippet?: (request: CodePreviewOpenRequest) => void;
+  }
+): ReactNode {
+  if (!text?.trim()) return null;
+  return (
+    <Box className="chat-markdown">
+      <MarkdownBody
+        text={text}
+        snippetNamespace={options?.snippetNamespace}
+        onOpenSnippet={options?.onOpenSnippet}
+      />
+    </Box>
+  );
 }
 
 const CHAT_ATTACHMENT_EXTENSIONS = new Set([
@@ -4181,10 +4503,10 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     useState<Record<string, { messages: string[]; beforeMessageId: string }>>({});
   const [streamTraceOpen, setStreamTraceOpen] = useState(false);
   const [workspaceOpen, setWorkspaceOpen] = useState(
-    () => typeof window !== "undefined" && window.innerWidth >= 1280
+    () => typeof window !== "undefined" && window.innerWidth >= 1360
   );
   const [conversationSidebarOpen, setConversationSidebarOpen] = useState(
-    () => typeof window !== "undefined" && window.innerWidth >= 1480
+    () => typeof window !== "undefined" && window.innerWidth >= 1520
   );
   const [conversationPage, setConversationPage] = useState(0);
   const [activityAutoFollow, setActivityAutoFollow] = useState(true);
@@ -4199,6 +4521,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
   const [streamPhaseStatus, setStreamPhaseStatus] = useState<StreamPhaseStatus | null>(null);
   const [codeViewerOpen, setCodeViewerOpen] = useState(false);
   const [codeViewerFileIdx, setCodeViewerFileIdx] = useState(0);
+  const [selectedSnippetId, setSelectedSnippetId] = useState<string | null>(null);
   const [previewDialogOpen, setPreviewDialogOpen] = useState(false);
   const [messageTraceOpen, setMessageTraceOpen] = useState<Record<string, boolean>>({});
   const [traceStepsById, setTraceStepsById] = useState<Record<string, JsonRecord[]>>({});
@@ -5139,6 +5462,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     setCompletedProgressMessagesByConversation({});
     setLiveFileWrites({});
     setDeployedFiles([]);
+    setSelectedSnippetId(null);
     setStreamPhaseStatus(null);
     setStreamedWorkspaceApp(null);
     streamedWorkspaceAppRef.current = null;
@@ -5167,6 +5491,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     setLastRunSteps([]);
     setLiveFileWrites({});
     setDeployedFiles([]);
+    setSelectedSnippetId(null);
     setStreamPhaseStatus(null);
     setStreamedWorkspaceApp(null);
     streamedWorkspaceAppRef.current = null;
@@ -6854,6 +7179,23 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     [...messages].reverse().find((m) => str(m.role, "").toLowerCase() === "assistant")?.content,
     ""
   );
+  const workspaceSnippetFiles = useMemo(
+    () => buildWorkspaceSnippetFiles(messages),
+    [messages]
+  );
+  useEffect(() => {
+    if (!selectedSnippetId) return;
+    if (workspaceSnippetFiles.some((snippet) => snippet.id === selectedSnippetId)) return;
+    setSelectedSnippetId(null);
+  }, [selectedSnippetId, workspaceSnippetFiles]);
+  const openCodePreviewInWorkspace = (request: CodePreviewOpenRequest) => {
+    setWorkspaceOpen(true);
+    if (request.snippetId) {
+      setSelectedSnippetId(request.snippetId);
+      return;
+    }
+    setSelectedSnippetId(null);
+  };
   const latestAssistantTraceSteps = latestAssistantTraceId
       ? traceStepsById[latestAssistantTraceId] || []
       : [];
@@ -6942,6 +7284,15 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     extractFirstCodeFence(streamingResponse) ||
     extractFirstCodeFence(latestAssistantMessageText);
   const activeCodeFile = deployedFiles[codeViewerFileIdx] ?? null;
+  const activeSnippetFile = useMemo(() => {
+    if (workspaceSnippetFiles.length === 0) return null;
+    if (selectedSnippetId) {
+      return workspaceSnippetFiles.find((snippet) => snippet.id === selectedSnippetId) || null;
+    }
+    return deployedFiles.length === 0
+      ? workspaceSnippetFiles[workspaceSnippetFiles.length - 1] || null
+      : null;
+  }, [workspaceSnippetFiles, selectedSnippetId, deployedFiles.length]);
   const activeLiveWrite = activeCodeFile ? liveFileWrites[activeCodeFile.name] : undefined;
   const activePhaseStatus = streamPhaseStatus;
   const resolvedActiveFileContent = choosePreferredWorkspaceFileContent(
@@ -6952,6 +7303,11 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     ? resolvedActiveFileContent ||
       `Preview unavailable for ${activeCodeFile.name} until file contents are captured.`
     : "";
+  const activeWorkspaceCodeEntry = activeSnippetFile ?? activeCodeFile;
+  const activeWorkspaceCodePath = activeSnippetFile?.displayName || activeCodeFile?.name || "";
+  const activeWorkspaceCodeContent = activeSnippetFile?.content || codeViewerContent;
+  const activeWorkspaceCodeSourceLabel = activeSnippetFile?.sourceLabel || "";
+  const isShowingSnippetPreview = Boolean(activeSnippetFile);
   const codeViewerWriteStatus = activeLiveWrite
     ? activeLiveWrite.totalLines > 0
       ? `${Math.min(activeLiveWrite.line, activeLiveWrite.totalLines)}/${activeLiveWrite.totalLines} lines written${activeLiveWrite.done ? " (done)" : ""}`
@@ -7187,10 +7543,13 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
   useEffect(() => {
     if (!activeLiveWriteName) return;
     const nextIndex = deployedFiles.findIndex((file) => file.name === activeLiveWriteName);
-    if (nextIndex >= 0 && nextIndex !== codeViewerFileIdx) {
-      setCodeViewerFileIdx(nextIndex);
+    if (nextIndex >= 0) {
+      if (selectedSnippetId) setSelectedSnippetId(null);
+      if (nextIndex !== codeViewerFileIdx) {
+        setCodeViewerFileIdx(nextIndex);
+      }
     }
-  }, [activeLiveWriteName, deployedFiles, codeViewerFileIdx]);
+  }, [activeLiveWriteName, deployedFiles, codeViewerFileIdx, selectedSnippetId]);
   const executionPlanCompletedCount = displayedExecutionPlan.filter((step) => step.status === "completed").length;
   const executionPlanActiveCount = displayedExecutionPlan.filter((step) => step.status === "running").length;
   const executionPlanFailedCount = displayedExecutionPlan.filter((step) => step.status === "failed").length;
@@ -7377,21 +7736,21 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
         gridTemplateColumns: {
           xs: "1fr",
           md: showConversationSidebar
-            ? "clamp(240px, 28vw, 294px) minmax(0,1fr)"
+            ? "clamp(220px, 25vw, 270px) minmax(0,1fr)"
             : "1fr",
           lg: showWorkspacePanel
             ? showConversationSidebar
-              ? "clamp(236px, 18vw, 276px) minmax(0,1fr) clamp(316px, 23vw, 360px)"
-              : "minmax(0,1fr) clamp(316px, 23vw, 360px)"
+              ? "clamp(214px, 16vw, 248px) minmax(0,1fr) clamp(286px, 21vw, 332px)"
+              : "minmax(0,1fr) clamp(286px, 21vw, 332px)"
             : showConversationSidebar
-              ? "clamp(236px, 18vw, 276px) minmax(0,1fr)"
+              ? "clamp(214px, 16vw, 248px) minmax(0,1fr)"
               : "minmax(0,1fr)",
           xl: showWorkspacePanel
             ? showConversationSidebar
-              ? "clamp(244px, 16vw, 288px) minmax(0,1fr) clamp(328px, 23vw, 372px)"
-              : "minmax(0,1fr) clamp(328px, 23vw, 372px)"
+              ? "clamp(220px, 15vw, 256px) minmax(0,1fr) clamp(300px, 20vw, 340px)"
+              : "minmax(0,1fr) clamp(300px, 20vw, 340px)"
             : showConversationSidebar
-              ? "clamp(244px, 16vw, 288px) minmax(0,1fr)"
+              ? "clamp(220px, 15vw, 256px) minmax(0,1fr)"
               : "minmax(0,1fr)"
         },
         gap: { xs: 1, md: 1.25 }
@@ -7404,7 +7763,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
             minHeight: 0,
             display: "flex",
             flexDirection: "column",
-            maxHeight: { xs: 280, lg: "none" }
+            maxHeight: { xs: 260, lg: "none" }
           }}
         >
           <Stack direction="row" justifyContent="space-between" alignItems="center" mb={1.25}>
@@ -7742,7 +8101,10 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                             {renderedContent}
                           </Typography>
                         ) : (
-                          renderChatMarkdown(renderedContent)
+                          renderChatMarkdown(renderedContent, {
+                            snippetNamespace: messageId,
+                            onOpenSnippet: openCodePreviewInWorkspace
+                          })
                         )}
                       </Box>
                       {isUser ? (
@@ -8291,7 +8653,10 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                         <Box
                           key={f.name}
                           className={`deployed-file-row${live && !live.done ? " is-live" : ""}${i === codeViewerFileIdx ? " is-selected" : ""}`}
-                          onClick={() => { setCodeViewerFileIdx(i); }}
+                          onClick={() => {
+                            setSelectedSnippetId(null);
+                            setCodeViewerFileIdx(i);
+                          }}
                         >
                           <span className="deployed-file-icon">&#128196;</span>
                           <span className="deployed-file-name">{f.name}</span>
@@ -8312,21 +8677,51 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
               </Accordion>
             ) : null}
 
-            {activeCodeFile ? (
+            {workspaceSnippetFiles.length > 0 ? (
+              <Accordion className="chat-workspace-section" disableGutters>
+                <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ minHeight: 34 }}>
+                  <Typography variant="subtitle2">Snippets ({workspaceSnippetFiles.length})</Typography>
+                </AccordionSummary>
+                <AccordionDetails sx={{ p: "4px 8px 8px" }}>
+                  <Stack spacing={0.5}>
+                    {workspaceSnippetFiles.map((snippet) => (
+                      <Box
+                        key={snippet.id}
+                        className={`deployed-file-row${activeSnippetFile?.id === snippet.id ? " is-selected" : ""}`}
+                        onClick={() => {
+                          setWorkspaceOpen(true);
+                          setSelectedSnippetId(snippet.id);
+                        }}
+                      >
+                        <span className="deployed-file-icon">&lt;/&gt;</span>
+                        <span className="deployed-file-name" title={snippet.displayName}>{snippet.displayName}</span>
+                        <span className="deployed-file-size">{snippet.sourceLabel}</span>
+                      </Box>
+                    ))}
+                  </Stack>
+                </AccordionDetails>
+              </Accordion>
+            ) : null}
+
+            {activeWorkspaceCodeEntry ? (
               <Accordion className="chat-workspace-section" disableGutters defaultExpanded>
                 <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ minHeight: 34 }}>
                   <Stack direction="row" spacing={1} alignItems="center" sx={{ width: "100%", minWidth: 0 }}>
-                    <Typography variant="subtitle2">Live code</Typography>
+                    <Typography variant="subtitle2">{isShowingSnippetPreview ? "Code preview" : "Live code"}</Typography>
                     <Typography
                       variant="caption"
                       className="chat-workspace-code-path"
                       noWrap
-                      title={activeCodeFile.name}
+                      title={activeWorkspaceCodePath}
                     >
-                      {activeCodeFile.name}
+                      {activeWorkspaceCodePath}
                     </Typography>
                     <Box sx={{ flex: 1 }} />
-                    {codeViewerWriteStatus ? (
+                    {isShowingSnippetPreview ? (
+                      <Typography variant="caption" color="text.secondary" noWrap title={activeWorkspaceCodeSourceLabel}>
+                        {activeWorkspaceCodeSourceLabel}
+                      </Typography>
+                    ) : codeViewerWriteStatus ? (
                       <Typography variant="caption" color="text.secondary" noWrap>
                         {codeViewerWriteStatus}
                       </Typography>
@@ -8345,13 +8740,30 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                   </Stack>
                 </AccordionSummary>
                 <AccordionDetails>
-                  {deployedFiles.length > 1 ? (
+                  {isShowingSnippetPreview ? (
+                    workspaceSnippetFiles.length > 1 ? (
+                      <Box className="code-file-tabs chat-workspace-file-tabs">
+                        {workspaceSnippetFiles.map((snippet) => (
+                          <button
+                            key={snippet.id}
+                            className={`code-file-tab${activeSnippetFile?.id === snippet.id ? " code-file-tab-active" : ""}`}
+                            onClick={() => setSelectedSnippetId(snippet.id)}
+                          >
+                            {snippet.displayName}
+                          </button>
+                        ))}
+                      </Box>
+                    ) : null
+                  ) : deployedFiles.length > 1 ? (
                     <Box className="code-file-tabs chat-workspace-file-tabs">
                       {deployedFiles.map((f, i) => (
                         <button
                           key={f.name}
                           className={`code-file-tab${i === codeViewerFileIdx ? " code-file-tab-active" : ""}`}
-                          onClick={() => setCodeViewerFileIdx(i)}
+                          onClick={() => {
+                            setSelectedSnippetId(null);
+                            setCodeViewerFileIdx(i);
+                          }}
                         >
                           {f.name}
                         </button>
@@ -8359,15 +8771,19 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                     </Box>
                   ) : null}
                   <pre className="code-viewer-pre chat-workspace-code-inline">
-                    <code>{renderCodeBlockLines(codeViewerContent || "", {
-                      fileName: activeCodeFile.name,
+                    <code>{renderCodeBlockLines(activeWorkspaceCodeContent || "", {
+                      fileName: activeWorkspaceCodePath,
                       activeLine:
-                        activeLiveWrite && !activeLiveWrite.done
+                        !isShowingSnippetPreview && activeLiveWrite && !activeLiveWrite.done
                           ? activeLiveWrite.line
                           : null
                     })}</code>
                   </pre>
-                  {activeLiveWrite && !activeLiveWrite.done ? (
+                  {isShowingSnippetPreview ? (
+                    <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.75 }}>
+                      Referenced from {activeWorkspaceCodeSourceLabel}.
+                    </Typography>
+                  ) : activeLiveWrite && !activeLiveWrite.done ? (
                     <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.75 }}>
                       Writing in progress...
                     </Typography>
@@ -8461,8 +8877,14 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
         <DialogTitle sx={{ p: "10px 16px", borderBottom: "1px solid rgba(100,160,230,0.18)" }}>
           <Stack direction="row" justifyContent="space-between" alignItems="center">
             <Box>
-              <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>Generated Files</Typography>
-              {activeCodeFile && codeViewerWriteStatus ? (
+              <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>
+                {isShowingSnippetPreview ? "Assistant Snippets" : "Generated Files"}
+              </Typography>
+              {isShowingSnippetPreview ? (
+                <Typography variant="caption" color="text.secondary">
+                  {activeWorkspaceCodeSourceLabel}
+                </Typography>
+              ) : activeCodeFile && codeViewerWriteStatus ? (
                 <Typography variant="caption" color="text.secondary">
                   {`${activeCodeFile.name} - ${codeViewerWriteStatus}`}
                 </Typography>
@@ -8472,13 +8894,30 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
               <CloseIcon fontSize="small" />
             </IconButton>
           </Stack>
-          {deployedFiles.length > 1 && (
+          {isShowingSnippetPreview ? (
+            workspaceSnippetFiles.length > 1 ? (
+              <Box className="code-file-tabs" sx={{ mt: 0.5 }}>
+                {workspaceSnippetFiles.map((snippet) => (
+                  <button
+                    key={snippet.id}
+                    className={`code-file-tab${activeSnippetFile?.id === snippet.id ? " code-file-tab-active" : ""}`}
+                    onClick={() => setSelectedSnippetId(snippet.id)}
+                  >
+                    {snippet.displayName}
+                  </button>
+                ))}
+              </Box>
+            ) : null
+          ) : deployedFiles.length > 1 && (
             <Box className="code-file-tabs" sx={{ mt: 0.5 }}>
               {deployedFiles.map((f, i) => (
                 <button
                   key={f.name}
                   className={`code-file-tab${i === codeViewerFileIdx ? " code-file-tab-active" : ""}`}
-                  onClick={() => setCodeViewerFileIdx(i)}
+                  onClick={() => {
+                    setSelectedSnippetId(null);
+                    setCodeViewerFileIdx(i);
+                  }}
                 >
                   {f.name}
                 </button>
@@ -8487,18 +8926,24 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
           )}
         </DialogTitle>
         <DialogContent sx={{ p: 0 }}>
-          {activeCodeFile && (
+          {activeWorkspaceCodeEntry && (
             <>
               <pre className="code-viewer-pre">
-                <code>{renderCodeBlockLines(codeViewerContent || "", {
-                  fileName: activeCodeFile.name,
+                <code>{renderCodeBlockLines(activeWorkspaceCodeContent || "", {
+                  fileName: activeWorkspaceCodePath,
                   activeLine:
-                    activeLiveWrite && !activeLiveWrite.done
+                    !isShowingSnippetPreview && activeLiveWrite && !activeLiveWrite.done
                       ? activeLiveWrite.line
                       : null
                 })}</code>
               </pre>
-              {activeLiveWrite && !activeLiveWrite.done ? (
+              {isShowingSnippetPreview ? (
+                <Box sx={{ px: 1.5, pb: 1 }}>
+                  <Typography variant="caption" color="text.secondary">
+                    Referenced from {activeWorkspaceCodeSourceLabel}.
+                  </Typography>
+                </Box>
+              ) : activeLiveWrite && !activeLiveWrite.done ? (
                 <Box sx={{ px: 1.5, pb: 1 }}>
                   <Typography variant="caption" color="text.secondary">
                     Writing in progress...

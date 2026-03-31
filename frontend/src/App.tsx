@@ -712,7 +712,7 @@ export default function App() {
         <AppBar position="static" elevation={0} color="transparent" className="glass-appbar shell-appbar">
           <Toolbar
             className="shell-toolbar"
-            sx={{ minHeight: "var(--appbar-height)", px: { xs: 1.75, md: 2.25 } }}
+            sx={{ minHeight: "var(--appbar-height)", px: { xs: 1.25, md: 1.5 } }}
           >
             <Stack direction="row" alignItems="center" spacing={1} sx={{ flexGrow: 1, minWidth: 0 }}>
               <Box className="shell-brand-mark">

@@ -26,6 +26,7 @@ pub mod orchestra;
 pub mod parallel;
 pub mod pipeline;
 pub mod prompt_policy;
+pub mod product_help;
 pub mod secrets;
 pub mod self_evolve;
 pub mod self_tune;

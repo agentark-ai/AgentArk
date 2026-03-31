@@ -7390,7 +7390,7 @@ impl Agent {
         // Sync auto-approve list from config into safety engine at startup
         safety.set_auto_approved(&config.auto_approve);
 
-        Ok(Self {
+        let agent = Self {
             _agent_id: AgentId::new(),
             storage: storage.clone(),
             encrypted_storage,
@@ -7449,7 +7449,46 @@ impl Agent {
                 );
                 reg
             },
-        })
+        };
+
+        match agent.sync_bundled_product_help().await {
+            Ok(count) => tracing::info!("Synced {} bundled product-help knowledge item(s)", count),
+            Err(error) => {
+                tracing::warn!("Failed to sync bundled product-help knowledge: {}", error)
+            }
+        }
+
+        Ok(agent)
+    }
+
+    pub async fn sync_bundled_product_help(&self) -> Result<usize> {
+        let mut actions = self.runtime.list_enabled_actions().await?;
+        self.append_dynamic_integration_actions(&mut actions).await;
+        let items = crate::core::product_help::build_seed_knowledge_items(&actions);
+
+        self.storage
+            .delete_knowledge_items_by_source(crate::core::product_help::CURATED_SOURCE)
+            .await?;
+        self.storage
+            .delete_knowledge_items_by_source(crate::core::product_help::RUNTIME_SOURCE)
+            .await?;
+
+        let mut inserted = 0usize;
+        for item in items {
+            self.storage
+                .create_knowledge_item(
+                    &item.title,
+                    &item.content,
+                    Some(item.source),
+                    item.url.as_deref(),
+                    item.tags.as_deref(),
+                    None,
+                )
+                .await?;
+            inserted += 1;
+        }
+
+        Ok(inserted)
     }
 
     fn integration_enabled_key(id: &str) -> String {
@@ -11365,6 +11404,27 @@ Rules:
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&saved_user_facts);
             system_prompt.push('\n');
+        }
+
+        if let Some(product_help_context) = self
+            .build_agentark_product_help_context(message, project_id)
+            .await
+        {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&product_help_context);
+            system_prompt.push('\n');
+
+            let mut trace = trace_ref.write().await;
+            trace.steps.push(ExecutionStep {
+                icon: "[docs]".to_string(),
+                title: "Product Help Context".to_string(),
+                detail: "Injected bundled AgentArk help context for a product how-to request."
+                    .to_string(),
+                step_type: "info".to_string(),
+                data: None,
+                timestamp: chrono::Utc::now(),
+                duration_ms: None,
+            });
         }
 
         // Append document context if available
@@ -16516,6 +16576,114 @@ Do not ask for JSON. Do not claim deployment is unavailable unless `app_deploy` 
                 lines.join("\n")
             ))
         }
+    }
+
+    async fn build_agentark_product_help_context(
+        &self,
+        message: &str,
+        project_id: Option<&str>,
+    ) -> Option<String> {
+        if !crate::core::product_help::looks_like_agentark_help_query(message) {
+            return None;
+        }
+
+        let query_tokens = tokenize_lower(message);
+        let help_topics = crate::core::product_help::infer_help_topics(message)
+            .into_iter()
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        let items = self
+            .load_merged_knowledge_items(project_id, 160)
+            .await
+            .into_iter()
+            .filter(|item| {
+                crate::core::product_help::is_product_help_source(item.source.as_deref())
+            })
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            return None;
+        }
+
+        let score_item = |item: &crate::storage::entities::knowledge_item::Model| {
+            let title = item.title.to_ascii_lowercase();
+            let content = item.content.to_ascii_lowercase();
+            let tags = item.tags.as_deref().unwrap_or("").to_ascii_lowercase();
+            let url = item.url.as_deref().unwrap_or("").to_ascii_lowercase();
+            let source = item.source.as_deref().unwrap_or("").to_ascii_lowercase();
+            let combined = format!("{title} {content} {tags} {url} {source}");
+            let mut score = keyword_overlap_score(&combined, &query_tokens);
+            for topic in &help_topics {
+                if tags.contains(topic) {
+                    score += 4;
+                }
+                if title.contains(topic) {
+                    score += 3;
+                }
+                if content.contains(topic) || url.contains(topic) {
+                    score += 1;
+                }
+            }
+            if item.source.as_deref() == Some(crate::core::product_help::CURATED_SOURCE) {
+                score += 1;
+            }
+            score
+        };
+
+        let mut scored = items
+            .into_iter()
+            .map(|item| {
+                let score = score_item(&item);
+                (item, score)
+            })
+            .collect::<Vec<_>>();
+        scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.updated_at.cmp(&a.0.updated_at)));
+
+        let mut relevant = scored
+            .iter()
+            .filter(|(_, score)| *score > 0)
+            .take(5)
+            .map(|(item, _)| item.clone())
+            .collect::<Vec<_>>();
+        if relevant.is_empty() {
+            relevant = scored
+                .into_iter()
+                .take(3)
+                .map(|(item, _)| item)
+                .collect::<Vec<_>>();
+        }
+        if relevant.is_empty() {
+            return None;
+        }
+
+        let entries = relevant
+            .iter()
+            .map(|item| {
+                let url = item
+                    .url
+                    .as_deref()
+                    .map(|value| format!(" ({})", safe_truncate(value, 120)))
+                    .unwrap_or_default();
+                let tags = item
+                    .tags
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| format!(" tags={}", safe_truncate(value, 80)))
+                    .unwrap_or_default();
+                format!(
+                    "### {}{}{}\n{}",
+                    safe_truncate(&item.title, 120),
+                    url,
+                    tags,
+                    safe_truncate(&item.content, 900)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        Some(format!(
+            "## AgentArk Product Help\nThe user is asking how to use AgentArk. Use the following bundled product-help material as the source of truth for AgentArk-specific steps, settings locations, and verification.\n- Prefer exact UI/config paths and step-by-step instructions.\n- If bundled help conflicts with the live action catalog, trust the live action catalog for what this instance can do right now.\n- For external provider setup that can drift over time, such as Google Cloud or OAuth console steps, keep the AgentArk-specific path from these docs but verify the provider-side details with web search and prefer official docs when needed.\n- End with a brief verification/check-success step when relevant.\n\n{}",
+            entries
+        ))
     }
 
     async fn build_memory_domain_context(

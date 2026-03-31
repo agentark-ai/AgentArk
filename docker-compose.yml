@@ -70,9 +70,6 @@ services:
         INSTALL_LIGHTPANDA: ${AGENTARK_INSTALL_LIGHTPANDA:-true}
         INSTALL_GWS: ${AGENTARK_INSTALL_GWS:-true}
         INSTALL_DOCKER_CLI: ${AGENTARK_INSTALL_DOCKER_CLI:-true}
-        INSTALL_OPENSPACE: ${AGENTARK_INSTALL_OPENSPACE:-true}
-        INSTALL_OLLAMA_CLI: ${AGENTARK_INSTALL_OLLAMA_CLI:-false}
-        # INSTALL_REMOTION_TEMPLATE removed - disabled, see Dockerfile notes
         INSTALL_WHATSAPP_BRIDGE: ${AGENTARK_INSTALL_WHATSAPP_BRIDGE:-true}
     image: agentark:local-full
     container_name: agentark

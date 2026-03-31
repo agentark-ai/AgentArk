@@ -402,13 +402,36 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
       : failingSources.length === 1
         ? `${failingSources[0]} failed to load. Retrying automatically.`
         : `${failingSources.join(", ")} failed to load. Retrying automatically.`;
+  const automationSurfaceTotal =
+    automationCounts.tasks +
+    automationCounts.watchers +
+    automationCounts.apps +
+    automationCounts.integrations;
+  const automationHeadline =
+    automationSurfaceTotal > 0
+      ? `${automationSurfaceTotal} automation surfaces are currently in play.`
+      : "No active automation surfaces are live right now.";
 
   return (
     <Box
       data-tour-target="overview-dashboard"
       className="overview-shell"
     >
-      <Box data-tour-target="welcome-hero">
+      {hasErrors ? (
+        <Alert severity="error">
+          {dataSourceErrorSummary}
+        </Alert>
+      ) : null}
+
+      <Box
+        data-tour-target="welcome-hero"
+        sx={{
+          display: "grid",
+          gridTemplateColumns: { xs: "1fr", xl: "minmax(0, 1.45fr) minmax(320px, 0.9fr)" },
+          gap: 1,
+          alignItems: "stretch",
+        }}
+      >
         <WelcomeHero
           onGoChat={() => navigateToView("chat")}
           onRunBriefing={() => runBriefingMutation.mutate()}
@@ -420,16 +443,27 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
           briefingLoading={runBriefingMutation.isPending}
           pauseLoading={pauseMutation.isPending}
           prompts={heroPrompts}
+          currentTaskDesc={currentTask}
+        />
+        <AgentStatusBar
+          serverStatus={serverStatus}
+          serverError={serverError}
+          serverLoading={serverLoading}
+          currentTaskDesc={currentTask}
+          agentPaused={agentPaused}
+          hasLlmConfigured={hasLlmConfigured}
+          automationCounts={automationCounts}
+          recentFailureTitle={recentFailedAutomationRun?.title || recentFailedAutomationRun?.summary || null}
         />
       </Box>
 
-      {hasErrors ? (
-        <Alert severity="error">
-          {dataSourceErrorSummary}
-        </Alert>
-      ) : null}
-
-      <Box className="overview-stage">
+      <Box
+        className="overview-stage"
+        sx={{
+          gridTemplateColumns: { xs: "1fr", lg: "minmax(0, 1.18fr) minmax(320px, 0.82fr)" },
+          gap: 1,
+        }}
+      >
         <NeedsAttentionInbox
           tasks={tasks}
           notifications={notifications}
@@ -444,17 +478,21 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
           rejecting={rejectMutation.isPending}
           retrying={retryMutation.isPending}
         />
+        <SmartSuggestions
+          briefing={briefingQ.data}
+          nudges={nudges}
+          onExecuteSkill={(skill) => executeSkillMutation.mutate(skill)}
+          onSnooze={(id) => nudgeFeedbackMutation.mutate({ id, action: "snooze" })}
+          onDismiss={(id) => nudgeFeedbackMutation.mutate({ id, action: "dismiss" })}
+          executing={executeSkillMutation.isPending}
+          feedbackPending={nudgeFeedbackMutation.isPending}
+        />
+      </Box>
 
-        <Stack className="overview-command-stack">
-          <AgentStatusBar
-            serverStatus={serverStatus}
-            serverError={serverError}
-            serverLoading={serverLoading}
-            currentTaskDesc={currentTask}
-          />
-
-          <Box className="overview-action-card">
-            <Stack spacing={1.25}>
+      <Grid2 container spacing={1} className="overview-secondary-grid">
+        <Grid2 size={{ xs: 12, lg: 4 }}>
+          <Box className="overview-action-card" sx={{ height: "100%" }}>
+            <Stack spacing={1.15}>
               <Box>
                 <Typography
                   variant="overline"
@@ -465,25 +503,83 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
                     mb: 0.35
                   }}
                 >
-                  Live Surface
+                  Automation Posture
                 </Typography>
-                <Typography variant="h6" sx={{ fontWeight: 600, mb: 0.45 }}>
-                  Keep the first screen focused.
+                <Typography variant="h6" sx={{ fontWeight: 700, mb: 0.45 }}>
+                  Background systems, without the dashboard sprawl.
                 </Typography>
                 <Typography variant="body2" color="text.secondary">
-                  Open the deeper operational views only when you need them. The landing view should stay clean and readable.
+                  {automationHeadline}
                 </Typography>
               </Box>
 
-              <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
-                <Chip size="small" label={`${automationCounts.tasks} tasks`} />
-                <Chip size="small" label={`${automationCounts.watchers} watchers`} />
-                <Chip size="small" label={`${automationCounts.apps} apps`} />
-                <Chip size="small" label={`${automationCounts.integrations} integrations`} />
-                <Chip size="small" label={`${traces.length} traces`} />
-              </Stack>
+              <Box
+                sx={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+                  gap: 0.85,
+                }}
+              >
+                {[
+                  { label: "Tasks", value: automationCounts.tasks },
+                  { label: "Watchers", value: automationCounts.watchers },
+                  { label: "Apps", value: automationCounts.apps },
+                  { label: "Integrations", value: automationCounts.integrations },
+                ].map((item) => (
+                  <Box
+                    key={item.label}
+                    sx={{
+                      borderRadius: 2.5,
+                      border: "1px solid rgba(108, 156, 212, 0.16)",
+                      background: "rgba(7, 18, 32, 0.52)",
+                      px: 1,
+                      py: 0.9,
+                    }}
+                  >
+                    <Typography variant="caption" color="text.secondary">
+                      {item.label}
+                    </Typography>
+                    <Typography variant="subtitle1" sx={{ mt: 0.2, fontWeight: 700 }}>
+                      {item.value}
+                    </Typography>
+                  </Box>
+                ))}
+              </Box>
 
-              <Stack direction={{ xs: "column", sm: "row" }} spacing={1}>
+              {recentFailedAutomationRun ? (
+                <Alert severity="warning" sx={{ py: 0.3 }}>
+                  Degraded run: {recentFailedAutomationRun.title || recentFailedAutomationRun.summary}
+                </Alert>
+              ) : automationPreview.length > 0 ? (
+                <Stack spacing={0.5}>
+                  {automationPreview.slice(0, 3).map((item) => (
+                    <Stack
+                      key={`${item.kind}-${item.id}`}
+                      direction="row"
+                      spacing={0.75}
+                      alignItems="center"
+                      sx={{
+                        px: 0.9,
+                        py: 0.7,
+                        borderRadius: 2.5,
+                        background: "rgba(7, 18, 32, 0.42)",
+                        border: "1px solid rgba(108, 156, 212, 0.1)",
+                      }}
+                    >
+                      <Chip size="small" label={automationKindLabel(item.kind)} />
+                      <Typography variant="body2" noWrap sx={{ minWidth: 0, flex: 1 }} title={item.title}>
+                        {item.title}
+                      </Typography>
+                    </Stack>
+                  ))}
+                </Stack>
+              ) : (
+                <Typography variant="body2" color="text.secondary">
+                  Runtime inventory is quiet. Use this space to spot drift before it becomes work.
+                </Typography>
+              )}
+
+              <Stack direction={{ xs: "column", sm: "row" }} spacing={0.85}>
                 <Button variant="outlined" size="small" onClick={() => setInventoryOpen(true)}>
                   Automation Inventory
                 </Button>
@@ -496,22 +592,16 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
               </Stack>
             </Stack>
           </Box>
-        </Stack>
-      </Box>
-
-      <Grid2 container spacing={1} className="overview-secondary-grid">
-        <Grid2 size={{ xs: 12, lg: 6 }}>
+        </Grid2>
+        <Grid2 size={{ xs: 12, lg: 4 }}>
           <TodaysHighlights tasks={tasks} traces={traces} />
         </Grid2>
-        <Grid2 size={{ xs: 12, lg: 6 }}>
-          <SmartSuggestions
-            briefing={briefingQ.data}
-            nudges={nudges}
-            onExecuteSkill={(skill) => executeSkillMutation.mutate(skill)}
-            onSnooze={(id) => nudgeFeedbackMutation.mutate({ id, action: "snooze" })}
-            onDismiss={(id) => nudgeFeedbackMutation.mutate({ id, action: "dismiss" })}
-            executing={executeSkillMutation.isPending}
-            feedbackPending={nudgeFeedbackMutation.isPending}
+        <Grid2 size={{ xs: 12, lg: 4 }}>
+          <ActivityFeed
+            traces={traces}
+            onViewAll={() => {
+              setActivityOpen(true);
+            }}
           />
         </Grid2>
       </Grid2>

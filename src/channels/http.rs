@@ -3740,6 +3740,10 @@ pub async fn serve(
         .route("/memory/knowledge", get(list_knowledge_items))
         .route("/memory/knowledge", post(create_knowledge_item))
         .route(
+            "/memory/knowledge/sync-product-docs",
+            post(sync_product_help_knowledge),
+        )
+        .route(
             "/memory/knowledge/{id}",
             axum::routing::delete(delete_knowledge_item),
         )
@@ -4926,6 +4930,12 @@ fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value> {
         "/memory/knowledge",
         "POST",
         "Create knowledge base item",
+        "Memory",
+    );
+    add(
+        "/memory/knowledge/sync-product-docs",
+        "POST",
+        "Sync bundled AgentArk product-help knowledge",
         "Memory",
     );
     add(
@@ -25416,6 +25426,21 @@ async fn delete_knowledge_item(State(state): State<AppState>, Path(id): Path<Str
             StatusCode::OK,
             Json(serde_json::json!({ "deleted": deleted })),
         )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn sync_product_help_knowledge(State(state): State<AppState>) -> Response {
+    let agent = state.agent.read().await;
+    match agent.sync_bundled_product_help().await {
+        Ok(synced) => (StatusCode::OK, Json(serde_json::json!({ "synced": synced })))
             .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

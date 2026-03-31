@@ -60,13 +60,20 @@ export function ActivityFeed({ traces, onViewAll }: Props) {
   const items = (traces || []).slice(0, 5);
 
   return (
-    <Card>
-      <CardContent sx={{ p: 1.5 }}>
+    <Card sx={{ height: "100%" }}>
+      <CardContent sx={{ p: 1.55 }}>
         <Stack direction="row" justifyContent="space-between" alignItems="center" mb={1}>
-          <Typography variant="h6">Recent Activity</Typography>
+          <Box>
+            <Typography variant="h6" sx={{ fontWeight: 700 }}>
+              Runtime Activity
+            </Typography>
+            <Typography variant="caption" color="text.secondary">
+              Recent supervised runs and operator-visible outcomes.
+            </Typography>
+          </Box>
           {traces.length > 5 ? (
             <Button size="small" onClick={onViewAll} sx={{ textTransform: "none" }}>
-              View all
+              Open trace
             </Button>
           ) : null}
         </Stack>
@@ -76,13 +83,17 @@ export function ActivityFeed({ traces, onViewAll }: Props) {
             No recent activity.
           </Typography>
         ) : (
-          <Stack spacing={0.6}>
+          <Stack spacing={0.7}>
             {items.map((trace) => (
               <Box
                 key={trace.id}
                 className="activity-item console-line"
                 onClick={() => setExpandedId(expandedId === trace.id ? null : trace.id)}
-                sx={{ cursor: "pointer" }}
+                sx={{
+                  cursor: "pointer",
+                  borderRadius: 2.5,
+                  background: "linear-gradient(180deg, rgba(6, 16, 30, 0.82), rgba(4, 12, 24, 0.76))",
+                }}
               >
                 <Stack
                   direction="row"
@@ -93,7 +104,7 @@ export function ActivityFeed({ traces, onViewAll }: Props) {
                   <Typography
                     variant="caption"
                     color="text.secondary"
-                    sx={{ flexShrink: 0, minWidth: 55 }}
+                    sx={{ flexShrink: 0, minWidth: 62, fontFamily: "JetBrains Mono, monospace" }}
                   >
                     {relativeTime(trace.started_at)}
                   </Typography>

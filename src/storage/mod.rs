@@ -2103,6 +2103,15 @@ impl Storage {
         Ok(query.count(&self.db).await?)
     }
 
+    /// Delete all knowledge base items for a specific source.
+    pub async fn delete_knowledge_items_by_source(&self, source: &str) -> Result<u64> {
+        let result = knowledge_item::Entity::delete_many()
+            .filter(knowledge_item::Column::Source.eq(source.to_string()))
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected)
+    }
+
     /// Delete a knowledge base item.
     pub async fn delete_knowledge_item(&self, id: &str) -> Result<bool> {
         let result = knowledge_item::Entity::delete_by_id(id.to_string())

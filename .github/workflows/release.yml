@@ -58,9 +58,6 @@ jobs:
               INSTALL_CLOUDFLARED=false
               INSTALL_LIGHTPANDA=true
               INSTALL_GWS=false
-              INSTALL_OPENSPACE=false
-              INSTALL_OLLAMA_CLI=false
-              INSTALL_REMOTION_TEMPLATE=false
               INSTALL_WHATSAPP_BRIDGE=true
           - variant: full
             build_args: |
@@ -72,9 +69,6 @@ jobs:
               INSTALL_CLOUDFLARED=true
               INSTALL_LIGHTPANDA=true
               INSTALL_GWS=true
-              INSTALL_OPENSPACE=true
-              INSTALL_OLLAMA_CLI=true
-              INSTALL_REMOTION_TEMPLATE=true
               INSTALL_WHATSAPP_BRIDGE=true
     permissions:
       contents: read

@@ -146,63 +146,57 @@ export function TodaysHighlights({ tasks, traces }: Props) {
     (todayAnalytics?.totals?.total_tokens ?? 0) > 0 ||
     (todayAnalytics?.totals?.cost_usd ?? 0) > 0;
   const noTodayData = completedToday === 0 && todayTraceCount === 0 && !todayUsagePresent;
+  const summaryCards = noTodayData
+    ? fallbackRows
+    : [
+        {
+          label: "Completed",
+          value: formatCompact(completedToday),
+        },
+        {
+          label: "Live runs",
+          value: formatCompact(todayTraceCount),
+        },
+        {
+          label: todayUsagePresent ? "Today spend" : "Requests",
+          value: todayUsagePresent
+            ? formatSpend(todayAnalytics?.totals?.cost_usd ?? null)
+            : formatCompact(todayAnalytics?.totals?.request_count ?? 0),
+        },
+      ];
 
   return (
     <Card sx={{ height: "100%" }}>
-      <CardContent sx={{ p: 1.5 }}>
-        <Typography variant="h6" mb={1.25}>
-          Today's Highlights
-        </Typography>
-
-        {noTodayData ? (
-          <Stack spacing={1.1}>
-            <Typography variant="body2" color="text.secondary">
-              No meaningful activity yet today. Showing the last 30 days instead.
+      <CardContent sx={{ p: 1.55 }}>
+        <Stack spacing={1.15}>
+          <Box>
+            <Typography variant="h6" sx={{ fontWeight: 700 }}>
+              Operational Summary
             </Typography>
-            <Stack direction={{ xs: "column", sm: "row" }} spacing={1} useFlexGap flexWrap="wrap">
-              {fallbackRows.map((row) => (
-                <Box
-                  key={row.label}
-                  sx={{
-                    flex: "1 1 0",
-                    minWidth: 120,
-                    px: 1.1,
-                    py: 0.95,
-                    borderRadius: "12px",
-                    border: "1px solid rgba(108,156,212,0.16)",
-                    background: "rgba(7, 18, 32, 0.56)",
-                  }}
-                >
-                  <Typography variant="caption" color="text.secondary">
-                    {row.label}
-                  </Typography>
-                  <Typography variant="h5" sx={{ mt: 0.3, fontWeight: 700, color: "#f3fbff" }}>
-                    {row.value}
-                  </Typography>
-                </Box>
-              ))}
-            </Stack>
-          </Stack>
-        ) : (
-          <>
+            <Typography variant="body2" color="text.secondary">
+              Compact view of today’s completion pace, runtime activity, and usage footprint.
+            </Typography>
+          </Box>
 
-            <Stack direction="row" alignItems="baseline" spacing={1} mb={1}>
-              <Typography variant="h4" fontWeight={700} sx={{ color: "#14f195" }}>
-                {completedToday}
-              </Typography>
-              <Typography variant="body2" color="text.secondary">
-                tasks completed
+          {noTodayData ? (
+            <Typography variant="body2" color="text.secondary">
+              No meaningful activity yet today. Falling back to the trailing 30-day baseline.
+            </Typography>
+          ) : (
+            <Stack direction="row" alignItems="center" spacing={0.55} useFlexGap flexWrap="wrap">
+              <Typography variant="body2" sx={{ color: "rgba(225, 239, 255, 0.96)", fontWeight: 600 }}>
+                {completedToday > 0 ? `${completedToday} completions` : "No completions yet"}
               </Typography>
               {trendPct !== 0 ? (
-                <Stack direction="row" alignItems="center" spacing={0.3}>
+                <Stack direction="row" alignItems="center" spacing={0.25}>
                   {trendPct > 0 ? (
-                    <TrendingUpRoundedIcon sx={{ fontSize: 16, color: "#14f195" }} />
+                    <TrendingUpRoundedIcon sx={{ fontSize: 15, color: "#14f195" }} />
                   ) : (
-                    <TrendingDownRoundedIcon sx={{ fontSize: 16, color: "#ff9800" }} />
+                    <TrendingDownRoundedIcon sx={{ fontSize: 15, color: "#ff9800" }} />
                   )}
                   <Typography
                     variant="caption"
-                    fontWeight={600}
+                    fontWeight={700}
                     sx={{ color: trendPct > 0 ? "#14f195" : "#ff9800" }}
                   >
                     {trendPct > 0 ? "+" : ""}{trendPct}% vs avg
@@ -210,70 +204,83 @@ export function TodaysHighlights({ tasks, traces }: Props) {
                 </Stack>
               ) : null}
             </Stack>
+          )}
 
-            {completedList.length > 0 ? (
-              <Stack spacing={0.5} mb={1.25}>
-                {completedList.map((t, idx) => (
-                  <Stack key={t.id || idx} direction="row" spacing={0.75} alignItems="center">
-                    <CheckCircleRoundedIcon sx={{ fontSize: 14, color: "#14f195", flexShrink: 0 }} />
-                    <Typography variant="body2" noWrap title={String(t.description || "")}>
-                      {String(t.description || "Task completed")}
-                    </Typography>
-                  </Stack>
-                ))}
-              </Stack>
-            ) : (
-              <Typography variant="body2" color="text.secondary" mb={1.25}>
-                No completed tasks yet today.
-              </Typography>
-            )}
-
-            {todayUsagePresent ? (
-              <Stack direction={{ xs: "column", sm: "row" }} spacing={1} useFlexGap flexWrap="wrap" mb={1.1}>
-                {todayUsageRows.map((row) => (
-                  <Box
-                    key={row.label}
-                    sx={{
-                      flex: "1 1 0",
-                      minWidth: 120,
-                      px: 1.1,
-                      py: 0.9,
-                      borderRadius: "12px",
-                      border: "1px solid rgba(108,156,212,0.14)",
-                      background: "rgba(7, 18, 32, 0.5)",
-                    }}
-                  >
-                    <Typography variant="caption" color="text.secondary">
-                      {row.label}
-                    </Typography>
-                    <Typography variant="h6" sx={{ mt: 0.25, fontWeight: 700, color: "#f3fbff" }}>
-                      {row.value}
-                    </Typography>
-                  </Box>
-                ))}
-              </Stack>
-            ) : null}
-
-            {nextScheduled ? (
-              <Stack direction="row" spacing={0.75} alignItems="center" mb={1}>
-                <ScheduleRoundedIcon sx={{ fontSize: 14, color: "#2fd4ff", flexShrink: 0 }} />
-                <Typography variant="body2" color="text.secondary">
-                  Next: {String(nextScheduled.description || "Scheduled task").slice(0, 50)}
+          <Box
+            sx={{
+              display: "grid",
+              gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+              gap: 1,
+            }}
+          >
+            {summaryCards.map((row) => (
+              <Box
+                key={row.label}
+                sx={{
+                  minWidth: 0,
+                  px: 1.05,
+                  py: 0.9,
+                  borderRadius: "12px",
+                  border: "1px solid rgba(108,156,212,0.16)",
+                  background: "rgba(7, 18, 32, 0.56)",
+                }}
+              >
+                <Typography variant="caption" color="text.secondary">
+                  {row.label}
                 </Typography>
-              </Stack>
-            ) : null}
+                <Typography variant="h6" sx={{ mt: 0.2, fontWeight: 700, color: "#f3fbff" }}>
+                  {row.value}
+                </Typography>
+              </Box>
+            ))}
+          </Box>
 
-            <Box sx={{ mt: 0.75, opacity: 0.9 }}>
-              <Sparkline values={weekCounts} />
-            </Box>
+          {completedList.length > 0 ? (
+            <Stack spacing={0.55}>
+              {completedList.map((t, idx) => (
+                <Stack key={t.id || idx} direction="row" spacing={0.75} alignItems="center">
+                  <CheckCircleRoundedIcon sx={{ fontSize: 14, color: "#14f195", flexShrink: 0 }} />
+                  <Typography variant="body2" noWrap title={String(t.description || "")}>
+                    {String(t.description || "Task completed")}
+                  </Typography>
+                </Stack>
+              ))}
+            </Stack>
+          ) : (
+            <Typography variant="body2" color="text.secondary">
+              No completed tasks have landed yet today.
+            </Typography>
+          )}
 
-            {timeSavedMin > 0 ? (
-              <Typography variant="caption" color="text.secondary" mt={0.75} display="block">
-                Estimated ~{timeSavedMin} min saved today
+          {todayUsagePresent ? (
+            <Stack direction={{ xs: "column", sm: "row" }} spacing={0.85} useFlexGap flexWrap="wrap">
+              {todayUsageRows.map((row) => (
+                <Typography key={row.label} variant="caption" color="text.secondary">
+                  {row.label}: <span style={{ color: "rgba(230, 241, 255, 0.94)" }}>{row.value}</span>
+                </Typography>
+              ))}
+            </Stack>
+          ) : null}
+
+          {nextScheduled ? (
+            <Stack direction="row" spacing={0.75} alignItems="center">
+              <ScheduleRoundedIcon sx={{ fontSize: 14, color: "#2fd4ff", flexShrink: 0 }} />
+              <Typography variant="body2" color="text.secondary">
+                Next scheduled: {String(nextScheduled.description || "Scheduled task").slice(0, 56)}
               </Typography>
-            ) : null}
-          </>
-        )}
+            </Stack>
+          ) : null}
+
+          <Box sx={{ opacity: 0.9 }}>
+            <Sparkline values={weekCounts} />
+          </Box>
+
+          {timeSavedMin > 0 ? (
+            <Typography variant="caption" color="text.secondary" display="block">
+              Estimated operator time reclaimed today: ~{timeSavedMin} min
+            </Typography>
+          ) : null}
+        </Stack>
       </CardContent>
     </Card>
   );

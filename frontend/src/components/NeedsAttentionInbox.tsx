@@ -20,6 +20,39 @@ type AttentionItem = {
   targetView?: string;
 };
 
+function attentionMeta(kind: AttentionItem["kind"]): {
+  label: string;
+  accent: string;
+  defaultDetail: string;
+} {
+  switch (kind) {
+    case "approval":
+      return {
+        label: "Approval",
+        accent: "rgba(255, 194, 87, 0.96)",
+        defaultDetail: "An operator decision is blocking execution.",
+      };
+    case "failed":
+      return {
+        label: "Failure",
+        accent: "rgba(255, 123, 123, 0.95)",
+        defaultDetail: "A run degraded and may need intervention.",
+      };
+    case "setup":
+      return {
+        label: "Setup",
+        accent: "rgba(97, 208, 255, 0.96)",
+        defaultDetail: "Core capability setup is incomplete.",
+      };
+    default:
+      return {
+        label: "Alert",
+        accent: "rgba(255, 151, 115, 0.94)",
+        defaultDetail: "A system alert needs operator review.",
+      };
+  }
+}
+
 function notificationTargetView(notification: Notification): string {
   const title = String(notification.title || "").toLowerCase();
   const body = String(notification.body || "").toLowerCase();
@@ -145,51 +178,79 @@ export function NeedsAttentionInbox({
   const count = items.length;
 
   return (
-    <Card className="attention-card" sx={{ alignSelf: "flex-start" }}>
-      <CardContent sx={{ p: 1.5 }}>
-        <Stack direction="row" alignItems="center" spacing={1} mb={count > 0 ? 1.25 : 0}>
+    <Card className="attention-card" sx={{ alignSelf: "stretch", height: "100%" }}>
+      <CardContent sx={{ p: 1.55, height: "100%" }}>
+        <Stack direction="row" alignItems="center" spacing={1} mb={0.45}>
           <WarningAmberRoundedIcon
             sx={{ color: count > 0 ? "rgba(255, 167, 38, 0.9)" : "rgba(155, 180, 214, 0.4)", fontSize: 20 }}
           />
-          <Typography variant="h6" sx={{ flex: 1 }}>
-            Needs Your Attention
+          <Typography variant="h6" sx={{ flex: 1, fontWeight: 700 }}>
+            Decision Queue
           </Typography>
           {count > 0 ? (
             <Badge badgeContent={count} color="warning" />
           ) : null}
         </Stack>
+        <Typography variant="body2" color="text.secondary" sx={{ mb: count > 0 ? 1.25 : 0.9 }}>
+          Blocking approvals, failed runs, security alerts, and setup gaps that require an operator.
+        </Typography>
 
         {count === 0 ? (
-          <Box className="empty-state" sx={{ py: 2.5 }}>
+          <Box className="empty-state" sx={{ py: 3 }}>
             <CheckCircleOutlineRoundedIcon
               sx={{ fontSize: 36, color: "rgba(20, 241, 149, 0.6)" }}
             />
-            <Typography variant="body2" color="text.secondary">
-              All caught up!
+            <Typography variant="body2" color="text.secondary" sx={{ fontWeight: 600 }}>
+              Operator queue is clear.
             </Typography>
           </Box>
         ) : (
-          <Stack spacing={0.75}>
-            {items.map((item) => (
-              <Box key={item.id} className="action-row" sx={{ p: "8px 10px" }}>
+          <Stack spacing={0.85}>
+            {items.map((item) => {
+              const meta = attentionMeta(item.kind);
+              return (
+              <Box
+                key={item.id}
+                className="action-row"
+                sx={{
+                  p: "10px 12px",
+                  borderLeft: `3px solid ${meta.accent}`,
+                  background: "linear-gradient(180deg, rgba(8, 18, 34, 0.76), rgba(6, 14, 28, 0.72))",
+                }}
+              >
                 <Stack
                   direction={{ xs: "column", sm: "row" }}
                   spacing={1}
                   justifyContent="space-between"
-                  alignItems={{ xs: "flex-start", sm: "center" }}
+                  alignItems={{ xs: "flex-start", sm: "flex-start" }}
                 >
                   <Box sx={{ flex: 1, minWidth: 0 }}>
-                    <Typography variant="body2" fontWeight={600} noWrap title={item.title}>
-                      {item.title}
-                    </Typography>
-                    {item.detail ? (
-                      <Typography variant="caption" color="text.secondary" noWrap>
-                        {item.detail}
+                    <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" alignItems="center" sx={{ mb: 0.35 }}>
+                      <Box
+                        sx={{
+                          px: 0.8,
+                          py: 0.2,
+                          borderRadius: 999,
+                          border: `1px solid ${meta.accent}`,
+                          color: meta.accent,
+                          fontSize: "0.68rem",
+                          fontWeight: 700,
+                          letterSpacing: "0.08em",
+                          textTransform: "uppercase",
+                        }}
+                      >
+                        {meta.label}
+                      </Box>
+                      <Typography variant="body2" fontWeight={700} title={item.title}>
+                        {item.title}
                       </Typography>
-                    ) : null}
+                    </Stack>
+                    <Typography variant="caption" color="text.secondary" sx={{ display: "block", lineHeight: 1.45 }}>
+                      {item.detail || meta.defaultDetail}
+                    </Typography>
                   </Box>
 
-                  <Stack direction="row" spacing={0.6} flexShrink={0}>
+                  <Stack direction="row" spacing={0.6} flexShrink={0} sx={{ pt: { sm: 0.2 } }}>
                     {item.kind === "approval" ? (
                       <>
                         <Button
@@ -198,7 +259,7 @@ export function NeedsAttentionInbox({
                           color="success"
                           disabled={approving}
                           onClick={() => onApprove(item.id)}
-                          sx={{ minWidth: 70, textTransform: "none" }}
+                          sx={{ minWidth: 78, textTransform: "none" }}
                         >
                           Approve
                         </Button>
@@ -208,7 +269,7 @@ export function NeedsAttentionInbox({
                           color="warning"
                           disabled={rejecting}
                           onClick={() => onReject(item.id)}
-                          sx={{ minWidth: 60, textTransform: "none" }}
+                          sx={{ minWidth: 68, textTransform: "none" }}
                         >
                           Reject
                         </Button>
@@ -219,7 +280,7 @@ export function NeedsAttentionInbox({
                         size="small"
                         disabled={retrying}
                         onClick={() => onRetry(item.id)}
-                        sx={{ textTransform: "none" }}
+                        sx={{ textTransform: "none", minWidth: 68 }}
                       >
                         Retry
                       </Button>
@@ -228,7 +289,7 @@ export function NeedsAttentionInbox({
                         variant="contained"
                         size="small"
                         onClick={() => onNavigate("settings")}
-                        sx={{ textTransform: "none" }}
+                        sx={{ textTransform: "none", minWidth: 68 }}
                       >
                         Set Up
                       </Button>
@@ -237,7 +298,7 @@ export function NeedsAttentionInbox({
                         variant="text"
                         size="small"
                         onClick={() => onNavigate(item.targetView || "settings")}
-                        sx={{ textTransform: "none" }}
+                        sx={{ textTransform: "none", minWidth: 56 }}
                       >
                         View
                       </Button>
@@ -245,15 +306,15 @@ export function NeedsAttentionInbox({
                   </Stack>
                 </Stack>
               </Box>
-            ))}
+            )})}
 
             {count >= 5 ? (
               <Button
                 size="small"
-                onClick={() => onNavigate("skills")}
+                onClick={() => onNavigate("tasks")}
                 sx={{ textTransform: "none", alignSelf: "flex-start", mt: 0.5 }}
               >
-                View all tasks
+                Open full task queue
               </Button>
             ) : null}
           </Stack>
