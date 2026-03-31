@@ -66,6 +66,7 @@ import { api } from "../api/client";
 import AgentLogo from "../assets/logo.svg";
 import { MetricBarCard } from "./analytics/MetricBarCard";
 import { BrowserProfilesPanel } from "./BrowserProfilesPanel";
+import { BackgroundSessionsManager } from "./BackgroundSessionsManager";
 import { ChannelsControlPanel } from "./ChannelsControlPanel";
 import { DevicesControlPanel } from "./DevicesControlPanel";
 import { IntegrationsPanel } from "./IntegrationsPanel";
@@ -1094,6 +1095,7 @@ export type WorkspaceView =
   | "gatewayops"
   | "failover"
   | "tasks"
+  | "sessions"
   | "skills"
   | "apps"
   | "moltbook"
@@ -5064,6 +5066,25 @@ function ChatManager({
     },
     [starredConversations, conversations, conversationId, selectedConversationQ.data]
   );
+  const backgroundSessionsQ = useQuery({
+    queryKey: ["chat-background-sessions"],
+    queryFn: api.getBackgroundSessions,
+    refetchInterval: chatAutoRefresh ? REFRESH_MS : false
+  });
+  const backgroundSessions = pickRecords(backgroundSessionsQ.data, "sessions");
+  const activeConversationSession = useMemo(
+    () =>
+      backgroundSessions.find((session) => {
+        const sessionConversationId = str(session.conversation_id, "").trim();
+        const status = str(session.status, "").trim().toLowerCase();
+        return (
+          !!conversationId &&
+          sessionConversationId === conversationId &&
+          !["completed", "failed", "cancelled"].includes(status)
+        );
+      }) || null,
+    [backgroundSessions, conversationId]
+  );
   const selectedMessageCount = num(selectedConversation?.message_count, 0);
   const selectedConversationUpdatedAtMs = Date.parse(str(selectedConversation?.updated_at, ""));
   const recentlyTouchedEmptyConversation =
@@ -8444,6 +8465,17 @@ function ChatManager({
               projects={projects}
               onNavigateToView={onNavigateToView}
             />
+            {activeConversationSession ? (
+              <Chip
+                size="small"
+                variant="outlined"
+                color="info"
+                clickable={!!onNavigateToView}
+                onClick={() => onNavigateToView?.("sessions")}
+                label={`Session: ${str(activeConversationSession.title, "Background session")} - ${str(activeConversationSession.status, "active")}`}
+                sx={{ maxWidth: 280 }}
+              />
+            ) : null}
             <Tooltip title={showWorkspacePanel ? "Hide workspace panel" : "Show workspace panel"}>
               <span
                 className={`activity-toggle-pill${showWorkspacePanel ? " active" : ""}${isStreamingForCurrentConversation ? " streaming" : ""}`}
@@ -9616,6 +9648,12 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
     queryFn: () => api.rawGet("/tasks?limit=100"),
     refetchInterval: autoRefresh ? REFRESH_MS : false
   });
+  const sessionsQ = useQuery({
+    queryKey: ["background-sessions-task-links"],
+    queryFn: api.getBackgroundSessions,
+    refetchInterval: autoRefresh ? REFRESH_MS : false,
+    staleTime: 10_000
+  });
 
   const opMutation = useMutation({
     mutationFn: ({
@@ -9680,6 +9718,21 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
   });
 
   const tasks = pickRecords(tasksQ.data, "tasks");
+  const sessionsById = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const session of pickRecords(sessionsQ.data, "sessions")) {
+      const id = str(session.id, "").trim();
+      if (!id) continue;
+      map.set(id, str(session.title, "").trim());
+    }
+    return map;
+  }, [sessionsQ.data]);
+  const taskBackgroundSessionId = (task: JsonRecord): string =>
+    str(asRecord(asRecord(task.arguments)._automation).background_session_id, "").trim();
+  const taskBackgroundSessionTitle = (task: JsonRecord): string => {
+    const id = taskBackgroundSessionId(task);
+    return id ? sessionsById.get(id) || "" : "";
+  };
   const isWebChatRequestTask = (task: JsonRecord): boolean => {
     const argumentsObj = asRecord(task.arguments);
     return (
@@ -9806,6 +9859,10 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
                 const schedule = cronExpr ? `cron: ${cronExpr}` : "manual";
                 const rawStatus = str(task.status, "-");
                 const rawStatusLower = rawStatus.toLowerCase();
+                const backgroundSessionId = taskBackgroundSessionId(task);
+                const backgroundSessionTitle = backgroundSessionId
+                  ? sessionsById.get(backgroundSessionId) || ""
+                  : "";
                 const isChatRequestTask = isWebChatRequestTask(task);
                 const rowActions: RowMenuAction[] = [
                   {
@@ -9874,9 +9931,23 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
                 return (
                   <TableRow key={id}>
                     <TableCell sx={{ maxWidth: 520 }}>
-                      <Typography variant="body2" noWrap title={str(task.description)}>
-                        {str(task.description)}
-                      </Typography>
+                      <Stack spacing={0.35}>
+                        <Typography variant="body2" noWrap title={str(task.description)}>
+                          {str(task.description)}
+                        </Typography>
+                        {backgroundSessionId ? (
+                          <Typography
+                            variant="caption"
+                            color="text.secondary"
+                            noWrap
+                            title={backgroundSessionTitle || backgroundSessionId}
+                          >
+                            {backgroundSessionTitle
+                              ? `Background session: ${backgroundSessionTitle}`
+                              : "Background session linked"}
+                          </Typography>
+                        ) : null}
+                      </Stack>
                     </TableCell>
                     <TableCell sx={{ maxWidth: 220 }}>
                       <Typography variant="body2" noWrap title={str(task.action)}>
@@ -9918,6 +9989,17 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
               />
               <Chip size="small" variant="outlined" label={str(selectedTask?.cron, "") ? "Scheduled" : "Manual"} />
               <Chip size="small" variant="outlined" label={`Action: ${str(selectedTask?.action, "-")}`} />
+              {selectedTask && taskBackgroundSessionId(selectedTask) ? (
+                <Chip
+                  size="small"
+                  variant="outlined"
+                  label={
+                    taskBackgroundSessionTitle(selectedTask)
+                      ? `Session: ${taskBackgroundSessionTitle(selectedTask)}`
+                      : "Background session linked"
+                  }
+                />
+              ) : null}
             </Stack>
 
             <Typography variant="caption" color="text.secondary">
@@ -15538,6 +15620,8 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
   const selectedTraceProofId = str(selectedTrace.proof_id, "");
   const selectedTraceChannel = str(selectedTrace.channel, "chat");
   const selectedTraceResponse = str(selectedTrace.response, "").trim();
+  const selectedTraceStarted = humanTs(str(selectedTrace.started_at, ""));
+  const selectedTraceCompleted = humanTs(str(selectedTrace.completed_at, ""));
   const traceEvidence = buildTraceEvidenceItems(steps);
   const traceArtifacts = extractTraceArtifacts(selectedTrace, steps);
   const evolutionReviewCards = useMemo(() => buildEvolutionReviewCards(steps), [steps]);
@@ -15570,6 +15654,36 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
       : selectedTraceStatus === "failed"
         ? `Failed after ${formatTraceDuration(selectedTrace.duration_ms)}`
         : `Status: ${selectedTraceStatus}`;
+  const renderDiagnosticsSectionHeader = ({
+    eyebrow,
+    title,
+    description,
+    meta,
+  }: {
+    eyebrow: string;
+    title: string;
+    description: string;
+    meta: string;
+  }) => (
+    <Stack
+      className="diagnostics-section-head"
+      direction={{ xs: "column", lg: "row" }}
+      alignItems={{ xs: "flex-start", lg: "center" }}
+      justifyContent="space-between"
+      spacing={1.5}
+    >
+      <Box className="diagnostics-section-copy">
+        <Typography className="diagnostics-section-eyebrow">{eyebrow}</Typography>
+        <Typography variant="h5" className="diagnostics-section-title">{title}</Typography>
+        <Typography variant="body2" className="diagnostics-section-description">
+          {description}
+        </Typography>
+      </Box>
+      <Box className="diagnostics-section-meta">
+        {meta}
+      </Box>
+    </Stack>
+  );
 
   return (
     <Stack spacing={2}>
@@ -15619,13 +15733,13 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
       </Box>
 
       {traceSection === "history" ? (
-      <Box className="list-shell">
-        <Stack direction="row" alignItems="center" justifyContent="space-between" mb={1.5}>
-          <Typography variant="h6">Trace History</Typography>
-          <Typography variant="caption" color="text.secondary">
-            Showing {history.length} of {historyTotal} runs
-          </Typography>
-        </Stack>
+      <Box className="list-shell diagnostics-section-shell">
+        {renderDiagnosticsSectionHeader({
+          eyebrow: "Execution diagnostics",
+          title: "Execution History",
+          description: "Shows every recorded run with source, request preview, status, step count, and duration. Open a row to inspect the full execution trace.",
+          meta: `Showing ${history.length} of ${historyTotal} runs`
+        })}
         {(() => {
           const completed = history.filter((h) => str(h.status, "").toLowerCase() === "completed");
           const failed = history.filter((h) => str(h.status, "").toLowerCase() === "failed");
@@ -15637,27 +15751,27 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
           <>
           <Grid2 container spacing={1} sx={{ mb: 1.5 }}>
             <Grid2 size={{ xs: 6, sm: 3 }}>
-              <Box className="metadata-box" sx={{ textAlign: "center" }}>
-                <Typography variant="caption" color="text.secondary">Total</Typography>
-                <Typography variant="h5">{history.length}</Typography>
+              <Box className="metadata-box diagnostics-stat-card" sx={{ textAlign: "center" }}>
+                <Typography variant="caption" className="diagnostics-stat-label">Total</Typography>
+                <Typography variant="h5" className="diagnostics-stat-value">{history.length}</Typography>
               </Box>
             </Grid2>
             <Grid2 size={{ xs: 6, sm: 3 }}>
-              <Box className="metadata-box" sx={{ textAlign: "center" }}>
-                <Typography variant="caption" color="text.secondary">Completed</Typography>
-                <Typography variant="h5" sx={{ color: "rgba(74,210,157,0.9)" }}>{completed.length}</Typography>
+              <Box className="metadata-box diagnostics-stat-card" sx={{ textAlign: "center" }}>
+                <Typography variant="caption" className="diagnostics-stat-label">Completed</Typography>
+                <Typography variant="h5" className="diagnostics-stat-value" sx={{ color: "rgba(74,210,157,0.9)" }}>{completed.length}</Typography>
               </Box>
             </Grid2>
             <Grid2 size={{ xs: 6, sm: 3 }}>
-              <Box className="metadata-box" sx={{ textAlign: "center" }}>
-                <Typography variant="caption" color="text.secondary">Failed</Typography>
-                <Typography variant="h5" sx={{ color: "rgba(255,100,100,0.9)" }}>{failed.length}</Typography>
+              <Box className="metadata-box diagnostics-stat-card" sx={{ textAlign: "center" }}>
+                <Typography variant="caption" className="diagnostics-stat-label">Failed</Typography>
+                <Typography variant="h5" className="diagnostics-stat-value" sx={{ color: "rgba(255,100,100,0.9)" }}>{failed.length}</Typography>
               </Box>
             </Grid2>
             <Grid2 size={{ xs: 6, sm: 3 }}>
-              <Box className="metadata-box" sx={{ textAlign: "center" }}>
-                <Typography variant="caption" color="text.secondary">Avg steps</Typography>
-                <Typography variant="h5">{history.length > 0 ? Math.round(history.reduce((sum, h) => sum + num(h.step_count, 0), 0) / history.length) : 0}</Typography>
+              <Box className="metadata-box diagnostics-stat-card" sx={{ textAlign: "center" }}>
+                <Typography variant="caption" className="diagnostics-stat-label">Avg steps</Typography>
+                <Typography variant="h5" className="diagnostics-stat-value">{history.length > 0 ? Math.round(history.reduce((sum, h) => sum + num(h.step_count, 0), 0) / history.length) : 0}</Typography>
               </Box>
             </Grid2>
           </Grid2>
@@ -15665,6 +15779,7 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
             <Grid2 container spacing={1.25} sx={{ mb: 2 }}>
               <Grid2 size={{ xs: 12, lg: 6 }}>
                 <MetricBarCard
+                  className="diagnostics-chart-card delay-1"
                   title="Execution Volume"
                   value={`${history.length} runs`}
                   values={histTrendValues}
@@ -15674,6 +15789,7 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
               </Grid2>
               <Grid2 size={{ xs: 12, lg: 6 }}>
                 <MetricBarCard
+                  className="diagnostics-chart-card delay-2"
                   title="Failures"
                   value={`${failed.length} failed`}
                   values={histFailValues}
@@ -15691,7 +15807,7 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
             No trace history is available yet. New chat runs will appear here with detailed execution steps.
           </Alert>
         ) : (
-          <TableContainer className="table-shell">
+          <TableContainer className="table-shell diagnostics-table-shell">
             <Table size="small" sx={{ tableLayout: "fixed" }}>
               <TableHead>
                 <TableRow>
@@ -15725,7 +15841,7 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
                         </Typography>
                       </TableCell>
                       <TableCell>
-                        <Typography variant="body2" fontWeight={600} noWrap title={str(item.message_preview)}>
+                        <Typography variant="body2" fontWeight={600} className="diagnostics-cell-clamp diagnostics-cell-clamp--2" title={str(item.message_preview)}>
                           {str(item.message_preview)}
                         </Typography>
                       </TableCell>
@@ -15760,24 +15876,20 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
       ) : null}
 
       {traceSection === "sync" ? (
-      <Box className="list-shell">
+      <Box className="list-shell diagnostics-section-shell">
         <Stack spacing={1.25}>
-          <Stack direction="row" alignItems="center" justifyContent="space-between" flexWrap="wrap" useFlexGap>
-            <Box>
-              <Typography variant="h6">Integration Sync Runs</Typography>
-              <Typography variant="caption" color="text.secondary">
-                Background and manual sync executions across all connected integrations.
-              </Typography>
-            </Box>
-            <Typography variant="caption" color="text.secondary">
-              Showing {syncRuns.length} of {syncRunTotal} runs
-            </Typography>
-          </Stack>
+          {renderDiagnosticsSectionHeader({
+            eyebrow: "Integration health",
+            title: "Sync Runs",
+            description: "Shows background and manual integration sync executions, their outcome, item counts, summaries, and the runtime state captured for each run.",
+            meta: `Showing ${syncRuns.length} of ${syncRunTotal} runs`
+          })}
 
           {syncRunBuckets.length > 0 ? (
             <Grid2 container spacing={1.25}>
               <Grid2 size={{ xs: 12, lg: 6 }}>
                 <MetricBarCard
+                  className="diagnostics-chart-card delay-1"
                   title="Sync Run Volume"
                   value={`${num(syncRunStats.total_runs, 0)} total`}
                   values={syncRunTrendValues}
@@ -15787,6 +15899,7 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
               </Grid2>
               <Grid2 size={{ xs: 12, lg: 6 }}>
                 <MetricBarCard
+                  className="diagnostics-chart-card delay-2"
                   title="Attention Load"
                   value={`${num(syncRunStats.important_hits, 0)} important`}
                   values={syncAttentionValues}
@@ -15799,27 +15912,27 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
 
           <Grid2 container spacing={1}>
             <Grid2 size={{ xs: 6, md: 3 }}>
-              <Box className="metadata-box">
-                <Typography variant="caption" color="text.secondary">Completed</Typography>
-                <Typography variant="h6">{num(syncRunStats.completed_runs, 0)}</Typography>
+              <Box className="metadata-box diagnostics-stat-card">
+                <Typography variant="caption" className="diagnostics-stat-label">Completed</Typography>
+                <Typography variant="h6" className="diagnostics-stat-value">{num(syncRunStats.completed_runs, 0)}</Typography>
               </Box>
             </Grid2>
             <Grid2 size={{ xs: 6, md: 3 }}>
-              <Box className="metadata-box">
-                <Typography variant="caption" color="text.secondary">Failed</Typography>
-                <Typography variant="h6">{num(syncRunStats.failed_runs, 0)}</Typography>
+              <Box className="metadata-box diagnostics-stat-card">
+                <Typography variant="caption" className="diagnostics-stat-label">Failed</Typography>
+                <Typography variant="h6" className="diagnostics-stat-value">{num(syncRunStats.failed_runs, 0)}</Typography>
               </Box>
             </Grid2>
             <Grid2 size={{ xs: 6, md: 3 }}>
-              <Box className="metadata-box">
-                <Typography variant="caption" color="text.secondary">Blocked</Typography>
-                <Typography variant="h6">{num(syncRunStats.blocked_runs, 0)}</Typography>
+              <Box className="metadata-box diagnostics-stat-card">
+                <Typography variant="caption" className="diagnostics-stat-label">Blocked</Typography>
+                <Typography variant="h6" className="diagnostics-stat-value">{num(syncRunStats.blocked_runs, 0)}</Typography>
               </Box>
             </Grid2>
             <Grid2 size={{ xs: 6, md: 3 }}>
-              <Box className="metadata-box">
-                <Typography variant="caption" color="text.secondary">Avg duration</Typography>
-                <Typography variant="h6">{formatTraceDuration(syncRunStats.avg_duration_ms)}</Typography>
+              <Box className="metadata-box diagnostics-stat-card">
+                <Typography variant="caption" className="diagnostics-stat-label">Avg duration</Typography>
+                <Typography variant="h6" className="diagnostics-stat-value">{formatTraceDuration(syncRunStats.avg_duration_ms)}</Typography>
               </Box>
             </Grid2>
           </Grid2>
@@ -15832,7 +15945,7 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
             </Alert>
           ) : (
             <>
-              <TableContainer className="table-shell">
+              <TableContainer className="table-shell diagnostics-table-shell">
                 <Table size="small" sx={{ tableLayout: "fixed" }}>
                   <TableHead>
                     <TableRow>
@@ -15868,7 +15981,7 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
                             <Chip size="small" color={syncRunStatusColor(status)} label={status} />
                           </TableCell>
                           <TableCell>
-                            <Typography variant="body2" noWrap title={str(item.summary)}>
+                            <Typography variant="body2" className="diagnostics-cell-clamp diagnostics-cell-clamp--2" title={str(item.summary)}>
                               {str(item.summary)}
                             </Typography>
                           </TableCell>
@@ -15905,68 +16018,82 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
       </Box>
       ) : null}
 
-      <Dialog open={selectedTraceId != null} onClose={() => setSelectedTraceId(null)} maxWidth="lg" fullWidth>
-        <DialogTitle sx={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 2 }}>
+      <Dialog
+        open={selectedTraceId != null}
+        onClose={() => setSelectedTraceId(null)}
+        maxWidth="lg"
+        fullWidth
+        PaperProps={{ className: "diagnostics-dialog-shell diagnostics-dialog-shell--trace" }}
+      >
+        <DialogTitle className="diagnostics-dialog-title" sx={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 2 }}>
           <Box>
             <Typography variant="h6">Trace Detail</Typography>
             <Typography variant="caption" color="text.secondary">
-              <span title={humanTs(str(selectedTrace.started_at)).tip}>{humanTs(str(selectedTrace.started_at)).label}</span> | {selectedTraceChannel}
+              <span title={selectedTraceStarted.tip}>{selectedTraceStarted.label}</span> | {selectedTraceChannel}
             </Typography>
           </Box>
-          <IconButton size="small" onClick={() => setSelectedTraceId(null)}>
+          <IconButton size="small" className="diagnostics-dialog-close" onClick={() => setSelectedTraceId(null)}>
             <CloseIcon fontSize="small" />
           </IconButton>
         </DialogTitle>
-        <DialogContent dividers>
+        <DialogContent dividers className="diagnostics-dialog-content">
           {traceDetailQ.isLoading ? (
             <Typography variant="body2" color="text.secondary">Loading trace...</Typography>
           ) : (
-            <Stack spacing={1.5}>
-              {/* Summary bar */}
-              <Stack direction="row" spacing={1} alignItems="center" useFlexGap flexWrap="wrap">
-                <Chip size="small" color={traceStatusColor(selectedTraceStatus)} label={selectedTraceStatus} />
-                <Typography variant="body2" color="text.secondary">
-                  {num(selectedTrace.step_count, steps.length)} steps | {formatTraceDuration(selectedTrace.duration_ms)}
-                  {selectedTrace.total_tokens ? ` | ${num(selectedTrace.total_tokens, 0)} tokens` : ""}
-                  {str(selectedTrace.model) ? ` | ${str(selectedTrace.model)}` : ""}
-                </Typography>
-                {selectedTraceProofId ? (
-                  <Typography variant="caption" sx={{ fontFamily: "monospace", color: "text.secondary" }}>
-                    ID: {selectedTraceProofId.slice(0, 12)}...
+            <Stack spacing={1.75}>
+              <Box className="diagnostics-dialog-intro">
+                <Typography className="diagnostics-dialog-eyebrow">Execution record</Typography>
+                <Stack
+                  direction={{ xs: "column", lg: "row" }}
+                  spacing={1.5}
+                  alignItems={{ xs: "flex-start", lg: "center" }}
+                  justifyContent="space-between"
+                >
+                  <Box className="diagnostics-section-copy">
+                    <Typography variant="h5" className="diagnostics-section-title">What This Trace Shows</Typography>
+                    <Typography variant="body2" className="diagnostics-section-description">
+                      This view shows the original request, final output, artifacts, and the step-by-step runtime evidence captured for one execution.
+                    </Typography>
+                  </Box>
+                  <Box className="diagnostics-section-meta">
+                    {traceOutcomeSummary}
+                  </Box>
+                </Stack>
+                <Stack direction="row" spacing={1} alignItems="center" useFlexGap flexWrap="wrap" sx={{ mt: 1.25 }}>
+                  <Chip size="small" color={traceStatusColor(selectedTraceStatus)} label={selectedTraceStatus} />
+                  <Typography variant="body2" color="text.secondary">
+                    {num(selectedTrace.step_count, steps.length)} steps | {formatTraceDuration(selectedTrace.duration_ms)}
+                    {selectedTrace.total_tokens ? ` | ${num(selectedTrace.total_tokens, 0)} tokens` : ""}
+                    {str(selectedTrace.model) ? ` | ${str(selectedTrace.model)}` : ""}
                   </Typography>
-                ) : null}
-              </Stack>
-
-              {/* User message */}
-              <Box sx={{ p: 1.25, borderRadius: 1.5, bgcolor: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.08)" }}>
-                <Typography variant="caption" color="text.secondary" sx={{ mb: 0.25, display: "block" }}>Input</Typography>
-                <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>{str(selectedTrace.message)}</Typography>
+                  {selectedTraceProofId ? (
+                    <Typography variant="caption" className="diagnostics-keyline">
+                      ID: {selectedTraceProofId.slice(0, 12)}...
+                    </Typography>
+                  ) : null}
+                </Stack>
               </Box>
 
-              {/* Response (collapsed if long) */}
+              <Box className="diagnostics-content-card diagnostics-content-card--input">
+                <Typography variant="caption" className="diagnostics-card-label">Input</Typography>
+                <Typography variant="body2" className="diagnostics-card-copy">{str(selectedTrace.message)}</Typography>
+              </Box>
+
               {selectedTraceResponse ? (
-                <Box sx={{ p: 1.25, borderRadius: 1.5, bgcolor: "rgba(70,174,255,0.05)", border: "1px solid rgba(70,174,255,0.15)" }}>
-                  <Typography variant="caption" color="text.secondary" sx={{ mb: 0.25, display: "block" }}>Output</Typography>
-                  <Typography variant="body2" sx={{ whiteSpace: "pre-wrap", maxHeight: 200, overflow: "auto" }}>
+                <Box className="diagnostics-content-card diagnostics-content-card--output">
+                  <Typography variant="caption" className="diagnostics-card-label">Output</Typography>
+                  <Typography variant="body2" className="diagnostics-card-copy diagnostics-card-copy--scroll">
                     {selectedTraceResponse}
                   </Typography>
                 </Box>
               ) : null}
 
               {evolutionReviewCards.length > 0 ? (
-                <Box sx={{ p: 1.25, borderRadius: 1.5, bgcolor: "rgba(120, 166, 255, 0.05)", border: "1px solid rgba(120, 166, 255, 0.16)" }}>
+                <Box className="diagnostics-content-card diagnostics-content-card--review">
                   <Typography variant="subtitle2" sx={{ mb: 1 }}>Evolution Review</Typography>
                   <Stack spacing={1}>
                     {evolutionReviewCards.map((card) => (
-                      <Box
-                        key={card.key}
-                        sx={{
-                          p: 1,
-                          borderRadius: 1.25,
-                          bgcolor: "rgba(255,255,255,0.025)",
-                          border: "1px solid rgba(255,255,255,0.06)"
-                        }}
-                      >
+                      <Box key={card.key} className="diagnostics-subcard">
                         <Stack direction="row" spacing={1} alignItems="center" useFlexGap flexWrap="wrap" sx={{ mb: 0.5 }}>
                           <Typography variant="body2" fontWeight={700}>{card.title}</Typography>
                           <Chip size="small" color={traceStepColor(card.status)} label={card.status} />
@@ -15985,20 +16112,7 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
                           </Typography>
                         ) : null}
                         {card.evidence ? (
-                          <Box
-                            component="pre"
-                            sx={{
-                              mt: 0.75,
-                              mb: 0,
-                              p: 0.75,
-                              whiteSpace: "pre-wrap",
-                              wordBreak: "break-word",
-                              fontSize: 11,
-                              borderRadius: 1,
-                              bgcolor: "rgba(255,255,255,0.03)",
-                              border: "1px solid rgba(255,255,255,0.06)"
-                            }}
-                          >
+                          <Box component="pre" className="diagnostics-code-block">
                             {card.evidence}
                           </Box>
                         ) : null}
@@ -16010,39 +16124,39 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
 
               {/* Artifacts */}
               {traceArtifacts.length > 0 ? (
-                <Stack direction="row" spacing={0.5} useFlexGap flexWrap="wrap" alignItems="center">
+                <Stack direction="row" spacing={0.5} useFlexGap flexWrap="wrap" alignItems="center" className="diagnostics-artifact-row">
                   <Typography variant="caption" color="text.secondary">Artifacts:</Typography>
                   {traceArtifacts.map((a) => <Chip key={a} size="small" variant="outlined" label={a} />)}
                 </Stack>
               ) : null}
 
               {/* Execution steps â€” the main view */}
-              <Box>
+              <Box className="diagnostics-content-card diagnostics-content-card--steps">
                 <Typography variant="subtitle2" sx={{ mb: 0.75 }}>Execution Steps</Typography>
-                <Box className="metadata-box" sx={{ maxHeight: 500 }}>
+                <Box className="diagnostics-steps-shell">
                   {steps.length === 0 ? (
                     <Typography variant="body2" color="text.secondary">No steps recorded.</Typography>
                   ) : (
-                    <Stack spacing={0.5}>
+                    <Stack spacing={0.9}>
                       {steps.map((step, idx) => {
                         const consoleView = buildTraceStepConsoleView(selectedTrace, steps, step);
                         const stepTime = formatTraceStepTime(str(step.time));
                         return (
-                          <Box key={`${str(step.time, "step")}-${idx}`} sx={{ py: 0.5, px: 1, borderRadius: 1, "&:hover": { bgcolor: "rgba(255,255,255,0.03)" } }}>
-                            <Stack direction="row" spacing={1} alignItems="baseline" useFlexGap flexWrap="wrap">
-                              <Typography variant="caption" color="text.secondary" sx={{ minWidth: 70, fontFamily: "monospace", fontSize: "0.7rem" }}>
+                          <Box key={`${str(step.time, "step")}-${idx}`} className="diagnostics-step-item">
+                            <Stack direction="row" spacing={1} alignItems="baseline" useFlexGap flexWrap="wrap" className="diagnostics-step-head">
+                              <Typography variant="caption" className="diagnostics-step-time">
                                 {stepTime}
                               </Typography>
                               <Box component="span" sx={{ width: 6, height: 6, borderRadius: "50%", flexShrink: 0, mt: 0.5, bgcolor: str(step.type).includes("error") || str(step.type).includes("fail") ? "rgba(255,100,100,0.85)" : str(step.type).includes("success") || str(step.type).includes("complete") ? "rgba(74,210,157,0.85)" : str(step.type).includes("think") || str(step.type).includes("reason") ? "rgba(255,211,106,0.85)" : "rgba(120,160,210,0.5)" }} />
-                              <Typography variant="body2" fontWeight={600} sx={{ flex: 1 }}>{str(step.title)}</Typography>
+                              <Typography variant="body2" fontWeight={600} className="diagnostics-step-title" sx={{ flex: 1 }}>{str(step.title)}</Typography>
                             </Stack>
                             {consoleView.detail ? (
-                              <Typography variant="caption" color="text.secondary" sx={{ pl: "86px", display: "block", whiteSpace: "pre-wrap" }}>
+                              <Typography variant="caption" color="text.secondary" className="diagnostics-step-detail">
                                 {consoleView.detail}
                               </Typography>
                             ) : null}
                             {consoleView.dataText ? (
-                              <Box component="pre" sx={{ ml: "86px", mt: 0.25, mb: 0, p: 0.75, whiteSpace: "pre-wrap", wordBreak: "break-word", fontSize: 11, borderRadius: 1, bgcolor: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)", maxHeight: 120, overflow: "auto" }}>
+                              <Box component="pre" className="diagnostics-code-block diagnostics-step-code">
                                 {consoleView.dataText}
                               </Box>
                             ) : null}
@@ -16055,20 +16169,26 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
               </Box>
 
               {/* Timing footer */}
-              <Typography variant="caption" color="text.secondary">
-                Started: <span title={humanTs(str(selectedTrace.started_at)).tip}>{humanTs(str(selectedTrace.started_at)).label}</span>
-                {selectedTrace.completed_at ? <>{" | Completed: "}<span title={humanTs(str(selectedTrace.completed_at)).tip}>{humanTs(str(selectedTrace.completed_at)).label}</span></> : ""}
+              <Typography variant="caption" color="text.secondary" className="diagnostics-footer-note">
+                Started: <span title={selectedTraceStarted.tip}>{selectedTraceStarted.label}</span>
+                {selectedTrace.completed_at ? <>{" | Completed: "}<span title={selectedTraceCompleted.tip}>{selectedTraceCompleted.label}</span></> : ""}
               </Typography>
             </Stack>
           )}
         </DialogContent>
-        <DialogActions>
+        <DialogActions className="diagnostics-dialog-actions">
           <Button onClick={() => setSelectedTraceId(null)}>Close</Button>
         </DialogActions>
       </Dialog>
 
-      <Dialog open={selectedSyncRunId != null} onClose={() => setSelectedSyncRunId(null)} maxWidth="md" fullWidth>
-        <DialogTitle sx={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 2 }}>
+      <Dialog
+        open={selectedSyncRunId != null}
+        onClose={() => setSelectedSyncRunId(null)}
+        maxWidth="md"
+        fullWidth
+        PaperProps={{ className: "diagnostics-dialog-shell diagnostics-dialog-shell--sync" }}
+      >
+        <DialogTitle className="diagnostics-dialog-title" sx={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 2 }}>
           <Box>
             <Typography variant="h6">Integration Sync Run</Typography>
             <Typography variant="caption" color="text.secondary">
@@ -16076,22 +16196,41 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
               {selectedSyncRun ? ` | ${str(selectedSyncRun.integration_name, "-")} | ${syncRunTriggerLabel(str(selectedSyncRun.trigger, ""))}` : ""}
             </Typography>
           </Box>
-          <IconButton size="small" onClick={() => setSelectedSyncRunId(null)}>
+          <IconButton size="small" className="diagnostics-dialog-close" onClick={() => setSelectedSyncRunId(null)}>
             <CloseIcon fontSize="small" />
           </IconButton>
         </DialogTitle>
-        <DialogContent dividers>
+        <DialogContent dividers className="diagnostics-dialog-content">
           {!selectedSyncRun ? (
             <Typography variant="body2" color="text.secondary">Run details are not available on this page.</Typography>
           ) : (
-            <Stack spacing={1.5}>
-              <Stack direction="row" spacing={1} alignItems="center" useFlexGap flexWrap="wrap">
-                <Chip size="small" color={syncRunStatusColor(selectedSyncRunStatus)} label={selectedSyncRunStatus || "unknown"} />
-                <Chip size="small" variant="outlined" label={syncRunTriggerLabel(str(selectedSyncRun.trigger, ""))} />
-                <Typography variant="body2" color="text.secondary">
-                  {formatTraceDuration(selectedSyncRun.duration_ms)} | {str(selectedSyncRun.sync_kind, "activity")}
-                </Typography>
-              </Stack>
+            <Stack spacing={1.75}>
+              <Box className="diagnostics-dialog-intro">
+                <Typography className="diagnostics-dialog-eyebrow">Integration execution</Typography>
+                <Stack
+                  direction={{ xs: "column", lg: "row" }}
+                  spacing={1.5}
+                  alignItems={{ xs: "flex-start", lg: "center" }}
+                  justifyContent="space-between"
+                >
+                  <Box className="diagnostics-section-copy">
+                    <Typography variant="h5" className="diagnostics-section-title">What This Sync Run Shows</Typography>
+                    <Typography variant="body2" className="diagnostics-section-description">
+                      This view shows what one sync execution fetched, what changed, whether the integration was connected, and which sample items were captured in that run.
+                    </Typography>
+                  </Box>
+                  <Box className="diagnostics-section-meta">
+                    {formatTraceDuration(selectedSyncRun.duration_ms)} | {str(selectedSyncRun.sync_kind, "activity")}
+                  </Box>
+                </Stack>
+                <Stack direction="row" spacing={1} alignItems="center" useFlexGap flexWrap="wrap" sx={{ mt: 1.25 }}>
+                  <Chip size="small" color={syncRunStatusColor(selectedSyncRunStatus)} label={selectedSyncRunStatus || "unknown"} />
+                  <Chip size="small" variant="outlined" label={syncRunTriggerLabel(str(selectedSyncRun.trigger, ""))} />
+                  <Typography variant="body2" color="text.secondary">
+                    {str(selectedSyncRun.integration_name, "-")}
+                  </Typography>
+                </Stack>
+              </Box>
 
               <Alert severity={selectedSyncRunStatus === "failed" ? "error" : selectedSyncRunStatus === "blocked" ? "warning" : "info"}>
                 {str(selectedSyncRun.summary, "No summary available.")}
@@ -16099,36 +16238,36 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
 
               <Grid2 container spacing={1}>
                 <Grid2 size={{ xs: 6, sm: 3 }}>
-                  <Box className="metadata-box">
-                    <Typography variant="caption" color="text.secondary">Fetched</Typography>
-                    <Typography variant="h6">{num(selectedSyncRun.fetched_item_count, 0)}</Typography>
+                  <Box className="metadata-box diagnostics-stat-card">
+                    <Typography variant="caption" className="diagnostics-stat-label">Fetched</Typography>
+                    <Typography variant="h6" className="diagnostics-stat-value">{num(selectedSyncRun.fetched_item_count, 0)}</Typography>
                   </Box>
                 </Grid2>
                 <Grid2 size={{ xs: 6, sm: 3 }}>
-                  <Box className="metadata-box">
-                    <Typography variant="caption" color="text.secondary">New</Typography>
-                    <Typography variant="h6">{num(selectedSyncRun.new_item_count, 0)}</Typography>
+                  <Box className="metadata-box diagnostics-stat-card">
+                    <Typography variant="caption" className="diagnostics-stat-label">New</Typography>
+                    <Typography variant="h6" className="diagnostics-stat-value">{num(selectedSyncRun.new_item_count, 0)}</Typography>
                   </Box>
                 </Grid2>
                 <Grid2 size={{ xs: 6, sm: 3 }}>
-                  <Box className="metadata-box">
-                    <Typography variant="caption" color="text.secondary">Recorded</Typography>
-                    <Typography variant="h6">{num(selectedSyncRun.recorded_item_count, 0)}</Typography>
+                  <Box className="metadata-box diagnostics-stat-card">
+                    <Typography variant="caption" className="diagnostics-stat-label">Recorded</Typography>
+                    <Typography variant="h6" className="diagnostics-stat-value">{num(selectedSyncRun.recorded_item_count, 0)}</Typography>
                   </Box>
                 </Grid2>
                 <Grid2 size={{ xs: 6, sm: 3 }}>
-                  <Box className="metadata-box">
-                    <Typography variant="caption" color="text.secondary">Important</Typography>
-                    <Typography variant="h6">{num(selectedSyncRun.important_item_count, 0)}</Typography>
+                  <Box className="metadata-box diagnostics-stat-card">
+                    <Typography variant="caption" className="diagnostics-stat-label">Important</Typography>
+                    <Typography variant="h6" className="diagnostics-stat-value">{num(selectedSyncRun.important_item_count, 0)}</Typography>
                   </Box>
                 </Grid2>
               </Grid2>
 
               <Grid2 container spacing={1}>
                 <Grid2 size={{ xs: 12, sm: 6 }}>
-                  <Box className="metadata-box" sx={{ minHeight: 86 }}>
-                    <Typography variant="caption" color="text.secondary">Runtime state</Typography>
-                    <Typography variant="body2">
+                  <Box className="diagnostics-content-card" sx={{ minHeight: 110 }}>
+                    <Typography variant="caption" className="diagnostics-card-label">Runtime state</Typography>
+                    <Typography variant="body2" className="diagnostics-card-copy">
                       {toBool(selectedSyncRun.connected) ? "Connected" : "Not connected"}
                       {" | "}
                       {toBool(selectedSyncRun.integration_enabled) ? "Integration enabled" : "Integration disabled"}
@@ -16139,9 +16278,9 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
                   </Box>
                 </Grid2>
                 <Grid2 size={{ xs: 12, sm: 6 }}>
-                  <Box className="metadata-box" sx={{ minHeight: 86 }}>
-                    <Typography variant="caption" color="text.secondary">Last detected item</Typography>
-                    <Typography variant="body2">
+                  <Box className="diagnostics-content-card" sx={{ minHeight: 110 }}>
+                    <Typography variant="caption" className="diagnostics-card-label">Last detected item</Typography>
+                    <Typography variant="body2" className="diagnostics-card-copy">
                       {str(selectedSyncRun.last_item_at) ? humanTs(str(selectedSyncRun.last_item_at)).label : "None"}
                     </Typography>
                     <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.5 }}>
@@ -16156,7 +16295,7 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
               ) : null}
 
               {Array.isArray(selectedSyncRun.sample_titles) && selectedSyncRun.sample_titles.length > 0 ? (
-                <Box className="metadata-box">
+                <Box className="diagnostics-content-card">
                   <Typography variant="subtitle2">Captured items</Typography>
                   <Typography variant="caption" color="text.secondary">
                     Top items seen in this run.
@@ -16173,20 +16312,20 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
             </Stack>
           )}
         </DialogContent>
-        <DialogActions>
+        <DialogActions className="diagnostics-dialog-actions">
           <Button onClick={() => setSelectedSyncRunId(null)}>Close</Button>
         </DialogActions>
       </Dialog>
 
       {/* Observability Export Delivery Logs */}
       {traceSection === "exports" ? (
-        <Box className="list-shell">
-          <Stack direction="row" alignItems="center" justifyContent="space-between" mb={1.5}>
-            <Typography variant="h6">Export Delivery</Typography>
-            <Typography variant="caption" color="text.secondary">
-              {exportLogs.length} deliveries
-            </Typography>
-          </Stack>
+        <Box className="list-shell diagnostics-section-shell">
+          {renderDiagnosticsSectionHeader({
+            eyebrow: "Delivery evidence",
+            title: "Export Deliveries",
+            description: "Shows observability exports sent by the system, whether delivery succeeded, which event fired, and which trace each delivery belongs to.",
+            meta: `${exportLogs.length} deliveries`
+          })}
           {(() => {
             const successLogs = exportLogs.filter((e) => str(e.level, "").toLowerCase() === "success");
             const errorLogs = exportLogs.filter((e) => str(e.level, "").toLowerCase() === "error");
@@ -16198,27 +16337,27 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
             <>
             <Grid2 container spacing={1} sx={{ mb: 1.5 }}>
               <Grid2 size={{ xs: 6, sm: 3 }}>
-                <Box className="metadata-box" sx={{ textAlign: "center" }}>
-                  <Typography variant="caption" color="text.secondary">Total</Typography>
-                  <Typography variant="h5">{exportLogs.length}</Typography>
+                <Box className="metadata-box diagnostics-stat-card" sx={{ textAlign: "center" }}>
+                  <Typography variant="caption" className="diagnostics-stat-label">Total</Typography>
+                  <Typography variant="h5" className="diagnostics-stat-value">{exportLogs.length}</Typography>
                 </Box>
               </Grid2>
               <Grid2 size={{ xs: 6, sm: 3 }}>
-                <Box className="metadata-box" sx={{ textAlign: "center" }}>
-                  <Typography variant="caption" color="text.secondary">Success</Typography>
-                  <Typography variant="h5" sx={{ color: "rgba(74,210,157,0.9)" }}>{successLogs.length}</Typography>
+                <Box className="metadata-box diagnostics-stat-card" sx={{ textAlign: "center" }}>
+                  <Typography variant="caption" className="diagnostics-stat-label">Success</Typography>
+                  <Typography variant="h5" className="diagnostics-stat-value" sx={{ color: "rgba(74,210,157,0.9)" }}>{successLogs.length}</Typography>
                 </Box>
               </Grid2>
               <Grid2 size={{ xs: 6, sm: 3 }}>
-                <Box className="metadata-box" sx={{ textAlign: "center" }}>
-                  <Typography variant="caption" color="text.secondary">Errors</Typography>
-                  <Typography variant="h5" sx={{ color: "rgba(255,100,100,0.9)" }}>{errorLogs.length}</Typography>
+                <Box className="metadata-box diagnostics-stat-card" sx={{ textAlign: "center" }}>
+                  <Typography variant="caption" className="diagnostics-stat-label">Errors</Typography>
+                  <Typography variant="h5" className="diagnostics-stat-value" sx={{ color: "rgba(255,100,100,0.9)" }}>{errorLogs.length}</Typography>
                 </Box>
               </Grid2>
               <Grid2 size={{ xs: 6, sm: 3 }}>
-                <Box className="metadata-box" sx={{ textAlign: "center" }}>
-                  <Typography variant="caption" color="text.secondary">Events</Typography>
-                  <Typography variant="h5">{new Set(exportLogs.map((e) => str(e.event, ""))).size}</Typography>
+                <Box className="metadata-box diagnostics-stat-card" sx={{ textAlign: "center" }}>
+                  <Typography variant="caption" className="diagnostics-stat-label">Events</Typography>
+                  <Typography variant="h5" className="diagnostics-stat-value">{new Set(exportLogs.map((e) => str(e.event, ""))).size}</Typography>
                 </Box>
               </Grid2>
             </Grid2>
@@ -16226,6 +16365,7 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
               <Grid2 container spacing={1.25} sx={{ mb: 2 }}>
                 <Grid2 size={{ xs: 12, lg: 6 }}>
                   <MetricBarCard
+                    className="diagnostics-chart-card delay-1"
                     title="Delivery Volume"
                     value={`${exportLogs.length} exports`}
                     values={expTrendValues}
@@ -16235,6 +16375,7 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
                 </Grid2>
                 <Grid2 size={{ xs: 12, lg: 6 }}>
                   <MetricBarCard
+                    className="diagnostics-chart-card delay-2"
                     title="Export Errors"
                     value={`${errorLogs.length} errors`}
                     values={expErrorValues}
@@ -16252,7 +16393,7 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
               No observability export delivery logs are available yet.
             </Alert>
           ) : (
-            <TableContainer className="table-shell">
+            <TableContainer className="table-shell diagnostics-table-shell">
               <Table size="small">
                 <TableHead>
                   <TableRow>
@@ -16291,7 +16432,7 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
                         </TableCell>
                         <TableCell><Typography variant="body2" noWrap>{str(entry.event, "-")}</Typography></TableCell>
                         <TableCell sx={{ maxWidth: 520 }}>
-                          <Typography variant="body2" color={level === "error" ? "error" : "text.secondary"} noWrap title={str(entry.message, "-")}>
+                          <Typography variant="body2" className="diagnostics-cell-clamp diagnostics-cell-clamp--2" color={level === "error" ? "error" : "text.secondary"} title={str(entry.message, "-")}>
                             {str(entry.message, "-")}
                           </Typography>
                         </TableCell>
@@ -16576,6 +16717,12 @@ function WatchersManager({ autoRefresh }: { autoRefresh: boolean }) {
     queryFn: () => api.rawGet("/watchers"),
     refetchInterval: autoRefresh ? REFRESH_MS : false
   });
+  const sessionsQ = useQuery({
+    queryKey: ["background-sessions-watcher-links"],
+    queryFn: api.getBackgroundSessions,
+    refetchInterval: autoRefresh ? REFRESH_MS : false,
+    staleTime: 10_000
+  });
 
   const pauseMutation = useMutation({
     mutationFn: (id: string) => api.rawPost(`/watchers/${encodeURIComponent(id)}/pause`, {}),
@@ -16628,6 +16775,21 @@ function WatchersManager({ autoRefresh }: { autoRefresh: boolean }) {
   });
 
   const watchers = pickRecords(watchersQ.data, "watchers");
+  const sessionsById = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const session of pickRecords(sessionsQ.data, "sessions")) {
+      const id = str(session.id, "").trim();
+      if (!id) continue;
+      map.set(id, str(session.title, "").trim());
+    }
+    return map;
+  }, [sessionsQ.data]);
+  const watcherBackgroundSessionId = (watcher: JsonRecord | null | undefined): string =>
+    str(asRecord(asRecord(watcher?.poll_arguments)._automation).background_session_id, "").trim();
+  const watcherBackgroundSessionTitle = (watcher: JsonRecord | null | undefined): string => {
+    const id = watcherBackgroundSessionId(watcher);
+    return id ? sessionsById.get(id) || "" : "";
+  };
   const selectedWatcher = useMemo(
     () => watchers.find((watcher) => str(watcher.id, "") === selectedWatcherId) ?? null,
     [selectedWatcherId, watchers]
@@ -16734,6 +16896,10 @@ function WatchersManager({ autoRefresh }: { autoRefresh: boolean }) {
                   const id = str(w.id, String(idx));
                   const rawStatus = str(w.status, "");
                   const statusLower = rawStatus.toLowerCase();
+                  const backgroundSessionId = watcherBackgroundSessionId(w);
+                  const backgroundSessionTitle = backgroundSessionId
+                    ? sessionsById.get(backgroundSessionId) || ""
+                    : "";
                   const isActive = statusLower.includes("active");
                   const isPaused = statusLower.includes("paused");
                   const isHistoryOnly = toBool(w.history_only);
@@ -16758,12 +16924,26 @@ function WatchersManager({ autoRefresh }: { autoRefresh: boolean }) {
                   return (
                     <TableRow key={id}>
                       <TableCell sx={{ maxWidth: 260 }}>
-                        <Typography variant="body2" noWrap title={str(w.description, "")}>
-                          {str(w.description, "-")}
-                        </Typography>
-                        <Typography variant="caption" color="text.secondary" noWrap>
-                          {str(w.notify_channel, "-")} - {formatDurationFromSeconds(num(w.timeout_secs, 0))}
-                        </Typography>
+                        <Stack spacing={0.35}>
+                          <Typography variant="body2" noWrap title={str(w.description, "")}>
+                            {str(w.description, "-")}
+                          </Typography>
+                          <Typography variant="caption" color="text.secondary" noWrap>
+                            {str(w.notify_channel, "-")} - {formatDurationFromSeconds(num(w.timeout_secs, 0))}
+                          </Typography>
+                          {backgroundSessionId ? (
+                            <Typography
+                              variant="caption"
+                              color="text.secondary"
+                              noWrap
+                              title={backgroundSessionTitle || backgroundSessionId}
+                            >
+                              {backgroundSessionTitle
+                                ? `Background session: ${backgroundSessionTitle}`
+                                : "Background session linked"}
+                            </Typography>
+                          ) : null}
+                        </Stack>
                       </TableCell>
                       <TableCell>
                         <Typography variant="body2" noWrap>{str(w.poll_action, "-")}</Typography>
@@ -16898,6 +17078,17 @@ function WatchersManager({ autoRefresh }: { autoRefresh: boolean }) {
                 variant="outlined"
                 label={watcherPollOutcomeLabel(selectedWatcher?.last_poll_outcome)}
                 color={watcherPollOutcomeColor(selectedWatcher?.last_poll_outcome)}
+              />
+            ) : null}
+            {watcherBackgroundSessionId(selectedWatcher) ? (
+              <Chip
+                size="small"
+                variant="outlined"
+                label={
+                  watcherBackgroundSessionTitle(selectedWatcher)
+                    ? `Session: ${watcherBackgroundSessionTitle(selectedWatcher)}`
+                    : "Background session linked"
+                }
               />
             ) : null}
             <Typography variant="caption" color="text.secondary" sx={{ ml: "auto !important" }}>
@@ -25632,6 +25823,7 @@ export function NativeWorkspace({
       {view === "gatewayops" ? <SettingsManager autoRefresh={autoRefresh} initialTab={9} hideSettingsNav /> : null}
       {view === "failover" ? <SettingsManager autoRefresh={autoRefresh} initialTab={1} /> : null}
       {view === "tasks" ? <TasksManager autoRefresh={autoRefresh} /> : null}
+      {view === "sessions" ? <BackgroundSessionsManager autoRefresh={autoRefresh} /> : null}
       {view === "skills" ? <SkillsManager autoRefresh={autoRefresh} /> : null}
       {view === "apps" ? <AppsManager autoRefresh={autoRefresh} /> : null}
       {view === "moltbook" ? (
@@ -25666,7 +25858,7 @@ export function NativeWorkspace({
       {view === "memory" ? (
         <MemoryManager autoRefresh={autoRefresh} projects={projects} activeProjectId={activeProjectId} />
       ) : null}
-      {["tasks", "skills", "apps"].includes(view) ? <Divider sx={{ mt: 2 }} /> : null}
+      {["tasks", "sessions", "skills", "apps"].includes(view) ? <Divider sx={{ mt: 2 }} /> : null}
     </Box>
   );
 }

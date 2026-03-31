@@ -15,6 +15,114 @@ export type Task = {
   cron?: string;
 };
 
+export type BackgroundSessionCounts = {
+  tasks_total: number;
+  tasks_queued: number;
+  tasks_running: number;
+  tasks_waiting: number;
+  tasks_paused: number;
+  tasks_done: number;
+  tasks_failed: number;
+  tasks_cancelled: number;
+  watchers_total: number;
+  watchers_active: number;
+  watchers_paused: number;
+  watchers_triggered: number;
+  watchers_stopped: number;
+};
+
+export type BackgroundSessionSummary = {
+  id: string;
+  title: string;
+  objective: string;
+  status: string;
+  summary?: string | null;
+  current_focus?: string | null;
+  waiting_on?: string | null;
+  next_expected_action?: string | null;
+  last_error?: string | null;
+  preferred_delivery_channel?: string | null;
+  linked_task_ids: string[];
+  linked_watcher_ids: string[];
+  created_at: string;
+  updated_at: string;
+  last_activity_at: string;
+  live_summary: string;
+  counts: BackgroundSessionCounts;
+};
+
+export type BackgroundSessionEvent = {
+  id: string;
+  at: string;
+  kind: string;
+  summary: string;
+  detail?: string | null;
+  actor?: string | null;
+};
+
+export type BackgroundSessionLinkedTask = {
+  id: string;
+  description: string;
+  action: string;
+  status: string;
+  created_at: string;
+  cron?: string | null;
+  result?: string | null;
+};
+
+export type BackgroundSessionLinkedWatcher = {
+  id: string;
+  description: string;
+  poll_action: string;
+  status: string;
+  created_at: string;
+  last_poll_at?: string | null;
+  notify_channel?: string | null;
+  last_error?: string | null;
+  trigger_result?: string | null;
+};
+
+export type BackgroundSessionRun = {
+  id: string;
+  automation_id: string;
+  kind: string;
+  title: string;
+  action: string;
+  trigger: string;
+  status: string;
+  attempt: number;
+  started_at: string;
+  completed_at?: string | null;
+  duration_ms?: number | null;
+  summary: string;
+  output_preview?: string | null;
+  error?: string | null;
+  next_retry_at?: string | null;
+};
+
+export type BackgroundSessionDetail = {
+  session: BackgroundSessionSummary;
+  session_detail: {
+    working_memory?: string | null;
+    channel?: string | null;
+    conversation_id?: string | null;
+    project_id?: string | null;
+    events: BackgroundSessionEvent[];
+  };
+  linked_tasks: BackgroundSessionLinkedTask[];
+  linked_watchers: BackgroundSessionLinkedWatcher[];
+  recent_runs: BackgroundSessionRun[];
+  missing_links: {
+    task_ids: string[];
+    watcher_ids: string[];
+  };
+};
+
+export type BackgroundSessionsResponse = {
+  sessions: BackgroundSessionSummary[];
+  total: number;
+};
+
 export type Notification = {
   id: string;
   level: string;

@@ -66,6 +66,7 @@ type ViewKey =
   | "failover"
   | "skills"
   | "tasks"
+  | "sessions"
   | "apps"
   | "moltbook"
   | "arkpulse"
@@ -106,6 +107,8 @@ const VIEW_ALIASES: Record<string, ViewKey> = {
   failover: "settings",
   watchers: "status",
   watcher: "status",
+  sessions: "sessions",
+  session: "sessions",
   status: "status",
   memory: "settings",
   integrations: "settings",
@@ -125,6 +128,7 @@ const VIEW_KEYS: ReadonlySet<ViewKey> = new Set<ViewKey>([
   "failover",
   "skills",
   "tasks",
+  "sessions",
   "apps",
   "moltbook",
   "arkpulse",
@@ -165,6 +169,7 @@ const NAV_GROUPS: NavGroup[] = [
     label: "Operations",
     items: [
       { key: "tasks", label: "Tasks", icon: <TaskRoundedIcon fontSize="small" /> },
+      { key: "sessions", label: "Sessions", icon: <HubRoundedIcon fontSize="small" /> },
       { key: "status", label: "Watchers", icon: <VisibilityRoundedIcon fontSize="small" /> },
       { key: "arkpulse", label: "ArkPulse", icon: <MonitorHeartRoundedIcon fontSize="small" /> },
       { key: "trace", label: "Trace", icon: <TimelineRoundedIcon fontSize="small" /> },
@@ -193,6 +198,7 @@ const VIEW_PATH_SEGMENTS: Record<ViewKey, string> = {
   failover: "failover",
   skills: "skills",
   tasks: "tasks",
+  sessions: "sessions",
   apps: "apps",
   moltbook: "moltbook",
   arkpulse: "arkpulse",

@@ -1,4 +1,6 @@
 import type {
+  BackgroundSessionDetail,
+  BackgroundSessionsResponse,
   SkillImportRequest,
   SkillImportResponse,
   SkillSecretsResponse,
@@ -533,6 +535,48 @@ export const api = {
     }
     return [];
   },
+  getBackgroundSessions: () => request<BackgroundSessionsResponse>("/background-sessions"),
+  getBackgroundSession: (id: string) =>
+    request<BackgroundSessionDetail>(`/background-sessions/${encodeURIComponent(id)}`),
+  createBackgroundSession: (payload: Record<string, unknown>) =>
+    request<{ status: string; id: string }>("/background-sessions", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  updateBackgroundSession: (id: string, payload: Record<string, unknown>) =>
+    request<{ status: string }>(`/background-sessions/${encodeURIComponent(id)}`, {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  attachBackgroundSessionWork: (id: string, payload: Record<string, unknown>) =>
+    request<{ status: string }>(`/background-sessions/${encodeURIComponent(id)}/attach`, {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  detachBackgroundSessionWork: (id: string, payload: Record<string, unknown>) =>
+    request<{ status: string }>(`/background-sessions/${encodeURIComponent(id)}/detach`, {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  pauseBackgroundSession: (id: string) =>
+    request<{ status: string }>(`/background-sessions/${encodeURIComponent(id)}/pause`, {
+      method: "POST",
+      body: JSON.stringify({})
+    }),
+  resumeBackgroundSession: (id: string) =>
+    request<{ status: string }>(`/background-sessions/${encodeURIComponent(id)}/resume`, {
+      method: "POST",
+      body: JSON.stringify({})
+    }),
+  cancelBackgroundSession: (id: string) =>
+    request<{ status: string }>(`/background-sessions/${encodeURIComponent(id)}/cancel`, {
+      method: "POST",
+      body: JSON.stringify({})
+    }),
+  deleteBackgroundSession: (id: string) =>
+    request<{ status: string }>(`/background-sessions/${encodeURIComponent(id)}`, {
+      method: "DELETE"
+    }),
   getNotifications: async () => {
     const raw = await request<unknown>("/notifications");
     if (Array.isArray(raw)) return raw as Notification[];

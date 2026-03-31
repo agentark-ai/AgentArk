@@ -1681,6 +1681,67 @@ pub struct UpdateTaskRequest {
     pub cron: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct CreateBackgroundSessionRequest {
+    #[serde(default)]
+    pub title: Option<String>,
+    pub objective: String,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub current_focus: Option<String>,
+    #[serde(default)]
+    pub waiting_on: Option<String>,
+    #[serde(default)]
+    pub next_expected_action: Option<String>,
+    #[serde(default)]
+    pub working_memory: Option<String>,
+    #[serde(default)]
+    pub preferred_delivery_channel: Option<String>,
+    #[serde(default)]
+    pub channel: Option<String>,
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub task_ids: Vec<String>,
+    #[serde(default)]
+    pub watcher_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct UpdateBackgroundSessionRequest {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub objective: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub current_focus: Option<String>,
+    #[serde(default)]
+    pub waiting_on: Option<String>,
+    #[serde(default)]
+    pub next_expected_action: Option<String>,
+    #[serde(default)]
+    pub working_memory: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub preferred_delivery_channel: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct BackgroundSessionLinkRequest {
+    #[serde(default)]
+    pub task_ids: Vec<String>,
+    #[serde(default)]
+    pub watcher_ids: Vec<String>,
+}
+
 /// Plan task request (LLM-assisted)
 #[derive(Debug, Deserialize)]
 pub struct PlanTaskRequest {
@@ -3427,6 +3488,19 @@ pub async fn serve(
         .route("/tasks/{id}/retry", post(retry_task))
         .route("/tasks/{id}/approve", post(approve_task))
         .route("/tasks/{id}/reject", post(reject_task))
+        .route("/background-sessions", get(list_background_sessions))
+        .route("/background-sessions", post(create_background_session))
+        .route("/background-sessions/{id}", get(get_background_session))
+        .route("/background-sessions/{id}", post(update_background_session))
+        .route(
+            "/background-sessions/{id}",
+            axum::routing::delete(delete_background_session),
+        )
+        .route("/background-sessions/{id}/attach", post(attach_background_session_work))
+        .route("/background-sessions/{id}/detach", post(detach_background_session_work))
+        .route("/background-sessions/{id}/pause", post(pause_background_session))
+        .route("/background-sessions/{id}/resume", post(resume_background_session))
+        .route("/background-sessions/{id}/cancel", post(cancel_background_session))
         .route("/automation/objects", get(list_automation_objects))
         .route("/automation/runs", get(list_automation_runs_endpoint))
         .route("/goals", get(list_goals))
@@ -4593,6 +4667,66 @@ fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value> {
     add("/tasks/{id}/retry", "POST", "Retry failed task", "Tasks");
     add("/tasks/{id}/approve", "POST", "Approve task", "Tasks");
     add("/tasks/{id}/reject", "POST", "Reject task", "Tasks");
+    add(
+        "/background-sessions",
+        "GET",
+        "List background sessions",
+        "Automation",
+    );
+    add(
+        "/background-sessions",
+        "POST",
+        "Create background session",
+        "Automation",
+    );
+    add(
+        "/background-sessions/{id}",
+        "GET",
+        "Get background session detail",
+        "Automation",
+    );
+    add(
+        "/background-sessions/{id}",
+        "POST",
+        "Update background session",
+        "Automation",
+    );
+    add(
+        "/background-sessions/{id}",
+        "DELETE",
+        "Delete background session",
+        "Automation",
+    );
+    add(
+        "/background-sessions/{id}/attach",
+        "POST",
+        "Attach tasks or watchers to a background session",
+        "Automation",
+    );
+    add(
+        "/background-sessions/{id}/detach",
+        "POST",
+        "Detach tasks or watchers from a background session",
+        "Automation",
+    );
+    add(
+        "/background-sessions/{id}/pause",
+        "POST",
+        "Pause background session work",
+        "Automation",
+    );
+    add(
+        "/background-sessions/{id}/resume",
+        "POST",
+        "Resume background session work",
+        "Automation",
+    );
+    add(
+        "/background-sessions/{id}/cancel",
+        "POST",
+        "Stop background session work",
+        "Automation",
+    );
     add(
         "/automation/objects",
         "GET",
@@ -12193,6 +12327,1164 @@ fn automation_watcher_next_run_at(watcher: &crate::core::watcher::Watcher) -> Op
     }
     let base = watcher.last_poll_at.unwrap_or(watcher.created_at);
     Some((base + chrono::Duration::seconds(watcher.interval_secs as i64)).to_rfc3339())
+}
+
+#[derive(Debug, Default)]
+struct BackgroundSessionCounts {
+    tasks_total: usize,
+    tasks_queued: usize,
+    tasks_running: usize,
+    tasks_waiting: usize,
+    tasks_paused: usize,
+    tasks_done: usize,
+    tasks_failed: usize,
+    tasks_cancelled: usize,
+    watchers_total: usize,
+    watchers_active: usize,
+    watchers_paused: usize,
+    watchers_triggered: usize,
+    watchers_stopped: usize,
+}
+
+fn parse_background_session_status(
+    value: Option<&str>,
+) -> Result<Option<crate::core::BackgroundSessionStatus>, String> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+    let status = match normalized.as_str() {
+        "draft" => crate::core::BackgroundSessionStatus::Draft,
+        "active" | "working" => crate::core::BackgroundSessionStatus::Active,
+        "waiting" => crate::core::BackgroundSessionStatus::Waiting,
+        "needs_input" | "needs-input" | "needsinput" => {
+            crate::core::BackgroundSessionStatus::NeedsInput
+        }
+        "paused" => crate::core::BackgroundSessionStatus::Paused,
+        "completed" | "done" => crate::core::BackgroundSessionStatus::Completed,
+        "failed" | "error" => crate::core::BackgroundSessionStatus::Failed,
+        "cancelled" | "canceled" | "stopped" => crate::core::BackgroundSessionStatus::Cancelled,
+        _ => {
+            return Err(format!(
+                "Unsupported background session status: {}",
+                raw.trim()
+            ))
+        }
+    };
+    Ok(Some(status))
+}
+
+fn background_session_status_label(status: &crate::core::BackgroundSessionStatus) -> String {
+    status.label().to_string()
+}
+
+fn task_background_session_id(task: &Task) -> Option<String> {
+    crate::core::background_session_id_from_automation(&task.arguments)
+}
+
+fn watcher_background_session_id(watcher: &crate::core::watcher::Watcher) -> Option<String> {
+    crate::core::background_session_id_from_automation(&watcher.poll_arguments)
+}
+
+fn collect_background_session_counts(
+    session_id: &str,
+    session: &crate::core::BackgroundSession,
+    tasks: &[Task],
+    watchers: &[crate::core::watcher::Watcher],
+) -> BackgroundSessionCounts {
+    let mut counts = BackgroundSessionCounts::default();
+
+    for task in tasks {
+        let task_id = task.id.to_string();
+        let is_linked = session.linked_task_ids.iter().any(|id| id == &task_id)
+            || task_background_session_id(task).as_deref() == Some(session_id);
+        if !is_linked {
+            continue;
+        }
+        counts.tasks_total += 1;
+        match &task.status {
+            TaskStatus::Pending => counts.tasks_queued += 1,
+            TaskStatus::AwaitingApproval | TaskStatus::ExpiredNeedsReapproval => {
+                counts.tasks_waiting += 1
+            }
+            TaskStatus::Paused => counts.tasks_paused += 1,
+            TaskStatus::InProgress => counts.tasks_running += 1,
+            TaskStatus::Completed => counts.tasks_done += 1,
+            TaskStatus::Failed { .. } => counts.tasks_failed += 1,
+            TaskStatus::Cancelled => counts.tasks_cancelled += 1,
+        }
+    }
+
+    for watcher in watchers {
+        let watcher_id = watcher.id.to_string();
+        let is_linked = session
+            .linked_watcher_ids
+            .iter()
+            .any(|id| id == &watcher_id)
+            || watcher_background_session_id(watcher).as_deref() == Some(session_id);
+        if !is_linked {
+            continue;
+        }
+        counts.watchers_total += 1;
+        match &watcher.status {
+            crate::core::watcher::WatcherStatus::Active => counts.watchers_active += 1,
+            crate::core::watcher::WatcherStatus::Paused => counts.watchers_paused += 1,
+            crate::core::watcher::WatcherStatus::Triggered => counts.watchers_triggered += 1,
+            crate::core::watcher::WatcherStatus::TimedOut
+            | crate::core::watcher::WatcherStatus::Cancelled
+            | crate::core::watcher::WatcherStatus::Failed { .. } => counts.watchers_stopped += 1,
+        }
+    }
+
+    counts
+}
+
+fn background_session_live_summary(
+    session: &crate::core::BackgroundSession,
+    counts: &BackgroundSessionCounts,
+) -> String {
+    if let Some(waiting_on) = session.waiting_on.as_deref() {
+        if !waiting_on.trim().is_empty() {
+            return waiting_on.trim().to_string();
+        }
+    }
+    if let Some(current_focus) = session.current_focus.as_deref() {
+        if !current_focus.trim().is_empty() {
+            return current_focus.trim().to_string();
+        }
+    }
+    match session.status {
+        crate::core::BackgroundSessionStatus::Draft => {
+            "Ready to attach work and begin in the background.".to_string()
+        }
+        crate::core::BackgroundSessionStatus::Active => {
+            if counts.tasks_running > 0 {
+                "Working through linked tasks right now.".to_string()
+            } else if counts.watchers_active > 0 {
+                "Watching for changes in the background.".to_string()
+            } else if counts.tasks_queued > 0 {
+                "Queued work is ready to run.".to_string()
+            } else {
+                "Standing by for the next step.".to_string()
+            }
+        }
+        crate::core::BackgroundSessionStatus::Waiting => {
+            "Waiting for an external signal or follow-up.".to_string()
+        }
+        crate::core::BackgroundSessionStatus::NeedsInput => {
+            "Needs an operator decision before it can continue.".to_string()
+        }
+        crate::core::BackgroundSessionStatus::Paused => {
+            "Paused. Linked work will stay idle until resumed.".to_string()
+        }
+        crate::core::BackgroundSessionStatus::Completed => {
+            "Completed. No further work is scheduled.".to_string()
+        }
+        crate::core::BackgroundSessionStatus::Failed => {
+            "Blocked by a failure. Inspect the latest error before resuming.".to_string()
+        }
+        crate::core::BackgroundSessionStatus::Cancelled => {
+            "Stopped by the operator.".to_string()
+        }
+    }
+}
+
+fn background_session_counts_json(counts: &BackgroundSessionCounts) -> serde_json::Value {
+    serde_json::json!({
+        "tasks_total": counts.tasks_total,
+        "tasks_queued": counts.tasks_queued,
+        "tasks_running": counts.tasks_running,
+        "tasks_waiting": counts.tasks_waiting,
+        "tasks_paused": counts.tasks_paused,
+        "tasks_done": counts.tasks_done,
+        "tasks_failed": counts.tasks_failed,
+        "tasks_cancelled": counts.tasks_cancelled,
+        "watchers_total": counts.watchers_total,
+        "watchers_active": counts.watchers_active,
+        "watchers_paused": counts.watchers_paused,
+        "watchers_triggered": counts.watchers_triggered,
+        "watchers_stopped": counts.watchers_stopped,
+    })
+}
+
+fn background_session_list_item_json(
+    session: &crate::core::BackgroundSession,
+    counts: &BackgroundSessionCounts,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": session.id.clone(),
+        "title": session.title.clone(),
+        "objective": session.objective.clone(),
+        "status": background_session_status_label(&session.status),
+        "summary": session.summary.clone(),
+        "current_focus": session.current_focus.clone(),
+        "waiting_on": session.waiting_on.clone(),
+        "next_expected_action": session.next_expected_action.clone(),
+        "last_error": session.last_error.clone(),
+        "preferred_delivery_channel": session.preferred_delivery_channel.clone(),
+        "linked_task_ids": session.linked_task_ids.clone(),
+        "linked_watcher_ids": session.linked_watcher_ids.clone(),
+        "created_at": session.created_at.to_rfc3339(),
+        "updated_at": session.updated_at.to_rfc3339(),
+        "last_activity_at": session.last_activity_at.to_rfc3339(),
+        "live_summary": background_session_live_summary(session, counts),
+        "counts": background_session_counts_json(counts),
+    })
+}
+
+fn background_session_task_json(task: &Task) -> serde_json::Value {
+    serde_json::json!({
+        "id": task.id.to_string(),
+        "description": task.description.clone(),
+        "action": task.action.clone(),
+        "status": automation_task_status_label(&task.status),
+        "created_at": task.created_at.to_rfc3339(),
+        "cron": task.cron.clone(),
+        "result": task.result.clone(),
+    })
+}
+
+fn background_session_watcher_json(
+    watcher: &crate::core::watcher::Watcher,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": watcher.id.to_string(),
+        "description": watcher.description.clone(),
+        "poll_action": watcher.poll_action.clone(),
+        "status": automation_watcher_status_label(&watcher.status),
+        "created_at": watcher.created_at.to_rfc3339(),
+        "last_poll_at": watcher.last_poll_at.map(|value| value.to_rfc3339()),
+        "notify_channel": watcher.notify_channel.clone(),
+        "last_error": watcher.last_error.clone(),
+        "trigger_result": watcher.trigger_result.clone(),
+    })
+}
+
+async fn rebind_task_background_session(
+    state: &AppState,
+    task_id: &str,
+    session_id: Option<&str>,
+) -> Result<bool, String> {
+    let uuid = uuid::Uuid::parse_str(task_id.trim())
+        .map_err(|_| format!("Invalid task id: {}", task_id.trim()))?;
+
+    let serialized_arguments = {
+        let mut tasks = state.tasks.write().await;
+        let Some(task) = tasks.get_mut(uuid) else {
+            return Ok(false);
+        };
+        task.arguments =
+            crate::core::set_background_session_id_in_automation(&task.arguments, session_id);
+        serde_json::to_string(&task.arguments)
+            .map_err(|error| format!("Failed to serialize task arguments: {}", error))?
+    };
+
+    let agent = state.agent.read().await;
+    agent
+        .storage
+        .update_task(
+            task_id.trim(),
+            None,
+            Some(serialized_arguments),
+            None,
+            None,
+        )
+        .await
+        .map_err(|error| format!("Failed to update task linkage: {}", error))?;
+    Ok(true)
+}
+
+async fn rebind_watcher_background_session(
+    state: &AppState,
+    watcher_id: &str,
+    session_id: Option<&str>,
+) -> Result<bool, String> {
+    let uuid = uuid::Uuid::parse_str(watcher_id.trim())
+        .map_err(|_| format!("Invalid watcher id: {}", watcher_id.trim()))?;
+    let agent = state.agent.read().await;
+    Ok(agent
+        .watcher_manager
+        .set_background_session_id(uuid, session_id)
+        .await)
+}
+
+async fn pause_linked_background_session_work(
+    state: &AppState,
+    session: &crate::core::BackgroundSession,
+) -> anyhow::Result<(usize, usize)> {
+    let linked_task_ids: HashSet<String> = session.linked_task_ids.iter().cloned().collect();
+    let mut paused_tasks = Vec::new();
+    {
+        let snapshot = state.tasks.read().await.all().to_vec();
+        let mut tasks = state.tasks.write().await;
+        for task in snapshot {
+            let task_id = task.id.to_string();
+            if !(linked_task_ids.contains(&task_id)
+                || task_background_session_id(&task).as_deref() == Some(session.id.as_str()))
+            {
+                continue;
+            }
+            if let Some(inner) = tasks.get_mut(task.id) {
+                if matches!(inner.status, TaskStatus::Pending | TaskStatus::AwaitingApproval) {
+                    inner.status = TaskStatus::Paused;
+                    paused_tasks.push(task_id);
+                }
+            }
+        }
+    }
+
+    if !paused_tasks.is_empty() {
+        let agent = state.agent.read().await;
+        for task_id in &paused_tasks {
+            agent
+                .storage
+                .update_task_status(task_id, "\"Paused\"")
+                .await?;
+        }
+    }
+
+    let mut paused_watchers = 0usize;
+    {
+        let agent = state.agent.read().await;
+        for watcher_id in &session.linked_watcher_ids {
+            if let Ok(uuid) = uuid::Uuid::parse_str(watcher_id) {
+                if agent.watcher_manager.pause(uuid).await {
+                    paused_watchers += 1;
+                    if let Some(watcher) = agent.watcher_manager.get(uuid).await {
+                        agent
+                            .sync_watcher_supervisor_state(&watcher, Some("paused"), None)
+                            .await;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((paused_tasks.len(), paused_watchers))
+}
+
+async fn resume_linked_background_session_work(
+    state: &AppState,
+    session: &crate::core::BackgroundSession,
+) -> anyhow::Result<(usize, usize)> {
+    let linked_task_ids: HashSet<String> = session.linked_task_ids.iter().cloned().collect();
+    let mut resumed_tasks = Vec::new();
+    let mut rescheduled_tasks: Vec<(String, String)> = Vec::new();
+    {
+        let snapshot = state.tasks.read().await.all().to_vec();
+        let mut tasks = state.tasks.write().await;
+        for task in snapshot {
+            let task_id = task.id.to_string();
+            if !(linked_task_ids.contains(&task_id)
+                || task_background_session_id(&task).as_deref() == Some(session.id.as_str()))
+            {
+                continue;
+            }
+            if let Some(inner) = tasks.get_mut(task.id) {
+                if inner.action == "chat_request" {
+                    continue;
+                }
+                if matches!(inner.status, TaskStatus::Paused) {
+                    inner.status = TaskStatus::Pending;
+                    let now = chrono::Utc::now();
+                    if inner.cron.is_some()
+                        || inner
+                            .scheduled_for
+                            .as_ref()
+                            .map(|dt| *dt <= now)
+                            .unwrap_or(false)
+                    {
+                        inner.scheduled_for = Some(now);
+                        rescheduled_tasks.push((task_id.clone(), now.to_rfc3339()));
+                    }
+                    resumed_tasks.push(task_id);
+                }
+            }
+        }
+    }
+
+    if !resumed_tasks.is_empty() {
+        let agent = state.agent.read().await;
+        for task_id in &resumed_tasks {
+            agent
+                .storage
+                .update_task_status(task_id, "\"Pending\"")
+                .await?;
+        }
+        for (task_id, scheduled_for) in &rescheduled_tasks {
+            agent
+                .storage
+                .update_task(task_id, None, None, None, Some(scheduled_for.clone()))
+                .await?;
+        }
+    }
+
+    let mut resumed_watchers = 0usize;
+    {
+        let agent = state.agent.read().await;
+        for watcher_id in &session.linked_watcher_ids {
+            if let Ok(uuid) = uuid::Uuid::parse_str(watcher_id) {
+                if agent.watcher_manager.resume(uuid).await {
+                    resumed_watchers += 1;
+                    if let Some(watcher) = agent.watcher_manager.get(uuid).await {
+                        agent
+                            .sync_watcher_supervisor_state(&watcher, Some("active"), None)
+                            .await;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((resumed_tasks.len(), resumed_watchers))
+}
+
+async fn cancel_linked_background_session_work(
+    state: &AppState,
+    session: &crate::core::BackgroundSession,
+) -> anyhow::Result<(usize, usize)> {
+    let linked_task_ids: HashSet<String> = session.linked_task_ids.iter().cloned().collect();
+    let mut cancelled_tasks = Vec::new();
+    {
+        let snapshot = state.tasks.read().await.all().to_vec();
+        let mut tasks = state.tasks.write().await;
+        for task in snapshot {
+            let task_id = task.id.to_string();
+            if !(linked_task_ids.contains(&task_id)
+                || task_background_session_id(&task).as_deref() == Some(session.id.as_str()))
+            {
+                continue;
+            }
+            if let Some(inner) = tasks.get_mut(task.id) {
+                if matches!(
+                    inner.status,
+                    TaskStatus::Pending
+                        | TaskStatus::AwaitingApproval
+                        | TaskStatus::Paused
+                        | TaskStatus::InProgress
+                ) {
+                    inner.status = TaskStatus::Cancelled;
+                    cancelled_tasks.push(task_id);
+                }
+            }
+        }
+    }
+
+    if !cancelled_tasks.is_empty() {
+        let agent = state.agent.read().await;
+        for task_id in &cancelled_tasks {
+            agent
+                .storage
+                .update_task_status(task_id, "\"Cancelled\"")
+                .await?;
+            signal_chat_task_cancellation(state, task_id).await;
+        }
+    }
+
+    let mut cancelled_watchers = 0usize;
+    {
+        let agent = state.agent.read().await;
+        for watcher_id in &session.linked_watcher_ids {
+            if let Ok(uuid) = uuid::Uuid::parse_str(watcher_id) {
+                if agent.watcher_manager.cancel(uuid).await {
+                    cancelled_watchers += 1;
+                    if let Some(watcher) = agent.watcher_manager.get(uuid).await {
+                        agent
+                            .sync_watcher_supervisor_state(&watcher, Some("cancelled"), None)
+                            .await;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((cancelled_tasks.len(), cancelled_watchers))
+}
+
+async fn list_background_sessions(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let tasks = { state.tasks.read().await.all().to_vec() };
+    let (sessions, watchers) = {
+        let agent = state.agent.read().await;
+        (
+            agent.background_sessions.list().await,
+            agent.watcher_manager.list().await,
+        )
+    };
+
+    let session_items: Vec<_> = sessions
+        .iter()
+        .map(|session| {
+            let counts = collect_background_session_counts(&session.id, session, &tasks, &watchers);
+            background_session_list_item_json(session, &counts)
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "sessions": session_items,
+        "total": session_items.len(),
+    }))
+}
+
+async fn create_background_session(
+    State(state): State<AppState>,
+    Json(request): Json<CreateBackgroundSessionRequest>,
+) -> Response {
+    let objective = request.objective.trim();
+    if objective.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Objective is required.".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let session = {
+        let agent = state.agent.read().await;
+        agent
+            .background_sessions
+            .create(
+                crate::core::BackgroundSessionCreate {
+                    title: request.title.clone(),
+                    objective: request.objective.clone(),
+                    summary: request.summary.clone(),
+                    current_focus: request.current_focus.clone(),
+                    waiting_on: request.waiting_on.clone(),
+                    next_expected_action: request.next_expected_action.clone(),
+                    working_memory: request.working_memory.clone(),
+                    preferred_delivery_channel: request.preferred_delivery_channel.clone(),
+                    channel: request.channel.clone(),
+                    conversation_id: request.conversation_id.clone(),
+                    project_id: request.project_id.clone(),
+                    task_ids: Vec::new(),
+                    watcher_ids: Vec::new(),
+                },
+                Some("api"),
+            )
+            .await
+    };
+
+    if !request.task_ids.is_empty() || !request.watcher_ids.is_empty() {
+        let mut linked_task_ids = Vec::new();
+        let mut linked_watcher_ids = Vec::new();
+
+        for task_id in &request.task_ids {
+            match rebind_task_background_session(&state, task_id, Some(&session.id)).await {
+                Ok(true) => linked_task_ids.push(task_id.trim().to_string()),
+                Ok(false) => {}
+                Err(error) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse { error }),
+                    )
+                        .into_response()
+                }
+            }
+        }
+        for watcher_id in &request.watcher_ids {
+            match rebind_watcher_background_session(&state, watcher_id, Some(&session.id)).await {
+                Ok(true) => linked_watcher_ids.push(watcher_id.trim().to_string()),
+                Ok(false) => {}
+                Err(error) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse { error }),
+                    )
+                        .into_response()
+                }
+            }
+        }
+
+        let agent = state.agent.read().await;
+        agent
+            .background_sessions
+            .remove_child_references(&linked_task_ids, &linked_watcher_ids, Some("api"))
+            .await;
+        let _ = agent
+            .background_sessions
+            .attach_items(&session.id, &linked_task_ids, &linked_watcher_ids, Some("api"))
+            .await;
+    }
+
+    spawn_autonomy_analysis_tick(state.agent.clone(), "background_session_created");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "id": session.id,
+        })),
+    )
+        .into_response()
+}
+
+async fn get_background_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let tasks = { state.tasks.read().await.all().to_vec() };
+    let (session, watchers, runs) = {
+        let agent = state.agent.read().await;
+        (
+            agent.background_sessions.get(&id).await,
+            agent.watcher_manager.list().await,
+            crate::core::list_automation_runs(&agent.storage, 80)
+                .await
+                .unwrap_or_default(),
+        )
+    };
+    let Some(session) = session else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Background session not found.".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let counts = collect_background_session_counts(&session.id, &session, &tasks, &watchers);
+    let linked_task_id_set: HashSet<String> = session.linked_task_ids.iter().cloned().collect();
+    let linked_watcher_id_set: HashSet<String> = session.linked_watcher_ids.iter().cloned().collect();
+
+    let linked_tasks: Vec<_> = tasks
+        .iter()
+        .filter(|task| {
+            linked_task_id_set.contains(&task.id.to_string())
+                || task_background_session_id(task).as_deref() == Some(session.id.as_str())
+        })
+        .map(background_session_task_json)
+        .collect();
+
+    let linked_watchers: Vec<_> = watchers
+        .iter()
+        .filter(|watcher| {
+            linked_watcher_id_set.contains(&watcher.id.to_string())
+                || watcher_background_session_id(watcher).as_deref() == Some(session.id.as_str())
+        })
+        .map(background_session_watcher_json)
+        .collect();
+
+    let run_target_ids: HashSet<String> = session
+        .linked_task_ids
+        .iter()
+        .chain(session.linked_watcher_ids.iter())
+        .cloned()
+        .collect();
+    let recent_runs: Vec<_> = runs
+        .into_iter()
+        .filter(|run| run_target_ids.contains(&run.automation_id))
+        .take(24)
+        .map(|run| {
+            serde_json::json!({
+                "id": run.id.clone(),
+                "automation_id": run.automation_id.clone(),
+                "kind": run.automation_kind.clone(),
+                "title": run.title.clone(),
+                "action": run.action.clone(),
+                "trigger": run.trigger.clone(),
+                "status": automation_run_status_label(&run.status),
+                "attempt": run.attempt,
+                "started_at": run.started_at.clone(),
+                "completed_at": run.completed_at.clone(),
+                "duration_ms": run.duration_ms,
+                "summary": run.critique.summary.clone(),
+                "output_preview": run.output_preview.clone(),
+                "error": run.error.clone(),
+                "next_retry_at": run.next_retry_at.clone(),
+            })
+        })
+        .collect();
+
+    let live_task_ids: HashSet<String> = linked_tasks
+        .iter()
+        .filter_map(|item| {
+            item.get("id")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string())
+        })
+        .collect();
+    let live_watcher_ids: HashSet<String> = linked_watchers
+        .iter()
+        .filter_map(|item| {
+            item.get("id")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string())
+        })
+        .collect();
+    let missing_task_ids: Vec<_> = session
+        .linked_task_ids
+        .iter()
+        .filter(|task_id| !live_task_ids.contains(*task_id))
+        .cloned()
+        .collect();
+    let missing_watcher_ids: Vec<_> = session
+        .linked_watcher_ids
+        .iter()
+        .filter(|watcher_id| !live_watcher_ids.contains(*watcher_id))
+        .cloned()
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "session": background_session_list_item_json(&session, &counts),
+            "session_detail": {
+                "working_memory": session.working_memory.clone(),
+                "channel": session.channel.clone(),
+                "conversation_id": session.conversation_id.clone(),
+                "project_id": session.project_id.clone(),
+                "events": session.events.iter().map(|event| serde_json::json!({
+                    "id": event.id.clone(),
+                    "at": event.at.to_rfc3339(),
+                    "kind": event.kind.clone(),
+                    "summary": event.summary.clone(),
+                    "detail": event.detail.clone(),
+                    "actor": event.actor.clone(),
+                })).collect::<Vec<_>>(),
+            },
+            "linked_tasks": linked_tasks,
+            "linked_watchers": linked_watchers,
+            "recent_runs": recent_runs,
+            "missing_links": {
+                "task_ids": missing_task_ids,
+                "watcher_ids": missing_watcher_ids,
+            }
+        })),
+    )
+        .into_response()
+}
+
+async fn update_background_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<UpdateBackgroundSessionRequest>,
+) -> Response {
+    let status = match parse_background_session_status(request.status.as_deref()) {
+        Ok(status) => status,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse { error }),
+            )
+                .into_response()
+        }
+    };
+
+    let updated = {
+        let agent = state.agent.read().await;
+        agent
+            .background_sessions
+            .update(
+                &id,
+                crate::core::BackgroundSessionUpdate {
+                    title: request.title,
+                    objective: request.objective,
+                    status,
+                    summary: request.summary,
+                    current_focus: request.current_focus,
+                    waiting_on: request.waiting_on,
+                    next_expected_action: request.next_expected_action,
+                    working_memory: request.working_memory,
+                    last_error: request.last_error,
+                    preferred_delivery_channel: request.preferred_delivery_channel,
+                },
+                Some("api"),
+            )
+            .await
+    };
+
+    if updated.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Background session not found.".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    spawn_autonomy_analysis_tick(state.agent.clone(), "background_session_updated");
+    (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response()
+}
+
+async fn attach_background_session_work(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<BackgroundSessionLinkRequest>,
+) -> Response {
+    let session_exists = {
+        let agent = state.agent.read().await;
+        agent.background_sessions.get(&id).await.is_some()
+    };
+    if !session_exists {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Background session not found.".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let mut linked_task_ids = Vec::new();
+    let mut linked_watcher_ids = Vec::new();
+
+    for task_id in &request.task_ids {
+        match rebind_task_background_session(&state, task_id, Some(&id)).await {
+            Ok(true) => linked_task_ids.push(task_id.trim().to_string()),
+            Ok(false) => {}
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse { error }),
+                )
+                    .into_response()
+            }
+        }
+    }
+    for watcher_id in &request.watcher_ids {
+        match rebind_watcher_background_session(&state, watcher_id, Some(&id)).await {
+            Ok(true) => linked_watcher_ids.push(watcher_id.trim().to_string()),
+            Ok(false) => {}
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse { error }),
+                )
+                    .into_response()
+            }
+        }
+    }
+
+    let attached = {
+        let agent = state.agent.read().await;
+        agent
+            .background_sessions
+            .remove_child_references(&linked_task_ids, &linked_watcher_ids, Some("api"))
+            .await;
+        agent
+            .background_sessions
+            .attach_items(&id, &linked_task_ids, &linked_watcher_ids, Some("api"))
+            .await
+    };
+
+    if attached.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Background session not found.".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    spawn_autonomy_analysis_tick(state.agent.clone(), "background_session_attached");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "linked_task_ids": linked_task_ids,
+            "linked_watcher_ids": linked_watcher_ids,
+        })),
+    )
+        .into_response()
+}
+
+async fn detach_background_session_work(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<BackgroundSessionLinkRequest>,
+) -> Response {
+    let session_exists = {
+        let agent = state.agent.read().await;
+        agent.background_sessions.get(&id).await.is_some()
+    };
+    if !session_exists {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Background session not found.".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let mut detached_task_ids = Vec::new();
+    let mut detached_watcher_ids = Vec::new();
+
+    for task_id in &request.task_ids {
+        match rebind_task_background_session(&state, task_id, None).await {
+            Ok(true) => detached_task_ids.push(task_id.trim().to_string()),
+            Ok(false) => {}
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse { error }),
+                )
+                    .into_response()
+            }
+        }
+    }
+    for watcher_id in &request.watcher_ids {
+        match rebind_watcher_background_session(&state, watcher_id, None).await {
+            Ok(true) => detached_watcher_ids.push(watcher_id.trim().to_string()),
+            Ok(false) => {}
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse { error }),
+                )
+                    .into_response()
+            }
+        }
+    }
+
+    let detached = {
+        let agent = state.agent.read().await;
+        agent
+            .background_sessions
+            .detach_items(&id, &detached_task_ids, &detached_watcher_ids, Some("api"))
+            .await
+    };
+
+    if detached.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Background session not found.".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    spawn_autonomy_analysis_tick(state.agent.clone(), "background_session_detached");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "detached_task_ids": detached_task_ids,
+            "detached_watcher_ids": detached_watcher_ids,
+        })),
+    )
+        .into_response()
+}
+
+async fn pause_background_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let session = {
+        let agent = state.agent.read().await;
+        agent.background_sessions.get(&id).await
+    };
+    let Some(session) = session else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Background session not found.".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let (paused_tasks, paused_watchers) =
+        match pause_linked_background_session_work(&state, &session).await {
+            Ok(result) => result,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to pause background session work: {}", error),
+                    }),
+                )
+                    .into_response()
+            }
+        };
+
+    {
+        let agent = state.agent.read().await;
+        let _ = agent
+            .background_sessions
+            .set_status(
+                &id,
+                crate::core::BackgroundSessionStatus::Paused,
+                "Background session paused.",
+                Some("api"),
+            )
+            .await;
+    }
+
+    spawn_autonomy_analysis_tick(state.agent.clone(), "background_session_paused");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "paused_tasks": paused_tasks,
+            "paused_watchers": paused_watchers,
+        })),
+    )
+        .into_response()
+}
+
+async fn resume_background_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let session = {
+        let agent = state.agent.read().await;
+        agent.background_sessions.get(&id).await
+    };
+    let Some(session) = session else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Background session not found.".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let (resumed_tasks, resumed_watchers) =
+        match resume_linked_background_session_work(&state, &session).await {
+            Ok(result) => result,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to resume background session work: {}", error),
+                    }),
+                )
+                    .into_response()
+            }
+        };
+
+    {
+        let agent = state.agent.read().await;
+        let _ = agent
+            .background_sessions
+            .set_status(
+                &id,
+                crate::core::BackgroundSessionStatus::Active,
+                "Background session resumed.",
+                Some("api"),
+            )
+            .await;
+    }
+
+    spawn_autonomy_analysis_tick(state.agent.clone(), "background_session_resumed");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "resumed_tasks": resumed_tasks,
+            "resumed_watchers": resumed_watchers,
+        })),
+    )
+        .into_response()
+}
+
+async fn cancel_background_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let session = {
+        let agent = state.agent.read().await;
+        agent.background_sessions.get(&id).await
+    };
+    let Some(session) = session else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Background session not found.".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let (cancelled_tasks, cancelled_watchers) =
+        match cancel_linked_background_session_work(&state, &session).await {
+            Ok(result) => result,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to stop background session work: {}", error),
+                    }),
+                )
+                    .into_response()
+            }
+        };
+
+    {
+        let agent = state.agent.read().await;
+        let _ = agent
+            .background_sessions
+            .set_status(
+                &id,
+                crate::core::BackgroundSessionStatus::Cancelled,
+                "Background session stopped.",
+                Some("api"),
+            )
+            .await;
+    }
+
+    spawn_autonomy_analysis_tick(state.agent.clone(), "background_session_cancelled");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "cancelled_tasks": cancelled_tasks,
+            "cancelled_watchers": cancelled_watchers,
+        })),
+    )
+        .into_response()
+}
+
+async fn delete_background_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let removed = {
+        let agent = state.agent.read().await;
+        agent.background_sessions.delete(&id).await
+    };
+    let Some(session) = removed else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Background session not found.".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    for task_id in &session.linked_task_ids {
+        if let Err(error) = rebind_task_background_session(&state, task_id, None).await {
+            tracing::warn!(
+                "Failed to unlink task {} from deleted background session {}: {}",
+                task_id,
+                id,
+                error
+            );
+        }
+    }
+    for watcher_id in &session.linked_watcher_ids {
+        if let Err(error) = rebind_watcher_background_session(&state, watcher_id, None).await {
+            tracing::warn!(
+                "Failed to unlink watcher {} from deleted background session {}: {}",
+                watcher_id,
+                id,
+                error
+            );
+        }
+    }
+
+    spawn_autonomy_analysis_tick(state.agent.clone(), "background_session_deleted");
+    (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response()
 }
 
 async fn list_automation_objects(State(state): State<AppState>) -> Json<serde_json::Value> {

@@ -13,6 +13,22 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: agentark
+          POSTGRES_PASSWORD: agentark
+          POSTGRES_DB: agentark
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agentark -d agentark"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      AGENTARK_DATABASE_URL: postgres://agentark:agentark@127.0.0.1:5432/agentark
     steps:
       - name: Checkout
         uses: actions/checkout@v4

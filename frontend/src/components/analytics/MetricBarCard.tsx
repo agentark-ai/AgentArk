@@ -12,15 +12,20 @@ type Props = {
   values: number[];
   rows: MetricLegendRow[];
   palette: string[];
+  className?: string;
+  chartHeight?: number;
 };
 
-export function MetricBarCard({ title, value, values, rows, palette }: Props) {
+export function MetricBarCard({ title, value, values, rows, palette, className = "", chartHeight = 84 }: Props) {
   const option = {
     backgroundColor: "transparent",
     animation: true,
     animationDuration: 800,
     animationEasing: "cubicOut",
     animationDelay: (idx: number) => idx * 60,
+    animationDurationUpdate: 460,
+    animationEasingUpdate: "quarticOut",
+    animationDelayUpdate: (idx: number) => idx * 35,
     grid: { left: 0, right: 0, top: 8, bottom: 2, containLabel: false },
     tooltip: {
       trigger: "axis",
@@ -77,7 +82,7 @@ export function MetricBarCard({ title, value, values, rows, palette }: Props) {
 
   return (
     <Box
-      className="list-shell"
+      className={`list-shell metric-bar-card stat-card rise-in ${className}`.trim()}
       sx={{
         p: 1.6,
         borderRadius: "12px",
@@ -85,17 +90,18 @@ export function MetricBarCard({ title, value, values, rows, palette }: Props) {
         background: "linear-gradient(170deg, rgba(6,15,29,0.95), rgba(3,9,21,0.9))",
       }}
     >
-      <Typography variant="subtitle1" sx={{ color: "#d8edff", fontWeight: 600 }}>
+      <Typography variant="subtitle1" className="metric-bar-card-title">
         {title}
       </Typography>
-      <Typography variant="h4" sx={{ color: "#f3fbff", fontWeight: 700, mb: 0.4 }}>
+      <Typography variant="h4" className="metric-bar-card-value">
         {value}
       </Typography>
-      <ReactECharts option={option} style={{ height: 84 }} />
+      <ReactECharts option={option} style={{ height: chartHeight }} className="metric-bar-card-chart" />
       <Stack spacing={0.5} sx={{ mt: 0.8 }}>
         {rows.map((row, index) => (
           <Stack
             key={`${title}-${row.label}-${index}`}
+            className="metric-bar-card-row"
             direction="row"
             justifyContent="space-between"
             alignItems="center"
@@ -110,11 +116,11 @@ export function MetricBarCard({ title, value, values, rows, palette }: Props) {
                   flex: "0 0 auto",
                 }}
               />
-              <Typography variant="body2" noWrap title={row.label}>
+              <Typography variant="body2" className="metric-bar-card-row-label" noWrap title={row.label}>
                 {row.label}
               </Typography>
             </Stack>
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" className="metric-bar-card-row-value">
               {row.value}
             </Typography>
           </Stack>

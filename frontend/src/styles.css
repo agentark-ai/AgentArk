@@ -3263,6 +3263,365 @@ body {
   min-width: 100%;
 }
 
+.metric-bar-card {
+  position: relative;
+  overflow: hidden;
+  border-radius: 16px !important;
+  border: 1px solid rgba(94, 157, 219, 0.22) !important;
+  background:
+    radial-gradient(circle at top left, rgba(66, 214, 255, 0.14), transparent 38%),
+    linear-gradient(170deg, rgba(8, 19, 37, 0.96), rgba(4, 11, 23, 0.92)) !important;
+  box-shadow:
+    inset 0 0 0 1px rgba(104, 176, 236, 0.05),
+    0 18px 30px rgba(0, 0, 0, 0.22);
+}
+
+.metric-bar-card-title {
+  color: rgba(196, 228, 255, 0.88) !important;
+  font-weight: 600 !important;
+  letter-spacing: 0.01em;
+}
+
+.metric-bar-card-value {
+  margin-bottom: 4px !important;
+  color: rgba(244, 251, 255, 0.98) !important;
+  font-weight: 700 !important;
+}
+
+.metric-bar-card-chart {
+  position: relative;
+  z-index: 1;
+}
+
+.metric-bar-card-row {
+  padding: 4px 0;
+  border-bottom: 1px solid rgba(96, 154, 214, 0.08);
+}
+
+.metric-bar-card-row:last-child {
+  border-bottom: 0;
+}
+
+.metric-bar-card-row-label {
+  color: rgba(212, 233, 255, 0.9) !important;
+}
+
+.metric-bar-card-row-value {
+  color: rgba(152, 194, 231, 0.88) !important;
+}
+
+.diagnostics-section-shell {
+  padding: 16px 16px 18px !important;
+}
+
+.diagnostics-section-head {
+  margin-bottom: 18px !important;
+  padding: 18px 20px;
+  border: 1px solid rgba(97, 162, 224, 0.2);
+  border-radius: 18px;
+  background:
+    radial-gradient(circle at top left, rgba(61, 214, 255, 0.12), transparent 34%),
+    linear-gradient(160deg, rgba(8, 20, 38, 0.94), rgba(5, 12, 24, 0.9));
+  box-shadow:
+    inset 0 0 0 1px rgba(109, 179, 236, 0.04),
+    0 18px 30px rgba(0, 0, 0, 0.18);
+}
+
+.diagnostics-section-copy {
+  min-width: 0;
+  max-width: 76ch;
+}
+
+.diagnostics-section-eyebrow,
+.diagnostics-dialog-eyebrow {
+  display: block;
+  margin-bottom: 8px;
+  color: rgba(132, 206, 255, 0.78);
+  font-size: 11px !important;
+  font-weight: 700 !important;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.diagnostics-section-title {
+  color: rgba(244, 250, 255, 0.98) !important;
+  font-weight: 700 !important;
+  letter-spacing: -0.01em;
+}
+
+.diagnostics-section-description {
+  margin-top: 6px !important;
+  color: rgba(178, 207, 235, 0.84) !important;
+  line-height: 1.6 !important;
+  max-width: 72ch;
+}
+
+.diagnostics-section-meta {
+  flex: 0 0 auto;
+  max-width: 100%;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(92, 151, 211, 0.2);
+  background: rgba(6, 17, 33, 0.72);
+  color: rgba(214, 237, 255, 0.9);
+  font-size: 12px;
+  line-height: 1.45;
+  letter-spacing: 0.04em;
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.diagnostics-stat-card {
+  min-height: 96px;
+  border-color: rgba(96, 157, 217, 0.18) !important;
+  background:
+    linear-gradient(180deg, rgba(8, 19, 37, 0.88), rgba(5, 12, 24, 0.78)),
+    radial-gradient(circle at top left, rgba(56, 200, 255, 0.08), transparent 42%);
+  box-shadow:
+    inset 0 0 0 1px rgba(101, 165, 224, 0.04),
+    0 10px 24px rgba(0, 0, 0, 0.16);
+}
+
+.diagnostics-stat-label {
+  display: block !important;
+  color: rgba(140, 187, 227, 0.72) !important;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 10px !important;
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.diagnostics-stat-value {
+  margin-top: 8px !important;
+  color: rgba(242, 249, 255, 0.97) !important;
+  font-weight: 700 !important;
+}
+
+.diagnostics-chart-card {
+  min-height: 100%;
+}
+
+.diagnostics-table-shell {
+  max-height: min(56vh, 520px);
+  border-color: rgba(102, 162, 221, 0.22);
+  background:
+    linear-gradient(180deg, rgba(4, 11, 23, 0.88), rgba(3, 8, 18, 0.8)),
+    radial-gradient(circle at top left, rgba(58, 188, 255, 0.06), transparent 36%);
+  box-shadow:
+    inset 0 0 0 1px rgba(95, 155, 214, 0.04),
+    0 18px 30px rgba(0, 0, 0, 0.14);
+}
+
+.diagnostics-table-shell th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: rgba(8, 17, 31, 0.94) !important;
+  border-bottom-color: rgba(102, 162, 221, 0.2) !important;
+  color: rgba(154, 206, 244, 0.8) !important;
+  font-size: 10.5px !important;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.diagnostics-table-shell td {
+  border-bottom-color: rgba(96, 154, 214, 0.1) !important;
+  vertical-align: top;
+}
+
+.diagnostics-table-shell tbody tr {
+  transition: background 160ms ease, transform 160ms ease;
+}
+
+.diagnostics-table-shell tbody tr:hover {
+  background: rgba(52, 138, 212, 0.08);
+}
+
+.diagnostics-cell-clamp {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  white-space: normal !important;
+  word-break: break-word;
+  line-height: 1.5 !important;
+}
+
+.diagnostics-cell-clamp--2 {
+  -webkit-line-clamp: 2;
+}
+
+.diagnostics-dialog-shell {
+  border: 1px solid rgba(102, 162, 221, 0.24);
+  border-radius: 22px !important;
+  background:
+    radial-gradient(circle at top left, rgba(58, 196, 255, 0.1), transparent 34%),
+    linear-gradient(180deg, rgba(7, 16, 31, 0.98), rgba(4, 10, 20, 0.96)) !important;
+  box-shadow:
+    inset 0 0 0 1px rgba(106, 172, 233, 0.04),
+    0 24px 44px rgba(0, 0, 0, 0.34) !important;
+  overflow: hidden;
+}
+
+.diagnostics-dialog-title {
+  padding: 18px 20px 14px !important;
+  border-bottom: 1px solid rgba(95, 154, 214, 0.14);
+  background: linear-gradient(180deg, rgba(10, 21, 39, 0.94), rgba(8, 17, 31, 0.82));
+}
+
+.diagnostics-dialog-content {
+  padding: 18px 20px 20px !important;
+  background: transparent;
+}
+
+.diagnostics-dialog-content.MuiDialogContent-dividers {
+  border-top: 0 !important;
+  border-bottom: 1px solid rgba(95, 154, 214, 0.12) !important;
+}
+
+.diagnostics-dialog-close {
+  color: rgba(178, 214, 245, 0.78) !important;
+  background: rgba(8, 17, 31, 0.56) !important;
+  border: 1px solid rgba(95, 154, 214, 0.16) !important;
+}
+
+.diagnostics-dialog-close:hover {
+  background: rgba(13, 29, 50, 0.86) !important;
+  color: rgba(224, 239, 255, 0.96) !important;
+}
+
+.diagnostics-dialog-actions {
+  padding: 12px 18px 16px !important;
+  background: linear-gradient(180deg, rgba(6, 14, 27, 0.74), rgba(4, 11, 22, 0.88));
+}
+
+.diagnostics-dialog-intro {
+  padding: 16px 18px;
+  border: 1px solid rgba(95, 154, 214, 0.18);
+  border-radius: 18px;
+  background:
+    radial-gradient(circle at top left, rgba(60, 206, 255, 0.1), transparent 34%),
+    linear-gradient(160deg, rgba(9, 21, 39, 0.92), rgba(6, 14, 28, 0.86));
+}
+
+.diagnostics-keyline,
+.diagnostics-footer-note {
+  color: rgba(148, 190, 225, 0.8) !important;
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.diagnostics-content-card {
+  border: 1px solid rgba(96, 154, 214, 0.16);
+  border-radius: 16px;
+  padding: 14px 15px;
+  background:
+    linear-gradient(180deg, rgba(8, 19, 36, 0.84), rgba(5, 12, 24, 0.76)),
+    radial-gradient(circle at top left, rgba(60, 188, 255, 0.05), transparent 34%);
+  box-shadow: inset 0 0 0 1px rgba(102, 160, 218, 0.04);
+}
+
+.diagnostics-content-card--output {
+  border-color: rgba(67, 179, 255, 0.22);
+  background:
+    linear-gradient(180deg, rgba(10, 24, 43, 0.88), rgba(7, 16, 31, 0.8)),
+    radial-gradient(circle at top left, rgba(68, 189, 255, 0.08), transparent 36%);
+}
+
+.diagnostics-content-card--review {
+  border-color: rgba(132, 165, 255, 0.2);
+}
+
+.diagnostics-card-label {
+  display: block !important;
+  margin-bottom: 8px !important;
+  color: rgba(138, 197, 241, 0.8) !important;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  font-size: 10.5px !important;
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.diagnostics-card-copy {
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: rgba(225, 238, 251, 0.94) !important;
+  line-height: 1.6 !important;
+}
+
+.diagnostics-card-copy--scroll {
+  max-height: 220px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.diagnostics-subcard {
+  padding: 12px;
+  border: 1px solid rgba(95, 154, 214, 0.14);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.diagnostics-artifact-row {
+  margin-top: -2px;
+}
+
+.diagnostics-steps-shell {
+  max-height: min(52vh, 520px);
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.diagnostics-step-item {
+  padding: 12px 14px;
+  border: 1px solid rgba(95, 154, 214, 0.12);
+  border-radius: 14px;
+  background:
+    linear-gradient(180deg, rgba(7, 17, 32, 0.88), rgba(5, 11, 22, 0.82)),
+    radial-gradient(circle at top left, rgba(56, 190, 255, 0.05), transparent 34%);
+}
+
+.diagnostics-step-head {
+  min-width: 0;
+}
+
+.diagnostics-step-time {
+  min-width: 78px;
+  color: rgba(141, 190, 225, 0.76) !important;
+  font-size: 10.5px !important;
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.diagnostics-step-title {
+  color: rgba(237, 245, 255, 0.96) !important;
+}
+
+.diagnostics-step-detail {
+  display: block;
+  padding-left: 86px;
+  margin-top: 6px !important;
+  white-space: pre-wrap;
+  line-height: 1.55;
+}
+
+.diagnostics-code-block {
+  margin: 10px 0 0;
+  padding: 10px 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 11px;
+  border-radius: 12px;
+  border: 1px solid rgba(95, 154, 214, 0.14);
+  background: rgba(3, 8, 18, 0.78);
+  color: rgba(202, 227, 252, 0.92);
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  overflow: auto;
+}
+
+.diagnostics-step-code {
+  margin-left: 86px;
+  max-height: 140px;
+}
+
 .bulk-import-source-card {
   border: 1px solid rgba(0, 255, 170, 0.1);
   border-radius: 14px;
@@ -3626,12 +3985,35 @@ body {
   .inbox-grid {
     grid-template-columns: 1fr;
   }
+  .diagnostics-section-shell {
+    padding: 14px !important;
+  }
+  .diagnostics-section-head,
+  .diagnostics-dialog-intro,
+  .diagnostics-content-card {
+    padding: 14px;
+  }
+  .diagnostics-dialog-title,
+  .diagnostics-dialog-content,
+  .diagnostics-dialog-actions {
+    padding-left: 14px !important;
+    padding-right: 14px !important;
+  }
 }
 
 @media (max-width: 640px) {
   .chat-empty-state {
     align-items: flex-start;
     text-align: left;
+  }
+  .diagnostics-step-detail {
+    padding-left: 0;
+  }
+  .diagnostics-step-code {
+    margin-left: 0;
+  }
+  .diagnostics-step-time {
+    min-width: 0;
   }
 }
 

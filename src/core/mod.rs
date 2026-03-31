@@ -4,6 +4,7 @@
 mod agent;
 pub mod automation;
 pub mod autonomy;
+pub mod background_session;
 pub mod browser_profiles;
 pub mod browser_session;
 pub mod config;
@@ -44,6 +45,11 @@ pub use agent::{
 pub use automation::{
     list_runs as list_automation_runs, list_supervisor_states as list_automation_supervisor_states,
     AutomationRunStatus, AutomationSupervisorState,
+};
+pub use background_session::{
+    background_session_id_from_automation, set_background_session_id_in_automation,
+    BackgroundSession, BackgroundSessionCreate, BackgroundSessionEvent, BackgroundSessionManager,
+    BackgroundSessionStatus, BackgroundSessionUpdate,
 };
 pub use autonomy::{
     score_action_risk, AutonomySettings, AutopilotMode, ConversationScope, RecommendedAction,

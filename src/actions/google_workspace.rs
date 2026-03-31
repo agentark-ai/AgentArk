@@ -621,6 +621,46 @@ fn probe_status_counts_as_connected(status: reqwest::StatusCode) -> bool {
     )
 }
 
+#[cfg(test)]
+fn google_test_api_override(config_dir: &Path, key: &str, default: &'static str) -> String {
+    let path = config_dir.join(key);
+    match std::fs::read_to_string(path) {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                default.to_string()
+            } else {
+                trimmed.to_string()
+            }
+        }
+        Err(_) => default.to_string(),
+    }
+}
+
+#[cfg(test)]
+fn docs_api_base(config_dir: &Path) -> String {
+    google_test_api_override(config_dir, ".agentark_test_docs_api_base", DOCS_API_BASE)
+}
+
+#[cfg(not(test))]
+fn docs_api_base(_config_dir: &Path) -> &'static str {
+    DOCS_API_BASE
+}
+
+#[cfg(test)]
+fn sheets_api_base(config_dir: &Path) -> String {
+    google_test_api_override(
+        config_dir,
+        ".agentark_test_sheets_api_base",
+        SHEETS_API_BASE,
+    )
+}
+
+#[cfg(not(test))]
+fn sheets_api_base(_config_dir: &Path) -> &'static str {
+    SHEETS_API_BASE
+}
+
 async fn current_workspace_access_token(config_dir: &Path) -> Result<String> {
     let mut tokens = load_workspace_tokens(config_dir)?.ok_or_else(|| {
         anyhow!("Google Workspace is not connected yet. Complete the sign-in flow first.")
@@ -1503,7 +1543,7 @@ pub async fn docs_read(config_dir: &Path, arguments: &serde_json::Value) -> Resu
                     .timeout(std::time::Duration::from_secs(15))
                     .build()?;
                 let response = client
-                    .get(format!("{}/documents/{}", DOCS_API_BASE, args.document_id))
+                    .get(format!("{}/documents/{}", docs_api_base(config_dir), args.document_id))
                     .bearer_auth(access_token)
                     .send()
                     .await?;
@@ -1519,7 +1559,7 @@ pub async fn docs_read(config_dir: &Path, arguments: &serde_json::Value) -> Resu
             .timeout(std::time::Duration::from_secs(15))
             .build()?;
         let response = client
-            .get(format!("{}/documents/{}", DOCS_API_BASE, args.document_id))
+            .get(format!("{}/documents/{}", docs_api_base(config_dir), args.document_id))
             .bearer_auth(access_token)
             .send()
             .await?;
@@ -1598,7 +1638,7 @@ pub async fn sheets_read(config_dir: &Path, arguments: &serde_json::Value) -> Re
                 let response = client
                     .get(format!(
                         "{}/spreadsheets/{}/values/{}",
-                        SHEETS_API_BASE,
+                        sheets_api_base(config_dir),
                         args.spreadsheet_id,
                         urlencoding::encode(&args.range)
                     ))
@@ -1619,7 +1659,7 @@ pub async fn sheets_read(config_dir: &Path, arguments: &serde_json::Value) -> Re
         let response = client
             .get(format!(
                 "{}/spreadsheets/{}/values/{}",
-                SHEETS_API_BASE,
+                sheets_api_base(config_dir),
                 args.spreadsheet_id,
                 urlencoding::encode(&args.range)
             ))
@@ -1916,7 +1956,10 @@ pub async fn test_bundle_access(config_dir: &Path, bundle: &str) -> Result<Strin
         }
         "docs" => {
             let response = client
-                .get(format!("{}/documents/__agentark_probe__", DOCS_API_BASE))
+                .get(format!(
+                    "{}/documents/__agentark_probe__",
+                    docs_api_base(config_dir)
+                ))
                 .bearer_auth(&access_token)
                 .send()
                 .await?;
@@ -1935,7 +1978,7 @@ pub async fn test_bundle_access(config_dir: &Path, bundle: &str) -> Result<Strin
             let response = client
                 .get(format!(
                     "{}/spreadsheets/__agentark_probe__?includeGridData=false&fields=spreadsheetId",
-                    SHEETS_API_BASE
+                    sheets_api_base(config_dir)
                 ))
                 .bearer_auth(&access_token)
                 .send()
@@ -2019,7 +2062,9 @@ pub async fn test_selected_bundles(config_dir: &Path) -> Result<HashMap<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{http::StatusCode, routing::get, Router};
     use tempfile::tempdir;
+    use tokio::net::TcpListener;
 
     #[test]
     fn parses_google_client_json_shapes() {
@@ -2145,6 +2190,30 @@ metadata:
     #[tokio::test]
     async fn test_selected_bundles_reports_docs_and_sheets_access() {
         let dir = tempdir().unwrap();
+        let app = Router::new()
+            .route(
+                "/v1/documents/__agentark_probe__",
+                get(|| async { StatusCode::NOT_FOUND }),
+            )
+            .route(
+                "/v4/spreadsheets/__agentark_probe__",
+                get(|| async { StatusCode::NOT_FOUND }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        std::fs::write(
+            dir.path().join(".agentark_test_docs_api_base"),
+            format!("http://{addr}/v1"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(".agentark_test_sheets_api_base"),
+            format!("http://{addr}/v4"),
+        )
+        .unwrap();
         save_workspace_client_config(
             dir.path(),
             &GoogleWorkspaceClientConfig {
@@ -2169,11 +2238,11 @@ metadata:
         let checks = test_selected_bundles(dir.path()).await.unwrap();
         assert_eq!(
             checks.get("docs").map(String::as_str),
-            Some("Docs access granted")
+            Some("Docs connected")
         );
         assert_eq!(
             checks.get("sheets").map(String::as_str),
-            Some("Sheets access granted")
+            Some("Sheets connected")
         );
     }
 }

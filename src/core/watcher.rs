@@ -868,6 +868,23 @@ impl WatcherManager {
         updated
     }
 
+    /// Rebind a watcher to a different background session without changing its runtime behavior.
+    pub async fn set_background_session_id(&self, id: Uuid, session_id: Option<&str>) -> bool {
+        let updated = if let Some(w) = self.watchers.write().await.get_mut(&id) {
+            w.poll_arguments = super::background_session::set_background_session_id_in_automation(
+                &w.poll_arguments,
+                session_id,
+            );
+            true
+        } else {
+            false
+        };
+        if updated {
+            self.persist().await;
+        }
+        updated
+    }
+
     /// Delete a watcher by ID
     pub async fn delete(&self, id: Uuid) -> bool {
         let deleted = self.watchers.write().await.remove(&id).is_some();

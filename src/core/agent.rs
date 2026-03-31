@@ -78,6 +78,8 @@ const CONTEXT_DIGEST_VERSION: u8 = 2;
 const CONTEXT_SALIENT_OLDER_LIMIT: usize = 6;
 const CONTEXT_SHORT_FOLLOWUP_OLDER_LIMIT: usize = 4;
 const CONVERSATION_RECENT_ARTIFACT_KEY_PREFIX: &str = "conversation_recent_artifact_v1:";
+const BACKGROUND_SESSION_IDLE_CONSOLIDATION_AFTER_MINS: i64 = 10;
+const BACKGROUND_SESSION_CONSOLIDATION_COOLDOWN_MINS: i64 = 30;
 const CONVERSATION_LAST_DEPLOYED_APP_KEY_PREFIX: &str = "conversation_last_deployed_app_v1:";
 const USER_SELECTED_MODEL_SLOT_KEY: &str = "user_selected_model_slot_v1";
 const APP_FOLLOWUP_CONTEXT_MAX_AGE_SECS: i64 = 24 * 60 * 60;
@@ -6124,6 +6126,9 @@ pub struct Agent {
     /// Task queue for autonomous execution
     pub tasks: Arc<RwLock<TaskQueue>>,
 
+    /// Durable operator-facing container for ongoing work that spans tasks/watchers.
+    pub background_sessions: super::background_session::BackgroundSessionManager,
+
     /// Configuration
     pub config: AgentConfig,
 
@@ -6288,7 +6293,6 @@ struct AutomationPlanValidationResult {
     action_name: String,
     action_arguments: serde_json::Value,
     delivery_channel: String,
-    assessment: AutomationIntentAssessment,
     notes: Vec<String>,
 }
 
@@ -8009,6 +8013,10 @@ impl Agent {
             execution_supervisor: super::ExecutionSupervisor::default(),
             primary_model_id,
             tasks,
+            background_sessions: super::background_session::BackgroundSessionManager::new(
+                Some(storage.clone()),
+            )
+            .await,
             config,
             config_dir: config_dir.to_path_buf(),
             data_dir: data_dir.to_path_buf(),
@@ -9507,6 +9515,684 @@ impl Agent {
         let _ = self.storage.delete(&legacy_key).await;
     }
 
+    fn background_session_artifact_context(
+        session: &super::background_session::BackgroundSession,
+    ) -> ConversationArtifactContext {
+        ConversationArtifactContext {
+            artifact_type: "background_session".to_string(),
+            artifact_id: session.id.clone(),
+            title: session.title.clone(),
+            summary: session
+                .summary
+                .clone()
+                .unwrap_or_else(|| safe_truncate(&session.objective, 220)),
+            url: String::new(),
+            related_actions: vec![
+                "schedule_task".to_string(),
+                "watch".to_string(),
+                "notify_user".to_string(),
+                "list_tasks".to_string(),
+                "list_watchers".to_string(),
+            ],
+            updated_at: session.updated_at.to_rfc3339(),
+        }
+    }
+
+    fn render_background_session_context_block(
+        session: &super::background_session::BackgroundSession,
+    ) -> String {
+        let mut lines = vec![
+            "## Background Session".to_string(),
+            format!("Session: '{}'", safe_truncate(&session.title, 120)),
+            format!("Objective: {}", safe_truncate(&session.objective, 240)),
+            format!("Status: {}", session.status.label()),
+        ];
+        if let Some(summary) = session.summary.as_deref().filter(|value| !value.trim().is_empty()) {
+            lines.push(format!("Summary: {}", safe_truncate(summary, 240)));
+        }
+        if let Some(focus) = session
+            .current_focus
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            lines.push(format!("Current focus: {}", safe_truncate(focus, 220)));
+        }
+        if let Some(waiting_on) = session
+            .waiting_on
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            lines.push(format!("Waiting on: {}", safe_truncate(waiting_on, 220)));
+        }
+        if let Some(next) = session
+            .next_expected_action
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            lines.push(format!("Next expected action: {}", safe_truncate(next, 220)));
+        }
+        if let Some(memory) = session
+            .working_memory
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            lines.push(format!("Working memory:\n{}", safe_truncate(memory, 1200)));
+        }
+        lines.join("\n")
+    }
+
+    fn background_session_should_promote(
+        message: &str,
+        request_shape: Option<&RequestShapeAssessment>,
+    ) -> bool {
+        if let Some(shape) = request_shape {
+            if matches!(shape.execution_mode.as_str(), "scheduled" | "watch_until") {
+                return true;
+            }
+            if shape.shape == "goal" && shape.confidence >= 0.72 {
+                return true;
+            }
+        }
+
+        let lower = message.trim().to_ascii_lowercase();
+        if lower.is_empty() {
+            return false;
+        }
+        [
+            "in the background",
+            "keep watching",
+            "keep monitoring",
+            "monitor this",
+            "follow up on this",
+            "ongoing",
+            "stay on top of",
+            "continue working on",
+            "keep me posted",
+            "notify me when",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    }
+
+    async fn configured_push_channels(&self) -> Vec<String> {
+        [
+            "telegram",
+            "whatsapp",
+            "slack",
+            "discord",
+            "matrix",
+            "teams",
+        ]
+        .iter()
+        .filter(|channel| self.push_channel_is_configured(channel))
+        .map(|channel| (*channel).to_string())
+        .collect()
+    }
+
+    async fn stored_preferred_push_channel(&self) -> Option<String> {
+        self.storage
+            .get("daily_brief_channel")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| is_push_notification_channel(value))
+            .filter(|value| self.push_channel_is_configured(value))
+    }
+
+    async fn resolve_single_push_channel(&self, requested: Option<&str>) -> Option<String> {
+        if let Some(channel) = requested
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_ascii_lowercase())
+            .filter(|value| is_push_notification_channel(value))
+            .filter(|value| self.push_channel_is_configured(value))
+        {
+            return Some(channel);
+        }
+
+        if let Some(preferred) = self.stored_preferred_push_channel().await {
+            return Some(preferred);
+        }
+
+        self.configured_push_channels().await.into_iter().next()
+    }
+
+    async fn active_background_session_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Option<super::background_session::BackgroundSession> {
+        self.background_sessions
+            .find_active_for_conversation(conversation_id)
+            .await
+    }
+
+    async fn sync_background_session_artifact_context(
+        &self,
+        conversation_id: &str,
+        session: &super::background_session::BackgroundSession,
+    ) {
+        let cid = conversation_id.trim();
+        if cid.is_empty() {
+            return;
+        }
+        self.persist_conversation_artifact_context_payload(
+            cid,
+            Self::background_session_artifact_context(session),
+        )
+        .await;
+    }
+
+    async fn ensure_background_session_for_automation(
+        &self,
+        channel: &str,
+        conversation_id: Option<&str>,
+        project_id: Option<&str>,
+        explicit_session_id: Option<&str>,
+        objective: &str,
+        next_expected_action: &str,
+    ) -> Option<super::background_session::BackgroundSession> {
+        if let Some(session_id) = explicit_session_id.and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        }) {
+            if let Some(existing) = self.background_sessions.get(session_id).await {
+                let rebound = self
+                    .background_sessions
+                    .bind_runtime_context(
+                        &existing.id,
+                        Some(channel),
+                        conversation_id,
+                        project_id,
+                        Some("agent"),
+                    )
+                    .await
+                    .unwrap_or(existing);
+                if let Some(cid) = conversation_id {
+                    self.sync_background_session_artifact_context(cid, &rebound)
+                        .await;
+                }
+                return Some(rebound);
+            }
+        }
+
+        let conversation_id = conversation_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+
+        if let Some(existing) = self
+            .active_background_session_for_conversation(conversation_id)
+            .await
+        {
+            let rebound = self
+                .background_sessions
+                .bind_runtime_context(
+                    &existing.id,
+                    Some(channel),
+                    Some(conversation_id),
+                    project_id,
+                    Some("agent"),
+                )
+                .await
+                .unwrap_or(existing);
+            self.sync_background_session_artifact_context(conversation_id, &rebound)
+                .await;
+            return Some(rebound);
+        }
+
+        let session = self
+            .background_sessions
+            .create(
+                super::background_session::BackgroundSessionCreate {
+                    title: None,
+                    objective: objective.to_string(),
+                    summary: Some(
+                        "Created automatically to keep background work attached to one durable session."
+                            .to_string(),
+                    ),
+                    current_focus: Some(objective.to_string()),
+                    waiting_on: None,
+                    next_expected_action: Some(next_expected_action.to_string()),
+                    working_memory: Some(format!(
+                        "Objective: {}\nProvenance: automation request in conversation {}\n",
+                        safe_truncate(objective, 400),
+                        conversation_id
+                    )),
+                    preferred_delivery_channel: self.resolve_single_push_channel(None).await,
+                    channel: Some(channel.to_string()),
+                    conversation_id: Some(conversation_id.to_string()),
+                    project_id: project_id.map(|value| value.to_string()),
+                    task_ids: Vec::new(),
+                    watcher_ids: Vec::new(),
+                },
+                Some("agent"),
+            )
+            .await;
+        self.sync_background_session_artifact_context(conversation_id, &session)
+            .await;
+        Some(session)
+    }
+
+    async fn ensure_background_session_for_request(
+        &self,
+        channel: &str,
+        conversation_id: &str,
+        project_id: Option<&str>,
+        message: &str,
+        request_shape: Option<&RequestShapeAssessment>,
+    ) -> Option<super::background_session::BackgroundSession> {
+        let conversation_id = conversation_id.trim();
+        if conversation_id.is_empty() {
+            return None;
+        }
+
+        if let Some(existing) = self
+            .active_background_session_for_conversation(conversation_id)
+            .await
+        {
+            let rebound = self
+                .background_sessions
+                .bind_runtime_context(
+                    &existing.id,
+                    Some(channel),
+                    Some(conversation_id),
+                    project_id,
+                    Some("agent"),
+                )
+                .await
+                .unwrap_or(existing);
+            self.sync_background_session_artifact_context(conversation_id, &rebound)
+                .await;
+            return Some(rebound);
+        }
+
+        if !Self::background_session_should_promote(message, request_shape) {
+            return None;
+        }
+
+        let session = self
+            .background_sessions
+            .create(
+                super::background_session::BackgroundSessionCreate {
+                    title: None,
+                    objective: message.to_string(),
+                    summary: Some(
+                        "Created from chat to keep ongoing work attached to one durable session."
+                            .to_string(),
+                    ),
+                    current_focus: Some(message.to_string()),
+                    waiting_on: None,
+                    next_expected_action: Some(
+                        "Plan the ongoing work and attach any required tasks or watchers."
+                            .to_string(),
+                    ),
+                    working_memory: Some(format!(
+                        "Objective: {}\nProvenance: chat conversation {}\n",
+                        safe_truncate(message, 400),
+                        conversation_id
+                    )),
+                    preferred_delivery_channel: self.resolve_single_push_channel(None).await,
+                    channel: Some(channel.to_string()),
+                    conversation_id: Some(conversation_id.to_string()),
+                    project_id: project_id.map(|value| value.to_string()),
+                    task_ids: Vec::new(),
+                    watcher_ids: Vec::new(),
+                },
+                Some("agent"),
+            )
+            .await;
+        self.sync_background_session_artifact_context(conversation_id, &session)
+            .await;
+        Some(session)
+    }
+
+    async fn attach_items_to_background_session(
+        &self,
+        session_id: &str,
+        task_ids: &[String],
+        watcher_ids: &[String],
+    ) {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return;
+        }
+        self.background_sessions
+            .remove_child_references(task_ids, watcher_ids, Some("agent"))
+            .await;
+        let _ = self
+            .background_sessions
+            .attach_items(session_id, task_ids, watcher_ids, Some("agent"))
+            .await;
+    }
+
+    async fn sync_background_session_after_response(
+        &self,
+        conversation_id: &str,
+        message: &str,
+        response: &str,
+    ) {
+        let conversation_id = conversation_id.trim();
+        if conversation_id.is_empty() {
+            return;
+        }
+        let Some(session) = self
+            .active_background_session_for_conversation(conversation_id)
+            .await
+        else {
+            return;
+        };
+        let next_expected_action = response
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(|line| safe_truncate(line, 220));
+        if let Some(updated) = self
+            .background_sessions
+            .apply_chat_turn(
+                &session.id,
+                message,
+                response,
+                next_expected_action,
+                Some("agent"),
+            )
+            .await
+        {
+            self.sync_background_session_artifact_context(conversation_id, &updated)
+                .await;
+        }
+    }
+
+    async fn maybe_consolidate_idle_background_sessions(&self) {
+        let sessions = self.background_sessions.list().await;
+        if sessions.is_empty() {
+            return;
+        }
+
+        let now = chrono::Utc::now();
+        let task_snapshot = { self.tasks.read().await.all().to_vec() };
+        let watcher_snapshot = self.watcher_manager.list().await;
+        let recent_runs = crate::core::list_automation_runs(&self.storage, 40)
+            .await
+            .unwrap_or_default();
+
+        for session in sessions {
+            if session.status.is_closed() {
+                continue;
+            }
+            if (now - session.last_activity_at).num_minutes()
+                < BACKGROUND_SESSION_IDLE_CONSOLIDATION_AFTER_MINS
+            {
+                continue;
+            }
+            if session
+                .last_consolidated_at
+                .map(|value| (now - value).num_minutes() < BACKGROUND_SESSION_CONSOLIDATION_COOLDOWN_MINS)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            let mut lines = vec![
+                format!("Session: {}", safe_truncate(&session.title, 120)),
+                format!("Objective: {}", safe_truncate(&session.objective, 220)),
+                format!("Status: {}", session.status.label()),
+            ];
+            if let Some(focus) = session
+                .current_focus
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                lines.push(format!("Current focus: {}", safe_truncate(focus, 220)));
+            }
+            if let Some(waiting_on) = session
+                .waiting_on
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                lines.push(format!("Waiting on: {}", safe_truncate(waiting_on, 220)));
+            }
+
+            let task_lines = task_snapshot
+                .iter()
+                .filter(|task| {
+                    session
+                        .linked_task_ids
+                        .iter()
+                        .any(|id| id == &task.id.to_string())
+                        || super::background_session::background_session_id_from_automation(&task.arguments)
+                            .as_deref()
+                            == Some(session.id.as_str())
+                })
+                .take(4)
+                .map(|task| {
+                    format!(
+                        "- task {} [{}]: {}",
+                        task.id,
+                        Self::task_status_debug_label(&task.status),
+                        safe_truncate(&task.description, 120)
+                    )
+                })
+                .collect::<Vec<_>>();
+            if !task_lines.is_empty() {
+                lines.push("Linked tasks:".to_string());
+                lines.extend(task_lines);
+            }
+
+            let watcher_lines = watcher_snapshot
+                .iter()
+                .filter(|watcher| {
+                    session
+                        .linked_watcher_ids
+                        .iter()
+                        .any(|id| id == &watcher.id.to_string())
+                        || super::background_session::background_session_id_from_automation(
+                            &watcher.poll_arguments,
+                        )
+                        .as_deref()
+                            == Some(session.id.as_str())
+                })
+                .take(4)
+                .map(|watcher| {
+                    format!(
+                        "- watcher {} [{}]: {}",
+                        watcher.id,
+                        Self::watcher_supervisor_status_label(&watcher.status),
+                        safe_truncate(&watcher.description, 120)
+                    )
+                })
+                .collect::<Vec<_>>();
+            if !watcher_lines.is_empty() {
+                lines.push("Linked watchers:".to_string());
+                lines.extend(watcher_lines);
+            }
+
+            let run_lines = recent_runs
+                .iter()
+                .filter(|run| {
+                    session
+                        .linked_task_ids
+                        .iter()
+                        .chain(session.linked_watcher_ids.iter())
+                        .any(|id| id == &run.automation_id)
+                })
+                .take(4)
+                .map(|run| {
+                    format!(
+                        "- run {} [{}]: {}",
+                        run.automation_id,
+                        format!("{:?}", run.status).to_ascii_lowercase(),
+                        safe_truncate(&run.title, 120)
+                    )
+                })
+                .collect::<Vec<_>>();
+            if !run_lines.is_empty() {
+                lines.push("Recent runs:".to_string());
+                lines.extend(run_lines);
+            }
+
+            let event_lines = session
+                .events
+                .iter()
+                .rev()
+                .take(4)
+                .map(|event| {
+                    format!(
+                        "- {} [{}]: {}",
+                        event.at.to_rfc3339(),
+                        event.kind,
+                        safe_truncate(&event.summary, 120)
+                    )
+                })
+                .collect::<Vec<_>>();
+            if !event_lines.is_empty() {
+                lines.push("Recent session events:".to_string());
+                lines.extend(event_lines);
+            }
+
+            lines.push(format!("Provenance: session_id={}", session.id));
+
+            let summary = Some(
+                session
+                    .summary
+                    .clone()
+                    .unwrap_or_else(|| safe_truncate(&session.objective, 220)),
+            );
+            let next_expected_action = session.next_expected_action.clone().or_else(|| {
+                if session.status == super::background_session::BackgroundSessionStatus::Paused {
+                    Some("Resume the session when you want background work to continue.".to_string())
+                } else if session.status
+                    == super::background_session::BackgroundSessionStatus::Waiting
+                {
+                    Some("Wait for the external signal or provide the missing input.".to_string())
+                } else {
+                    Some("Review linked work and continue from the latest outcome.".to_string())
+                }
+            });
+
+            let _ = self
+                .background_sessions
+                .record_consolidation(
+                    &session.id,
+                    summary,
+                    lines.join("\n"),
+                    next_expected_action,
+                    Some("agent"),
+                )
+                .await;
+        }
+    }
+
+    async fn maybe_handle_background_session_delivery_rebind(
+        &self,
+        conversation_id: &str,
+        message: &str,
+    ) -> Option<String> {
+        let conversation_id = conversation_id.trim();
+        if conversation_id.is_empty() {
+            return None;
+        }
+        let session = self
+            .active_background_session_for_conversation(conversation_id)
+            .await?;
+        let lower = message.trim().to_ascii_lowercase();
+        if lower.is_empty() {
+            return None;
+        }
+
+        let looks_like_rebind = [
+            "configured",
+            "connected",
+            "set up",
+            "setup",
+            "enabled",
+            "ready",
+            "route it",
+            "route this",
+            "use telegram",
+            "use whatsapp",
+            "use slack",
+            "use discord",
+            "use matrix",
+            "use teams",
+            "deliver via",
+            "send via",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle));
+        let mentioned_channel = [
+            "telegram",
+            "whatsapp",
+            "slack",
+            "discord",
+            "matrix",
+            "teams",
+        ]
+        .iter()
+        .find(|channel| lower.contains(**channel))
+        .copied();
+        if mentioned_channel.is_none()
+            && !lower.contains("configured now")
+            && !lower.contains("connected now")
+            && !lower.contains("ready now")
+        {
+            return None;
+        }
+        if !looks_like_rebind {
+            return None;
+        }
+
+        if let Some(channel) = mentioned_channel {
+            if !self.push_channel_is_configured(channel) {
+                return Some(format!(
+                    "{} is not connected yet, so I kept '{}' on in-app delivery. Once that channel is actually connected, tell me again and I'll route this session through it.",
+                    channel,
+                    safe_truncate(&session.title, 120)
+                ));
+            }
+        }
+
+        let Some(channel) = self.resolve_single_push_channel(mentioned_channel).await else {
+            return Some(format!(
+                "I didn't find a connected messaging channel yet, so '{}' stays on in-app delivery for now.",
+                safe_truncate(&session.title, 120)
+            ));
+        };
+
+        if session
+            .preferred_delivery_channel
+            .as_deref()
+            .map(str::trim)
+            .map(|value| value.eq_ignore_ascii_case(channel.as_str()))
+            .unwrap_or(false)
+        {
+            return Some(format!(
+                "'{}' is already routed through {} for notifications.",
+                safe_truncate(&session.title, 120),
+                channel
+            ));
+        }
+
+        if let Some(updated) = self
+            .background_sessions
+            .set_delivery_channel(&session.id, Some(&channel), Some("agent"))
+            .await
+        {
+            self.sync_background_session_artifact_context(conversation_id, &updated)
+                .await;
+        }
+
+        Some(format!(
+            "Updated '{}' to deliver future session notifications through {}. Existing session-owned tasks and watchers will reuse that route instead of creating duplicate automation.",
+            safe_truncate(&session.title, 120),
+            channel
+        ))
+    }
+
     async fn recent_artifact_still_exists(&self, artifact: &ConversationArtifactContext) -> bool {
         let artifact_id = artifact.artifact_id.trim();
         if artifact_id.is_empty() {
@@ -9531,6 +10217,7 @@ impl Agent {
                     .iter()
                     .any(|task| task.id.to_string() == artifact_id)
             }
+            "background_session" => self.background_sessions.get(artifact_id).await.is_some(),
             "goal" => {
                 let tasks = self.tasks.read().await;
                 tasks.all().iter().any(|task| {
@@ -9943,7 +10630,7 @@ Rules:
     fn heuristic_automation_intent_assessment(
         surface: AutomationSurface,
         request_text: &str,
-        action_name: &str,
+        _action_name: &str,
         delivery_channel: &str,
         trigger_kind_hint: Option<&str>,
         action_meta: &crate::actions::ActionPlannerMetadata,
@@ -10363,7 +11050,6 @@ Rules:
             action_name,
             action_arguments,
             delivery_channel,
-            assessment,
             notes,
         }
     }
@@ -11303,6 +11989,7 @@ Rules:
             .resolve_conversation_id(channel, conversation_id, project_id, &early_safe_message)
             .await;
         let conversation_key = resolved_conversation_id.clone();
+        self.maybe_consolidate_idle_background_sessions().await;
 
         // Chat-safe secret save flow for channels that don't have channel-specific secret handling.
         // Telegram/WhatsApp enforce their own pairing/allowlist checks before storing secrets.
@@ -11674,6 +12361,26 @@ Rules:
                         is_new_conversation,
                         project_id,
                         model_used: "link_capture_fast_path",
+                        user_message_already_recorded,
+                    },
+                )
+                .await;
+        }
+
+        if let Some(response) = self
+            .maybe_handle_background_session_delivery_rebind(&conversation_key, message)
+            .await
+        {
+            return self
+                .persist_immediate_exchange(
+                    message,
+                    &response,
+                    ImmediateExchangeContext {
+                        channel,
+                        conversation_key: &conversation_key,
+                        is_new_conversation,
+                        project_id,
+                        model_used: "background_session_delivery_rebind",
                         user_message_already_recorded,
                     },
                 )
@@ -12658,7 +13365,15 @@ Rules:
             .await;
         let direct_app_deploy_intent = has_app_deploy_intent(message, &all_actions);
         let direct_schedule_task_intent = has_schedule_task_intent(message, &all_actions);
+        let mut active_background_session = self
+            .active_background_session_for_conversation(&conversation_key)
+            .await;
         let mut recent_artifact = self.load_recent_artifact_context(&conversation_key).await;
+        if recent_artifact.is_none() {
+            if let Some(session) = active_background_session.as_ref() {
+                recent_artifact = Some(Self::background_session_artifact_context(session));
+            }
+        }
         // If no artifact context exists, check if the user mentions a deployed app by name
         // and synthesize one so the full app-context pipeline activates.
         if recent_artifact.is_none() {
@@ -12772,6 +13487,18 @@ Rules:
                 request_hints,
             )
             .await;
+        if let Some(session) = self
+            .ensure_background_session_for_request(
+                channel,
+                &conversation_key,
+                project_id,
+                message,
+                request_shape.as_ref(),
+            )
+            .await
+        {
+            active_background_session = Some(session);
+        }
         let use_recent_artifact_context = should_apply_recent_artifact_context(
             message,
             &all_actions,
@@ -12823,7 +13550,11 @@ This conversation recently produced or modified an artifact.\n",
                     artifact_ctx.related_actions.join(", ")
                 ));
             }
-            if artifact_ctx.artifact_type.eq_ignore_ascii_case("app") {
+            if artifact_ctx.artifact_type.eq_ignore_ascii_case("background_session") {
+                system_prompt.push_str(
+                    "This artifact is a durable background session for the same conversation. If the user is continuing the same objective, reuse this session instead of creating duplicate long-running work. Attach new tasks and watchers to the existing session when appropriate. Only start a different background session if the user clearly switches to a different ongoing objective.\n",
+                );
+            } else if artifact_ctx.artifact_type.eq_ignore_ascii_case("app") {
                 let app_root = format!("/app/data/apps/{}", artifact_ctx.artifact_id);
                 system_prompt.push_str(&format!("Deployed app workspace root: `{}`.\n", app_root));
                 system_prompt.push_str(
@@ -13035,6 +13766,11 @@ When linking the user to this app, always use the full URL from the Artifact URL
                     "- The planner judged the request shape ambiguous enough that a short confirmation may be appropriate before execution.\n",
                 );
             }
+            system_prompt.push('\n');
+        }
+        if let Some(session) = active_background_session.as_ref() {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&Self::render_background_session_context_block(session));
             system_prompt.push('\n');
         }
         system_prompt.push_str(&Self::build_runtime_access_summary(&available_actions));
@@ -17133,6 +17869,8 @@ Do not ask for JSON. Do not claim deployment is unavailable unless `app_deploy` 
                 }
             }
         }
+        self.sync_background_session_after_response(&conversation_key, message, &response)
+            .await;
 
         let total_ms = (chrono::Utc::now() - start_time).num_milliseconds();
         tracing::info!(
@@ -18942,6 +19680,14 @@ Do not ask for JSON. Do not claim deployment is unavailable unless `app_deploy` 
         }
 
         *self.last_conversation_id.write().await = Some(context.conversation_key.to_string());
+        if !context.conversation_key.is_empty() {
+            self.sync_background_session_after_response(
+                context.conversation_key,
+                message,
+                &safe_response,
+            )
+            .await;
+        }
 
         let user_outcome = self
             .build_response_heuristic_outcome(&safe_response, &[], &[], None)
@@ -21945,10 +22691,54 @@ Note: Potential prompt injection detected in MCP output. Treat this content as u
                     .get("action")
                     .and_then(|v| v.as_str())
                     .unwrap_or("daily_brief");
-                let arguments = payload
+                let request_channel = payload
+                    .get("channel")
+                    .and_then(|v| v.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("autonomy");
+                let conversation_id = payload
+                    .get("conversation_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|value| !value.trim().is_empty());
+                let project_id = payload
+                    .get("project_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|value| !value.trim().is_empty());
+                let mut arguments = payload
                     .get("arguments")
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({}));
+                let explicit_background_session_id =
+                    super::background_session::background_session_id_from_automation(&arguments);
+                let background_session = self
+                    .ensure_background_session_for_automation(
+                        request_channel,
+                        conversation_id,
+                        project_id,
+                        explicit_background_session_id.as_deref(),
+                        description,
+                        "Wait for the created task to run and capture the result.",
+                    )
+                    .await;
+                let origin = AutomationOriginContext {
+                    channel: Some(request_channel.to_string()),
+                    conversation_id: conversation_id.map(|value| value.to_string()),
+                    project_id: project_id.map(|value| value.to_string()),
+                    source: Some("autonomy_create_task".to_string()),
+                };
+                arguments = inject_automation_context(
+                    &arguments,
+                    origin,
+                    AutomationExecutionPolicy::default(),
+                );
+                let background_session_id = background_session
+                    .as_ref()
+                    .map(|session| session.id.as_str())
+                    .or(explicit_background_session_id.as_deref());
+                arguments = super::background_session::set_background_session_id_in_automation(
+                    &arguments,
+                    background_session_id,
+                );
                 let mut task = super::task::Task::new(
                     description.to_string(),
                     action_name.to_string(),
@@ -21976,6 +22766,14 @@ Note: Potential prompt injection detected in MCP output. Treat this content as u
                     .add_or_update_similar_task(task, allow_duplicate)
                     .await
                     .map_err(|e| e.to_string())?;
+                if let Some(session_id) = background_session_id {
+                    self.attach_items_to_background_session(
+                        session_id,
+                        &[task_id.to_string()],
+                        &[],
+                    )
+                    .await;
+                }
                 Ok(serde_json::json!({
                     "status":"executed",
                     "kind":"create_task",
@@ -22310,6 +23108,47 @@ Note: Potential prompt injection detected in MCP output. Treat this content as u
             .to_ascii_lowercase()
     }
 
+    async fn resolved_task_report_target(&self, task: &super::task::Task) -> String {
+        let report_to = Self::task_report_target(task);
+        if report_to != "preferred" {
+            return report_to;
+        }
+        let session_id =
+            super::background_session::background_session_id_from_automation(&task.arguments);
+        if let Some(session_id) = session_id.as_deref() {
+            if let Some(session) = self.background_sessions.get(session_id).await {
+                if let Some(preferred) = session.preferred_delivery_channel.as_deref() {
+                    if let Some(channel) = self.resolve_single_push_channel(Some(preferred)).await {
+                        return channel;
+                    }
+                }
+            }
+        }
+        report_to
+    }
+
+    async fn resolved_watcher_notification_channel(
+        &self,
+        watcher: &super::watcher::Watcher,
+    ) -> String {
+        let requested = watcher.notify_channel.trim().to_ascii_lowercase();
+        if requested != "preferred" {
+            return requested;
+        }
+        let session_id =
+            super::background_session::background_session_id_from_automation(&watcher.poll_arguments);
+        if let Some(session_id) = session_id.as_deref() {
+            if let Some(session) = self.background_sessions.get(session_id).await {
+                if let Some(preferred) = session.preferred_delivery_channel.as_deref() {
+                    if let Some(channel) = self.resolve_single_push_channel(Some(preferred)).await {
+                        return channel;
+                    }
+                }
+            }
+        }
+        requested
+    }
+
     fn webhook_task_metadata(task: &super::task::Task) -> Option<&serde_json::Value> {
         let automation = task.arguments.get("_automation")?;
         if automation.get("kind").and_then(|value| value.as_str()) != Some("webhook") {
@@ -22508,6 +23347,7 @@ Note: Potential prompt injection detected in MCP output. Treat this content as u
 
     async fn deliver_task_report_message(&self, task: &super::task::Task, message: &str) {
         let report_to = Self::task_report_target(task);
+        let resolved_report_to = self.resolved_task_report_target(task).await;
         let is_webhook = Self::webhook_task_metadata(task).is_some();
         if task.action == "daily_brief" {
             tracing::debug!(
@@ -22525,7 +23365,7 @@ Note: Potential prompt injection detected in MCP output. Treat this content as u
             }
             return;
         }
-        if report_to == "preferred" {
+        if report_to == "preferred" && resolved_report_to == "preferred" {
             if !is_webhook {
                 self.emit_notification("Scheduled Task Result", message, "info", "scheduler")
                     .await;
@@ -22545,24 +23385,17 @@ Note: Potential prompt injection detected in MCP output. Treat this content as u
         }
         tracing::info!(
             "Sending automated task result to channel={} (task={})",
-            report_to,
+            resolved_report_to,
             task.description
         );
-        let delivered = if report_to == "preferred" {
-            self.notify_preferred_channel_reported(message)
-                .await
-                .into_iter()
-                .any(|outcome| outcome.success)
-        } else {
-            self.try_send_notification_reported(&report_to, message)
-                .await
-                .success
-        };
+        let delivered = self
+            .try_send_notification_reported(&resolved_report_to, message)
+            .await
+            .success;
         if !delivered {
             tracing::warn!(
                 "Task '{}' completed but delivery to '{}' failed",
-                task.description,
-                report_to
+                task.description, resolved_report_to
             );
             let failure_title = if is_webhook {
                 "Webhook delivery failed"
@@ -22571,7 +23404,7 @@ Note: Potential prompt injection detected in MCP output. Treat this content as u
             };
             let failure_body = format!(
                 "Task '{}' completed, but delivery to '{}' failed.\n\n{}",
-                task.description, report_to, message
+                task.description, resolved_report_to, message
             );
             if is_webhook {
                 self.emit_notification_forced(failure_title, &failure_body, "warning", "webhook")
@@ -23159,7 +23992,10 @@ Note: Potential prompt injection detected in MCP output. Treat this content as u
         self.emit_notification("Watcher Triggered", &notify_text, "info", "watcher")
             .await;
         let requested_channel = watcher.notify_channel.trim().to_ascii_lowercase();
-        if requested_channel == "preferred" {
+        let resolved_channel = self
+            .resolved_watcher_notification_channel(&watcher)
+            .await;
+        if requested_channel == "preferred" && resolved_channel == "preferred" {
             for outcome in self
                 .notify_preferred_push_channel_reported(&notify_text)
                 .await
@@ -23177,16 +24013,16 @@ Note: Potential prompt injection detected in MCP output. Treat this content as u
                     )
                     .await;
             }
-        } else if !requested_channel.is_empty() {
+        } else if !resolved_channel.is_empty() {
             let delivered = self
-                .try_send_notification(&requested_channel, &notify_text)
+                .try_send_notification(&resolved_channel, &notify_text)
                 .await;
             self.watcher_manager
                 .push_notification_attempt(
                     watcher.id,
                     super::watcher::WatcherNotificationAttempt {
                         attempted_at: chrono::Utc::now(),
-                        channel: requested_channel,
+                        channel: resolved_channel,
                         success: delivered,
                         message: notify_text.clone(),
                         error: (!delivered).then_some(
@@ -24404,6 +25240,18 @@ Keep it concise and useful.",
             Ok(normalized) => normalized,
             Err(error) => return Some(error),
         };
+        let explicit_background_session_id =
+            super::background_session::background_session_id_from_automation(&task_args);
+        let background_session = self
+            .ensure_background_session_for_automation(
+                request_channel,
+                conversation_id,
+                project_id,
+                explicit_background_session_id.as_deref(),
+                task_desc,
+                "Wait for the scheduled task to execute and record the outcome.",
+            )
+            .await;
         let origin = AutomationOriginContext {
             channel: Some(request_channel.to_string()),
             conversation_id: conversation_id.map(|value| value.to_string()),
@@ -24421,6 +25269,14 @@ Keep it concise and useful.",
             },
         );
         task_args = inject_automation_context(&task_args, origin, policy);
+        let background_session_id = background_session
+            .as_ref()
+            .map(|session| session.id.as_str())
+            .or(explicit_background_session_id.as_deref());
+        task_args = super::background_session::set_background_session_id_in_automation(
+            &task_args,
+            background_session_id,
+        );
 
         let task = super::task::Task {
             id: uuid::Uuid::new_v4(),
@@ -24490,6 +25346,22 @@ Keep it concise and useful.",
             )
             .await;
         }
+        if let Some(session_id) = background_session_id {
+            self.attach_items_to_background_session(
+                session_id,
+                &[task_id.to_string()],
+                &[],
+            )
+            .await;
+        }
+        let display_report_to = if report_to == "preferred" {
+            background_session
+                .as_ref()
+                .and_then(|session| session.preferred_delivery_channel.clone())
+                .unwrap_or(report_to.clone())
+        } else {
+            report_to.clone()
+        };
 
         Some(format!(
             "{}!\n\nTask: {}\nAction: {}\nSchedule: {}\nReport to: {}\nTask ID: `{}`{}{}",
@@ -24497,7 +25369,7 @@ Keep it concise and useful.",
             task_desc,
             action_name,
             schedule_desc,
-            watcher_delivery_label(&report_to),
+            watcher_delivery_label(&display_report_to),
             task_id,
             duplicate_note,
             planner_note
@@ -24512,6 +25384,21 @@ Keep it concise and useful.",
             super::watcher::WatcherStatus::TimedOut => "timed_out".to_string(),
             super::watcher::WatcherStatus::Cancelled => "cancelled".to_string(),
             super::watcher::WatcherStatus::Failed { .. } => "failed".to_string(),
+        }
+    }
+
+    fn task_status_debug_label(status: &super::task::TaskStatus) -> String {
+        match status {
+            super::task::TaskStatus::Pending => "pending".to_string(),
+            super::task::TaskStatus::AwaitingApproval => "awaiting_approval".to_string(),
+            super::task::TaskStatus::ExpiredNeedsReapproval => {
+                "expired_needs_reapproval".to_string()
+            }
+            super::task::TaskStatus::Paused => "paused".to_string(),
+            super::task::TaskStatus::InProgress => "in_progress".to_string(),
+            super::task::TaskStatus::Completed => "completed".to_string(),
+            super::task::TaskStatus::Failed { .. } => "failed".to_string(),
+            super::task::TaskStatus::Cancelled => "cancelled".to_string(),
         }
     }
 
@@ -24709,6 +25596,18 @@ Keep it concise and useful.",
             Ok(normalized) => normalized,
             Err(error) => return Some(error),
         };
+        let explicit_background_session_id =
+            super::background_session::background_session_id_from_automation(&poll_arguments);
+        let background_session = self
+            .ensure_background_session_for_automation(
+                request_channel,
+                conversation_id,
+                project_id,
+                explicit_background_session_id.as_deref(),
+                description,
+                "Keep the watcher active and report when its condition is met.",
+            )
+            .await;
 
         let origin = AutomationOriginContext {
             channel: Some(request_channel.to_string()),
@@ -24731,6 +25630,14 @@ Keep it concise and useful.",
             },
         );
         poll_arguments = inject_automation_context(&poll_arguments, origin, policy);
+        let background_session_id = background_session
+            .as_ref()
+            .map(|session| session.id.as_str())
+            .or(explicit_background_session_id.as_deref());
+        poll_arguments = super::background_session::set_background_session_id_in_automation(
+            &poll_arguments,
+            background_session_id,
+        );
 
         // Parse condition
         let condition = if let Some(keyword) =
@@ -24803,6 +25710,22 @@ Keep it concise and useful.",
             )
             .await;
         }
+        if let Some(session_id) = background_session_id {
+            self.attach_items_to_background_session(
+                session_id,
+                &[],
+                &[id.to_string()],
+            )
+            .await;
+        }
+        let display_notify_channel = if notify_channel == "preferred" {
+            background_session
+                .as_ref()
+                .and_then(|session| session.preferred_delivery_channel.clone())
+                .unwrap_or(notify_channel.clone())
+        } else {
+            notify_channel.clone()
+        };
 
         // Human-readable duration
         let duration_desc = if until_stopped {
@@ -24865,7 +25788,7 @@ Keep it concise and useful.",
             poll_action,
             interval_secs,
             on_trigger,
-            watcher_delivery_label(&notify_channel),
+            watcher_delivery_label(&display_notify_channel),
             duration_desc,
             duration_note,
             delivery_note,

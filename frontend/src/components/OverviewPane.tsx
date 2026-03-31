@@ -24,7 +24,7 @@ import { buildAttentionItems } from "./NeedsAttentionInbox";
 import { TodaysHighlights } from "./TodaysHighlights";
 import { SmartSuggestions } from "./SmartSuggestions";
 import { ActivityFeed } from "./ActivityFeed";
-import type { RecommendedSkill, Task } from "../types";
+import type { BackgroundSessionSummary, RecommendedSkill, Task } from "../types";
 
 const REFRESH_MS = 8000;
 const ACTIVE_TASK_STALE_MS = 24 * 60 * 60 * 1000;
@@ -179,6 +179,11 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
     queryFn: () => api.rawGet("/automation/runs"),
     refetchInterval: interval,
   });
+  const sessionsQ = useQuery({
+    queryKey: ["background-sessions-dashboard"],
+    queryFn: api.getBackgroundSessions,
+    refetchInterval: interval,
+  });
   const settingsQ = useQuery({
     queryKey: ["settings-dashboard"],
     queryFn: api.getSettings,
@@ -202,6 +207,17 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
   const automationPreview = automationObjects.slice(0, 8);
   const automationRuns = useMemo(() => pickAutomationRuns(automationRunsQ.data), [automationRunsQ.data]);
   const automationRunsPreview = automationRuns.slice(0, 6);
+  const backgroundSessions = useMemo<BackgroundSessionSummary[]>(
+    () => sessionsQ.data?.sessions || [],
+    [sessionsQ.data]
+  );
+  const activeBackgroundSessions = useMemo(
+    () =>
+      backgroundSessions.filter((session) =>
+        ["active", "waiting", "needs_input", "paused"].includes((session.status || "").toLowerCase())
+      ),
+    [backgroundSessions]
+  );
   const automationCounts = useMemo(() => {
     return automationObjects.reduce(
       (acc, item) => {
@@ -386,7 +402,8 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
     briefingQ.error ||
     autonomySettingsQ.error ||
     automationQ.error ||
-    automationRunsQ.error
+    automationRunsQ.error ||
+    sessionsQ.error
   );
   const failingSources = [
     tasksQ.error ? "tasks" : null,
@@ -395,6 +412,7 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
     autonomySettingsQ.error ? "autonomy settings" : null,
     automationQ.error ? "automation objects" : null,
     automationRunsQ.error ? "automation runs" : null,
+    sessionsQ.error ? "background sessions" : null,
   ].filter(Boolean) as string[];
   const dataSourceErrorSummary =
     failingSources.length === 0
@@ -479,6 +497,55 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
               </Stack>
             </Box>
           )}
+
+          <Box className="overview-inline-note">
+            <Stack spacing={1}>
+              <Stack direction={{ xs: "column", sm: "row" }} spacing={1} alignItems={{ xs: "flex-start", sm: "center" }} justifyContent="space-between">
+                <Box>
+                  <Typography variant="overline" className="overview-inline-note__kicker">
+                    Active Sessions
+                  </Typography>
+                  <Typography variant="body2" sx={{ color: "rgba(225, 239, 255, 0.94)", fontWeight: 600 }}>
+                    {activeBackgroundSessions.length > 0
+                      ? `${activeBackgroundSessions.length} background session${activeBackgroundSessions.length === 1 ? "" : "s"} currently have ongoing work or supervision state.`
+                      : "No background sessions are currently active."}
+                  </Typography>
+                </Box>
+                <Button variant="outlined" size="small" onClick={() => navigateToView("sessions")}>
+                  Open Sessions
+                </Button>
+              </Stack>
+              {activeBackgroundSessions.length > 0 ? (
+                <Stack spacing={0.75}>
+                  {activeBackgroundSessions.slice(0, 3).map((session) => (
+                    <Stack
+                      key={session.id}
+                      direction="row"
+                      spacing={0.75}
+                      alignItems="center"
+                      sx={{
+                        px: 0.9,
+                        py: 0.75,
+                        borderRadius: 2.5,
+                        background: "rgba(7, 18, 32, 0.42)",
+                        border: "1px solid rgba(108, 156, 212, 0.1)",
+                      }}
+                    >
+                      <Chip size="small" label={session.status.replace(/_/g, " ")} color={automationStatusColor(session.status)} />
+                      <Box sx={{ minWidth: 0, flex: 1 }}>
+                        <Typography variant="body2" noWrap sx={{ fontWeight: 600 }} title={session.title}>
+                          {session.title}
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary" noWrap title={session.live_summary}>
+                          {session.live_summary}
+                        </Typography>
+                      </Box>
+                    </Stack>
+                  ))}
+                </Stack>
+              ) : null}
+            </Stack>
+          </Box>
 
           <Box className={`overview-bento-grid ${showActivityFeed ? "overview-bento-grid--three" : "overview-bento-grid--two"}`}>
             <Box className="overview-panel-slot">
