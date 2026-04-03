@@ -13,6 +13,7 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  AGENTARK_RELEASE_FEATURES: telegram,docker,ssh
 
 jobs:
   test:
@@ -53,13 +54,13 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: cargo check
-        run: cargo check --locked
+        run: cargo check --locked --no-default-features --features "${{ env.AGENTARK_RELEASE_FEATURES }}"
 
       - name: cargo clippy
-        run: cargo clippy --locked
+        run: cargo clippy --locked --no-default-features --features "${{ env.AGENTARK_RELEASE_FEATURES }}"
 
       - name: cargo test (unit)
-        run: cargo test --locked
+        run: cargo test --locked --no-default-features --features "${{ env.AGENTARK_RELEASE_FEATURES }}"
 
   build-and-push:
     needs: test
@@ -103,7 +104,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            AGENTARK_DOCKER_FEATURES=telegram,docker,ssh
+            AGENTARK_DOCKER_FEATURES=${{ env.AGENTARK_RELEASE_FEATURES }}
             AGENTARK_BUILD_JOBS=0
             INSTALL_PLAYWRIGHT_RUNTIME=true
             INSTALL_MEM0=true
