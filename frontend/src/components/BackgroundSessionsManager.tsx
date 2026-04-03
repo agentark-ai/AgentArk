@@ -23,6 +23,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
 import type { BackgroundSessionDetail, BackgroundSessionSummary } from "../types";
+import { WorkspacePageHeader, WorkspacePageShell } from "./WorkspacePage";
 
 const REFRESH_MS = 8000;
 
@@ -347,28 +348,20 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
     detailQ.data?.session || sessions.find((session) => session.id === selectedId) || null;
 
   return (
-    <Stack spacing={2}>
+    <WorkspacePageShell spacing={1.5}>
       {notice ? <Alert severity={notice.kind}>{notice.text}</Alert> : null}
       {sessionsQ.error ? <Alert severity="error">{errMessage(sessionsQ.error)}</Alert> : null}
 
-      <Box className="list-shell">
-        <Stack
-          direction={{ xs: "column", md: "row" }}
-          spacing={1.5}
-          alignItems={{ xs: "flex-start", md: "center" }}
-          justifyContent="space-between"
-        >
-          <Box>
-            <Typography variant="h6">Background Sessions</Typography>
-            <Typography variant="body2" color="text.secondary">
-              Durable containers for ongoing work across tasks, watchers, and recent runtime history.
-            </Typography>
-          </Box>
+      <WorkspacePageHeader
+        eyebrow="Operations"
+        title="Sessions"
+        description="Durable containers for ongoing work across tasks, watchers, and recent runtime history."
+        actions={
           <Button variant="contained" onClick={openCreateDialog}>
             New Session
           </Button>
-        </Stack>
-      </Box>
+        }
+      />
 
       <Grid2 container spacing={2}>
         {[
@@ -962,6 +955,6 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
           </Button>
         </DialogActions>
       </Dialog>
-    </Stack>
+    </WorkspacePageShell>
   );
 }

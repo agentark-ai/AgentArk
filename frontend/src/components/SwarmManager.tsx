@@ -1,7 +1,22 @@
-import { Alert, Box, Chip, Grid2, Stack, Typography } from "@mui/material";
-import { useQuery } from "@tanstack/react-query";
-import type { ReactNode } from "react";
+import {
+  Alert,
+  Box,
+  Button,
+  Chip,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
+  Grid2,
+  MenuItem,
+  Stack,
+  TextField,
+  Typography
+} from "@mui/material";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMemo, useState, type ReactNode } from "react";
 import { api } from "../api/client";
+import { WorkspacePageHeader, WorkspacePageShell } from "./WorkspacePage";
 
 const REFRESH_MS = 8000;
 
@@ -15,6 +30,7 @@ type ProvisionedAgent = {
   id: string;
   name: string;
   displayName: string;
+  isSystem: boolean;
   agentType: string;
   provider: string;
   model: string;
@@ -215,6 +231,7 @@ function toProvisionedAgents(data: unknown): ProvisionedAgent[] {
       id: str(agent.id, ""),
       name: str(agent.name, "Agent"),
       displayName: str(agent.display_name, str(agent.name, "Agent")),
+      isSystem: bool(agent.is_system),
       agentType: str(agent.agent_type, "Agent"),
       provider: str(agent.llm_provider, "-"),
       model: str(agent.llm_model, "-"),
@@ -233,6 +250,28 @@ function toProvisionedAgents(data: unknown): ProvisionedAgent[] {
       return (Number.isFinite(rightTs) ? rightTs : 0) - (Number.isFinite(leftTs) ? leftTs : 0);
     });
 }
+
+type AgentDraft = {
+  name: string;
+  agent_type: string;
+  llm_provider: string;
+  llm_model: string;
+  llm_base_url: string;
+  llm_api_key: string;
+  capabilities: string;
+  system_prompt: string;
+};
+
+const EMPTY_DRAFT: AgentDraft = {
+  name: "",
+  agent_type: "researcher",
+  llm_provider: "ollama",
+  llm_model: "",
+  llm_base_url: "http://localhost:11434",
+  llm_api_key: "",
+  capabilities: "",
+  system_prompt: ""
+};
 
 function toSwarmRuns(data: unknown): SwarmRun[] {
   return pickRecords(data, "runs")
@@ -426,6 +465,11 @@ function RunCard({ run, live = false }: { run: SwarmRun; live?: boolean }) {
 }
 
 export function SwarmManager({ autoRefresh }: Props) {
+  const queryClient = useQueryClient();
+  const [createOpen, setCreateOpen] = useState(false);
+  const [draft, setDraft] = useState<AgentDraft>(EMPTY_DRAFT);
+  const [formError, setFormError] = useState<string | null>(null);
+
   const statusQ = useQuery({
     queryKey: ["swarm-status"],
     queryFn: () => api.rawGet("/swarm/status"),
@@ -450,106 +494,120 @@ export function SwarmManager({ autoRefresh }: Props) {
   const status = asRecord(statusQ.data);
   const config = asRecord(configQ.data);
   const agents = toProvisionedAgents(agentsQ.data);
+  const customAgents = useMemo(() => agents.filter((agent) => !agent.isSystem), [agents]);
+  const hiddenSystemCount = agents.length - customAgents.length;
   const activeRuns = toSwarmRuns({ runs: pickRecords(status.active_runs, "active_runs") });
   const recentRuns = toSwarmRuns(delegationsQ.data).filter(
     (run) => !activeRuns.some((active) => active.id === run.id)
   );
   const swarmEnabled = bool(status.enabled) || bool(config.enabled);
   const activeAgentCount = Math.max(0, num(status.active_agents, 0));
-  const totalAgentCount = Math.max(agents.length, num(status.total_agents, 0));
+  const totalAgentCount = Math.max(customAgents.length, num(status.total_agents, 0) - hiddenSystemCount);
   const interruptedRuns = recentRuns.filter((run) => run.status === "interrupted").length;
   const failedRuns = recentRuns.filter((run) =>
     ["failed", "timed_out", "panicked"].includes(run.status)
   ).length;
   const queryError = statusQ.error || configQ.error || agentsQ.error || delegationsQ.error;
 
+  const createAgent = useMutation({
+    mutationFn: async () => {
+      const payload = {
+        name: draft.name.trim(),
+        agent_type: draft.agent_type.trim(),
+        llm_provider: draft.llm_provider.trim(),
+        llm_model: draft.llm_model.trim(),
+        llm_base_url: draft.llm_base_url.trim() || undefined,
+        llm_api_key: draft.llm_api_key.trim() || undefined,
+        capabilities: draft.capabilities
+          .split(",")
+          .map((value) => value.trim())
+          .filter(Boolean),
+        system_prompt: draft.system_prompt.trim() || undefined
+      };
+      return api.rawPost("/swarm/agents", payload);
+    },
+    onSuccess: async () => {
+      setCreateOpen(false);
+      setDraft(EMPTY_DRAFT);
+      setFormError(null);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["swarm-status"] }),
+        queryClient.invalidateQueries({ queryKey: ["swarm-agents"] }),
+        queryClient.invalidateQueries({ queryKey: ["swarm-delegations"] })
+      ]);
+    }
+  });
+
+  const providerNeedsBaseUrl =
+    draft.llm_provider === "ollama" ||
+    draft.llm_provider === "openai-compatible" ||
+    draft.llm_provider === "openrouter" ||
+    draft.llm_provider === "openai-subscription";
+
   return (
-    <Stack spacing={2.25}>
-      <Box
-        sx={{
-          p: { xs: 2, md: 2.5 },
-          borderRadius: "22px",
-          border: "1px solid rgba(85, 177, 255, 0.18)",
-          background:
-            "radial-gradient(circle at top right, rgba(82, 180, 255, 0.16), transparent 38%), linear-gradient(180deg, rgba(13, 21, 40, 0.96) 0%, rgba(8, 14, 28, 0.98) 100%)",
-          boxShadow: "0 28px 60px rgba(4, 10, 22, 0.34)"
-        }}
-      >
-        <Stack spacing={2}>
-          <Stack
-            direction={{ xs: "column", md: "row" }}
-            justifyContent="space-between"
-            alignItems={{ xs: "flex-start", md: "center" }}
-            gap={1.5}
-          >
-            <Box>
-              <Typography variant="overline" sx={{ letterSpacing: "0.16em", color: "info.light" }}>
-                Multi-agent control
+    <WorkspacePageShell spacing={1.5}>
+      <WorkspacePageHeader
+        eyebrow="Multi-agent control"
+        title="Agents"
+        description="Live delegated runs, specialist roster, and recent swarm history stay visible here. Chat and this view now share the same execution state instead of splitting live work from history."
+        actions={
+          <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+            <Button
+              size="small"
+              variant="contained"
+              onClick={() => {
+                setFormError(null);
+                setCreateOpen(true);
+              }}
+            >
+              Add agent
+            </Button>
+            <Chip
+              size="small"
+              color={swarmEnabled ? "success" : "default"}
+              variant={swarmEnabled ? "filled" : "outlined"}
+              label={swarmEnabled ? "Swarm enabled" : "Swarm disabled"}
+            />
+            <Chip size="small" variant="outlined" label={`${activeRuns.length} live run${activeRuns.length === 1 ? "" : "s"}`} />
+          </Stack>
+        }
+      />
+
+      <Grid2 container spacing={1.5}>
+        {[
+          {
+            label: "Active agents",
+            value: String(activeAgentCount),
+            tone: activeAgentCount > 0 ? "warning.main" : "text.primary"
+          },
+          {
+            label: "Custom agents",
+            value: String(totalAgentCount),
+            tone: "text.primary"
+          },
+          {
+            label: "Interrupted runs",
+            value: String(interruptedRuns),
+            tone: interruptedRuns > 0 ? "warning.light" : "text.primary"
+          },
+          {
+            label: "Failed runs",
+            value: String(failedRuns),
+            tone: failedRuns > 0 ? "error.light" : "text.primary"
+          }
+        ].map((item) => (
+          <Grid2 key={item.label} size={{ xs: 6, lg: 3 }}>
+            <Box className="list-shell" sx={{ minHeight: 110, height: "100%" }}>
+              <Typography variant="caption" color="text.secondary">
+                {item.label}
               </Typography>
-              <Typography variant="h5" sx={{ fontWeight: 800 }}>
-                Agents
-              </Typography>
-              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5, maxWidth: 820 }}>
-                Live delegated runs, specialist roster, and recent swarm history stay visible here.
-                Chat and this view now share the same execution state instead of splitting live work
-                from history.
+              <Typography variant="h5" sx={{ fontWeight: 800, color: item.tone }}>
+                {item.value}
               </Typography>
             </Box>
-            <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
-              <Chip
-                size="small"
-                color={swarmEnabled ? "success" : "default"}
-                variant={swarmEnabled ? "filled" : "outlined"}
-                label={swarmEnabled ? "Swarm enabled" : "Swarm disabled"}
-              />
-              <Chip size="small" variant="outlined" label={`${activeRuns.length} live run${activeRuns.length === 1 ? "" : "s"}`} />
-            </Stack>
-          </Stack>
-
-          <Grid2 container spacing={1}>
-            {[
-              {
-                label: "Active agents",
-                value: String(activeAgentCount),
-                tone: activeAgentCount > 0 ? "warning.main" : "text.primary"
-              },
-              {
-                label: "Specialists",
-                value: String(totalAgentCount),
-                tone: "text.primary"
-              },
-              {
-                label: "Interrupted runs",
-                value: String(interruptedRuns),
-                tone: interruptedRuns > 0 ? "warning.light" : "text.primary"
-              },
-              {
-                label: "Failed runs",
-                value: String(failedRuns),
-                tone: failedRuns > 0 ? "error.light" : "text.primary"
-              }
-            ].map((item) => (
-              <Grid2 key={item.label} size={{ xs: 6, lg: 3 }}>
-                <Box
-                  sx={{
-                    p: 1.35,
-                    borderRadius: "14px",
-                    border: "1px solid rgba(255,255,255,0.07)",
-                    background: "rgba(255,255,255,0.035)"
-                  }}
-                >
-                  <Typography variant="caption" color="text.secondary">
-                    {item.label}
-                  </Typography>
-                  <Typography variant="h5" sx={{ fontWeight: 800, color: item.tone }}>
-                    {item.value}
-                  </Typography>
-                </Box>
-              </Grid2>
-            ))}
           </Grid2>
-        </Stack>
-      </Box>
+        ))}
+      </Grid2>
 
       {queryError ? <Alert severity="error">{errMessage(queryError)}</Alert> : null}
 
@@ -586,16 +644,54 @@ export function SwarmManager({ autoRefresh }: Props) {
 
       <SectionShell
         eyebrow="Roster"
-        title="All specialist agents"
-        detail="Configured specialists stay visible even while idle, with their latest task and status nearby."
+        title="Custom agents"
+        detail="User-managed specialists stay visible here. Built-in system specialists remain available for delegation without cluttering the roster."
       >
-        {agents.length === 0 ? (
-          <Typography variant="body2" color="text.secondary">
-            No specialist agents have been provisioned yet.
-          </Typography>
+        <Stack spacing={1.2}>
+          <Stack
+            direction={{ xs: "column", md: "row" }}
+            alignItems={{ xs: "flex-start", md: "center" }}
+            justifyContent="space-between"
+            gap={1}
+          >
+            <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+              <Chip size="small" variant="outlined" label={`${customAgents.length} custom`} />
+              {hiddenSystemCount > 0 ? (
+                <Chip size="small" variant="outlined" label={`${hiddenSystemCount} system hidden`} />
+              ) : null}
+            </Stack>
+            <Button
+              size="small"
+              variant="outlined"
+              onClick={() => {
+                setFormError(null);
+                setCreateOpen(true);
+              }}
+            >
+              Add agent
+            </Button>
+          </Stack>
+
+        {customAgents.length === 0 ? (
+          <Box
+            sx={{
+              p: 1.5,
+              borderRadius: "14px",
+              border: "1px dashed rgba(255,255,255,0.12)",
+              background: "rgba(255,255,255,0.02)"
+            }}
+          >
+            <Typography variant="body2" sx={{ fontWeight: 700 }}>
+              No custom agents yet
+            </Typography>
+            <Typography variant="body2" color="text.secondary" sx={{ mt: 0.45 }}>
+              Add user-managed agents when you want fixed specialists with your own model, prompt,
+              or capability mix. Built-in system specialists stay hidden from this list.
+            </Typography>
+          </Box>
         ) : (
           <Grid2 container spacing={1.15}>
-            {agents.map((agent) => (
+            {customAgents.map((agent) => (
               <Grid2 key={agent.id} size={{ xs: 12, md: 6, xl: 4 }}>
                 <Box
                   sx={{
@@ -673,6 +769,7 @@ export function SwarmManager({ autoRefresh }: Props) {
             ))}
           </Grid2>
         )}
+        </Stack>
       </SectionShell>
 
       <SectionShell
@@ -692,6 +789,131 @@ export function SwarmManager({ autoRefresh }: Props) {
           </Stack>
         )}
       </SectionShell>
-    </Stack>
+
+      <Dialog open={createOpen} onClose={() => setCreateOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>Add custom agent</DialogTitle>
+        <DialogContent>
+          <Stack spacing={1.25} sx={{ mt: 1 }}>
+            <Typography variant="body2" color="text.secondary">
+              This creates a user-managed specialist for the roster and routing surfaces. System agents stay hidden.
+            </Typography>
+            <TextField
+              fullWidth
+              size="small"
+              label="Name"
+              value={draft.name}
+              onChange={(event) => setDraft((prev) => ({ ...prev, name: event.target.value }))}
+            />
+            <TextField
+              fullWidth
+              select
+              size="small"
+              label="Role"
+              value={draft.agent_type}
+              onChange={(event) => setDraft((prev) => ({ ...prev, agent_type: event.target.value }))}
+            >
+              {["researcher", "coder", "analyst", "writer", "validator", "planner"].map((option) => (
+                <MenuItem key={option} value={option}>
+                  {option}
+                </MenuItem>
+              ))}
+            </TextField>
+            <Grid2 container spacing={1}>
+              <Grid2 size={{ xs: 12, md: 6 }}>
+                <TextField
+                  fullWidth
+                  select
+                  size="small"
+                  label="Provider"
+                  value={draft.llm_provider}
+                  onChange={(event) => setDraft((prev) => ({ ...prev, llm_provider: event.target.value }))}
+                >
+                  {["ollama", "openai", "openai-compatible", "openrouter", "anthropic"].map((option) => (
+                    <MenuItem key={option} value={option}>
+                      {option}
+                    </MenuItem>
+                  ))}
+                </TextField>
+              </Grid2>
+              <Grid2 size={{ xs: 12, md: 6 }}>
+                <TextField
+                  fullWidth
+                  size="small"
+                  label="Model"
+                  value={draft.llm_model}
+                  onChange={(event) => setDraft((prev) => ({ ...prev, llm_model: event.target.value }))}
+                  placeholder={draft.llm_provider === "ollama" ? "llama3.1:8b" : "gpt-4.1-mini"}
+                />
+              </Grid2>
+              {providerNeedsBaseUrl ? (
+                <Grid2 size={{ xs: 12 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    label="Base URL"
+                    value={draft.llm_base_url}
+                    onChange={(event) => setDraft((prev) => ({ ...prev, llm_base_url: event.target.value }))}
+                    placeholder={draft.llm_provider === "ollama" ? "http://localhost:11434" : "https://openrouter.ai/api/v1"}
+                  />
+                </Grid2>
+              ) : null}
+              {draft.llm_provider !== "ollama" ? (
+                <Grid2 size={{ xs: 12 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    type="password"
+                    label="API key (optional)"
+                    value={draft.llm_api_key}
+                    onChange={(event) => setDraft((prev) => ({ ...prev, llm_api_key: event.target.value }))}
+                  />
+                </Grid2>
+              ) : null}
+            </Grid2>
+            <TextField
+              fullWidth
+              size="small"
+              label="Capabilities"
+              value={draft.capabilities}
+              onChange={(event) => setDraft((prev) => ({ ...prev, capabilities: event.target.value }))}
+              placeholder="debugging, code review, refactoring"
+              helperText="Comma-separated skills shown on the agent card."
+            />
+            <TextField
+              fullWidth
+              size="small"
+              multiline
+              minRows={4}
+              label="System prompt override (optional)"
+              value={draft.system_prompt}
+              onChange={(event) => setDraft((prev) => ({ ...prev, system_prompt: event.target.value }))}
+            />
+            {formError ? <Alert severity="error">{formError}</Alert> : null}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setCreateOpen(false)}>Cancel</Button>
+          <Button
+            variant="contained"
+            disabled={createAgent.isPending}
+            onClick={async () => {
+              const missingBaseUrl = providerNeedsBaseUrl && !draft.llm_base_url.trim();
+              if (!draft.name.trim() || !draft.agent_type.trim() || !draft.llm_provider.trim() || !draft.llm_model.trim() || missingBaseUrl) {
+                setFormError("Name, role, provider, and model are required. Include a base URL when the provider needs one.");
+                return;
+              }
+              setFormError(null);
+              try {
+                await createAgent.mutateAsync();
+              } catch (error) {
+                setFormError(errMessage(error));
+              }
+            }}
+          >
+            Create agent
+          </Button>
+        </DialogActions>
+      </Dialog>
+    </WorkspacePageShell>
   );
 }

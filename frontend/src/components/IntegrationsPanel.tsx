@@ -3712,7 +3712,7 @@ export function IntegrationsPanel({
                 Failed to load gateway channel health: {(channelsQ.error as Error)?.message || "Unknown error"}
               </Alert>
             ) : null}
-            <Grid2 container spacing={1}>
+            <Grid2 container spacing={1} alignItems="stretch">
               {messagingSetups.map((setup) => {
                 const displayState = messagingDisplayState(setup.status, setup.enabled);
                 const accent = integrationCardAccent(
@@ -3725,14 +3725,15 @@ export function IntegrationsPanel({
                         : "not_configured"
                 );
                 return (
-                  <Grid2 key={setup.id} size={{ xs: 12, sm: 6, lg: 3 }}>
+                  <Grid2 key={setup.id} size={{ xs: 12, sm: 6, lg: 3 }} sx={{ display: "flex" }}>
                     <Box
                       sx={{
+                        height: "100%",
                         border: `1px solid ${accent.border}`,
                         background: accent.background,
                         borderRadius: 1.5,
                         p: 1.5,
-                        minHeight: 172,
+                        minHeight: 196,
                         display: "flex",
                         flexDirection: "column",
                         justifyContent: "space-between"
@@ -3751,10 +3752,32 @@ export function IntegrationsPanel({
                             variant="outlined"
                           />
                         </Stack>
-                        <Typography variant="body2" color="text.secondary">
+                        <Typography
+                          variant="body2"
+                          color="text.secondary"
+                          sx={{
+                            lineHeight: 1.45,
+                            display: "-webkit-box",
+                            WebkitLineClamp: 3,
+                            WebkitBoxOrient: "vertical",
+                            overflow: "hidden",
+                            minHeight: "4.35em"
+                          }}
+                        >
                           {setup.detail}
                         </Typography>
-                        <Typography variant="caption" color="text.secondary">
+                        <Typography
+                          variant="caption"
+                          color="text.secondary"
+                          sx={{
+                            lineHeight: 1.4,
+                            display: "-webkit-box",
+                            WebkitLineClamp: 2,
+                            WebkitBoxOrient: "vertical",
+                            overflow: "hidden",
+                            minHeight: "2.8em"
+                          }}
+                        >
                           {messagingWizardHint(setup.status, setup.enabled)}
                         </Typography>
                       </Stack>
@@ -3878,7 +3901,7 @@ export function IntegrationsPanel({
                 Failed to load gateway channel health: {(channelsQ.error as Error)?.message || "Unknown error"}
               </Alert>
             ) : null}
-            <Grid2 container spacing={1}>
+            <Grid2 container spacing={1} alignItems="stretch">
               {messagingSetups.map((setup) => {
                 const displayState = messagingDisplayState(setup.status, setup.enabled);
                 const accent = integrationCardAccent(
@@ -3891,14 +3914,15 @@ export function IntegrationsPanel({
                         : "not_configured"
                 );
                 return (
-                  <Grid2 key={setup.id} size={{ xs: 12, sm: 6, lg: 3 }}>
+                  <Grid2 key={setup.id} size={{ xs: 12, sm: 6, lg: 3 }} sx={{ display: "flex" }}>
                     <Box
                       sx={{
+                        height: "100%",
                         border: `1px solid ${accent.border}`,
                         background: accent.background,
                         borderRadius: 1.5,
                         p: 1.5,
-                        minHeight: 172,
+                        minHeight: 196,
                         display: "flex",
                         flexDirection: "column",
                         justifyContent: "space-between"
@@ -3917,10 +3941,32 @@ export function IntegrationsPanel({
                             variant="outlined"
                           />
                         </Stack>
-                        <Typography variant="body2" color="text.secondary">
+                        <Typography
+                          variant="body2"
+                          color="text.secondary"
+                          sx={{
+                            lineHeight: 1.45,
+                            display: "-webkit-box",
+                            WebkitLineClamp: 3,
+                            WebkitBoxOrient: "vertical",
+                            overflow: "hidden",
+                            minHeight: "4.35em"
+                          }}
+                        >
                           {setup.detail}
                         </Typography>
-                        <Typography variant="caption" color="text.secondary">
+                        <Typography
+                          variant="caption"
+                          color="text.secondary"
+                          sx={{
+                            lineHeight: 1.4,
+                            display: "-webkit-box",
+                            WebkitLineClamp: 2,
+                            WebkitBoxOrient: "vertical",
+                            overflow: "hidden",
+                            minHeight: "2.8em"
+                          }}
+                        >
                           {messagingWizardHint(setup.status, setup.enabled)}
                         </Typography>
                       </Stack>

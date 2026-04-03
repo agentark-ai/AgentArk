@@ -26797,6 +26797,10 @@ fn build_swarm_agent_from_delegation(
     }
 }
 
+fn is_system_swarm_agent(agent: &crate::storage::entities::swarm_agent::Model) -> bool {
+    agent.id.starts_with("default-")
+}
+
 fn summarize_swarm_run_status(agents: &[crate::core::swarm::SwarmActivityAgent]) -> String {
     if agents.iter().any(|agent| {
         matches!(
@@ -27052,6 +27056,7 @@ async fn swarm_list_agents(State(state): State<AppState>) -> Response {
                         "id": a.id,
                         "name": a.name,
                         "display_name": display_name,
+                        "is_system": is_system_swarm_agent(a),
                         "agent_type": a.agent_type,
                         "llm_provider": provider_label,
                         "llm_model": live.map(|info| info.llm_model.clone()).unwrap_or(llm_model),

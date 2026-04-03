@@ -45,6 +45,10 @@ function pickRecords(payload: unknown, key: string): JsonRecord[] {
   return Array.isArray(value) ? value.filter(isRecord) : [];
 }
 
+function visibleSwarmRows(rows: JsonRecord[]): JsonRecord[] {
+  return rows.filter((row) => !toBool(row.is_system));
+}
+
 function errMessage(error: unknown): string {
   if (error instanceof Error && error.message) return error.message;
   return str(asRecord(error).error, "Request failed");
@@ -75,7 +79,7 @@ export function IntegrationRoutingPanel({ autoRefresh }: { autoRefresh: boolean 
   const routeRows = pickRecords(routingQ.data, "rules");
   const groupRows = pickRecords(routingQ.data, "broadcast_groups");
   const channelRows = pickRecords(channelsQ.data, "channels");
-  const swarmRows = pickRecords(asRecord(swarmQ.data), "agents");
+  const swarmRows = visibleSwarmRows(pickRecords(asRecord(swarmQ.data), "agents"));
 
   useEffect(() => {
     if (routeRows.length === 0) {

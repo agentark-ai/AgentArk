@@ -80,6 +80,7 @@ import { RoutingControlPanel } from "./RoutingControlPanel";
 import { SentinelPanel } from "./SentinelPanel";
 import { SuggestionRunDialog, type SuggestionRunState } from "./SuggestionRunDialog";
 import { SwarmManager } from "./SwarmManager";
+import { WorkspacePageHeader, WorkspacePageShell } from "./WorkspacePage";
 import {
   getAppShareLinkLabel,
   getAppShareOpenLabel,
@@ -10861,28 +10862,23 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
   }, [tasks]);
 
   return (
-    <Stack spacing={1.5} sx={{ flex: 1, minHeight: 0, height: "100%" }}>
-      <Box className="list-shell">
-        <Stack
-          direction={{ xs: "column", sm: "row" }}
-          spacing={1.5}
-          alignItems={{ xs: "flex-start", sm: "center" }}
-          justifyContent="space-between"
-        >
-          <Box>
-            <Typography variant="h6">Tasks</Typography>
-            <Typography variant="body2" color="text.secondary">
-              Describe what you want in plain English. AgentArk can generate a runnable task for you.
-            </Typography>
-          </Box>
-          <Button variant="contained" onClick={() => {
-            setFormError(null);
-            setCreateTaskOpen(true);
-          }}>
+    <WorkspacePageShell spacing={1.5} sx={{ flex: 1, minHeight: 0, height: "100%" }}>
+      <WorkspacePageHeader
+        eyebrow="Operations"
+        title="Tasks"
+        description="Describe what you want in plain English. AgentArk can generate a runnable task for you."
+        actions={
+          <Button
+            variant="contained"
+            onClick={() => {
+              setFormError(null);
+              setCreateTaskOpen(true);
+            }}
+          >
             Create Task
           </Button>
-        </Stack>
-      </Box>
+        }
+      />
 
       <Grid2 container spacing={2}>
         <Grid2 size={{ xs: 12, sm: 6, md: 3 }}>
@@ -11416,7 +11412,7 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
           </Stack>
         </DialogContent>
       </Dialog>
-    </Stack>
+    </WorkspacePageShell>
   );
 }
 
@@ -12022,12 +12018,14 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
         : false;
 
   return (
-    <Stack spacing={2}>
-      <Box className="list-shell">
-        <Stack direction="row" justifyContent="space-between" alignItems="center" mb={1}>
-          <Typography variant="h6">Skills</Typography>
-          {skillsTab === "manage" ? (
-            <Stack direction="row" spacing={1}>
+    <WorkspacePageShell spacing={1.5}>
+      <WorkspacePageHeader
+        eyebrow="Agent"
+        title="Skills"
+        description={`System skills: ${systemSkills.length}, bundled skills: ${bundledSkills.length}, custom skills: ${customSkills.length}, automations: ${hooks.length}.`}
+        actions={
+          skillsTab === "manage" ? (
+            <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
               <Button size="small" variant="outlined" onClick={() => setAiCreateOpen(true)}>
                 Create Skill
               </Button>
@@ -12038,14 +12036,17 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
                 Bulk Import
               </Button>
             </Stack>
-          ) : null}
-        </Stack>
+          ) : null
+        }
+      />
+
+      <Box className="list-shell">
         <Typography variant="body2" color="text.secondary">
-          System skills: {systemSkills.length}, bundled skills: {bundledSkills.length}, custom skills: {customSkills.length}, automations: {hooks.length}.
+          Start with AI Quick Create for new skills, then drop into the editor only when you need manual SKILL.md control.
         </Typography>
         {skillsTab === "manage" ? (
           <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.5 }}>
-            Start with AI Quick Create. Use Advanced Editor only when you need manual SKILL.md control.
+            Create and manage user skills here, while bundled and system skills stay available in their own sections below.
           </Typography>
         ) : null}
         {lastImport?.message ? (
@@ -12792,7 +12793,7 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
       </Dialog>
 
       <SkillSecretsDialog open={secretsName != null} skillName={secretsName} onClose={() => setSecretsName(null)} />
-    </Stack>
+    </WorkspacePageShell>
   );
 }
 
@@ -12968,50 +12969,48 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
   };
 
   return (
-    <Stack spacing={2}>
+    <WorkspacePageShell spacing={1.5}>
+      <WorkspacePageHeader
+        eyebrow="Agent"
+        title="Apps"
+        description="Manage deployed app runtime, health, and local access."
+      />
+
+      {tunnelQ.error ? <Alert severity="error">{errMessage(tunnelQ.error)}</Alert> : null}
+      {tunnelErrorText ? <Alert severity="error">{tunnelErrorText}</Alert> : null}
+      {tunnelActionError ? <Alert severity="error">{tunnelActionError}</Alert> : null}
+      {appsActionError ? <Alert severity="error">{appsActionError}</Alert> : null}
+      {appsActionSuccess ? <Alert severity="success">{appsActionSuccess}</Alert> : null}
+      {appsRestartNotice ? (
+        <Box className="settings-inline-card tone-info">
+          <Stack
+            className="settings-inline-card-head"
+            direction={{ xs: "column", sm: "row" }}
+            justifyContent="space-between"
+            alignItems={{ xs: "flex-start", sm: "center" }}
+            spacing={1}
+          >
+            <Box className="settings-inline-card-copy">
+              <Typography className="settings-inline-card-kicker">Restarting</Typography>
+              <Typography className="settings-inline-card-title">App changes are being applied</Typography>
+              <Typography className="settings-inline-card-description">{appsRestartNotice}</Typography>
+            </Box>
+            <Chip
+              size="small"
+              icon={<AutorenewRoundedIcon />}
+              label="Up to 10 seconds"
+              color="info"
+              variant="outlined"
+            />
+          </Stack>
+        </Box>
+      ) : null}
+      {restoreActive ? (
+        <Alert severity="info">
+          Restoring {restoreTotal} app{restoreTotal === 1 ? "" : "s"} in the background. {restorePending} remaining, {restoreReady} ready{restoreDegraded > 0 ? `, ${restoreDegraded} degraded` : ""}.
+        </Alert>
+      ) : null}
       <Box className="list-shell">
-        <Stack direction={{ xs: "column", md: "row" }} justifyContent="space-between" alignItems={{ xs: "flex-start", md: "center" }} spacing={1} mb={1}>
-          <Box>
-            <Typography variant="h6">Deployed Apps</Typography>
-            <Typography variant="caption" color="text.secondary">
-              Manage app runtime, health, and local access.
-            </Typography>
-          </Box>
-        </Stack>
-        {tunnelQ.error ? <Alert severity="error" sx={{ mb: 1 }}>{errMessage(tunnelQ.error)}</Alert> : null}
-        {tunnelErrorText ? <Alert severity="error" sx={{ mb: 1 }}>{tunnelErrorText}</Alert> : null}
-        {tunnelActionError ? <Alert severity="error" sx={{ mb: 1 }}>{tunnelActionError}</Alert> : null}
-        {appsActionError ? <Alert severity="error" sx={{ mb: 1 }}>{appsActionError}</Alert> : null}
-        {appsActionSuccess ? <Alert severity="success" sx={{ mb: 1 }}>{appsActionSuccess}</Alert> : null}
-        {appsRestartNotice ? (
-          <Box className="settings-inline-card tone-info" sx={{ mb: 1.25 }}>
-            <Stack
-              className="settings-inline-card-head"
-              direction={{ xs: "column", sm: "row" }}
-              justifyContent="space-between"
-              alignItems={{ xs: "flex-start", sm: "center" }}
-              spacing={1}
-            >
-              <Box className="settings-inline-card-copy">
-                <Typography className="settings-inline-card-kicker">Restarting</Typography>
-                <Typography className="settings-inline-card-title">App changes are being applied</Typography>
-                <Typography className="settings-inline-card-description">{appsRestartNotice}</Typography>
-              </Box>
-              <Chip
-                size="small"
-                icon={<AutorenewRoundedIcon />}
-                label="Up to 10 seconds"
-                color="info"
-                variant="outlined"
-              />
-            </Stack>
-          </Box>
-        ) : null}
-        {restoreActive ? (
-          <Alert severity="info" sx={{ mb: 1 }}>
-            Restoring {restoreTotal} app{restoreTotal === 1 ? "" : "s"} in the background. {restorePending} remaining, {restoreReady} ready{restoreDegraded > 0 ? `, ${restoreDegraded} degraded` : ""}.
-          </Alert>
-        ) : null}
         <TableContainer className="table-shell">
           <Table size="small">
             <TableHead>
@@ -13277,7 +13276,7 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
           </Table>
         </TableContainer>
       </Box>
-    </Stack>
+    </WorkspacePageShell>
   );
 }
 
@@ -13452,22 +13451,17 @@ function GoalsManager({ autoRefresh }: { autoRefresh: boolean }) {
   };
 
   return (
-    <Stack spacing={2}>
-      <Box className="list-shell">
-        <Stack direction={{ xs: "column", md: "row" }} justifyContent="space-between" alignItems={{ xs: "flex-start", md: "center" }} spacing={1} mb={1}>
-          <Stack spacing={0.25}>
-            <Typography variant="h6">Goals</Typography>
-            <Typography variant="caption" color="text.secondary">
-              Track outcomes and spin up AI autopilot loops when needed.
-            </Typography>
-          </Stack>
-          <Stack direction="row" spacing={1}>
-            <Button size="small" variant="outlined" onClick={() => openGoalDialog(true)}>
-              Create Goal
-            </Button>
-          </Stack>
-        </Stack>
-      </Box>
+    <WorkspacePageShell spacing={1.5}>
+      <WorkspacePageHeader
+        eyebrow="Agent"
+        title="Goals"
+        description="Track outcomes and spin up AI autopilot loops when needed."
+        actions={
+          <Button size="small" variant="outlined" onClick={() => openGoalDialog(true)}>
+            Create Goal
+          </Button>
+        }
+      />
 
       <Grid2 container spacing={2}>
         <Grid2 size={{ xs: 12, md: 3 }}><Box className="list-shell" sx={{ minHeight: 110 }}><Typography variant="caption" color="text.secondary">Autopilot Items</Typography><Typography variant="h5">{num(summary.total)}</Typography><Typography variant="caption" color="text.secondary">Recent tasks tied to goals</Typography></Box></Grid2>
@@ -13908,7 +13902,7 @@ function GoalsManager({ autoRefresh }: { autoRefresh: boolean }) {
           </Button>
         </DialogActions>
       </Dialog>
-    </Stack>
+    </WorkspacePageShell>
   );
 }
 
@@ -14474,7 +14468,12 @@ function AutonomyManager({ autoRefresh }: { autoRefresh: boolean }) {
   }
 
   return (
-    <Stack spacing={2}>
+    <WorkspacePageShell spacing={1.5}>
+      <WorkspacePageHeader
+        eyebrow="Core"
+        title="Mission Control"
+        description="Choose how hands-off you want AgentArk to be, review what is waiting on you, and open the advanced autonomy controls when needed."
+      />
       <Box className="list-shell">
         <Stack spacing={1.25}>
           <Typography variant="h6">Automation Mode</Typography>
@@ -15290,7 +15289,7 @@ function AutonomyManager({ autoRefresh }: { autoRefresh: boolean }) {
         </Alert>
       ) : null}
       {success ? <Alert severity="success">{success}</Alert> : null}
-    </Stack>
+    </WorkspacePageShell>
   );
 }
 
@@ -15352,30 +15351,33 @@ function DocumentsManager({
   };
 
   return (
-    <Stack spacing={2}>
-      <Box className="list-shell">
-        <input
-          ref={fileInputRef}
-          type="file"
-          hidden
-          accept=".txt,.md,.markdown,.json,.csv,.tsv,.xml,.html,.htm,.yaml,.yml,.log,.ini,.toml,.sql,.js,.ts,.tsx,.jsx,.py,.rs,.go,.java,.c,.cpp,.h,.hpp,.sh,.bat,.ps1,.pdf,.docx,text/*,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-          onChange={handleFileSelected}
-        />
-        <Stack direction={{ xs: "column", sm: "row" }} spacing={1} alignItems={{ xs: "flex-start", sm: "center" }} mb={1}>
-          <Box sx={{ flex: 1 }}>
-            <Typography variant="h6">Documents</Typography>
-            <Typography variant="body2" color="text.secondary">
-              Showing files for {activeScopeLabel}.
-            </Typography>
-          </Box>
+    <WorkspacePageShell spacing={1.5}>
+      <input
+        ref={fileInputRef}
+        type="file"
+        hidden
+        accept=".txt,.md,.markdown,.json,.csv,.tsv,.xml,.html,.htm,.yaml,.yml,.log,.ini,.toml,.sql,.js,.ts,.tsx,.jsx,.py,.rs,.go,.java,.c,.cpp,.h,.hpp,.sh,.bat,.ps1,.pdf,.docx,text/*,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        onChange={handleFileSelected}
+      />
+      <WorkspacePageHeader
+        eyebrow="Data"
+        title="Documents"
+        description={`Showing files for ${activeScopeLabel}.`}
+        actions={
           <Button
             variant="contained"
             size="small"
-            onClick={() => { setUploadDialogOpen(true); setUploadSuccess(null); setError(null); }}
+            onClick={() => {
+              setUploadDialogOpen(true);
+              setUploadSuccess(null);
+              setError(null);
+            }}
           >
             Upload Document
           </Button>
-        </Stack>
+        }
+      />
+      <Box className="list-shell">
 
         <Dialog open={uploadDialogOpen} onClose={() => { if (!uploadFileMutation.isPending) { setUploadDialogOpen(false); setSelectedFile(null); setSelectedFileName(""); setError(null); } }} maxWidth="sm" fullWidth>
           <DialogTitle sx={{ pb: 0.5 }}>Upload Document</DialogTitle>
@@ -15501,7 +15503,7 @@ function DocumentsManager({
       </Box>
 
       {docsQ.error || error ? <Alert severity="error">{error || errMessage(docsQ.error)}</Alert> : null}
-    </Stack>
+    </WorkspacePageShell>
   );
 }
 
@@ -15626,7 +15628,12 @@ function MemoryManager({
   };
 
   return (
-    <Stack spacing={2}>
+    <WorkspacePageShell spacing={1.5}>
+      <WorkspacePageHeader
+        eyebrow="Data"
+        title="Memory"
+        description={`Review remembered facts, preferences, user data, and knowledge for ${activeScopeLabel}.`}
+      />
       <Alert severity="info">
         Showing memory for {activeScopeLabel}. New entries inherit this scope automatically.
       </Alert>
@@ -16144,7 +16151,7 @@ function MemoryManager({
           </Stack>
         </DialogContent>
       </Dialog>
-    </Stack>
+    </WorkspacePageShell>
   );
 }
 function ProjectsManager({
@@ -16233,7 +16240,17 @@ function ProjectsManager({
   }, [conversations]);
 
   return (
-    <Stack spacing={2}>
+    <WorkspacePageShell spacing={1.5}>
+      <WorkspacePageHeader
+        eyebrow="Workspace"
+        title="Projects"
+        description={`Active workspace: ${activeScopeLabel}. Create isolated workspaces when you want separate conversations, documents, and memory.`}
+        actions={
+          <Button size="small" variant="contained" onClick={() => setCreateOpen(true)}>
+            New Project
+          </Button>
+        }
+      />
       <Dialog open={createOpen} onClose={() => setCreateOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>Create Project</DialogTitle>
         <DialogContent>
@@ -16274,15 +16291,6 @@ function ProjectsManager({
       <Grid2 container spacing={2}>
         <Grid2 size={{ xs: 12, lg: 7 }}>
           <Box className="list-shell">
-            <Stack direction="row" justifyContent="space-between" alignItems="center" mb={1}>
-              <Box>
-                <Typography variant="h6">Projects</Typography>
-                <Typography variant="body2" color="text.secondary">
-                  Active workspace: {activeScopeLabel}
-                </Typography>
-              </Box>
-              <Button size="small" variant="contained" onClick={() => setCreateOpen(true)}>New Project</Button>
-            </Stack>
             <TableContainer className="table-shell">
               <Table size="small">
                 <TableHead>
@@ -16526,7 +16534,7 @@ function ProjectsManager({
           </Stack>
         </DialogContent>
       </Dialog>
-    </Stack>
+    </WorkspacePageShell>
   );
 }
 
@@ -17128,36 +17136,28 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
   );
 
     return (
-      <Stack spacing={1.25} className="workspace-page-shell trace-page-shell">
-        <Stack
-          direction={{ xs: "column", md: "row" }}
-          justifyContent="space-between"
-          alignItems={{ xs: "stretch", md: "flex-start" }}
-          spacing={1}
-          className="workspace-page-header"
-        >
-          <Box className="workspace-page-header-copy">
-            <Typography className="workspace-page-kicker">Observability</Typography>
-            <Typography className="workspace-page-title">Trace</Typography>
-            <Typography className="workspace-page-copy">
-              Execution history, integration sync runs, and export delivery in one place.
-            </Typography>
-          </Box>
-          <TextField
-            select
-            className="workspace-page-select"
-            size="small"
-            value={traceRange}
-            onChange={(event) => setTraceRange(event.target.value as TraceRange)}
-            sx={{ minWidth: 132, flexShrink: 0 }}
-          >
-            {TRACE_RANGE_PRESETS.map((preset) => (
-              <MenuItem key={preset.value} value={preset.value}>
-                {preset.label}
-              </MenuItem>
-            ))}
-          </TextField>
-        </Stack>
+      <WorkspacePageShell spacing={1.25} className="trace-page-shell">
+        <WorkspacePageHeader
+          eyebrow="Observability"
+          title="Trace"
+          description="Recent runs, integration activity, and export logs in one place."
+          actions={
+            <TextField
+              select
+              className="workspace-page-select"
+              size="small"
+              value={traceRange}
+              onChange={(event) => setTraceRange(event.target.value as TraceRange)}
+              sx={{ minWidth: 132, flexShrink: 0 }}
+            >
+              {TRACE_RANGE_PRESETS.map((preset) => (
+                <MenuItem key={preset.value} value={preset.value}>
+                  {preset.label}
+                </MenuItem>
+              ))}
+            </TextField>
+          }
+        />
 
         <Box className="list-shell workspace-page-subnav-shell">
           <Stack direction="row" alignItems="center" justifyContent="space-between">
@@ -17169,9 +17169,9 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
               className="workspace-page-subnav-tabs"
               sx={{ flex: 1 }}
             >
-              <Tab value="history" label={`Execution History (${historyTotal})`} />
-              <Tab value="sync" label={`Sync Runs (${syncRunTotal})`} />
-              <Tab value="exports" label={`Export Delivery (${exportLogs.length})`} />
+              <Tab value="history" label={`Runs (${historyTotal})`} />
+              <Tab value="sync" label={`Sync (${syncRunTotal})`} />
+              <Tab value="exports" label={`Exports (${exportLogs.length})`} />
             </Tabs>
             </Stack>
         </Box>
@@ -17333,69 +17333,18 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
           {renderDiagnosticsSectionHeader({
             eyebrow: "Integration health",
             title: "Sync Runs",
-            description: "Shows background and manual integration sync executions, their outcome, item counts, summaries, and the runtime state captured for each run.",
+            description: "Shows recent integration sync activity, whether it worked, and what changed.",
             meta: `Showing ${syncRuns.length} of ${syncRunTotal} runs`,
             compact: true,
           })}
-
-          <Box className="trace-section-body">
-            <Box className="trace-summary-rail">
-              <Grid2 container spacing={1} className="trace-summary-stats">
-                <Grid2 size={{ xs: 6, md: 3, xl: 6 }}>
-                  <Box className="metadata-box diagnostics-stat-card">
-                    <Typography variant="caption" className="diagnostics-stat-label">Completed</Typography>
-                    <Typography variant="h6" className="diagnostics-stat-value">{num(syncRunStats.completed_runs, 0)}</Typography>
-                  </Box>
-                </Grid2>
-                <Grid2 size={{ xs: 6, md: 3, xl: 6 }}>
-                  <Box className="metadata-box diagnostics-stat-card">
-                    <Typography variant="caption" className="diagnostics-stat-label">Failed</Typography>
-                    <Typography variant="h6" className="diagnostics-stat-value">{num(syncRunStats.failed_runs, 0)}</Typography>
-                  </Box>
-                </Grid2>
-                <Grid2 size={{ xs: 6, md: 3, xl: 6 }}>
-                  <Box className="metadata-box diagnostics-stat-card">
-                    <Typography variant="caption" className="diagnostics-stat-label">Blocked</Typography>
-                    <Typography variant="h6" className="diagnostics-stat-value">{num(syncRunStats.blocked_runs, 0)}</Typography>
-                  </Box>
-                </Grid2>
-                <Grid2 size={{ xs: 6, md: 3, xl: 6 }}>
-                  <Box className="metadata-box diagnostics-stat-card">
-                    <Typography variant="caption" className="diagnostics-stat-label">Avg duration</Typography>
-                    <Typography variant="h6" className="diagnostics-stat-value">{formatTraceDuration(syncRunStats.avg_duration_ms)}</Typography>
-                  </Box>
-                </Grid2>
-              </Grid2>
-
-              {syncRunBuckets.length > 0 ? (
-                <Box className="trace-chart-grid">
-                  <MetricBarCard
-                    className="diagnostics-chart-card trace-metric-card delay-1"
-                    title="Sync Run Volume"
-                    value={`${num(syncRunStats.total_runs, 0)} total`}
-                    values={syncRunTrendValues}
-                    rows={syncRunTrendRows}
-                    palette={["#47d7ff", "#29b8ff", "#0fe3c2", "#8be9fd", "#6aa7ff", "#1db5ff", "#67d4ff"]}
-                    chartHeight={64}
-                    compact
-                    rowsLimit={4}
-                  />
-                  <MetricBarCard
-                    className="diagnostics-chart-card trace-metric-card delay-2"
-                    title="Attention Load"
-                    value={`${num(syncRunStats.important_hits, 0)} important`}
-                    values={syncAttentionValues}
-                    rows={syncAttentionRows}
-                    palette={["#ffb347", "#ff7a7a", "#ff9966", "#ffd166", "#ff857d", "#ffb86c", "#ff9e64"]}
-                    chartHeight={64}
-                    compact
-                    rowsLimit={4}
-                  />
-                </Box>
-              ) : null}
-            </Box>
-
-            <Box className="trace-table-panel">
+          <Stack spacing={1.2}>
+            <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+              <Chip size="small" label={`${num(syncRunStats.completed_runs, 0)} completed`} />
+              <Chip size="small" label={`${num(syncRunStats.failed_runs, 0)} failed`} />
+              <Chip size="small" label={`${num(syncRunStats.blocked_runs, 0)} blocked`} />
+              <Chip size="small" label={`Avg ${formatTraceDuration(syncRunStats.avg_duration_ms)}`} />
+            </Stack>
+            <Box>
               {syncRunsQ.error ? (
                 <Alert severity="warning">{errMessage(syncRunsQ.error)}</Alert>
               ) : syncRuns.length === 0 ? (
@@ -17474,7 +17423,7 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
                 </>
               )}
             </Box>
-          </Box>
+          </Stack>
         </Stack>
       </Box>
       ) : null}
@@ -17917,8 +17866,8 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
           })()}
         </Box>
       ) : null}
-    </Stack>
-  );
+      </WorkspacePageShell>
+    );
 }
 
 function StatusManager({ autoRefresh }: { autoRefresh: boolean }) {
@@ -17962,7 +17911,12 @@ function StatusManager({ autoRefresh }: { autoRefresh: boolean }) {
   const watchers = pickRecords(watchersQ.data, "watchers");
 
   return (
-    <Stack spacing={2}>
+    <WorkspacePageShell spacing={1.5}>
+      <WorkspacePageHeader
+        eyebrow="Core"
+        title="Status"
+        description="Instance identity, security posture, and recent security events in one place."
+      />
       <Grid2 container spacing={2} alignItems="stretch">
         <Grid2 size={{ xs: 12, md: 3 }} sx={{ display: "flex" }}><Box className="list-shell" sx={{ minHeight: 120, height: "100%", width: "100%" }}><Typography variant="caption" color="text.secondary">DID</Typography><Typography variant="body2" sx={{ wordBreak: "break-all" }}>{str(status.did)}</Typography></Box></Grid2>
         <Grid2 size={{ xs: 12, md: 3 }} sx={{ display: "flex" }}><Box className="list-shell" sx={{ minHeight: 120, height: "100%", width: "100%" }}><Typography variant="caption" color="text.secondary">Tasks Pending</Typography><Typography variant="h5">{num(status.tasks_pending)}</Typography></Box></Grid2>
@@ -18066,7 +18020,7 @@ function StatusManager({ autoRefresh }: { autoRefresh: boolean }) {
       {statusQ.error || profileQ.error || securityQ.error || watchersQ.error || securityLogsQ.error || error ? (
         <Alert severity="error">{error || errMessage(statusQ.error || profileQ.error || securityQ.error || watchersQ.error || securityLogsQ.error)}</Alert>
       ) : null}
-    </Stack>
+    </WorkspacePageShell>
   );
 }
 
@@ -18272,7 +18226,12 @@ function WatchersManager({ autoRefresh }: { autoRefresh: boolean }) {
   }).length;
 
   return (
-    <Stack spacing={2}>
+    <WorkspacePageShell spacing={1.5}>
+      <WorkspacePageHeader
+        eyebrow="Operations"
+        title="Watchers"
+        description="Monitor conditions over time, then notify a channel or take the next action when something changes."
+      />
       <Grid2 container spacing={2} alignItems="stretch">
         <Grid2 size={{ xs: 6, md: 3 }} sx={{ display: "flex" }}>
           <Box className="list-shell" sx={{ minHeight: 80, height: "100%", width: "100%" }}>
@@ -18300,44 +18259,46 @@ function WatchersManager({ autoRefresh }: { autoRefresh: boolean }) {
         </Grid2>
       </Grid2>
 
-      <Stack direction="row" spacing={1} alignItems="center" useFlexGap flexWrap="wrap">
-        <Typography variant="caption" color="text.secondary" sx={{ mr: 0.5 }}>
-          Default watcher lifetime is 24h. You can pause, resume, extend, or queue a watcher to run on the next Sentinel tick.
-        </Typography>
-        <Button
-          size="small"
-          variant="outlined"
-          disabled={activeCount === 0 || pauseAllMutation.isPending}
-          onClick={async () => {
-            setError(null);
-            try {
-              await pauseAllMutation.mutateAsync();
-            } catch (e) {
-              setError(errMessage(e));
-            }
-          }}
-        >
-          Pause all active
-        </Button>
-        <Button
-          size="small"
-          variant="outlined"
-          disabled={pausedCount === 0 || resumeAllMutation.isPending}
-          onClick={async () => {
-            setError(null);
-            try {
-              await resumeAllMutation.mutateAsync();
-            } catch (e) {
-              setError(errMessage(e));
-            }
-          }}
-        >
-          Resume all paused
-        </Button>
-      </Stack>
+      <Box className="list-shell">
+        <Stack direction="row" spacing={1} alignItems="center" useFlexGap flexWrap="wrap">
+          <Typography variant="caption" color="text.secondary" sx={{ mr: 0.5 }}>
+            Default watcher lifetime is 24h. You can pause, resume, extend, or queue a watcher to run on the next Sentinel tick.
+          </Typography>
+          <Button
+            size="small"
+            variant="outlined"
+            disabled={activeCount === 0 || pauseAllMutation.isPending}
+            onClick={async () => {
+              setError(null);
+              try {
+                await pauseAllMutation.mutateAsync();
+              } catch (e) {
+                setError(errMessage(e));
+              }
+            }}
+          >
+            Pause all active
+          </Button>
+          <Button
+            size="small"
+            variant="outlined"
+            disabled={pausedCount === 0 || resumeAllMutation.isPending}
+            onClick={async () => {
+              setError(null);
+              try {
+                await resumeAllMutation.mutateAsync();
+              } catch (e) {
+                setError(errMessage(e));
+              }
+            }}
+          >
+            Resume all paused
+          </Button>
+        </Stack>
+      </Box>
 
       {watchers.length === 0 ? (
-        <Box sx={{ py: 8, textAlign: "center" }}>
+        <Box className="list-shell" sx={{ py: 8, textAlign: "center" }}>
           <Typography variant="h6" color="text.secondary">No watchers</Typography>
           <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
             Ask AgentArk to watch something until a condition is met, then notify a channel or take action.
@@ -18779,7 +18740,7 @@ function WatchersManager({ autoRefresh }: { autoRefresh: boolean }) {
       {watchersQ.error || error ? (
         <Alert severity="error">{error || errMessage(watchersQ.error)}</Alert>
       ) : null}
-    </Stack>
+    </WorkspacePageShell>
   );
 }
 
@@ -22104,7 +22065,11 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
       case 13:
         return { kicker: "Admin", description: "Review what AgentArk has learned, what is proposed, and what should be promoted." };
       case 14:
-        return { kicker: "Admin", description: "Retention windows, cleanup cadence, and long-run storage posture." };
+        return {
+          kicker: "Admin",
+          title: "Data Cleanup",
+          description: "Retention windows, cleanup cadence, and long-run storage posture."
+        };
       case 20:
         return { kicker: "Integrations", description: "Delivery channels, target routing, and messaging readiness." };
       case 21:
@@ -22116,7 +22081,16 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
       default:
         return { kicker: "Settings", description: "Operator controls and system defaults for this AgentArk instance." };
     }
-  })();
+  })() as { kicker: string; title?: string; description: string };
+  const selectedSettingsHeaderTitle =
+    selectedSettingsMeta.title || selectedSettingsNav?.label || "Settings";
+  const normalizeSettingsHeading = (value: string) =>
+    value
+      .trim()
+      .toLowerCase()
+      .replace(/&/g, "and")
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
 
   async function runArkPulseCheck() {
     setError(null);
@@ -22151,37 +22125,50 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
     description: string;
     info?: string | null;
     action?: JSX.Element | null;
-  }) => (
-    <Stack
-      className="settings-section-intro"
-      direction={{ xs: "column", md: "row" }}
-      justifyContent="space-between"
-      alignItems={{ xs: "flex-start", md: "center" }}
-      spacing={1}
-    >
-      <Box className="settings-section-intro-copy">
-        <Typography className="settings-section-kicker">{eyebrow}</Typography>
-        <Stack direction="row" spacing={0.75} alignItems="center" className="settings-section-title-row">
-          <Typography className="settings-section-title">{title}</Typography>
-          {info ? (
-            <Tooltip title={info} arrow placement="top-start">
-              <IconButton size="small" className="settings-section-info" aria-label={`${title} information`}>
-                <InfoOutlinedIcon fontSize="inherit" />
-              </IconButton>
-            </Tooltip>
-          ) : null}
-        </Stack>
-        <Typography className="settings-section-description">{description}</Typography>
-      </Box>
-      {action ? <Box className="settings-section-actions">{action}</Box> : null}
-    </Stack>
-  );
+  }) => {
+    const duplicatesPageHeader =
+      !info &&
+      !action &&
+      normalizeSettingsHeading(title) === normalizeSettingsHeading(selectedSettingsHeaderTitle) &&
+      normalizeSettingsHeading(eyebrow) === normalizeSettingsHeading(selectedSettingsMeta.kicker);
+
+    if (duplicatesPageHeader) {
+      return null;
+    }
+
+    return (
+      <Stack
+        className="settings-section-intro"
+        direction={{ xs: "column", md: "row" }}
+        justifyContent="space-between"
+        alignItems={{ xs: "flex-start", md: "center" }}
+        spacing={1}
+      >
+        <Box className="settings-section-intro-copy">
+          <Typography className="settings-section-kicker">{eyebrow}</Typography>
+          <Stack direction="row" spacing={0.75} alignItems="center" className="settings-section-title-row">
+            <Typography className="settings-section-title">{title}</Typography>
+            {info ? (
+              <Tooltip title={info} arrow placement="top-start">
+                <IconButton size="small" className="settings-section-info" aria-label={`${title} information`}>
+                  <InfoOutlinedIcon fontSize="inherit" />
+                </IconButton>
+              </Tooltip>
+            ) : null}
+          </Stack>
+          <Typography className="settings-section-description">{description}</Typography>
+        </Box>
+        {action ? <Box className="settings-section-actions">{action}</Box> : null}
+      </Stack>
+    );
+  };
 
   const renderSettingsInlineCard = ({
     eyebrow,
     title,
     description,
     tone = "default",
+    fullWidthCopy = false,
     action = null,
     children = null,
   }: {
@@ -22189,6 +22176,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
     title: string;
     description: string;
     tone?: "default" | "info" | "warning";
+    fullWidthCopy?: boolean;
     action?: JSX.Element | null;
     children?: ReactNode;
   }) => (
@@ -22200,10 +22188,18 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
         alignItems={{ xs: "flex-start", md: "center" }}
         spacing={1}
       >
-        <Box className="settings-inline-card-copy">
+        <Box
+          className="settings-inline-card-copy"
+          sx={fullWidthCopy ? { maxWidth: "none", flex: 1 } : undefined}
+        >
           {eyebrow ? <Typography className="settings-inline-card-kicker">{eyebrow}</Typography> : null}
           <Typography className="settings-inline-card-title">{title}</Typography>
-          <Typography className="settings-inline-card-description">{description}</Typography>
+          <Typography
+            className="settings-inline-card-description"
+            sx={fullWidthCopy ? { maxWidth: "none" } : undefined}
+          >
+            {description}
+          </Typography>
         </Box>
         {action ? <Box className="settings-inline-card-actions">{action}</Box> : null}
       </Stack>
@@ -22300,7 +22296,9 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
             >
               <Box className="workspace-page-header-copy">
                 <Typography className="workspace-page-kicker">{selectedSettingsMeta.kicker}</Typography>
-                <Typography className="workspace-page-title">{selectedSettingsNav?.label || "Settings"}</Typography>
+                <Typography className="workspace-page-title">
+                  {selectedSettingsHeaderTitle}
+                </Typography>
                 <Typography className="workspace-page-copy">
                   {selectedSettingsMeta.description}
                 </Typography>
@@ -23794,6 +23792,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
             title: "Use with care",
             description:
               "These controls can affect stability, security, or how the product behaves. Change them only if you understand the effect.",
+            fullWidthCopy: true,
             tone: "warning"
           })}
 
@@ -24080,11 +24079,6 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
 
           <Box className="list-shell">
             <Stack spacing={2}>
-              {renderSettingsSectionIntro({
-                eyebrow: "Lifecycle",
-                title: "Data Cleanup",
-                description: "Master switch for background cleanup, retention pruning, and periodic housekeeping across memory and storage.",
-              })}
               <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
                 <Chip
                   size="small"
@@ -27679,22 +27673,13 @@ function AnalyticsManager({ autoRefresh }: { autoRefresh: boolean }) {
   };
 
   return (
-    <Stack spacing={1.35} className="workspace-page-shell">
-      <Stack
-        direction={{ xs: "column", md: "row" }}
-        justifyContent="space-between"
-        alignItems={{ xs: "stretch", md: "flex-start" }}
-        spacing={1}
-        className="workspace-page-header"
-      >
-        <Box className="workspace-page-header-copy">
-          <Typography className="workspace-page-kicker">Usage</Typography>
-          <Typography className="workspace-page-title">Analytics</Typography>
-          <Typography className="workspace-page-copy">
-            LLM usage, policy performance, and model mix across the selected range.
-          </Typography>
-        </Box>
-        <TextField
+    <WorkspacePageShell spacing={1.35}>
+      <WorkspacePageHeader
+        eyebrow="Data"
+        title="Analytics"
+        description="LLM usage, policy performance, and model mix across the selected range."
+        actions={
+          <TextField
           select
           className="workspace-page-select"
           size="small"
@@ -27728,8 +27713,9 @@ function AnalyticsManager({ autoRefresh }: { autoRefresh: boolean }) {
             <MenuItem value="custom">Custom ({appliedCustomFrom.replace("T", " ")} â€” {appliedCustomTo.replace("T", " ")})</MenuItem>
           ) : null}
           <MenuItem value={"open_custom" as string}>Custom range...</MenuItem>
-        </TextField>
-      </Stack>
+          </TextField>
+        }
+      />
 
       <Dialog open={customDialogOpen} onClose={() => setCustomDialogOpen(false)} maxWidth="xs" fullWidth>
         <DialogTitle>Custom Date Range</DialogTitle>
@@ -28007,7 +27993,7 @@ function AnalyticsManager({ autoRefresh }: { autoRefresh: boolean }) {
           </Box>
         </Grid2>
       </Grid2>
-    </Stack>
+    </WorkspacePageShell>
   );
 }
 
@@ -28131,7 +28117,12 @@ function ChannelsManager({
   };
 
   return (
-    <Stack spacing={1.25}>
+    <WorkspacePageShell spacing={1.5}>
+      <WorkspacePageHeader
+        eyebrow="Gateway"
+        title="Channels"
+        description="Connected delivery channels, account bindings, and quick dispatch diagnostics."
+      />
       {notice ? <Alert severity={notice.kind}>{notice.text}</Alert> : null}
       {channelsQ.error ? <Alert severity="error">{errMessage(channelsQ.error)}</Alert> : null}
       <ChannelsControlPanel
@@ -28153,7 +28144,7 @@ function ChannelsManager({
         }}
         onSubmitQuickNote={(channelId, note) => upsertAccount("note", channelId, { quick_note: note })}
       />
-    </Stack>
+    </WorkspacePageShell>
   );
 }
 
@@ -28183,7 +28174,7 @@ function RoutingManager({ autoRefresh }: { autoRefresh: boolean }) {
   const routeRows = pickRecords(routingPayload, "rules");
   const groupRows = pickRecords(routingPayload, "broadcast_groups");
   const channelRows = pickRecords(channelsQ.data, "channels");
-  const swarmRows = pickRecords(asRecord(swarmQ.data), "agents");
+  const swarmRows = pickRecords(asRecord(swarmQ.data), "agents").filter((row) => !toBool(row.is_system));
 
   useEffect(() => {
     if (routeRows.length === 0) {
@@ -28320,7 +28311,12 @@ function RoutingManager({ autoRefresh }: { autoRefresh: boolean }) {
   };
 
   return (
-    <Stack spacing={1.25}>
+    <WorkspacePageShell spacing={1.5}>
+      <WorkspacePageHeader
+        eyebrow="Gateway"
+        title="Routing"
+        description="Message routing rules, broadcast groups, and handoff targets across channels and agents."
+      />
       {notice ? <Alert severity={notice.kind}>{notice.text}</Alert> : null}
       {routingQ.error ? <Alert severity="error">{errMessage(routingQ.error)}</Alert> : null}
       <RoutingControlPanel
@@ -28350,7 +28346,7 @@ function RoutingManager({ autoRefresh }: { autoRefresh: boolean }) {
           }
         }}
       />
-    </Stack>
+    </WorkspacePageShell>
   );
 }
 
@@ -28422,7 +28418,12 @@ function DevicesManager({ autoRefresh }: { autoRefresh: boolean }) {
   };
 
   return (
-    <Stack spacing={1.25}>
+    <WorkspacePageShell spacing={1.5}>
+      <WorkspacePageHeader
+        eyebrow="Companion"
+        title="Devices"
+        description="Paired nodes, heartbeat status, and companion command handoff history."
+      />
       {notice ? <Alert severity={notice.kind}>{notice.text}</Alert> : null}
       {nodesQ.error ? <Alert severity="error">{errMessage(nodesQ.error)}</Alert> : null}
       <DevicesControlPanel
@@ -28458,7 +28459,7 @@ function DevicesManager({ autoRefresh }: { autoRefresh: boolean }) {
         }}
         onRefreshNode={refreshNode}
       />
-    </Stack>
+    </WorkspacePageShell>
   );
 }
 
@@ -28568,7 +28569,12 @@ function BrowserProfilesManager({ autoRefresh }: { autoRefresh: boolean }) {
   };
 
   return (
-    <Stack spacing={1.25}>
+    <WorkspacePageShell spacing={1.5}>
+      <WorkspacePageHeader
+        eyebrow="Browser automation"
+        title="Profiles"
+        description="Reusable browser identities, launch readiness, and recent profile sessions."
+      />
       {notice ? <Alert severity={notice.kind}>{notice.text}</Alert> : null}
       {profilesQ.error ? <Alert severity="error">{errMessage(profilesQ.error)}</Alert> : null}
       <BrowserProfilesPanel
@@ -28631,7 +28637,7 @@ function BrowserProfilesManager({ autoRefresh }: { autoRefresh: boolean }) {
           await refresh();
         }}
       />
-    </Stack>
+    </WorkspacePageShell>
   );
 }
 

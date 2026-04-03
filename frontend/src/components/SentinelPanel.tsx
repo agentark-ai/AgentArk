@@ -8,13 +8,13 @@ import {
   FormControlLabel,
   Stack,
   Switch,
-  TextField,
   Typography,
 } from "@mui/material";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
 import { SuggestionRunDialog, type SuggestionRunState } from "./SuggestionRunDialog";
+import { WorkspacePageHeader, WorkspacePageShell } from "./WorkspacePage";
 import type {
   SentinelBackgroundLearning,
   SentinelBackgroundLearningJob,
@@ -106,6 +106,12 @@ function proposalTone(status: string): "success" | "warning" | "error" | "defaul
 
 function proposalActionLabel(proposal: SentinelProposal): string {
   return proposal.proposal_kind === "chat_suggestion_accept" ? "Launch" : "Run";
+}
+
+function modeSummary(mode: "off" | "assist" | "auto"): string {
+  if (mode === "off") return "Sentinel is off and will not prepare or run background work.";
+  if (mode === "auto") return "Sentinel can quietly handle safe background work for you.";
+  return "Sentinel suggests useful actions first and waits for your approval.";
 }
 
 function blankForm(): SentinelFormState {
@@ -343,22 +349,14 @@ export function SentinelPanel({
     setSuccess(null);
     const threshold = Number(form.confidence_threshold);
     const maxProposals = Number(form.max_proposals_per_scan);
-    if (!Number.isFinite(threshold) || threshold < 0.1 || threshold > 1) {
-      setError("Confidence threshold must be between 0.1 and 1.");
-      return;
-    }
-    if (!Number.isFinite(maxProposals) || maxProposals < 1 || maxProposals > 20) {
-      setError("Max proposals per scan must be between 1 and 20.");
-      return;
-    }
     try {
       await saveMutation.mutateAsync({
         enabled: form.enabled,
         watch_in_app: form.watch_in_app,
         watch_connected_services: form.watch_connected_services,
         infer_new_automations: form.infer_new_automations,
-        confidence_threshold: threshold,
-        max_proposals_per_scan: Math.round(maxProposals),
+        confidence_threshold: Number.isFinite(threshold) ? Math.min(1, Math.max(0.1, threshold)) : 0.72,
+        max_proposals_per_scan: Number.isFinite(maxProposals) ? Math.min(20, Math.max(1, Math.round(maxProposals))) : 6,
         autonomy_mode: form.autonomy_mode,
       });
       setSuccess("Sentinel settings saved.");
@@ -439,19 +437,12 @@ export function SentinelPanel({
 
   return (
     <>
-      <Stack spacing={1.5} className="workspace-page-shell">
-        <Box className="list-shell">
-          <Stack direction={{ xs: "column", md: "row" }} spacing={1.5} justifyContent="space-between">
-            <Box>
-              <Typography variant="overline" color="text.secondary">
-                Ambient Engine
-              </Typography>
-              <Typography variant="h4">Sentinel</Typography>
-              <Typography variant="body2" color="text.secondary" sx={{ maxWidth: 760 }}>
-                Background AI for AgentArk. It watches in-app signals and connected services on the queued background cadence,
-                prepares concrete next actions, and auto-runs only when autonomy mode is set to `Auto`.
-              </Typography>
-            </Box>
+      <WorkspacePageShell spacing={1.5}>
+        <WorkspacePageHeader
+          eyebrow="Ambient engine"
+          title="Sentinel"
+          description="Sentinel watches activity in the background, suggests helpful next steps, and can handle lightweight routine help automatically when you choose Auto."
+          actions={
             <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap" alignItems="flex-start">
               <Chip label={`${stats?.open_proposals ?? 0} open proposals`} />
               <Chip label={`${stats?.connected_services ?? 0} connected services`} />
@@ -460,8 +451,8 @@ export function SentinelPanel({
                 Open Trace
               </Button>
             </Stack>
-          </Stack>
-        </Box>
+          }
+        />
 
         {error ? <Alert severity="error">{error}</Alert> : null}
         {success ? <Alert severity="success">{success}</Alert> : null}
@@ -474,7 +465,7 @@ export function SentinelPanel({
             <Box className="list-shell">
               <Stack spacing={1.25}>
                 <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap" alignItems="center">
-                  <Typography variant="h6">Operating mode</Typography>
+                  <Typography variant="h6">How Sentinel should help</Typography>
                   <Chip
                     size="small"
                     color={form.autonomy_mode === "auto" ? "success" : form.autonomy_mode === "assist" ? "warning" : "default"}
@@ -482,6 +473,9 @@ export function SentinelPanel({
                   />
                   {settingsQ.data?.agent_paused ? <Chip size="small" color="warning" label="Agent paused" /> : null}
                 </Stack>
+                <Typography variant="body2" color="text.secondary">
+                  {modeSummary(form.autonomy_mode)}
+                </Typography>
                 <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
                   {(["off", "assist", "auto"] as const).map((mode) => (
                     <Button
@@ -489,7 +483,7 @@ export function SentinelPanel({
                       variant={form.autonomy_mode === mode ? "contained" : "outlined"}
                       onClick={() => setForm((current) => ({ ...current, autonomy_mode: mode }))}
                     >
-                      {mode === "off" ? "Off" : mode === "assist" ? "Assist" : "Auto"}
+                      {mode === "off" ? "Off" : mode === "assist" ? "Suggest first" : "Auto-run"}
                     </Button>
                   ))}
                 </Stack>
@@ -498,11 +492,11 @@ export function SentinelPanel({
                   <Stack spacing={0.75} sx={{ flex: 1 }}>
                     <FormControlLabel
                       control={<Switch checked={form.enabled} onChange={(event) => setForm((current) => ({ ...current, enabled: event.target.checked }))} />}
-                      label="Enable Sentinel"
+                      label="Keep Sentinel available"
                     />
                     <FormControlLabel
                       control={<Switch checked={form.watch_in_app} onChange={(event) => setForm((current) => ({ ...current, watch_in_app: event.target.checked }))} />}
-                      label="Watch in-app signals"
+                      label="Watch activity inside AgentArk"
                     />
                     <FormControlLabel
                       control={<Switch checked={form.watch_connected_services} onChange={(event) => setForm((current) => ({ ...current, watch_connected_services: event.target.checked }))} />}
@@ -510,26 +504,16 @@ export function SentinelPanel({
                     />
                     <FormControlLabel
                       control={<Switch checked={form.infer_new_automations} onChange={(event) => setForm((current) => ({ ...current, infer_new_automations: event.target.checked }))} />}
-                      label="Infer new automations"
+                      label="Suggest recurring automations"
                     />
                   </Stack>
                   <Stack spacing={1} sx={{ flex: 1 }}>
-                    <TextField
-                      label="Confidence threshold"
-                      size="small"
-                      value={form.confidence_threshold}
-                      onChange={(event) => setForm((current) => ({ ...current, confidence_threshold: event.target.value }))}
-                      helperText="0.1 to 1.0"
-                    />
-                    <TextField
-                      label="Max proposals per scan"
-                      size="small"
-                      value={form.max_proposals_per_scan}
-                      onChange={(event) => setForm((current) => ({ ...current, max_proposals_per_scan: event.target.value }))}
-                      helperText="Bound new work per background pass."
-                    />
+                    <Alert severity="info">
+                      Advanced scoring and proposal limits use the built-in defaults. This page keeps the main setup simple.
+                    </Alert>
                     <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
                       <Chip size="small" variant="outlined" label={`Daily run limit ${settingsQ.data?.daily_run_limit ?? 40}`} />
+                      <Chip size="small" variant="outlined" label={`${stats?.connected_services ?? 0} connected services`} />
                       {settingsQ.data?.quiet_hours_start || settingsQ.data?.quiet_hours_end ? (
                         <Chip
                           size="small"
@@ -568,15 +552,14 @@ export function SentinelPanel({
 
             <Box className="list-shell">
               <Stack spacing={1}>
-                <Typography variant="h6">Queue status</Typography>
+                <Typography variant="h6">Current status</Typography>
                 <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
-                  <Chip size="small" label={`Open ${scan?.open_proposals ?? 0}`} />
-                  <Chip size="small" label={`Last created ${scan?.last_created_proposals ?? 0}`} />
-                  <Chip size="small" label={`Auto executed ${scan?.last_auto_executed ?? 0}`} />
-                  <Chip size="small" label={`State ${str(scan?.last_status, "idle")}`} />
+                  <Chip size="small" label={`${scan?.open_proposals ?? 0} open`} />
+                  <Chip size="small" label={`${scan?.last_auto_executed ?? 0} auto-ran`} />
+                  <Chip size="small" label={str(scan?.last_status, "idle")} />
                 </Stack>
                 <Typography variant="body2" color="text.secondary">
-                  Last background pass: {scan?.last_completed_at ? humanTs(scan.last_completed_at).label : "waiting for first queued run"}
+                  Last background pass: {scan?.last_completed_at ? humanTs(scan.last_completed_at).label : "waiting for the first run"}
                 </Typography>
                 {str(scan?.last_error, "").trim() ? (
                   <Alert severity="warning">{str(scan?.last_error, "")}</Alert>
@@ -608,7 +591,7 @@ export function SentinelPanel({
                     ? str(backgroundLearning?.summary, "")
                     : autonomyDisabled
                       ? "Background learning is paused until autonomy is re-enabled."
-                      : "Sentinel periodically reviews recent activity, consolidates memory, and learns reusable patterns."}
+                      : "Sentinel quietly reviews recent activity and improves memory and reuse in the background."}
                 </Typography>
                 <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
                   <Chip
@@ -636,7 +619,7 @@ export function SentinelPanel({
                   />
                 </Stack>
                 <Divider />
-                <Stack spacing={1}>
+                <Stack spacing={1} sx={{ display: "none" }}>
                   {backgroundLearningJobs.map(({ key, label, job }) => {
                     const status = str(job?.status, autonomyDisabled ? "disabled" : "idle");
                     const statsEntries = backgroundJobStats(job);
@@ -679,6 +662,9 @@ export function SentinelPanel({
                     );
                   })}
                 </Stack>
+                <Typography variant="caption" color="text.secondary">
+                  Reflection, memory cleanup, and pattern learning continue automatically in the background. Detailed internals are hidden here to keep this page simple.
+                </Typography>
               </Stack>
             </Box>
           </Stack>
@@ -692,7 +678,7 @@ export function SentinelPanel({
                 </Stack>
                 {openProposals.length === 0 ? (
                   <Typography variant="body2" color="text.secondary">
-                    No open Sentinel proposals yet. The next queued background pass will populate this when it sees useful signals.
+                    Nothing needs your attention right now.
                   </Typography>
                 ) : (
                   <Stack spacing={1}>
@@ -704,7 +690,6 @@ export function SentinelPanel({
                               <Typography variant="subtitle2">{proposal.title}</Typography>
                               <Chip size="small" color={proposalTone(proposal.status)} label={proposal.status} />
                               <Chip size="small" variant="outlined" label={proposal.source_kind} />
-                              <Chip size="small" variant="outlined" label={`${Math.round((proposal.confidence || 0) * 100)}%`} />
                             </Stack>
                             <Stack direction="row" spacing={1}>
                               <Button
@@ -747,7 +732,7 @@ export function SentinelPanel({
                 <Typography variant="h6">Recent observations</Typography>
                 {recentObservations.length === 0 ? (
                   <Typography variant="body2" color="text.secondary">
-                    No observations recorded yet.
+                    No recent background signals were worth surfacing.
                   </Typography>
                 ) : (
                   <Stack spacing={1}>
@@ -806,7 +791,7 @@ export function SentinelPanel({
             </Box>
           </Stack>
         </Stack>
-      </Stack>
+      </WorkspacePageShell>
 
       <SuggestionRunDialog
         run={run}

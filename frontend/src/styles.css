@@ -311,6 +311,10 @@ body {
   padding: 0 0 16px;
 }
 
+.workspace-page-hero-shell {
+  min-height: 0;
+}
+
 .trace-page-shell {
   flex: 1 1 auto;
   min-height: 0;
@@ -328,6 +332,15 @@ body {
 .workspace-page-header-copy {
   min-width: 0;
   max-width: 780px;
+}
+
+.workspace-page-header-actions {
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
 }
 
 .workspace-page-select .MuiOutlinedInput-root {
@@ -483,11 +496,13 @@ body {
   display: flex;
   min-width: 0;
   min-height: 0;
+  align-self: start;
 }
 
 .overview-panel-slot > * {
-  flex: 1 1 auto;
+  flex: 0 0 auto;
   min-width: 0;
+  width: 100%;
 }
 
 .overview-command-stack {
@@ -503,7 +518,7 @@ body {
   background: linear-gradient(180deg, rgba(8, 18, 32, 0.82), rgba(7, 15, 28, 0.74));
   padding: calc(var(--surface-padding) + 2px);
   box-shadow: 0 10px 24px rgba(0, 0, 0, 0.1);
-  flex: 1;
+  flex: 0 0 auto;
 }
 
 .overview-action-card .MuiButton-root {
@@ -3161,8 +3176,8 @@ body {
 
 .settings-shell-layout {
   display: grid;
-  grid-template-columns: 224px minmax(0, 1fr);
-  gap: 16px;
+  grid-template-columns: 208px minmax(0, 1fr);
+  gap: 10px;
   min-height: 0;
   height: 100%;
 }
@@ -3175,7 +3190,7 @@ body {
   border-right: 1px solid rgba(255, 255, 255, 0.04);
   border-radius: 0;
   background: transparent;
-  padding: 20px 16px 20px 10px;
+  padding: 14px 8px 14px 4px;
   min-height: 0;
 }
 
@@ -3183,9 +3198,9 @@ body {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 2px 8px 14px;
+  padding: 0 6px 10px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-  margin-bottom: 14px;
+  margin-bottom: 8px;
 }
 
 .settings-nav-list {
@@ -3194,7 +3209,7 @@ body {
   max-height: none;
   overflow-y: auto;
   overflow-x: hidden;
-  padding-right: 2px;
+  padding-right: 0;
 }
 
 .settings-nav-btn {
@@ -3204,9 +3219,9 @@ body {
   text-align: left;
   text-transform: none !important;
   border-radius: var(--button-radius) !important;
-  padding: 0 12px !important;
-  min-height: var(--button-height-sm) !important;
-  font-size: 0.8rem !important;
+  padding: 0 10px !important;
+  min-height: 32px !important;
+  font-size: 0.78rem !important;
   font-weight: 500 !important;
   color: var(--button-text-muted) !important;
   border: 1px solid transparent !important;
@@ -3240,7 +3255,7 @@ body {
 .settings-nav-divider {
   height: 1px;
   background: rgba(255, 255, 255, 0.05);
-  margin: 6px 8px;
+  margin: 4px 6px;
 }
 
 .settings-nav-group-label {
@@ -3248,7 +3263,7 @@ body {
   text-transform: uppercase;
   letter-spacing: 0.08em;
   color: rgba(140, 170, 210, 0.48);
-  margin: 6px 8px 4px;
+  margin: 4px 6px 3px;
   font-weight: 600;
 }
 
@@ -3258,7 +3273,7 @@ body {
   background: transparent;
   display: flex;
   flex-direction: column;
-  padding: 20px 28px;
+  padding: 14px 18px;
   min-width: 0;
   overflow: hidden;
   min-height: 0;
@@ -3267,7 +3282,7 @@ body {
 }
 
 .settings-main.settings-main-standalone {
-  padding: 16px 20px 24px;
+  padding: 14px 18px 20px;
 }
 
 .settings-page-shell {
@@ -4789,6 +4804,10 @@ body {
   .workspace-page-header {
     flex-direction: column;
     align-items: stretch;
+  }
+
+  .workspace-page-header-actions {
+    justify-content: flex-start;
   }
 
   .chat-empty-state {
