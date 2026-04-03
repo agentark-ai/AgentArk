@@ -33,6 +33,74 @@ use std::time::Duration;
 
 const INTEGRATION_STATUS_TIMEOUT: Duration = Duration::from_secs(4);
 
+fn integration_action_is_read_only(action: &str) -> bool {
+    let normalized = action.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    [
+        "get",
+        "list",
+        "read",
+        "fetch",
+        "search",
+        "status",
+        "feed",
+        "preview",
+        "inspect",
+        "discover",
+        "check",
+        "test",
+        "validate",
+        "health",
+    ]
+    .iter()
+    .any(|keyword| normalized == *keyword || normalized.starts_with(&format!("{}_", keyword)))
+}
+
+fn integration_action_requires_outbound_gate(
+    integration: &dyn Integration,
+    action: &str,
+) -> bool {
+    if integration_action_is_read_only(action) {
+        return false;
+    }
+
+    let normalized = action.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+
+    if [
+        "notify",
+        "send",
+        "message",
+        "post",
+        "create",
+        "comment",
+        "reply",
+        "publish",
+        "update",
+        "delete",
+        "upvote",
+        "react",
+        "submit",
+        "register",
+        "deliver",
+        "write",
+    ]
+    .iter()
+    .any(|keyword| normalized == *keyword || normalized.contains(keyword))
+    {
+        return true;
+    }
+
+    let capabilities = integration.capabilities();
+    capabilities.contains(&Capability::Write)
+        || capabilities.contains(&Capability::Notify)
+        || capabilities.contains(&Capability::Delete)
+}
+
 fn parse_boolish(value: &str) -> Option<bool> {
     let v = value.trim().to_ascii_lowercase();
     if v.is_empty() {
@@ -362,7 +430,37 @@ impl IntegrationManager {
             .get(integration_id)
             .ok_or_else(|| anyhow::anyhow!("Integration '{}' not found", integration_id))?;
 
-        integration.execute(action, params).await
+        let sanitized_params = if integration_action_requires_outbound_gate(integration.as_ref(), action)
+        {
+            let privacy =
+                crate::security::sanitize_outbound_json(params, &crate::security::OutboundPrivacyPolicy::default());
+            match privacy.decision {
+                crate::security::OutboundPrivacyDecision::Allow => params.clone(),
+                crate::security::OutboundPrivacyDecision::RedactedAllow => {
+                    tracing::warn!(
+                        integration_id = integration_id,
+                        action = action,
+                        redactions = ?privacy.redactions,
+                        reasons = ?privacy.reasons,
+                        "Outbound privacy gate redacted integration payload"
+                    );
+                    privacy.sanitized_value
+                }
+                crate::security::OutboundPrivacyDecision::Block => {
+                    anyhow::bail!(
+                        "{}",
+                        crate::security::format_outbound_privacy_block(
+                            &format!("integration '{}:{}'", integration_id, action),
+                            &privacy.reasons,
+                        )
+                    );
+                }
+            }
+        } else {
+            params.clone()
+        };
+
+        integration.execute(action, &sanitized_params).await
     }
 }
 

@@ -314,6 +314,7 @@ type ChatStreamPayload = {
   conversation_id?: string | null;
   project_id?: string | null;
   deep_research?: boolean;
+  plan_confirmation_mode?: string;
   execution_mode?: string;
   attachments_present?: boolean;
 };
@@ -1024,7 +1025,7 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ action, dry_run: false })
       }),
-  chat: (payload: { message: string; channel?: string; conversation_id?: string | null; project_id?: string | null; deep_research?: boolean; execution_mode?: string }) =>
+  chat: (payload: { message: string; channel?: string; conversation_id?: string | null; project_id?: string | null; deep_research?: boolean; plan_confirmation_mode?: string; execution_mode?: string }) =>
     request<{ response: string; proof_id?: string; conversation_id?: string; conversation_title?: string }>(
       "/chat",
       {
@@ -1033,8 +1034,36 @@ export const api = {
       }
     ),
   chatStream: (payload: ChatStreamPayload, handlers?: ChatStreamHandlers) => streamChat(payload, handlers),
-  resumeChatTaskStream: (id: string, handlers?: ChatStreamHandlers) =>
-    streamSseJson(`/tasks/${encodeURIComponent(id)}/resume-chat/stream`, {}, handlers),
+  resumeChatTaskStream: (
+    id: string,
+    payloadOrHandlers?: { plan_override?: Record<string, unknown> } | ChatStreamHandlers,
+    maybeHandlers?: ChatStreamHandlers
+  ) => {
+    const payload =
+      payloadOrHandlers &&
+      typeof payloadOrHandlers === "object" &&
+      ("signal" in payloadOrHandlers ||
+        "onEvent" in payloadOrHandlers ||
+        "onToken" in payloadOrHandlers ||
+        "onThinking" in payloadOrHandlers ||
+        "onToolStart" in payloadOrHandlers ||
+        "onToolProgress" in payloadOrHandlers ||
+        "onToolResult" in payloadOrHandlers ||
+        "onTaskStarted" in payloadOrHandlers ||
+        "onTaskStatus" in payloadOrHandlers ||
+        "onContent" in payloadOrHandlers ||
+        "onError" in payloadOrHandlers ||
+        "onDone" in payloadOrHandlers)
+        ? undefined
+        : (payloadOrHandlers as { plan_override?: Record<string, unknown> } | undefined);
+    const handlers = payload ? maybeHandlers : (payloadOrHandlers as ChatStreamHandlers | undefined);
+    return streamSseJson(`/tasks/${encodeURIComponent(id)}/resume-chat/stream`, payload ?? {}, handlers);
+  },
+  cancelTask: (id: string) =>
+    request<{ status: string }>(`/tasks/${encodeURIComponent(id)}/cancel`, {
+      method: "POST",
+      body: JSON.stringify({})
+    }),
   runStream: (runId: string, sinceSeq?: number, handlers?: ChatStreamHandlers) =>
     streamRun(runId, sinceSeq, handlers),
   approveTask: (id: string) =>

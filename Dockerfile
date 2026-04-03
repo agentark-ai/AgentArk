@@ -12,41 +12,25 @@
 # across rebuilds when using docker compose. The primary database lives in Postgres.
 #
 # =============================================================================
-# BUILD VARIANTS
+# DEFAULT IMAGE
 # =============================================================================
 #
-# SLIM BUILD (~900MB) - core agent, no heavy optional runtimes:
+# AgentArk now ships as a single full-runtime image. This is the image profile
+# used by docker compose and the published GHCR release image.
 #
-#   docker build -t agentark:slim .
+#   docker build -t agentark:local .
 #
-# FULL BUILD (~5-6GB) - everything including Playwright and bundled services:
+# OPTIONAL LIGHTER SELF-BUILDS
+# =============================================================================
 #
-#   docker build -t agentark:full \
-#     --build-arg INSTALL_PLAYWRIGHT_RUNTIME=true \
-#     --build-arg INSTALL_TAILSCALE=true \
-#     --build-arg INSTALL_CLOUDFLARED=true \
-#     --build-arg INSTALL_LIGHTPANDA=true \
-#     --build-arg INSTALL_GWS=true \
-#     # INSTALL_OLLAMA_CLI removed - 4GB, use external Ollama via API instead
-#     --build-arg INSTALL_WHATSAPP_BRIDGE=true \
-#     .
+# If you are building only for yourself and want to trim features locally, you
+# can still disable individual runtimes with build args:
 #
-# PowerShell (Windows):
-#
-#   docker build -t agentark:full `
-#     --build-arg INSTALL_PLAYWRIGHT_RUNTIME=true `
-#     --build-arg INSTALL_TAILSCALE=true `
-#     --build-arg INSTALL_CLOUDFLARED=true `
-#     --build-arg INSTALL_LIGHTPANDA=true `
-#     --build-arg INSTALL_GWS=true `
-#     # INSTALL_OLLAMA_CLI removed - 4GB, use external Ollama via API instead
-#     --build-arg INSTALL_WHATSAPP_BRIDGE=true `
-#     .
-#
-# CUSTOM BUILD - pick only what you need:
-#
-#   docker build -t agentark:custom \
-#     --build-arg INSTALL_CLOUDFLARED=true \
+#   docker build -t agentark:local \
+#     --build-arg INSTALL_PLAYWRIGHT_RUNTIME=false \
+#     --build-arg INSTALL_TAILSCALE=false \
+#     --build-arg INSTALL_CLOUDFLARED=false \
+#     --build-arg INSTALL_GWS=false \
 #     .
 #
 # =============================================================================
@@ -71,7 +55,8 @@ FROM rust:1.92-trixie AS builder
 WORKDIR /app
 
 # Copy manifests for dependency resolution
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY .cargo ./.cargo
 
 # Create dummy main to cache dependencies
 RUN mkdir src && echo "fn main() {}" > src/main.rs
@@ -85,8 +70,8 @@ ARG AGENTARK_BUILD_JOBS=2
 ARG AGENTARK_DOCKER_FEATURES="telegram,docker,ssh"
 
 # Build dependencies with cache mount (survives across docker builds)
-RUN --mount=type=cache,target=/app/target \
-    --mount=type=cache,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,id=agentark-cargo-target,target=/app/target \
+    --mount=type=cache,id=agentark-cargo-registry,target=/usr/local/cargo/registry \
     if [ "${AGENTARK_BUILD_JOBS}" = "0" ]; then \
         cargo build --release --no-default-features --features "${AGENTARK_DOCKER_FEATURES}"; \
     else \
@@ -101,10 +86,9 @@ COPY src ./src
 COPY assets ./assets
 
 # Build for release with cache mount, then copy binary out of cache
-RUN --mount=type=cache,target=/app/target \
-    --mount=type=cache,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,id=agentark-cargo-target,target=/app/target \
+    --mount=type=cache,id=agentark-cargo-registry,target=/usr/local/cargo/registry \
     rm -f target/release/agentark target/release/deps/agentark-* && \
-    touch src/main.rs && \
     if [ "${AGENTARK_BUILD_JOBS}" = "0" ]; then \
         cargo build --release --no-default-features --features "${AGENTARK_DOCKER_FEATURES}"; \
     else \
@@ -116,7 +100,7 @@ RUN --mount=type=cache,target=/app/target \
 FROM node:20-slim AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package.json frontend/package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm \
+RUN --mount=type=cache,id=agentark-frontend-npm,target=/root/.npm \
     npm pkg delete devDependencies.@rollup/rollup-win32-x64-msvc 2>/dev/null; npm ci
 ARG FRONTEND_CACHEBUST=0
 COPY frontend/src ./src
@@ -135,7 +119,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends git ca-certific
 
 WORKDIR /bridges/whatsapp-bridge
 COPY bridges/whatsapp-bridge/package.json bridges/whatsapp-bridge/package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm \
+RUN --mount=type=cache,id=agentark-node-npm,target=/root/.npm \
     if [ "${INSTALL_WHATSAPP_BRIDGE}" = "true" ]; then \
         printf '[url "https://github.com/"]\n\tinsteadOf = ssh://git@github.com/\n\tinsteadOf = git@github.com:\n' > /root/.gitconfig && \
         npm ci --omit=dev && \
@@ -147,7 +131,7 @@ COPY bridges/whatsapp-bridge/index.js ./
 WORKDIR /bridges/playwright-bridge
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 COPY bridges/playwright-bridge/package.json bridges/playwright-bridge/package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm \
+RUN --mount=type=cache,id=agentark-node-npm,target=/root/.npm \
     if [ "${INSTALL_PLAYWRIGHT_RUNTIME}" = "true" ]; then \
         npm ci --omit=dev && \
         rm -rf /tmp/*; \
@@ -231,7 +215,7 @@ RUN if [ "${INSTALL_LIGHTPANDA}" = "true" ]; then \
 
 # Install Google Workspace CLI so AgentArk can use gws as a Workspace execution backend.
 ARG GOOGLE_WORKSPACE_CLI_VERSION=latest
-RUN --mount=type=cache,target=/root/.npm \
+RUN --mount=type=cache,id=agentark-runtime-npm,target=/root/.npm \
     if [ "${INSTALL_GWS}" = "true" ]; then \
         npm install -g "@googleworkspace/cli@${GOOGLE_WORKSPACE_CLI_VERSION}" && \
         mkdir -p /app/gws-skills && \

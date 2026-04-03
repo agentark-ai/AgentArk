@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 pub const TOOL_STRATEGY_PROFILE_KEY: &str = "tool_strategy_profile_v1";
 pub const TOOL_STRATEGY_PROFILE_CANARY_KEY: &str = "tool_strategy_profile_canary_v1";
 pub const TOOL_STRATEGY_CANARY_STATE_KEY: &str = "tool_strategy_canary_state_v1";
+pub const TOOL_STRATEGY_PROFILE_BASELINE_SNAPSHOT_KEY: &str =
+    "tool_strategy_profile_baseline_snapshot_v1";
 pub const ROUTING_COMPLEXITY_POLICY_CANARY_KEY: &str = "routing_complexity_policy_canary_v1";
 pub const ROUTING_COMPLEXITY_CANARY_STATE_KEY: &str = "routing_complexity_policy_canary_state_v1";
 pub const ROUTING_COMPLEXITY_POLICY_BASELINE_SNAPSHOT_KEY: &str =

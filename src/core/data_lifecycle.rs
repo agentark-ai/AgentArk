@@ -47,6 +47,10 @@ pub struct DataLifecycleSettings {
     pub experience_edge_retention_days: u64,
     #[serde(default = "default_learning_candidate_retention_days")]
     pub learning_candidate_retention_days: u64,
+    #[serde(default = "default_experience_item_retention_days")]
+    pub experience_item_retention_days: u64,
+    #[serde(default = "default_procedural_pattern_retention_days")]
+    pub procedural_pattern_retention_days: u64,
     #[serde(default = "default_housekeeping_interval_secs")]
     pub housekeeping_interval_secs: u64,
     #[serde(default = "default_security_cleanup_interval_days")]
@@ -115,6 +119,14 @@ fn default_learning_candidate_retention_days() -> u64 {
     30
 }
 
+fn default_experience_item_retention_days() -> u64 {
+    365
+}
+
+fn default_procedural_pattern_retention_days() -> u64 {
+    365
+}
+
 fn default_housekeeping_interval_secs() -> u64 {
     3600
 }
@@ -147,6 +159,8 @@ impl Default for DataLifecycleSettings {
             experience_run_retention_days: default_experience_run_retention_days(),
             experience_edge_retention_days: default_experience_edge_retention_days(),
             learning_candidate_retention_days: default_learning_candidate_retention_days(),
+            experience_item_retention_days: default_experience_item_retention_days(),
+            procedural_pattern_retention_days: default_procedural_pattern_retention_days(),
             housekeeping_interval_secs: default_housekeeping_interval_secs(),
             security_cleanup_interval_days: default_security_cleanup_interval_days(),
             security_cleanup_idle_threshold_secs: default_security_cleanup_idle_threshold_secs(),
@@ -178,6 +192,11 @@ impl DataLifecycleSettings {
             self.experience_edge_retention_days.min(MAX_RETENTION_DAYS);
         self.learning_candidate_retention_days = self
             .learning_candidate_retention_days
+            .min(MAX_RETENTION_DAYS);
+        self.experience_item_retention_days =
+            self.experience_item_retention_days.min(MAX_RETENTION_DAYS);
+        self.procedural_pattern_retention_days = self
+            .procedural_pattern_retention_days
             .min(MAX_RETENTION_DAYS);
         self.notification_cleanup_interval_secs = self
             .notification_cleanup_interval_secs

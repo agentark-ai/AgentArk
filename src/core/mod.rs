@@ -49,7 +49,7 @@ pub(crate) use agent::queue_stream_event;
 pub(crate) use agent::ChatExecutionIntentDecision;
 pub use agent::{
     Agent, ConversationMessage, ExecutionStep, ExecutionTrace, RequestExecutionHints,
-    SecurityEvents, SecuritySnapshot, StreamEvent, UserProfile,
+    RequestPlanConfirmationMode, SecurityEvents, SecuritySnapshot, StreamEvent, UserProfile,
 };
 pub use automation::{
     list_runs as list_automation_runs, list_supervisor_states as list_automation_supervisor_states,

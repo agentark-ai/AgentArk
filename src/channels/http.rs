@@ -20,7 +20,8 @@ use chrono::{Datelike, Timelike};
 use futures::{SinkExt, StreamExt};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
@@ -79,7 +80,7 @@ use crate::clients::{
     ExecutorClient, ExecutorClientConfig, WorkspaceClient, WorkspaceClientConfig,
 };
 use crate::core::config::{
-    DeploymentMode, EmbeddingsConfig, EmbeddingsProviderKind, TelegramConfig,
+    DeploymentMode, EmbeddingsConfig, EmbeddingsProviderKind, MemoryConfig, TelegramConfig,
     TunnelCloudflareConfig, TunnelConfig, TunnelNgrokConfig, TunnelProviderKind,
     TunnelTailscaleConfig,
 };
@@ -568,6 +569,8 @@ pub struct ChatRequest {
     pub deep_research: bool,
     #[serde(default)]
     pub execution_mode: Option<String>,
+    #[serde(default)]
+    pub plan_confirmation_mode: Option<String>,
     #[serde(default)]
     pub attachments_present: bool,
 }
@@ -2574,6 +2577,10 @@ pub struct DataLifecycleSettingsUpdate {
     #[serde(default)]
     pub learning_candidate_retention_days: Option<u64>,
     #[serde(default)]
+    pub experience_item_retention_days: Option<u64>,
+    #[serde(default)]
+    pub procedural_pattern_retention_days: Option<u64>,
+    #[serde(default)]
     pub housekeeping_interval_secs: Option<u64>,
     #[serde(default)]
     pub security_cleanup_interval_days: Option<u64>,
@@ -2713,6 +2720,7 @@ struct EvolutionSettingsResponse {
     learning_queue_cap: u64,
     learning_queue: crate::storage::LearningQueueCounts,
     canary: EvolutionCanarySummary,
+    strategy_canary: EvolutionCanarySummary,
     prompt_canary: EvolutionCanarySummary,
     classifier_prompt_canary: EvolutionCanarySummary,
     specialist_prompt_canary: EvolutionCanarySummary,
@@ -2744,6 +2752,7 @@ struct EvolutionSettingsUpdateRequest {
 #[derive(Debug, Deserialize)]
 struct EvolutionDevQuery {
     limit: Option<u64>,
+    include_superseded: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2787,6 +2796,7 @@ struct PromptEvolutionInsights {
 #[derive(Debug, Serialize)]
 struct EvolutionDevResponse {
     canary_state: Option<crate::core::self_evolve::strategy_runtime::CanaryRolloutState>,
+    strategy_canary_state: Option<crate::core::self_evolve::strategy_runtime::CanaryRolloutState>,
     last_result: Option<serde_json::Value>,
     lineage_recent: Vec<serde_json::Value>,
     policy_metrics: Vec<EvolutionVersionMetric>,
@@ -4370,6 +4380,8 @@ pub async fn serve(
         // Memory consolidation
         .route("/memory/consolidate", post(trigger_consolidation))
         .route("/memory/stats", get(memory_stats))
+        .route("/memory/maintenance/review", get(memory_maintenance_review))
+        .route("/memory/maintenance/run", post(run_memory_maintenance))
         .route("/memory/episodes", get(list_episodes))
         .route("/memory/facts", get(list_facts))
         .route("/memory/preferences", get(list_user_preferences))
@@ -9950,11 +9962,13 @@ async fn build_runtime_health_payload(
         .build()
         .ok();
     let pgvector_retrieval_ok = if state.server_role == HttpServerRole::ControlPlane {
-        if let Some(client) = embedding_client.as_ref() {
+        let pgvector_ok = storage.pgvector_health_check().await.is_ok();
+        let embeddings_ok = if let Some(client) = embedding_client.as_ref() {
             client.health_check().await.is_ok()
         } else {
             true
-        }
+        };
+        pgvector_ok && embeddings_ok
     } else {
         true
     };
@@ -12738,6 +12752,8 @@ fn build_request_execution_hints(
     caller: Option<&crate::actions::ActionCallerPrincipal>,
     surface: crate::actions::ActionExecutionSurface,
     direct_user_intent: bool,
+    plan_confirmation_mode: crate::core::RequestPlanConfirmationMode,
+    plan_override: Option<crate::core::ExecutionPlan>,
 ) -> crate::core::RequestExecutionHints {
     crate::core::RequestExecutionHints {
         deep_research,
@@ -12745,6 +12761,19 @@ fn build_request_execution_hints(
         caller_principal: caller.cloned(),
         execution_surface: surface,
         direct_user_intent,
+        plan_confirmation_mode,
+        plan_override,
+    }
+}
+
+fn normalized_chat_plan_confirmation_mode(
+    mode: Option<&str>,
+) -> crate::core::RequestPlanConfirmationMode {
+    match mode.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "before_execution" | "plan" | "confirm" => {
+            crate::core::RequestPlanConfirmationMode::BeforeExecution
+        }
+        _ => crate::core::RequestPlanConfirmationMode::None,
     }
 }
 
@@ -13047,6 +13076,10 @@ async fn chat(
                     caller,
                     crate::actions::ActionExecutionSurface::Chat,
                     true,
+                    normalized_chat_plan_confirmation_mode(
+                        request.plan_confirmation_mode.as_deref(),
+                    ),
+                    None,
                 ),
             )
             .await
@@ -13379,6 +13412,24 @@ fn normalize_stream_event_for_sse(
                     "step_type": "plan_revised",
                     "title": "Execution Plan Revised",
                     "detail": reason.unwrap_or_else(|| format!("Plan revised to {} steps.", plan.steps.len())),
+                    "plan": plan,
+                }),
+            )),
+            String::new(),
+        ),
+        crate::core::StreamEvent::PlanReadyForConfirmation {
+            task_id,
+            plan,
+            source,
+        } => (
+            Some((
+                "plan_ready_for_confirmation",
+                serde_json::json!({
+                    "step_type": "plan_ready_for_confirmation",
+                    "title": "Plan Ready For Confirmation",
+                    "detail": "Review the plan, make edits if needed, and press Start to continue.",
+                    "task_id": task_id,
+                    "source": source,
                     "plan": plan,
                 }),
             )),
@@ -13765,6 +13816,8 @@ struct ChatStreamRunRequest {
     conversation_id: Option<String>,
     project_id: Option<String>,
     deep_research: bool,
+    plan_confirmation_mode: crate::core::RequestPlanConfirmationMode,
+    plan_override: Option<crate::core::ExecutionPlan>,
     caller_principal: Option<crate::actions::ActionCallerPrincipal>,
     task_mode: ChatStreamTaskMode,
 }
@@ -13779,6 +13832,8 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
     let conversation_id = request.conversation_id.clone();
     let project_id = request.project_id.clone();
     let deep_research = request.deep_research;
+    let plan_confirmation_mode = request.plan_confirmation_mode;
+    let plan_override = request.plan_override.clone();
     let caller_principal = request.caller_principal.clone();
     let task_mode = request.task_mode.clone();
     let app_state = state.clone();
@@ -13789,31 +13844,43 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                 execution_mode,
                 attachments_present,
             } => {
-                let routing = match normalized_chat_execution_mode(execution_mode.as_deref()) {
-                    "chat" => crate::core::ChatExecutionIntentDecision {
-                        create_task: false,
-                        work_type: "task",
-                    },
-                    "task" => crate::core::ChatExecutionIntentDecision {
+                let routing = if deep_research
+                    && matches!(
+                        plan_confirmation_mode,
+                        crate::core::RequestPlanConfirmationMode::BeforeExecution
+                    )
+                {
+                    crate::core::ChatExecutionIntentDecision {
                         create_task: true,
-                        work_type: if deep_research {
-                            "research"
-                        } else if attachments_present {
-                            "workspace"
-                        } else {
-                            "task"
+                        work_type: "research",
+                    }
+                } else {
+                    match normalized_chat_execution_mode(execution_mode.as_deref()) {
+                        "chat" => crate::core::ChatExecutionIntentDecision {
+                            create_task: false,
+                            work_type: "task",
                         },
-                    },
-                    _ => {
-                        let agent_guard = agent_ref.read().await;
-                        agent_guard
-                            .classify_chat_execution_intent(
-                                &channel,
-                                &message,
-                                deep_research,
-                                attachments_present,
-                            )
-                            .await
+                        "task" => crate::core::ChatExecutionIntentDecision {
+                            create_task: true,
+                            work_type: if deep_research {
+                                "research"
+                            } else if attachments_present {
+                                "workspace"
+                            } else {
+                                "task"
+                            },
+                        },
+                        _ => {
+                            let agent_guard = agent_ref.read().await;
+                            agent_guard
+                                .classify_chat_execution_intent(
+                                    &channel,
+                                    &message,
+                                    deep_research,
+                                    attachments_present,
+                                )
+                                .await
+                        }
                     }
                 };
                 if routing.create_task {
@@ -13832,6 +13899,10 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                             "conversation_id": conversation_id.clone(),
                             "project_id": project_id.clone(),
                             "deep_research": deep_research,
+                            "plan_confirmation_mode": match plan_confirmation_mode {
+                                crate::core::RequestPlanConfirmationMode::BeforeExecution => "before_execution",
+                                crate::core::RequestPlanConfirmationMode::None => "none",
+                            },
                             "attachments_present": attachments_present,
                         }),
                     );
@@ -14044,6 +14115,7 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
             let trace_ref = trace_ref.clone();
             let chat_task_id = tracked_task.as_ref().map(|task| task.task.id.to_string());
             let caller_principal = caller_principal.clone();
+            let plan_override = plan_override.clone();
             tokio::spawn(async move {
                 let agent_guard = agent_ref.read().await;
                 if user_message_already_recorded {
@@ -14061,6 +14133,8 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                                 caller_principal.as_ref(),
                                 crate::actions::ActionExecutionSurface::Chat,
                                 true,
+                                plan_confirmation_mode,
+                                plan_override.clone(),
                             ),
                         )
                         .await
@@ -14079,6 +14153,8 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                                 caller_principal.as_ref(),
                                 crate::actions::ActionExecutionSurface::Chat,
                                 true,
+                                plan_confirmation_mode,
+                                plan_override.clone(),
                             ),
                         )
                         .await
@@ -14373,6 +14449,14 @@ struct ResumableChatTaskRequest {
     project_id: Option<String>,
     deep_research: bool,
     work_type: String,
+    stored_plan_override: Option<serde_json::Value>,
+    paused_for_plan_confirmation: bool,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ResumeChatTaskStreamRequest {
+    #[serde(default)]
+    plan_override: Option<serde_json::Value>,
 }
 
 fn extract_resumable_web_chat_task(
@@ -14381,17 +14465,35 @@ fn extract_resumable_web_chat_task(
     if task.action != "chat_request" {
         return Err("Only chat-request tasks can be resumed in chat.".to_string());
     }
-    if !matches!(
-        task.status,
-        crate::core::TaskStatus::Cancelled | crate::core::TaskStatus::Failed { .. }
-    ) {
-        return Err("Only cancelled or failed chat tasks can be resumed in chat.".to_string());
-    }
-
     let arguments = task
         .arguments
         .as_object()
         .ok_or_else(|| "This chat task is missing its stored arguments.".to_string())?;
+
+    let pause_kind = arguments
+        .get("_pause_kind")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let paused_for_plan_confirmation = pause_kind == "plan_confirmation";
+    if !matches!(
+        task.status,
+        crate::core::TaskStatus::Cancelled
+            | crate::core::TaskStatus::Failed { .. }
+            | crate::core::TaskStatus::Paused
+    ) {
+        return Err(
+            "Only cancelled, failed, or plan-confirmation-paused chat tasks can be resumed in chat."
+                .to_string(),
+        );
+    }
+    if matches!(task.status, crate::core::TaskStatus::Paused) && !paused_for_plan_confirmation {
+        return Err(
+            "Only cancelled, failed, or plan-confirmation-paused chat tasks can be resumed in chat."
+                .to_string(),
+        );
+    }
 
     let origin = arguments
         .get("_origin")
@@ -14465,6 +14567,11 @@ fn extract_resumable_web_chat_task(
                 "task".to_string()
             }
         });
+    let stored_plan_override = arguments
+        .get("_plan_preview")
+        .and_then(|value| value.as_object())
+        .and_then(|value| value.get("current_plan"))
+        .cloned();
 
     Ok(ResumableChatTaskRequest {
         message,
@@ -14473,7 +14580,28 @@ fn extract_resumable_web_chat_task(
         project_id,
         deep_research,
         work_type,
+        stored_plan_override,
+        paused_for_plan_confirmation,
     })
+}
+
+async fn parse_execution_plan_override(
+    state: &AppState,
+    raw: Option<&serde_json::Value>,
+) -> std::result::Result<Option<crate::core::ExecutionPlan>, String> {
+    let Some(raw_plan) = raw else {
+        return Ok(None);
+    };
+    let agent = state.agent.read().await;
+    let actions = agent
+        .runtime
+        .list_actions()
+        .await
+        .map_err(|error| format!("Failed to load actions for plan validation: {}", error))?;
+    let parsed = crate::core::planner::parse_plan_from_value(raw_plan, &actions, None, 1, false)
+        .map(|plan| crate::core::planner::prepare_plan_for_execution(&plan))
+        .ok_or_else(|| "Invalid plan override payload.".to_string())?;
+    Ok(Some(parsed))
 }
 
 async fn chat_stream(
@@ -14764,6 +14892,10 @@ async fn chat_stream(
             conversation_id: request.conversation_id,
             project_id: request.project_id,
             deep_research: request.deep_research,
+            plan_confirmation_mode: normalized_chat_plan_confirmation_mode(
+                request.plan_confirmation_mode.as_deref(),
+            ),
+            plan_override: None,
             caller_principal: maybe_caller.as_ref().map(|Extension(value)| value.clone()),
             task_mode: ChatStreamTaskMode::CreateIfNeeded {
                 execution_mode: request.execution_mode,
@@ -17259,6 +17391,7 @@ async fn resume_chat_task_stream(
     State(state): State<AppState>,
     maybe_caller: Option<Extension<crate::actions::ActionCallerPrincipal>>,
     Path(id): Path<String>,
+    request: Option<Json<ResumeChatTaskStreamRequest>>,
 ) -> Response {
     let uuid = match uuid::Uuid::parse_str(&id) {
         Ok(value) => value,
@@ -17272,8 +17405,9 @@ async fn resume_chat_task_stream(
                 .into_response();
         }
     };
+    let resume_request_body = request.map(|Json(body)| body).unwrap_or_default();
 
-    let (resume_request, resumed_task, previous_task, status_json) = {
+    let (resume_request, resumed_task, previous_task, status_json, arguments_json) = {
         let mut tasks = state.tasks.write().await;
         let Some(task) = tasks.get_mut(uuid) else {
             return (
@@ -17293,22 +17427,85 @@ async fn resume_chat_task_stream(
         };
 
         let previous_task = task.clone();
+        let effective_plan_override = resume_request_body
+            .plan_override
+            .clone()
+            .or_else(|| resume_request.stored_plan_override.clone());
+        if resume_request.paused_for_plan_confirmation {
+            let mut updated_arguments = task
+                .arguments
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            updated_arguments.remove("_pause_kind");
+            if let Some(raw_plan) = effective_plan_override.clone() {
+                let mut preview = updated_arguments
+                    .get("_plan_preview")
+                    .and_then(|value| value.as_object())
+                    .cloned()
+                    .unwrap_or_default();
+                preview.insert("current_plan".to_string(), raw_plan);
+                updated_arguments.insert(
+                    "_plan_preview".to_string(),
+                    serde_json::Value::Object(preview),
+                );
+            }
+            task.arguments = serde_json::Value::Object(updated_arguments.clone());
+        }
         task.status = TaskStatus::InProgress;
         task.result = None;
         task.proof_id = None;
         task.scheduled_for = None;
+        let paused_for_plan_confirmation = resume_request.paused_for_plan_confirmation;
 
         (
             resume_request,
             task.clone(),
             previous_task,
             serde_json::to_string(&task.status).unwrap_or("\"InProgress\"".to_string()),
+            if paused_for_plan_confirmation {
+                Some(serde_json::to_string(&task.arguments).unwrap_or_else(|_| "{}".to_string()))
+            } else {
+                None
+            },
         )
+    };
+
+    let parsed_plan_override = match parse_execution_plan_override(
+        &state,
+        resume_request_body
+            .plan_override
+            .as_ref()
+            .or(resume_request.stored_plan_override.as_ref()),
+    )
+    .await
+    {
+        Ok(plan) => plan,
+        Err(error) => {
+            let mut tasks = state.tasks.write().await;
+            if let Some(task) = tasks.get_mut(uuid) {
+                *task = previous_task;
+            }
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse { error }),
+            )
+                .into_response();
+        }
     };
 
     let save_result = {
         let agent = state.agent.read().await;
-        agent.storage.retry_task(&id, &status_json, None).await
+        if let Err(error) = agent.storage.retry_task(&id, &status_json, None).await {
+            Err(error)
+        } else if let Some(arguments_json) = arguments_json.clone() {
+            agent
+                .storage
+                .update_task(&id, None, Some(arguments_json), None, None)
+                .await
+        } else {
+            Ok(())
+        }
     };
 
     if let Err(error) = save_result {
@@ -17333,6 +17530,8 @@ async fn resume_chat_task_stream(
             conversation_id: Some(resume_request.conversation_id),
             project_id: resume_request.project_id,
             deep_research: resume_request.deep_research,
+            plan_confirmation_mode: crate::core::RequestPlanConfirmationMode::None,
+            plan_override: parsed_plan_override,
             caller_principal: maybe_caller.as_ref().map(|Extension(value)| value.clone()),
             task_mode: ChatStreamTaskMode::Existing(Box::new(StreamedChatTask {
                 task: resumed_task,
@@ -19148,6 +19347,51 @@ async fn load_canary_state_by_key(
         .ok()
 }
 
+async fn load_tool_strategy_profile_by_key(
+    storage: &crate::storage::Storage,
+    key: &str,
+) -> Option<crate::core::self_evolve::strategy_runtime::ToolStrategyProfile> {
+    let raw = storage.get(key).await.ok().flatten()?;
+    serde_json::from_slice::<crate::core::self_evolve::strategy_runtime::ToolStrategyProfile>(&raw)
+        .ok()
+}
+
+fn parse_tool_strategy_candidate_profile(
+    candidate: &crate::storage::learning_candidate::Model,
+) -> Result<crate::core::self_evolve::strategy_runtime::ToolStrategyProfile> {
+    serde_json::from_value(candidate.proposed_content.clone()).map_err(|error| {
+        anyhow::anyhow!(
+            "Invalid strategy candidate payload for '{}': {}",
+            candidate.id,
+            error
+        )
+    })
+}
+
+async fn disable_tool_strategy_canary_for_version(
+    storage: &crate::storage::Storage,
+    candidate_version: &str,
+) -> Result<bool> {
+    storage
+        .disable_strategy_canary_for_version(candidate_version)
+        .await
+}
+
+async fn promote_tool_strategy_candidate_to_baseline(
+    storage: &crate::storage::Storage,
+    candidate: &crate::storage::learning_candidate::Model,
+) -> Result<String> {
+    storage
+        .promote_strategy_learning_candidate_to_baseline(&candidate.id)
+        .await
+}
+
+async fn rollback_tool_strategy_baseline(
+    storage: &crate::storage::Storage,
+) -> Result<String> {
+    storage.rollback_tool_strategy_baseline().await
+}
+
 async fn load_last_self_evolve_result(
     storage: &crate::storage::Storage,
 ) -> Option<serde_json::Value> {
@@ -19450,6 +19694,11 @@ async fn build_evolution_settings_response(
     storage: &crate::storage::Storage,
 ) -> EvolutionSettingsResponse {
     let canary_state = load_evolution_canary_state(storage).await;
+    let strategy_canary_state = load_canary_state_by_key(
+        storage,
+        crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_CANARY_STATE_KEY,
+    )
+    .await;
     let last_result = load_last_self_evolve_result(storage).await;
     let prompt_canary_state = load_prompt_evolution_canary_state(storage).await;
     let classifier_prompt_canary_state = load_canary_state_by_key(
@@ -19490,6 +19739,27 @@ async fn build_evolution_settings_response(
             enabled: false,
             rollout_percent: 0,
             baseline_version: "routing-policy-default-v1".to_string(),
+            candidate_version: "-".to_string(),
+        }
+    };
+    let strategy_canary = if let Some(state) = strategy_canary_state.as_ref() {
+        EvolutionCanarySummary {
+            enabled: state.enabled,
+            rollout_percent: state.rollout_percent,
+            baseline_version: state.baseline_version.clone(),
+            candidate_version: state.candidate_version.clone(),
+        }
+    } else {
+        EvolutionCanarySummary {
+            enabled: false,
+            rollout_percent: 0,
+            baseline_version: load_tool_strategy_profile_by_key(
+                storage,
+                crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_PROFILE_KEY,
+            )
+            .await
+            .map(|profile| profile.version)
+            .unwrap_or_else(|| "strategy-v1".to_string()),
             candidate_version: "-".to_string(),
         }
     };
@@ -19785,6 +20055,7 @@ async fn build_evolution_settings_response(
         learning_queue_cap: load_learning_queue_cap(storage).await,
         learning_queue,
         canary,
+        strategy_canary,
         prompt_canary,
         classifier_prompt_canary,
         specialist_prompt_canary,
@@ -20313,6 +20584,7 @@ fn build_specialist_prompt_insights(
 async fn build_evolution_dev_response(
     storage: &crate::storage::Storage,
     limit: u64,
+    include_superseded: bool,
 ) -> EvolutionDevResponse {
     let logs = storage
         .list_operational_log_version_metrics_by_event("tool_call", limit)
@@ -20320,6 +20592,11 @@ async fn build_evolution_dev_response(
         .unwrap_or_default();
     let policy_metrics = aggregate_version_metrics(&logs, |row| row.policy_version.as_deref());
     let strategy_metrics = aggregate_version_metrics(&logs, |row| row.strategy_version.as_deref());
+    let strategy_canary_state = load_canary_state_by_key(
+        storage,
+        crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_CANARY_STATE_KEY,
+    )
+    .await;
     let prompt_tool_logs = storage
         .list_operational_logs_by_event("tool_call", limit)
         .await
@@ -20333,7 +20610,7 @@ async fn build_evolution_dev_response(
         .await
         .unwrap_or_default();
     let learning_candidates = storage
-        .list_learning_candidates(None, 24)
+        .list_learning_candidates_with_options(None, include_superseded, 24)
         .await
         .unwrap_or_default()
         .into_iter()
@@ -20458,6 +20735,7 @@ async fn build_evolution_dev_response(
         .collect::<Vec<_>>();
     EvolutionDevResponse {
         canary_state: load_evolution_canary_state(storage).await,
+        strategy_canary_state,
         last_result: load_last_self_evolve_result(storage).await,
         lineage_recent: read_recent_lineage(40).await,
         policy_metrics,
@@ -20645,7 +20923,15 @@ async fn get_evolution_dev(
         agent.storage.clone()
     };
     let limit = query.limit.unwrap_or(5000).clamp(100, 100_000);
-    Json(build_evolution_dev_response(&storage, limit).await).into_response()
+    Json(
+        build_evolution_dev_response(
+            &storage,
+            limit,
+            query.include_superseded.unwrap_or(false),
+        )
+        .await,
+    )
+    .into_response()
 }
 
 async fn persist_evolution_action_trace(
@@ -20894,138 +21180,327 @@ async fn run_evolution_dev_action(
 
     let message = match action.as_str() {
         "disable_canary" => {
-            let mut canary = match load_evolution_canary_state(&storage).await {
-                Some(state) => state,
-                None => {
+            if let Some(candidate_id) = request
+                .candidate_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                let Some(candidate) = (match storage.get_learning_candidate(candidate_id).await {
+                    Ok(value) => value,
+                    Err(e) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse {
+                                error: format!("Failed to load learning candidate: {}", e),
+                            }),
+                        )
+                            .into_response();
+                    }
+                }) else {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(ErrorResponse {
+                            error: "Learning candidate not found.".to_string(),
+                        }),
+                    )
+                        .into_response();
+                };
+                if candidate.candidate_type != "strategy" {
                     return (
                         StatusCode::BAD_REQUEST,
                         Json(ErrorResponse {
-                            error: "No canary state found.".to_string(),
+                            error: "candidate_id is only supported for strategy canary controls."
+                                .to_string(),
                         }),
                     )
                         .into_response();
                 }
-            };
-            canary.enabled = false;
-            let bytes = match serde_json::to_vec(&canary) {
-                Ok(v) => v,
-                Err(e) => {
+                let profile = match parse_tool_strategy_candidate_profile(&candidate) {
+                    Ok(profile) => profile,
+                    Err(error) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse {
+                                error: error.to_string(),
+                            }),
+                        )
+                            .into_response();
+                    }
+                };
+                match disable_tool_strategy_canary_for_version(&storage, &profile.version).await {
+                    Ok(true) => {
+                        format!("Tool-strategy canary disabled for '{}'.", profile.version)
+                    }
+                    Ok(false) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse {
+                                error: "No matching tool-strategy canary is active for that candidate."
+                                    .to_string(),
+                            }),
+                        )
+                            .into_response();
+                    }
+                    Err(error) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse {
+                                error: format!("Failed to disable tool-strategy canary: {}", error),
+                            }),
+                        )
+                            .into_response();
+                    }
+                }
+            } else {
+                let mut canary = match load_evolution_canary_state(&storage).await {
+                    Some(state) => state,
+                    None => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse {
+                                error: "No canary state found.".to_string(),
+                            }),
+                        )
+                            .into_response();
+                    }
+                };
+                canary.enabled = false;
+                let bytes = match serde_json::to_vec(&canary) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse {
+                                error: format!("Failed to serialize canary state: {}", e),
+                            }),
+                        )
+                            .into_response();
+                    }
+                };
+                if let Err(e) = storage
+                    .set(
+                        crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_CANARY_STATE_KEY,
+                        &bytes,
+                    )
+                    .await
+                {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(ErrorResponse {
-                            error: format!("Failed to serialize canary state: {}", e),
+                            error: format!("Failed to disable canary: {}", e),
                         }),
                     )
                         .into_response();
                 }
-            };
-            if let Err(e) = storage
-                .set(
-                    crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_CANARY_STATE_KEY,
-                    &bytes,
-                )
-                .await
-            {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("Failed to disable canary: {}", e),
-                    }),
-                )
-                    .into_response();
+                "Canary rollout disabled.".to_string()
             }
-            "Canary rollout disabled.".to_string()
         }
         "promote_candidate" => {
-            let candidate_bytes = match storage
-                .get(crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_POLICY_CANARY_KEY)
-                .await
+            if let Some(candidate_id) = request
+                .candidate_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
             {
-                Ok(Some(v)) => v,
-                _ => {
+                let Some(candidate) = (match storage.get_learning_candidate(candidate_id).await {
+                    Ok(value) => value,
+                    Err(e) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse {
+                                error: format!("Failed to load learning candidate: {}", e),
+                            }),
+                        )
+                            .into_response();
+                    }
+                }) else {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(ErrorResponse {
+                            error: "Learning candidate not found.".to_string(),
+                        }),
+                    )
+                        .into_response();
+                };
+                if candidate.candidate_type != "strategy" {
                     return (
                         StatusCode::BAD_REQUEST,
                         Json(ErrorResponse {
-                            error: "No candidate policy found to promote.".to_string(),
+                            error: "candidate_id is only supported for strategy promotions."
+                                .to_string(),
                         }),
                     )
                         .into_response();
                 }
-            };
-            if let Err(e) = storage
-                .set(
-                    crate::core::self_evolve::ROUTING_COMPLEXITY_POLICY_KEY,
-                    &candidate_bytes,
+                let promoted_version =
+                    match promote_tool_strategy_candidate_to_baseline(&storage, &candidate).await {
+                        Ok(version) => version,
+                        Err(error) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(ErrorResponse {
+                                    error: format!(
+                                        "Failed to promote tool-strategy candidate: {}",
+                                        error
+                                    ),
+                                }),
+                            )
+                                .into_response();
+                        }
+                    };
+                format!(
+                    "Tool-strategy candidate '{}' promoted to baseline.",
+                    promoted_version
                 )
-                .await
-            {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("Failed to promote candidate: {}", e),
-                    }),
-                )
-                    .into_response();
-            }
-            if let Some(mut canary) = load_evolution_canary_state(&storage).await {
-                canary.enabled = false;
-                canary.baseline_version = canary.candidate_version.clone();
-                if let Ok(bytes) = serde_json::to_vec(&canary) {
-                    let _ = storage
-                        .set(
-                            crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_CANARY_STATE_KEY,
-                            &bytes,
+            } else {
+                let candidate_bytes = match storage
+                    .get(crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_POLICY_CANARY_KEY)
+                    .await
+                {
+                    Ok(Some(v)) => v,
+                    _ => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse {
+                                error: "No candidate policy found to promote.".to_string(),
+                            }),
                         )
-                        .await;
+                            .into_response();
+                    }
+                };
+                if let Err(e) = storage
+                    .set(
+                        crate::core::self_evolve::ROUTING_COMPLEXITY_POLICY_KEY,
+                        &candidate_bytes,
+                    )
+                    .await
+                {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!("Failed to promote candidate: {}", e),
+                        }),
+                    )
+                        .into_response();
                 }
+                if let Some(mut canary) = load_evolution_canary_state(&storage).await {
+                    canary.enabled = false;
+                    canary.baseline_version = canary.candidate_version.clone();
+                    if let Ok(bytes) = serde_json::to_vec(&canary) {
+                        let _ = storage
+                            .set(
+                                crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_CANARY_STATE_KEY,
+                                &bytes,
+                            )
+                            .await;
+                    }
+                }
+                "Candidate policy promoted to baseline.".to_string()
             }
-            "Candidate policy promoted to baseline.".to_string()
         }
         "rollback_baseline" => {
-            let snapshot = match storage
-                .get(
-                    crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_POLICY_BASELINE_SNAPSHOT_KEY,
-                )
-                .await
+            if let Some(candidate_id) = request
+                .candidate_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
             {
-                Ok(Some(v)) => v,
-                _ => {
+                let Some(candidate) = (match storage.get_learning_candidate(candidate_id).await {
+                    Ok(value) => value,
+                    Err(e) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse {
+                                error: format!("Failed to load learning candidate: {}", e),
+                            }),
+                        )
+                            .into_response();
+                    }
+                }) else {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(ErrorResponse {
+                            error: "Learning candidate not found.".to_string(),
+                        }),
+                    )
+                        .into_response();
+                };
+                if candidate.candidate_type != "strategy" {
                     return (
                         StatusCode::BAD_REQUEST,
                         Json(ErrorResponse {
-                            error: "No baseline snapshot available for rollback.".to_string(),
+                            error: "candidate_id is only supported for strategy rollback."
+                                .to_string(),
                         }),
                     )
                         .into_response();
                 }
-            };
-            if let Err(e) = storage
-                .set(
-                    crate::core::self_evolve::ROUTING_COMPLEXITY_POLICY_KEY,
-                    &snapshot,
-                )
-                .await
-            {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("Failed to rollback baseline policy: {}", e),
-                    }),
-                )
-                    .into_response();
-            }
-            if let Some(mut canary) = load_evolution_canary_state(&storage).await {
-                canary.enabled = false;
-                if let Ok(bytes) = serde_json::to_vec(&canary) {
-                    let _ = storage
-                        .set(
-                            crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_CANARY_STATE_KEY,
-                            &bytes,
+                let restored_version = match rollback_tool_strategy_baseline(&storage).await {
+                    Ok(version) => version,
+                    Err(error) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse {
+                                error: format!(
+                                    "Failed to rollback tool-strategy baseline: {}",
+                                    error
+                                ),
+                            }),
                         )
-                        .await;
+                            .into_response();
+                    }
+                };
+                format!(
+                    "Tool-strategy baseline rolled back to '{}'.",
+                    restored_version
+                )
+            } else {
+                let snapshot = match storage
+                    .get(
+                        crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_POLICY_BASELINE_SNAPSHOT_KEY,
+                    )
+                    .await
+                {
+                    Ok(Some(v)) => v,
+                    _ => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse {
+                                error: "No baseline snapshot available for rollback.".to_string(),
+                            }),
+                        )
+                            .into_response();
+                    }
+                };
+                if let Err(e) = storage
+                    .set(
+                        crate::core::self_evolve::ROUTING_COMPLEXITY_POLICY_KEY,
+                        &snapshot,
+                    )
+                    .await
+                {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!("Failed to rollback baseline policy: {}", e),
+                        }),
+                    )
+                        .into_response();
                 }
+                if let Some(mut canary) = load_evolution_canary_state(&storage).await {
+                    canary.enabled = false;
+                    if let Ok(bytes) = serde_json::to_vec(&canary) {
+                        let _ = storage
+                            .set(
+                                crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_CANARY_STATE_KEY,
+                                &bytes,
+                            )
+                            .await;
+                    }
+                }
+                "Rolled back to the stored baseline snapshot.".to_string()
             }
-            "Rolled back to the stored baseline snapshot.".to_string()
         }
         "approve_learning_candidate" => {
             let Some(candidate_id) = request
@@ -21121,110 +21596,36 @@ async fn run_evolution_dev_action(
                     name.to_string()
                 }
                 "strategy" => {
-                    let profile: crate::core::self_evolve::strategy_runtime::ToolStrategyProfile =
-                        match serde_json::from_value(candidate.proposed_content.clone()) {
-                            Ok(value) => value,
-                            Err(error) => {
-                                return (
-                                    StatusCode::BAD_REQUEST,
-                                    Json(ErrorResponse {
-                                        error: format!(
-                                            "Invalid strategy candidate payload: {}",
-                                            error
-                                        ),
-                                    }),
-                                )
-                                    .into_response();
-                            }
-                        };
-                    let candidate_bytes = match serde_json::to_vec(&profile) {
-                        Ok(bytes) => bytes,
+                    if let Err(error) = parse_tool_strategy_candidate_profile(&candidate) {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse {
+                                error: error.to_string(),
+                            }),
+                        )
+                            .into_response();
+                    }
+                    match storage
+                        .approve_strategy_learning_candidate(
+                            candidate_id,
+                            Some("Approved from Evolution developer controls."),
+                        )
+                        .await
+                    {
+                        Ok(version) => version,
                         Err(error) => {
                             return (
                                 StatusCode::INTERNAL_SERVER_ERROR,
                                 Json(ErrorResponse {
                                     error: format!(
-                                        "Failed to serialize strategy candidate: {}",
+                                        "Failed to approve strategy learning candidate: {}",
                                         error
                                     ),
                                 }),
                             )
                                 .into_response();
                         }
-                    };
-                    let baseline_version = storage
-                        .get(crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_PROFILE_KEY)
-                        .await
-                        .ok()
-                        .flatten()
-                        .and_then(|raw| {
-                            serde_json::from_slice::<
-                                crate::core::self_evolve::strategy_runtime::ToolStrategyProfile,
-                            >(&raw)
-                            .ok()
-                        })
-                        .map(|value| value.version)
-                        .unwrap_or_else(|| "strategy-v1".to_string());
-                    if let Err(error) = storage
-                        .set(
-                            crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_PROFILE_CANARY_KEY,
-                            &candidate_bytes,
-                        )
-                        .await
-                    {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ErrorResponse {
-                                error: format!(
-                                    "Failed to store strategy candidate profile: {}",
-                                    error
-                                ),
-                            }),
-                        )
-                            .into_response();
                     }
-                    let canary_state =
-                        crate::core::self_evolve::strategy_runtime::CanaryRolloutState {
-                            enabled: true,
-                            baseline_version,
-                            candidate_version: profile.version.clone(),
-                            rollout_percent: 20,
-                            ..Default::default()
-                        };
-                    let canary_bytes = match serde_json::to_vec(&canary_state) {
-                        Ok(bytes) => bytes,
-                        Err(error) => {
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(ErrorResponse {
-                                    error: format!(
-                                        "Failed to serialize strategy canary state: {}",
-                                        error
-                                    ),
-                                }),
-                            )
-                                .into_response();
-                        }
-                    };
-                    if let Err(error) = storage
-                        .set(
-                            crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_CANARY_STATE_KEY,
-                            &canary_bytes,
-                        )
-                        .await
-                    {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ErrorResponse {
-                                error: format!(
-                                    "Failed to activate strategy canary: {}",
-                                    error
-                                ),
-                            }),
-                        )
-                            .into_response();
-                    }
-                    profile.version
                 }
                 "memory_deprecate" => {
                     let item_id = candidate
@@ -21340,22 +21741,24 @@ async fn run_evolution_dev_action(
                         .into_response();
                 }
             };
-            if let Err(error) = storage
-                .update_learning_candidate_review(
-                    candidate_id,
-                    "approved",
-                    Some("Approved from Evolution developer controls."),
-                    Some(&approved_ref),
-                )
-                .await
-            {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("Failed to record candidate approval: {}", error),
-                    }),
-                )
-                    .into_response();
+            if candidate.candidate_type != "strategy" {
+                if let Err(error) = storage
+                    .update_learning_candidate_review(
+                        candidate_id,
+                        "approved",
+                        Some("Approved from Evolution developer controls."),
+                        Some(&approved_ref),
+                    )
+                    .await
+                {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!("Failed to record candidate approval: {}", error),
+                        }),
+                    )
+                        .into_response();
+                }
             }
             format!("Approved learning candidate '{}'.", candidate.title)
         }
@@ -21394,7 +21797,35 @@ async fn run_evolution_dev_action(
                 )
                     .into_response();
             };
-            if let Err(error) = storage
+            if candidate.candidate_type == "strategy" {
+                if let Err(error) = parse_tool_strategy_candidate_profile(&candidate) {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: error.to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+                if let Err(error) = storage
+                    .reject_strategy_learning_candidate(
+                        candidate_id,
+                        Some("Rejected from Evolution developer controls."),
+                    )
+                    .await
+                {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!(
+                                "Failed to reject strategy learning candidate: {}",
+                                error
+                            ),
+                        }),
+                    )
+                        .into_response();
+                }
+            } else if let Err(error) = storage
                 .update_learning_candidate_review(
                     candidate_id,
                     "rejected",
@@ -21426,7 +21857,7 @@ async fn run_evolution_dev_action(
     };
 
     let evolution = build_evolution_settings_response(&storage).await;
-    let dev = build_evolution_dev_response(&storage, 5000).await;
+    let dev = build_evolution_dev_response(&storage, 5000, false).await;
     let trace_id = persist_evolution_action_trace(
         &state,
         &action,
@@ -21533,7 +21964,7 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
     } else {
         match embeddings_cfg.provider {
             EmbeddingsProviderKind::LocalHf => format!(
-                "Local embeddings are configured for {} and will initialize on first use",
+                "Local embeddings are configured for {} and initialize in the background after startup",
                 embeddings_model
             ),
             EmbeddingsProviderKind::Ollama => {
@@ -22840,6 +23271,12 @@ async fn update_settings(
         if let Some(v) = update.learning_candidate_retention_days {
             current.learning_candidate_retention_days = v;
         }
+        if let Some(v) = update.experience_item_retention_days {
+            current.experience_item_retention_days = v;
+        }
+        if let Some(v) = update.procedural_pattern_retention_days {
+            current.procedural_pattern_retention_days = v;
+        }
         if let Some(v) = update.housekeeping_interval_secs {
             current.housekeeping_interval_secs = v;
         }
@@ -23183,7 +23620,7 @@ async fn update_settings(
             "" | "local-hf" | "local_hf" => EmbeddingsConfig {
                 provider: EmbeddingsProviderKind::LocalHf,
                 model: if embeddings_model_raw.trim().is_empty() {
-                    "sentence-transformers/all-MiniLM-L6-v2".to_string()
+                    "BAAI/bge-small-en-v1.5".to_string()
                 } else {
                     embeddings_model_raw.trim().to_string()
                 },
@@ -31510,6 +31947,417 @@ struct CreateKnowledgeItemRequest {
     project_id: Option<String>,
 }
 
+const MEMORY_MAINTENANCE_EPISODE_RETENTION_ACTION: &str = "episode_retention_cleanup";
+
+#[derive(Debug, Serialize)]
+struct MemoryMaintenanceKnowledgeCounts {
+    episodes: u64,
+    facts: u64,
+    documents: u64,
+    document_chunks: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryMaintenancePolicy {
+    data_cleanup_enabled: bool,
+    episode_retention_enabled: bool,
+    protect_fact_sources: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryMaintenanceDurablePolicy {
+    documents: String,
+    semantic_facts: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryMaintenanceEpisodeCleanupReview {
+    available: bool,
+    reason: String,
+    current_episode_count: u64,
+    max_episodes: u64,
+    candidate_count: u64,
+    raw_candidate_count: u64,
+    estimated_remaining_episodes: u64,
+    protected_recent_count: u64,
+    protected_fact_source_count: u64,
+    cutoff_days: u64,
+    keep_last: u64,
+    require_consolidated: bool,
+    max_importance: f32,
+    max_access_count: i32,
+    preview_signature: String,
+    confirmation_phrase: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryMaintenanceReviewResponse {
+    generated_at: String,
+    knowledge_counts: MemoryMaintenanceKnowledgeCounts,
+    policy: MemoryMaintenancePolicy,
+    durable_policy: MemoryMaintenanceDurablePolicy,
+    episode_cleanup: MemoryMaintenanceEpisodeCleanupReview,
+}
+
+#[derive(Debug, Deserialize)]
+struct RunMemoryMaintenanceRequest {
+    action: String,
+    preview_signature: String,
+    confirmation_text: String,
+}
+
+#[derive(Debug)]
+struct EpisodeCleanupPlan {
+    delete_ids: Vec<String>,
+    review: MemoryMaintenanceEpisodeCleanupReview,
+}
+
+fn collect_protected_episode_ids_for_maintenance(sources: &[String]) -> HashSet<String> {
+    let mut protected = HashSet::new();
+    for blob in sources {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(blob) {
+            if let Some(entries) = value.as_array() {
+                for entry in entries {
+                    if let Some(id) = entry.as_str() {
+                        protected.insert(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    protected
+}
+
+fn build_episode_cleanup_preview_signature(
+    current_episode_count: u64,
+    delete_ids: &[String],
+    mem_cfg: &MemoryConfig,
+) -> String {
+    let mut hasher = DefaultHasher::new();
+    MEMORY_MAINTENANCE_EPISODE_RETENTION_ACTION.hash(&mut hasher);
+    current_episode_count.hash(&mut hasher);
+    mem_cfg.max_episodes.hash(&mut hasher);
+    mem_cfg.retention_min_age_days.hash(&mut hasher);
+    mem_cfg.retention_keep_last.hash(&mut hasher);
+    mem_cfg.retention_require_consolidated.hash(&mut hasher);
+    mem_cfg.retention_max_access_count.hash(&mut hasher);
+    mem_cfg.retention_max_importance.to_bits().hash(&mut hasher);
+    mem_cfg.retention_protect_fact_sources.hash(&mut hasher);
+    for id in delete_ids {
+        id.hash(&mut hasher);
+    }
+    format!("{:016x}", hasher.finish())
+}
+
+async fn get_memory_maintenance_counts(
+    storage: &crate::storage::Storage,
+) -> Result<MemoryMaintenanceKnowledgeCounts, String> {
+    let episodes = storage
+        .count_episodes()
+        .await
+        .map_err(|e| format!("Failed to count episodes: {}", e))?;
+    let facts = storage
+        .count_facts(None)
+        .await
+        .map_err(|e| format!("Failed to count semantic facts: {}", e))?;
+    let documents = storage
+        .count_documents(None)
+        .await
+        .map_err(|e| format!("Failed to count documents: {}", e))?;
+    let document_chunks = storage
+        .count_document_chunks()
+        .await
+        .map_err(|e| format!("Failed to count document chunks: {}", e))?;
+    Ok(MemoryMaintenanceKnowledgeCounts {
+        episodes,
+        facts,
+        documents,
+        document_chunks,
+    })
+}
+
+async fn build_episode_cleanup_plan(
+    storage: &crate::storage::Storage,
+    mem_cfg: &MemoryConfig,
+    lifecycle: &DataLifecycleSettings,
+) -> Result<EpisodeCleanupPlan, String> {
+    let current_episode_count = storage
+        .count_episodes()
+        .await
+        .map_err(|e| format!("Failed to count episodes: {}", e))?;
+    let cutoff_days = mem_cfg.retention_min_age_days.max(1);
+    let safe_cutoff_days = cutoff_days.min(36500);
+    let keep_last = mem_cfg.retention_keep_last.max(1) as u64;
+    let max_episodes = mem_cfg.max_episodes.max(1) as u64;
+    let cutoff = chrono::Utc::now()
+        - chrono::Duration::days(i64::try_from(safe_cutoff_days).unwrap_or(36500));
+    let cutoff_rfc3339 = cutoff.to_rfc3339();
+
+    let keep_newest_ids = storage
+        .list_newest_episode_ids(keep_last)
+        .await
+        .map_err(|e| format!("Failed to load protected recent episodes: {}", e))?;
+    let keep_newest_protected: HashSet<String> = keep_newest_ids.into_iter().collect();
+    let mut protected = keep_newest_protected.clone();
+
+    let fact_protected = if mem_cfg.retention_protect_fact_sources {
+        let sources = storage
+            .list_all_semantic_fact_sources()
+            .await
+            .map_err(|e| format!("Failed to inspect semantic fact sources: {}", e))?;
+        let ids = collect_protected_episode_ids_for_maintenance(&sources);
+        protected.extend(ids.iter().cloned());
+        ids
+    } else {
+        HashSet::new()
+    };
+
+    let target = if current_episode_count > max_episodes {
+        ((current_episode_count - max_episodes) + 100)
+            .min(mem_cfg.retention_max_delete_per_run.max(1))
+    } else {
+        0
+    };
+
+    let raw_candidates = if target > 0 {
+        storage
+            .list_episode_prune_candidates(
+                &cutoff_rfc3339,
+                mem_cfg.retention_require_consolidated,
+                mem_cfg.retention_max_importance,
+                mem_cfg.retention_max_access_count,
+                target,
+            )
+            .await
+            .map_err(|e| format!("Failed to build cleanup preview: {}", e))?
+    } else {
+        Vec::new()
+    };
+
+    let delete_ids: Vec<String> = raw_candidates
+        .iter()
+        .filter(|id| !protected.contains(*id))
+        .cloned()
+        .collect();
+    let available = !delete_ids.is_empty();
+    let reason = if current_episode_count == 0 {
+        "No episodic memories are stored yet.".to_string()
+    } else if current_episode_count <= max_episodes {
+        format!(
+            "Episode count is within the configured cap ({} <= {}). No manual cleanup is needed right now.",
+            current_episode_count, max_episodes
+        )
+    } else if raw_candidates.is_empty() {
+        "No episodes met the current retention safety thresholds, so nothing is eligible for reviewed cleanup.".to_string()
+    } else if delete_ids.is_empty() {
+        "Episodes matched age/importance rules, but they are still protected by the keep-last window or semantic-fact source protection.".to_string()
+    } else if !lifecycle.cleanup_enabled || !mem_cfg.retention_enabled {
+        "Automatic cleanup is disabled, but this reviewed flow can still run a one-time cleanup with the same safety thresholds.".to_string()
+    } else {
+        format!(
+            "{} low-risk episodic memories can be removed while leaving documents and semantic facts untouched.",
+            delete_ids.len()
+        )
+    };
+    let preview_signature = if available {
+        build_episode_cleanup_preview_signature(current_episode_count, &delete_ids, mem_cfg)
+    } else {
+        String::new()
+    };
+    let confirmation_phrase = if available {
+        format!("delete {} episodes", delete_ids.len())
+    } else {
+        String::new()
+    };
+    let review = MemoryMaintenanceEpisodeCleanupReview {
+        available,
+        reason,
+        current_episode_count,
+        max_episodes,
+        candidate_count: delete_ids.len() as u64,
+        raw_candidate_count: raw_candidates.len() as u64,
+        estimated_remaining_episodes: current_episode_count.saturating_sub(delete_ids.len() as u64),
+        protected_recent_count: keep_newest_protected.len() as u64,
+        protected_fact_source_count: fact_protected.len() as u64,
+        cutoff_days: safe_cutoff_days,
+        keep_last,
+        require_consolidated: mem_cfg.retention_require_consolidated,
+        max_importance: mem_cfg.retention_max_importance,
+        max_access_count: mem_cfg.retention_max_access_count,
+        preview_signature,
+        confirmation_phrase,
+    };
+
+    Ok(EpisodeCleanupPlan { delete_ids, review })
+}
+
+async fn memory_maintenance_review(State(state): State<AppState>) -> Response {
+    let (storage, mem_cfg) = {
+        let agent = state.agent.read().await;
+        (agent.storage.clone(), agent.config.memory.clone())
+    };
+    let lifecycle = load_data_lifecycle_settings(&storage).await;
+    let counts = match get_memory_maintenance_counts(&storage).await {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!("Memory maintenance review failed to load counts: {}", error);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error }),
+            )
+                .into_response();
+        }
+    };
+    let plan = match build_episode_cleanup_plan(&storage, &mem_cfg, &lifecycle).await {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!("Memory maintenance review failed to build plan: {}", error);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error }),
+            )
+                .into_response();
+        }
+    };
+
+    if plan.review.available {
+        tracing::info!(
+            "Memory maintenance review ready: delete_candidates={} current_episodes={} documents={} chunks={}",
+            plan.review.candidate_count,
+            counts.episodes,
+            counts.documents,
+            counts.document_chunks
+        );
+    } else {
+        tracing::info!(
+            "Memory maintenance review generated with no actionable cleanup: current_episodes={} max_episodes={}",
+            counts.episodes,
+            plan.review.max_episodes
+        );
+    }
+
+    let response = MemoryMaintenanceReviewResponse {
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        knowledge_counts: counts,
+        policy: MemoryMaintenancePolicy {
+            data_cleanup_enabled: lifecycle.cleanup_enabled,
+            episode_retention_enabled: mem_cfg.retention_enabled,
+            protect_fact_sources: mem_cfg.retention_protect_fact_sources,
+        },
+        durable_policy: MemoryMaintenanceDurablePolicy {
+            documents: "Documents and document chunks are durable. This review screen reports their size but never deletes them.".to_string(),
+            semantic_facts: "Semantic facts are durable. Episode cleanup keeps fact rows intact and protects source-linked episodes when that safety rule is enabled.".to_string(),
+        },
+        episode_cleanup: plan.review,
+    };
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+async fn run_memory_maintenance(
+    State(state): State<AppState>,
+    Json(request): Json<RunMemoryMaintenanceRequest>,
+) -> Response {
+    if request.action.trim() != MEMORY_MAINTENANCE_EPISODE_RETENTION_ACTION {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Unsupported maintenance action".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let (storage, mem_cfg) = {
+        let agent = state.agent.read().await;
+        (agent.storage.clone(), agent.config.memory.clone())
+    };
+    let lifecycle = load_data_lifecycle_settings(&storage).await;
+    let plan = match build_episode_cleanup_plan(&storage, &mem_cfg, &lifecycle).await {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!("Memory maintenance run failed to rebuild plan: {}", error);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error }),
+            )
+                .into_response();
+        }
+    };
+
+    if !plan.review.available || plan.delete_ids.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: plan.review.reason,
+            }),
+        )
+            .into_response();
+    }
+    if request.preview_signature.trim() != plan.review.preview_signature {
+        tracing::warn!(
+            "Memory maintenance rejected stale preview: provided={} expected={}",
+            request.preview_signature.trim(),
+            plan.review.preview_signature
+        );
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "The cleanup preview is stale. Refresh the review screen and confirm again."
+                    .to_string(),
+            }),
+        )
+            .into_response();
+    }
+    if request.confirmation_text.trim() != plan.review.confirmation_phrase {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!(
+                    "Confirmation text must exactly match '{}'.",
+                    plan.review.confirmation_phrase
+                ),
+            }),
+        )
+            .into_response();
+    }
+
+    let deleted = match storage.delete_episodes_by_ids(&plan.delete_ids).await {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!("Memory maintenance cleanup failed: {}", error);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to delete episodic memories: {}", error),
+                }),
+            )
+                .into_response();
+        }
+    };
+    tracing::warn!(
+        "Memory maintenance cleanup executed: deleted={} expected={} current_before={} remaining_estimate={} signature={}",
+        deleted,
+        plan.delete_ids.len(),
+        plan.review.current_episode_count,
+        plan.review.estimated_remaining_episodes,
+        plan.review.preview_signature
+    );
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "action": MEMORY_MAINTENANCE_EPISODE_RETENTION_ACTION,
+            "deleted": deleted,
+            "summary": format!(
+                "Deleted {} episodic memories using the reviewed retention policy. Documents and semantic facts were left intact.",
+                deleted
+            ),
+        })),
+    )
+        .into_response()
+}
+
 async fn list_user_preferences(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -31993,6 +32841,8 @@ async fn mcp_handler(
                             caller,
                             crate::actions::ActionExecutionSurface::Api,
                             true,
+                            crate::core::RequestPlanConfirmationMode::None,
+                            None,
                         ),
                     )
                     .await
@@ -34362,6 +35212,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn normalize_stream_event_for_sse_emits_plan_ready_for_confirmation_payload() {
+        let plan = crate::core::ExecutionPlan {
+            plan_id: "plan-preview".to_string(),
+            revision: 1,
+            summary: "Scope, compare, and synthesize".to_string(),
+            steps: vec![crate::core::PlanStep {
+                id: 1,
+                title: "Scope the question".to_string(),
+                description: "Clarify the research goal before gathering sources."
+                    .to_string(),
+                action: None,
+                arguments: None,
+                tool_hint: None,
+                status: Some(crate::core::PlanStepStatus::Pending),
+            }],
+        };
+
+        let (event, next_state) = normalize_stream_event_for_sse(
+            crate::core::StreamEvent::PlanReadyForConfirmation {
+                task_id: "task-plan-preview".to_string(),
+                plan: plan.clone(),
+                source: "deep_research".to_string(),
+            },
+            "",
+        );
+
+        assert!(next_state.is_empty());
+        let Some((event_name, payload)) = event else {
+            panic!("expected plan_ready_for_confirmation event");
+        };
+        assert_eq!(event_name, "plan_ready_for_confirmation");
+        assert_eq!(
+            payload.get("task_id").and_then(|value| value.as_str()),
+            Some("task-plan-preview")
+        );
+        assert_eq!(
+            payload.get("source").and_then(|value| value.as_str()),
+            Some("deep_research")
+        );
+        assert_eq!(
+            payload
+                .get("plan")
+                .and_then(|value| value.get("summary"))
+                .and_then(|value| value.as_str()),
+            Some("Scope, compare, and synthesize")
+        );
+    }
+
     #[tokio::test]
     async fn resume_chat_stream_rejects_non_chat_and_paused_tasks() {
         let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -34432,6 +35331,115 @@ mod tests {
             .and_then(|value| value.as_str())
             .unwrap_or_default()
             .contains("cancelled or failed"));
+    }
+
+    #[tokio::test]
+    async fn resume_chat_stream_allows_paused_plan_confirmation_tasks() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        let router = Router::new()
+            .route(
+                "/tasks/{id}/resume-chat/stream",
+                post(resume_chat_task_stream),
+            )
+            .with_state(state.clone());
+
+        let conversation_id = uuid::Uuid::new_v4().to_string();
+        create_test_conversation_with_user_message(&state, &conversation_id, "hello").await;
+
+        let preview_plan = serde_json::json!({
+            "summary": "Gather sources and verify claims",
+            "steps": [
+                {
+                    "id": 1,
+                    "title": "Gather source sets",
+                    "description": "Collect official docs and recent reporting.",
+                    "status": "pending",
+                    "action": serde_json::Value::Null,
+                    "arguments": serde_json::json!({}),
+                    "tool_hint": serde_json::Value::Null
+                }
+            ]
+        });
+
+        let mut paused_chat_task = crate::core::Task::new(
+            "Paused deep research plan".to_string(),
+            "chat_request".to_string(),
+            serde_json::json!({
+                "_task_kind": "chat_request",
+                "_origin": "chat",
+                "_work_type": "research",
+                "_pause_kind": "plan_confirmation",
+                "_plan_preview": {
+                    "original_plan": preview_plan.clone(),
+                    "current_plan": preview_plan.clone(),
+                    "source": "deep_research"
+                },
+                "message": "hello",
+                "channel": "web",
+                "conversation_id": conversation_id.clone(),
+                "project_id": serde_json::Value::Null,
+                "deep_research": true,
+                "attachments_present": false,
+            }),
+        );
+        paused_chat_task.status = TaskStatus::Paused;
+        let paused_chat_id = paused_chat_task.id;
+        add_test_task(&state, paused_chat_task).await;
+
+        let override_body = serde_json::json!({
+            "plan_override": {
+                "summary": "Edited deep research plan",
+                "steps": [
+                    {
+                        "title": "Compare the top sources",
+                        "description": "Verify the strongest claims before answering.",
+                        "action": serde_json::Value::Null,
+                        "arguments": serde_json::json!({}),
+                        "tool_hint": serde_json::Value::Null
+                    }
+                ]
+            }
+        });
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/tasks/{}/resume-chat/stream", paused_chat_id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(override_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .expect("stream body should complete")
+                .to_vec(),
+        )
+        .expect("sse body should be utf8");
+        assert!(body.contains("event: task_started"));
+
+        let tasks = state.tasks.read().await;
+        let stored_task = tasks
+            .all()
+            .iter()
+            .find(|candidate| candidate.id == paused_chat_id)
+            .expect("resumed task should remain in queue");
+        assert!(!matches!(stored_task.status, TaskStatus::Paused));
+        assert!(stored_task.arguments.get("_pause_kind").is_none());
+        assert_eq!(
+            stored_task
+                .arguments
+                .get("_plan_preview")
+                .and_then(|value| value.get("current_plan"))
+                .and_then(|value| value.get("summary"))
+                .and_then(|value| value.as_str()),
+            Some("Edited deep research plan")
+        );
     }
 
     #[tokio::test]

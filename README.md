@@ -45,7 +45,7 @@
 </p>
 
 <p align="center">
-  <strong>Daily brief | personal memory | self-evolves from use | encrypted secrets | safe actions | power automations when you want them</strong><br>
+  <strong>Daily brief | personal memory | adapts from use | encrypted secrets | safe actions | power automations when you want them</strong><br>
   Self-host anywhere. Connect any LLM. Stay private.
 </p>
 
@@ -61,7 +61,7 @@ AgentArk is a self-hosted personal AI assistant for daily life and work.
 
 It runs on your machine, keeps track of your preferences, delivers a daily brief, follows up across channels, and can take action safely when you ask. When you need more than a chat app, it can also schedule routines, monitor things in the background, build apps, and run deeper self-improving automations.
 
-It is built to evolve with you. AgentArk learns from accepted work, user corrections, repeated routines, and live tool outcomes so the assistant gets more aligned with your workflow instead of acting like every session is day one.
+It is built to evolve with you. AgentArk improves mainly through offline-first personalization: accepted work, user corrections, repeated routines, and live tool outcomes are reflected into local memory, retrieval context, prompts, routing, and strategy so the assistant gets more aligned with your workflow instead of acting like every session is day one. By default, that does not mean continuously retraining base model weights in the background.
 
 Short examples:
 
@@ -81,11 +81,26 @@ Most AI assistants force a bad tradeoff: easy but forgetful, or powerful but too
 | **Daily usefulness** | Good at one-off chats, weak at follow-up | Memory, recurring briefs, reminders, messaging channels, and durable tasks |
 | **Trust model** | Easy to ask, harder to verify | Approvals, security logs, execution history, and guarded actions |
 | **Continuity** | Context often resets every session | Durable user facts, preferences, documents, task state, and integration state |
-| **Improvement loop** | Behavior stays mostly static unless manually reprompted or reconfigured | Self-tune and self-evolve learn from accepted work, corrections, tool outcomes, and benchmarks |
+| **Improvement loop** | Behavior stays mostly static unless manually reprompted or reconfigured | Self-tune and self-evolve adapt local memory, prompts, routing, and strategy from accepted work, corrections, tool outcomes, and benchmarks |
 | **Power features** | Automation is shallow or separated from chat | Tasks, watchers, apps, integrations, swarm agents, and reusable skills |
-| **Security model** | Secrets and actions are often bolted on around the prompt | AES-256-GCM at rest, Argon2id master-password mode, sandboxing, approvals, and verifiable history |
+| **Security model** | Secrets and actions are often bolted on around the prompt | AES-256-GCM at rest, Argon2id master-password mode, sandboxing, approvals, HTTPS/TLS when configured, and verifiable history |
 
-Security is not just a checkbox here. Sensitive config is split from readable config: normal settings live in `config.toml`, while API keys, OAuth tokens, and custom secrets are stored encrypted in `secrets.enc`. When a master password is set, AgentArk derives the encryption key with **Argon2id** and uses **AES-256-GCM** for encryption at rest. Without a master password, it falls back to a locally generated per-install keyfile so secrets are still encrypted by default. Memory content, OAuth tokens, and secret-backed integration credentials all use the same encrypted storage path. Secrets entered through the built-in secret flows, such as `set secret ...`, integration settings, or runtime `{{secret:KEY}}` placeholders, are stored encrypted and resolved at execution time, so they do not appear in normal LLM-visible tool-call arguments or traces.
+Security is described here in terms of concrete controls, not vague labels like "military-grade encryption." Sensitive config is split from readable config: normal settings live in `config.toml`, while API keys, OAuth tokens, and custom secrets are stored encrypted in `secrets.enc`. When a master password is set, AgentArk derives the encryption key with **Argon2id** and uses **AES-256-GCM** for encryption at rest. Without a master password, it falls back to a locally generated per-install keyfile so secrets are still encrypted by default. Memory content, OAuth tokens, and secret-backed integration credentials all use the same encrypted storage path. Secrets entered through the built-in secret flows, such as `set secret ...`, integration settings, or runtime `{{secret:KEY}}` placeholders, are stored encrypted and resolved at execution time, so they do not appear in normal LLM-visible tool-call arguments or traces.
+
+Current security properties in this repository:
+
+- **Data at rest**: AES-256-GCM for encrypted secrets and sensitive stored content, with Argon2id-based key derivation for master-password mode.
+- **Data in transit**: HTTPS/TLS is supported when `tls_cert_path` and `tls_key_path` are configured, or when AgentArk is deployed behind an HTTPS reverse proxy. If you bind publicly without TLS, traffic is not encrypted in transit.
+- **Runtime isolation**: risky execution paths are constrained with sandboxing, approvals, guarded actions, and execution history.
+- **Auditability**: execution proofs, security logs, and approval records are intended to make behavior inspectable after the fact.
+
+What AgentArk does **not** claim by default:
+
+- It does not claim a FIPS 140-3 validated cryptographic module by default.
+- It does not claim NIST SP 800-52 TLS compliance, zero-trust compliance under SP 800-207, or NSA CNSA alignment by default.
+- It does not claim that every deployment automatically meets defense, regulated, or federal security baselines out of the box.
+
+If you need standards-based language for a regulated or defense-adjacent environment, document exactly which deployment controls satisfy which requirement. In practice, that usually means mapping AgentArk's at-rest encryption to AES under FIPS 197, configuring transport security to your organization's TLS baseline, defining key-management and rotation practices separately, and using validated crypto modules, hardened TLS termination, and zero-trust network controls where those are required.
 
 ### Talk to it like this:
 
@@ -117,7 +132,7 @@ It does not stop at a reply. It can **save the preference**, **schedule the foll
 | **Follows up** | Background watchers, scheduled tasks, and routines that run unattended |
 | **Reaches you** | One assistant reachable from web UI, CLI, Telegram, and WhatsApp |
 | **Researches and builds** | Web search, file work, app deployment, API calls, and grounded summaries |
-| **Improves over time** | Self-tune and self-evolve adapt prompts, routing, and strategy from corrections and live outcomes |
+| **Improves over time** | Self-tune and self-evolve adapt local memory, prompts, routing, and strategy from corrections and live outcomes |
 | **Grows with power users** | Apps, integrations, swarm agents, reusable skills, and self-improving autonomy features |
 
 ### How it stacks up:
@@ -152,7 +167,7 @@ Most self-hosted agents, whether OpenClaw, PicoClaw, NanoClaw, Agent Zero, or si
 - **Secure first** - encrypted secrets, approvals, sandboxing, and verifiable records of what the assistant did
 - **Daily by default** - briefs, reminders, follow-up, and messaging delivery are first-class workflows
 - **Memory that compounds** - each useful interaction can build on previous preferences, facts, and documents
-- **Self-evolving** - accepted work, user corrections, tool outcomes, and benchmarks improve prompts, routing, and strategy over time
+- **Self-evolving** - accepted work, user corrections, tool outcomes, and benchmarks improve local memory, prompts, routing, and strategy over time
 - **Chat-first** - talk to it naturally, not through config files or flowcharts
 - **Power when needed** - tasks, watchers, apps, integrations, and swarm features stay available for deeper work
 - **Model-agnostic** - OpenAI, Anthropic, Google, Ollama, or any OpenAI-compatible endpoint
@@ -188,36 +203,33 @@ scripts\start.bat
 
 This starts AgentArk with the bundled database and default local setup. Most installs do not need extra `.env` work: open `http://localhost:8990`, choose your model in Settings, and start chatting.
 
-### Container variants
+### Published container image
 
-AgentArk publishes two GHCR variants for deployments: a lean `base` image and a heavier `full` image.
+AgentArk now publishes a single GHCR image for deployments. The published image matches the full runtime profile used by the default Compose setup, including Playwright/Chromium, cloudflared, tailscale, Lightpanda, Google Workspace CLI, and the bundled WhatsApp bridge.
 
-| Variant | What it includes | Approx. size (linux/amd64) |
+| Image | What it includes | Approx. size (linux/amd64) |
 |:--|:--|:--|
-| `ghcr.io/agentark-ai/agentark:base` | Core AgentArk server, web UI, Git, Python app runtime | ~900 MB |
-| `ghcr.io/agentark-ai/agentark:full` | Base image plus Playwright/Chromium, cloudflared, tailscale, Lightpanda, Google Workspace CLI, bundled WhatsApp bridge for on-demand Baileys mode | ~4.5 GB |
+| `ghcr.io/agentark-ai/agentark:latest` | Full AgentArk runtime for normal self-hosted deployments | ~4.5 GB |
 
-Pull whichever image matches your deployment:
+Pull the moving tag:
 
 ```bash
-docker pull ghcr.io/agentark-ai/agentark:base
-docker pull ghcr.io/agentark-ai/agentark:full
+docker pull ghcr.io/agentark-ai/agentark:latest
 ```
 
-Release publishes also create versioned tags in the same shape, for example:
+Versioned releases publish plain semver tags as well, for example:
 
 ```bash
-docker pull ghcr.io/agentark-ai/agentark:1.2.3-base
-docker pull ghcr.io/agentark-ai/agentark:1.2.3-full
+docker pull ghcr.io/agentark-ai/agentark:1.2.3
 ```
 
 Tag behavior:
-- pushes to `main` refresh moving tags like `:base`, `:full`, `:latest-base`, and `:latest-full`
-- `v*` releases publish those moving tags and the matching versioned tags like `:1.2.3-base` and `:1.2.3-full`
+- pushes to `main` refresh `:latest`
+- `v*` releases publish matching versioned tags like `:1.2.3` and `:1.2`
 
 ### Local builds
 
-Local `docker compose build` always produces the **full** image (~12.5 GB) with all runtimes included:
+Local `docker compose build` produces the same full-runtime image profile used by the published GHCR image:
 
 ```bash
 docker compose up -d --build
@@ -225,7 +237,7 @@ docker compose up -d --build
 
 Compose-managed installs reuse the installed AgentArk image as the default runtime/app image. The default path does not expect a separate `agentark-sandbox` image; only set `AGENTARK_RUNTIME_IMAGE` if you intentionally want a different runner image.
 
-The slim base image (~900 MB) is only available via GHCR pulls. If you want a lighter local build, use build args to disable specific components:
+If you want a lighter self-built image, use build args to disable specific components:
 
 ```bash
 docker compose build --build-arg INSTALL_OLLAMA_CLI=false
@@ -368,10 +380,10 @@ This section is a product-shape comparison against other self-hosted agents, not
 
 | Compared with | Strongest at | Where AgentArk is different |
 | --- | --- | --- |
-| **OpenClaw** | Fast local execution and lightweight setup | AgentArk adds daily-assistant continuity, durable memory, guarded actions, and self-evolution from use |
+| **OpenClaw** | Fast local execution and lightweight setup | AgentArk adds daily-assistant continuity, durable memory, guarded actions, and adaptation from use |
 | **PicoClaw** | Small-footprint runtime and low-overhead operation | AgentArk adds multi-channel workflows, deeper automation, richer memory, and adaptive improvement over time |
-| **NanoClaw** | Minimal local operation and simplicity | AgentArk adds background routines, stronger follow-up, broader task execution, and compounding learning loops |
-| **Agent Zero** | Open-ended autonomy and experimentation | AgentArk adds a stronger trust layer, personal-assistant UX, and a more opinionated self-evolve control plane |
+| **NanoClaw** | Minimal local operation and simplicity | AgentArk adds background routines, stronger follow-up, broader task execution, and compounding personalization loops |
+| **Agent Zero** | Open-ended autonomy and experimentation | AgentArk adds a stronger trust layer, personal-assistant UX, and a more opinionated adaptation control plane |
 
 In short:
 
@@ -391,23 +403,24 @@ In short:
 | --------------------------- | ------------------------------------------------------------------------------------------------- |
 | **Parallel Thinking**       | Multiple reasoning paths processed simultaneously - 25-35 % cost reduction                        |
 | **Sub-Agent Orchestration** | Researcher · Coder · Analyst · Writer · Validator - auto-selected per task                        |
-| **Self-Evolve Engine**      | Prompt evolution, policy tuning, strategy learning, and routing benchmarks that improve the agent over time |
-| **Self-Tune**               | Learns your style, tracks tool success rates, auto-adjusts autonomy confidence — adapts to you over time |
+| **Self-Evolve Engine**      | Prompt evolution, policy tuning, strategy learning, and routing benchmarks that improve the agent over time without continuously retraining base model weights by default |
+| **Self-Tune**               | Learns your style from local history, tracks tool success rates, and auto-adjusts autonomy confidence over time |
 | **Cognitive Memory**        | Three-tier: Episodic (conversations) · Semantic (facts) · Procedural (actions) with decay scoring |
 | **Live App Deployment**     | Deploy static or dynamic apps from chat - Node, Python, HTML, and more                            |
 | **Goal Autopilot**          | Goal → plan → scheduled execution → recurring progress reports                                    |
 | **Predictive Nudges**       | Early warnings for missed deadlines, overdue pressure, and recommended next actions               |
-| **Background Learning**     | Periodic reflection pass, memory consolidation, and pattern induction that improve suggestions and briefs |
+| **Background Learning**     | Periodic reflection pass, memory consolidation, and pattern induction that improve retrieval, suggestions, and briefs |
 
 ### Security
 
 |                           |                                                                                                |
 | ------------------------- | ---------------------------------------------------------------------------------------------- |
-| **AES-256-GCM + Argon2**  | All secrets encrypted at rest; industry-standard key derivation                                |
+| **AES-256-GCM + Argon2id** | Secrets and sensitive stored content encrypted at rest; master-password mode derives keys with Argon2id |
 | **Action Security Guard** | 4-pillar defense: integrity signing, static analysis, permissions, injection scanning          |
 | **Prompt Protection**     | Injection detection, leakage prevention, output redaction                                      |
 | **Sandboxed Execution**   | WASM (Wasmtime) + Docker isolation with automatic rollback                                     |
 | **Execution Proofs**      | Verifiable records of what the agent actually did, useful for trust, debugging, approvals, and audits |
+| **Transport Security**    | HTTPS/TLS when configured directly, or via an HTTPS reverse proxy in front of AgentArk         |
 | **10-Layer Hardening**    | API key auth, localhost bind, CORS, rate limiting, Docker socket proxy, optional TLS, and more |
 
 ### Integrations
@@ -436,7 +449,9 @@ Policy-driven proactive operation with enterprise guardrails:
 
 ### Background Learning
 
-AgentArk also runs a background learning loop inside Sentinel. It periodically reflects on recent activity, consolidates memory, and folds repeated successful patterns back into the system.
+AgentArk also runs a background learning loop inside Sentinel. In the current product, this is an offline-first personalization path: it periodically reflects on recent activity, consolidates encrypted local memory and tool history, and folds repeated successful patterns back into retrieval, prompts, routing, and follow-up behavior.
+
+By default, this does not mean continuous base-model weight training. The highest-leverage and lowest-risk learning path for a local agent is usually retrieval and memory backed by local history, not silently changing model parameters in the background.
 
 What users get:
 
@@ -450,6 +465,8 @@ In the Sentinel panel, this appears as `Background learning` with sub-categories
 Users can also ask AgentArk in chat to check current background learning status, explain why a job is paused or failing, and walk through the live Sentinel state for debugging.
 
 For unattended runs, AgentArk also fails closed on missing critical inputs instead of guessing. If a scheduled or background task cannot continue safely, it moves to `Input needed`, emits a notification, and shows the exact missing fields in Tasks and Trace so the user can fix them and resume.
+
+If a future deployment adds learning that updates model parameters, treat that as a separate higher-risk capability and document the controls explicitly: model lineage and provenance, signed artifacts, gated rollouts or approvals, poisoning checks, and, for federated setups, secure aggregation and privacy protections.
 
 ---
 
@@ -476,7 +493,7 @@ If you skip setup and run `agentark chat` first, AgentArk will explain what is m
 ### Default stack notes
 
 - Docker Compose starts Postgres and AgentArk's internal services automatically. Normal installs do not need extra service-token setup.
-- Local embeddings are the default and use the built-in Hugging Face path with `sentence-transformers/all-MiniLM-L6-v2`.
+- Local embeddings are the default and use the built-in Hugging Face path with `BAAI/bge-small-en-v1.5`.
 - In `Settings > Models > Embeddings`, `External` supports user-managed OpenAI-compatible embedding endpoints, including Ollama if you run it yourself.
 - The Docker image includes bundled skills under `/app/skills`. Deleting one in the Skills UI removes it for that install; fresh installs restore the bundled defaults from the image.
 - Compose sets `AGENTARK_DATABASE_URL` automatically for the app container. Native binary installs must provide their own Postgres URL.

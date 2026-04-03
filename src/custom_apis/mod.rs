@@ -519,7 +519,14 @@ async fn register_config(runtime: &ActionRuntime, config: &CustomApiConfig) -> R
                     sandbox_mode: Some(SandboxMode::Native),
                     source: ActionSource::System,
                     file_path: None,
-                    authorization: Default::default(),
+                    authorization: crate::actions::ActionAuthorization {
+                        outbound: crate::actions::ActionEgressPolicy {
+                            read_only: operation.draft.read_only,
+                            outbound_write: !operation.draft.read_only,
+                            public_publish: false,
+                        },
+                        ..Default::default()
+                    },
                 },
                 CustomApiBinding {
                     api_id: config.id.clone(),

@@ -215,6 +215,23 @@ pub struct HealthCheck {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct KnowledgeStoreCounts {
+    episodes: u64,
+    facts: u64,
+    documents: u64,
+    document_chunks: u64,
+}
+
+const KNOWLEDGE_EPISODE_WARN_THRESHOLD: u64 = 20_000;
+const KNOWLEDGE_EPISODE_HIGH_THRESHOLD: u64 = 100_000;
+const KNOWLEDGE_FACT_WARN_THRESHOLD: u64 = 10_000;
+const KNOWLEDGE_FACT_HIGH_THRESHOLD: u64 = 50_000;
+const KNOWLEDGE_DOCUMENT_WARN_THRESHOLD: u64 = 500;
+const KNOWLEDGE_DOCUMENT_HIGH_THRESHOLD: u64 = 2_000;
+const KNOWLEDGE_DOCUMENT_CHUNK_WARN_THRESHOLD: u64 = 25_000;
+const KNOWLEDGE_DOCUMENT_CHUNK_HIGH_THRESHOLD: u64 = 100_000;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DoctorRemediationSpec {
@@ -250,6 +267,9 @@ const ARKPULSE_LAST_RUN_AT_KEY: &str = "arkpulse_last_run_at";
 const ARKPULSE_CRITICAL_LAST_SIG_KEY: &str = "arkpulse_critical_last_sig_v1";
 const ARKPULSE_CRITICAL_LAST_SENT_KEY: &str = "arkpulse_critical_last_sent_v1";
 const ARKPULSE_CRITICAL_NOTIFY_COOLDOWN_SECS: i64 = 24 * 3600;
+const ARKPULSE_GROWTH_LAST_SIG_KEY: &str = "arkpulse_growth_last_sig_v1";
+const ARKPULSE_GROWTH_LAST_SENT_KEY: &str = "arkpulse_growth_last_sent_v1";
+const ARKPULSE_GROWTH_NOTIFY_COOLDOWN_SECS: i64 = 7 * 24 * 3600;
 pub const SENTINEL_SCHEDULER_HEARTBEAT_KEY: &str = "sentinel_scheduler_heartbeat_v1";
 pub const SENTINEL_WATCHER_HEARTBEAT_KEY: &str = "sentinel_watcher_heartbeat_v1";
 pub const SENTINEL_INTEGRATION_SYNC_HEARTBEAT_KEY: &str = "sentinel_integration_sync_heartbeat_v1";
@@ -325,6 +345,162 @@ async fn should_emit_arkpulse_critical_notification(
         )
         .await;
     true
+}
+
+async fn should_emit_arkpulse_growth_notification(
+    storage: &crate::storage::Storage,
+    signature: &str,
+) -> bool {
+    let signature = normalize_arkpulse_alert_signature(signature);
+    let now_ts = chrono::Utc::now().timestamp();
+    let last_sig = storage
+        .get(ARKPULSE_GROWTH_LAST_SIG_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| String::from_utf8(raw).ok())
+        .unwrap_or_default();
+    let last_sent_ts = storage
+        .get(ARKPULSE_GROWTH_LAST_SENT_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| String::from_utf8(raw).ok())
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+
+    let elapsed = if now_ts > last_sent_ts {
+        now_ts - last_sent_ts
+    } else {
+        0
+    };
+
+    if !signature.is_empty()
+        && signature == last_sig
+        && elapsed < ARKPULSE_GROWTH_NOTIFY_COOLDOWN_SECS
+    {
+        return false;
+    }
+
+    if !signature.is_empty() {
+        let _ = storage
+            .set(ARKPULSE_GROWTH_LAST_SIG_KEY, signature.as_bytes())
+            .await;
+    }
+    let _ = storage
+        .set(
+            ARKPULSE_GROWTH_LAST_SENT_KEY,
+            now_ts.to_string().as_bytes(),
+        )
+        .await;
+    true
+}
+
+fn knowledge_store_counts_summary(counts: &KnowledgeStoreCounts) -> String {
+    format!(
+        "{} episodes, {} facts, {} documents, {} chunks",
+        counts.episodes, counts.facts, counts.documents, counts.document_chunks
+    )
+}
+
+fn knowledge_store_growth_reasons(counts: &KnowledgeStoreCounts, high: bool) -> Vec<String> {
+    let mut reasons = Vec::new();
+    let (episode_threshold, fact_threshold, document_threshold, chunk_threshold) = if high {
+        (
+            KNOWLEDGE_EPISODE_HIGH_THRESHOLD,
+            KNOWLEDGE_FACT_HIGH_THRESHOLD,
+            KNOWLEDGE_DOCUMENT_HIGH_THRESHOLD,
+            KNOWLEDGE_DOCUMENT_CHUNK_HIGH_THRESHOLD,
+        )
+    } else {
+        (
+            KNOWLEDGE_EPISODE_WARN_THRESHOLD,
+            KNOWLEDGE_FACT_WARN_THRESHOLD,
+            KNOWLEDGE_DOCUMENT_WARN_THRESHOLD,
+            KNOWLEDGE_DOCUMENT_CHUNK_WARN_THRESHOLD,
+        )
+    };
+    if counts.episodes >= episode_threshold {
+        reasons.push(format!("episodes={}", counts.episodes));
+    }
+    if counts.facts >= fact_threshold {
+        reasons.push(format!("facts={}", counts.facts));
+    }
+    if counts.documents >= document_threshold {
+        reasons.push(format!("documents={}", counts.documents));
+    }
+    if counts.document_chunks >= chunk_threshold {
+        reasons.push(format!("chunks={}", counts.document_chunks));
+    }
+    reasons
+}
+
+fn knowledge_store_growth_severity(counts: &KnowledgeStoreCounts) -> Option<&'static str> {
+    if !knowledge_store_growth_reasons(counts, true).is_empty() {
+        Some("high")
+    } else if !knowledge_store_growth_reasons(counts, false).is_empty() {
+        Some("medium")
+    } else {
+        None
+    }
+}
+
+fn build_knowledge_store_health_check(counts: &KnowledgeStoreCounts) -> HealthCheck {
+    match knowledge_store_growth_severity(counts) {
+        Some("high") => HealthCheck {
+            service: "Knowledge store".to_string(),
+            status: "warn".to_string(),
+            message: format!(
+                "Large durable knowledge footprint: {}",
+                knowledge_store_counts_summary(counts)
+            ),
+        },
+        Some("medium") => HealthCheck {
+            service: "Knowledge store".to_string(),
+            status: "warn".to_string(),
+            message: format!(
+                "Knowledge growth worth reviewing: {}",
+                knowledge_store_counts_summary(counts)
+            ),
+        },
+        _ => HealthCheck {
+            service: "Knowledge store".to_string(),
+            status: "ok".to_string(),
+            message: knowledge_store_counts_summary(counts),
+        },
+    }
+}
+
+fn build_knowledge_growth_notification(findings: &[DoctorFinding]) -> Option<(String, String)> {
+    let relevant: Vec<&DoctorFinding> = findings
+        .iter()
+        .filter(|finding| {
+            finding.category == "resource"
+                && finding.target == "knowledge_store"
+                && finding.severity == "high"
+        })
+        .collect();
+    if relevant.is_empty() {
+        return None;
+    }
+
+    let mut signature_parts = relevant
+        .iter()
+        .map(|finding| format!("{}:{}:{}", finding.severity, finding.title, finding.target))
+        .collect::<Vec<_>>();
+    signature_parts.sort();
+    signature_parts.dedup();
+    let signature = signature_parts.join("|");
+
+    let detail = relevant
+        .iter()
+        .map(|finding| finding.evidence.clone())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let body = format!(
+        "AgentArk kept your documents and memories intact, but the durable knowledge store is getting large ({detail}). Open ArkPulse to review capacity and Postgres maintenance before latency or backup times drift."
+    );
+    Some((signature, body))
 }
 
 fn control_plane_bases() -> (String, String) {
@@ -1570,6 +1746,91 @@ async fn run_resource_checks(
                 "Database growth could not be evaluated.",
                 "Verify Postgres connectivity and permissions for size introspection".to_string(),
             );
+        }
+    }
+
+    let knowledge_counts = match (
+        ctx.storage.count_episodes().await,
+        ctx.storage.count_facts(None).await,
+        ctx.storage.count_documents(None).await,
+        ctx.storage.count_document_chunks().await,
+    ) {
+        (Ok(episodes), Ok(facts), Ok(documents), Ok(document_chunks)) => Some(KnowledgeStoreCounts {
+            episodes,
+            facts,
+            documents,
+            document_chunks,
+        }),
+        (episode_res, fact_res, document_res, chunk_res) => {
+            let mut errors = Vec::new();
+            if let Err(error) = episode_res {
+                errors.push(format!("episodes: {}", error));
+            }
+            if let Err(error) = fact_res {
+                errors.push(format!("facts: {}", error));
+            }
+            if let Err(error) = document_res {
+                errors.push(format!("documents: {}", error));
+            }
+            if let Err(error) = chunk_res {
+                errors.push(format!("chunks: {}", error));
+            }
+            tracing::warn!(
+                "Knowledge store growth inspection failed: {}",
+                errors.join(" | ")
+            );
+            push_finding!(
+                findings,
+                "medium",
+                "resource",
+                "knowledge_store",
+                "Could not inspect durable knowledge growth",
+                errors.join(" | "),
+                "Storage growth could not be evaluated for durable documents and memories.",
+                "Open ArkPulse again after verifying Postgres connectivity and count queries".to_string(),
+            );
+            None
+        }
+    };
+    if let Some(counts) = knowledge_counts {
+        match knowledge_store_growth_severity(&counts) {
+            Some("high") => {
+                let reasons = knowledge_store_growth_reasons(&counts, true).join(", ");
+                tracing::warn!(
+                    "Knowledge store growth warning (high): {} ({})",
+                    knowledge_store_counts_summary(&counts),
+                    reasons
+                );
+                push_finding!(
+                    findings,
+                    "high",
+                    "resource",
+                    "knowledge_store",
+                    "Durable knowledge store is large",
+                    format!("{} | thresholds crossed: {}", knowledge_store_counts_summary(&counts), reasons),
+                    "Documents and memories are durable by design, so growth needs monitoring and Postgres capacity planning rather than silent deletion.",
+                    "Open ArkPulse, review knowledge volume, and schedule Postgres vacuum/backup capacity checks".to_string(),
+                );
+            }
+            Some("medium") => {
+                let reasons = knowledge_store_growth_reasons(&counts, false).join(", ");
+                tracing::info!(
+                    "Knowledge store growth warning (medium): {} ({})",
+                    knowledge_store_counts_summary(&counts),
+                    reasons
+                );
+                push_finding!(
+                    findings,
+                    "medium",
+                    "resource",
+                    "knowledge_store",
+                    "Durable knowledge growth warning",
+                    format!("{} | planning thresholds crossed: {}", knowledge_store_counts_summary(&counts), reasons),
+                    "Documents and memories are being retained as intended, but the knowledge store is large enough to justify capacity monitoring.",
+                    "Review ArkPulse trends and plan Postgres maintenance before latency or backup times drift".to_string(),
+                );
+            }
+            _ => {}
         }
     }
 
@@ -3777,37 +4038,82 @@ pub async fn run_pulse(agent: &SharedAgent) {
         let mut health_checks = Vec::new();
 
         // Postgres-backed pgvector retrieval
-        let episode_count = pulse_ctx.storage.count_episodes().await.unwrap_or(0) as usize;
-        let fact_count = pulse_ctx.storage.count_facts(None).await.unwrap_or(0) as usize;
-        let total_memories = episode_count.saturating_add(fact_count);
-        let pgvector_retrieval_check = if let Some(client) = pulse_ctx.embedding_client.as_ref() {
-            match client.health_check().await {
-                Ok(message) => HealthCheck {
-                    service: "Postgres pgvector retrieval".to_string(),
-                    status: "ok".to_string(),
-                    message: format!(
-                        "{} | {} episodes, {} facts",
-                        message, episode_count, fact_count
-                    ),
-                },
-                Err(error) => HealthCheck {
-                    service: "Postgres pgvector retrieval".to_string(),
-                    status: "warn".to_string(),
-                    message: format!(
-                        "Dense retrieval backend unavailable: {} | {} episodes, {} facts",
-                        error, episode_count, fact_count
-                    ),
-                },
+        let episode_count = match pulse_ctx.storage.count_episodes().await {
+            Ok(count) => count as usize,
+            Err(error) => {
+                tracing::warn!("ArkPulse failed to count episodes: {}", error);
+                0
             }
-        } else {
-            HealthCheck {
+        };
+        let fact_count = match pulse_ctx.storage.count_facts(None).await {
+            Ok(count) => count as usize,
+            Err(error) => {
+                tracing::warn!("ArkPulse failed to count semantic facts: {}", error);
+                0
+            }
+        };
+        let document_count = match pulse_ctx.storage.count_documents(None).await {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::warn!("ArkPulse failed to count documents: {}", error);
+                0
+            }
+        };
+        let document_chunk_count = match pulse_ctx.storage.count_document_chunks().await {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::warn!("ArkPulse failed to count document chunks: {}", error);
+                0
+            }
+        };
+        let total_memories = episode_count.saturating_add(fact_count);
+        let knowledge_counts = KnowledgeStoreCounts {
+            episodes: episode_count as u64,
+            facts: fact_count as u64,
+            documents: document_count,
+            document_chunks: document_chunk_count,
+        };
+        health_checks.push(build_knowledge_store_health_check(&knowledge_counts));
+        let pgvector_retrieval_check = match pulse_ctx.storage.pgvector_health_check().await {
+            Ok(()) => {
+                if let Some(client) = pulse_ctx.embedding_client.as_ref() {
+                    match client.health_check().await {
+                        Ok(message) => HealthCheck {
+                            service: "Postgres pgvector retrieval".to_string(),
+                            status: "ok".to_string(),
+                            message: format!(
+                                "pgvector ready, embeddings healthy ({}) | {} episodes, {} facts",
+                                message, episode_count, fact_count
+                            ),
+                        },
+                        Err(error) => HealthCheck {
+                            service: "Postgres pgvector retrieval".to_string(),
+                            status: "warn".to_string(),
+                            message: format!(
+                                "pgvector ready, embeddings unavailable: {} | {} episodes, {} facts",
+                                error, episode_count, fact_count
+                            ),
+                        },
+                    }
+                } else {
+                    HealthCheck {
+                        service: "Postgres pgvector retrieval".to_string(),
+                        status: "warn".to_string(),
+                        message: format!(
+                            "pgvector ready, but retrieval is lexical-only until embeddings are configured | {} episodes, {} facts",
+                            episode_count, fact_count
+                        ),
+                    }
+                }
+            }
+            Err(error) => HealthCheck {
                 service: "Postgres pgvector retrieval".to_string(),
                 status: "warn".to_string(),
                 message: format!(
-                    "Lexical-only retrieval | {} episodes, {} facts",
-                    episode_count, fact_count
+                    "pgvector unavailable: {} | {} episodes, {} facts",
+                    error, episode_count, fact_count
                 ),
-            }
+            },
         };
         health_checks.push(pgvector_retrieval_check);
 
@@ -4110,6 +4416,11 @@ pub async fn run_pulse(agent: &SharedAgent) {
         || has_dead_apps
         || health_error_count > 0
         || doctor_critical_count > 0;
+    let growth_notification = if !should_notify_user {
+        build_knowledge_growth_notification(&details.doctor_findings)
+    } else {
+        None
+    };
     let has_any_signal = has_overdue
         || has_failures
         || has_security
@@ -4200,6 +4511,22 @@ pub async fn run_pulse(agent: &SharedAgent) {
         tracing::debug!(
             "ArkPulse: alert recorded without user notification (below ultra-severe threshold)"
         );
+    }
+    if let Some((signature, body)) = growth_notification {
+        if should_emit_arkpulse_growth_notification(&storage, &signature).await {
+            agent_guard
+                .emit_notification("Knowledge growth warning", &body, "warning", "arkpulse_growth")
+                .await;
+            tracing::warn!(
+                "ArkPulse: emitted throttled knowledge growth notification (cooldown={}s)",
+                ARKPULSE_GROWTH_NOTIFY_COOLDOWN_SECS
+            );
+        } else {
+            tracing::debug!(
+                "ArkPulse: suppressed duplicate knowledge growth notification within {}s cooldown",
+                ARKPULSE_GROWTH_NOTIFY_COOLDOWN_SECS
+            );
+        }
     }
     let event = PulseEvent {
         timestamp: chrono::Utc::now().to_rfc3339(),

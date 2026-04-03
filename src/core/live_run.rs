@@ -394,6 +394,19 @@ fn stream_event_payload(event: &StreamEvent) -> (String, RunEventPriority, serde
                 "reason": reason,
             }),
         ),
+        StreamEvent::PlanReadyForConfirmation {
+            task_id,
+            plan,
+            source,
+        } => (
+            "plan_ready_for_confirmation".to_string(),
+            RunEventPriority::Critical,
+            serde_json::json!({
+                "task_id": task_id,
+                "plan": plan,
+                "source": source,
+            }),
+        ),
         StreamEvent::PlanUnavailable { reason } => (
             "plan_unavailable".to_string(),
             RunEventPriority::High,

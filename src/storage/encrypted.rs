@@ -129,6 +129,11 @@ impl EncryptedStorage {
         Ok(self.decrypt_episode_content(episodes))
     }
 
+    pub async fn get_episodes_by_ids_decrypted(&self, ids: &[String]) -> Result<Vec<episode::Model>> {
+        let episodes = self.storage.get_episodes_by_ids(ids).await?;
+        Ok(self.decrypt_episode_content(episodes))
+    }
+
     /// Get unconsolidated episodes and decrypt content
     pub async fn get_unconsolidated_episodes_decrypted(
         &self,
@@ -204,6 +209,11 @@ impl EncryptedStorage {
         offset: u64,
     ) -> Result<Vec<semantic_fact::Model>> {
         let facts = self.storage.get_global_facts(limit, offset).await?;
+        Ok(self.decrypt_fact_content(facts))
+    }
+
+    pub async fn get_facts_by_ids_decrypted(&self, ids: &[String]) -> Result<Vec<semantic_fact::Model>> {
+        let facts = self.storage.get_facts_by_ids(ids).await?;
         Ok(self.decrypt_fact_content(facts))
     }
 

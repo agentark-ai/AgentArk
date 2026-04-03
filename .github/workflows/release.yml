@@ -6,6 +6,10 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
@@ -60,30 +64,6 @@ jobs:
   build-and-push:
     needs: test
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - variant: base
-            build_args: |
-              AGENTARK_DOCKER_FEATURES=telegram,docker,ssh
-              INSTALL_PLAYWRIGHT_RUNTIME=false
-              INSTALL_MEM0=false
-              INSTALL_TAILSCALE=false
-              INSTALL_CLOUDFLARED=false
-              INSTALL_LIGHTPANDA=true
-              INSTALL_GWS=false
-              INSTALL_WHATSAPP_BRIDGE=true
-          - variant: full
-            build_args: |
-              AGENTARK_DOCKER_FEATURES=telegram,docker,ssh
-              INSTALL_PLAYWRIGHT_RUNTIME=true
-              INSTALL_MEM0=true
-              INSTALL_TAILSCALE=true
-              INSTALL_CLOUDFLARED=true
-              INSTALL_LIGHTPANDA=true
-              INSTALL_GWS=true
-              INSTALL_WHATSAPP_BRIDGE=true
     permissions:
       contents: read
       packages: write
@@ -108,22 +88,30 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=${{ matrix.variant }},enable=${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' }}
-            type=raw,value=latest-${{ matrix.variant }},enable=${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
-            type=semver,pattern={{version}}-${{ matrix.variant }},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=semver,pattern={{major}}.{{minor}}-${{ matrix.variant }},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+            type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
           labels: |
-            org.opencontainers.image.title=AgentArk (${{ matrix.variant }})
-            org.opencontainers.image.description=AgentArk container variant: ${{ matrix.variant }}
+            org.opencontainers.image.title=AgentArk
+            org.opencontainers.image.description=AgentArk container image
 
-      - name: Build and push (${{ matrix.variant }})
+      - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: ${{ matrix.build_args }}
-          cache-from: type=gha,scope=${{ matrix.variant }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}
+          build-args: |
+            AGENTARK_DOCKER_FEATURES=telegram,docker,ssh
+            AGENTARK_BUILD_JOBS=0
+            INSTALL_PLAYWRIGHT_RUNTIME=true
+            INSTALL_MEM0=true
+            INSTALL_TAILSCALE=true
+            INSTALL_CLOUDFLARED=true
+            INSTALL_LIGHTPANDA=true
+            INSTALL_GWS=true
+            INSTALL_WHATSAPP_BRIDGE=true
+          cache-from: type=gha,scope=release
+          cache-to: type=gha,mode=max,scope=release
           platforms: linux/amd64

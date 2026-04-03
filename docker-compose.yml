@@ -69,7 +69,7 @@ services:
         INSTALL_GWS: ${AGENTARK_INSTALL_GWS:-true}
         INSTALL_DOCKER_CLI: ${AGENTARK_INSTALL_DOCKER_CLI:-true}
         INSTALL_WHATSAPP_BRIDGE: ${AGENTARK_INSTALL_WHATSAPP_BRIDGE:-true}
-    image: ${AGENTARK_IMAGE:-agentark:local-full}
+    image: ${AGENTARK_IMAGE:-agentark:local}
     container_name: agentark-control
     restart: unless-stopped
     security_opt:
@@ -101,7 +101,7 @@ services:
       - AGENTARK_DB_SCHEMA=${AGENTARK_DB_SCHEMA:-}
       - AGENTARK_BIND=0.0.0.0:8990
       - AGENTARK_PUBLIC_APP_BIND=${AGENTARK_PUBLIC_APP_BIND:-0.0.0.0:8992}
-      - AGENTARK_SELF_IMAGE=${AGENTARK_IMAGE:-agentark:local-full}
+      - AGENTARK_SELF_IMAGE=${AGENTARK_IMAGE:-agentark:local}
       - AGENTARK_STACK_ROLE=control
       - AGENTARK_EXECUTOR_URL=http://agentark-executor:8991
       - AGENTARK_WORKSPACE_URL=http://agentark-workspace:8992
@@ -124,7 +124,7 @@ services:
       start_period: 5s
 
   agentark-executor:
-    image: ${AGENTARK_IMAGE:-agentark:local-full}
+    image: ${AGENTARK_IMAGE:-agentark:local}
     container_name: agentark-executor
     restart: unless-stopped
     security_opt:
@@ -152,7 +152,7 @@ services:
       - AGENTARK_DB_SCHEMA=${AGENTARK_DB_SCHEMA:-}
       - AGENTARK_BIND=0.0.0.0:8990
       - AGENTARK_EXECUTOR_BIND=0.0.0.0:8991
-      - AGENTARK_SELF_IMAGE=${AGENTARK_IMAGE:-agentark:local-full}
+      - AGENTARK_SELF_IMAGE=${AGENTARK_IMAGE:-agentark:local}
       - AGENTARK_STACK_ROLE=executor
       - AGENTARK_CONTROL_URL=http://agentark-control:8990
       - AGENTARK_WORKSPACE_URL=http://agentark-workspace:8992
@@ -175,7 +175,7 @@ services:
       start_period: 5s
 
   agentark-workspace:
-    image: ${AGENTARK_IMAGE:-agentark:local-full}
+    image: ${AGENTARK_IMAGE:-agentark:local}
     container_name: agentark-workspace
     restart: unless-stopped
     security_opt:

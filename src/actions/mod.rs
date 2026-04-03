@@ -92,6 +92,16 @@ pub struct ActionHumanApproval {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ActionEgressPolicy {
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub outbound_write: bool,
+    #[serde(default)]
+    pub public_publish: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ActionAuthorization {
     #[serde(default)]
     pub risk_level: ActionRiskLevel,
@@ -103,6 +113,8 @@ pub struct ActionAuthorization {
     pub rate_limit: Option<ActionRateLimit>,
     #[serde(default)]
     pub human_approval: ActionHumanApproval,
+    #[serde(default)]
+    pub outbound: ActionEgressPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

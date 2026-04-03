@@ -3,6 +3,9 @@
 //! Default path evolves runtime strategy/policy with benchmark + lineage + gates.
 //! Codebase mutation remains available behind explicit opt-in.
 
+use anyhow::Result;
+use std::path::Path;
+
 pub mod agent;
 pub mod classifier_prompt_evolution;
 pub mod coding_guidelines;
@@ -36,3 +39,26 @@ pub use specialist_prompt_evolution::{
     SPECIALIST_PROMPT_BUNDLE_CANARY_STATE_KEY, SPECIALIST_PROMPT_BUNDLE_LAST_RESULT_KEY,
     SPECIALIST_PROMPT_BUNDLE_PROFILE_CANARY_KEY, SPECIALIST_PROMPT_BUNDLE_PROFILE_KEY,
 };
+
+pub(crate) async fn prune_jsonl_archive(archive: &Path, max_entries: usize) -> Result<()> {
+    if max_entries == 0 {
+        return Ok(());
+    }
+    let raw = match tokio::fs::read_to_string(archive).await {
+        Ok(content) => content,
+        Err(_) => return Ok(()),
+    };
+    let mut lines = raw
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+    if lines.len() <= max_entries {
+        return Ok(());
+    }
+    let retained = lines.split_off(lines.len().saturating_sub(max_entries));
+    let mut rewritten = retained.join("\n");
+    rewritten.push('\n');
+    tokio::fs::write(archive, rewritten).await?;
+    Ok(())
+}

@@ -28,6 +28,7 @@ import { SuggestionRunDialog, type SuggestionRunState } from "./SuggestionRunDia
 import type {
   AutonomyActionExecutionResponse,
   BackgroundSessionSummary,
+  BriefingResponse,
   RecommendedSkill,
   Task,
   TraceSummary,
@@ -448,48 +449,6 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
     () => pickDailyBriefAutomationRun(automationRuns, dailyBriefRun?.triggered_at),
     [automationRuns, dailyBriefRun?.triggered_at]
   );
-  const heroPrompts = useMemo(() => {
-    const prompts: string[] = [];
-    const seen = new Set<string>();
-    const pushPrompt = (value?: string | null) => {
-      const next = (value || "").trim();
-      if (!next || seen.has(next)) return;
-      seen.add(next);
-      prompts.push(next);
-    };
-    const clean = (value?: string | null) =>
-      (value || "")
-        .replace(/\s+/g, " ")
-        .trim()
-        .slice(0, 92);
-
-    pushPrompt(
-      currentTask
-        ? `Continue "${clean(currentTask)}" and only surface blockers that need me.`
-        : null
-    );
-    pushPrompt(
-      waitingTask
-        ? `Review "${clean(waitingTask.description || "the waiting task")}" and recommend the safest next decision.`
-        : null
-    );
-    pushPrompt(
-      recentFailedAutomationRun
-        ? `Inspect "${clean(recentFailedAutomationRun.title || recentFailedAutomationRun.summary)}" and tell me what failed and how to fix it.`
-        : null
-    );
-    pushPrompt(
-      traces[0]?.message_preview
-        ? `Summarize the latest run: "${clean(traces[0].message_preview)}" and tell me the next move.`
-        : null
-    );
-    pushPrompt("Review recent changes and list only the critical risks.");
-    pushPrompt("Build a small app to track competitor launches and deploy it.");
-    pushPrompt("Import this skill URL and wire up any required secrets.");
-    pushPrompt("Inspect active automations and surface anything that needs intervention.");
-    return prompts.slice(0, 6);
-  }, [currentTask, recentFailedAutomationRun, traces, waitingTask]);
-
   // Check if LLM is configured from settings
   const hasLlmConfigured = useMemo(() => {
     if (!settingsQ.data) return true; // Assume OK while loading
@@ -500,6 +459,128 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
     const model = String(settings.llm_model ?? settings.model ?? "").trim();
     return provider.length > 0 && model.length > 0;
   }, [settingsQ.data]);
+
+  const heroPrompts = useMemo(() => {
+    const prompts: string[] = [];
+    const seen = new Set<string>();
+    const pushPrompt = (value?: string | null) => {
+      const next = (value || "").trim();
+      if (!next || seen.has(next)) return;
+      seen.add(next);
+      prompts.push(next);
+    };
+    const clean = (value?: string | null, limit = 96) =>
+      (value || "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, limit);
+    const scifiLead = (value: string) => {
+      const next = clean(value, 104);
+      if (!next) return null;
+      return next.endsWith(".") ? next : `${next}.`;
+    };
+    const briefing = briefingQ.data as BriefingResponse | undefined;
+    const recommendedSkills =
+      briefing?.recommended_skills ||
+      (((briefing as unknown as { recommended_actions?: RecommendedSkill[] })?.recommended_actions ||
+        []) as RecommendedSkill[]);
+    const topOpportunity = briefing?.top_opportunities?.[0];
+    const topRisk = briefing?.top_risks?.[0];
+
+    if (hasLlmConfigured) {
+      pushPrompt(
+        recommendedSkills[0]
+          ? scifiLead(
+              `Open the next operator lane: ${clean(
+                recommendedSkills[0].summary ||
+                  recommendedSkills[0].description ||
+                  recommendedSkills[0].title,
+                92
+              )}`
+            )
+          : null
+      );
+      pushPrompt(
+        topOpportunity
+          ? scifiLead(
+              `Bring this signal online: ${clean(
+                topOpportunity.summary || topOpportunity.detail || topOpportunity.title,
+                92
+              )}`
+            )
+          : null
+      );
+      pushPrompt(
+        topRisk
+          ? scifiLead(
+              `Run a quiet risk sweep on ${clean(
+                topRisk.title || topRisk.summary || topRisk.detail || "the active queue",
+                72
+              )} and surface the safest move`
+            )
+          : null
+      );
+      pushPrompt(
+        currentTask
+          ? scifiLead(
+              `Resume the active lane: ${clean(currentTask, 84)} and surface only the next operator decision`
+            )
+          : null
+      );
+      pushPrompt(
+        waitingTask
+          ? scifiLead(
+              `Review ${clean(waitingTask.description || "the waiting task", 84)} and return the lowest-risk next step`
+            )
+          : null
+      );
+      pushPrompt(
+        recentFailedAutomationRun
+          ? scifiLead(
+              `Sweep the fault trace for ${clean(
+                recentFailedAutomationRun.title || recentFailedAutomationRun.summary,
+                78
+              )} and propose the cleanest recovery path`
+            )
+          : null
+      );
+      pushPrompt(
+        traces[0]?.message_preview
+          ? scifiLead(
+              `Read the latest mission signal: ${clean(traces[0].message_preview, 86)} and tell me the next move`
+            )
+          : null
+      );
+      pushPrompt("Run a quiet systems sweep and surface the single next move that matters.");
+      return prompts.slice(0, 6);
+    }
+
+    pushPrompt(
+      currentTask
+        ? `Continue "${clean(currentTask, 92)}" and only surface blockers that need me.`
+        : null
+    );
+    pushPrompt(
+      waitingTask
+        ? `Review "${clean(waitingTask.description || "the waiting task", 92)}" and recommend the safest next decision.`
+        : null
+    );
+    pushPrompt(
+      recentFailedAutomationRun
+        ? `Inspect "${clean(recentFailedAutomationRun.title || recentFailedAutomationRun.summary, 92)}" and tell me what failed and how to fix it.`
+        : null
+    );
+    pushPrompt(
+      traces[0]?.message_preview
+        ? `Summarize the latest run: "${clean(traces[0].message_preview, 92)}" and tell me the next move.`
+        : null
+    );
+    pushPrompt("Review recent changes and list only the critical risks.");
+    pushPrompt("Build a small app to track competitor launches and deploy it.");
+    pushPrompt("Import this skill URL and wire up any required secrets.");
+    pushPrompt("Inspect active automations and surface anything that needs intervention.");
+    return prompts.slice(0, 6);
+  }, [briefingQ.data, currentTask, hasLlmConfigured, recentFailedAutomationRun, traces, waitingTask]);
 
   const autonomySettings = useMemo(() => {
     const root = asRecord(autonomySettingsQ.data);

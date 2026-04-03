@@ -9,8 +9,13 @@
 //! - Memory isolation
 
 pub mod action_guard;
+pub mod outbound;
 pub mod pii;
 pub use action_guard::ActionGuard;
+pub use outbound::{
+    check_outbound_text, format_outbound_privacy_block, sanitize_outbound_json,
+    OutboundPrivacyDecision, OutboundPrivacyPolicy, OutboundPrivacyTextResult,
+};
 pub use pii::redact_pii;
 
 use once_cell::sync::Lazy;

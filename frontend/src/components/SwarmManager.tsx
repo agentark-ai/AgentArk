@@ -254,6 +254,7 @@ function toProvisionedAgents(data: unknown): ProvisionedAgent[] {
 type AgentDraft = {
   name: string;
   agent_type: string;
+  model_profile_id: string;
   llm_provider: string;
   llm_model: string;
   llm_base_url: string;
@@ -262,9 +263,20 @@ type AgentDraft = {
   system_prompt: string;
 };
 
+type SavedModelProfile = {
+  id: string;
+  label: string;
+  role: string;
+  provider: string;
+  model: string;
+  baseUrl: string;
+  enabled: boolean;
+};
+
 const EMPTY_DRAFT: AgentDraft = {
   name: "",
   agent_type: "researcher",
+  model_profile_id: "",
   llm_provider: "ollama",
   llm_model: "",
   llm_base_url: "http://localhost:11434",
@@ -272,6 +284,67 @@ const EMPTY_DRAFT: AgentDraft = {
   capabilities: "",
   system_prompt: ""
 };
+
+function formatProfileCount(count: number): string {
+  return `${count} profile${count === 1 ? "" : "s"}`;
+}
+
+function formatProfileRole(role: string): string {
+  const normalized = role.trim().toLowerCase();
+  switch (normalized) {
+    case "primary":
+      return "Primary";
+    case "fast":
+      return "Fast";
+    case "code":
+      return "Code";
+    case "research":
+      return "Research";
+    case "fallback":
+      return "Fallback";
+    default:
+      return normalized ? normalized.charAt(0).toUpperCase() + normalized.slice(1) : "Profile";
+  }
+}
+
+function toSavedModelProfiles(data: unknown): SavedModelProfile[] {
+  return pickRecords(data, "models")
+    .map((slot) => ({
+      id: str(slot.id, ""),
+      label: str(slot.label, "").trim(),
+      role: str(slot.role, "primary").trim(),
+      provider: str(slot.provider, "").trim(),
+      model: str(slot.model, "").trim(),
+      baseUrl: str(slot.base_url, "").trim(),
+      enabled: bool(slot.enabled)
+    }))
+    .filter((profile) => profile.id && profile.model)
+    .sort((left, right) => {
+      if (left.enabled !== right.enabled) return left.enabled ? -1 : 1;
+      return left.label.localeCompare(right.label);
+    });
+}
+
+function applyModelProfileToDraft(draft: AgentDraft, profile: SavedModelProfile | null): AgentDraft {
+  if (!profile) {
+    return {
+      ...draft,
+      model_profile_id: "",
+      llm_provider: "",
+      llm_model: "",
+      llm_base_url: "",
+      llm_api_key: ""
+    };
+  }
+  return {
+    ...draft,
+    model_profile_id: profile.id,
+    llm_provider: profile.provider,
+    llm_model: profile.model,
+    llm_base_url: profile.baseUrl,
+    llm_api_key: ""
+  };
+}
 
 function toSwarmRuns(data: unknown): SwarmRun[] {
   return pickRecords(data, "runs")
@@ -485,6 +558,11 @@ export function SwarmManager({ autoRefresh }: Props) {
     queryFn: () => api.rawGet("/swarm/config"),
     refetchInterval: autoRefresh ? REFRESH_MS : false
   });
+  const modelsQ = useQuery({
+    queryKey: ["models"],
+    queryFn: () => api.rawGet("/models"),
+    refetchInterval: autoRefresh ? REFRESH_MS : false
+  });
   const delegationsQ = useQuery({
     queryKey: ["swarm-delegations"],
     queryFn: () => api.rawGet("/swarm/delegations?limit=all"),
@@ -494,6 +572,14 @@ export function SwarmManager({ autoRefresh }: Props) {
   const status = asRecord(statusQ.data);
   const config = asRecord(configQ.data);
   const agents = toProvisionedAgents(agentsQ.data);
+  const savedModelProfiles = useMemo(() => toSavedModelProfiles(modelsQ.data), [modelsQ.data]);
+  const enabledModelProfiles = useMemo(
+    () => savedModelProfiles.filter((profile) => profile.enabled),
+    [savedModelProfiles]
+  );
+  const defaultModelProfile = enabledModelProfiles[0] ?? null;
+  const selectedModelProfile =
+    enabledModelProfiles.find((profile) => profile.id === draft.model_profile_id) ?? defaultModelProfile;
   const customAgents = useMemo(() => agents.filter((agent) => !agent.isSystem), [agents]);
   const hiddenSystemCount = agents.length - customAgents.length;
   const activeRuns = toSwarmRuns({ runs: pickRecords(status.active_runs, "active_runs") });
@@ -507,16 +593,17 @@ export function SwarmManager({ autoRefresh }: Props) {
   const failedRuns = recentRuns.filter((run) =>
     ["failed", "timed_out", "panicked"].includes(run.status)
   ).length;
-  const queryError = statusQ.error || configQ.error || agentsQ.error || delegationsQ.error;
+  const queryError = statusQ.error || configQ.error || agentsQ.error || delegationsQ.error || modelsQ.error;
 
   const createAgent = useMutation({
     mutationFn: async () => {
+      const resolvedProfile = selectedModelProfile;
       const payload = {
         name: draft.name.trim(),
         agent_type: draft.agent_type.trim(),
-        llm_provider: draft.llm_provider.trim(),
-        llm_model: draft.llm_model.trim(),
-        llm_base_url: draft.llm_base_url.trim() || undefined,
+        llm_provider: resolvedProfile?.provider.trim() || draft.llm_provider.trim(),
+        llm_model: resolvedProfile?.model.trim() || draft.llm_model.trim(),
+        llm_base_url: resolvedProfile?.baseUrl.trim() || draft.llm_base_url.trim() || undefined,
         llm_api_key: draft.llm_api_key.trim() || undefined,
         capabilities: draft.capabilities
           .split(",")
@@ -538,11 +625,18 @@ export function SwarmManager({ autoRefresh }: Props) {
     }
   });
 
-  const providerNeedsBaseUrl =
-    draft.llm_provider === "ollama" ||
-    draft.llm_provider === "openai-compatible" ||
-    draft.llm_provider === "openrouter" ||
-    draft.llm_provider === "openai-subscription";
+  const savedProfilesHelperText =
+    enabledModelProfiles.length > 0
+      ? `Choose from ${formatProfileCount(enabledModelProfiles.length)} saved in Settings > Models.`
+      : savedModelProfiles.length > 0
+        ? "All saved model profiles are disabled right now. Enable one in Settings > Models."
+        : "Add a model in Settings > Models first, then pick it here.";
+
+  function openCreateAgentDialog() {
+    setFormError(null);
+    setDraft(applyModelProfileToDraft(EMPTY_DRAFT, defaultModelProfile));
+    setCreateOpen(true);
+  }
 
   return (
     <WorkspacePageShell spacing={1.5}>
@@ -551,13 +645,31 @@ export function SwarmManager({ autoRefresh }: Props) {
         title="Agents"
         description="Live delegated runs, specialist roster, and recent swarm history stay visible here. Chat and this view now share the same execution state instead of splitting live work from history."
         actions={
-          <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+          <Stack
+            direction="row"
+            spacing={0.75}
+            useFlexGap
+            flexWrap="wrap"
+            alignItems="center"
+            sx={{
+              p: 0.45,
+              borderRadius: "16px",
+              border: "1px solid rgba(108, 156, 212, 0.12)",
+              background: "linear-gradient(180deg, rgba(9, 19, 35, 0.72), rgba(7, 15, 28, 0.62))",
+              boxShadow: "inset 0 1px 0 rgba(148, 199, 245, 0.04)"
+            }}
+          >
             <Button
               size="small"
               variant="contained"
-              onClick={() => {
-                setFormError(null);
-                setCreateOpen(true);
+              onClick={openCreateAgentDialog}
+              sx={{
+                minHeight: 32,
+                px: 1.5,
+                borderRadius: "10px",
+                fontWeight: 700,
+                textTransform: "none",
+                boxShadow: "none"
               }}
             >
               Add agent
@@ -567,8 +679,34 @@ export function SwarmManager({ autoRefresh }: Props) {
               color={swarmEnabled ? "success" : "default"}
               variant={swarmEnabled ? "filled" : "outlined"}
               label={swarmEnabled ? "Swarm enabled" : "Swarm disabled"}
+              sx={{
+                height: 32,
+                borderRadius: "10px",
+                "& .MuiChip-label": {
+                  px: 1.25,
+                  fontSize: "0.66rem",
+                  fontWeight: 700,
+                  letterSpacing: "0.08em",
+                  textTransform: "uppercase"
+                }
+              }}
             />
-            <Chip size="small" variant="outlined" label={`${activeRuns.length} live run${activeRuns.length === 1 ? "" : "s"}`} />
+            <Chip
+              size="small"
+              variant="outlined"
+              label={`${activeRuns.length} live run${activeRuns.length === 1 ? "" : "s"}`}
+              sx={{
+                height: 32,
+                borderRadius: "10px",
+                "& .MuiChip-label": {
+                  px: 1.2,
+                  fontSize: "0.66rem",
+                  fontWeight: 700,
+                  letterSpacing: "0.08em",
+                  textTransform: "uppercase"
+                }
+              }}
+            />
           </Stack>
         }
       />
@@ -663,10 +801,7 @@ export function SwarmManager({ autoRefresh }: Props) {
             <Button
               size="small"
               variant="outlined"
-              onClick={() => {
-                setFormError(null);
-                setCreateOpen(true);
-              }}
+              onClick={openCreateAgentDialog}
             >
               Add agent
             </Button>
@@ -795,7 +930,7 @@ export function SwarmManager({ autoRefresh }: Props) {
         <DialogContent>
           <Stack spacing={1.25} sx={{ mt: 1 }}>
             <Typography variant="body2" color="text.secondary">
-              This creates a user-managed specialist for the roster and routing surfaces. System agents stay hidden.
+              Create a user-managed specialist for the roster using one of your saved model profiles.
             </Typography>
             <TextField
               fullWidth
@@ -818,58 +953,53 @@ export function SwarmManager({ autoRefresh }: Props) {
                 </MenuItem>
               ))}
             </TextField>
-            <Grid2 container spacing={1}>
-              <Grid2 size={{ xs: 12, md: 6 }}>
-                <TextField
-                  fullWidth
-                  select
-                  size="small"
-                  label="Provider"
-                  value={draft.llm_provider}
-                  onChange={(event) => setDraft((prev) => ({ ...prev, llm_provider: event.target.value }))}
-                >
-                  {["ollama", "openai", "openai-compatible", "openrouter", "anthropic"].map((option) => (
-                    <MenuItem key={option} value={option}>
-                      {option}
-                    </MenuItem>
-                  ))}
-                </TextField>
-              </Grid2>
-              <Grid2 size={{ xs: 12, md: 6 }}>
-                <TextField
-                  fullWidth
-                  size="small"
-                  label="Model"
-                  value={draft.llm_model}
-                  onChange={(event) => setDraft((prev) => ({ ...prev, llm_model: event.target.value }))}
-                  placeholder={draft.llm_provider === "ollama" ? "llama3.1:8b" : "gpt-4.1-mini"}
-                />
-              </Grid2>
-              {providerNeedsBaseUrl ? (
-                <Grid2 size={{ xs: 12 }}>
-                  <TextField
-                    fullWidth
-                    size="small"
-                    label="Base URL"
-                    value={draft.llm_base_url}
-                    onChange={(event) => setDraft((prev) => ({ ...prev, llm_base_url: event.target.value }))}
-                    placeholder={draft.llm_provider === "ollama" ? "http://localhost:11434" : "https://openrouter.ai/api/v1"}
-                  />
-                </Grid2>
-              ) : null}
-              {draft.llm_provider !== "ollama" ? (
-                <Grid2 size={{ xs: 12 }}>
-                  <TextField
-                    fullWidth
-                    size="small"
-                    type="password"
-                    label="API key (optional)"
-                    value={draft.llm_api_key}
-                    onChange={(event) => setDraft((prev) => ({ ...prev, llm_api_key: event.target.value }))}
-                  />
-                </Grid2>
-              ) : null}
-            </Grid2>
+            <TextField
+              fullWidth
+              select
+              size="small"
+              label="Model profile"
+              value={selectedModelProfile?.id ?? ""}
+              onChange={(event) => {
+                const nextProfile =
+                  enabledModelProfiles.find((profile) => profile.id === event.target.value) ?? null;
+                setDraft((prev) => applyModelProfileToDraft(prev, nextProfile));
+              }}
+              helperText={savedProfilesHelperText}
+              disabled={enabledModelProfiles.length === 0}
+            >
+              {enabledModelProfiles.length === 0 ? (
+                <MenuItem value="" disabled>
+                  No saved profiles available
+                </MenuItem>
+              ) : (
+                enabledModelProfiles.map((profile) => (
+                  <MenuItem key={profile.id} value={profile.id}>
+                    {profile.label || `${formatProfileRole(profile.role)} profile`}
+                  </MenuItem>
+                ))
+              )}
+            </TextField>
+            {selectedModelProfile ? (
+              <Box
+                sx={{
+                  px: 1.15,
+                  py: 1,
+                  borderRadius: "14px",
+                  border: "1px solid rgba(255,255,255,0.08)",
+                  background: "linear-gradient(180deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.02) 100%)"
+                }}
+              >
+                <Stack direction={{ xs: "column", sm: "row" }} spacing={0.75} useFlexGap flexWrap="wrap" alignItems={{ xs: "flex-start", sm: "center" }}>
+                  <Typography variant="body2" sx={{ fontWeight: 700 }}>
+                    {selectedModelProfile.label || `${formatProfileRole(selectedModelProfile.role)} profile`}
+                  </Typography>
+                  <Chip size="small" variant="outlined" label={formatProfileRole(selectedModelProfile.role)} />
+                  <Typography variant="caption" color="text.secondary">
+                    Reuses your saved model setup automatically.
+                  </Typography>
+                </Stack>
+              </Box>
+            ) : null}
             <TextField
               fullWidth
               size="small"
@@ -897,9 +1027,8 @@ export function SwarmManager({ autoRefresh }: Props) {
             variant="contained"
             disabled={createAgent.isPending}
             onClick={async () => {
-              const missingBaseUrl = providerNeedsBaseUrl && !draft.llm_base_url.trim();
-              if (!draft.name.trim() || !draft.agent_type.trim() || !draft.llm_provider.trim() || !draft.llm_model.trim() || missingBaseUrl) {
-                setFormError("Name, role, provider, and model are required. Include a base URL when the provider needs one.");
+              if (!draft.name.trim() || !draft.agent_type.trim() || !selectedModelProfile || !draft.llm_provider.trim() || !draft.llm_model.trim()) {
+                setFormError("Name, role, and a saved model profile are required.");
                 return;
               }
               setFormError(null);

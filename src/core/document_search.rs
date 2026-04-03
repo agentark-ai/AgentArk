@@ -12,10 +12,11 @@ use crate::core::embeddings::EmbeddingClient;
 use crate::storage::{document, document_chunk, Storage};
 
 const MAX_EMBED_BATCH: usize = 64;
-const MAX_DENSE_BACKFILL_CHUNKS: usize = 512;
 const MAX_FILENAME_MATCH_DOCS: usize = 4;
 const MAX_FILENAME_MATCH_CHUNKS: usize = 3;
 const MAX_EXPLICIT_MATCH_CHUNKS: usize = 4;
+const MAX_VECTOR_SHORTLIST_CHUNKS: usize = 384;
+const MAX_RECENT_SHORTLIST_CHUNKS: usize = 96;
 const MIN_LEXICAL_SCORE: f32 = 0.08;
 const MIN_DENSE_SCORE: f32 = 0.22;
 
@@ -488,94 +489,23 @@ pub(crate) async fn embed_document_chunks(
     .await
 }
 
-async fn backfill_missing_embeddings(
-    storage: &Storage,
-    embedding_client: &EmbeddingClient,
-    documents_by_id: &HashMap<String, SearchableDocumentMeta>,
-    chunks: &mut [document_chunk::Model],
-    priority_doc_ids: &HashSet<String>,
-) -> usize {
-    let mut missing_priority_indices = Vec::new();
-    let mut missing_other_indices = Vec::new();
+fn dense_chunk_shortlist_limit(limit: usize) -> u64 {
+    limit.max(1).saturating_mul(12).clamp(96, MAX_VECTOR_SHORTLIST_CHUNKS) as u64
+}
 
-    for (index, chunk) in chunks.iter().enumerate() {
-        if chunk.embedding.is_some() || chunk.content.trim().is_empty() {
-            continue;
-        }
-        if priority_doc_ids.contains(&chunk.document_id) {
-            missing_priority_indices.push(index);
-        } else {
-            missing_other_indices.push(index);
+fn recent_chunk_shortlist_limit(limit: usize) -> u64 {
+    limit.max(1).saturating_mul(4).clamp(24, MAX_RECENT_SHORTLIST_CHUNKS) as u64
+}
+
+fn merge_shortlist_ids(primary: Vec<String>, secondary: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut merged = Vec::with_capacity(primary.len() + secondary.len());
+    for id in primary.into_iter().chain(secondary) {
+        if seen.insert(id.clone()) {
+            merged.push(id);
         }
     }
-
-    let backfill_indices: Vec<usize> = if chunks.len() <= MAX_DENSE_BACKFILL_CHUNKS {
-        missing_priority_indices
-            .into_iter()
-            .chain(missing_other_indices)
-            .collect()
-    } else if !priority_doc_ids.is_empty() {
-        missing_priority_indices
-            .into_iter()
-            .take(MAX_DENSE_BACKFILL_CHUNKS)
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    if backfill_indices.is_empty() {
-        return 0;
-    }
-
-    let mut updated = 0usize;
-    for batch in backfill_indices.chunks(MAX_EMBED_BATCH) {
-        let texts: Vec<String> = batch
-            .iter()
-            .filter_map(|index| {
-                let chunk = &chunks[*index];
-                let doc = documents_by_id.get(&chunk.document_id)?;
-                Some(build_embedding_text(
-                    &doc.document.filename,
-                    &doc.document.content_type,
-                    &chunk.content,
-                    doc.document.project_id.as_deref(),
-                ))
-            })
-            .collect();
-        if texts.len() != batch.len() {
-            continue;
-        }
-
-        let embeddings = match embedding_client.embed_texts(&texts).await {
-            Ok(values) => values,
-            Err(error) => {
-                tracing::debug!("Document embedding backfill unavailable: {}", error);
-                return updated;
-            }
-        };
-        if embeddings.len() != batch.len() {
-            tracing::warn!(
-                "Document embedding backfill mismatch: expected {}, got {}",
-                batch.len(),
-                embeddings.len()
-            );
-            continue;
-        }
-
-        for (offset, embedding) in embeddings.into_iter().enumerate() {
-            let index = batch[offset];
-            chunks[index].embedding = Some(embedding.clone());
-            if storage
-                .update_document_chunk_embedding(&chunks[index].id, Some(embedding))
-                .await
-                .is_ok()
-            {
-                updated += 1;
-            }
-        }
-    }
-
-    updated
+    merged
 }
 
 /// Search indexed document chunks using explicit refs, filename metadata,
@@ -639,16 +569,21 @@ pub(crate) async fn search_documents(
         let Some(doc) = documents_by_id.get(doc_id) else {
             continue;
         };
-        if let Ok(doc_chunks) = storage.get_document_chunks(doc_id).await {
-            for (position, chunk) in doc_chunks
-                .into_iter()
-                .take(MAX_EXPLICIT_MATCH_CHUNKS)
-                .enumerate()
-            {
-                let mut hit = build_chunk_hit(doc, &chunk);
-                hit.score = (0.98 - position as f32 * 0.02).clamp(0.0, 1.0);
-                hit.match_reason = "explicit_doc_ref".to_string();
-                merge_hit(&mut hits, hit);
+        match storage.get_document_chunks(doc_id).await {
+            Ok(doc_chunks) => {
+                for (position, chunk) in doc_chunks
+                    .into_iter()
+                    .take(MAX_EXPLICIT_MATCH_CHUNKS)
+                    .enumerate()
+                {
+                    let mut hit = build_chunk_hit(doc, &chunk);
+                    hit.score = (0.98 - position as f32 * 0.02).clamp(0.0, 1.0);
+                    hit.match_reason = "explicit_doc_ref".to_string();
+                    merge_hit(&mut hits, hit);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(doc_id = doc_id, "Explicit document chunk load failed: {}", error);
             }
         }
     }
@@ -663,20 +598,29 @@ pub(crate) async fn search_documents(
         .into_iter()
         .take(MAX_FILENAME_MATCH_DOCS.max(limit))
     {
-        if let Ok(doc_chunks) = storage.get_document_chunks(&doc.document.id).await {
-            for (position, chunk) in doc_chunks
-                .into_iter()
-                .take(MAX_FILENAME_MATCH_CHUNKS)
-                .enumerate()
-            {
-                let mut hit = build_chunk_hit(doc, &chunk);
-                hit.score = (0.58 + boost - position as f32 * 0.03).clamp(0.0, 1.0);
-                hit.match_reason = if boost >= 0.28 {
-                    "filename_exact".to_string()
-                } else {
-                    "filename".to_string()
-                };
-                merge_hit(&mut hits, hit);
+        match storage.get_document_chunks(&doc.document.id).await {
+            Ok(doc_chunks) => {
+                for (position, chunk) in doc_chunks
+                    .into_iter()
+                    .take(MAX_FILENAME_MATCH_CHUNKS)
+                    .enumerate()
+                {
+                    let mut hit = build_chunk_hit(doc, &chunk);
+                    hit.score = (0.58 + boost - position as f32 * 0.03).clamp(0.0, 1.0);
+                    hit.match_reason = if boost >= 0.28 {
+                        "filename_exact".to_string()
+                    } else {
+                        "filename".to_string()
+                    };
+                    merge_hit(&mut hits, hit);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    doc_id = doc.document.id.as_str(),
+                    "Filename-boosted document chunk load failed: {}",
+                    error
+                );
             }
         }
     }
@@ -685,36 +629,64 @@ pub(crate) async fn search_documents(
         return Ok(sort_and_truncate_hits(hits.into_values().collect(), limit));
     }
 
-    let doc_ids: Vec<String> = documents_by_id.keys().cloned().collect();
-    let mut chunks = storage.list_document_chunks_for_documents(&doc_ids).await?;
-    if chunks.is_empty() {
-        return Ok(sort_and_truncate_hits(hits.into_values().collect(), limit));
-    }
-
-    let priority_doc_ids: HashSet<String> = explicit_doc_ids
-        .iter()
-        .cloned()
-        .chain(filename_boosts.keys().cloned())
-        .collect();
     let query_embedding = if let Some(client) = embedding_client {
-        client
-            .embed_texts(std::slice::from_ref(&query_without_refs))
-            .await
-            .ok()
-            .and_then(|mut embeddings| embeddings.drain(..).next())
+        match client.embed_texts(std::slice::from_ref(&query_without_refs)).await {
+            Ok(mut embeddings) => embeddings.drain(..).next(),
+            Err(error) => {
+                tracing::warn!("Document query embedding failed; falling back to lexical search: {}", error);
+                None
+            }
+        }
     } else {
         None
     };
-
-    if let (Some(client), true) = (embedding_client, query_embedding.is_some()) {
-        let _ = backfill_missing_embeddings(
-            storage,
-            client,
-            &documents_by_id,
-            &mut chunks,
-            &priority_doc_ids,
-        )
-        .await;
+    let doc_ids: Vec<String> = documents_by_id.keys().cloned().collect();
+    let chunks = if let Some(embedding) = query_embedding.as_ref() {
+        let dense_ids = match storage
+            .nearest_document_chunk_ids(embedding, &doc_ids, dense_chunk_shortlist_limit(limit))
+            .await
+        {
+            Ok(ids) => ids,
+            Err(error) => {
+                tracing::warn!("Document pgvector shortlist failed: {}", error);
+                Vec::new()
+            }
+        };
+        let recent_ids = match storage
+            .list_recent_document_chunk_ids(&doc_ids, recent_chunk_shortlist_limit(limit))
+            .await
+        {
+            Ok(ids) => ids,
+            Err(error) => {
+                tracing::warn!("Document recent shortlist failed: {}", error);
+                Vec::new()
+            }
+        };
+        let shortlist_ids = merge_shortlist_ids(dense_ids, recent_ids);
+        if shortlist_ids.is_empty() {
+            tracing::debug!(
+                documents = doc_ids.len(),
+                "Document shortlist empty; falling back to full document chunk scan"
+            );
+            storage.list_document_chunks_for_documents(&doc_ids).await?
+        } else {
+            match storage.get_document_chunks_by_ids(&shortlist_ids).await {
+                Ok(chunks) => chunks,
+                Err(error) => {
+                    tracing::warn!(
+                        ids = shortlist_ids.len(),
+                        "Document shortlist hydrate failed; falling back to full scan: {}",
+                        error
+                    );
+                    storage.list_document_chunks_for_documents(&doc_ids).await?
+                }
+            }
+        }
+    } else {
+        storage.list_document_chunks_for_documents(&doc_ids).await?
+    };
+    if chunks.is_empty() {
+        return Ok(sort_and_truncate_hits(hits.into_values().collect(), limit));
     }
 
     for chunk in chunks {

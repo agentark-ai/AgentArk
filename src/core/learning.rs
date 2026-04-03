@@ -5,13 +5,16 @@ use sha2::{Digest, Sha256};
 use crate::core::{ExecutionRun, ExecutionRunStatus, ToolAttempt};
 use crate::storage::{
     experience_edge, experience_item, experience_run, learning_candidate, procedural_pattern,
-    Storage,
+    KvLeaseGuard, Storage,
 };
 
 pub const LEARNING_ENABLED_KEY: &str = "learning_enabled_v1";
 pub const LEARNING_LOCAL_ONLY_KEY: &str = "learning_local_only_v1";
 pub const LEARNING_MODEL_SLOT_KEY: &str = "learning_model_slot_v1";
 pub const LEARNING_QUEUE_CAP_KEY: &str = "learning_queue_cap_v1";
+const LEARNING_CANDIDATE_GENERATION_LEASE_KEY: &str = "learning_candidate_generation_lease_v1";
+const LEARNING_CANDIDATE_GENERATION_LEASE_TTL_SECS: i64 = 10 * 60;
+const LEARNING_CANDIDATE_GENERATION_LEASE_HEARTBEAT_SECS: u64 = 60;
 const CORRECTION_WINDOW_MINUTES: i64 = 30;
 const DEFAULT_QUEUE_CAP: usize = 64;
 
@@ -532,13 +535,26 @@ pub async fn record_user_correction(
     if !load_learning_enabled(storage).await {
         return Ok(());
     }
-    let _ = storage
-        .mark_latest_provisional_experience_run_corrected(
-            conversation_id,
-            &safe_truncate(message.trim(), 180),
-            CORRECTION_WINDOW_MINUTES,
-        )
-        .await?;
+    let signal = safe_truncate(message.trim(), 180);
+    let mut corrected = false;
+    if let Some(trace_id) = storage
+        .latest_assistant_trace_id_for_conversation(conversation_id)
+        .await?
+    {
+        corrected = storage
+            .mark_provisional_experience_run_corrected_by_trace_id(&trace_id, &signal)
+            .await?
+            .is_some();
+    }
+    if !corrected {
+        let _ = storage
+            .mark_latest_provisional_experience_run_corrected(
+                conversation_id,
+                &signal,
+                CORRECTION_WINDOW_MINUTES,
+            )
+            .await?;
+    }
     Ok(())
 }
 
@@ -860,7 +876,10 @@ pub async fn run_pattern_induction(storage: &Storage) -> Result<usize> {
             None,
             load_learning_queue_cap(storage).await as u64,
         )
-        .await?;
+        .await?
+        .into_iter()
+        .filter(|procedure| !experience_item_is_external_source(procedure))
+        .collect::<Vec<_>>();
     let mut updated = 0usize;
     for procedure in procedures {
         let metadata = procedure.metadata.as_object().cloned().unwrap_or_default();
@@ -886,11 +905,10 @@ pub async fn run_pattern_induction(storage: &Storage) -> Result<usize> {
             .get("suggested_steps")
             .cloned()
             .unwrap_or_else(|| Value::Array(Vec::new()));
-        let total = procedure
-            .support_count
-            .saturating_add(procedure.contradiction_count)
-            .max(1);
-        let success_rate = procedure.support_count as f64 / total as f64;
+        let support_count = procedure.support_count.max(0);
+        let correction_count = procedure.contradiction_count.max(0);
+        let sample_count = support_count.saturating_add(correction_count).max(1);
+        let success_rate = support_count as f64 / sample_count as f64;
         let now = chrono::Utc::now().to_rfc3339();
         storage
             .upsert_procedural_pattern(&procedural_pattern::Model {
@@ -908,12 +926,14 @@ pub async fn run_pattern_induction(storage: &Storage) -> Result<usize> {
                 tool_sequence_digest: tool_digest.map(|value| value.to_string()),
                 steps_json,
                 tool_sequence_json: tool_sequence,
-                sample_count: procedure.support_count.max(1),
-                success_count: procedure.support_count.max(1),
-                correction_count: procedure.contradiction_count.max(0),
+                sample_count,
+                success_count: support_count,
+                correction_count,
                 success_rate,
                 last_validated_at: Some(now.clone()),
-                status: if procedure.support_count >= 2 {
+                status: if correction_count > support_count {
+                    "deprecated".to_string()
+                } else if support_count >= 2 {
                     "active".to_string()
                 } else {
                     "draft".to_string()
@@ -1029,194 +1049,768 @@ fn memory_merge_sort_key(item: &experience_item::Model) -> (i32, i32, String, St
     )
 }
 
+fn metadata_marks_external_source(metadata: &Value) -> bool {
+    let Some(object) = metadata.as_object() else {
+        return false;
+    };
+
+    let contains_external_marker = |value: &str| {
+        let lowered = value.trim().to_ascii_lowercase();
+        !lowered.is_empty()
+            && [
+                "external-source",
+                "community-learning",
+                "learning-fenced",
+                "moltbook",
+            ]
+            .iter()
+            .any(|marker| lowered.contains(marker))
+    };
+
+    if object
+        .get("external_source")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+        || object
+            .get("fenced_external_source")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        || object
+            .get("learning_fenced")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+    {
+        return true;
+    }
+
+    if object
+        .get("source_scope")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("external"))
+        || object
+            .get("source_kind")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("external_source"))
+    {
+        return true;
+    }
+
+    if object
+        .get("source")
+        .and_then(|value| value.as_str())
+        .is_some_and(contains_external_marker)
+        || object
+            .get("tags")
+            .and_then(|value| value.as_str())
+            .is_some_and(contains_external_marker)
+    {
+        return true;
+    }
+
+    object
+        .get("tags")
+        .and_then(|value| value.as_array())
+        .is_some_and(|tags| {
+            tags.iter()
+                .filter_map(|value| value.as_str())
+                .any(contains_external_marker)
+        })
+}
+
+fn experience_item_is_external_source(item: &experience_item::Model) -> bool {
+    metadata_marks_external_source(&item.metadata)
+}
+
+fn procedural_pattern_is_external_source(pattern: &procedural_pattern::Model) -> bool {
+    metadata_marks_external_source(&pattern.metadata)
+}
+
+fn canonical_json_string(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string()),
+        Value::Array(items) => format!(
+            "[{}]",
+            items
+                .iter()
+                .map(canonical_json_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Value::Object(map) => {
+            let mut entries = map.iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(right.0));
+            format!(
+                "{{{}}}",
+                entries
+                    .into_iter()
+                    .map(|(key, value)| format!(
+                        "{}:{}",
+                        serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string()),
+                        canonical_json_string(value)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        }
+    }
+}
+
+fn semantic_candidate_proposed_content(candidate: &learning_candidate::Model) -> Value {
+    match candidate.candidate_type.as_str() {
+        "strategy" => {
+            let mut payload = candidate.proposed_content.clone();
+            if let Some(object) = payload.as_object_mut() {
+                object.remove("updated_at");
+            }
+            payload
+        }
+        _ => candidate.proposed_content.clone(),
+    }
+}
+
+fn candidate_confidence_bucket(confidence: f64) -> String {
+    let bounded = confidence.clamp(0.0, 1.0);
+    let rounded = (bounded * 20.0).round() / 20.0;
+    format!("{rounded:.2}")
+}
+
+fn learning_candidate_material_signature(candidate: &learning_candidate::Model) -> String {
+    let pattern_id = candidate.pattern_id.as_deref().unwrap_or("");
+    let evidence = canonical_json_string(&candidate.evidence_refs);
+    let proposed = canonical_json_string(&semantic_candidate_proposed_content(candidate));
+    let confidence = candidate_confidence_bucket(candidate.confidence);
+    short_hash(&[
+        candidate.candidate_type.as_str(),
+        candidate.subject_key.as_str(),
+        pattern_id,
+        evidence.as_str(),
+        proposed.as_str(),
+        confidence.as_str(),
+    ])
+}
+
+fn learning_candidate_revision_id(candidate: &learning_candidate::Model, signature: &str) -> String {
+    stable_id(
+        "candidate",
+        &[
+            candidate.candidate_type.as_str(),
+            candidate.subject_key.as_str(),
+            signature,
+        ],
+    )
+}
+
+fn learning_candidate_needs_refresh(
+    existing: &learning_candidate::Model,
+    candidate: &learning_candidate::Model,
+) -> bool {
+    existing.title != candidate.title
+        || existing.summary != candidate.summary
+        || existing.project_id != candidate.project_id
+        || existing.conversation_id != candidate.conversation_id
+        || existing.pattern_id != candidate.pattern_id
+        || existing.evidence_refs != candidate.evidence_refs
+        || semantic_candidate_proposed_content(existing) != semantic_candidate_proposed_content(candidate)
+        || (existing.confidence - candidate.confidence).abs() > f64::EPSILON
+}
+
+fn learning_candidate_is_draft(status: &str) -> bool {
+    status.eq_ignore_ascii_case("draft")
+}
+
+fn learning_candidate_is_reviewed(status: &str) -> bool {
+    status.eq_ignore_ascii_case("approved") || status.eq_ignore_ascii_case("rejected")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateWriteOutcome {
+    Unchanged,
+    Changed,
+    LeaseLost,
+}
+
+async fn supersede_stale_draft_candidates(
+    storage: &Storage,
+    lease_guard: &KvLeaseGuard,
+    existing_candidates: &[learning_candidate::Model],
+    keep_id: Option<&str>,
+    reviewed_candidate_id: &str,
+) -> Result<CandidateWriteOutcome> {
+    let mut updated = 0usize;
+    for draft in existing_candidates.iter().filter(|candidate| {
+        learning_candidate_is_draft(&candidate.approval_status)
+            && keep_id.map(|keep_id| candidate.id != keep_id).unwrap_or(true)
+    }) {
+        let note = format!(
+            "Auto-superseded because generation returned to reviewed candidate `{}`.",
+            reviewed_candidate_id
+        );
+        if !storage
+            .update_learning_candidate_review_guarded(
+                LEARNING_CANDIDATE_GENERATION_LEASE_KEY,
+                lease_guard,
+                &draft.id,
+                "superseded",
+                Some(&note),
+                None,
+            )
+            .await?
+        {
+            return Ok(CandidateWriteOutcome::LeaseLost);
+        }
+        updated += 1;
+    }
+    Ok(if updated > 0 {
+        CandidateWriteOutcome::Changed
+    } else {
+        CandidateWriteOutcome::Unchanged
+    })
+}
+
+async fn upsert_generated_learning_candidate(
+    storage: &Storage,
+    lease_guard: &KvLeaseGuard,
+    mut candidate: learning_candidate::Model,
+) -> Result<CandidateWriteOutcome> {
+    let existing_candidates = storage
+        .list_learning_candidates_for_subject(&candidate.candidate_type, &candidate.subject_key, 64)
+        .await?;
+    let material_signature = learning_candidate_material_signature(&candidate);
+
+    if let Some(existing) = existing_candidates
+        .iter()
+        .find(|existing| {
+            learning_candidate_is_reviewed(&existing.approval_status)
+                && learning_candidate_material_signature(existing) == material_signature
+        })
+    {
+        let superseded = supersede_stale_draft_candidates(
+            storage,
+            lease_guard,
+            &existing_candidates,
+            None,
+            &existing.id,
+        )
+        .await?;
+        return Ok(superseded);
+    }
+
+    if let Some(existing) = existing_candidates
+        .iter()
+        .find(|existing| {
+            learning_candidate_is_draft(&existing.approval_status)
+                && learning_candidate_material_signature(existing) == material_signature
+        })
+    {
+        candidate.id = existing.id.clone();
+        candidate.created_at = existing.created_at.clone();
+        candidate.approval_status = existing.approval_status.clone();
+        candidate.review_notes = existing.review_notes.clone();
+        candidate.reviewed_at = existing.reviewed_at.clone();
+        candidate.approved_ref = existing.approved_ref.clone();
+        let superseded = if let Some(reviewed_candidate) = existing_candidates
+            .iter()
+            .find(|candidate| learning_candidate_is_reviewed(&candidate.approval_status))
+        {
+            match supersede_stale_draft_candidates(
+                storage,
+                lease_guard,
+                &existing_candidates,
+                Some(&existing.id),
+                &reviewed_candidate.id,
+            )
+            .await?
+            {
+                CandidateWriteOutcome::LeaseLost => return Ok(CandidateWriteOutcome::LeaseLost),
+                CandidateWriteOutcome::Changed => true,
+                CandidateWriteOutcome::Unchanged => false,
+            }
+        } else {
+            false
+        };
+        if !learning_candidate_needs_refresh(existing, &candidate) {
+            return Ok(if superseded {
+                CandidateWriteOutcome::Changed
+            } else {
+                CandidateWriteOutcome::Unchanged
+            });
+        }
+        if !storage
+            .upsert_learning_candidate_guarded(
+                LEARNING_CANDIDATE_GENERATION_LEASE_KEY,
+                lease_guard,
+                &candidate,
+            )
+            .await?
+        {
+            return Ok(CandidateWriteOutcome::LeaseLost);
+        }
+        return Ok(CandidateWriteOutcome::Changed);
+    }
+
+    if existing_candidates.is_empty() {
+        if !storage
+            .upsert_learning_candidate_guarded(
+                LEARNING_CANDIDATE_GENERATION_LEASE_KEY,
+                lease_guard,
+                &candidate,
+            )
+            .await?
+        {
+            return Ok(CandidateWriteOutcome::LeaseLost);
+        }
+        return Ok(CandidateWriteOutcome::Changed);
+    }
+
+    if let Some(existing_draft) = existing_candidates
+        .iter()
+        .find(|existing| learning_candidate_is_draft(&existing.approval_status))
+    {
+        candidate.id = existing_draft.id.clone();
+        candidate.created_at = existing_draft.created_at.clone();
+        candidate.approval_status = existing_draft.approval_status.clone();
+        candidate.review_notes = existing_draft.review_notes.clone();
+        candidate.reviewed_at = existing_draft.reviewed_at.clone();
+        candidate.approved_ref = existing_draft.approved_ref.clone();
+        if !storage
+            .upsert_learning_candidate_guarded(
+                LEARNING_CANDIDATE_GENERATION_LEASE_KEY,
+                lease_guard,
+                &candidate,
+            )
+            .await?
+        {
+            return Ok(CandidateWriteOutcome::LeaseLost);
+        }
+        if let Some(reviewed_candidate) = existing_candidates
+            .iter()
+            .find(|candidate| learning_candidate_is_reviewed(&candidate.approval_status))
+        {
+            if matches!(
+                supersede_stale_draft_candidates(
+                    storage,
+                    lease_guard,
+                    &existing_candidates,
+                    Some(&existing_draft.id),
+                    &reviewed_candidate.id,
+                )
+                .await?,
+                CandidateWriteOutcome::LeaseLost
+            ) {
+                return Ok(CandidateWriteOutcome::LeaseLost);
+            }
+        }
+        return Ok(CandidateWriteOutcome::Changed);
+    }
+
+    if let Some(reviewed_candidate) = existing_candidates
+        .iter()
+        .find(|existing| learning_candidate_is_reviewed(&existing.approval_status))
+    {
+        let note = format!(
+            "Auto-reopened for review after material change from reviewed candidate `{}`.",
+            reviewed_candidate.id
+        );
+        candidate.summary = Some(match candidate.summary.take() {
+            Some(summary) if !summary.trim().is_empty() => format!("{summary} {note}"),
+            _ => note,
+        });
+    }
+    let revision_id = learning_candidate_revision_id(&candidate, &material_signature);
+    candidate.id = if existing_candidates
+        .iter()
+        .any(|existing| existing.id == revision_id)
+    {
+        let reopen_marker = chrono::Utc::now().to_rfc3339();
+        stable_id(
+            "candidate",
+            &[
+                candidate.candidate_type.as_str(),
+                candidate.subject_key.as_str(),
+                material_signature.as_str(),
+                reopen_marker.as_str(),
+            ],
+        )
+    } else {
+        revision_id
+    };
+    if !storage
+        .upsert_learning_candidate_guarded(
+            LEARNING_CANDIDATE_GENERATION_LEASE_KEY,
+            lease_guard,
+            &candidate,
+        )
+        .await?
+    {
+        return Ok(CandidateWriteOutcome::LeaseLost);
+    }
+    Ok(CandidateWriteOutcome::Changed)
+}
+
+fn apply_candidate_write_outcome(
+    outcome: CandidateWriteOutcome,
+    generated: &mut usize,
+    lease_alive: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> bool {
+    match outcome {
+        CandidateWriteOutcome::Changed => {
+            *generated += 1;
+            true
+        }
+        CandidateWriteOutcome::Unchanged => true,
+        CandidateWriteOutcome::LeaseLost => {
+            lease_alive.store(false, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!("Stopping learning candidate generation after lease ownership was lost");
+            false
+        }
+    }
+}
+
 pub async fn run_candidate_generation(storage: &Storage) -> Result<usize> {
     if !load_learning_enabled(storage).await {
         return Ok(0);
     }
-    let cap = load_learning_queue_cap(storage).await as u64;
-    let patterns = storage.list_candidate_ready_patterns(3, 0.66, cap).await?;
-    let mut generated = 0usize;
-    for pattern in patterns {
-        let steps = pattern
-            .steps_json
-            .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.as_str().map(|value| value.to_string()))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let action_name = candidate_action_name(&pattern);
-        let workflow_content = workflow_candidate_markdown(&pattern, &action_name, &steps);
-        let workflow_candidate_id = stable_id("candidate", &["workflow", pattern.id.as_str()]);
-        let now = chrono::Utc::now().to_rfc3339();
-        storage
-            .upsert_learning_candidate(&learning_candidate::Model {
-                id: workflow_candidate_id,
-                candidate_type: "workflow".to_string(),
-                subject_key: pattern.id.clone(),
-                title: format!("Workflow candidate: {}", pattern.title),
-                summary: Some("Generated from repeated successful procedures.".to_string()),
-                project_id: pattern.project_id.clone(),
-                conversation_id: pattern.conversation_id.clone(),
-                pattern_id: Some(pattern.id.clone()),
-                evidence_refs: json!([pattern.id]),
-                proposed_content: json!({
-                    "name": action_name,
-                    "content": workflow_content,
-                }),
-                confidence: pattern.success_rate,
-                approval_status: "draft".to_string(),
-                review_notes: None,
-                reviewed_at: None,
-                approved_ref: None,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            })
-            .await?;
-        generated += 1;
-
-        let metadata = pattern.metadata.as_object().cloned().unwrap_or_default();
-        let task_type = metadata
-            .get("task_type")
-            .and_then(|value| value.as_str())
-            .unwrap_or("general");
-        let tool_names = pattern
-            .tool_sequence_json
-            .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.as_str().map(|value| value.to_string()))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let strategy_profile = build_strategy_candidate_profile(&pattern, task_type, &tool_names);
-        let strategy_candidate_id = stable_id("candidate", &["strategy", pattern.id.as_str()]);
-        storage
-            .upsert_learning_candidate(&learning_candidate::Model {
-                id: strategy_candidate_id,
-                candidate_type: "strategy".to_string(),
-                subject_key: pattern.id.clone(),
-                title: format!("Strategy candidate: {}", pattern.title),
-                summary: Some("Generated from high-confidence procedural patterns.".to_string()),
-                project_id: pattern.project_id.clone(),
-                conversation_id: pattern.conversation_id.clone(),
-                pattern_id: Some(pattern.id.clone()),
-                evidence_refs: json!([pattern.id]),
-                proposed_content: serde_json::to_value(strategy_profile).unwrap_or(Value::Null),
-                confidence: (pattern.success_rate * 0.92).min(0.98),
-                approval_status: "draft".to_string(),
-                review_notes: None,
-                reviewed_at: None,
-                approved_ref: None,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            })
-            .await?;
-        generated += 1;
-    }
-
-    let at_risk_procedures = storage
-        .list_active_experience_items(&["procedure"], None, None, cap)
-        .await?;
-    for item in at_risk_procedures
-        .into_iter()
-        .filter(|item| item.contradiction_count > item.support_count && item.status == "active")
-    {
-        let now = chrono::Utc::now().to_rfc3339();
-        storage
-            .upsert_learning_candidate(&learning_candidate::Model {
-                id: stable_id("candidate", &["memory_deprecate", item.id.as_str()]),
-                candidate_type: "memory_deprecate".to_string(),
-                subject_key: item.id.clone(),
-                title: format!("Deprecate stale procedure: {}", item.title),
-                summary: Some(
-                    "The contradiction count has overtaken positive support for this procedure."
-                        .to_string(),
-                ),
-                project_id: item.project_id.clone(),
-                conversation_id: item.conversation_id.clone(),
-                pattern_id: None,
-                evidence_refs: json!([item.id]),
-                proposed_content: json!({
-                    "item_id": item.id,
-                    "next_status": "deprecated",
-                }),
-                confidence: 0.74,
-                approval_status: "draft".to_string(),
-                review_notes: None,
-                reviewed_at: None,
-                approved_ref: None,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            })
-            .await?;
-        generated += 1;
-    }
-
-    let mergeable_items = storage
-        .list_active_experience_items(
-            &["constraint", "personal_fact", "lesson", "procedure"],
-            None,
-            None,
-            cap,
+    let lease_owner = uuid::Uuid::new_v4().to_string();
+    let Some(lease_guard) = storage
+        .acquire_kv_lease_guard(
+            LEARNING_CANDIDATE_GENERATION_LEASE_KEY,
+            &lease_owner,
+            LEARNING_CANDIDATE_GENERATION_LEASE_TTL_SECS,
         )
-        .await?;
-    let mut merge_groups: std::collections::HashMap<String, Vec<experience_item::Model>> =
-        std::collections::HashMap::new();
-    for item in mergeable_items {
-        let Some(signature) = canonical_memory_merge_signature(&item) else {
-            continue;
-        };
-        merge_groups.entry(signature).or_default().push(item);
-    }
-    for group in merge_groups.into_values() {
-        if group.len() < 2 {
-            continue;
+        .await?
+    else {
+        return Ok(0);
+    };
+    let lease_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let heartbeat_storage = storage.clone();
+    let heartbeat_guard = lease_guard.clone();
+    let heartbeat_lease_alive = lease_alive.clone();
+    let (lease_stop_tx, mut lease_stop_rx) = tokio::sync::watch::channel(false);
+    let lease_heartbeat = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                changed = lease_stop_rx.changed() => {
+                    if changed.is_err() || *lease_stop_rx.borrow() {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(
+                    LEARNING_CANDIDATE_GENERATION_LEASE_HEARTBEAT_SECS,
+                )) => {
+                    match heartbeat_storage
+                        .refresh_kv_lease_guard(
+                            LEARNING_CANDIDATE_GENERATION_LEASE_KEY,
+                            &heartbeat_guard,
+                            LEARNING_CANDIDATE_GENERATION_LEASE_TTL_SECS,
+                        )
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            heartbeat_lease_alive
+                                .store(false, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!(
+                                "Learning candidate generation lease heartbeat lost ownership"
+                            );
+                            break;
+                        }
+                        Err(error) => {
+                            heartbeat_lease_alive
+                                .store(false, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!(
+                                "Learning candidate generation lease heartbeat refresh failed: {}",
+                                error
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
         }
-        let mut sorted = group;
-        sorted.sort_by_key(|item| std::cmp::Reverse(memory_merge_sort_key(item)));
-        let target = sorted[0].clone();
-        for source in sorted.into_iter().skip(1) {
-            if source.id == target.id {
+    });
+
+    let result = async {
+        let cap = load_learning_queue_cap(storage).await as u64;
+        let patterns = storage
+            .list_candidate_ready_patterns(3, 0.66, cap)
+            .await?
+            .into_iter()
+            .filter(|pattern| !procedural_pattern_is_external_source(pattern))
+            .collect::<Vec<_>>();
+        let mut generated = 0usize;
+        for pattern in patterns {
+            if !lease_alive.load(std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    "Stopping learning candidate generation after lease ownership was lost"
+                );
+                break;
+            }
+
+            let steps = pattern
+                .steps_json
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(|value| value.to_string()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let action_name = candidate_action_name(&pattern);
+            let workflow_content = workflow_candidate_markdown(&pattern, &action_name, &steps);
+            let workflow_candidate_id = stable_id("candidate", &["workflow", pattern.id.as_str()]);
+            let now = chrono::Utc::now().to_rfc3339();
+            if !apply_candidate_write_outcome(
+                upsert_generated_learning_candidate(
+                    storage,
+                    &lease_guard,
+                    learning_candidate::Model {
+                        id: workflow_candidate_id,
+                        candidate_type: "workflow".to_string(),
+                        subject_key: pattern.id.clone(),
+                        title: format!("Workflow candidate: {}", pattern.title),
+                        summary: Some("Generated from repeated successful procedures.".to_string()),
+                        project_id: pattern.project_id.clone(),
+                        conversation_id: pattern.conversation_id.clone(),
+                        pattern_id: Some(pattern.id.clone()),
+                        evidence_refs: json!([pattern.id]),
+                        proposed_content: json!({
+                            "name": action_name,
+                            "content": workflow_content,
+                        }),
+                        confidence: pattern.success_rate,
+                        approval_status: "draft".to_string(),
+                        review_notes: None,
+                        reviewed_at: None,
+                        approved_ref: None,
+                        created_at: now.clone(),
+                        updated_at: now.clone(),
+                    },
+                )
+                .await?,
+                &mut generated,
+                &lease_alive,
+            ) {
+                break;
+            }
+
+            let metadata = pattern.metadata.as_object().cloned().unwrap_or_default();
+            let task_type = metadata
+                .get("task_type")
+                .and_then(|value| value.as_str())
+                .unwrap_or("general");
+            let tool_names = pattern
+                .tool_sequence_json
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(|value| value.to_string()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let strategy_profile =
+                build_strategy_candidate_profile(&pattern, task_type, &tool_names);
+            let strategy_candidate_id = stable_id("candidate", &["strategy", pattern.id.as_str()]);
+            if !apply_candidate_write_outcome(
+                upsert_generated_learning_candidate(
+                    storage,
+                    &lease_guard,
+                    learning_candidate::Model {
+                        id: strategy_candidate_id,
+                        candidate_type: "strategy".to_string(),
+                        subject_key: pattern.id.clone(),
+                        title: format!("Strategy candidate: {}", pattern.title),
+                        summary: Some("Generated from high-confidence procedural patterns.".to_string()),
+                        project_id: pattern.project_id.clone(),
+                        conversation_id: pattern.conversation_id.clone(),
+                        pattern_id: Some(pattern.id.clone()),
+                        evidence_refs: json!([pattern.id]),
+                        proposed_content: serde_json::to_value(strategy_profile).unwrap_or(Value::Null),
+                        confidence: (pattern.success_rate * 0.92).min(0.98),
+                        approval_status: "draft".to_string(),
+                        review_notes: None,
+                        reviewed_at: None,
+                        approved_ref: None,
+                        created_at: now.clone(),
+                        updated_at: now.clone(),
+                    },
+                )
+                .await?,
+                &mut generated,
+                &lease_alive,
+            ) {
+                break;
+            }
+        }
+
+        let at_risk_procedures = storage
+            .list_active_experience_items(&["procedure"], None, None, cap)
+            .await?
+            .into_iter()
+            .filter(|item| !experience_item_is_external_source(item))
+            .collect::<Vec<_>>();
+        for item in at_risk_procedures
+            .into_iter()
+            .filter(|item| item.contradiction_count > item.support_count && item.status == "active")
+        {
+            if !lease_alive.load(std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    "Stopping learning candidate generation after lease ownership was lost"
+                );
+                break;
+            }
+
+            let now = chrono::Utc::now().to_rfc3339();
+            if !apply_candidate_write_outcome(
+                upsert_generated_learning_candidate(
+                    storage,
+                    &lease_guard,
+                    learning_candidate::Model {
+                        id: stable_id("candidate", &["memory_deprecate", item.id.as_str()]),
+                        candidate_type: "memory_deprecate".to_string(),
+                        subject_key: item.id.clone(),
+                        title: format!("Deprecate stale procedure: {}", item.title),
+                        summary: Some(
+                            "The contradiction count has overtaken positive support for this procedure."
+                                .to_string(),
+                        ),
+                        project_id: item.project_id.clone(),
+                        conversation_id: item.conversation_id.clone(),
+                        pattern_id: None,
+                        evidence_refs: json!([item.id]),
+                        proposed_content: json!({
+                            "item_id": item.id,
+                            "next_status": "deprecated",
+                        }),
+                        confidence: 0.74,
+                        approval_status: "draft".to_string(),
+                        review_notes: None,
+                        reviewed_at: None,
+                        approved_ref: None,
+                        created_at: now.clone(),
+                        updated_at: now.clone(),
+                    },
+                )
+                .await?,
+                &mut generated,
+                &lease_alive,
+            ) {
+                break;
+            }
+        }
+
+        let mergeable_items = storage
+            .list_active_experience_items(
+                &["constraint", "personal_fact", "lesson", "procedure"],
+                None,
+                None,
+                cap,
+            )
+            .await?
+            .into_iter()
+            .filter(|item| !experience_item_is_external_source(item))
+            .collect::<Vec<_>>();
+        let mut merge_groups: std::collections::HashMap<String, Vec<experience_item::Model>> =
+            std::collections::HashMap::new();
+        for item in mergeable_items {
+            let Some(signature) = canonical_memory_merge_signature(&item) else {
+                continue;
+            };
+            merge_groups.entry(signature).or_default().push(item);
+        }
+        for group in merge_groups.into_values() {
+            if !lease_alive.load(std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    "Stopping learning candidate generation after lease ownership was lost"
+                );
+                break;
+            }
+            if group.len() < 2 {
                 continue;
             }
-            let now = chrono::Utc::now().to_rfc3339();
-            storage
-                .upsert_learning_candidate(&learning_candidate::Model {
-                    id: stable_id("candidate", &["memory_merge", source.id.as_str(), target.id.as_str()]),
-                    candidate_type: "memory_merge".to_string(),
-                    subject_key: target.id.clone(),
-                    title: format!("Merge duplicate memory into {}", target.title),
-                    summary: Some(
-                        "Two active memories carry substantially the same content and can be merged."
-                            .to_string(),
-                    ),
-                    project_id: target.project_id.clone(),
-                    conversation_id: target.conversation_id.clone(),
-                    pattern_id: None,
-                    evidence_refs: json!([target.id, source.id]),
-                    proposed_content: json!({
-                        "target_item_id": target.id,
-                        "source_item_id": source.id,
-                        "reason": "duplicate_content",
-                    }),
-                    confidence: ((target.confidence + source.confidence) / 2.0).min(0.96),
-                    approval_status: "draft".to_string(),
-                    review_notes: None,
-                    reviewed_at: None,
-                    approved_ref: None,
-                    created_at: now.clone(),
-                    updated_at: now.clone(),
-                })
-                .await?;
-            generated += 1;
+            let mut sorted = group;
+            sorted.sort_by_key(|item| std::cmp::Reverse(memory_merge_sort_key(item)));
+            let target = sorted[0].clone();
+            for source in sorted.into_iter().skip(1) {
+                if !lease_alive.load(std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        "Stopping learning candidate generation after lease ownership was lost"
+                    );
+                    break;
+                }
+                if source.id == target.id {
+                    continue;
+                }
+                let now = chrono::Utc::now().to_rfc3339();
+                if !apply_candidate_write_outcome(
+                    upsert_generated_learning_candidate(
+                        storage,
+                        &lease_guard,
+                        learning_candidate::Model {
+                            id: stable_id(
+                                "candidate",
+                                &["memory_merge", source.id.as_str(), target.id.as_str()],
+                            ),
+                            candidate_type: "memory_merge".to_string(),
+                            subject_key: target.id.clone(),
+                            title: format!("Merge duplicate memory into {}", target.title),
+                            summary: Some(
+                                "Two active memories carry substantially the same content and can be merged."
+                                    .to_string(),
+                            ),
+                            project_id: target.project_id.clone(),
+                            conversation_id: target.conversation_id.clone(),
+                            pattern_id: None,
+                            evidence_refs: json!([target.id, source.id]),
+                            proposed_content: json!({
+                                "target_item_id": target.id,
+                                "source_item_id": source.id,
+                                "reason": "duplicate_content",
+                            }),
+                            confidence: ((target.confidence + source.confidence) / 2.0).min(0.96),
+                            approval_status: "draft".to_string(),
+                            review_notes: None,
+                            reviewed_at: None,
+                            approved_ref: None,
+                            created_at: now.clone(),
+                            updated_at: now.clone(),
+                        },
+                    )
+                    .await?,
+                    &mut generated,
+                    &lease_alive,
+                ) {
+                    break;
+                }
+            }
         }
+
+        Ok(generated)
+    }
+    .await;
+    let _ = lease_stop_tx.send(true);
+    if let Err(error) = lease_heartbeat.await {
+        tracing::warn!(
+            "Learning candidate generation lease heartbeat join failed: {}",
+            error
+        );
     }
 
-    Ok(generated)
+    if let Err(error) = storage
+        .release_kv_lease_guard(LEARNING_CANDIDATE_GENERATION_LEASE_KEY, &lease_guard)
+        .await
+    {
+        tracing::warn!(
+            "Failed to release learning candidate generation lease: {}",
+            error
+        );
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -1302,5 +1896,33 @@ mod tests {
             canonical_memory_merge_signature(&base),
             canonical_memory_merge_signature(&variant)
         );
+    }
+
+    #[test]
+    fn external_source_metadata_is_fenced_from_learning() {
+        let item = experience_item::Model {
+            id: "item-ext".to_string(),
+            kind: "lesson".to_string(),
+            scope: "global".to_string(),
+            project_id: None,
+            conversation_id: None,
+            title: "External insight".to_string(),
+            content: "Community learning".to_string(),
+            normalized_key: "lesson::external".to_string(),
+            confidence: 0.6,
+            support_count: 1,
+            contradiction_count: 0,
+            status: "active".to_string(),
+            metadata: serde_json::json!({
+                "source": "moltbook",
+                "tags": ["external-source", "community-learning", "learning-fenced"],
+                "fenced_external_source": true
+            }),
+            last_supported_at: None,
+            last_contradicted_at: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        assert!(experience_item_is_external_source(&item));
     }
 }

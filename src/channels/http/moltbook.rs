@@ -393,6 +393,102 @@ fn format_moltbook_external_knowledge_title(insights: &MoltbookMemoryInsights) -
     format!("Moltbook: {}", moltbook_text_preview(seed, 96))
 }
 
+fn sanitize_moltbook_public_text(
+    text: &str,
+) -> crate::security::OutboundPrivacyTextResult {
+    crate::security::check_outbound_text(
+        text,
+        &crate::security::OutboundPrivacyPolicy::default(),
+    )
+}
+
+fn moltbook_privacy_details(
+    result: &crate::security::OutboundPrivacyTextResult,
+) -> serde_json::Value {
+    serde_json::json!({
+        "decision": result.decision,
+        "reasons": result.reasons,
+        "redactions": result.redactions
+    })
+}
+
+fn sanitize_moltbook_memory_insights(
+    insights: &MoltbookMemoryInsights,
+) -> (Option<MoltbookMemoryInsights>, serde_json::Value) {
+    let mut combined_reasons = Vec::new();
+    let mut combined_redactions = Vec::new();
+    let mut dropped_insight_count = 0usize;
+    let mut summary_blocked = false;
+
+    let push_unique = |items: &mut Vec<String>, value: &str| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() || items.iter().any(|existing| existing == trimmed) {
+            return;
+        }
+        items.push(trimmed.to_string());
+    };
+
+    let summary_result = sanitize_moltbook_public_text(&insights.summary);
+    for reason in &summary_result.reasons {
+        push_unique(&mut combined_reasons, reason);
+    }
+    for redaction in &summary_result.redactions {
+        push_unique(&mut combined_redactions, redaction);
+    }
+
+    let sanitized_summary = if matches!(
+        summary_result.decision,
+        crate::security::OutboundPrivacyDecision::Block
+    ) {
+        summary_blocked = true;
+        String::new()
+    } else {
+        summary_result.sanitized_text.trim().to_string()
+    };
+
+    let mut sanitized_insights = Vec::new();
+    for insight in &insights.insights {
+        let result = sanitize_moltbook_public_text(insight);
+        for reason in &result.reasons {
+            push_unique(&mut combined_reasons, reason);
+        }
+        for redaction in &result.redactions {
+            push_unique(&mut combined_redactions, redaction);
+        }
+        if matches!(
+            result.decision,
+            crate::security::OutboundPrivacyDecision::Block
+        ) {
+            dropped_insight_count += 1;
+            continue;
+        }
+        let sanitized = result.sanitized_text.trim().to_string();
+        if !sanitized.is_empty() {
+            sanitized_insights.push(sanitized);
+        }
+    }
+
+    let privacy = serde_json::json!({
+        "fenced_external_source": true,
+        "summary_blocked": summary_blocked,
+        "dropped_insight_count": dropped_insight_count,
+        "reasons": combined_reasons,
+        "redactions": combined_redactions
+    });
+
+    if sanitized_summary.is_empty() && sanitized_insights.is_empty() {
+        (None, privacy)
+    } else {
+        (
+            Some(MoltbookMemoryInsights {
+                summary: sanitized_summary,
+                insights: sanitized_insights,
+            }),
+            privacy,
+        )
+    }
+}
+
 async fn persist_moltbook_external_knowledge(
     storage: &crate::storage::Storage,
     insights: &MoltbookMemoryInsights,
@@ -405,7 +501,7 @@ async fn persist_moltbook_external_knowledge(
             &content,
             Some("moltbook"),
             None,
-            Some("external-source,moltbook,community-learning"),
+            Some("external-source,moltbook,community-learning,learning-fenced"),
             None,
         )
         .await
@@ -1362,18 +1458,43 @@ Rules:
                             continue;
                         }
                     }
+                    let content_privacy = sanitize_moltbook_public_text(&content);
+                    if matches!(
+                        content_privacy.decision,
+                        crate::security::OutboundPrivacyDecision::Block
+                    ) {
+                        append_moltbook_activity(
+                            &storage,
+                            &run_id,
+                            "warning",
+                            "comment_blocked_privacy",
+                            serde_json::json!({
+                                "action_kind": "write",
+                                "post_id": post_id,
+                                "reason": action.reason.clone(),
+                                "privacy": moltbook_privacy_details(&content_privacy)
+                            }),
+                        )
+                        .await;
+                        engagement_failures.push(format!(
+                            "comment {}: blocked by outbound privacy gate",
+                            post_id
+                        ));
+                        continue;
+                    }
                     remaining_comments -= 1;
                     let post_api_url = moltbook_post_api_url(&post_id);
                     let comment_api_url = format!("{}/comments", post_api_url);
                     let post_meta = post_context.get(&post_id).cloned();
                     let post_url = post_meta.as_ref().map(|(_, _, url, _)| url.clone());
+                    let sanitized_comment_content = content_privacy.sanitized_text.clone();
                     match crate::integrations::Integration::execute(
                         &connector,
                         "comment",
                         &serde_json::json!({
                             "post_id": post_id,
                             "parent_id": action.parent_id.clone(),
-                            "content": content
+                            "content": sanitized_comment_content
                         }),
                     )
                     .await
@@ -1399,8 +1520,9 @@ Rules:
                                     "post_title": post_meta.as_ref().map(|(_, _, _, title)| title.clone()),
                                     "submolt": post_meta.as_ref().map(|(submolt, _, _, _)| submolt.clone()),
                                     "author": post_meta.as_ref().map(|(_, author, _, _)| author.clone()),
-                                    "content_preview": moltbook_text_preview(&content, 220),
-                                    "reason": action.reason.clone()
+                                    "content_preview": moltbook_text_preview(&content_privacy.sanitized_text, 220),
+                                    "reason": action.reason.clone(),
+                                    "privacy": moltbook_privacy_details(&content_privacy)
                                 }),
                             )
                             .await;
@@ -1422,8 +1544,9 @@ Rules:
                                     "post_title": post_meta.as_ref().map(|(_, _, _, title)| title.clone()),
                                     "submolt": post_meta.as_ref().map(|(submolt, _, _, _)| submolt.clone()),
                                     "author": post_meta.as_ref().map(|(_, author, _, _)| author.clone()),
-                                    "content_preview": moltbook_text_preview(&content, 220),
+                                    "content_preview": moltbook_text_preview(&content_privacy.sanitized_text, 220),
                                     "reason": action.reason.clone(),
+                                    "privacy": moltbook_privacy_details(&content_privacy),
                                     "error": error
                                 }),
                             )
@@ -1550,15 +1673,50 @@ Rules:
                     if !seen_actions.insert(format!("post:{}:{}", submolt, title)) {
                         continue;
                     }
+                    let title_privacy = sanitize_moltbook_public_text(&title);
+                    let content_privacy = sanitize_moltbook_public_text(&content);
+                    if matches!(
+                        title_privacy.decision,
+                        crate::security::OutboundPrivacyDecision::Block
+                    ) || matches!(
+                        content_privacy.decision,
+                        crate::security::OutboundPrivacyDecision::Block
+                    ) {
+                        append_moltbook_activity(
+                            &storage,
+                            &run_id,
+                            "warning",
+                            "post_blocked_privacy",
+                            serde_json::json!({
+                                "action_kind": "write",
+                                "api_url": create_post_api_url,
+                                "request": {
+                                    "submolt": submolt,
+                                },
+                                "reason": action.reason.clone(),
+                                "privacy": {
+                                    "title": moltbook_privacy_details(&title_privacy),
+                                    "content": moltbook_privacy_details(&content_privacy)
+                                }
+                            }),
+                        )
+                        .await;
+                        engagement_failures.push(
+                            "post: blocked by outbound privacy gate".to_string(),
+                        );
+                        continue;
+                    }
                     remaining_posts -= 1;
-                    let post_preview = moltbook_text_preview(&content, 280);
+                    let sanitized_post_title = title_privacy.sanitized_text.clone();
+                    let sanitized_post_content = content_privacy.sanitized_text.clone();
+                    let post_preview = moltbook_text_preview(&sanitized_post_content, 280);
                     match crate::integrations::Integration::execute(
                         &connector,
                         "create_post",
                         &serde_json::json!({
                             "submolt": submolt,
-                            "title": title,
-                            "content": content
+                            "title": sanitized_post_title,
+                            "content": sanitized_post_content
                         }),
                     )
                     .await
@@ -1593,10 +1751,14 @@ Rules:
                                     "post_id": posted_id,
                                     "request": {
                                         "submolt": submolt,
-                                        "title": title,
+                                        "title": title_privacy.sanitized_text.clone(),
                                         "content_preview": post_preview
                                     },
                                     "reason": action.reason.clone(),
+                                    "privacy": {
+                                        "title": moltbook_privacy_details(&title_privacy),
+                                        "content": moltbook_privacy_details(&content_privacy)
+                                    },
                                     "post_api_url": posted_api_url,
                                     "post_url": posted_url
                                 }),
@@ -1615,6 +1777,10 @@ Rules:
                                     "action_kind": "write",
                                     "api_url": create_post_api_url,
                                     "reason": action.reason.clone(),
+                                    "privacy": {
+                                        "title": moltbook_privacy_details(&title_privacy),
+                                        "content": moltbook_privacy_details(&content_privacy)
+                                    },
                                     "error": error
                                 }),
                             )
@@ -1777,53 +1943,78 @@ Rules:
     .await
     {
         Ok(Some(insights)) => {
-            match persist_moltbook_external_knowledge(&storage, &insights).await {
-                Ok(item) => {
-                    append_moltbook_activity(
-                        &storage,
-                        &run_id,
-                        "info",
-                        "external_memory_saved",
+            let (sanitized_insights, privacy) = sanitize_moltbook_memory_insights(&insights);
+            match sanitized_insights {
+                Some(sanitized) => match persist_moltbook_external_knowledge(&storage, &sanitized).await {
+                    Ok(item) => {
+                        append_moltbook_activity(
+                            &storage,
+                            &run_id,
+                            "info",
+                            "external_memory_saved",
+                            serde_json::json!({
+                                "knowledge_id": item.id.clone(),
+                                "title": item.title.clone(),
+                                "source": item.source.clone(),
+                                "tags": item.tags.clone(),
+                                "summary": sanitized.summary.clone(),
+                                "insights": sanitized.insights.clone(),
+                                "privacy": privacy.clone()
+                            }),
+                        )
+                        .await;
                         serde_json::json!({
+                            "status": "saved",
+                            "store": "knowledge",
                             "knowledge_id": item.id,
                             "title": item.title,
                             "source": item.source,
                             "tags": item.tags,
-                            "summary": insights.summary,
-                            "insights": insights.insights
-                        }),
-                    )
-                    .await;
-                    serde_json::json!({
-                        "status": "saved",
-                        "store": "knowledge",
-                        "knowledge_id": item.id,
-                        "title": item.title,
-                        "source": item.source,
-                        "tags": item.tags,
-                        "summary": insights.summary,
-                        "insights": insights.insights
-                    })
-                }
-                Err(error) => {
+                            "summary": sanitized.summary,
+                            "insights": sanitized.insights,
+                            "privacy": privacy
+                        })
+                    }
+                    Err(error) => {
+                        append_moltbook_activity(
+                            &storage,
+                            &run_id,
+                            "warning",
+                            "external_memory_save_failed",
+                            serde_json::json!({
+                                "summary": sanitized.summary.clone(),
+                                "insights": sanitized.insights.clone(),
+                                "privacy": privacy.clone(),
+                                "error": error.clone()
+                            }),
+                        )
+                        .await;
+                        serde_json::json!({
+                            "status": "save_failed",
+                            "store": "knowledge",
+                            "summary": sanitized.summary,
+                            "insights": sanitized.insights,
+                            "privacy": privacy,
+                            "error": error
+                        })
+                    }
+                },
+                None => {
                     append_moltbook_activity(
                         &storage,
                         &run_id,
                         "warning",
-                        "external_memory_save_failed",
+                        "external_memory_blocked_privacy",
                         serde_json::json!({
-                            "summary": insights.summary,
-                            "insights": insights.insights,
-                            "error": error
+                            "reason": "Distilled community learnings were blocked by the outbound privacy gate.",
+                            "privacy": privacy.clone()
                         }),
                     )
                     .await;
                     serde_json::json!({
-                        "status": "save_failed",
+                        "status": "blocked",
                         "store": "knowledge",
-                        "summary": insights.summary,
-                        "insights": insights.insights,
-                        "error": error
+                        "privacy": privacy
                     })
                 }
             }

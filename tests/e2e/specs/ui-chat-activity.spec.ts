@@ -613,4 +613,196 @@ test.describe("Chat Activity UI @smoke", () => {
       page.locator("text=Built the first draft and kept streaming the file into the workspace.")
     ).toBeVisible({ timeout: 10_000 });
   });
+
+  test("deep research shows a confirm card and resumes with the edited plan", async ({ page }) => {
+    let createdConversationId = "";
+    let userMessage = "";
+    let resumed = false;
+    let resumePayload: Record<string, unknown> | null = null;
+    const taskId = "task-deep-plan";
+    const assistantMessage = "Finished the deep research run with verified sources.";
+
+    await page.route("**/projects", async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ projects: [] })
+      });
+    });
+
+    await page.route("**/api/apps", async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ apps: [] })
+      });
+    });
+
+    await page.route("**/tunnel/status", async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({})
+      });
+    });
+
+    await page.route("**/conversations?**", async (route) => {
+      const conversations = createdConversationId
+        ? [
+            {
+              id: createdConversationId,
+              title: "Deep research preview",
+              channel: "web",
+              project_id: null,
+              created_at: "2026-04-03T10:00:00.000Z",
+              updated_at: resumed ? "2026-04-03T10:03:00.000Z" : "2026-04-03T10:01:00.000Z",
+              message_count: resumed ? 2 : 1,
+              archived: false
+            }
+          ]
+        : [];
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          conversations,
+          total: conversations.length,
+          limit: 30,
+          offset: 0
+        })
+      });
+    });
+
+    await page.route("**/conversations/*/messages?**", async (route) => {
+      const url = new URL(route.request().url());
+      const conversationId = url.pathname.split("/")[2] || "";
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          messages:
+            conversationId && conversationId === createdConversationId
+              ? resumed
+                ? [
+                    {
+                      id: "msg-user-deep-research",
+                      role: "user",
+                      content: userMessage,
+                      timestamp: "2026-04-03T10:00:01.000Z",
+                      model_used: null,
+                      trace_id: null
+                    },
+                    {
+                      id: "msg-assistant-deep-research",
+                      role: "assistant",
+                      content: assistantMessage,
+                      timestamp: "2026-04-03T10:03:10.000Z",
+                      model_used: "test-model",
+                      trace_id: null
+                    }
+                  ]
+                : [
+                    {
+                      id: "msg-user-deep-research",
+                      role: "user",
+                      content: userMessage,
+                      timestamp: "2026-04-03T10:00:01.000Z",
+                      model_used: null,
+                      trace_id: null
+                    }
+                  ]
+              : []
+        })
+      });
+    });
+
+    await page.route("**/conversations/*", async (route) => {
+      const url = new URL(route.request().url());
+      const conversationId = url.pathname.split("/")[2] || "";
+      if (!conversationId || conversationId !== createdConversationId) {
+        await route.fulfill({
+          status: 404,
+          contentType: "application/json",
+          body: JSON.stringify({ error: "not found" })
+        });
+        return;
+      }
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          id: createdConversationId,
+          title: "Deep research preview",
+          channel: "web",
+          project_id: null,
+          created_at: "2026-04-03T10:00:00.000Z",
+          updated_at: resumed ? "2026-04-03T10:03:10.000Z" : "2026-04-03T10:01:00.000Z",
+          message_count: resumed ? 2 : 1
+        })
+      });
+    });
+
+    await page.route("**/chat/stream", async (route) => {
+      const payload = route.request().postDataJSON() as {
+        conversation_id?: string;
+        message?: string;
+        deep_research?: boolean;
+        plan_confirmation_mode?: string;
+      };
+      expect(payload.deep_research).toBe(true);
+      expect(payload.plan_confirmation_mode).toBe("before_execution");
+      createdConversationId = payload.conversation_id || "conv-deep-research";
+      userMessage = payload.message || "compare open source release strategies for ai agents";
+      await route.fulfill({
+        status: 200,
+        contentType: "text/event-stream",
+        body: [
+          `event: task_started\ndata: {"task_id":"${taskId}","description":"Deep research preview","status":"in_progress","work_type":"research","conversation_id":"${createdConversationId}"}\n\n`,
+          `event: plan_generated\ndata: {"step_type":"plan_generated","plan":{"plan_id":"plan-preview","revision":1,"summary":"","steps":[{"id":1,"title":"Scope the question","description":"Clarify the research goal and constraints.","status":"pending","action":null,"arguments":{},"tool_hint":null},{"id":2,"title":"Gather source sets","description":"Collect primary sources, recent reporting, and comparison points.","status":"pending","action":null,"arguments":{},"tool_hint":null},{"id":3,"title":"Verify and synthesize","description":"Compare claims, resolve contradictions, and answer with citations.","status":"pending","action":null,"arguments":{},"tool_hint":null}]}}\n\n`,
+          `event: plan_ready_for_confirmation\ndata: {"step_type":"plan_ready_for_confirmation","task_id":"${taskId}","source":"deep_research","plan":{"plan_id":"plan-preview","revision":1,"summary":"","steps":[{"id":1,"title":"Scope the question","description":"Clarify the research goal and constraints.","status":"pending","action":null,"arguments":{},"tool_hint":null},{"id":2,"title":"Gather source sets","description":"Collect primary sources, recent reporting, and comparison points.","status":"pending","action":null,"arguments":{},"tool_hint":null},{"id":3,"title":"Verify and synthesize","description":"Compare claims, resolve contradictions, and answer with citations.","status":"pending","action":null,"arguments":{},"tool_hint":null}]}}\n\n`,
+          "event: done\ndata: {}\n\n"
+        ].join("")
+      });
+    });
+
+    await page.route(`**/tasks/${taskId}/resume-chat/stream`, async (route) => {
+      resumePayload = route.request().postDataJSON() as Record<string, unknown>;
+      resumed = true;
+      await route.fulfill({
+        status: 200,
+        contentType: "text/event-stream",
+        body: [
+          `event: task_started\ndata: {"task_id":"${taskId}","description":"Deep research preview","status":"in_progress","work_type":"research","conversation_id":"${createdConversationId}"}\n\n`,
+          'event: plan_step_update\ndata: {"step_type":"plan_step_update","plan_id":"plan-preview","revision":1,"step_id":1,"step_title":"Scope the question","status":"running","detail":"Started step 1: Scope the question."}\n\n',
+          `event: content\ndata: {"conversation_id":"${createdConversationId}","content":"${assistantMessage}"}\n\n`,
+          "event: done\ndata: {}\n\n"
+        ].join("")
+      });
+    });
+
+    await page.goto("/");
+    await page.waitForSelector("text=AgentArk", { timeout: 15_000 });
+
+    const chatNav = page.locator("text=Chat").first();
+    if (await chatNav.isVisible()) {
+      await chatNav.click();
+    }
+
+    await page.locator("label").filter({ hasText: "Deep research" }).click();
+    const input = page.locator("textarea[aria-label='Message']").first();
+    await expect(input).toBeVisible({ timeout: 10_000 });
+
+    await input.fill("compare open source release strategies for ai agents");
+    await input.press("Enter");
+
+    await expect(page.locator("text=Plan ready")).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator("text=Review the plan, make edits if needed, then start the run.")).toBeVisible({
+      timeout: 10_000
+    });
+
+    await page.getByRole("button", { name: "Edit" }).click();
+    await page.getByPlaceholder("Add a brief research summary").fill(
+      "Edited summary for a source-backed open source release strategy review."
+    );
+    await page.getByRole("button", { name: "Start" }).click();
+
+    await expect(page.locator(`text=${assistantMessage}`)).toBeVisible({ timeout: 10_000 });
+    expect(
+      (resumePayload?.plan_override as { summary?: string } | undefined)?.summary
+    ).toBe("Edited summary for a source-backed open source release strategy review.");
+  });
 });

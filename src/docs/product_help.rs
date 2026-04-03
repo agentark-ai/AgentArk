@@ -255,7 +255,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                 label: "embeddings",
                 items: &[
                     "Settings > Models > Embeddings is separate from chat model slots.",
-                    "Default mode is Local using built-in Hugging Face embeddings with `sentence-transformers/all-MiniLM-L6-v2`.",
+                    "Default mode is Local using built-in Hugging Face embeddings with `BAAI/bge-small-en-v1.5`.",
                     "External embeddings are optional and use an OpenAI-compatible embeddings endpoint.",
                     "User-managed Ollama can be used there if the user points __PRODUCT_NAME__ at it explicitly, but Ollama is not bundled for embeddings by default.",
                 ],
@@ -322,7 +322,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                 label: "default local setup",
                 items: &[
                     "Provider: local built-in Hugging Face embeddings.",
-                    "Model: `sentence-transformers/all-MiniLM-L6-v2`.",
+                    "Model: `BAAI/bge-small-en-v1.5`.",
                     "This does not require a bundled Ollama service.",
                     "The model is managed by __PRODUCT_NAME__ and should become ready after download or cache completes.",
                 ],
@@ -1017,7 +1017,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             "sentinel",
             "settings",
         ],
-        summary: "Settings > Admin > Evolution covers learning and self-evolve controls; Sentinel shows live Background learning status.",
+        summary: "Settings > Admin > Evolution covers local memory-driven learning and self-evolve controls; Sentinel shows live Background learning status.",
         sections: &[
             BundledHelpSection {
                 label: "learning pipeline",
@@ -1028,15 +1028,24 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Pattern induction turns repeated successful procedures into learned procedural patterns.",
                     "Candidate generation creates draft workflow, strategy, merge, or deprecation candidates for review.",
                     "Draft candidates are suggestions only until they are approved.",
+                    "This pipeline is offline-first personalization through local memory, retrieval context, prompts, routing, and policy state; it does not imply continuous base-model weight updates by default.",
                 ],
             },
             BundledHelpSection {
                 label: "self-evolve",
                 items: &[
-                    "Self-evolve focuses on improved routing-policy generation and testing.",
+                    "Self-evolve focuses on improved routing-policy generation and testing, not silent retraining of the base model.",
                     "Candidate policies can be activated in canary mode so only part of traffic uses them first.",
                     "Replay gate checks help decide whether a candidate is safe to promote.",
                     "Promotion mode, last promotion result, and canary state show rollout stage.",
+                ],
+            },
+            BundledHelpSection {
+                label: "parameter-updating learning",
+                items: &[
+                    "If a deployment adds learning that changes model parameters, describe it as a separate higher-risk capability.",
+                    "Expected controls include documented model lineage, signed artifacts, gated updates or approvals, and poisoning or provenance checks.",
+                    "For federated learning setups, require secure aggregation and privacy protections before making stronger claims.",
                 ],
             },
             BundledHelpSection {
@@ -1069,6 +1078,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "If the user asks whether it is enabled or what it has learned, report current toggles and counts first and then explain the meaning.",
                     "If the user asks about background learning status or why it is not running, lead with the live Sentinel background learning state and per-job status first.",
                     "Use live status rather than stale docs when debugging background learning.",
+                    "Do not describe the current product as continuously retraining base model weights unless that deployment explicitly has a parameter-updating feature enabled.",
                     "Keep official product explanation separate from draft candidate content.",
                 ],
             },

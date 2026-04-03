@@ -5,15 +5,16 @@ pub mod entities;
 mod migrations;
 
 use crate::crypto::KeyManager;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use sea_orm::entity::prelude::PgVector;
 use sea_orm::sea_query::{Alias, Expr, Func, OnConflict, Order, Query};
 #[allow(unused_imports)]
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectOptions, ConnectionTrait, Database,
-    DatabaseConnection, DbBackend, EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set, TransactionTrait, TryGetable, Unchanged,
+    DatabaseConnection, DatabaseTransaction, DbBackend, EntityTrait, FromQueryResult,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
+    TryGetable, Unchanged,
 };
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
@@ -29,6 +30,21 @@ pub struct Storage {
 pub struct HousekeepingStatus {
     pub housekeeping_last_run_at: Option<String>,
     pub notification_last_run_at: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct KvLeaseRecord {
+    owner_id: String,
+    acquired_at: String,
+    expires_at: String,
+    #[serde(default)]
+    fence_token: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct KvLeaseGuard {
+    pub owner_id: String,
+    pub fence_token: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -254,6 +270,73 @@ fn decrypt_storage_string(value: &str) -> String {
     } else {
         value.to_string()
     }
+}
+
+fn pgvector_sql_literal(embedding: &PgVector) -> String {
+    let values = embedding
+        .as_slice()
+        .iter()
+        .map(|value| format!("{value:.8}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("'[{values}]'::vector")
+}
+
+fn sql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn sql_string_list(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| sql_string_literal(value))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn lease_is_active(record: &KvLeaseRecord, now: chrono::DateTime<chrono::Utc>) -> bool {
+    chrono::DateTime::parse_from_rfc3339(&record.expires_at)
+        .map(|value| value.with_timezone(&chrono::Utc) > now)
+        .unwrap_or(false)
+}
+
+fn next_lease_fence_token(existing: Option<&KvLeaseRecord>) -> u64 {
+    existing
+        .map(|record| record.fence_token.saturating_add(1))
+        .unwrap_or(1)
+}
+
+fn kv_lease_guard_is_current(
+    record: &KvLeaseRecord,
+    guard: &KvLeaseGuard,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    record.owner_id == guard.owner_id
+        && record.fence_token == guard.fence_token
+        && lease_is_active(record, now)
+}
+
+fn parse_kv_json_value<T>(key: &str, raw: &[u8]) -> Result<Option<T>>
+where
+    T: serde::de::DeserializeOwned,
+{
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_slice(raw).with_context(|| {
+        format!("Failed to parse kv_store JSON payload for key '{key}'")
+    })?))
+}
+
+fn parse_strategy_candidate_profile(
+    candidate: &learning_candidate::Model,
+) -> Result<crate::core::self_evolve::strategy_runtime::ToolStrategyProfile> {
+    serde_json::from_value(candidate.proposed_content.clone()).with_context(|| {
+        format!(
+            "Failed to parse strategy candidate payload for '{}'",
+            candidate.id
+        )
+    })
 }
 
 fn is_foreign_key_constraint_error(error: &sea_orm::DbErr) -> bool {
@@ -592,6 +675,382 @@ impl Storage {
         kv_store::Entity::delete_by_id(key.to_string())
             .exec(&self.db)
             .await?;
+        Ok(())
+    }
+
+    async fn ensure_kv_row_exists_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        key: &str,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        kv_store::Entity::insert(kv_store::ActiveModel {
+            key: Set(key.to_string()),
+            value: Set(Vec::new()),
+            created_at: Set(now.clone()),
+            updated_at: Set(now),
+        })
+        .on_conflict(
+            OnConflict::column(kv_store::Column::Key)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(txn)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_kv_for_update_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        key: &str,
+    ) -> Result<Option<kv_store::Model>> {
+        let sql = format!(
+            "SELECT key, value, created_at, updated_at FROM kv_store WHERE key = {} FOR UPDATE",
+            sql_string_literal(key)
+        );
+        let row = txn
+            .query_one(Statement::from_string(DbBackend::Postgres, sql))
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some(kv_store::Model {
+            key: row.try_get("", "key")?,
+            value: row.try_get("", "value")?,
+            created_at: row.try_get("", "created_at")?,
+            updated_at: row.try_get("", "updated_at")?,
+        }))
+    }
+
+    async fn set_kv_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        key: &str,
+        value: &[u8],
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        kv_store::Entity::insert(kv_store::ActiveModel {
+            key: Set(key.to_string()),
+            value: Set(value.to_vec()),
+            created_at: Set(now.clone()),
+            updated_at: Set(now),
+        })
+        .on_conflict(
+            OnConflict::column(kv_store::Column::Key)
+                .update_columns([kv_store::Column::Value, kv_store::Column::UpdatedAt])
+                .to_owned(),
+        )
+        .exec(txn)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_kv_txn(&self, txn: &DatabaseTransaction, key: &str) -> Result<()> {
+        kv_store::Entity::delete_by_id(key.to_string())
+            .exec(txn)
+            .await?;
+        Ok(())
+    }
+
+    async fn load_kv_json_txn<T>(&self, txn: &DatabaseTransaction, key: &str) -> Result<Option<T>>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let row = self.get_kv_for_update_txn(txn, key).await?;
+        match row {
+            Some(row) => parse_kv_json_value(key, &row.value),
+            None => Ok(None),
+        }
+    }
+
+    async fn set_kv_json_txn<T>(&self, txn: &DatabaseTransaction, key: &str, value: &T) -> Result<()>
+    where
+        T: serde::Serialize,
+    {
+        let raw = serde_json::to_vec(value).with_context(|| {
+            format!("Failed to serialize kv_store JSON payload for key '{key}'")
+        })?;
+        self.set_kv_txn(txn, key, &raw).await
+    }
+
+    async fn load_learning_candidate_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        id: &str,
+    ) -> Result<Option<learning_candidate::Model>> {
+        Ok(learning_candidate::Entity::find_by_id(id.to_string())
+            .one(txn)
+            .await?)
+    }
+
+    async fn update_learning_candidate_review_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        id: &str,
+        approval_status: &str,
+        review_notes: Option<&str>,
+        approved_ref: Option<&str>,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        learning_candidate::Entity::update_many()
+            .col_expr(
+                learning_candidate::Column::ApprovalStatus,
+                Expr::value(approval_status.to_string()),
+            )
+            .col_expr(
+                learning_candidate::Column::ReviewNotes,
+                Expr::value(review_notes.map(|value| value.to_string())),
+            )
+            .col_expr(
+                learning_candidate::Column::ReviewedAt,
+                Expr::value(Some(now.clone())),
+            )
+            .col_expr(
+                learning_candidate::Column::ApprovedRef,
+                Expr::value(approved_ref.map(|value| value.to_string())),
+            )
+            .col_expr(learning_candidate::Column::UpdatedAt, Expr::value(now))
+            .filter(learning_candidate::Column::Id.eq(id))
+            .exec(txn)
+            .await?;
+        Ok(())
+    }
+
+    async fn require_kv_lease_guard_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        key: &str,
+        guard: &KvLeaseGuard,
+    ) -> Result<bool> {
+        self.ensure_kv_row_exists_txn(txn, key).await?;
+        let Some(row) = self.get_kv_for_update_txn(txn, key).await? else {
+            return Ok(false);
+        };
+        let Some(record) = serde_json::from_slice::<KvLeaseRecord>(&row.value).ok() else {
+            return Ok(false);
+        };
+        Ok(kv_lease_guard_is_current(
+            &record,
+            guard,
+            chrono::Utc::now(),
+        ))
+    }
+
+    async fn upsert_learning_candidate_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        candidate: &learning_candidate::Model,
+    ) -> Result<()> {
+        learning_candidate::Entity::insert(learning_candidate::ActiveModel {
+            id: Set(candidate.id.clone()),
+            candidate_type: Set(candidate.candidate_type.clone()),
+            subject_key: Set(candidate.subject_key.clone()),
+            title: Set(candidate.title.clone()),
+            summary: Set(candidate.summary.clone()),
+            project_id: Set(candidate.project_id.clone()),
+            conversation_id: Set(candidate.conversation_id.clone()),
+            pattern_id: Set(candidate.pattern_id.clone()),
+            evidence_refs: Set(candidate.evidence_refs.clone()),
+            proposed_content: Set(candidate.proposed_content.clone()),
+            confidence: Set(candidate.confidence),
+            approval_status: Set(candidate.approval_status.clone()),
+            review_notes: Set(candidate.review_notes.clone()),
+            reviewed_at: Set(candidate.reviewed_at.clone()),
+            approved_ref: Set(candidate.approved_ref.clone()),
+            created_at: Set(candidate.created_at.clone()),
+            updated_at: Set(candidate.updated_at.clone()),
+        })
+        .on_conflict(
+            OnConflict::column(learning_candidate::Column::Id)
+                .update_columns([
+                    learning_candidate::Column::CandidateType,
+                    learning_candidate::Column::SubjectKey,
+                    learning_candidate::Column::Title,
+                    learning_candidate::Column::Summary,
+                    learning_candidate::Column::ProjectId,
+                    learning_candidate::Column::ConversationId,
+                    learning_candidate::Column::PatternId,
+                    learning_candidate::Column::EvidenceRefs,
+                    learning_candidate::Column::ProposedContent,
+                    learning_candidate::Column::Confidence,
+                    learning_candidate::Column::UpdatedAt,
+                ])
+                .to_owned(),
+        )
+        .exec(txn)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn acquire_kv_lease(&self, key: &str, owner_id: &str, ttl_secs: i64) -> Result<bool> {
+        let ttl_secs = ttl_secs.max(1);
+        let txn = self.db.begin().await?;
+        self.ensure_kv_row_exists_txn(&txn, key).await?;
+        let existing = self.get_kv_for_update_txn(&txn, key).await?;
+        let now = chrono::Utc::now();
+        let lease = existing
+            .as_ref()
+            .and_then(|row| serde_json::from_slice::<KvLeaseRecord>(&row.value).ok());
+        if lease
+            .as_ref()
+            .is_some_and(|record| lease_is_active(record, now) && record.owner_id != owner_id)
+        {
+            txn.rollback().await?;
+            return Ok(false);
+        }
+
+        let next = KvLeaseRecord {
+            owner_id: owner_id.to_string(),
+            acquired_at: now.to_rfc3339(),
+            expires_at: (now + chrono::Duration::seconds(ttl_secs)).to_rfc3339(),
+            fence_token: next_lease_fence_token(lease.as_ref()),
+        };
+        let raw = serde_json::to_vec(&next)?;
+        self.set_kv_txn(&txn, key, &raw).await?;
+        txn.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn refresh_kv_lease(
+        &self,
+        key: &str,
+        owner_id: &str,
+        ttl_secs: i64,
+    ) -> Result<bool> {
+        let ttl_secs = ttl_secs.max(1);
+        let txn = self.db.begin().await?;
+        self.ensure_kv_row_exists_txn(&txn, key).await?;
+        let existing = self.get_kv_for_update_txn(&txn, key).await?;
+        let now = chrono::Utc::now();
+        let Some(lease) = existing
+            .as_ref()
+            .and_then(|row| serde_json::from_slice::<KvLeaseRecord>(&row.value).ok())
+        else {
+            txn.rollback().await?;
+            return Ok(false);
+        };
+        if lease.owner_id != owner_id || !lease_is_active(&lease, now) {
+            txn.rollback().await?;
+            return Ok(false);
+        }
+        let refreshed = KvLeaseRecord {
+            owner_id: owner_id.to_string(),
+            acquired_at: lease.acquired_at,
+            expires_at: (now + chrono::Duration::seconds(ttl_secs)).to_rfc3339(),
+            fence_token: lease.fence_token,
+        };
+        let raw = serde_json::to_vec(&refreshed)?;
+        self.set_kv_txn(&txn, key, &raw).await?;
+        txn.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn release_kv_lease(&self, key: &str, owner_id: &str) -> Result<()> {
+        let txn = self.db.begin().await?;
+        self.ensure_kv_row_exists_txn(&txn, key).await?;
+        let existing = self.get_kv_for_update_txn(&txn, key).await?;
+        let lease = existing
+            .as_ref()
+            .and_then(|row| serde_json::from_slice::<KvLeaseRecord>(&row.value).ok());
+        if lease
+            .as_ref()
+            .is_some_and(|record| record.owner_id == owner_id)
+        {
+            self.delete_kv_txn(&txn, key).await?;
+        }
+        txn.commit().await?;
+        Ok(())
+    }
+
+    pub async fn acquire_kv_lease_guard(
+        &self,
+        key: &str,
+        owner_id: &str,
+        ttl_secs: i64,
+    ) -> Result<Option<KvLeaseGuard>> {
+        let ttl_secs = ttl_secs.max(1);
+        let txn = self.db.begin().await?;
+        self.ensure_kv_row_exists_txn(&txn, key).await?;
+        let existing = self.get_kv_for_update_txn(&txn, key).await?;
+        let now = chrono::Utc::now();
+        let lease = existing
+            .as_ref()
+            .and_then(|row| serde_json::from_slice::<KvLeaseRecord>(&row.value).ok());
+        if lease
+            .as_ref()
+            .is_some_and(|record| lease_is_active(record, now) && record.owner_id != owner_id)
+        {
+            txn.rollback().await?;
+            return Ok(None);
+        }
+
+        let fence_token = next_lease_fence_token(lease.as_ref());
+        let next = KvLeaseRecord {
+            owner_id: owner_id.to_string(),
+            acquired_at: now.to_rfc3339(),
+            expires_at: (now + chrono::Duration::seconds(ttl_secs)).to_rfc3339(),
+            fence_token,
+        };
+        let raw = serde_json::to_vec(&next)?;
+        self.set_kv_txn(&txn, key, &raw).await?;
+        txn.commit().await?;
+        Ok(Some(KvLeaseGuard {
+            owner_id: owner_id.to_string(),
+            fence_token,
+        }))
+    }
+
+    pub async fn refresh_kv_lease_guard(
+        &self,
+        key: &str,
+        guard: &KvLeaseGuard,
+        ttl_secs: i64,
+    ) -> Result<bool> {
+        let ttl_secs = ttl_secs.max(1);
+        let txn = self.db.begin().await?;
+        self.ensure_kv_row_exists_txn(&txn, key).await?;
+        let existing = self.get_kv_for_update_txn(&txn, key).await?;
+        let now = chrono::Utc::now();
+        let Some(lease) = existing
+            .as_ref()
+            .and_then(|row| serde_json::from_slice::<KvLeaseRecord>(&row.value).ok())
+        else {
+            txn.rollback().await?;
+            return Ok(false);
+        };
+        if !kv_lease_guard_is_current(&lease, guard, now) {
+            txn.rollback().await?;
+            return Ok(false);
+        }
+        let refreshed = KvLeaseRecord {
+            owner_id: lease.owner_id,
+            acquired_at: lease.acquired_at,
+            expires_at: (now + chrono::Duration::seconds(ttl_secs)).to_rfc3339(),
+            fence_token: lease.fence_token,
+        };
+        let raw = serde_json::to_vec(&refreshed)?;
+        self.set_kv_txn(&txn, key, &raw).await?;
+        txn.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn release_kv_lease_guard(&self, key: &str, guard: &KvLeaseGuard) -> Result<()> {
+        let txn = self.db.begin().await?;
+        self.ensure_kv_row_exists_txn(&txn, key).await?;
+        let existing = self.get_kv_for_update_txn(&txn, key).await?;
+        let lease = existing
+            .as_ref()
+            .and_then(|row| serde_json::from_slice::<KvLeaseRecord>(&row.value).ok());
+        if lease
+            .as_ref()
+            .is_some_and(|record| {
+                record.owner_id == guard.owner_id && record.fence_token == guard.fence_token
+            })
+        {
+            self.delete_kv_txn(&txn, key).await?;
+        }
+        txn.commit().await?;
         Ok(())
     }
 
@@ -1119,6 +1578,93 @@ impl Storage {
         Ok(episodes)
     }
 
+    pub async fn get_episodes_by_ids(&self, ids: &[String]) -> Result<Vec<episode::Model>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let models = episode::Entity::find()
+            .filter(episode::Column::Id.is_in(ids.iter().cloned()))
+            .all(&self.db)
+            .await?;
+        let mut by_id = models
+            .into_iter()
+            .map(|model| (model.id.clone(), model))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        Ok(ids
+            .iter()
+            .filter_map(|id| by_id.remove(id))
+            .collect::<Vec<_>>())
+    }
+
+    pub async fn list_recent_episode_ids_for_scoring(
+        &self,
+        project_id: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<String>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut query = episode::Entity::find()
+            .select_only()
+            .column(episode::Column::Id)
+            .order_by_desc(episode::Column::Timestamp);
+        if let Some(pid) = project_id {
+            query = query.filter(
+                Condition::any()
+                    .add(episode::Column::ProjectId.eq(pid))
+                    .add(episode::Column::ProjectId.is_null()),
+            );
+        }
+
+        query
+            .limit(Self::db_limit(limit))
+            .into_tuple::<String>()
+            .all(&self.db)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn nearest_episode_ids(
+        &self,
+        query_embedding: &PgVector,
+        project_id: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<String>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let embedding_sql = pgvector_sql_literal(query_embedding);
+        let scope_filter = if let Some(pid) = project_id {
+            format!(
+                " AND (project_id = '{}' OR project_id IS NULL)",
+                pid.replace('\'', "''")
+            )
+        } else {
+            String::new()
+        };
+        let sql = format!(
+            "SELECT id \
+             FROM episodes \
+             WHERE embedding IS NOT NULL{scope_filter} \
+             ORDER BY embedding <=> {embedding_sql} ASC, timestamp DESC \
+             LIMIT {}",
+            Self::db_limit(limit)
+        );
+
+        let rows = self
+            .db
+            .query_all(Statement::from_string(DbBackend::Postgres, sql))
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| row.try_get::<String>("", "id").ok())
+            .collect())
+    }
+
     /// Count episodes
     pub async fn count_episodes(&self) -> Result<u64> {
         let count = episode::Entity::find().count(&self.db).await?;
@@ -1278,6 +1824,26 @@ impl Storage {
         Ok(facts)
     }
 
+    pub async fn get_facts_by_ids(&self, ids: &[String]) -> Result<Vec<semantic_fact::Model>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let models = semantic_fact::Entity::find()
+            .filter(semantic_fact::Column::Id.is_in(ids.iter().cloned()))
+            .all(&self.db)
+            .await?;
+        let mut by_id = models
+            .into_iter()
+            .map(|model| (model.id.clone(), model))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        Ok(ids
+            .iter()
+            .filter_map(|id| by_id.remove(id))
+            .collect::<Vec<_>>())
+    }
+
     /// Get only global-scope semantic facts.
     pub async fn get_global_facts(
         &self,
@@ -1309,6 +1875,73 @@ impl Storage {
             .filter(semantic_fact::Column::ProjectId.is_null())
             .count(&self.db)
             .await?)
+    }
+
+    pub async fn list_recent_fact_ids_for_scope(
+        &self,
+        project_id: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<String>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut query = semantic_fact::Entity::find()
+            .select_only()
+            .column(semantic_fact::Column::Id)
+            .order_by_desc(semantic_fact::Column::CreatedAt);
+        if let Some(pid) = project_id {
+            query = query.filter(
+                Condition::any()
+                    .add(semantic_fact::Column::ProjectId.eq(pid))
+                    .add(semantic_fact::Column::ProjectId.is_null()),
+            );
+        }
+
+        query
+            .limit(Self::db_limit(limit))
+            .into_tuple::<String>()
+            .all(&self.db)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn nearest_semantic_fact_ids(
+        &self,
+        query_embedding: &PgVector,
+        project_id: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<String>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let embedding_sql = pgvector_sql_literal(query_embedding);
+        let scope_filter = if let Some(pid) = project_id {
+            format!(
+                " AND (project_id = '{}' OR project_id IS NULL)",
+                pid.replace('\'', "''")
+            )
+        } else {
+            String::new()
+        };
+        let sql = format!(
+            "SELECT id \
+             FROM semantic_facts \
+             WHERE embedding IS NOT NULL{scope_filter} \
+             ORDER BY embedding <=> {embedding_sql} ASC, created_at DESC \
+             LIMIT {}",
+            Self::db_limit(limit)
+        );
+
+        let rows = self
+            .db
+            .query_all(Statement::from_string(DbBackend::Postgres, sql))
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| row.try_get::<String>("", "id").ok())
+            .collect())
     }
 
     /// Get episodes for scoring, scoped to project (includes global episodes too)
@@ -2482,17 +3115,77 @@ impl Storage {
             "correction_signal": correction_signal,
             "correction_recorded_at": now,
         });
-        let Some(target) = experience_run::Entity::find()
+        let candidates = experience_run::Entity::find()
             .filter(experience_run::Column::ConversationId.eq(conversation_id.to_string()))
             .filter(experience_run::Column::SuccessState.eq("provisional"))
             .filter(experience_run::Column::CorrectionState.eq("none"))
             .filter(experience_run::Column::CreatedAt.gte(cutoff))
             .order_by_desc(experience_run::Column::CreatedAt)
-            .one(&self.db)
-            .await?
-        else {
+            .limit(2)
+            .all(&self.db)
+            .await?;
+        if candidates.len() != 1 {
             return Ok(None);
-        };
+        }
+        let target = candidates
+            .into_iter()
+            .next()
+            .expect("exactly one correction candidate");
+
+        let mut metadata = target.metadata.clone();
+        if let Some(existing) = metadata.as_object_mut() {
+            if let Some(payload_map) = payload.as_object() {
+                for (key, value) in payload_map {
+                    existing.insert(key.clone(), value.clone());
+                }
+            }
+        } else {
+            metadata = payload;
+        }
+
+        let updated = experience_run::ActiveModel {
+            id: Unchanged(target.id),
+            success_state: Set(if target.success_state == "provisional" {
+                "failed".to_string()
+            } else {
+                target.success_state
+            }),
+            correction_state: Set("corrected".to_string()),
+            corrected_at: Set(Some(now.clone())),
+            updated_at: Set(now),
+            metadata: Set(metadata),
+            ..Default::default()
+        }
+        .update(&self.db)
+        .await?;
+        Ok(Some(updated))
+    }
+
+    pub async fn mark_provisional_experience_run_corrected_by_trace_id(
+        &self,
+        trace_id: &str,
+        correction_signal: &str,
+    ) -> Result<Option<experience_run::Model>> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let payload = serde_json::json!({
+            "correction_signal": correction_signal,
+            "correction_recorded_at": now,
+            "correction_bound_by": "trace_id",
+        });
+        let candidates = experience_run::Entity::find()
+            .filter(experience_run::Column::TraceId.eq(trace_id.to_string()))
+            .filter(experience_run::Column::SuccessState.eq("provisional"))
+            .filter(experience_run::Column::CorrectionState.eq("none"))
+            .limit(2)
+            .all(&self.db)
+            .await?;
+        if candidates.len() != 1 {
+            return Ok(None);
+        }
+        let target = candidates
+            .into_iter()
+            .next()
+            .expect("exactly one trace-bound correction candidate");
 
         let mut metadata = target.metadata.clone();
         if let Some(existing) = metadata.as_object_mut() {
@@ -3087,53 +3780,20 @@ impl Storage {
         Ok(patterns)
     }
 
-    pub async fn upsert_learning_candidate(
+    pub async fn upsert_learning_candidate_guarded(
         &self,
+        lease_key: &str,
+        guard: &KvLeaseGuard,
         candidate: &learning_candidate::Model,
-    ) -> Result<()> {
-        learning_candidate::Entity::insert(learning_candidate::ActiveModel {
-            id: Set(candidate.id.clone()),
-            candidate_type: Set(candidate.candidate_type.clone()),
-            subject_key: Set(candidate.subject_key.clone()),
-            title: Set(candidate.title.clone()),
-            summary: Set(candidate.summary.clone()),
-            project_id: Set(candidate.project_id.clone()),
-            conversation_id: Set(candidate.conversation_id.clone()),
-            pattern_id: Set(candidate.pattern_id.clone()),
-            evidence_refs: Set(candidate.evidence_refs.clone()),
-            proposed_content: Set(candidate.proposed_content.clone()),
-            confidence: Set(candidate.confidence),
-            approval_status: Set(candidate.approval_status.clone()),
-            review_notes: Set(candidate.review_notes.clone()),
-            reviewed_at: Set(candidate.reviewed_at.clone()),
-            approved_ref: Set(candidate.approved_ref.clone()),
-            created_at: Set(candidate.created_at.clone()),
-            updated_at: Set(candidate.updated_at.clone()),
-        })
-        .on_conflict(
-            OnConflict::column(learning_candidate::Column::Id)
-                .update_columns([
-                    learning_candidate::Column::CandidateType,
-                    learning_candidate::Column::SubjectKey,
-                    learning_candidate::Column::Title,
-                    learning_candidate::Column::Summary,
-                    learning_candidate::Column::ProjectId,
-                    learning_candidate::Column::ConversationId,
-                    learning_candidate::Column::PatternId,
-                    learning_candidate::Column::EvidenceRefs,
-                    learning_candidate::Column::ProposedContent,
-                    learning_candidate::Column::Confidence,
-                    learning_candidate::Column::ApprovalStatus,
-                    learning_candidate::Column::ReviewNotes,
-                    learning_candidate::Column::ReviewedAt,
-                    learning_candidate::Column::ApprovedRef,
-                    learning_candidate::Column::UpdatedAt,
-                ])
-                .to_owned(),
-        )
-        .exec(&self.db)
-        .await?;
-        Ok(())
+    ) -> Result<bool> {
+        let txn = self.db.begin().await?;
+        if !self.require_kv_lease_guard_txn(&txn, lease_key, guard).await? {
+            txn.rollback().await?;
+            return Ok(false);
+        }
+        self.upsert_learning_candidate_txn(&txn, candidate).await?;
+        txn.commit().await?;
+        Ok(true)
     }
 
     pub async fn get_learning_candidate(
@@ -3145,16 +3805,43 @@ impl Storage {
             .await?)
     }
 
-    pub async fn list_learning_candidates(
+    pub async fn list_learning_candidates_with_options(
         &self,
         approval_status: Option<&str>,
+        include_superseded: bool,
         limit: u64,
     ) -> Result<Vec<learning_candidate::Model>> {
         let mut query = learning_candidate::Entity::find();
         if let Some(status) = approval_status.filter(|v| !v.trim().is_empty()) {
             query = query.filter(learning_candidate::Column::ApprovalStatus.eq(status));
+        } else if !include_superseded {
+            query = query.filter(learning_candidate::Column::ApprovalStatus.ne("superseded"));
         }
         Ok(query
+            .order_by_desc(learning_candidate::Column::UpdatedAt)
+            .limit(Self::db_limit(limit))
+            .all(&self.db)
+            .await?)
+    }
+
+    pub async fn list_learning_candidates(
+        &self,
+        approval_status: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<learning_candidate::Model>> {
+        self.list_learning_candidates_with_options(approval_status, false, limit)
+            .await
+    }
+
+    pub async fn list_learning_candidates_for_subject(
+        &self,
+        candidate_type: &str,
+        subject_key: &str,
+        limit: u64,
+    ) -> Result<Vec<learning_candidate::Model>> {
+        Ok(learning_candidate::Entity::find()
+            .filter(learning_candidate::Column::CandidateType.eq(candidate_type.to_string()))
+            .filter(learning_candidate::Column::SubjectKey.eq(subject_key.to_string()))
             .order_by_desc(learning_candidate::Column::UpdatedAt)
             .limit(Self::db_limit(limit))
             .all(&self.db)
@@ -3193,6 +3880,244 @@ impl Storage {
             .exec(&self.db)
             .await?;
         Ok(())
+    }
+
+    pub async fn update_learning_candidate_review_guarded(
+        &self,
+        lease_key: &str,
+        guard: &KvLeaseGuard,
+        id: &str,
+        approval_status: &str,
+        review_notes: Option<&str>,
+        approved_ref: Option<&str>,
+    ) -> Result<bool> {
+        let txn = self.db.begin().await?;
+        if !self.require_kv_lease_guard_txn(&txn, lease_key, guard).await? {
+            txn.rollback().await?;
+            return Ok(false);
+        }
+        self.update_learning_candidate_review_txn(
+            &txn,
+            id,
+            approval_status,
+            review_notes,
+            approved_ref,
+        )
+        .await?;
+        txn.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn disable_strategy_canary_for_version(
+        &self,
+        candidate_version: &str,
+    ) -> Result<bool> {
+        let txn = self.db.begin().await?;
+        self.ensure_kv_row_exists_txn(
+            &txn,
+            crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_CANARY_STATE_KEY,
+        )
+        .await?;
+        let Some(mut canary_state) = self
+            .load_kv_json_txn::<crate::core::self_evolve::strategy_runtime::CanaryRolloutState>(
+                &txn,
+                crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_CANARY_STATE_KEY,
+            )
+            .await?
+        else {
+            txn.rollback().await?;
+            return Ok(false);
+        };
+        if canary_state.candidate_version != candidate_version {
+            txn.rollback().await?;
+            return Ok(false);
+        }
+        canary_state.enabled = false;
+        self.set_kv_json_txn(
+            &txn,
+            crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_CANARY_STATE_KEY,
+            &canary_state,
+        )
+        .await?;
+        txn.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn approve_strategy_learning_candidate(
+        &self,
+        candidate_id: &str,
+        review_notes: Option<&str>,
+    ) -> Result<String> {
+        let txn = self.db.begin().await?;
+        let candidate = self
+            .load_learning_candidate_txn(&txn, candidate_id)
+            .await?
+            .ok_or_else(|| anyhow!("Learning candidate '{}' not found", candidate_id))?;
+        if candidate.candidate_type != "strategy" {
+            anyhow::bail!("Learning candidate '{}' is not a strategy candidate", candidate_id);
+        }
+        let profile = parse_strategy_candidate_profile(&candidate)?;
+        let baseline_version = self
+            .load_kv_json_txn::<crate::core::self_evolve::strategy_runtime::ToolStrategyProfile>(
+                &txn,
+                crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_PROFILE_KEY,
+            )
+            .await?
+            .map(|value| value.version)
+            .unwrap_or_else(|| "strategy-v1".to_string());
+        let canary_state = crate::core::self_evolve::strategy_runtime::CanaryRolloutState {
+            enabled: true,
+            baseline_version,
+            candidate_version: profile.version.clone(),
+            rollout_percent: 20,
+            activated_at: Some(chrono::Utc::now().to_rfc3339()),
+            ..Default::default()
+        };
+        self.set_kv_json_txn(
+            &txn,
+            crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_PROFILE_CANARY_KEY,
+            &profile,
+        )
+        .await?;
+        self.set_kv_json_txn(
+            &txn,
+            crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_CANARY_STATE_KEY,
+            &canary_state,
+        )
+        .await?;
+        self.update_learning_candidate_review_txn(
+            &txn,
+            candidate_id,
+            "approved",
+            review_notes,
+            Some(&profile.version),
+        )
+        .await?;
+        txn.commit().await?;
+        Ok(profile.version)
+    }
+
+    pub async fn reject_strategy_learning_candidate(
+        &self,
+        candidate_id: &str,
+        review_notes: Option<&str>,
+    ) -> Result<String> {
+        let txn = self.db.begin().await?;
+        let candidate = self
+            .load_learning_candidate_txn(&txn, candidate_id)
+            .await?
+            .ok_or_else(|| anyhow!("Learning candidate '{}' not found", candidate_id))?;
+        if candidate.candidate_type != "strategy" {
+            anyhow::bail!("Learning candidate '{}' is not a strategy candidate", candidate_id);
+        }
+        let profile = parse_strategy_candidate_profile(&candidate)?;
+        let canary_key =
+            crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_CANARY_STATE_KEY;
+        if let Some(mut canary_state) = self
+            .load_kv_json_txn::<crate::core::self_evolve::strategy_runtime::CanaryRolloutState>(
+                &txn, canary_key,
+            )
+            .await?
+        {
+            if canary_state.candidate_version == profile.version {
+                canary_state.enabled = false;
+                self.set_kv_json_txn(&txn, canary_key, &canary_state).await?;
+            }
+        }
+        self.update_learning_candidate_review_txn(
+            &txn,
+            candidate_id,
+            "rejected",
+            review_notes,
+            None,
+        )
+        .await?;
+        txn.commit().await?;
+        Ok(profile.version)
+    }
+
+    pub async fn promote_strategy_learning_candidate_to_baseline(
+        &self,
+        candidate_id: &str,
+    ) -> Result<String> {
+        let txn = self.db.begin().await?;
+        let candidate = self
+            .load_learning_candidate_txn(&txn, candidate_id)
+            .await?
+            .ok_or_else(|| anyhow!("Learning candidate '{}' not found", candidate_id))?;
+        if candidate.candidate_type != "strategy" {
+            anyhow::bail!("Learning candidate '{}' is not a strategy candidate", candidate_id);
+        }
+        if !candidate.approval_status.eq_ignore_ascii_case("approved") {
+            anyhow::bail!("Strategy candidate must be approved before promotion");
+        }
+        let profile = parse_strategy_candidate_profile(&candidate)?;
+        let profile_key = crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_PROFILE_KEY;
+        let snapshot_key =
+            crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_PROFILE_BASELINE_SNAPSHOT_KEY;
+        if let Some(existing_baseline) = self.get_kv_for_update_txn(&txn, profile_key).await? {
+            if !existing_baseline.value.is_empty() {
+                self.set_kv_txn(&txn, snapshot_key, &existing_baseline.value)
+                    .await?;
+            }
+        }
+        self.set_kv_json_txn(&txn, profile_key, &profile).await?;
+
+        let canary_key =
+            crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_CANARY_STATE_KEY;
+        let mut canary_state = self
+            .load_kv_json_txn::<crate::core::self_evolve::strategy_runtime::CanaryRolloutState>(
+                &txn, canary_key,
+            )
+            .await?
+            .unwrap_or_default();
+        canary_state.enabled = false;
+        canary_state.baseline_version = profile.version.clone();
+        canary_state.candidate_version = profile.version.clone();
+        self.set_kv_json_txn(&txn, canary_key, &canary_state).await?;
+
+        txn.commit().await?;
+        Ok(profile.version)
+    }
+
+    pub async fn rollback_tool_strategy_baseline(&self) -> Result<String> {
+        let txn = self.db.begin().await?;
+        let snapshot_key =
+            crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_PROFILE_BASELINE_SNAPSHOT_KEY;
+        let snapshot_row = self
+            .get_kv_for_update_txn(&txn, snapshot_key)
+            .await?
+            .ok_or_else(|| anyhow!("No tool-strategy baseline snapshot available for rollback"))?;
+        let snapshot = snapshot_row.value;
+        if snapshot.is_empty() {
+            anyhow::bail!("No tool-strategy baseline snapshot available for rollback");
+        }
+        let restored_profile = parse_kv_json_value::<
+            crate::core::self_evolve::strategy_runtime::ToolStrategyProfile,
+        >(snapshot_key, &snapshot)?
+        .ok_or_else(|| anyhow!("No tool-strategy baseline snapshot available for rollback"))?;
+        self.set_kv_txn(
+            &txn,
+            crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_PROFILE_KEY,
+            &snapshot,
+        )
+        .await?;
+
+        let canary_key =
+            crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_CANARY_STATE_KEY;
+        let mut canary_state = self
+            .load_kv_json_txn::<crate::core::self_evolve::strategy_runtime::CanaryRolloutState>(
+                &txn, canary_key,
+            )
+            .await?
+            .unwrap_or_default();
+        canary_state.enabled = false;
+        canary_state.baseline_version = restored_profile.version.clone();
+        canary_state.candidate_version = restored_profile.version.clone();
+        self.set_kv_json_txn(&txn, canary_key, &canary_state).await?;
+
+        txn.commit().await?;
+        Ok(restored_profile.version)
     }
 
     pub async fn learning_queue_counts(&self) -> Result<LearningQueueCounts> {
@@ -3993,6 +4918,22 @@ impl Storage {
         Ok(msgs)
     }
 
+    pub async fn latest_assistant_trace_id_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<String>> {
+        Ok(message::Entity::find()
+            .filter(message::Column::ConversationId.eq(conversation_id.to_string()))
+            .filter(message::Column::Role.eq("assistant".to_string()))
+            .filter(message::Column::TraceId.is_not_null())
+            .order_by_desc(message::Column::Timestamp)
+            .one(&self.db)
+            .await?
+            .and_then(|message| message.trace_id)
+            .map(|trace_id| trace_id.trim().to_string())
+            .filter(|trace_id| !trace_id.is_empty()))
+    }
+
     /// Get most recent user-authored chat messages across conversations.
     pub async fn get_recent_user_messages(&self, limit: u64) -> Result<Vec<message::Model>> {
         let mut msgs = message::Entity::find()
@@ -4222,6 +5163,11 @@ impl Storage {
         Ok(query.count(&self.db).await?)
     }
 
+    /// Count document chunks across all documents.
+    pub async fn count_document_chunks(&self) -> Result<u64> {
+        Ok(document_chunk::Entity::find().count(&self.db).await?)
+    }
+
     /// List a bounded set of documents for metadata search.
     pub async fn list_documents_for_search(
         &self,
@@ -4283,20 +5229,109 @@ impl Storage {
         Ok(chunks)
     }
 
-    /// Update the stored embedding for a document chunk.
-    pub async fn update_document_chunk_embedding(
+    pub async fn get_document_chunks_by_ids(
         &self,
-        chunk_id: &str,
-        embedding: Option<PgVector>,
-    ) -> Result<()> {
-        if let Some(existing) = document_chunk::Entity::find_by_id(chunk_id.to_string())
-            .one(&self.db)
-            .await?
-        {
-            let mut model: document_chunk::ActiveModel = existing.into();
-            model.embedding = Set(embedding);
-            model.update(&self.db).await?;
+        ids: &[String],
+    ) -> Result<Vec<document_chunk::Model>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
         }
+
+        let mut chunks = document_chunk::Entity::find()
+            .filter(document_chunk::Column::Id.is_in(ids.iter().cloned()))
+            .all(&self.db)
+            .await?;
+        for chunk in &mut chunks {
+            chunk.content = decrypt_storage_string(&chunk.content);
+        }
+
+        let mut by_id = chunks
+            .into_iter()
+            .map(|chunk| (chunk.id.clone(), chunk))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        Ok(ids
+            .iter()
+            .filter_map(|id| by_id.remove(id))
+            .collect::<Vec<_>>())
+    }
+
+    pub async fn nearest_document_chunk_ids(
+        &self,
+        query_embedding: &PgVector,
+        document_ids: &[String],
+        limit: u64,
+    ) -> Result<Vec<String>> {
+        if limit == 0 || document_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let embedding_sql = pgvector_sql_literal(query_embedding);
+        let doc_id_list = sql_string_list(document_ids);
+        let sql = format!(
+            "SELECT c.id \
+             FROM document_chunks c \
+             INNER JOIN documents d ON d.id = c.document_id \
+             WHERE c.embedding IS NOT NULL AND c.document_id IN ({doc_id_list}) \
+             ORDER BY c.embedding <=> {embedding_sql} ASC, d.created_at DESC, c.chunk_index ASC \
+             LIMIT {}",
+            Self::db_limit(limit)
+        );
+
+        let rows = self
+            .db
+            .query_all(Statement::from_string(DbBackend::Postgres, sql))
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| row.try_get::<String>("", "id").ok())
+            .collect())
+    }
+
+    pub async fn list_recent_document_chunk_ids(
+        &self,
+        document_ids: &[String],
+        limit: u64,
+    ) -> Result<Vec<String>> {
+        if limit == 0 || document_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let doc_id_list = sql_string_list(document_ids);
+        let sql = format!(
+            "SELECT c.id \
+             FROM document_chunks c \
+             INNER JOIN documents d ON d.id = c.document_id \
+             WHERE c.document_id IN ({doc_id_list}) \
+             ORDER BY d.created_at DESC, c.chunk_index ASC \
+             LIMIT {}",
+            Self::db_limit(limit)
+        );
+
+        let rows = self
+            .db
+            .query_all(Statement::from_string(DbBackend::Postgres, sql))
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| row.try_get::<String>("", "id").ok())
+            .collect())
+    }
+
+    pub async fn pgvector_health_check(&self) -> Result<()> {
+        if self.db.get_database_backend() != DbBackend::Postgres {
+            anyhow::bail!("storage backend is not Postgres");
+        }
+
+        let sql =
+            "SELECT '[0,0]'::vector <=> '[0,0]'::vector AS cosine_distance".to_string();
+        let row = self
+            .db
+            .query_one(Statement::from_string(DbBackend::Postgres, sql))
+            .await?;
+
+        let row = row.ok_or_else(|| anyhow!("pgvector health check returned no rows"))?;
+        let _ = row.try_get::<f64>("", "cosine_distance")?;
         Ok(())
     }
 
@@ -5357,7 +6392,9 @@ impl Storage {
             && lifecycle.message_retention_days == 0
             && lifecycle.experience_run_retention_days == 0
             && lifecycle.experience_edge_retention_days == 0
-            && lifecycle.learning_candidate_retention_days == 0;
+            && lifecycle.learning_candidate_retention_days == 0
+            && lifecycle.experience_item_retention_days == 0
+            && lifecycle.procedural_pattern_retention_days == 0;
 
         if all_retention_disabled {
             self.set(
@@ -5495,6 +6532,24 @@ impl Storage {
             learning_candidate::Entity::delete_many()
                 .filter(learning_candidate::Column::CreatedAt.lt(learning_candidate_cutoff))
                 .filter(learning_candidate::Column::ApprovalStatus.ne("pending"))
+                .exec(&txn)
+                .await?;
+        }
+        if lifecycle.experience_item_retention_days > 0 {
+            let experience_item_cutoff = (now
+                - chrono::Duration::days(lifecycle.experience_item_retention_days as i64))
+            .to_rfc3339();
+            experience_item::Entity::delete_many()
+                .filter(experience_item::Column::UpdatedAt.lt(experience_item_cutoff))
+                .exec(&txn)
+                .await?;
+        }
+        if lifecycle.procedural_pattern_retention_days > 0 {
+            let procedural_pattern_cutoff = (now
+                - chrono::Duration::days(lifecycle.procedural_pattern_retention_days as i64))
+            .to_rfc3339();
+            procedural_pattern::Entity::delete_many()
+                .filter(procedural_pattern::Column::UpdatedAt.lt(procedural_pattern_cutoff))
                 .exec(&txn)
                 .await?;
         }

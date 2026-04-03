@@ -35,6 +35,18 @@ async fn ensure_index(
     Ok(())
 }
 
+async fn ensure_optional_sql(
+    db: &DatabaseConnection,
+    backend: DbBackend,
+    sql: impl Into<String>,
+    description: &str,
+) -> Result<()> {
+    if let Err(error) = db.execute(Statement::from_string(backend, sql.into())).await {
+        tracing::warn!("Skipping optional {}: {}", description, error);
+    }
+    Ok(())
+}
+
 macro_rules! ensure_table_list {
     ($db:expr, $backend:expr, $schema:expr, [$($entity:path),+ $(,)?]) => {
         $(
@@ -159,6 +171,15 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
             .col(episode::Column::ProjectId)
             .if_not_exists()
             .to_owned(),
+    )
+    .await?;
+    ensure_optional_sql(
+        db,
+        backend,
+        "CREATE INDEX IF NOT EXISTS idx_episodes_embedding_hnsw \
+         ON episodes USING hnsw (embedding vector_cosine_ops) \
+         WHERE embedding IS NOT NULL",
+        "episodes pgvector HNSW index",
     )
     .await?;
     ensure_index(
@@ -375,6 +396,15 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
             .to_owned(),
     )
     .await?;
+    ensure_optional_sql(
+        db,
+        backend,
+        "CREATE INDEX IF NOT EXISTS idx_document_chunks_embedding_hnsw \
+         ON document_chunks USING hnsw (embedding vector_cosine_ops) \
+         WHERE embedding IS NOT NULL",
+        "document chunk pgvector HNSW index",
+    )
+    .await?;
     ensure_index(
         db,
         backend,
@@ -483,6 +513,15 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
             .col(semantic_fact::Column::ProjectId)
             .if_not_exists()
             .to_owned(),
+    )
+    .await?;
+    ensure_optional_sql(
+        db,
+        backend,
+        "CREATE INDEX IF NOT EXISTS idx_semantic_facts_embedding_hnsw \
+         ON semantic_facts USING hnsw (embedding vector_cosine_ops) \
+         WHERE embedding IS NOT NULL",
+        "semantic fact pgvector HNSW index",
     )
     .await?;
     ensure_index(

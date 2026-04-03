@@ -139,16 +139,11 @@ export function WelcomeHero({
         overflow: "hidden",
       }}
     >
-      <CardContent sx={{ p: { xs: 1.1, md: 1.3 }, position: "relative", height: "100%" }}>
+      <CardContent sx={{ p: { xs: 1.15, md: 1.4 }, position: "relative", height: "100%" }}>
         <Stack spacing={1.05} className="mission-panel-content" sx={{ position: "relative", zIndex: 1 }}>
           <Stack spacing={1} className="mission-panel-section">
-            <Stack
-              direction={{ xs: "column", md: "row" }}
-              spacing={1}
-              justifyContent="space-between"
-              alignItems={{ xs: "flex-start", md: "flex-start" }}
-            >
-              <Stack spacing={0.8} sx={{ minWidth: 0, flex: 1 }}>
+            <Box className="welcome-hero-header">
+              <Stack spacing={0.8} sx={{ minWidth: 0, flex: 1 }} className="welcome-hero-copy">
                 <Stack direction="row" spacing={1} alignItems="center" sx={{ minWidth: 0 }}>
                   <Box
                     component="img"
@@ -185,14 +180,13 @@ export function WelcomeHero({
                   variant="body2"
                   color="text.secondary"
                   className="mission-card-copy"
-                  noWrap
                   title="Private by default, useful every day: memory, daily briefings, safe actions, and deeper automation when you want it."
                 >
                   Private by default, useful every day: memory, daily briefings, safe actions, and deeper automation when you want it.
                 </Typography>
               </Stack>
 
-              <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+              <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" className="welcome-hero-status-row">
                 <Chip
                   size="small"
                   color={agentPaused ? "warning" : "success"}
@@ -200,7 +194,7 @@ export function WelcomeHero({
                 />
                 <Chip size="small" label="Secure first" />
               </Stack>
-            </Stack>
+            </Box>
 
             <Box className="welcome-hero-command-deck">
               <Box className="welcome-hero-command-row">

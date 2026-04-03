@@ -17,7 +17,7 @@ use super::config::{AgentConfig, EmbeddingsProviderKind};
 use super::llm_provider::effective_openai_base_url;
 
 const MAX_EMBED_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-const DEFAULT_LOCAL_EMBEDDING_MODEL: &str = "sentence-transformers/all-MiniLM-L6-v2";
+const DEFAULT_LOCAL_EMBEDDING_MODEL: &str = "BAAI/bge-small-en-v1.5";
 const DEFAULT_OPENAI_EMBEDDINGS_BASE_URL: &str = "https://api.openai.com/v1";
 
 #[derive(Clone, Debug)]
@@ -459,7 +459,7 @@ impl EmbeddingClient {
                     .clone();
                 match status {
                     LocalEmbeddingStatus::Idle => Ok(format!(
-                        "Local embeddings configured ({}) and will download on first use",
+                        "Local embeddings configured ({}) and will initialize in the background after startup",
                         self.model
                     )),
                     LocalEmbeddingStatus::Preparing => Ok(format!(
@@ -707,6 +707,10 @@ mod tests {
         assert_eq!(
             resolve_local_embedding_model("sentence-transformers/all-MiniLM-L6-v2").unwrap(),
             LocalEmbeddingModel::AllMiniLML6V2
+        );
+        assert_eq!(
+            resolve_local_embedding_model("BAAI/bge-small-en-v1.5").unwrap(),
+            LocalEmbeddingModel::BGESmallENV15
         );
         assert_eq!(
             resolve_local_embedding_model("bge-small-en-v1.5").unwrap(),

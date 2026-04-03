@@ -179,3 +179,35 @@ pub fn has_user_secret(custom: &std::collections::HashMap<String, String>, user_
     keys.iter()
         .any(|k| custom.get(k).is_some_and(|v| !v.trim().is_empty()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_style_keys_write_env_and_legacy_aliases() {
+        assert_eq!(
+            storage_keys_for_user_key("MOLTBOOK_API_KEY"),
+            vec![
+                "env:MOLTBOOK_API_KEY".to_string(),
+                "moltbook_api_key".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_set_secret_command_accepts_equals_form() {
+        assert_eq!(
+            parse_set_secret_command("set secret GITHUB_TOKEN=abc123"),
+            Some(("GITHUB_TOKEN".to_string(), "abc123".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_use_current_llm_key_command_accepts_full_phrase() {
+        assert_eq!(
+            parse_use_current_llm_key_command("use current llm key for OPENAI_API_KEY"),
+            Some("OPENAI_API_KEY".to_string())
+        );
+    }
+}

@@ -37,6 +37,12 @@ pub struct PluginActionManifest {
     pub input_schema: Value,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub outbound_write: bool,
+    #[serde(default)]
+    pub public_publish: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1039,7 +1045,14 @@ async fn register_plugin_actions(
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-            authorization: Default::default(),
+            authorization: crate::actions::ActionAuthorization {
+                outbound: crate::actions::ActionEgressPolicy {
+                    read_only: action.read_only,
+                    outbound_write: !action.read_only || action.outbound_write,
+                    public_publish: action.public_publish,
+                },
+                ..Default::default()
+            },
         };
         runtime
             .register_plugin_action(

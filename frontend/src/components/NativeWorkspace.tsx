@@ -51,6 +51,7 @@ import ErrorOutlineRoundedIcon from "@mui/icons-material/ErrorOutlineRounded";
 import FileDownloadRoundedIcon from "@mui/icons-material/FileDownloadRounded";
 import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import MoreVertIcon from "@mui/icons-material/MoreVert";
+import OpenInFullRoundedIcon from "@mui/icons-material/OpenInFullRounded";
 import RadioButtonUncheckedRoundedIcon from "@mui/icons-material/RadioButtonUncheckedRounded";
 import StarBorderRoundedIcon from "@mui/icons-material/StarBorderRounded";
 import StarRoundedIcon from "@mui/icons-material/StarRounded";
@@ -96,7 +97,16 @@ import {
   getTunnelStopButtonLabel,
   getTunnelUrlFieldLabel
 } from "../lib/tunnelAccess";
-import type { ArkPulseRemediationSpec, ArkPulseRunFixRequest, SkillImportResponse, LlmAnalyticsResponse, TraceOperationalEvent, TraceSummary } from "../types";
+import type {
+  ArkPulseRemediationSpec,
+  ArkPulseRunFixRequest,
+  LlmAnalyticsResponse,
+  MemoryMaintenanceReviewResponse,
+  RunMemoryMaintenanceRequest,
+  SkillImportResponse,
+  TraceOperationalEvent,
+  TraceSummary
+} from "../types";
 import { useUiStore } from "../store/uiStore";
 
 const REFRESH_MS = 8000;
@@ -154,7 +164,7 @@ const AUTO_APPROVE_ACTION_OPTIONS = [
 ] as const;
 type ImportRiskBand = "secure" | "review" | "risky";
 type ChatPendingRunMode = "fresh" | "resume";
-type ChatPendingRunPhase = "running" | "interrupted";
+type ChatPendingRunPhase = "running" | "interrupted" | "awaiting_confirmation";
 
 type ChatPendingRunSnapshot = {
   conversationId: string;
@@ -230,6 +240,26 @@ type CodePreviewOpenRequest = {
   fileName?: string;
   code?: string;
   languageHint?: string;
+};
+
+type ResearchReportPreview = {
+  title: string;
+  summary: string;
+  summaryPreview: string;
+  keyFindings: string[];
+  keyFindingCount: number;
+  sourceCount: number;
+  openQuestionCount: number;
+  contradictionCount: number;
+  content: string;
+};
+
+type ResearchReportDialogState = {
+  report: ResearchReportPreview;
+  messageId: string;
+  previousUserPrompt: string;
+  timestamp?: string;
+  traceId?: string;
 };
 
 const MODEL_FALLBACKS_BY_PROVIDER: Record<string, string[]> = {
@@ -819,6 +849,27 @@ type ExecutionPlanState = {
   steps: ExecutionPlanItem[];
 };
 
+type PlanConfirmationStage = "planning" | "awaiting_confirmation" | "running" | "failed";
+
+type PlanConfirmationStepDraft = ExecutionPlanItem & {
+  draft_id: string;
+  enabled: boolean;
+};
+
+type PlanConfirmationDraft = {
+  summary: string;
+  steps: PlanConfirmationStepDraft[];
+};
+
+type PlanConfirmationState = {
+  stage: PlanConfirmationStage;
+  taskId: string | null;
+  source: string;
+  originalPlan: ExecutionPlanState | null;
+  draft: PlanConfirmationDraft | null;
+  editing: boolean;
+};
+
 type ToolProgressPresentation = {
   title: string;
   detail: string;
@@ -919,6 +970,41 @@ function normalizeExecutionPlanState(rawPlan: unknown): ExecutionPlanState | nul
     revision: num(record.revision, 0),
     summary: str(record.summary, ""),
     steps: normalizeExecutionPlanSteps(rawSteps)
+  };
+}
+
+function createPlanConfirmationDraft(plan: ExecutionPlanState | null): PlanConfirmationDraft | null {
+  if (!plan) return null;
+  return {
+    summary: plan.summary,
+    steps: plan.steps.map((step, index) => ({
+      ...step,
+      draft_id: `${plan.plan_id || "plan"}:${index}:${step.id}`,
+      enabled: true
+    }))
+  };
+}
+
+function buildExecutionPlanFromDraft(
+  draft: PlanConfirmationDraft | null,
+  basePlan: ExecutionPlanState | null
+): ExecutionPlanState | null {
+  if (!draft) return null;
+  const enabledSteps = draft.steps.filter((step) => step.enabled);
+  if (enabledSteps.length === 0) return null;
+  return {
+    plan_id: basePlan?.plan_id || "",
+    revision: basePlan?.revision || 1,
+    summary: draft.summary.trim() || basePlan?.summary || "",
+    steps: enabledSteps.map((step, index) => ({
+      id: index + 1,
+      title: step.title,
+      description: step.description,
+      status: "pending",
+      action: step.action ?? null,
+      arguments: step.arguments ?? null,
+      tool_hint: step.tool_hint ?? null
+    }))
   };
 }
 
@@ -3079,6 +3165,110 @@ function renderChatMarkdown(
       />
     </Box>
   );
+}
+
+function stripMarkdownDecorations(text: string): string {
+  return (text || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/^\s*#{1,6}\s+/gm, "")
+    .replace(/^\s*[-+*]\s+/gm, "")
+    .replace(/^\s*\d+\.\s+/gm, "")
+    .replace(/[*_~]/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function extractMarkdownSection(text: string, heading: string): string {
+  const lines = (text || "").replace(/\r\n/g, "\n").split("\n");
+  const target = `## ${heading}`.replace(/\s+/g, " ").trim().toLowerCase();
+  let collecting = false;
+  const collected: string[] = [];
+  for (const line of lines) {
+    const normalized = line.replace(/\s+/g, " ").trim().toLowerCase();
+    if (normalized.startsWith("## ")) {
+      if (collecting) break;
+      collecting = normalized === target;
+      continue;
+    }
+    if (collecting) {
+      collected.push(line);
+    }
+  }
+  return collected.join("\n").trim();
+}
+
+function countMarkdownItems(section: string): number {
+  const lines = (section || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const itemCount = lines.filter((line) => /^(\d+\.\s+|[-+*]\s+)/.test(line)).length;
+  if (itemCount > 0) return itemCount;
+  return lines.length > 0 ? lines.filter((line) => line.length > 20).length : 0;
+}
+
+function parseResearchReport(text: string): ResearchReportPreview | null {
+  const normalized = (text || "").replace(/\r\n/g, "\n").trim();
+  if (!normalized) return null;
+  const lines = normalized.split("\n");
+  const firstHeadingIndex = lines.findIndex((line) => line.trim().length > 0);
+  if (firstHeadingIndex < 0) return null;
+  const headingLine = lines[firstHeadingIndex].trim();
+  const titleMatch = headingLine.match(/^#\s*Research(?: Summary)?:\s*(.+)$/i);
+  if (!titleMatch) return null;
+
+  const firstSectionIndex = lines.findIndex(
+    (line, idx) => idx > firstHeadingIndex && /^##\s+/.test(line.trim())
+  );
+  const summaryBlock = lines
+    .slice(firstHeadingIndex + 1, firstSectionIndex >= 0 ? firstSectionIndex : lines.length)
+    .join("\n")
+    .trim();
+  const summary = stripMarkdownDecorations(summaryBlock);
+  const summaryPreview = summary.length > 520 ? `${summary.slice(0, 517).trimEnd()}...` : summary;
+  const keyFindingsSection = extractMarkdownSection(normalized, "Key Findings");
+  const keyFindingCount = countMarkdownItems(keyFindingsSection);
+  const keyFindings = keyFindingsSection
+    .split("\n")
+    .map((line) => stripMarkdownDecorations(line).trim())
+    .filter(Boolean)
+    .slice(0, 3);
+  const sourceCount = countMarkdownItems(extractMarkdownSection(normalized, "Sources"));
+  const openQuestionCount = countMarkdownItems(extractMarkdownSection(normalized, "Open Questions"));
+  const contradictionCount = countMarkdownItems(
+    extractMarkdownSection(normalized, "Contradictions To Verify")
+  );
+
+  return {
+    title: str(titleMatch[1], "Research report").trim() || "Research report",
+    summary,
+    summaryPreview,
+    keyFindings,
+    keyFindingCount,
+    sourceCount,
+    openQuestionCount,
+    contradictionCount,
+    content: normalized
+  };
+}
+
+function researchReportMetaLabel(report: ResearchReportPreview): string {
+  const parts = ["Research report"];
+  if (report.sourceCount > 0) {
+    parts.push(`${report.sourceCount} source${report.sourceCount === 1 ? "" : "s"}`);
+  }
+  if (report.keyFindingCount > 0) {
+    parts.push(`${report.keyFindingCount} key finding${report.keyFindingCount === 1 ? "" : "s"}`);
+  }
+  if (report.openQuestionCount > 0) {
+    parts.push(`${report.openQuestionCount} open question${report.openQuestionCount === 1 ? "" : "s"}`);
+  }
+  if (report.contradictionCount > 0) {
+    parts.push(`${report.contradictionCount} contradiction${report.contradictionCount === 1 ? "" : "s"}`);
+  }
+  return parts.join(" | ");
 }
 
 const CHAT_ATTACHMENT_EXTENSIONS = new Set([
@@ -5468,6 +5658,7 @@ function ChatManager({
   const [streamingResponse, setStreamingResponse] = useState("");
   const [streamingSteps, setStreamingSteps] = useState<JsonRecord[]>([]);
   const [executionPlan, setExecutionPlan] = useState<ExecutionPlanState | null>(null);
+  const [planConfirmation, setPlanConfirmation] = useState<PlanConfirmationState | null>(null);
   const [executionPlanFailure, setExecutionPlanFailure] = useState("");
   const [executionPlanExpanded, setExecutionPlanExpanded] = useState(false);
   const [streamingProgressMessages, setStreamingProgressMessages] = useState<string[]>([]);
@@ -5498,6 +5689,7 @@ function ChatManager({
   const [codeViewerFileIdx, setCodeViewerFileIdx] = useState(0);
   const [selectedSnippetId, setSelectedSnippetId] = useState<string | null>(null);
   const [previewDialogOpen, setPreviewDialogOpen] = useState(false);
+  const [researchReportDialog, setResearchReportDialog] = useState<ResearchReportDialogState | null>(null);
   const [messageTraceOpen, setMessageTraceOpen] = useState<Record<string, boolean>>({});
   const [traceStepsById, setTraceStepsById] = useState<Record<string, JsonRecord[]>>({});
   const [traceLoadingById, setTraceLoadingById] = useState<Record<string, boolean>>({});
@@ -6278,6 +6470,19 @@ function ChatManager({
     return isRedundantStatusDetail(prefix, detail) ? detail : `${prefix} ${detail}`;
   };
 
+  const markPendingRunAwaitingPlanConfirmation = (taskId = "") => {
+    setPendingRunSnapshot((prev) => {
+      if (!prev) return prev;
+      const next = {
+        ...prev,
+        taskId: taskId || prev.taskId || "",
+        phase: "awaiting_confirmation" as ChatPendingRunPhase
+      };
+      storeChatPendingRunSnapshot(next);
+      return next;
+    });
+  };
+
   const humanizeStep = (
     title: string,
     detail: string,
@@ -6685,6 +6890,8 @@ function ChatManager({
     setAttachedFiles([]);
     setChatError(null);
     setChatNotice(null);
+    setPlanConfirmation(null);
+    setResearchReportDialog(null);
     lastWorkspaceRestoreSeedRef.current = "";
       setPendingUserMessage(null);
       setFailedUserMessage(null);
@@ -7041,22 +7248,35 @@ function ChatManager({
     URL.revokeObjectURL(url);
   };
 
-  const exportAssistantMessage = async (message: JsonRecord, previousUserPrompt?: string) => {
+  const exportAssistantMarkdown = async ({
+    content,
+    headingHint,
+    previousUserPrompt,
+    timestamp,
+    traceId
+  }: {
+    content: string;
+    headingHint?: string;
+    previousUserPrompt?: string;
+    timestamp?: string;
+    traceId?: string;
+  }) => {
     try {
-      const content = str(message.content, "").trim();
-      if (!content) throw new Error("Nothing to export.");
+      const normalizedContent = str(content, "").trim();
+      if (!normalizedContent) throw new Error("Nothing to export.");
+      const report = parseResearchReport(normalizedContent);
       const prompt = (previousUserPrompt || "").trim();
       const conversationTitle = str(selectedConversation?.title, "").trim() || "research";
-      const heading = prompt || conversationTitle || "research";
+      const heading = report?.title || headingHint || prompt || conversationTitle || "research";
       const safe = heading.replace(/[^\w.-]+/g, "_").replace(/^_+|_+$/g, "").toLowerCase() || "research";
       const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-      const timestamp = str(message.timestamp, "").trim();
-      const traceId = str(message.trace_id, "").trim();
+      const cleanTimestamp = str(timestamp, "").trim();
+      const cleanTraceId = str(traceId, "").trim();
       const lines: string[] = [];
       lines.push(`# ${heading}`);
       if (conversationId) lines.push(`conversation_id: ${conversationId}`);
-      if (timestamp) lines.push(`assistant_timestamp: ${timestamp}`);
-      if (traceId) lines.push(`trace_id: ${traceId}`);
+      if (cleanTimestamp) lines.push(`assistant_timestamp: ${cleanTimestamp}`);
+      if (cleanTraceId) lines.push(`trace_id: ${cleanTraceId}`);
       lines.push(`exported_at: ${new Date().toISOString()}`);
       lines.push("");
       if (prompt) {
@@ -7065,13 +7285,44 @@ function ChatManager({
         lines.push("");
       }
       lines.push("## Response");
-      lines.push(content);
+      lines.push(normalizedContent);
       lines.push("");
       downloadTextFile(`${safe}-${stamp}.md`, lines.join("\n"), "text/markdown;charset=utf-8");
       setChatNotice("Reply exported.");
     } catch (err) {
       setChatError(normalizeChatError(errMessage(err)));
     }
+  };
+
+  const exportAssistantMessage = async (message: JsonRecord, previousUserPrompt?: string) => {
+    await exportAssistantMarkdown({
+      content: str(message.content, "").trim(),
+      previousUserPrompt,
+      timestamp: str(message.timestamp, "").trim(),
+      traceId: str(message.trace_id, "").trim()
+    });
+  };
+
+  const openResearchReportPreview = ({
+    report,
+    previousUserPrompt,
+    messageId,
+    timestamp,
+    traceId
+  }: {
+    report: ResearchReportPreview;
+    previousUserPrompt: string;
+    messageId: string;
+    timestamp?: string;
+    traceId?: string;
+  }) => {
+    setResearchReportDialog({
+      report,
+      messageId,
+      previousUserPrompt,
+      timestamp,
+      traceId
+    });
   };
 
   const copyMessage = async (message: JsonRecord) => {
@@ -7083,6 +7334,141 @@ function ChatManager({
     } catch (err) {
       setChatError(normalizeChatError(errMessage(err)));
     }
+  };
+
+  const renderResearchReportCard = ({
+    report,
+    previousUserPrompt,
+    messageId,
+    timestamp,
+    traceId,
+    isStreaming = false
+  }: {
+    report: ResearchReportPreview;
+    previousUserPrompt: string;
+    messageId: string;
+    timestamp?: string;
+    traceId?: string;
+    isStreaming?: boolean;
+  }) => {
+    const metaLabel = isStreaming
+      ? `Streaming report preview | ${researchReportMetaLabel(report)}`
+      : researchReportMetaLabel(report);
+    const summaryText =
+      report.summaryPreview ||
+      report.keyFindings[0] ||
+      "Open the report to review the full research write-up.";
+    return (
+      <Box className="chat-research-report-shell">
+        <Typography variant="caption" className="chat-research-report-meta">
+          {metaLabel}
+        </Typography>
+        <Box
+          className="chat-research-report-card"
+          role="button"
+          tabIndex={0}
+          onClick={() =>
+            openResearchReportPreview({
+              report,
+              previousUserPrompt,
+              messageId,
+              timestamp,
+              traceId
+            })
+          }
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              openResearchReportPreview({
+                report,
+                previousUserPrompt,
+                messageId,
+                timestamp,
+                traceId
+              });
+            }
+          }}
+        >
+          <Stack direction="row" justifyContent="space-between" alignItems="flex-start" spacing={1.5}>
+            <Box sx={{ minWidth: 0, flex: 1 }}>
+              <Typography variant="body1" className="chat-research-report-title">
+                {report.title}
+              </Typography>
+            </Box>
+            <Stack direction="row" spacing={0.5} alignItems="center">
+              <Tooltip title={isStreaming ? "Download current report draft" : "Download report"}>
+                <IconButton
+                  size="small"
+                  className="chat-research-report-action"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    void exportAssistantMarkdown({
+                      content: report.content,
+                      headingHint: report.title,
+                      previousUserPrompt,
+                      timestamp,
+                      traceId
+                    });
+                  }}
+                >
+                  <FileDownloadRoundedIcon fontSize="small" />
+                </IconButton>
+              </Tooltip>
+              <Tooltip title={isStreaming ? "Open current report draft" : "Open report"}>
+                <IconButton
+                  size="small"
+                  className="chat-research-report-action"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    openResearchReportPreview({
+                      report,
+                      previousUserPrompt,
+                      messageId,
+                      timestamp,
+                      traceId
+                    });
+                  }}
+                >
+                  <OpenInFullRoundedIcon fontSize="small" />
+                </IconButton>
+              </Tooltip>
+            </Stack>
+          </Stack>
+          <Typography variant="caption" className="chat-research-report-eyebrow">
+            Executive summary
+          </Typography>
+          <Typography variant="body2" className="chat-research-report-summary">
+            {summaryText}
+          </Typography>
+          <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" className="chat-research-report-chips">
+            {report.sourceCount > 0 ? (
+              <Chip size="small" label={`${report.sourceCount} source${report.sourceCount === 1 ? "" : "s"}`} />
+            ) : null}
+            {report.openQuestionCount > 0 ? (
+              <Chip
+                size="small"
+                label={`${report.openQuestionCount} open question${report.openQuestionCount === 1 ? "" : "s"}`}
+              />
+            ) : null}
+            {report.contradictionCount > 0 ? (
+              <Chip
+                size="small"
+                label={`${report.contradictionCount} contradiction${report.contradictionCount === 1 ? "" : "s"}`}
+              />
+            ) : null}
+          </Stack>
+          {report.keyFindings.length > 0 ? (
+            <Stack spacing={0.35} className="chat-research-report-findings">
+              {report.keyFindings.map((finding, index) => (
+                <Typography key={`${report.title}-finding-${index}`} variant="body2" className="chat-research-report-finding">
+                  {index + 1}. {finding}
+                </Typography>
+              ))}
+            </Stack>
+          ) : null}
+        </Box>
+      </Box>
+    );
   };
 
   const toggleConversationStarMutation = useMutation({
@@ -7374,24 +7760,77 @@ function ChatManager({
       setExecutionPlan(nextPlan);
       setExecutionPlanFailure("");
       setExecutionPlanExpanded(false);
+      setPlanConfirmation((prev) =>
+        prev?.stage === "planning"
+          ? {
+              ...prev,
+              originalPlan: nextPlan,
+              draft: createPlanConfirmationDraft(nextPlan)
+            }
+          : prev
+      );
     }
     if (stepType === "plan_revised") {
       const nextPlan = normalizeExecutionPlanState(normalizedIncomingStep.plan);
       if (nextPlan) {
         setExecutionPlan(nextPlan);
         setExecutionPlanFailure("");
+        setPlanConfirmation((prev) =>
+          prev?.stage === "awaiting_confirmation"
+            ? {
+                ...prev,
+                originalPlan: nextPlan,
+                draft: createPlanConfirmationDraft(nextPlan)
+              }
+            : prev
+        );
       }
       setExecutionPlanExpanded(false);
+    }
+    if (stepType === "plan_ready_for_confirmation") {
+      const nextPlan = normalizeExecutionPlanState(normalizedIncomingStep.plan);
+      const taskId = str(normalizedIncomingStep.task_id, "").trim();
+      setExecutionPlan(nextPlan);
+      setExecutionPlanFailure("");
+      setExecutionPlanExpanded(false);
+      setPlanConfirmation({
+        stage: "awaiting_confirmation",
+        taskId: taskId || null,
+        source: str(normalizedIncomingStep.source, "deep_research").trim() || "deep_research",
+        originalPlan: nextPlan,
+        draft: createPlanConfirmationDraft(nextPlan),
+        editing: false
+      });
+      markPendingRunAwaitingPlanConfirmation(taskId);
+      setChatNotice("Deep research plan ready. Review it, then Start or Cancel.");
     }
     if (stepType === "plan_unavailable") {
       setExecutionPlan(null);
       setExecutionPlanFailure(str(normalizedIncomingStep.detail, "Structured planning was unavailable."));
+      setPlanConfirmation((prev) =>
+        prev
+          ? {
+              ...prev,
+              stage: "failed",
+              editing: false
+            }
+          : prev
+      );
     }
     if (stepType === "plan_step_update" && typeof normalizedIncomingStep.step_id === "number") {
       const sid = normalizedIncomingStep.step_id as number;
       const newStatus = typeof normalizedIncomingStep.status === "string" ? normalizedIncomingStep.status : "running";
       const planId = str(normalizedIncomingStep.plan_id, "");
       const revision = num(normalizedIncomingStep.revision, 0);
+      setPlanConfirmation((prev) =>
+        prev
+          ? {
+              ...prev,
+              stage: "running",
+              editing: false
+            }
+          : prev
+      );
       setExecutionPlan((prev) => {
         if (!prev) return prev;
         if (planId && prev.plan_id && planId !== prev.plan_id) return prev;
@@ -7793,6 +8232,7 @@ function ChatManager({
       statusSource?: string;
       deepResearch?: boolean;
       resumeTaskId?: string;
+      planOverride?: ExecutionPlanState | null;
     }
   ): Promise<boolean> => {
     const resumeTaskId = (opts?.resumeTaskId || "").trim();
@@ -7819,6 +8259,7 @@ function ChatManager({
     }
     const now = Date.now();
     const deepResearch = Boolean(opts?.deepResearch);
+    const planOverride = opts?.planOverride ?? null;
     const executionMode: ChatExecutionMode = "auto";
     const fingerprint = isResumeMode
       ? `resume::${resumeTaskId}::${targetConversationId || "__no_conversation__"}`
@@ -7839,6 +8280,28 @@ function ChatManager({
     streamAbortRef.current = abortController;
 
     setChatError(null);
+    if (!isResumeMode && deepResearch) {
+      setPlanConfirmation({
+        stage: "planning",
+        taskId: null,
+        source: "deep_research",
+        originalPlan: null,
+        draft: null,
+        editing: false
+      });
+    } else if (isResumeMode && planOverride) {
+      setPlanConfirmation((prev) =>
+        prev
+          ? {
+              ...prev,
+              stage: "running",
+              editing: false
+            }
+          : prev
+      );
+    } else if (!isResumeMode) {
+      setPlanConfirmation(null);
+    }
     const sensitiveMessage =
       !isResumeMode &&
       (Boolean(opts?.sensitive) ||
@@ -7914,6 +8377,21 @@ function ChatManager({
         });
       }
     };
+    const handlePlanStreamEvent = (eventName: string, payload: unknown) => {
+      absorbConversationId(payload);
+      if (
+        eventName === "plan_generated" ||
+        eventName === "plan_revised" ||
+        eventName === "plan_step_update" ||
+        eventName === "plan_unavailable" ||
+        eventName === "plan_ready_for_confirmation"
+      ) {
+        const planPayload = asRecord(payload);
+        if (Object.keys(planPayload).length > 0) {
+          pushStreamingStep(planPayload);
+        }
+      }
+    };
 
     try {
       if (!isResumeMode && files.length > 0) {
@@ -7929,22 +8407,12 @@ function ChatManager({
         }
       }
       await (isResumeMode
-        ? api.resumeChatTaskStream(resumeTaskId, {
+        ? api.resumeChatTaskStream(
+            resumeTaskId,
+            planOverride ? { plan_override: planOverride as Record<string, unknown> } : undefined,
+            {
             signal: abortController.signal,
-            onEvent: (eventName, payload) => {
-              absorbConversationId(payload);
-              if (
-                eventName === "plan_generated" ||
-                eventName === "plan_revised" ||
-                eventName === "plan_step_update" ||
-                eventName === "plan_unavailable"
-              ) {
-                const planPayload = asRecord(payload);
-                if (Object.keys(planPayload).length > 0) {
-                  pushStreamingStep(planPayload);
-                }
-              }
-            },
+            onEvent: handlePlanStreamEvent,
             onToken: (token) => {
               latestStreamingResponse += token;
               setStreamingResponse((prev) => prev + token);
@@ -7994,6 +8462,9 @@ function ChatManager({
                       ? "awaiting approval"
                       : status.replace(/_/g, " ");
             setChatNotice(`Task ${statusLabel}: ${description}`);
+            if (status === "paused" && planConfirmation?.stage === "planning") {
+              markPendingRunAwaitingPlanConfirmation(taskId);
+            }
             void queryClient.invalidateQueries({ queryKey: ["tasks"] });
             void queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
             void queryClient.invalidateQueries({ queryKey: ["swarm-status"] });
@@ -8011,7 +8482,8 @@ function ChatManager({
           onError: (messageText) => {
             streamError = normalizeChatError(messageText);
           }
-        })
+          }
+        )
         : api.chatStream(
             {
               message: payloadMessage,
@@ -8019,25 +8491,13 @@ function ChatManager({
               conversation_id: targetConversationId,
               project_id: targetProjectId || undefined,
               deep_research: deepResearch,
+              plan_confirmation_mode: deepResearch ? "before_execution" : undefined,
               execution_mode: executionMode,
               attachments_present: files.length > 0
             },
             {
               signal: abortController.signal,
-            onEvent: (eventName, payload) => {
-                absorbConversationId(payload);
-                if (
-                  eventName === "plan_generated" ||
-                  eventName === "plan_revised" ||
-                  eventName === "plan_step_update" ||
-                  eventName === "plan_unavailable"
-                ) {
-                  const planPayload = asRecord(payload);
-                  if (Object.keys(planPayload).length > 0) {
-                    pushStreamingStep(planPayload);
-                  }
-                }
-              },
+              onEvent: handlePlanStreamEvent,
               onToken: (token) => {
                 latestStreamingResponse += token;
                 setStreamingResponse((prev) => prev + token);
@@ -8087,6 +8547,9 @@ function ChatManager({
                       ? "awaiting approval"
                       : status.replace(/_/g, " ");
             setChatNotice(`Task ${statusLabel}: ${description}`);
+            if (status === "paused" && planConfirmation?.stage === "planning") {
+              markPendingRunAwaitingPlanConfirmation(taskId);
+            }
             void queryClient.invalidateQueries({ queryKey: ["tasks"] });
             void queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
             void queryClient.invalidateQueries({ queryKey: ["swarm-status"] });
@@ -8119,6 +8582,21 @@ function ChatManager({
       const finalTaskId = activeChatTaskIdRef.current || resumeTaskId || "";
       if (streamError) {
         setChatError(streamError);
+        setPlanConfirmation((prev) => {
+          if (!prev) return prev;
+          if (isResumeMode && planOverride) {
+            return {
+              ...prev,
+              stage: "awaiting_confirmation",
+              editing: false
+            };
+          }
+          return {
+            ...prev,
+            stage: "failed",
+            editing: false
+          };
+        });
         if (!sensitiveMessage && !isResumeMode) {
           setFailedUserMessage(activeMessage);
         }
@@ -8229,7 +8707,7 @@ function ChatManager({
     const runId = str(pendingRunSnapshot?.runId, "").trim();
     const pendingConversationId = str(pendingRunSnapshot?.conversationId, "").trim();
     if (!runId || !pendingConversationId) return;
-    if (pendingRunSnapshot?.phase === "interrupted") return;
+    if (pendingRunSnapshot?.phase === "interrupted" || pendingRunSnapshot?.phase === "awaiting_confirmation") return;
     if (!conversationId || conversationId !== pendingConversationId) return;
     if (isStreaming || streamLockRef.current) return;
     if (reattachedRunIdRef.current === runId) return;
@@ -8358,6 +8836,97 @@ function ChatManager({
     void queryClient.invalidateQueries({ queryKey: ["swarm-delegations"] });
   };
 
+  const updatePlanConfirmationDraft = (
+    updater: (draft: PlanConfirmationDraft) => PlanConfirmationDraft
+  ) => {
+    setPlanConfirmation((prev) => {
+      if (!prev?.draft) return prev;
+      return {
+        ...prev,
+        draft: updater(prev.draft)
+      };
+    });
+  };
+
+  const resetPlanConfirmationDraft = () => {
+    setPlanConfirmation((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        draft: createPlanConfirmationDraft(prev.originalPlan),
+        editing: false
+      };
+    });
+  };
+
+  const handlePlanConfirmationCancel = async () => {
+    const taskId = str(planConfirmation?.taskId, "").trim();
+    if (!taskId) {
+      setPlanConfirmation(null);
+      return;
+    }
+    try {
+      await api.cancelTask(taskId);
+      setChatNotice("Deep research plan canceled.");
+      setPlanConfirmation(null);
+      setExecutionPlan(null);
+      setExecutionPlanFailure("");
+      setExecutionPlanExpanded(false);
+      storeChatPendingRunSnapshot(null);
+      setPendingRunSnapshot(null);
+      setPendingUserMessage(null);
+      setFailedUserMessage(null);
+      setStreamingResponse("");
+      setStreamingSteps([]);
+      streamingStepsRef.current = [];
+      await queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      await queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
+      await queryClient.invalidateQueries({ queryKey: ["chat-conversations"] });
+    } catch (err) {
+      setChatError(normalizeChatError(errMessage(err)));
+    }
+  };
+
+  const handlePlanConfirmationStart = async () => {
+    const taskId = str(planConfirmation?.taskId, "").trim();
+    const overridePlan = buildExecutionPlanFromDraft(
+      planConfirmation?.draft ?? null,
+      planConfirmation?.originalPlan ?? null
+    );
+    if (!taskId || !overridePlan) {
+      setChatError("Select at least one research step before starting.");
+      return;
+    }
+
+    setPlanConfirmation((prev) =>
+      prev
+        ? {
+            ...prev,
+            stage: "running",
+            editing: false
+          }
+        : prev
+    );
+
+    const ok = await runStreamingChat("", [], {
+      conversationIdOverride: conversationId || undefined,
+      projectIdOverride: effectiveProjectId || undefined,
+      resumeTaskId: taskId,
+      planOverride: overridePlan
+    });
+
+    if (!ok) {
+      setPlanConfirmation((prev) =>
+        prev
+          ? {
+              ...prev,
+              stage: "awaiting_confirmation"
+            }
+          : prev
+      );
+    }
+  };
+
   useEffect(() => {
     if (typeof window === "undefined") return;
     const handleLaunchRun = (event: Event) => {
@@ -8483,7 +9052,12 @@ function ChatManager({
     return () => window.clearTimeout(timer);
   }, [chatNotice]);
 
-  const pendingSnapshotPhase = pendingRunSnapshot?.phase === "interrupted" ? "interrupted" : "running";
+  const pendingSnapshotPhase =
+    pendingRunSnapshot?.phase === "interrupted"
+      ? "interrupted"
+      : pendingRunSnapshot?.phase === "awaiting_confirmation"
+        ? "awaiting_confirmation"
+        : "running";
   const pendingSnapshotMode = pendingRunSnapshot?.mode === "resume" ? "resume" : "fresh";
   const hasRecoveredStream =
     !isStreamingForCurrentConversation &&
@@ -8518,6 +9092,17 @@ function ChatManager({
       : null;
   const visibleFailedUserMessage = hasPendingSnapshotForConversation ? failedUserMessage : null;
   const visibleStreamingResponse = hasPendingSnapshotForConversation ? streamingResponse : "";
+  const streamingResearchReport = showStreamingAssistant
+    ? parseResearchReport(visibleStreamingResponse)
+    : null;
+  const streamingResearchPrompt = visiblePendingUserMessage || (() => {
+    for (let cursor = messages.length - 1; cursor >= 0; cursor -= 1) {
+      const candidate = asRecord(messages[cursor]);
+      if (str(candidate.role, "").toLowerCase() !== "user") continue;
+      return stripAttachmentContextMarker(str(candidate.content, ""));
+    }
+    return "";
+  })();
   const completedProgressSnapshot =
     !hasPendingSnapshotForConversation && conversationId
       ? completedProgressMessagesByConversation[conversationId] || null
@@ -8668,6 +9253,27 @@ function ChatManager({
   const displayedExecutionPlan = displayedExecutionPlanState?.steps || [];
   const displayedExecutionPlanSummary = str(displayedExecutionPlanState?.summary, "");
   const displayedExecutionPlanFailure = executionPlanFailure || persistedExecutionPlanFailure;
+  const planConfirmationDraftPlan = useMemo(
+    () => buildExecutionPlanFromDraft(planConfirmation?.draft ?? null, planConfirmation?.originalPlan ?? null),
+    [planConfirmation]
+  );
+  const isPlanningDeepResearch = planConfirmation?.stage === "planning";
+  const isAwaitingPlanConfirmation = planConfirmation?.stage === "awaiting_confirmation";
+  const showPlanConfirmationCard = isPlanningDeepResearch || isAwaitingPlanConfirmation;
+  const planConfirmationEnabledCount =
+    planConfirmation?.draft?.steps.filter((step) => step.enabled).length ?? 0;
+  const planConfirmationDisabledCount =
+    (planConfirmation?.draft?.steps.length ?? 0) - planConfirmationEnabledCount;
+  const planConfirmationVisibleSteps = planConfirmation?.draft?.steps || [];
+  const planConfirmationSummaryText = str(
+    planConfirmation?.draft?.summary,
+    str(planConfirmation?.originalPlan?.summary, "")
+  );
+  const planConfirmationDepthCue = isAwaitingPlanConfirmation
+    ? planConfirmationEnabledCount > 0
+      ? `Will run ${planConfirmationEnabledCount} scoped research step${planConfirmationEnabledCount === 1 ? "" : "s"}, compare source sets, and finish with citations.`
+      : "Select at least one step to continue the deep research run."
+    : "Preparing a deeper, source-backed research plan.";
   const completedWorkspaceSteps =
     completedPersistedTraceSteps.length >= completedLastRunSteps.length &&
     completedPersistedTraceSteps.length > 0
@@ -9029,6 +9635,9 @@ function ChatManager({
         : displayedExecutionPlan.length > 0 && executionPlanCompletedCount === displayedExecutionPlan.length
           ? "done"
           : "pending";
+  const shouldShowCompactExecutionPlan = !showPlanConfirmationCard && displayedExecutionPlan.length > 0;
+  const shouldShowExecutionPlanWarning = !showPlanConfirmationCard && !!displayedExecutionPlanFailure;
+  const composerLockedForPlanConfirmation = showPlanConfirmationCard;
   const renderExecutionPlanStatusIcon = (status: string, className = "") => {
     if (status === "completed") {
       return <CheckCircleRoundedIcon className={className} />;
@@ -9583,6 +10192,7 @@ function ChatManager({
                 const ts = tsRaw ? formatChatTimestamp(tsRaw) : null;
                 const content = str(message.content);
                 const renderedContent = isUser ? stripAttachmentContextMarker(content) : content;
+                const researchReport = isAssistant ? parseResearchReport(renderedContent) : null;
                 const previousUserPrompt = !isUser
                   ? (() => {
                       for (let cursor = idx - 1; cursor >= 0; cursor -= 1) {
@@ -9651,10 +10261,18 @@ function ChatManager({
                             {renderedContent}
                           </Typography>
                         ) : (
-                          renderChatMarkdown(renderedContent, {
-                            snippetNamespace: messageId,
-                            onOpenSnippet: openCodePreviewInWorkspace
-                          })
+                          researchReport
+                            ? renderResearchReportCard({
+                                report: researchReport,
+                                previousUserPrompt,
+                                messageId,
+                                timestamp: tsRaw,
+                                traceId
+                              })
+                            : renderChatMarkdown(renderedContent, {
+                                snippetNamespace: messageId,
+                                onOpenSnippet: openCodePreviewInWorkspace
+                              })
                         )}
                       </Box>
                       {isUser ? renderUserAvatar() : null}
@@ -9705,7 +10323,16 @@ function ChatManager({
                         AgentArk | stopped
                       </Typography>
                       {visibleStreamingResponse.trim()
-                        ? renderChatMarkdown(visibleStreamingResponse)
+                        ? (
+                            streamingResearchReport
+                              ? renderResearchReportCard({
+                                  report: streamingResearchReport,
+                                  previousUserPrompt: streamingResearchPrompt,
+                                  messageId: "streaming-interrupted-report",
+                                  isStreaming: true
+                                })
+                              : renderChatMarkdown(visibleStreamingResponse)
+                          )
                         : (
                           <Typography variant="body2" color="text.secondary">
                             This run was stopped before a full reply was sent.
@@ -9738,18 +10365,32 @@ function ChatManager({
               {showStreamingAssistant && latestStreamingAssistantIndex === -1 ? (
                 <Box className="chat-row">
                   {renderAgentAvatar("chat-avatar-working")}
-                  <Box className="chat-bubble chat-bubble-assistant chat-bubble-streaming">
-                    <Typography variant="caption" color="text.secondary" className="chat-streaming-status">
-                      {visibleStreamingResponse.trim() ? "AgentArk is streaming..." : streamingActivity}
+                <Box className="chat-bubble chat-bubble-assistant chat-bubble-streaming">
+                  <Typography variant="caption" color="text.secondary" className="chat-streaming-status">
+                      {streamingResearchReport ? "Deep research report is streaming..." : visibleStreamingResponse.trim() ? "AgentArk is streaming..." : streamingActivity}
                     </Typography>
                     {visibleStreamingResponse.trim() ? (
-                      <Typography
-                        variant="body2"
-                        sx={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
-                      >
-                        {visibleStreamingResponse}
-                        <span className="stream-caret" />
-                      </Typography>
+                      streamingResearchReport
+                        ? (
+                            <Box sx={{ position: "relative" }}>
+                              {renderResearchReportCard({
+                                report: streamingResearchReport,
+                                previousUserPrompt: streamingResearchPrompt,
+                                messageId: "streaming-report",
+                                isStreaming: true
+                              })}
+                              <span className="stream-caret" />
+                            </Box>
+                          )
+                        : (
+                            <Typography
+                              variant="body2"
+                              sx={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
+                            >
+                              {visibleStreamingResponse}
+                              <span className="stream-caret" />
+                            </Typography>
+                          )
                     ) : (
                       <div className="typing-dots" aria-label="typing">
                         <span />
@@ -9929,8 +10570,230 @@ function ChatManager({
             </AccordionDetails>
           </Accordion>
         ) : null}
-        <Box className={`chat-composer-shell${displayedExecutionPlan.length > 0 || !!displayedExecutionPlanFailure ? " has-plan" : ""}${executionPlanExpanded ? " plan-expanded" : ""}`}>
-          {displayedExecutionPlan.length > 0 ? (
+        {showPlanConfirmationCard ? (
+          <Box className={`chat-plan-confirmation-card${planConfirmation?.editing ? " editing" : ""}`}>
+            {isPlanningDeepResearch ? (
+              <Stack direction="row" spacing={1.2} alignItems="center">
+                <CircularProgress size={18} thickness={5} className="chat-plan-confirmation-spinner" />
+                <Box sx={{ minWidth: 0 }}>
+                  <Typography variant="caption" className="chat-plan-confirmation-kicker">
+                    Deep research
+                  </Typography>
+                  <Typography variant="body2" className="chat-plan-confirmation-title">
+                    Preparing research plan
+                  </Typography>
+                  <Typography variant="caption" className="chat-plan-confirmation-copy">
+                    Building a confirmable plan before any research tools run.
+                  </Typography>
+                </Box>
+              </Stack>
+            ) : (
+              <Stack spacing={1.25}>
+                <Stack direction="row" justifyContent="space-between" alignItems="flex-start" spacing={1}>
+                  <Box sx={{ minWidth: 0, flex: 1 }}>
+                    <Stack direction="row" spacing={0.8} alignItems="center" useFlexGap flexWrap="wrap">
+                      <Typography variant="caption" className="chat-plan-confirmation-kicker">
+                        Deep research
+                      </Typography>
+                      <Typography variant="caption" className="chat-plan-confirmation-badge">
+                        Plan ready
+                      </Typography>
+                    </Stack>
+                    <Typography variant="body2" className="chat-plan-confirmation-title">
+                      Review the plan, make edits if needed, then start the run.
+                    </Typography>
+                  </Box>
+                  <Typography variant="caption" className="chat-plan-confirmation-meta">
+                    {planConfirmationEnabledCount} active
+                    {planConfirmationDisabledCount > 0 ? ` / ${planConfirmationDisabledCount} skipped` : ""}
+                  </Typography>
+                </Stack>
+
+                {planConfirmation?.editing ? (
+                  <TextField
+                    size="small"
+                    multiline
+                    minRows={2}
+                    value={planConfirmationSummaryText}
+                    onChange={(e) =>
+                      updatePlanConfirmationDraft((draft) => ({
+                        ...draft,
+                        summary: e.target.value
+                      }))
+                    }
+                    placeholder="Add a brief research summary"
+                    fullWidth
+                  />
+                ) : (
+                  <Typography variant="body2" className="chat-plan-confirmation-summary">
+                    {planConfirmationSummaryText || "This run will scope the question, gather sources, compare claims, and synthesize the answer."}
+                  </Typography>
+                )}
+
+                <Typography variant="caption" className="chat-plan-confirmation-copy">
+                  {planConfirmationDepthCue}
+                </Typography>
+
+                <Stack spacing={0.9}>
+                  {planConfirmationVisibleSteps.map((step, index) => {
+                    const stepDetail = str(step.description, "").trim();
+                    return (
+                      <Box
+                        key={step.draft_id}
+                        className={`chat-plan-confirmation-step${step.enabled ? "" : " disabled"}`}
+                      >
+                        <Box className={`chat-plan-confirmation-step-marker${step.enabled ? "" : " disabled"}`}>
+                          {index + 1}
+                        </Box>
+                        <Box sx={{ minWidth: 0, flex: 1 }}>
+                          {planConfirmation?.editing ? (
+                            <Stack spacing={0.9}>
+                              <Stack direction={{ xs: "column", sm: "row" }} spacing={1} alignItems={{ sm: "center" }}>
+                                <Checkbox
+                                  checked={step.enabled}
+                                  onChange={(e) =>
+                                    updatePlanConfirmationDraft((draft) => ({
+                                      ...draft,
+                                      steps: draft.steps.map((candidate) =>
+                                        candidate.draft_id === step.draft_id
+                                          ? { ...candidate, enabled: e.target.checked }
+                                          : candidate
+                                      )
+                                    }))
+                                  }
+                                  size="small"
+                                  sx={{ p: 0.25 }}
+                                />
+                                <TextField
+                                  size="small"
+                                  value={step.title}
+                                  onChange={(e) =>
+                                    updatePlanConfirmationDraft((draft) => ({
+                                      ...draft,
+                                      steps: draft.steps.map((candidate) =>
+                                        candidate.draft_id === step.draft_id
+                                          ? { ...candidate, title: e.target.value }
+                                          : candidate
+                                      )
+                                    }))
+                                  }
+                                  fullWidth
+                                  placeholder={`Step ${index + 1}`}
+                                />
+                              </Stack>
+                              <TextField
+                                size="small"
+                                multiline
+                                minRows={2}
+                                value={step.description}
+                                onChange={(e) =>
+                                  updatePlanConfirmationDraft((draft) => ({
+                                    ...draft,
+                                    steps: draft.steps.map((candidate) =>
+                                      candidate.draft_id === step.draft_id
+                                        ? { ...candidate, description: e.target.value }
+                                        : candidate
+                                    )
+                                  }))
+                                }
+                                fullWidth
+                                placeholder="Describe what this step should verify or produce"
+                              />
+                              <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                                <Button
+                                  size="small"
+                                  variant="outlined"
+                                  disabled={index === 0}
+                                  onClick={() =>
+                                    updatePlanConfirmationDraft((draft) => {
+                                      if (index === 0) return draft;
+                                      const steps = [...draft.steps];
+                                      [steps[index - 1], steps[index]] = [steps[index], steps[index - 1]];
+                                      return { ...draft, steps };
+                                    })
+                                  }
+                                >
+                                  Move up
+                                </Button>
+                                <Button
+                                  size="small"
+                                  variant="outlined"
+                                  disabled={index === planConfirmationVisibleSteps.length - 1}
+                                  onClick={() =>
+                                    updatePlanConfirmationDraft((draft) => {
+                                      if (index >= draft.steps.length - 1) return draft;
+                                      const steps = [...draft.steps];
+                                      [steps[index], steps[index + 1]] = [steps[index + 1], steps[index]];
+                                      return { ...draft, steps };
+                                    })
+                                  }
+                                >
+                                  Move down
+                                </Button>
+                              </Stack>
+                            </Stack>
+                          ) : (
+                            <>
+                              <Typography variant="body2" className="chat-plan-confirmation-step-title">
+                                {step.title}
+                              </Typography>
+                              {stepDetail ? (
+                                <Typography variant="caption" className="chat-plan-confirmation-step-detail">
+                                  {stepDetail}
+                                </Typography>
+                              ) : null}
+                            </>
+                          )}
+                        </Box>
+                      </Box>
+                    );
+                  })}
+                </Stack>
+
+                <Stack direction="row" spacing={1} justifyContent="space-between" alignItems="center" useFlexGap flexWrap="wrap">
+                  <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+                    <Button
+                      size="small"
+                      variant={planConfirmation?.editing ? "contained" : "outlined"}
+                      onClick={() =>
+                        setPlanConfirmation((prev) =>
+                          prev
+                            ? {
+                                ...prev,
+                                editing: !prev.editing
+                              }
+                            : prev
+                        )
+                      }
+                    >
+                      {planConfirmation?.editing ? "Done editing" : "Edit"}
+                    </Button>
+                    {planConfirmation?.editing ? (
+                      <Button size="small" variant="text" onClick={resetPlanConfirmationDraft}>
+                        Reset
+                      </Button>
+                    ) : null}
+                  </Stack>
+                  <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+                    <Button size="small" variant="outlined" onClick={() => void handlePlanConfirmationCancel()}>
+                      Cancel
+                    </Button>
+                    <Button
+                      size="small"
+                      variant="contained"
+                      disabled={!planConfirmationDraftPlan || planConfirmationEnabledCount === 0 || isStreaming}
+                      onClick={() => void handlePlanConfirmationStart()}
+                    >
+                      Start
+                    </Button>
+                  </Stack>
+                </Stack>
+              </Stack>
+            )}
+          </Box>
+        ) : null}
+        <Box className={`chat-composer-shell${shouldShowCompactExecutionPlan || shouldShowExecutionPlanWarning ? " has-plan" : ""}${executionPlanExpanded ? " plan-expanded" : ""}`}>
+          {shouldShowCompactExecutionPlan ? (
             <Box className="chat-composer-plan">
               <Box
                 className={`chat-composer-plan-toggle status-${executionPlanTone}${executionPlanExpanded ? " expanded" : ""}`}
@@ -10007,7 +10870,7 @@ function ChatManager({
                 </Box>
               ) : null}
             </Box>
-          ) : displayedExecutionPlanFailure ? (
+          ) : shouldShowExecutionPlanWarning ? (
             <Box className="chat-composer-plan-warning">
               <Stack direction="row" spacing={1.1} alignItems="flex-start">
                 <Box className="chat-composer-plan-icon status-failed">
@@ -10031,7 +10894,11 @@ function ChatManager({
           ) : null}
           <textarea
             className="chat-composer-textarea"
-            placeholder="Message (Enter to send, Shift+Enter for newline)"
+            placeholder={
+              composerLockedForPlanConfirmation
+                ? "Review the Deep research plan, then Start or Cancel."
+                : "Message (Enter to send, Shift+Enter for newline)"
+            }
             aria-label="Message"
             value={prompt}
             onChange={(e) => {
@@ -10043,7 +10910,7 @@ function ChatManager({
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                 e.preventDefault();
-                if (isStreaming || (!prompt.trim() && attachedFiles.length === 0)) return;
+                if (isStreaming || composerLockedForPlanConfirmation || (!prompt.trim() && attachedFiles.length === 0)) return;
                 const msg = prompt.trim();
                 setPrompt("");
                 (e.target as HTMLTextAreaElement).style.height = "auto";
@@ -10054,7 +10921,7 @@ function ChatManager({
               }
             }}
             rows={1}
-            disabled={false}
+            disabled={composerLockedForPlanConfirmation}
           />
           <div className="chat-composer-actions">
             {false ? (
@@ -10093,21 +10960,21 @@ function ChatManager({
               ))}
               </Stack>
             ) : null}
-            <Tooltip title={deepResearchEnabled ? "Deep Research enabled â€” slower, source-backed" : "Enable Deep Research"}>
+            <Tooltip title={deepResearchEnabled ? "Deep research enabled - slower, source-backed" : "Enable Deep research"}>
               <FormControlLabel
                 control={
                   <Switch
                     size="small"
                     checked={deepResearchEnabled}
                     onChange={() => setDeepResearchEnabled((prev) => !prev)}
-                    disabled={isStreaming}
+                    disabled={isStreaming || composerLockedForPlanConfirmation}
                     sx={{
                       "& .MuiSwitch-switchBase.Mui-checked": { color: "#2fd4ff" },
                       "& .MuiSwitch-switchBase.Mui-checked + .MuiSwitch-track": { backgroundColor: "rgba(47, 212, 255, 0.4)" },
                     }}
                   />
                 }
-                label="Research"
+                label="Deep research"
                 slotProps={{ typography: { sx: { fontSize: "0.7rem", fontWeight: 600, color: deepResearchEnabled ? "#2fd4ff" : "text.secondary" } } }}
                 sx={{ ml: 0, mr: 0.5 }}
               />
@@ -10117,7 +10984,7 @@ function ChatManager({
                 size="small"
                 className="chat-composer-action-btn"
                 onClick={() => fileInputRef.current?.click()}
-                disabled={isStreaming}
+                disabled={isStreaming || composerLockedForPlanConfirmation}
               >
                 <AttachFileRoundedIcon fontSize="small" />
               </IconButton>
@@ -10138,8 +11005,9 @@ function ChatManager({
                 id="chat-send-btn"
                 size="small"
                 className="chat-composer-send-btn"
-                disabled={!prompt.trim() && attachedFiles.length === 0}
+                disabled={composerLockedForPlanConfirmation || (!prompt.trim() && attachedFiles.length === 0)}
                 onClick={async () => {
+                  if (composerLockedForPlanConfirmation) return;
                   setChatError(null);
                   const msg = prompt.trim();
                   setPrompt("");
@@ -10554,6 +11422,79 @@ function ChatManager({
             )}
           </Stack>
         </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={!!researchReportDialog}
+        onClose={() => setResearchReportDialog(null)}
+        maxWidth="lg"
+        fullWidth
+        PaperProps={{ className: "chat-research-report-dialog" }}
+      >
+        <DialogTitle className="chat-research-report-dialog-title">
+          <Stack direction="row" justifyContent="space-between" alignItems="flex-start" spacing={1.5}>
+            <Box sx={{ minWidth: 0, flex: 1 }}>
+              <Typography variant="subtitle1" className="chat-research-report-dialog-heading">
+                {researchReportDialog?.report.title || "Research report"}
+              </Typography>
+              <Typography variant="caption" className="chat-research-report-dialog-meta">
+                {researchReportDialog ? researchReportMetaLabel(researchReportDialog.report) : "Research report"}
+              </Typography>
+            </Box>
+            <Stack direction="row" spacing={0.5}>
+              <Tooltip title="Download report">
+                <span>
+                  <IconButton
+                    size="small"
+                    onClick={() => {
+                      if (!researchReportDialog) return;
+                      void exportAssistantMarkdown({
+                        content: researchReportDialog.report.content,
+                        headingHint: researchReportDialog.report.title,
+                        previousUserPrompt: researchReportDialog.previousUserPrompt,
+                        timestamp: researchReportDialog.timestamp,
+                        traceId: researchReportDialog.traceId
+                      });
+                    }}
+                  >
+                    <FileDownloadRoundedIcon fontSize="small" />
+                  </IconButton>
+                </span>
+              </Tooltip>
+              <IconButton size="small" onClick={() => setResearchReportDialog(null)}>
+                <CloseIcon fontSize="small" />
+              </IconButton>
+            </Stack>
+          </Stack>
+        </DialogTitle>
+        <DialogContent dividers className="chat-research-report-dialog-content">
+          {researchReportDialog
+            ? renderChatMarkdown(researchReportDialog.report.content, {
+                snippetNamespace: `research-report-${researchReportDialog.messageId || "dialog"}`,
+                onOpenSnippet: openCodePreviewInWorkspace
+              })
+            : null}
+        </DialogContent>
+        <DialogActions className="chat-research-report-dialog-actions">
+          <Button
+            variant="outlined"
+            onClick={() => {
+              if (!researchReportDialog) return;
+              void exportAssistantMarkdown({
+                content: researchReportDialog.report.content,
+                headingHint: researchReportDialog.report.title,
+                previousUserPrompt: researchReportDialog.previousUserPrompt,
+                timestamp: researchReportDialog.timestamp,
+                traceId: researchReportDialog.traceId
+              });
+            }}
+          >
+            Download
+          </Button>
+          <Button variant="contained" onClick={() => setResearchReportDialog(null)}>
+            Close
+          </Button>
+        </DialogActions>
       </Dialog>
     </Box>
   );
@@ -18753,6 +19694,7 @@ function SettingsManager({
   initialTab?: number | null;
   hideSettingsNav?: boolean;
 }) {
+  const LOCAL_EMBEDDINGS_MODEL = "BAAI/bge-small-en-v1.5";
   const queryClient = useQueryClient();
   const [tab, setTab] = useState(() => {
     if (typeof initialTab === "number") return initialTab;
@@ -18831,6 +19773,8 @@ function SettingsManager({
   const [securityLogsDialogOpen, setSecurityLogsDialogOpen] = useState(false);
   const [selectedSecurityLog, setSelectedSecurityLog] = useState<JsonRecord | null>(null);
   const [selectedPulseEvent, setSelectedPulseEvent] = useState<JsonRecord | null>(null);
+  const [storageMaintenanceOpen, setStorageMaintenanceOpen] = useState(false);
+  const [storageMaintenanceConfirm, setStorageMaintenanceConfirm] = useState("");
   const [activePulseFixId, setActivePulseFixId] = useState<string | null>(null);
   const [selectedMoltbookEvent, setSelectedMoltbookEvent] = useState<JsonRecord | null>(null);
   const [pulsePollState, setPulsePollState] = useState<{ baselineEventId: string; deadlineAt: number } | null>(null);
@@ -18978,6 +19922,12 @@ function SettingsManager({
     enabled: pulseTabActive,
     refetchInterval: pulseTabActive ? (pulsePollState ? 2000 : autoRefresh ? REFRESH_MS : false) : false
   });
+  const storageMaintenanceReviewQ = useQuery({
+    queryKey: ["memory-maintenance-review"],
+    queryFn: () => api.rawGet("/memory/maintenance/review") as Promise<MemoryMaintenanceReviewResponse>,
+    enabled: storageMaintenanceOpen,
+    refetchOnWindowFocus: false
+  });
   const moltbookStatusQ = useQuery({
     queryKey: ["moltbook-status"],
     queryFn: () => api.rawGet("/moltbook/status"),
@@ -18996,9 +19946,15 @@ function SettingsManager({
     enabled: evolutionTabActive,
     refetchInterval: evolutionTabActive && autoRefresh ? REFRESH_MS : false
   });
+  const [showSupersededLearningCandidates, setShowSupersededLearningCandidates] = useState(false);
   const evolutionDevQ = useQuery({
-    queryKey: ["settings-evolution-dev"],
-    queryFn: () => api.rawGet("/settings/evolution/dev?limit=5000"),
+    queryKey: ["settings-evolution-dev", showSupersededLearningCandidates],
+    queryFn: () =>
+      api.rawGet(
+        `/settings/evolution/dev?limit=5000${
+          showSupersededLearningCandidates ? "&include_superseded=true" : ""
+        }`
+      ),
     enabled: evolutionTabActive,
     refetchInterval: evolutionTabActive && autoRefresh ? REFRESH_MS : false
   });
@@ -19062,7 +20018,7 @@ function SettingsManager({
     daily_brief_channel: "telegram",
     smart_routing: true,
     embeddings_provider: "local-hf",
-    embeddings_model: "sentence-transformers/all-MiniLM-L6-v2",
+    embeddings_model: LOCAL_EMBEDDINGS_MODEL,
     embeddings_base_url: "",
     embeddings_api_key: "",
 
@@ -19394,7 +20350,7 @@ function SettingsManager({
       daily_brief_channel: str(settings.daily_brief_channel, "telegram"),
       smart_routing: toBool(settings.smart_routing),
       embeddings_provider: str(settings.embeddings_provider, "local-hf"),
-      embeddings_model: str(settings.embeddings_model, "sentence-transformers/all-MiniLM-L6-v2"),
+      embeddings_model: str(settings.embeddings_model, LOCAL_EMBEDDINGS_MODEL),
       embeddings_base_url: str(settings.embeddings_base_url, ""),
       embeddings_api_key: "",
 
@@ -19832,7 +20788,10 @@ function SettingsManager({
         daily_brief_channel: form.daily_brief_channel || "telegram",
         smart_routing: form.smart_routing,
         embeddings_provider: form.embeddings_provider || "local-hf",
-        embeddings_model: form.embeddings_model || "sentence-transformers/all-MiniLM-L6-v2",
+        embeddings_model:
+          (form.embeddings_provider || "local-hf") === "local-hf"
+            ? LOCAL_EMBEDDINGS_MODEL
+            : form.embeddings_model || LOCAL_EMBEDDINGS_MODEL,
         embeddings_base_url: form.embeddings_base_url || null,
         embeddings_api_key: form.embeddings_api_key || null,
 
@@ -20805,6 +21764,16 @@ function SettingsManager({
     { label: "Watchers", value: String(num(selectedPulseDetails.active_watchers, 0)) },
     { label: "Uptime", value: formatDurationFromSeconds(selectedPulseDetails.uptime_secs) }
   ];
+  const storageMaintenanceReview = storageMaintenanceReviewQ.data as MemoryMaintenanceReviewResponse | undefined;
+  const storageMaintenanceCounts = asRecord(storageMaintenanceReview?.knowledge_counts);
+  const storageMaintenancePolicy = asRecord(storageMaintenanceReview?.policy);
+  const storageMaintenanceDurablePolicy = asRecord(storageMaintenanceReview?.durable_policy);
+  const storageMaintenanceEpisode = asRecord(storageMaintenanceReview?.episode_cleanup);
+  const storageMaintenanceAvailable = toBool(storageMaintenanceEpisode.available);
+  const storageMaintenanceConfirmationPhrase = str(storageMaintenanceEpisode.confirmation_phrase, "");
+  const storageMaintenanceConfirmMatches =
+    storageMaintenanceConfirmationPhrase.trim().length > 0 &&
+    storageMaintenanceConfirm.trim() === storageMaintenanceConfirmationPhrase;
   const latestPulseEvent = asRecord(pulseEvents[0]);
   const latestPulseDetails = asRecord(latestPulseEvent.details);
   const latestPulseFindingsCount = pickRecords(latestPulseDetails, "doctor_findings").filter((f) =>
@@ -21773,6 +22742,30 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
     },
     onError: (e) => setError(errMessage(e))
   });
+  const runStorageMaintenanceMutation = useMutation({
+    mutationFn: (payload: RunMemoryMaintenanceRequest) => api.rawPost("/memory/maintenance/run", payload),
+    onSuccess: async (raw) => {
+      const response = asRecord(raw);
+      setSuccess(str(response.summary, "Storage maintenance completed."));
+      setStorageMaintenanceOpen(false);
+      setStorageMaintenanceConfirm("");
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["memory-maintenance-review"] }),
+        queryClient.invalidateQueries({ queryKey: ["arkpulse-log"] }),
+        queryClient.invalidateQueries({ queryKey: ["notifications"] }),
+        queryClient.invalidateQueries({ queryKey: ["notifications-count"] }),
+        queryClient.invalidateQueries({ queryKey: ["memory-stats"] }),
+        queryClient.invalidateQueries({ queryKey: ["memory-facts"] }),
+        queryClient.invalidateQueries({ queryKey: ["documents-manager"] })
+      ]);
+      try {
+        await api.rawPost("/arkpulse/trigger", {});
+      } catch (e) {
+        setError(`Storage maintenance ran, but ArkPulse refresh failed: ${errMessage(e)}`);
+      }
+    },
+    onError: (e) => setError(errMessage(e))
+  });
 
   const trustEvaluateMutation = useMutation({
     mutationFn: (payload: { action_kind: string; payload: unknown }) =>
@@ -22129,8 +23122,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
     const duplicatesPageHeader =
       !info &&
       !action &&
-      normalizeSettingsHeading(title) === normalizeSettingsHeading(selectedSettingsHeaderTitle) &&
-      normalizeSettingsHeading(eyebrow) === normalizeSettingsHeading(selectedSettingsMeta.kicker);
+      normalizeSettingsHeading(title) === normalizeSettingsHeading(selectedSettingsHeaderTitle);
 
     if (duplicatesPageHeader) {
       return null;
@@ -22866,23 +23858,23 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                         <MenuItem value="ollama">External Ollama</MenuItem>
                       </TextField>
                     </Grid2>
-                    <Grid2 size={{ xs: 12, md: 8 }}>
-                      <TextField
-                        label="Embedding Model"
-                        value={form.embeddings_model}
-                        onChange={(e) => setField("embeddings_model", e.target.value)}
-                        fullWidth
-                        size="small"
-                        placeholder="sentence-transformers/all-MiniLM-L6-v2"
-                        helperText={
-                          embeddingsIsLocal
-                            ? "Default local model: sentence-transformers/all-MiniLM-L6-v2"
-                            : embeddingsIsOllama
+                    {!embeddingsIsLocal ? (
+                      <Grid2 size={{ xs: 12, md: 8 }}>
+                        <TextField
+                          label="Embedding Model"
+                          value={form.embeddings_model}
+                          onChange={(e) => setField("embeddings_model", e.target.value)}
+                          fullWidth
+                          size="small"
+                          placeholder={embeddingsIsOllama ? "nomic-embed-text" : "text-embedding-3-small"}
+                          helperText={
+                            embeddingsIsOllama
                               ? "Example: nomic-embed-text"
                               : "Use the model name exposed by your external /embeddings provider."
-                        }
-                      />
-                    </Grid2>
+                          }
+                        />
+                      </Grid2>
+                    ) : null}
 
                     {embeddingsIsExternal ? (
                       <Grid2 size={{ xs: 12, md: 8 }}>
@@ -22923,7 +23915,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
 
                   {embeddingsIsLocal ? (
                     <Alert severity="info" icon={<InfoOutlinedIcon fontSize="inherit" />}>
-                      Local embeddings download on first use and stay cached inside AgentArk data. No Ollama service is required.
+                      Local embeddings use the built-in default model {LOCAL_EMBEDDINGS_MODEL} and initialize in the background on first startup. They stay cached inside AgentArk data, and no Ollama service is required.
                     </Alert>
                   ) : null}
                 </Stack>
@@ -26345,12 +27337,33 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
               <Box className="list-shell" sx={{ minHeight: 0 }}>
                 {renderSettingsSectionIntro({
                   eyebrow: "Evolution",
-                  title: "Draft learning candidates",
+                  title: "Learning candidates",
                   description:
                     "Suggestions created from evidence. These do not become active workflows or strategies until approved.",
                   info:
                     "This list shows the new ideas AgentArk has generated from evidence, including workflow, memory, and strategy suggestions."
                 })}
+                {developerModeEnabled ? (
+                  <Stack
+                    direction={{ xs: "column", sm: "row" }}
+                    spacing={1.5}
+                    alignItems={{ xs: "flex-start", sm: "center" }}
+                    sx={{ mb: 1.5 }}
+                  >
+                    <FormControlLabel
+                      control={
+                        <Switch
+                          checked={showSupersededLearningCandidates}
+                          onChange={(event) => setShowSupersededLearningCandidates(event.target.checked)}
+                        />
+                      }
+                      label="Show superseded history"
+                    />
+                    <Typography variant="caption" color="text.secondary">
+                      Superseded revisions stay hidden by default so the active review queue remains focused.
+                    </Typography>
+                  </Stack>
+                ) : null}
                 {evolutionDevQ.isLoading ? (
                   <Typography variant="body2" color="text.secondary">Loading learning candidates...</Typography>
                 ) : evolutionDevQ.error ? (
@@ -26821,6 +27834,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                   const fix = displayRemediation ? describeArkPulseRemediation(displayRemediation) : getArkPulseFixText(fr);
                   const canCopyFix = fix.trim().length > 0 && fix.trim() !== "-";
                   const canRunFix = runnableRemediation != null;
+                  const canReviewStorageMaintenance = target === "knowledge_store";
                   const fixActionId = `${title}:${target}:${idx}`;
                   const fixBusy = runPulseFixMutation.isPending && activePulseFixId === fixActionId;
                   return (
@@ -26860,6 +27874,21 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                           </Typography>
                         </Box>
                         <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+                          {canReviewStorageMaintenance ? (
+                            <Button
+                              size="small"
+                              variant="contained"
+                              color="warning"
+                              onClick={() => {
+                                setError(null);
+                                setSuccess(null);
+                                setStorageMaintenanceConfirm("");
+                                setStorageMaintenanceOpen(true);
+                              }}
+                            >
+                              Review storage maintenance
+                            </Button>
+                          ) : null}
                           <Button
                             size="small"
                             variant="outlined"
@@ -26905,7 +27934,9 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                           </Button>
                         </Stack>
                         <Typography variant="caption" color="text.secondary">
-                          {typedRemediation
+                          {canReviewStorageMaintenance
+                            ? "Opens a review screen first, then requires explicit confirmation before any episodic cleanup can run."
+                            : typedRemediation
                             ? "Runs directly from ArkPulse using the finding's typed remediation."
                             : canRunFix
                               ? "Legacy event: ArkPulse is using the saved fix command fallback for this run."
@@ -26946,6 +27977,160 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
             ) : null}
           </Stack>
         </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={storageMaintenanceOpen}
+        onClose={() => {
+          if (runStorageMaintenanceMutation.isPending) return;
+          setStorageMaintenanceOpen(false);
+          setStorageMaintenanceConfirm("");
+        }}
+        maxWidth="md"
+        fullWidth
+      >
+        <DialogTitle>Storage Maintenance Review</DialogTitle>
+        <DialogContent dividers>
+          {storageMaintenanceReviewQ.isLoading ? (
+            <Typography variant="body2" color="text.secondary">
+              Building storage review...
+            </Typography>
+          ) : storageMaintenanceReviewQ.error ? (
+            <Alert severity="error">{errMessage(storageMaintenanceReviewQ.error)}</Alert>
+          ) : (
+            <Stack spacing={1.5}>
+              <Alert severity={storageMaintenanceAvailable ? "warning" : "info"} variant="outlined">
+                {str(storageMaintenanceEpisode.reason, "No storage maintenance action is available right now.")}
+              </Alert>
+
+              <Grid2 container spacing={1}>
+                {[
+                  { label: "Episodes", value: String(num(storageMaintenanceCounts.episodes, 0)) },
+                  { label: "Facts", value: String(num(storageMaintenanceCounts.facts, 0)) },
+                  { label: "Documents", value: String(num(storageMaintenanceCounts.documents, 0)) },
+                  { label: "Chunks", value: String(num(storageMaintenanceCounts.document_chunks, 0)) }
+                ].map((item) => (
+                  <Grid2 key={item.label} size={{ xs: 6, md: 3 }}>
+                    <Box className="metadata-box" sx={{ minHeight: 86 }}>
+                      <Typography variant="caption" color="text.secondary">
+                        {item.label}
+                      </Typography>
+                      <Typography variant="h6">{item.value}</Typography>
+                    </Box>
+                  </Grid2>
+                ))}
+              </Grid2>
+
+              <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+                <Chip
+                  size="small"
+                  label={toBool(storageMaintenancePolicy.data_cleanup_enabled) ? "Data cleanup on" : "Data cleanup off"}
+                  color={toBool(storageMaintenancePolicy.data_cleanup_enabled) ? "success" : "default"}
+                  variant={toBool(storageMaintenancePolicy.data_cleanup_enabled) ? "filled" : "outlined"}
+                />
+                <Chip
+                  size="small"
+                  label={toBool(storageMaintenancePolicy.episode_retention_enabled) ? "Episode retention on" : "Episode retention off"}
+                  color={toBool(storageMaintenancePolicy.episode_retention_enabled) ? "success" : "default"}
+                  variant={toBool(storageMaintenancePolicy.episode_retention_enabled) ? "filled" : "outlined"}
+                />
+                <Chip
+                  size="small"
+                  label={toBool(storageMaintenancePolicy.protect_fact_sources) ? "Fact source protection on" : "Fact source protection off"}
+                  color={toBool(storageMaintenancePolicy.protect_fact_sources) ? "info" : "default"}
+                  variant="outlined"
+                />
+              </Stack>
+
+              <Alert severity="info" variant="outlined">
+                {str(storageMaintenanceDurablePolicy.documents, "Documents stay durable.")}
+              </Alert>
+              <Alert severity="info" variant="outlined">
+                {str(storageMaintenanceDurablePolicy.semantic_facts, "Semantic facts stay durable.")}
+              </Alert>
+
+              <Box className="metadata-box">
+                <Stack spacing={0.7}>
+                  <Typography variant="subtitle2">Episode cleanup preview</Typography>
+                  <Typography variant="body2" color="text.secondary">
+                    Current episodes: {num(storageMaintenanceEpisode.current_episode_count, 0)} | Configured cap: {num(storageMaintenanceEpisode.max_episodes, 0)} | Estimated remaining after cleanup: {num(storageMaintenanceEpisode.estimated_remaining_episodes, 0)}
+                  </Typography>
+                  <Typography variant="body2" color="text.secondary">
+                    Eligible after protections: {num(storageMaintenanceEpisode.candidate_count, 0)} of {num(storageMaintenanceEpisode.raw_candidate_count, 0)} raw candidates
+                  </Typography>
+                  <Typography variant="body2" color="text.secondary">
+                    Safeguards: keep last {num(storageMaintenanceEpisode.keep_last, 0)} | min age {num(storageMaintenanceEpisode.cutoff_days, 0)} days | max importance {num(storageMaintenanceEpisode.max_importance, 0).toFixed(2)} | max access count {num(storageMaintenanceEpisode.max_access_count, 0)}
+                  </Typography>
+                  <Typography variant="body2" color="text.secondary">
+                    Protected rows: {num(storageMaintenanceEpisode.protected_recent_count, 0)} recent episodes | {num(storageMaintenanceEpisode.protected_fact_source_count, 0)} fact-linked episodes
+                  </Typography>
+                  <Typography variant="body2" color="text.secondary">
+                    Consolidated-only requirement: {toBool(storageMaintenanceEpisode.require_consolidated) ? "on" : "off"}
+                  </Typography>
+                </Stack>
+              </Box>
+
+              {storageMaintenanceAvailable ? (
+                <Box className="metadata-box">
+                  <Stack spacing={1}>
+                    <Typography variant="subtitle2">Confirmation required</Typography>
+                    <Typography variant="body2" color="text.secondary">
+                      Type <b>{storageMaintenanceConfirmationPhrase}</b> to run this reviewed cleanup.
+                    </Typography>
+                    <TextField
+                      fullWidth
+                      size="small"
+                      label="Confirmation text"
+                      value={storageMaintenanceConfirm}
+                      onChange={(e) => setStorageMaintenanceConfirm(e.target.value)}
+                    />
+                  </Stack>
+                </Box>
+              ) : null}
+            </Stack>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button
+            onClick={() => {
+              if (runStorageMaintenanceMutation.isPending) return;
+              setStorageMaintenanceOpen(false);
+              setStorageMaintenanceConfirm("");
+            }}
+          >
+            Close
+          </Button>
+          <Button
+            onClick={() => void storageMaintenanceReviewQ.refetch()}
+            disabled={storageMaintenanceReviewQ.isFetching || runStorageMaintenanceMutation.isPending}
+          >
+            {storageMaintenanceReviewQ.isFetching ? "Refreshing..." : "Refresh review"}
+          </Button>
+          <Button
+            color="warning"
+            variant="contained"
+            disabled={
+              !storageMaintenanceAvailable ||
+              !storageMaintenanceConfirmMatches ||
+              runStorageMaintenanceMutation.isPending
+            }
+            onClick={async () => {
+              setError(null);
+              setSuccess(null);
+              try {
+                await runStorageMaintenanceMutation.mutateAsync({
+                  action: "episode_retention_cleanup",
+                  preview_signature: str(storageMaintenanceEpisode.preview_signature, ""),
+                  confirmation_text: storageMaintenanceConfirm.trim()
+                });
+              } catch {
+                // handled by mutation onError
+              }
+            }}
+          >
+            {runStorageMaintenanceMutation.isPending ? "Running..." : "Run reviewed cleanup"}
+          </Button>
+        </DialogActions>
       </Dialog>
 
       {settingsQ.isLoading || mediaQ.isLoading ? (

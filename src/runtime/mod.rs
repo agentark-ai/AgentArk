@@ -3161,13 +3161,13 @@ impl ActionRuntime {
         // Research
         self.register_builtin_action(ActionDef {
             name: "research".to_string(),
-            description: "Conduct deep research on a topic by searching and analyzing multiple sources. Use for complex questions that need thorough investigation beyond a simple web search.".to_string(),
+            description: "Conduct deep research on a topic by gathering diverse source sets, fetching and comparing evidence, surfacing contradictions and open questions, and returning a citation-backed synthesis. Use for complex questions that need thorough investigation beyond a simple web search.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Research topic or question" },
-                    "max_sources": { "type": "integer", "description": "Maximum sources to examine (default 5)" },
+                    "max_sources": { "type": "integer", "description": "Maximum sources to examine (default 5, or 12 when depth='deep')" },
                     "backend": { "type": "string", "description": "Optional search backend override: lightpanda, duckduckgo, playwright, brave, brave_api, serper" },
                     "depth": { "type": "string", "description": "Research depth: quick, standard, deep" },
                     "include_sources": { "type": "boolean", "description": "Include source URLs" }
@@ -5446,12 +5446,22 @@ impl ActionRuntime {
         }
 
         if let Some(binding) = plugin_binding {
-            return self.execute_plugin_action(binding, &resolved_args).await;
+            let outbound_args = if Self::action_def_requires_outbound_gate(&info) {
+                Self::sanitize_outbound_action_arguments(action_name, &resolved_args)?
+            } else {
+                resolved_args.clone()
+            };
+            return self.execute_plugin_action(binding, &outbound_args).await;
         }
 
         if let Some(binding) = custom_api_binding {
+            let outbound_args = if binding.read_only {
+                resolved_args.clone()
+            } else {
+                Self::sanitize_outbound_action_arguments(action_name, &resolved_args)?
+            };
             return self
-                .execute_custom_api_action(binding, &resolved_args)
+                .execute_custom_api_action(binding, &outbound_args)
                 .await;
         }
 
@@ -5694,6 +5704,40 @@ impl ActionRuntime {
         }
 
         walk(arguments, &re, action_name, &resolve_secret, &resolve_env)
+    }
+
+    fn action_def_requires_outbound_gate(info: &ActionDef) -> bool {
+        let outbound = &info.authorization.outbound;
+        !outbound.read_only && (outbound.outbound_write || outbound.public_publish)
+    }
+
+    fn sanitize_outbound_action_arguments(
+        action_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let privacy = crate::security::sanitize_outbound_json(
+            arguments,
+            &crate::security::OutboundPrivacyPolicy::default(),
+        );
+        match privacy.decision {
+            crate::security::OutboundPrivacyDecision::Allow => Ok(arguments.clone()),
+            crate::security::OutboundPrivacyDecision::RedactedAllow => {
+                tracing::warn!(
+                    action = action_name,
+                    redactions = ?privacy.redactions,
+                    reasons = ?privacy.reasons,
+                    "Outbound privacy gate redacted action arguments"
+                );
+                Ok(privacy.sanitized_value)
+            }
+            crate::security::OutboundPrivacyDecision::Block => Err(anyhow::anyhow!(
+                "{}",
+                crate::security::format_outbound_privacy_block(
+                    &format!("action '{}'", action_name),
+                    &privacy.reasons,
+                )
+            )),
+        }
     }
 
     async fn execute_mcp_action(
@@ -12226,5 +12270,20 @@ version: "1.2.3"
 
         assert!(!decision.allowed);
         assert!(decision.reason.contains("trusted local session"));
+    }
+
+    #[test]
+    fn outbound_gate_respects_explicit_action_metadata() {
+        let mut action = ActionDef::default();
+        action.authorization.outbound.read_only = true;
+        assert!(!ActionRuntime::action_def_requires_outbound_gate(&action));
+
+        action.authorization.outbound.read_only = false;
+        action.authorization.outbound.outbound_write = true;
+        assert!(ActionRuntime::action_def_requires_outbound_gate(&action));
+
+        action.authorization.outbound.outbound_write = false;
+        action.authorization.outbound.public_publish = true;
+        assert!(ActionRuntime::action_def_requires_outbound_gate(&action));
     }
 }

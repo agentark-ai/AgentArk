@@ -314,7 +314,7 @@ pub struct PublicAppsConfig {
 }
 
 fn default_local_embeddings_model() -> String {
-    "sentence-transformers/all-MiniLM-L6-v2".to_string()
+    "BAAI/bge-small-en-v1.5".to_string()
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]

@@ -38,6 +38,7 @@ const PROMPT_BUNDLE_DEFAULT_VERSION: &str = "prompt-bundle-default-v1";
 const LINEAGE_ARCHIVE_REL_PATH: &str = ".agentark/self_evolve/prompt_bundle_lineage.jsonl";
 const BENCHMARK_PROFILE_REL_PATH: &str = "assets/self_evolve/prompt_bundle_benchmark_v1.json";
 const DEFAULT_RECENT_LINEAGE_LIMIT: usize = 12;
+const MAX_LINEAGE_ARCHIVE_ENTRIES: usize = 400;
 const MAX_SURFACE_CHARS: usize = 16_000;
 const ROUTER_WEIGHT: f64 = 0.35;
 const SYNTHESIS_WEIGHT: f64 = 0.25;
@@ -607,6 +608,7 @@ impl PromptEvolutionEngine {
             .open(&archive)
             .await?;
         file.write_all(line.as_bytes()).await?;
+        super::prune_jsonl_archive(&archive, MAX_LINEAGE_ARCHIVE_ENTRIES).await?;
         Ok(entry.entry_id.clone())
     }
 

@@ -15,6 +15,7 @@ pub const ROUTING_COMPLEXITY_POLICY_KEY: &str = "routing_complexity_policy_v1";
 const LINEAGE_ARCHIVE_REL_PATH: &str = ".agentark/self_evolve/routing_policy_lineage.jsonl";
 const BENCHMARK_PROFILE_REL_PATH: &str = "assets/self_evolve/routing_benchmark_v1.json";
 const DEFAULT_RECENT_LINEAGE_LIMIT: usize = 12;
+const MAX_LINEAGE_ARCHIVE_ENTRIES: usize = 400;
 const MAX_INDICATORS: usize = 96;
 const MAX_INDICATOR_LEN: usize = 80;
 
@@ -346,6 +347,7 @@ impl PolicyEvolutionEngine {
             .open(&archive)
             .await?;
         file.write_all(line.as_bytes()).await?;
+        super::prune_jsonl_archive(&archive, MAX_LINEAGE_ARCHIVE_ENTRIES).await?;
         Ok(entry.entry_id.clone())
     }
 

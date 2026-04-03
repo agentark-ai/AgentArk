@@ -655,6 +655,14 @@ fn render_cli_stream_event(
                 reason.unwrap_or_else(|| format!("Plan revised to {} steps", plan.steps.len()))
             );
         }
+        core::StreamEvent::PlanReadyForConfirmation { task_id, plan, .. } => {
+            finish_cli_inline_response(state)?;
+            println!(
+                "\x1b[35m[plan]\x1b[0m Ready for confirmation on task {} ({} steps)",
+                &task_id[..task_id.len().min(8)],
+                plan.steps.len()
+            );
+        }
         core::StreamEvent::PlanUnavailable { reason } => {
             finish_cli_inline_response(state)?;
             println!("\x1b[33m[plan]\x1b[0m {}", reason);

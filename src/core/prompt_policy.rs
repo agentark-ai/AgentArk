@@ -219,6 +219,8 @@ Rules:
 - Use `integration` for connecting, configuring, scaffolding, or testing external capabilities.
 - Use `inspection` when the user mainly wants to inspect state, logs, traces, configured services, apps, tasks, watchers, or workspace/runtime information.
 - Use `conversation` only for normal chat, explanation, light Q&A, or purely conversational follow-ups.
+- When the recent artifact context is a research report, short follow-up questions about findings, sources, citations, contradictions, or recommendations are usually `conversation`.
+- When that same research-report follow-up clearly asks for more evidence, more sources, re-verification, updates, comparisons, or a new report, prefer `task`.
 - Set `should_confirm=true` only when the execution type or target is genuinely unclear and a wrong guess would send the work down the wrong path.
 - Keep `preferred_actions` short, use only provided action names, and favor actions that match the chosen shape."#
         .to_string()

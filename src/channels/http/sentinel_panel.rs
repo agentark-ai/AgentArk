@@ -1,10 +1,14 @@
 use super::*;
+use once_cell::sync::Lazy;
+use tokio::sync::Mutex;
 
 const SENTINEL_SCAN_STATE_KEY: &str = "sentinel_scan_state_v1";
 const SENTINEL_OBSERVATIONS_KEY: &str = "sentinel_observations_v1";
 const SENTINEL_PROPOSALS_KEY: &str = "sentinel_proposals_v1";
 const SENTINEL_DAILY_AUTO_RUNS_KEY: &str = "sentinel_daily_auto_runs_v1";
 const BACKGROUND_LEARNING_STATE_KEY: &str = "sentinel_background_learning_state_v1";
+const BACKGROUND_LEARNING_STATE_LEASE_KEY: &str = "sentinel_background_learning_state_lease_v1";
+const BACKGROUND_LEARNING_STATE_LEASE_TTL_SECS: i64 = 15;
 const SENTINEL_SCAN_COOLDOWN_SECS: i64 = 30 * 60;
 const MAX_SENTINEL_OBSERVATIONS: usize = 120;
 const MAX_SENTINEL_PROPOSALS: usize = 96;
@@ -16,6 +20,7 @@ const BACKGROUND_LEARNING_JOB_KEYS: [(&str, &str); 4] = [
     ("pattern_induction", "Pattern induction"),
     ("candidate_generation", "Candidate generation"),
 ];
+static BACKGROUND_LEARNING_STORE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(super) struct SentinelScanState {
@@ -301,7 +306,9 @@ async fn save_background_learning_store(
     store: &BackgroundLearningStore,
 ) {
     if let Ok(raw) = serde_json::to_vec(store) {
-        let _ = storage.set(BACKGROUND_LEARNING_STATE_KEY, &raw).await;
+        if let Err(error) = storage.set(BACKGROUND_LEARNING_STATE_KEY, &raw).await {
+            tracing::warn!("Failed to save background learning store: {}", error);
+        }
     }
 }
 
@@ -327,6 +334,39 @@ pub(crate) async fn record_background_learning_job_result(
     storage: &crate::storage::Storage,
     update: &BackgroundLearningJobUpdate,
 ) {
+    let _guard = BACKGROUND_LEARNING_STORE_LOCK.lock().await;
+    let lease_owner = uuid::Uuid::new_v4().to_string();
+    let mut lease_acquired = false;
+    for _ in 0..20 {
+        match storage
+            .acquire_kv_lease(
+                BACKGROUND_LEARNING_STATE_LEASE_KEY,
+                &lease_owner,
+                BACKGROUND_LEARNING_STATE_LEASE_TTL_SECS,
+            )
+            .await
+        {
+            Ok(true) => {
+                lease_acquired = true;
+                break;
+            }
+            Ok(false) => {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to acquire background learning state lease: {}",
+                    error
+                );
+                return;
+            }
+        }
+    }
+    if !lease_acquired {
+        tracing::warn!("Timed out waiting for background learning state lease");
+        return;
+    }
+
     let mut store = load_background_learning_store(storage).await;
     let label = background_learning_label(&update.key);
     let mut jobs = normalize_background_learning_jobs(store.jobs);
@@ -366,6 +406,15 @@ pub(crate) async fn record_background_learning_job_result(
     }
     store.jobs = jobs;
     save_background_learning_store(storage, &store).await;
+    if let Err(error) = storage
+        .release_kv_lease(BACKGROUND_LEARNING_STATE_LEASE_KEY, &lease_owner)
+        .await
+    {
+        tracing::warn!(
+            "Failed to release background learning state lease: {}",
+            error
+        );
+    }
 }
 
 fn build_background_learning_feed(
