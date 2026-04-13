@@ -119,7 +119,7 @@ dotenvy = "0.15"
 uuid = { version = "1", features = ["v4", "serde"] }
 regex = "1"
 pdf-extract = "0.7"
-zip = "2"
+zip = "8"
 base64 = "0.22"
 hex = "0.4"
 urlencoding = "2"
