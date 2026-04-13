@@ -152,7 +152,7 @@ jobs:
 
       - name: Attest container image provenance
         if: ${{ github.event.repository.private == false || vars.AGENTARK_ENABLE_PRIVATE_ATTESTATIONS == 'true' }}
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@v4
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.build.outputs.digest }}
@@ -238,13 +238,13 @@ jobs:
 
       - name: Attest release tarball provenance
         if: ${{ github.event.repository.private == false || vars.AGENTARK_ENABLE_PRIVATE_ATTESTATIONS == 'true' }}
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/${{ env.RELEASE_ASSET_NAME }}
 
       - name: Attest checksum file provenance
         if: ${{ github.event.repository.private == false || vars.AGENTARK_ENABLE_PRIVATE_ATTESTATIONS == 'true' }}
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/SHA256SUMS
 
