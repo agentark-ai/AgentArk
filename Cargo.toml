@@ -64,7 +64,7 @@ wasmtime = "41"
 bollard = { version = "0.18", optional = true }
 
 # Optional TLS support
-axum-server = { version = "0.7", features = ["tls-rustls"], optional = true }
+axum-server = { version = "0.8", features = ["tls-rustls"], optional = true }
 rcgen = { version = "0.13", optional = true }
 
 # Cryptography (for DID, VCs, execution proofs, data encryption)
