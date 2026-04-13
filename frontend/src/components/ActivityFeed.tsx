@@ -93,8 +93,8 @@ export function ActivityFeed({ traces, onViewAll }: Props) {
                   onClick={() => setExpandedId(expandedId === trace.id ? null : trace.id)}
                   sx={{
                     cursor: "pointer",
-                    borderRadius: 2.5,
-                    background: "linear-gradient(180deg, rgba(6, 16, 30, 0.82), rgba(4, 12, 24, 0.76))",
+                    borderRadius: 2,
+                    background: "linear-gradient(180deg, rgba(24, 24, 28, 0.92), rgba(15, 15, 18, 0.88))",
                   }}
                 >
                   <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between">
@@ -123,7 +123,7 @@ export function ActivityFeed({ traces, onViewAll }: Props) {
                   </Stack>
 
                   <Collapse in={expandedId === trace.id}>
-                    <Box sx={{ mt: 0.75, pl: 1, borderLeft: "2px solid rgba(47, 212, 255, 0.25)" }}>
+                    <Box sx={{ mt: 0.75, pl: 1, borderLeft: "2px solid rgba(255, 255, 255, 0.12)" }}>
                       {trace.duration_ms != null ? (
                         <Typography variant="caption" color="text.secondary" display="block">
                           Completed in {trace.duration_ms}ms

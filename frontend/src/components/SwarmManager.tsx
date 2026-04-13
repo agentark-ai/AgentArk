@@ -1,7 +1,9 @@
 import {
   Alert,
+  Autocomplete,
   Box,
   Button,
+  CircularProgress,
   Chip,
   Dialog,
   DialogActions,
@@ -16,6 +18,7 @@ import {
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState, type ReactNode } from "react";
 import { api } from "../api/client";
+import { formatUiDateTime } from "../lib/dateFormat";
 import { WorkspacePageHeader, WorkspacePageShell } from "./WorkspacePage";
 
 const REFRESH_MS = 8000;
@@ -34,7 +37,10 @@ type ProvisionedAgent = {
   agentType: string;
   provider: string;
   model: string;
+  llmBaseUrl: string;
   capabilities: string[];
+  systemPrompt: string;
+  accessScope: AccessScope;
   createdAt: string;
   status: string;
   enabled: boolean;
@@ -42,6 +48,65 @@ type ProvisionedAgent = {
   lastSummary: string;
   lastUpdate: string;
   lastActivityAt: string;
+};
+
+type AccessScope = {
+  approved_permission_ids: string[];
+  mcp_server_ids: string[];
+  ssh_connection_names: string[];
+  custom_api_ids: string[];
+  integration_ids: string[];
+  channel_ids: string[];
+};
+
+type AccessScopeKey = keyof AccessScope;
+
+type ResourceAccessScopeKey = Exclude<AccessScopeKey, "approved_permission_ids">;
+
+type BuilderOption = {
+  id: string;
+  label: string;
+  helper: string;
+  status: string;
+  enabled: boolean;
+};
+
+type BuilderOptions = {
+  mcpServers: BuilderOption[];
+  sshConnections: BuilderOption[];
+  customApis: BuilderOption[];
+  integrations: BuilderOption[];
+  channels: BuilderOption[];
+};
+
+type AccessPlanAction = {
+  name: string;
+  reason: string;
+};
+
+type AccessPlanDetail = {
+  actionName: string;
+  reason: string;
+  permissionIds: string[];
+};
+
+type AccessPlanGroup = {
+  id: string;
+  scopeField: AccessScopeKey;
+  label: string;
+  summary: string;
+  reason: string;
+  reviewBand: string;
+  selectionMode: string;
+  suggestedIds: string[];
+  details: AccessPlanDetail[];
+};
+
+type AccessPlan = {
+  implicitAccess: AccessPlanGroup[];
+  requestedAccess: AccessPlanGroup[];
+  suggestedActions: AccessPlanAction[];
+  notes: string[];
 };
 
 type SwarmRunAgent = {
@@ -121,10 +186,7 @@ function errMessage(error: unknown): string {
 
 function formatTimestamp(value: unknown): string {
   const raw = str(value, "").trim();
-  if (!raw) return "-";
-  const parsed = new Date(raw);
-  if (Number.isNaN(parsed.getTime())) return raw;
-  return parsed.toLocaleString();
+  return formatUiDateTime(raw, { fallback: "-" });
 }
 
 function formatElapsedMs(value: unknown): string {
@@ -159,6 +221,54 @@ function parseCapabilities(value: unknown): string[] {
       .map((item) => item.trim())
       .filter(Boolean);
   }
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
+}
+
+function parseStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return uniqueStrings(
+    value
+      .map((item) => str(item, "").trim())
+      .filter(Boolean)
+  );
+}
+
+function emptyAccessScope(): AccessScope {
+  return {
+    approved_permission_ids: [],
+    mcp_server_ids: [],
+    ssh_connection_names: [],
+    custom_api_ids: [],
+    integration_ids: [],
+    channel_ids: []
+  };
+}
+
+function cloneAccessScope(scope?: AccessScope | null): AccessScope {
+  const current = scope ?? emptyAccessScope();
+  return {
+    approved_permission_ids: [...current.approved_permission_ids],
+    mcp_server_ids: [...current.mcp_server_ids],
+    ssh_connection_names: [...current.ssh_connection_names],
+    custom_api_ids: [...current.custom_api_ids],
+    integration_ids: [...current.integration_ids],
+    channel_ids: [...current.channel_ids]
+  };
+}
+
+function parseAccessScope(value: unknown): AccessScope {
+  const record = asRecord(value);
+  return {
+    approved_permission_ids: parseStringArray(record.approved_permission_ids),
+    mcp_server_ids: parseStringArray(record.mcp_server_ids),
+    ssh_connection_names: parseStringArray(record.ssh_connection_names),
+    custom_api_ids: parseStringArray(record.custom_api_ids),
+    integration_ids: parseStringArray(record.integration_ids),
+    channel_ids: parseStringArray(record.channel_ids)
+  };
 }
 
 function normalizeLifecycleStatus(status: unknown): string {
@@ -235,7 +345,10 @@ function toProvisionedAgents(data: unknown): ProvisionedAgent[] {
       agentType: str(agent.agent_type, "Agent"),
       provider: str(agent.llm_provider, "-"),
       model: str(agent.llm_model, "-"),
+      llmBaseUrl: str(agent.llm_base_url, ""),
       capabilities: parseCapabilities(agent.capabilities),
+      systemPrompt: str(agent.system_prompt, ""),
+      accessScope: parseAccessScope(agent.access_scope),
       createdAt: str(agent.created_at, ""),
       status: normalizeLifecycleStatus(agent.status),
       enabled: bool(agent.enabled),
@@ -252,6 +365,7 @@ function toProvisionedAgents(data: unknown): ProvisionedAgent[] {
 }
 
 type AgentDraft = {
+  description: string;
   name: string;
   agent_type: string;
   model_profile_id: string;
@@ -261,6 +375,7 @@ type AgentDraft = {
   llm_api_key: string;
   capabilities: string;
   system_prompt: string;
+  access_scope: AccessScope;
 };
 
 type SavedModelProfile = {
@@ -274,15 +389,17 @@ type SavedModelProfile = {
 };
 
 const EMPTY_DRAFT: AgentDraft = {
+  description: "",
   name: "",
-  agent_type: "researcher",
+  agent_type: "",
   model_profile_id: "",
   llm_provider: "ollama",
   llm_model: "",
   llm_base_url: "http://localhost:11434",
   llm_api_key: "",
   capabilities: "",
-  system_prompt: ""
+  system_prompt: "",
+  access_scope: emptyAccessScope()
 };
 
 function formatProfileCount(count: number): string {
@@ -346,6 +463,366 @@ function applyModelProfileToDraft(draft: AgentDraft, profile: SavedModelProfile 
   };
 }
 
+function toBuilderOption(
+  row: JsonRecord,
+  idFallback: string,
+  labelFallback: string,
+  helper: string
+): BuilderOption | null {
+  const id = str(row.id, idFallback).trim();
+  const label = str(row.name, labelFallback).trim() || id;
+  if (!id) return null;
+  return {
+    id,
+    label,
+    helper,
+    status: str(row.status, "").trim(),
+    enabled: row.enabled === undefined ? true : bool(row.enabled)
+  };
+}
+
+function formatBuilderStatus(status: string): string {
+  const normalized = status.trim().toLowerCase();
+  if (!normalized) return "";
+  if (normalized === "ok") return "Healthy";
+  return normalized
+    .split(/[_\-\s]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function builderStatusLooksUsable(status: unknown): boolean {
+  const normalized = str(status, "").trim().toLowerCase();
+  if (!normalized) return true;
+  return ![
+    "disabled",
+    "not_configured",
+    "missing_config",
+    "missing_token",
+    "offline",
+    "unavailable",
+    "disconnected",
+    "error",
+    "failed"
+  ].includes(normalized);
+}
+
+function sortBuilderOptions(options: BuilderOption[]): BuilderOption[] {
+  return [...options].sort((left, right) => left.label.localeCompare(right.label));
+}
+
+function normalizeBuilderHelper(helper: string): string {
+  return helper
+    .replace(/\u00e2\u20ac\u00a2|\u2022/g, "|")
+    .replace(/\s*\|\s*/g, " | ")
+    .replace(/\s{2,}/g, " ")
+    .replace(/^\|\s*|\s*\|$/g, "")
+    .trim();
+}
+
+function filterBuilderOptions(options: BuilderOptions): BuilderOptions {
+  const cleanedItems = (items: BuilderOption[]) =>
+    items.map((item) => ({
+      ...item,
+      helper: normalizeBuilderHelper(item.helper)
+    }));
+  const usableItems = (items: BuilderOption[]) =>
+    sortBuilderOptions(
+      cleanedItems(items).filter((item) => item.enabled && builderStatusLooksUsable(item.status))
+    );
+
+  return {
+    mcpServers: usableItems(options.mcpServers),
+    sshConnections: sortBuilderOptions(cleanedItems(options.sshConnections)),
+    customApis: sortBuilderOptions(cleanedItems(options.customApis).filter((item) => item.enabled)),
+    integrations: usableItems(options.integrations),
+    channels: usableItems(options.channels)
+  };
+}
+
+function toBuilderOptions(data: unknown): BuilderOptions {
+  const payload = asRecord(data);
+  const mcpServers = pickRecords(payload.mcp_servers, "mcp_servers")
+    .map((row) =>
+      toBuilderOption(
+        row,
+        str(row.id, ""),
+        str(row.name, str(row.id, "")),
+        [str(row.description, ""), `${num(row.tool_count, 0)} tools`, `${num(row.resource_count, 0)} resources`]
+          .filter(Boolean)
+          .join(" | ")
+      )
+    )
+    .filter(
+      (item): item is BuilderOption =>
+        item !== null && item.enabled && builderStatusLooksUsable(item.status)
+    );
+  const sshConnections = pickRecords(payload.ssh_connections, "ssh_connections")
+    .map((row) =>
+      toBuilderOption(
+        { ...row, id: str(row.name, "") },
+        str(row.name, ""),
+        str(row.name, ""),
+        `${str(row.username, "")}@${str(row.host, "")}:${str(row.port, "")}`
+      )
+    )
+    .filter((item): item is BuilderOption => Boolean(item));
+  const customApis = pickRecords(payload.custom_apis, "custom_apis")
+    .map((row) =>
+      toBuilderOption(
+        row,
+        str(row.id, ""),
+        str(row.name, str(row.id, "")),
+        [str(row.base_url, ""), `${num(row.action_count, 0)} actions`].filter(Boolean).join(" | ")
+      )
+    )
+    .filter((item): item is BuilderOption => item !== null && item.enabled);
+  const integrations = pickRecords(payload.integrations, "integrations")
+    .map((row) =>
+      toBuilderOption(
+        row,
+        str(row.id, ""),
+        str(row.name, str(row.id, "")),
+        [str(row.description, ""), formatBuilderStatus(str(row.status, ""))].filter(Boolean).join(" | ")
+      )
+    )
+    .filter(
+      (item): item is BuilderOption =>
+        item !== null && item.enabled && builderStatusLooksUsable(item.status)
+    );
+  const channels = pickRecords(payload.channels, "channels")
+    .flatMap((row) => {
+      if (!bool(row.enabled) || !bool(row.configured) || !builderStatusLooksUsable(row.status)) {
+        return [];
+      }
+      const option = toBuilderOption(
+        row,
+        str(row.id, ""),
+        str(row.name, str(row.id, "")),
+        [
+          str(row.kind, ""),
+          num(row.connected_account_count, 0) > 0
+            ? `${num(row.connected_account_count, 0)} account${num(row.connected_account_count, 0) === 1 ? "" : "s"}`
+            : "",
+          "ready"
+        ]
+          .filter(Boolean)
+          .join(" | ")
+      );
+      return option ? [option] : [];
+    });
+  return {
+    mcpServers: pickRecords(payload.mcp_servers, "mcp_servers")
+      .map((row) =>
+        toBuilderOption(
+          row,
+          str(row.id, ""),
+          str(row.name, str(row.id, "")),
+          [str(row.description, ""), `${num(row.tool_count, 0)} tools`, `${num(row.resource_count, 0)} resources`]
+            .filter(Boolean)
+            .join(" • ")
+        )
+      )
+      .filter((item): item is BuilderOption => Boolean(item)),
+    sshConnections: pickRecords(payload.ssh_connections, "ssh_connections")
+      .map((row) =>
+        toBuilderOption(
+          { ...row, id: str(row.name, "") },
+          str(row.name, ""),
+          str(row.name, ""),
+          `${str(row.username, "")}@${str(row.host, "")}:${str(row.port, "")}`
+        )
+      )
+      .filter((item): item is BuilderOption => Boolean(item)),
+    customApis: pickRecords(payload.custom_apis, "custom_apis")
+      .map((row) =>
+        toBuilderOption(
+          row,
+          str(row.id, ""),
+          str(row.name, str(row.id, "")),
+          [str(row.base_url, ""), `${num(row.action_count, 0)} actions`].filter(Boolean).join(" • ")
+        )
+      )
+      .filter((item): item is BuilderOption => Boolean(item)),
+    integrations: pickRecords(payload.integrations, "integrations")
+      .map((row) =>
+        toBuilderOption(
+          row,
+          str(row.id, ""),
+          str(row.name, str(row.id, "")),
+          [str(row.description, ""), str(row.status, "")].filter(Boolean).join(" • ")
+        )
+      )
+      .filter((item): item is BuilderOption => Boolean(item)),
+    channels: pickRecords(payload.channels, "channels")
+      .map((row) =>
+        toBuilderOption(
+          row,
+          str(row.id, ""),
+          str(row.name, str(row.id, "")),
+          [
+            str(row.kind, ""),
+            bool(row.configured) ? "configured" : "not configured",
+            str(row.status, "")
+          ]
+            .filter(Boolean)
+            .join(" • ")
+        )
+      )
+      .filter((item): item is BuilderOption => Boolean(item))
+  };
+}
+
+function buildOptionMap(options: BuilderOption[]): Record<string, BuilderOption> {
+  return options.reduce<Record<string, BuilderOption>>((acc, option) => {
+    acc[option.id] = option;
+    return acc;
+  }, {});
+}
+
+function formatPermissionLabel(permissionId: string): string {
+  const normalized = permissionId.trim().toLowerCase();
+  switch (normalized) {
+    case "code_execute":
+      return "Code execution";
+    case "shell":
+      return "Shell commands";
+    case "file_write":
+      return "File writes";
+    case "scheduler":
+      return "Task scheduling";
+    case "local_network_discovery":
+      return "Local network discovery";
+    case "browser_auto":
+      return "Browser automation";
+    case "app_hosting":
+      return "App hosting";
+    case "messaging_send":
+      return "Messaging send";
+    case "broad_network":
+      return "Broad network actions";
+    case "ssh":
+      return "SSH execution";
+    case "gmail":
+      return "Gmail access";
+    case "calendar_write":
+      return "Calendar write";
+    case "google_workspace_command":
+      return "Workspace command execution";
+    case "watcher":
+      return "Background watchers";
+    default:
+      return normalized
+        .split(/[_\-\s]+/)
+        .filter(Boolean)
+        .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+        .join(" ");
+  }
+}
+
+function parseAccessPlanDetail(value: unknown): AccessPlanDetail {
+  const record = asRecord(value);
+  return {
+    actionName: str(record.action_name, ""),
+    reason: str(record.reason, ""),
+    permissionIds: parseStringArray(record.permission_ids)
+  };
+}
+
+function parseAccessPlanGroup(value: unknown): AccessPlanGroup {
+  const record = asRecord(value);
+  const scopeField = str(record.scope_field, "approved_permission_ids") as AccessScopeKey;
+  return {
+    id: str(record.id, `${scopeField}:${str(record.label, "group")}`),
+    scopeField,
+    label: str(record.label, "Access"),
+    summary: str(record.summary, ""),
+    reason: str(record.reason, ""),
+    reviewBand: str(record.review_band, "elevated"),
+    selectionMode: str(record.selection_mode, "toggle"),
+    suggestedIds: parseStringArray(record.suggested_ids),
+    details: asRecords(record.details).map(parseAccessPlanDetail)
+  };
+}
+
+function parseAccessPlan(value: unknown): AccessPlan {
+  const record = asRecord(value);
+  return {
+    implicitAccess: asRecords(record.implicit_access).map(parseAccessPlanGroup),
+    requestedAccess: asRecords(record.requested_access).map(parseAccessPlanGroup),
+    suggestedActions: asRecords(record.suggested_actions).map((item) => ({
+      name: str(item.name, ""),
+      reason: str(item.reason, "")
+    })),
+    notes: parseStringArray(record.notes)
+  };
+}
+
+function findMatchingModelProfile(
+  agent: ProvisionedAgent,
+  profiles: SavedModelProfile[]
+): SavedModelProfile | null {
+  return (
+    profiles.find(
+      (profile) =>
+        profile.provider === agent.provider &&
+        profile.model === agent.model &&
+        (profile.baseUrl || "") === (agent.llmBaseUrl || "")
+    ) ?? null
+  );
+}
+
+function accessScopeLabels(
+  scope: AccessScope,
+  optionMaps: {
+    mcp: Record<string, BuilderOption>;
+    ssh: Record<string, BuilderOption>;
+    customApi: Record<string, BuilderOption>;
+    integration: Record<string, BuilderOption>;
+    channel: Record<string, BuilderOption>;
+  }
+): string[] {
+  return [
+    ...scope.approved_permission_ids.map((id) => formatPermissionLabel(id)),
+    ...scope.mcp_server_ids.map((id) => optionMaps.mcp[id]?.label || id),
+    ...scope.ssh_connection_names.map((id) => optionMaps.ssh[id]?.label || id),
+    ...scope.custom_api_ids.map((id) => optionMaps.customApi[id]?.label || id),
+    ...scope.integration_ids.map((id) => optionMaps.integration[id]?.label || id),
+    ...scope.channel_ids.map((id) => optionMaps.channel[id]?.label || id)
+  ];
+}
+
+function accessScopeSummary(scope: AccessScope): string[] {
+  const parts: string[] = [];
+  if (scope.approved_permission_ids.length) {
+    parts.push(`${scope.approved_permission_ids.length} permission${scope.approved_permission_ids.length === 1 ? "" : "s"}`);
+  }
+  if (scope.mcp_server_ids.length) parts.push(`${scope.mcp_server_ids.length} MCP`);
+  if (scope.ssh_connection_names.length) parts.push(`${scope.ssh_connection_names.length} SSH`);
+  if (scope.custom_api_ids.length) parts.push(`${scope.custom_api_ids.length} API`);
+  if (scope.integration_ids.length) parts.push(`${scope.integration_ids.length} integration`);
+  if (scope.channel_ids.length) parts.push(`${scope.channel_ids.length} channel`);
+  return parts;
+}
+
+function mergeAccessScopeOptions(options: BuilderOption[], selectedIds: string[]): BuilderOption[] {
+  if (selectedIds.length === 0) return options;
+  const knownIds = new Set(options.map((option) => option.id));
+  const unavailableSelections = selectedIds
+    .filter((id) => id && !knownIds.has(id))
+    .map(
+      (id): BuilderOption => ({
+        id,
+        label: id,
+        helper: "Currently unavailable in Settings.",
+        status: "unavailable",
+        enabled: false
+      })
+    );
+  return [...options, ...unavailableSelections];
+}
+
 function toSwarmRuns(data: unknown): SwarmRun[] {
   return pickRecords(data, "runs")
     .map((run) => ({
@@ -395,7 +872,7 @@ function SectionShell({
     <Box
       sx={{
         p: { xs: 2, md: 2.35 },
-        borderRadius: "18px",
+        borderRadius: "8px",
         border: "1px solid rgba(255,255,255,0.07)",
         background:
           "linear-gradient(180deg, rgba(255,255,255,0.05) 0%, rgba(255,255,255,0.025) 100%)",
@@ -404,7 +881,7 @@ function SectionShell({
     >
       <Stack spacing={1.4}>
         <Box>
-          <Typography variant="overline" sx={{ letterSpacing: "0.16em", color: "info.light" }}>
+          <Typography variant="overline" sx={{ letterSpacing: 0, color: "info.light" }}>
             {eyebrow}
           </Typography>
           <Typography variant="h6" sx={{ fontWeight: 800 }}>
@@ -426,7 +903,7 @@ function RunCard({ run, live = false }: { run: SwarmRun; live?: boolean }) {
     <Box
       sx={{
         p: 1.5,
-        borderRadius: "16px",
+        borderRadius: "8px",
         border: live
           ? "1px solid rgba(88, 174, 255, 0.18)"
           : "1px solid rgba(255,255,255,0.07)",
@@ -480,7 +957,7 @@ function RunCard({ run, live = false }: { run: SwarmRun; live?: boolean }) {
                 sx={{
                   height: "100%",
                   p: 1.1,
-                  borderRadius: "12px",
+                  borderRadius: "8px",
                   border: "1px solid rgba(255,255,255,0.06)",
                   background: "rgba(7, 12, 24, 0.58)"
                 }}
@@ -537,10 +1014,152 @@ function RunCard({ run, live = false }: { run: SwarmRun; live?: boolean }) {
   );
 }
 
+function AccessScopeSelect({
+  label,
+  helperText,
+  options,
+  selectedIds,
+  onChange
+}: {
+  label: string;
+  helperText?: string;
+  options: BuilderOption[];
+  selectedIds: string[];
+  onChange: (nextIds: string[]) => void;
+}) {
+  const mergedOptions = useMemo(() => mergeAccessScopeOptions(options, selectedIds), [options, selectedIds]);
+  const selectedOptions = useMemo(
+    () => mergedOptions.filter((option) => selectedIds.includes(option.id)),
+    [mergedOptions, selectedIds]
+  );
+  const hasConfiguredOptions = options.length > 0;
+  const hasSelections = selectedIds.length > 0;
+  const helper = helperText?.trim() ?? "";
+  const effectiveHelperText =
+    !hasConfiguredOptions && hasSelections
+      ? [helper, "Previously selected resources are currently unavailable in Settings."].filter(Boolean).join(" ")
+      : helper || undefined;
+
+  return (
+    <Autocomplete
+      multiple
+      size="small"
+      disableCloseOnSelect
+      filterSelectedOptions
+      disabled={!hasConfiguredOptions && !hasSelections}
+      limitTags={3}
+      options={mergedOptions}
+      value={selectedOptions}
+      onChange={(_, value) => onChange(value.map((item) => item.id))}
+      isOptionEqualToValue={(option, value) => option.id === value.id}
+      getOptionLabel={(option) => option.label}
+      noOptionsText={hasSelections ? "No other configured options" : "Nothing available"}
+      slotProps={{
+        popper: {
+          sx: {
+            zIndex: (theme) => theme.zIndex.modal + 2
+          }
+        },
+        paper: {
+          sx: {
+            mt: 0.75,
+            borderRadius: "8px",
+            border: "1px solid rgba(255,255,255,0.09)",
+            background: "linear-gradient(180deg, rgba(8, 14, 28, 0.98) 0%, rgba(6, 10, 20, 0.98) 100%)",
+            boxShadow: "0 24px 80px rgba(0,0,0,0.45)",
+            "& .MuiAutocomplete-listbox": {
+              p: 0.75,
+              display: "grid",
+              gap: 0.65,
+              maxHeight: 280
+            }
+          }
+        }
+      }}
+      renderInput={(params) => (
+        <TextField
+          {...params}
+          label={label}
+          helperText={effectiveHelperText}
+          placeholder={
+            hasConfiguredOptions
+              ? "Select one or more"
+              : hasSelections
+                ? "Selected resources are currently unavailable"
+                : "No enabled options available"
+          }
+        />
+      )}
+      renderOption={(props, option) => {
+        const { key, ...optionProps } = props;
+        return (
+          <Box
+            component="li"
+            key={key}
+            {...optionProps}
+            sx={{
+              display: "flex",
+              alignItems: "flex-start",
+              gap: 1,
+              px: 1.15,
+              py: 1,
+              borderRadius: "8px",
+              border: "1px solid rgba(255,255,255,0.06)",
+              background: "rgba(255,255,255,0.02)",
+              transition: "background 0.18s ease, border-color 0.18s ease",
+              "&.Mui-focused": {
+                background: "rgba(57, 208, 255, 0.08)",
+                borderColor: "rgba(57, 208, 255, 0.22)"
+              },
+              '&[aria-selected="true"]': {
+                background: "rgba(57, 208, 255, 0.12)",
+                borderColor: "rgba(57, 208, 255, 0.28)"
+              }
+            }}
+          >
+            <Box sx={{ minWidth: 0, flex: 1 }}>
+              <Typography variant="body2" sx={{ fontWeight: 700, lineHeight: 1.3 }}>
+                {option.label}
+              </Typography>
+              {option.helper ? (
+                <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.2 }}>
+                  {option.helper}
+                </Typography>
+              ) : null}
+            </Box>
+            {option.status ? (
+              <Chip
+                size="small"
+                variant="outlined"
+                label={formatBuilderStatus(option.status)}
+                sx={{ height: 22, flexShrink: 0 }}
+              />
+            ) : null}
+          </Box>
+        );
+      }}
+      renderTags={(value, getTagProps) =>
+        value.map((option, index) => (
+          <Chip
+            {...getTagProps({ index })}
+            key={option.id}
+            size="small"
+            variant="outlined"
+            label={option.label}
+          />
+        ))
+      }
+    />
+  );
+}
+
 export function SwarmManager({ autoRefresh }: Props) {
   const queryClient = useQueryClient();
   const [createOpen, setCreateOpen] = useState(false);
+  const [agentDialogStep, setAgentDialogStep] = useState<0 | 1>(0);
+  const [editingAgentId, setEditingAgentId] = useState<string | null>(null);
   const [draft, setDraft] = useState<AgentDraft>(EMPTY_DRAFT);
+  const [accessPlan, setAccessPlan] = useState<AccessPlan | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
 
   const statusQ = useQuery({
@@ -563,6 +1182,11 @@ export function SwarmManager({ autoRefresh }: Props) {
     queryFn: () => api.rawGet("/models"),
     refetchInterval: autoRefresh ? REFRESH_MS : false
   });
+  const builderQ = useQuery({
+    queryKey: ["swarm-agent-builder-options"],
+    queryFn: () => api.rawGet("/swarm/agents/builder/options"),
+    refetchInterval: autoRefresh ? REFRESH_MS : false
+  });
   const delegationsQ = useQuery({
     queryKey: ["swarm-delegations"],
     queryFn: () => api.rawGet("/swarm/delegations?limit=all"),
@@ -573,14 +1197,83 @@ export function SwarmManager({ autoRefresh }: Props) {
   const config = asRecord(configQ.data);
   const agents = toProvisionedAgents(agentsQ.data);
   const savedModelProfiles = useMemo(() => toSavedModelProfiles(modelsQ.data), [modelsQ.data]);
+  const builderOptions = useMemo(
+    () => filterBuilderOptions(toBuilderOptions(builderQ.data)),
+    [builderQ.data]
+  );
+  const builderOptionsByScope = useMemo(
+    () => ({
+      mcp_server_ids: builderOptions.mcpServers,
+      ssh_connection_names: builderOptions.sshConnections,
+      custom_api_ids: builderOptions.customApis,
+      integration_ids: builderOptions.integrations,
+      channel_ids: builderOptions.channels
+    }),
+    [builderOptions]
+  );
   const enabledModelProfiles = useMemo(
     () => savedModelProfiles.filter((profile) => profile.enabled),
     [savedModelProfiles]
   );
   const defaultModelProfile = enabledModelProfiles[0] ?? null;
   const selectedModelProfile =
-    enabledModelProfiles.find((profile) => profile.id === draft.model_profile_id) ?? defaultModelProfile;
+    enabledModelProfiles.find((profile) => profile.id === draft.model_profile_id) ?? null;
   const customAgents = useMemo(() => agents.filter((agent) => !agent.isSystem), [agents]);
+  const editingAgent = useMemo(
+    () => customAgents.find((agent) => agent.id === editingAgentId) ?? null,
+    [customAgents, editingAgentId]
+  );
+  const resourceAccessSections = useMemo(
+    () =>
+      [
+        {
+          field: "mcp_server_ids" as ResourceAccessScopeKey,
+          label: "MCP servers",
+          helperText: "Attach only the MCP servers this agent should see.",
+          options: builderOptions.mcpServers,
+          selectedIds: draft.access_scope.mcp_server_ids
+        },
+        {
+          field: "ssh_connection_names" as ResourceAccessScopeKey,
+          label: "SSH connections",
+          helperText: "Grant remote execution only on the named SSH connections you select.",
+          options: builderOptions.sshConnections,
+          selectedIds: draft.access_scope.ssh_connection_names
+        },
+        {
+          field: "custom_api_ids" as ResourceAccessScopeKey,
+          label: "Custom APIs",
+          helperText: "Attach imported API actions explicitly instead of exposing every configured API.",
+          options: builderOptions.customApis,
+          selectedIds: draft.access_scope.custom_api_ids
+        },
+        {
+          field: "integration_ids" as ResourceAccessScopeKey,
+          label: "Integrations",
+          helperText: "Limit built-in integration actions like Google Workspace or Slack.",
+          options: builderOptions.integrations,
+          selectedIds: draft.access_scope.integration_ids
+        },
+        {
+          field: "channel_ids" as ResourceAccessScopeKey,
+          label: "Messaging channels",
+          helperText: "Only selected messaging channels can be attached for agent delivery or reporting flows.",
+          options: builderOptions.channels,
+          selectedIds: draft.access_scope.channel_ids
+        }
+      ].filter((section) => section.options.length > 0 || section.selectedIds.length > 0),
+    [builderOptions, draft.access_scope]
+  );
+  const optionMaps = useMemo(
+    () => ({
+      mcp: buildOptionMap(builderOptions.mcpServers),
+      ssh: buildOptionMap(builderOptions.sshConnections),
+      customApi: buildOptionMap(builderOptions.customApis),
+      integration: buildOptionMap(builderOptions.integrations),
+      channel: buildOptionMap(builderOptions.channels)
+    }),
+    [builderOptions]
+  );
   const hiddenSystemCount = agents.length - customAgents.length;
   const activeRuns = toSwarmRuns({ runs: pickRecords(status.active_runs, "active_runs") });
   const recentRuns = toSwarmRuns(delegationsQ.data).filter(
@@ -593,9 +1286,47 @@ export function SwarmManager({ autoRefresh }: Props) {
   const failedRuns = recentRuns.filter((run) =>
     ["failed", "timed_out", "panicked"].includes(run.status)
   ).length;
-  const queryError = statusQ.error || configQ.error || agentsQ.error || delegationsQ.error || modelsQ.error;
+  const queryError =
+    statusQ.error || configQ.error || agentsQ.error || delegationsQ.error || modelsQ.error || builderQ.error;
+  const accessPlanReview = useMemo(() => {
+    if (!accessPlan) {
+      return {
+        implicit: [] as AccessPlanGroup[],
+        requested: [] as AccessPlanGroup[],
+        unavailable: [] as AccessPlanGroup[]
+      };
+    }
+    const requested: AccessPlanGroup[] = [];
+    const unavailable: AccessPlanGroup[] = [];
+    accessPlan.requestedAccess.forEach((group) => {
+      if (group.scopeField === "approved_permission_ids") {
+        requested.push(group);
+        return;
+      }
+      const options = builderOptionsByScope[group.scopeField as ResourceAccessScopeKey] ?? [];
+      const optionIds = new Set(options.map((option) => option.id));
+      const selectedIds = draft.access_scope[group.scopeField] as string[];
+      const hasCurrentSelection = selectedIds.length > 0;
+      const exactIdsMissing =
+        group.selectionMode === "exact" &&
+        group.suggestedIds.length > 0 &&
+        group.suggestedIds.every((id) => !optionIds.has(id) && !selectedIds.includes(id));
+      const noChoicesAvailable =
+        group.selectionMode !== "exact" && options.length === 0 && !hasCurrentSelection;
+      if (exactIdsMissing || noChoicesAvailable) {
+        unavailable.push(group);
+      } else {
+        requested.push(group);
+      }
+    });
+    return {
+      implicit: accessPlan.implicitAccess,
+      requested,
+      unavailable
+    };
+  }, [accessPlan, builderOptionsByScope, draft.access_scope]);
 
-  const createAgent = useMutation({
+  const saveAgent = useMutation({
     mutationFn: async () => {
       const resolvedProfile = selectedModelProfile;
       const payload = {
@@ -609,19 +1340,99 @@ export function SwarmManager({ autoRefresh }: Props) {
           .split(",")
           .map((value) => value.trim())
           .filter(Boolean),
-        system_prompt: draft.system_prompt.trim() || undefined
+        system_prompt: draft.system_prompt.trim() || undefined,
+        access_scope: cloneAccessScope(draft.access_scope)
       };
-      return api.rawPost("/swarm/agents", payload);
+      return api.rawPost(editingAgentId ? `/swarm/agents/${editingAgentId}` : "/swarm/agents", payload);
     },
     onSuccess: async () => {
+      setEditingAgentId(null);
       setCreateOpen(false);
-      setDraft(EMPTY_DRAFT);
+      setAgentDialogStep(0);
+      setAccessPlan(null);
+      setDraft(applyModelProfileToDraft({ ...EMPTY_DRAFT, access_scope: emptyAccessScope() }, defaultModelProfile));
       setFormError(null);
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["swarm-status"] }),
         queryClient.invalidateQueries({ queryKey: ["swarm-agents"] }),
         queryClient.invalidateQueries({ queryKey: ["swarm-delegations"] })
       ]);
+    }
+  });
+  const deleteAgent = useMutation({
+    mutationFn: (id: string) => api.rawDelete(`/swarm/agents/${encodeURIComponent(id)}`),
+    onSuccess: async (_, id) => {
+      if (editingAgentId === id) {
+        setEditingAgentId(null);
+        setCreateOpen(false);
+        setAgentDialogStep(0);
+        setAccessPlan(null);
+        setDraft(applyModelProfileToDraft({ ...EMPTY_DRAFT, access_scope: emptyAccessScope() }, defaultModelProfile));
+      }
+      setFormError(null);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["swarm-status"] }),
+        queryClient.invalidateQueries({ queryKey: ["swarm-agents"] }),
+        queryClient.invalidateQueries({ queryKey: ["swarm-delegations"] })
+      ]);
+    },
+    onError: (error) => setFormError(errMessage(error))
+  });
+  const planAccess = useMutation({
+    mutationFn: async () =>
+      api.rawPost("/swarm/agents/access-plan", {
+        description: draft.description.trim() || undefined,
+        name: draft.name.trim(),
+        agent_type: draft.agent_type.trim(),
+        model_profile_id: draft.model_profile_id || undefined,
+        capabilities: draft.capabilities
+          .split(",")
+          .map((value) => value.trim())
+          .filter(Boolean),
+        system_prompt: draft.system_prompt.trim(),
+        access_scope: cloneAccessScope(draft.access_scope)
+      }),
+    onSuccess: (response) => {
+      const nextPlan = parseAccessPlan(response);
+      setAccessPlan(nextPlan);
+      setDraft((prev) => {
+        const nextDraft = {
+          ...prev,
+          access_scope: cloneAccessScope(prev.access_scope)
+        };
+        nextPlan.requestedAccess.forEach((group) => {
+          if (group.scopeField === "approved_permission_ids" || group.selectionMode !== "exact") {
+            return;
+          }
+          const current = nextDraft.access_scope[group.scopeField] as string[];
+          if (current.length > 0) return;
+          const options = builderOptionsByScope[group.scopeField as ResourceAccessScopeKey] ?? [];
+          const optionIds = new Set(options.map((option) => option.id));
+          const nextIds = group.suggestedIds.filter((id) => optionIds.has(id));
+          if (nextIds.length > 0) {
+            (nextDraft.access_scope[group.scopeField] as string[]) = uniqueStrings(nextIds);
+          }
+        });
+        return nextDraft;
+      });
+      setAgentDialogStep(1);
+    }
+  });
+  const generateDraft = useMutation({
+    mutationFn: async () =>
+      api.rawPost("/swarm/agents/draft", {
+        description: draft.description.trim(),
+        model_profile_id: draft.model_profile_id || undefined
+      }),
+    onSuccess: (response) => {
+      const payload = asRecord(response);
+      setDraft((prev) => ({
+        ...prev,
+        name: str(payload.name, prev.name),
+        agent_type: str(payload.agent_type, prev.agent_type),
+        capabilities: parseCapabilities(payload.capabilities).join(", "),
+        system_prompt: str(payload.system_prompt, prev.system_prompt)
+      }));
     }
   });
 
@@ -632,10 +1443,70 @@ export function SwarmManager({ autoRefresh }: Props) {
         ? "All saved model profiles are disabled right now. Enable one in Settings > Models."
         : "Add a model in Settings > Models first, then pick it here.";
 
+  function closeAgentDialog() {
+    if (saveAgent.isPending || planAccess.isPending || deleteAgent.isPending) return;
+    setCreateOpen(false);
+    setAgentDialogStep(0);
+    setAccessPlan(null);
+    setEditingAgentId(null);
+    setFormError(null);
+    setDraft(applyModelProfileToDraft({ ...EMPTY_DRAFT, access_scope: emptyAccessScope() }, defaultModelProfile));
+  }
+
   function openCreateAgentDialog() {
     setFormError(null);
-    setDraft(applyModelProfileToDraft(EMPTY_DRAFT, defaultModelProfile));
+    setAccessPlan(null);
+    setAgentDialogStep(0);
+    setEditingAgentId(null);
+    setDraft(applyModelProfileToDraft({ ...EMPTY_DRAFT, access_scope: emptyAccessScope() }, defaultModelProfile));
     setCreateOpen(true);
+  }
+
+  function openEditAgentDialog(agent: ProvisionedAgent) {
+    const matchingProfile =
+      findMatchingModelProfile(agent, enabledModelProfiles) ?? findMatchingModelProfile(agent, savedModelProfiles);
+    setFormError(null);
+    setAccessPlan(null);
+    setAgentDialogStep(0);
+    setEditingAgentId(agent.id);
+    setDraft({
+      description: "",
+      name: agent.name,
+      agent_type: agent.agentType,
+      model_profile_id: matchingProfile?.id ?? "",
+      llm_provider: agent.provider,
+      llm_model: agent.model,
+      llm_base_url: agent.llmBaseUrl,
+      llm_api_key: "",
+      capabilities: agent.capabilities.join(", "),
+      system_prompt: agent.systemPrompt,
+      access_scope: cloneAccessScope(agent.accessScope)
+    });
+    setCreateOpen(true);
+  }
+
+  function updateAccessScope(field: ResourceAccessScopeKey, values: string[]) {
+    setDraft((prev) => ({
+      ...prev,
+      access_scope: {
+        ...prev.access_scope,
+        [field]: uniqueStrings(values)
+      }
+    }));
+  }
+
+  function toggleApprovedPermission(permissionId: string, enabled: boolean) {
+    const normalized = permissionId.trim().toLowerCase();
+    if (!normalized) return;
+    setDraft((prev) => ({
+      ...prev,
+      access_scope: {
+        ...prev.access_scope,
+        approved_permission_ids: enabled
+          ? uniqueStrings([...prev.access_scope.approved_permission_ids, normalized])
+          : prev.access_scope.approved_permission_ids.filter((value) => value !== normalized)
+      }
+    }));
   }
 
   return (
@@ -653,7 +1524,7 @@ export function SwarmManager({ autoRefresh }: Props) {
             alignItems="center"
             sx={{
               p: 0.45,
-              borderRadius: "16px",
+              borderRadius: "8px",
               border: "1px solid rgba(108, 156, 212, 0.12)",
               background: "linear-gradient(180deg, rgba(9, 19, 35, 0.72), rgba(7, 15, 28, 0.62))",
               boxShadow: "inset 0 1px 0 rgba(148, 199, 245, 0.04)"
@@ -666,7 +1537,7 @@ export function SwarmManager({ autoRefresh }: Props) {
               sx={{
                 minHeight: 32,
                 px: 1.5,
-                borderRadius: "10px",
+                borderRadius: "8px",
                 fontWeight: 700,
                 textTransform: "none",
                 boxShadow: "none"
@@ -681,12 +1552,12 @@ export function SwarmManager({ autoRefresh }: Props) {
               label={swarmEnabled ? "Swarm enabled" : "Swarm disabled"}
               sx={{
                 height: 32,
-                borderRadius: "10px",
+                borderRadius: "8px",
                 "& .MuiChip-label": {
                   px: 1.25,
                   fontSize: "0.66rem",
                   fontWeight: 700,
-                  letterSpacing: "0.08em",
+                  letterSpacing: 0,
                   textTransform: "uppercase"
                 }
               }}
@@ -697,12 +1568,12 @@ export function SwarmManager({ autoRefresh }: Props) {
               label={`${activeRuns.length} live run${activeRuns.length === 1 ? "" : "s"}`}
               sx={{
                 height: 32,
-                borderRadius: "10px",
+                borderRadius: "8px",
                 "& .MuiChip-label": {
                   px: 1.2,
                   fontSize: "0.66rem",
                   fontWeight: 700,
-                  letterSpacing: "0.08em",
+                  letterSpacing: 0,
                   textTransform: "uppercase"
                 }
               }}
@@ -758,7 +1629,7 @@ export function SwarmManager({ autoRefresh }: Props) {
           <Box
             sx={{
               p: 1.5,
-              borderRadius: "14px",
+              borderRadius: "8px",
               border: "1px dashed rgba(255,255,255,0.12)",
               background: "rgba(255,255,255,0.02)"
             }}
@@ -789,7 +1660,6 @@ export function SwarmManager({ autoRefresh }: Props) {
           <Stack
             direction={{ xs: "column", md: "row" }}
             alignItems={{ xs: "flex-start", md: "center" }}
-            justifyContent="space-between"
             gap={1}
           >
             <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
@@ -798,20 +1668,13 @@ export function SwarmManager({ autoRefresh }: Props) {
                 <Chip size="small" variant="outlined" label={`${hiddenSystemCount} system hidden`} />
               ) : null}
             </Stack>
-            <Button
-              size="small"
-              variant="outlined"
-              onClick={openCreateAgentDialog}
-            >
-              Add agent
-            </Button>
           </Stack>
 
         {customAgents.length === 0 ? (
           <Box
             sx={{
               p: 1.5,
-              borderRadius: "14px",
+              borderRadius: "8px",
               border: "1px dashed rgba(255,255,255,0.12)",
               background: "rgba(255,255,255,0.02)"
             }}
@@ -832,7 +1695,7 @@ export function SwarmManager({ autoRefresh }: Props) {
                   sx={{
                     height: "100%",
                     p: 1.4,
-                    borderRadius: "16px",
+                    borderRadius: "8px",
                     border: "1px solid rgba(255,255,255,0.07)",
                     background: "linear-gradient(180deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.02) 100%)"
                   }}
@@ -854,11 +1717,29 @@ export function SwarmManager({ autoRefresh }: Props) {
                           {agent.provider} / {agent.model}
                         </Typography>
                       </Box>
-                      <Chip
-                        size="small"
-                        color={statusChipColor(agent.enabled ? agent.status : "disabled")}
-                        label={statusChipLabel(agent.enabled ? agent.status : "disabled")}
-                      />
+                      <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                        <Chip
+                          size="small"
+                          color={statusChipColor(agent.enabled ? agent.status : "disabled")}
+                          label={statusChipLabel(agent.enabled ? agent.status : "disabled")}
+                        />
+                        <Button size="small" variant="outlined" onClick={() => openEditAgentDialog(agent)}>
+                          Edit
+                        </Button>
+                        <Button
+                          size="small"
+                          color="error"
+                          variant="outlined"
+                          disabled={deleteAgent.isPending}
+                          onClick={() => {
+                            if (window.confirm(`Delete ${agent.displayName}?`)) {
+                              deleteAgent.mutate(agent.id);
+                            }
+                          }}
+                        >
+                          Delete
+                        </Button>
+                      </Stack>
                     </Stack>
 
                     <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
@@ -871,12 +1752,54 @@ export function SwarmManager({ autoRefresh }: Props) {
                           sx={{ height: 22 }}
                         />
                       ))}
+                      {agent.systemPrompt ? (
+                        <Chip size="small" variant="outlined" color="info" label="Prompt set" sx={{ height: 22 }} />
+                      ) : null}
                     </Stack>
 
                     <Box
                       sx={{
                         p: 1,
-                        borderRadius: "12px",
+                        borderRadius: "8px",
+                        background: "rgba(6, 11, 23, 0.48)",
+                        border: "1px solid rgba(255,255,255,0.05)"
+                      }}
+                    >
+                      <Typography variant="caption" color="text.secondary">
+                        Access
+                      </Typography>
+                      <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" sx={{ mt: 0.75 }}>
+                        {accessScopeSummary(agent.accessScope).length > 0 ? (
+                          accessScopeSummary(agent.accessScope).map((summary) => (
+                            <Chip key={`${agent.id}-${summary}`} size="small" variant="filled" label={summary} sx={{ height: 22 }} />
+                          ))
+                        ) : (
+                          <Chip size="small" variant="outlined" label="No elevated access" sx={{ height: 22 }} />
+                        )}
+                      </Stack>
+                      {accessScopeLabels(agent.accessScope, optionMaps).length > 0 ? (
+                        <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" sx={{ mt: 0.75 }}>
+                          {accessScopeLabels(agent.accessScope, optionMaps)
+                            .slice(0, 4)
+                            .map((label) => (
+                              <Chip key={`${agent.id}-${label}`} size="small" variant="outlined" label={label} sx={{ height: 22 }} />
+                            ))}
+                          {accessScopeLabels(agent.accessScope, optionMaps).length > 4 ? (
+                            <Chip
+                              size="small"
+                              variant="outlined"
+                              label={`+${accessScopeLabels(agent.accessScope, optionMaps).length - 4} more`}
+                              sx={{ height: 22 }}
+                            />
+                          ) : null}
+                        </Stack>
+                      ) : null}
+                    </Box>
+
+                    <Box
+                      sx={{
+                        p: 1,
+                        borderRadius: "8px",
                         background: "rgba(6, 11, 23, 0.48)",
                         border: "1px solid rgba(255,255,255,0.05)"
                       }}
@@ -925,122 +1848,281 @@ export function SwarmManager({ autoRefresh }: Props) {
         )}
       </SectionShell>
 
-      <Dialog open={createOpen} onClose={() => setCreateOpen(false)} maxWidth="sm" fullWidth>
-        <DialogTitle>Add custom agent</DialogTitle>
-        <DialogContent>
-          <Stack spacing={1.25} sx={{ mt: 1 }}>
-            <Typography variant="body2" color="text.secondary">
-              Create a user-managed specialist for the roster using one of your saved model profiles.
-            </Typography>
-            <TextField
-              fullWidth
-              size="small"
-              label="Name"
-              value={draft.name}
-              onChange={(event) => setDraft((prev) => ({ ...prev, name: event.target.value }))}
-            />
-            <TextField
-              fullWidth
-              select
-              size="small"
-              label="Role"
-              value={draft.agent_type}
-              onChange={(event) => setDraft((prev) => ({ ...prev, agent_type: event.target.value }))}
-            >
-              {["researcher", "coder", "analyst", "writer", "validator", "planner"].map((option) => (
-                <MenuItem key={option} value={option}>
-                  {option}
-                </MenuItem>
-              ))}
-            </TextField>
-            <TextField
-              fullWidth
-              select
-              size="small"
-              label="Model profile"
-              value={selectedModelProfile?.id ?? ""}
-              onChange={(event) => {
-                const nextProfile =
-                  enabledModelProfiles.find((profile) => profile.id === event.target.value) ?? null;
-                setDraft((prev) => applyModelProfileToDraft(prev, nextProfile));
-              }}
-              helperText={savedProfilesHelperText}
-              disabled={enabledModelProfiles.length === 0}
-            >
-              {enabledModelProfiles.length === 0 ? (
-                <MenuItem value="" disabled>
-                  No saved profiles available
-                </MenuItem>
-              ) : (
-                enabledModelProfiles.map((profile) => (
-                  <MenuItem key={profile.id} value={profile.id}>
-                    {profile.label || `${formatProfileRole(profile.role)} profile`}
-                  </MenuItem>
-                ))
-              )}
-            </TextField>
-            {selectedModelProfile ? (
-              <Box
-                sx={{
-                  px: 1.15,
-                  py: 1,
-                  borderRadius: "14px",
-                  border: "1px solid rgba(255,255,255,0.08)",
-                  background: "linear-gradient(180deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.02) 100%)"
-                }}
-              >
-                <Stack direction={{ xs: "column", sm: "row" }} spacing={0.75} useFlexGap flexWrap="wrap" alignItems={{ xs: "flex-start", sm: "center" }}>
-                  <Typography variant="body2" sx={{ fontWeight: 700 }}>
-                    {selectedModelProfile.label || `${formatProfileRole(selectedModelProfile.role)} profile`}
+      <Dialog open={createOpen} onClose={closeAgentDialog} maxWidth="md" fullWidth>
+        <DialogTitle>{editingAgent ? "Edit custom agent" : "Add custom agent"}</DialogTitle>
+        <DialogContent dividers>
+          {agentDialogStep === 0 ? (
+            <Stack spacing={1.35}>
+              <Alert severity="info">
+                Define the agent first. Elevated access is reviewed on the next step from the
+                drafted spec and live tool metadata.
+              </Alert>
+              <TextField
+                fullWidth
+                size="small"
+                multiline
+                minRows={3}
+                label="Describe the agent"
+                value={draft.description}
+                onChange={(event) => setDraft((prev) => ({ ...prev, description: event.target.value }))}
+                placeholder="Example: Handles Slack follow-ups, summarizes urgent threads, drafts replies, and can query our Google Workspace docs."
+                helperText="Optional for manual setup. Required only if you want AI to draft the name, role, capabilities, and system prompt."
+              />
+              <Stack direction={{ xs: "column", sm: "row" }} spacing={1} justifyContent="space-between" alignItems={{ xs: "stretch", sm: "center" }}>
+                <Typography variant="caption" color="text.secondary">
+                  AI drafting never auto-saves. It only fills the editable fields below.
+                </Typography>
+                <Button
+                  variant="outlined"
+                  disabled={generateDraft.isPending || !draft.description.trim()}
+                  startIcon={generateDraft.isPending ? <CircularProgress size={14} color="inherit" /> : undefined}
+                  onClick={async () => {
+                    setFormError(null);
+                    try {
+                      await generateDraft.mutateAsync();
+                    } catch (error) {
+                      setFormError(errMessage(error));
+                    }
+                  }}
+                >
+                  {generateDraft.isPending ? "Generating..." : "Generate draft"}
+                </Button>
+              </Stack>
+
+              <Grid2 container spacing={1}>
+                <Grid2 size={{ xs: 12, md: 6 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    label="Name"
+                    value={draft.name}
+                    onChange={(event) => setDraft((prev) => ({ ...prev, name: event.target.value }))}
+                  />
+                </Grid2>
+                <Grid2 size={{ xs: 12, md: 6 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    label="Role"
+                    value={draft.agent_type}
+                    onChange={(event) => setDraft((prev) => ({ ...prev, agent_type: event.target.value }))}
+                    placeholder="researcher, coder, support specialist, Slack triager"
+                    helperText="Built-ins still work, but custom role labels are allowed."
+                  />
+                </Grid2>
+                <Grid2 size={{ xs: 12 }}>
+                  <TextField
+                    fullWidth
+                    select
+                    size="small"
+                    label="Model profile"
+                    value={draft.model_profile_id}
+                    onChange={(event) => {
+                      const nextProfile =
+                        enabledModelProfiles.find((profile) => profile.id === event.target.value) ?? null;
+                      setDraft((prev) => applyModelProfileToDraft(prev, nextProfile));
+                    }}
+                    helperText={savedProfilesHelperText}
+                    disabled={enabledModelProfiles.length === 0}
+                  >
+                    <MenuItem value="">
+                      {editingAgent ? "Keep current model config" : "Select a saved model profile"}
+                    </MenuItem>
+                    {enabledModelProfiles.map((profile) => (
+                      <MenuItem key={profile.id} value={profile.id}>
+                        {profile.label || `${formatProfileRole(profile.role)} profile`}
+                      </MenuItem>
+                    ))}
+                  </TextField>
+                </Grid2>
+              </Grid2>
+
+              {selectedModelProfile ? (
+                <Box
+                  sx={{
+                    px: 1.15,
+                    py: 1,
+                    borderRadius: "8px",
+                    border: "1px solid rgba(255,255,255,0.08)",
+                    background: "linear-gradient(180deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.02) 100%)"
+                  }}
+                >
+                  <Stack direction={{ xs: "column", sm: "row" }} spacing={0.75} useFlexGap flexWrap="wrap" alignItems={{ xs: "flex-start", sm: "center" }}>
+                    <Typography variant="body2" sx={{ fontWeight: 700 }}>
+                      {selectedModelProfile.label || `${formatProfileRole(selectedModelProfile.role)} profile`}
+                    </Typography>
+                    <Chip size="small" variant="outlined" label={formatProfileRole(selectedModelProfile.role)} />
+                    <Typography variant="caption" color="text.secondary">
+                      Reuses your saved model setup automatically.
+                    </Typography>
+                  </Stack>
+                </Box>
+              ) : draft.llm_provider && draft.llm_model ? (
+                <Alert severity="warning">
+                  This agent is keeping its stored model config: {draft.llm_provider} / {draft.llm_model}
+                  {draft.llm_base_url ? ` / ${draft.llm_base_url}` : ""}. Pick a saved profile above if
+                  you want to replace it.
+                </Alert>
+              ) : null}
+
+              <TextField
+                fullWidth
+                size="small"
+                label="Capabilities"
+                value={draft.capabilities}
+                onChange={(event) => setDraft((prev) => ({ ...prev, capabilities: event.target.value }))}
+                placeholder="debugging, code review, refactoring"
+                helperText="Comma-separated skills shown on the agent card."
+              />
+              <TextField
+                fullWidth
+                size="small"
+                multiline
+                minRows={5}
+                label="System prompt"
+                value={draft.system_prompt}
+                onChange={(event) => setDraft((prev) => ({ ...prev, system_prompt: event.target.value }))}
+              />
+              {formError ? <Alert severity="error">{formError}</Alert> : null}
+            </Stack>
+          ) : (
+            <Stack spacing={1.1}>
+              {accessPlanReview.requested.length > 0 ? (
+                <Stack spacing={0.8}>
+                  <Typography variant="subtitle2" sx={{ fontWeight: 800 }}>
+                    Tool permissions
                   </Typography>
-                  <Chip size="small" variant="outlined" label={formatProfileRole(selectedModelProfile.role)} />
-                  <Typography variant="caption" color="text.secondary">
-                    Reuses your saved model setup automatically.
-                  </Typography>
+
+                  {accessPlanReview.requested
+                    .filter((group) => group.scopeField === "approved_permission_ids")
+                    .map((group) => {
+                      const permissionId = (group.suggestedIds[0] || group.id).toLowerCase();
+                      const checked = draft.access_scope.approved_permission_ids.includes(permissionId);
+                      return (
+                        <Box
+                          key={group.id}
+                          sx={{
+                            px: 1,
+                            py: 0.85,
+                            borderRadius: "8px",
+                            border: "1px solid rgba(255,255,255,0.08)",
+                            background: "rgba(255,255,255,0.02)",
+                            display: "flex",
+                            alignItems: { xs: "stretch", sm: "center" },
+                            justifyContent: "space-between",
+                            gap: 1,
+                            flexDirection: { xs: "column", sm: "row" }
+                          }}
+                        >
+                          <Typography variant="body2" sx={{ fontWeight: 700 }}>
+                            {group.label}
+                          </Typography>
+                          <Stack direction="row" spacing={0.75}>
+                            <Button
+                              size="small"
+                              variant={checked ? "contained" : "outlined"}
+                              onClick={() => toggleApprovedPermission(permissionId, true)}
+                            >
+                              Approve
+                            </Button>
+                            <Button
+                              size="small"
+                              color="inherit"
+                              variant={checked ? "outlined" : "contained"}
+                              onClick={() => toggleApprovedPermission(permissionId, false)}
+                            >
+                              Reject
+                            </Button>
+                          </Stack>
+                        </Box>
+                      );
+                    })}
+
+                  {accessPlanReview.requested
+                    .filter((group) => group.scopeField !== "approved_permission_ids")
+                    .map((group) => {
+                      const section = resourceAccessSections.find((item) => item.field === group.scopeField);
+                      if (!section) return null;
+                      return (
+                        <AccessScopeSelect
+                          key={group.id}
+                          label={group.label}
+                          options={section.options}
+                          selectedIds={draft.access_scope[group.scopeField] as string[]}
+                          onChange={(nextIds) => updateAccessScope(group.scopeField as ResourceAccessScopeKey, nextIds)}
+                        />
+                      );
+                    })}
                 </Stack>
-              </Box>
-            ) : null}
-            <TextField
-              fullWidth
-              size="small"
-              label="Capabilities"
-              value={draft.capabilities}
-              onChange={(event) => setDraft((prev) => ({ ...prev, capabilities: event.target.value }))}
-              placeholder="debugging, code review, refactoring"
-              helperText="Comma-separated skills shown on the agent card."
-            />
-            <TextField
-              fullWidth
-              size="small"
-              multiline
-              minRows={4}
-              label="System prompt override (optional)"
-              value={draft.system_prompt}
-              onChange={(event) => setDraft((prev) => ({ ...prev, system_prompt: event.target.value }))}
-            />
-            {formError ? <Alert severity="error">{formError}</Alert> : null}
-          </Stack>
+              ) : (
+                <Alert severity="success">No approval needed for this agent.</Alert>
+              )}
+
+              {accessPlanReview.unavailable.length > 0 ? (
+                <Stack spacing={0.8}>
+                  {accessPlanReview.unavailable.map((group) => (
+                    <Alert key={group.id} severity="warning">
+                      Configure {group.label} in Settings.
+                    </Alert>
+                  ))}
+                </Stack>
+              ) : null}
+              {formError ? <Alert severity="error">{formError}</Alert> : null}
+            </Stack>
+          )}
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setCreateOpen(false)}>Cancel</Button>
-          <Button
-            variant="contained"
-            disabled={createAgent.isPending}
-            onClick={async () => {
-              if (!draft.name.trim() || !draft.agent_type.trim() || !selectedModelProfile || !draft.llm_provider.trim() || !draft.llm_model.trim()) {
-                setFormError("Name, role, and a saved model profile are required.");
-                return;
-              }
-              setFormError(null);
-              try {
-                await createAgent.mutateAsync();
-              } catch (error) {
-                setFormError(errMessage(error));
-              }
-            }}
-          >
-            Create agent
-          </Button>
+          <Button onClick={closeAgentDialog}>Cancel</Button>
+          {agentDialogStep === 1 ? <Button onClick={() => setAgentDialogStep(0)}>Back</Button> : null}
+          {agentDialogStep === 0 ? (
+            <Button
+              variant="contained"
+              disabled={planAccess.isPending}
+              startIcon={planAccess.isPending ? <CircularProgress size={14} color="inherit" /> : undefined}
+              onClick={async () => {
+                const hasModelConfig = Boolean(
+                  (selectedModelProfile?.provider || draft.llm_provider).trim() &&
+                    (selectedModelProfile?.model || draft.llm_model).trim()
+                );
+                if (!draft.name.trim() || !draft.agent_type.trim() || !hasModelConfig) {
+                  setFormError("Name, role, and model config are required.");
+                  return;
+                }
+                setFormError(null);
+                try {
+                  await planAccess.mutateAsync();
+                } catch (error) {
+                  setFormError(errMessage(error));
+                }
+              }}
+            >
+              {planAccess.isPending ? "Reviewing..." : "Review access"}
+            </Button>
+          ) : (
+            <Button
+              variant="contained"
+              disabled={saveAgent.isPending}
+              startIcon={saveAgent.isPending ? <CircularProgress size={14} color="inherit" /> : undefined}
+              onClick={async () => {
+                const hasModelConfig = Boolean(
+                  (selectedModelProfile?.provider || draft.llm_provider).trim() &&
+                    (selectedModelProfile?.model || draft.llm_model).trim()
+                );
+                if (!draft.name.trim() || !draft.agent_type.trim() || !hasModelConfig) {
+                  setFormError("Name, role, and model config are required.");
+                  return;
+                }
+                setFormError(null);
+                try {
+                  await saveAgent.mutateAsync();
+                } catch (error) {
+                  setFormError(errMessage(error));
+                }
+              }}
+            >
+              {saveAgent.isPending ? (editingAgent ? "Saving..." : "Creating...") : editingAgent ? "Save changes" : "Create agent"}
+            </Button>
+          )}
         </DialogActions>
       </Dialog>
     </WorkspacePageShell>

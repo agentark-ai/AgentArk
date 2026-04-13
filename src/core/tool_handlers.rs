@@ -13,6 +13,7 @@ pub struct ToolHandlerContext<'a> {
     pub conversation_id: Option<&'a str>,
     pub project_id: Option<&'a str>,
     pub public_base_url: Option<&'a str>,
+    pub authorization: &'a crate::actions::ActionAuthorizationContext,
     pub integration_aliases: &'a HashMap<String, String>,
 }
 
@@ -64,7 +65,12 @@ impl ToolHandler for GenerateImageToolHandler {
         ctx: &ToolHandlerContext<'_>,
     ) -> Result<Option<String>> {
         let out = agent
-            .handle_generate_image_tool_call(call, ctx.stream_tx, ctx.request_channel)
+            .handle_generate_image_tool_call(
+                call,
+                ctx.stream_tx,
+                ctx.request_channel,
+                Some(ctx.authorization),
+            )
             .await?;
         Ok(Some(out))
     }
@@ -92,6 +98,7 @@ impl ToolHandler for GenerateVideoToolHandler {
                 ctx.stream_tx,
                 ctx.request_channel,
                 ctx.public_base_url,
+                Some(ctx.authorization),
             )
             .await?;
         Ok(Some(out))
@@ -115,7 +122,7 @@ impl ToolHandler for BrowserAutoToolHandler {
         ctx: &ToolHandlerContext<'_>,
     ) -> Result<Option<String>> {
         let out = agent
-            .handle_browser_auto_tool_call(call, ctx.stream_tx)
+            .handle_browser_auto_tool_call(call, ctx.stream_tx, Some(ctx.authorization))
             .await?;
         Ok(Some(out))
     }
@@ -207,7 +214,10 @@ impl ToolHandler for IntegrationToolHandler {
                 },
             );
         }
-        let allowed = agent.safety.is_allowed(&call.name, &call.arguments).await?;
+        let allowed = agent
+            .safety
+            .is_allowed_with_authorization(&call.name, &call.arguments, Some(ctx.authorization))
+            .await?;
         if !allowed {
             let blocked = format!("Tool '{}' blocked by safety policy", call.name);
             if let Some(tx) = ctx.stream_tx {
@@ -389,6 +399,7 @@ impl ToolHandler for AppDeployToolHandler {
                 ctx.request_channel,
                 ctx.conversation_id,
                 ctx.public_base_url,
+                Some(ctx.authorization),
             )
             .await?;
         Ok(Some(out))
@@ -540,6 +551,7 @@ impl ToolHandler for RuntimeToolHandler {
                 ctx.request_channel,
                 ctx.conversation_id,
                 ctx.project_id,
+                Some(ctx.authorization),
             )
             .await?;
         Ok(Some(out))

@@ -448,6 +448,131 @@ export type IntegrationItem = {
   config_values?: Record<string, unknown> | null;
 };
 
+export type ExtensionPackAuthMode =
+  | "none"
+  | "api_key"
+  | "basic"
+  | "oauth2_external"
+  | string;
+
+export type ExtensionPackTrustLevel = "trusted" | "unverified" | string;
+
+export type ExtensionPackSourceKind =
+  | "bundled_registry"
+  | "local_manifest"
+  | "direct_url"
+  | "scaffolded"
+  | "local_path"
+  | "uploaded_bundle"
+  | string;
+
+export type ExtensionPackManifest = {
+  sdk_version: string;
+  id: string;
+  name: string;
+  version: string;
+  kind: string;
+  publisher?: string;
+  publisher_did?: string | null;
+  description?: string;
+  docs_url?: string | null;
+  signature?: string | null;
+  draft: boolean;
+  tags?: string[];
+  auth: {
+    mode: ExtensionPackAuthMode;
+    required_secrets?: string[];
+    required_scopes?: string[];
+    metadata?: Record<string, unknown> | null;
+  };
+  features: Array<{
+    id: string;
+    kind: string;
+    title?: string;
+    description?: string;
+    read_only: boolean;
+    experimental: boolean;
+    binding?: { kind: string; config?: Record<string, unknown> | null } | null;
+  }>;
+  metadata?: Record<string, unknown> | null;
+};
+
+export type PackFeatureSummary = {
+  id: string;
+  kind: string;
+  title: string;
+  description: string;
+  read_only: boolean;
+  experimental: boolean;
+  binding_kind?: string | null;
+};
+
+export type ExtensionPackView = {
+  manifest: ExtensionPackManifest;
+  installed: boolean;
+  enabled: boolean;
+  trust_level: ExtensionPackTrustLevel;
+  verification_status: string;
+  verification_detail?: string | null;
+  source_kind: ExtensionPackSourceKind;
+  source_url?: string | null;
+  needs_auth: boolean;
+  status: string;
+  status_detail?: string | null;
+  supports_connect_url: boolean;
+  supports_webhook: boolean;
+  webhook_path?: string | null;
+  feature_summaries: PackFeatureSummary[];
+};
+
+export type ExtensionPackConnectionView = {
+  connection: {
+    id: string;
+    pack_id: string;
+    name: string;
+    enabled: boolean;
+    metadata?: Record<string, unknown> | null;
+    last_error?: string | null;
+    last_tested_at?: string | null;
+    created_at: string;
+    updated_at: string;
+  };
+  state: string;
+  auth_mode: ExtensionPackAuthMode;
+  has_secret: boolean;
+};
+
+export type ExtensionPackSearchResponse = {
+  query: string;
+  installed: ExtensionPackView[];
+  catalog: ExtensionPackView[];
+  not_found: boolean;
+  next_steps: string[];
+};
+
+export type ExtensionPackEventRecord = {
+  id: string;
+  pack_id: string;
+  feature_id: string;
+  connection_id?: string | null;
+  event_type: string;
+  provider_event_id?: string | null;
+  transport: string;
+  status: string;
+  outcome?: string | null;
+  response_preview?: string | null;
+  metadata?: Record<string, unknown> | null;
+  payload?: Record<string, unknown> | string | null;
+  received_at: string;
+  processed_at?: string | null;
+};
+
+export type ExtensionPackEventsResponse = {
+  pack_id: string;
+  count: number;
+  items: ExtensionPackEventRecord[];
+};
+
 export type GoogleWorkspaceOAuthClientSettings = {
   configured: boolean;
   source: string;
@@ -822,10 +947,13 @@ export type SkillImportResponse = {
     warnings?: string[];
     findings?: Array<{
       category?: string;
+      label?: string;
       description?: string;
+      explanation?: string;
       matched_text?: string;
       line?: number;
       severity?: number;
+      contextual?: boolean;
     }>;
     blocked?: boolean;
     total_severity?: number;

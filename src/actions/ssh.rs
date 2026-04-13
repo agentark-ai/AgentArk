@@ -42,6 +42,29 @@ fn load_connections(config_dir: &Path) -> Result<Vec<SshConnection>> {
     }
 }
 
+pub fn list_connections(config_dir: &Path) -> Result<Vec<SshConnection>> {
+    load_connections(config_dir)
+}
+
+fn connection_is_allowed(allowed_names: Option<&[String]>, connection_name: &str) -> bool {
+    match allowed_names {
+        Some(allowed) => allowed
+            .iter()
+            .any(|value| value.trim() == connection_name.trim()),
+        None => true,
+    }
+}
+
+fn filter_connections_by_allowlist(
+    connections: Vec<SshConnection>,
+    allowed_names: Option<&[String]>,
+) -> Vec<SshConnection> {
+    connections
+        .into_iter()
+        .filter(|connection| connection_is_allowed(allowed_names, &connection.name))
+        .collect()
+}
+
 fn save_connections(config_dir: &Path, connections: &[SshConnection]) -> Result<()> {
     let manager = crate::core::config::SecureConfigManager::new(config_dir)?;
     manager.set_custom_secret(
@@ -159,12 +182,22 @@ fn append_ssh_output(
 
 /// List available SSH connections
 pub async fn ssh_list_connections(config_dir: &Path) -> Result<String> {
-    let connections = load_connections(config_dir)?;
+    ssh_list_connections_scoped(config_dir, None).await
+}
+
+/// List available SSH connections, optionally restricted to an allowlist.
+pub async fn ssh_list_connections_scoped(
+    config_dir: &Path,
+    allowed_names: Option<&[String]>,
+) -> Result<String> {
+    let connections = filter_connections_by_allowlist(load_connections(config_dir)?, allowed_names);
     if connections.is_empty() {
-        return Ok(
+        return Ok(if allowed_names.is_some() {
+            "No SSH connections are attached to this agent.".to_string()
+        } else {
             "No SSH connections configured. Add connections in Settings > MCP Servers > SSH Access."
-                .to_string(),
-        );
+                .to_string()
+        });
     }
 
     let mut output = format!("{} SSH connection(s):\n", connections.len());
@@ -179,6 +212,15 @@ pub async fn ssh_list_connections(config_dir: &Path) -> Result<String> {
 
 /// Execute a command on a remote server via SSH
 pub async fn ssh_execute(config_dir: &Path, arguments: &serde_json::Value) -> Result<String> {
+    ssh_execute_scoped(config_dir, arguments, None).await
+}
+
+/// Execute a command on a remote server via SSH, optionally restricted to an allowlist.
+pub async fn ssh_execute_scoped(
+    config_dir: &Path,
+    arguments: &serde_json::Value,
+    allowed_names: Option<&[String]>,
+) -> Result<String> {
     let conn_name = arguments
         .get("connection")
         .and_then(|v| v.as_str())
@@ -187,6 +229,13 @@ pub async fn ssh_execute(config_dir: &Path, arguments: &serde_json::Value) -> Re
         .get("command")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("Missing 'command' to execute"))?;
+
+    if !connection_is_allowed(allowed_names, conn_name) {
+        return Err(anyhow!(
+            "SSH connection '{}' is not attached to this agent.",
+            conn_name
+        ));
+    }
 
     let connections = load_connections(config_dir)?;
     let conn = connections
@@ -407,6 +456,32 @@ impl russh::client::Handler for Handler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filter_connections_by_allowlist_keeps_only_attached_names() {
+        let filtered = filter_connections_by_allowlist(
+            vec![
+                SshConnection {
+                    name: "prod".to_string(),
+                    host: "prod.example.com".to_string(),
+                    port: 22,
+                    username: "root".to_string(),
+                    key_name: "prod-key".to_string(),
+                },
+                SshConnection {
+                    name: "staging".to_string(),
+                    host: "staging.example.com".to_string(),
+                    port: 22,
+                    username: "root".to_string(),
+                    key_name: "staging-key".to_string(),
+                },
+            ],
+            Some(&["prod".to_string()]),
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "prod");
+    }
 
     #[test]
     fn verify_or_learn_server_key_trusts_first_use_and_reuses_fingerprint() {

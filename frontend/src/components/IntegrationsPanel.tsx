@@ -33,6 +33,7 @@ import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
+import { formatUiDateTime } from "../lib/dateFormat";
 import type {
   GatewayChannelDescriptor,
   IntegrationConfigField,
@@ -40,6 +41,7 @@ import type {
   IntegrationSyncFeedItem,
   IntegrationSyncStatus
 } from "../types";
+import { ExtensionPacksPanel } from "./ExtensionPacksPanel";
 import { IntegrationQuickstartPanel } from "./IntegrationQuickstartPanel";
 import { IntegrationRoutingPanel } from "./IntegrationRoutingPanel";
 import { PluginSdkPanel } from "./PluginSdkPanel";
@@ -243,11 +245,6 @@ type McpServerForm = {
 };
 
 type ChannelSettingsForm = {
-  search_primary: string;
-  search_fallback1: string;
-  search_fallback2: string;
-  search_serper_key: string;
-  search_brave_key: string;
   telegram_enabled: boolean;
   telegram_bot_token: string;
   telegram_allowed_users_csv: string;
@@ -395,9 +392,7 @@ function integrationSyncFormFromStatus(status?: IntegrationSyncStatus | null): I
 }
 
 function formatDateTime(value?: string | null): string {
-  if (!value) return "Never";
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString();
+  return formatUiDateTime(value, { fallback: "Never" });
 }
 
 function asErrorMessage(err: unknown): string {
@@ -411,49 +406,42 @@ function asErrorMessage(err: unknown): string {
   return err.message;
 }
 
-function statusColor(status: IntegrationItem["status"]): "success" | "warning" | "error" | "default" {
-  if (status === "connected") return "success";
-  if (status === "configured") return "warning";
-  if (status === "starting") return "warning";
-  if (status === "disabled") return "warning";
-  if (status === "needs_auth") return "warning";
-  if (status === "error") return "error";
-  return "default";
+type IntegrationCardState = "enabled" | "disabled";
+
+function integrationIsLiveConnected(integration?: IntegrationItem | null): boolean {
+  return !!integration && integration.status === "connected" && integration.enabled;
 }
 
-type IntegrationCardState = "enabled" | "configured" | "disabled" | "needs_auth" | "error" | "not_configured";
-
 function integrationCardState(integration: IntegrationItem): IntegrationCardState {
-  if (integration.status === "connected") {
-    return integration.enabled ? "enabled" : "disabled";
-  }
-  if (integration.status === "configured") return "configured";
-  if (integration.status === "starting") return "needs_auth";
-  if (integration.status === "disabled") return "disabled";
-  if (integration.status === "needs_auth") return "needs_auth";
-  if (integration.status === "error") return "error";
-  return "not_configured";
+  return integrationIsLiveConnected(integration) ? "enabled" : "disabled";
 }
 
 function integrationCardLabel(state: IntegrationCardState): string {
-  if (state === "enabled") return "Enabled";
-  if (state === "configured") return "Configured";
-  if (state === "disabled") return "Disabled";
-  if (state === "needs_auth") return "Needs sign-in";
-  if (state === "error") return "Error";
-  return "Not configured";
+  return state === "enabled" ? "Connected" : "Disabled";
+}
+
+function integrationDialogStatusLabel(integration?: IntegrationItem | null): string {
+  return integrationIsLiveConnected(integration) ? "Connected" : "Disabled";
 }
 
 function integrationCardCopy(integration: IntegrationItem): string {
-  const detail = str(integration.status_detail, "").trim();
-  if (detail) return detail;
-  const state = integrationCardState(integration);
-  if (state === "enabled") return integration.description;
-  if (state === "configured") return "Credentials are saved, but live connectivity has not been confirmed yet.";
-  if (state === "disabled") return "Configured, but currently disabled for agent use.";
-  if (state === "needs_auth") return "Finish the sign-in flow to activate this integration.";
-  if (state === "error") return "The saved credentials could not be validated.";
-  return "No saved credentials found for this integration yet.";
+  if (integrationIsLiveConnected(integration)) {
+    const detail = str(integration.status_detail, "").trim();
+    return detail || integration.description;
+  }
+  if (integration.status === "connected") {
+    return "Connected credentials found, but this integration is currently disabled for agent use.";
+  }
+  if (integration.status === "error") {
+    return "Disabled until the saved credentials are fixed.";
+  }
+  if (integration.status === "needs_auth" || integration.status === "starting") {
+    return "Disabled until sign-in is completed.";
+  }
+  if (integration.status === "configured") {
+    return "Disabled until a live connection is confirmed.";
+  }
+  return "Disabled until this integration is connected.";
 }
 
 function integrationCardAccent(state: IntegrationCardState): {
@@ -474,54 +462,18 @@ function integrationCardAccent(state: IntegrationCardState): {
       chipColor: "rgba(74,210,157,0.9)"
     };
   }
-  if (state === "configured") {
-    return {
-      border: "rgba(105,226,255,0.24)",
-      background: "rgba(105,226,255,0.05)",
-      hoverBorder: "rgba(105,226,255,0.4)",
-      hoverBackground: "rgba(105,226,255,0.08)",
-      chipBorder: "rgba(105,226,255,0.24)",
-      chipColor: "rgba(105,226,255,0.92)"
-    };
-  }
-  if (state === "disabled") {
-    return {
-      border: "rgba(255,180,50,0.28)",
-      background: "rgba(255,180,50,0.05)",
-      hoverBorder: "rgba(255,180,50,0.44)",
-      hoverBackground: "rgba(255,180,50,0.08)",
-      chipBorder: "rgba(255,180,50,0.24)",
-      chipColor: "rgba(255,196,92,0.92)"
-    };
-  }
-  if (state === "needs_auth") {
-    return {
-      border: "rgba(255,180,50,0.2)",
-      background: "rgba(255,180,50,0.03)",
-      hoverBorder: "rgba(255,180,50,0.38)",
-      hoverBackground: "rgba(255,180,50,0.06)",
-      chipBorder: "rgba(255,180,50,0.24)",
-      chipColor: "rgba(255,196,92,0.9)"
-    };
-  }
-  if (state === "error") {
-    return {
-      border: "rgba(255,88,88,0.28)",
-      background: "rgba(255,88,88,0.05)",
-      hoverBorder: "rgba(255,88,88,0.45)",
-      hoverBackground: "rgba(255,88,88,0.08)",
-      chipBorder: "rgba(255,88,88,0.24)",
-      chipColor: "rgba(255,130,130,0.92)"
-    };
-  }
   return {
-    border: "rgba(108,156,212,0.18)",
-    background: "rgba(6,15,29,0.5)",
-    hoverBorder: "rgba(47,212,255,0.4)",
-    hoverBackground: "rgba(47,212,255,0.06)",
-    chipBorder: "rgba(255,255,255,0.1)",
-    chipColor: "rgba(180,200,225,0.66)"
+    border: "rgba(255,180,50,0.28)",
+    background: "rgba(255,180,50,0.05)",
+    hoverBorder: "rgba(255,180,50,0.44)",
+    hoverBackground: "rgba(255,180,50,0.08)",
+    chipBorder: "rgba(255,180,50,0.24)",
+    chipColor: "rgba(255,196,92,0.92)"
   };
+}
+
+function integrationCardDotColor(state: IntegrationCardState): string {
+  return state === "enabled" ? "#4ad29d" : "rgba(255,180,50,0.85)";
 }
 
 type MessagingDisplayState = "off" | "checking" | "needs_setup" | "ready" | "error";
@@ -590,7 +542,7 @@ function gatewayChannelDetail(channel: GatewayChannelDescriptor | null, fallback
   if (str(channel.delivery_mode, "").trim()) {
     parts.push(str(channel.delivery_mode, "").replace(/_/g, " "));
   }
-  return parts.join(" • ");
+  return parts.join(" | ");
 }
 
 function isRecord(value: unknown): value is JsonRecord {
@@ -862,7 +814,6 @@ export function IntegrationsPanel({
   const [oauthBusyId, setOauthBusyId] = useState<string | null>(null);
   const [oauthPendingId, setOauthPendingId] = useState<string | null>(null);
   const [channelsDirty, setChannelsDirty] = useState(false);
-  const [searchSetupOpen, setSearchSetupOpen] = useState(false);
   const [telegramSetupOpen, setTelegramSetupOpen] = useState(false);
   const [slackSetupOpen, setSlackSetupOpen] = useState(false);
   const [discordSetupOpen, setDiscordSetupOpen] = useState(false);
@@ -876,11 +827,6 @@ export function IntegrationsPanel({
   const [wechatSetupOpen, setWechatSetupOpen] = useState(false);
   const [qqSetupOpen, setQqSetupOpen] = useState(false);
   const [channelForm, setChannelForm] = useState<ChannelSettingsForm>({
-    search_primary: "lightpanda",
-    search_fallback1: "duckduckgo",
-    search_fallback2: "none",
-    search_serper_key: "",
-    search_brave_key: "",
     telegram_enabled: false,
     telegram_bot_token: "",
     telegram_allowed_users_csv: "",
@@ -1025,7 +971,8 @@ export function IntegrationsPanel({
   const settingsQ = useQuery({
     queryKey: ["settings"],
     queryFn: () => api.rawGet("/settings"),
-    refetchInterval: autoRefresh ? REFRESH_MS : false,
+    refetchInterval: false,
+    refetchOnWindowFocus: false,
     enabled: showIntegrations
   });
   const channelsQ = useQuery({
@@ -1250,8 +1197,6 @@ export function IntegrationsPanel({
   const hasLineChannelSecret = toBool(settings.has_line_channel_secret);
   const hasWeChatBridgeToken = toBool(settings.has_wechat_bridge_token);
   const hasQqBridgeToken = toBool(settings.has_qq_bridge_token);
-  const searchSerperConfigured = toBool(settings.search_serper_configured);
-  const searchBraveConfigured = toBool(settings.search_brave_configured);
   const telegramDraftTokenConfigured = channelForm.telegram_bot_token.trim().length > 0;
   const telegramTokenConfigured = hasTelegramToken || telegramDraftTokenConfigured;
   const whatsappTokenConfigured = hasWhatsAppToken || channelForm.whatsapp_access_token.trim().length > 0;
@@ -1530,7 +1475,7 @@ export function IntegrationsPanel({
   ].filter((item): item is { key: string; label: string; detail: string; badge: string } => Boolean(item));
   const sectionAccordionSx = {
     border: "1px solid rgba(112,153,201,0.14)",
-    borderRadius: "14px",
+    borderRadius: "8px",
     background: "rgba(8,18,34,0.7)",
     boxShadow: "none",
     "&:before": { display: "none" },
@@ -1558,7 +1503,7 @@ export function IntegrationsPanel({
       px: 1,
       fontSize: "0.64rem",
       fontWeight: 700,
-      letterSpacing: "0.08em",
+      letterSpacing: 0,
       textTransform: "uppercase"
     }
   } as const;
@@ -1714,11 +1659,6 @@ export function IntegrationsPanel({
     if (!showIntegrations || !settingsQ.data || channelsDirty) return;
     const next = asRecord(settingsQ.data);
     setChannelForm({
-      search_primary: str(next.search_primary, "lightpanda"),
-      search_fallback1: str(next.search_fallback1, "duckduckgo"),
-      search_fallback2: str(next.search_fallback2, "none"),
-      search_serper_key: "",
-      search_brave_key: "",
       telegram_enabled: toBool(next.telegram_enabled),
       telegram_bot_token: "",
       telegram_allowed_users_csv: asStringList(next.telegram_allowed_users).join(", "),
@@ -1939,10 +1879,6 @@ export function IntegrationsPanel({
       setChannelField("whatsapp_enabled", true);
     }
     setWhatsAppSetupOpen(true);
-  };
-
-  const openSearchSetup = () => {
-    setSearchSetupOpen(true);
   };
 
   const saveChannelDialog = async (onClose: () => void) => {
@@ -2172,11 +2108,6 @@ export function IntegrationsPanel({
         llm_fallback_model: settings.llm_fallback_model ?? null,
         llm_fallback_base_url: settings.llm_fallback_base_url ?? null,
         llm_fallback_api_key: null,
-        search_primary: form.search_primary.trim() || null,
-        search_fallback1: form.search_fallback1.trim() || null,
-        search_fallback2: form.search_fallback2.trim() || null,
-        search_serper_key: form.search_serper_key.trim() || null,
-        search_brave_key: form.search_brave_key.trim() || null,
         telegram_enabled: !!form.telegram_enabled,
         telegram_bot_token: form.telegram_bot_token.trim() || null,
         telegram_allowed_users: parseTelegramUsers(form.telegram_allowed_users_csv),
@@ -2368,8 +2299,7 @@ export function IntegrationsPanel({
     };
     const channelName = channelNameMap[channel] || channel;
     const formatSeen = (value: string) => {
-      const parsed = new Date(value);
-      return Number.isNaN(parsed.getTime()) ? value || "-" : parsed.toLocaleString();
+      return formatUiDateTime(value, { fallback: "-" });
     };
     const senderLabel = (row: JsonRecord) => str(row.sender_label, str(row.sender_id, "-"));
     const scopeLabel = (row: JsonRecord) => str(row.scope_label, str(row.scope_id, "-"));
@@ -2447,7 +2377,7 @@ export function IntegrationsPanel({
                         <Typography variant="body2">{senderLabel(row)}</Typography>
                         <Typography variant="caption" color="text.secondary">
                           {str(row.sender_id, "-")}
-                          {str(row.scope_id) ? ` • ${scopeLabel(row)}` : ""}
+                          {str(row.scope_id) ? ` | ${scopeLabel(row)}` : ""}
                         </Typography>
                         <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
                           Last seen {formatSeen(str(row.last_seen_at))}
@@ -2508,7 +2438,7 @@ export function IntegrationsPanel({
                         <Typography variant="body2">{senderLabel(row)}</Typography>
                         <Typography variant="caption" color="text.secondary">
                           {str(row.sender_id, "-")}
-                          {str(row.scope_id) ? ` • ${scopeLabel(row)}` : ""}
+                          {str(row.scope_id) ? ` | ${scopeLabel(row)}` : ""}
                         </Typography>
                       </Box>
                       <Button
@@ -3266,6 +3196,20 @@ export function IntegrationsPanel({
         </Alert>
       ) : null}
 
+      {showIntegrations ? (
+        <ExtensionPacksPanel
+          mode={
+            showChannelsPage
+              ? "channels"
+              : showMessagingOnly
+                ? "messaging"
+                : showConnectorsPage
+                  ? "connectors"
+                  : "all"
+          }
+        />
+      ) : null}
+
       {showConnectorsPage ? (
         <>
           {readyList.length > 0 ? (
@@ -3289,15 +3233,7 @@ export function IntegrationsPanel({
                 {readyList.map((integration) => {
                   const cardState = integrationCardState(integration);
                   const accent = integrationCardAccent(cardState);
-                  const sc = statusColor(integration.status);
-                  const dotColor =
-                    sc === "success"
-                      ? "#4ad29d"
-                      : sc === "error"
-                        ? "rgba(255,88,88,0.85)"
-                        : sc === "warning"
-                          ? "rgba(255,180,50,0.85)"
-                          : "rgba(255,255,255,0.25)";
+                  const dotColor = integrationCardDotColor(cardState);
                   return (
                     <Grid2 key={`connected-${integration.id}`} size={{ xs: 12, sm: 6, md: 4, lg: 3 }}>
                       <Box
@@ -3317,7 +3253,7 @@ export function IntegrationsPanel({
                         sx={{
                           height: "100%",
                           p: 1.35,
-                          borderRadius: "12px",
+                          borderRadius: "8px",
                           border: `1px solid ${accent.border}`,
                           background: accent.background,
                           cursor: "pointer",
@@ -3524,15 +3460,7 @@ export function IntegrationsPanel({
               {readyList.map((integration) => {
                 const cardState = integrationCardState(integration);
                 const accent = integrationCardAccent(cardState);
-                const sc = statusColor(integration.status);
-                const dotColor =
-                  sc === "success"
-                    ? "#4ad29d"
-                    : sc === "error"
-                      ? "rgba(255,88,88,0.85)"
-                      : sc === "warning"
-                        ? "rgba(255,180,50,0.85)"
-                        : "rgba(255,255,255,0.25)";
+                const dotColor = integrationCardDotColor(cardState);
                 return (
                   <Grid2 key={`connected-${integration.id}`} size={{ xs: 12, sm: 6, md: 4, lg: 3 }}>
                     <Box
@@ -3552,7 +3480,7 @@ export function IntegrationsPanel({
                       sx={{
                         height: "100%",
                         p: 1.35,
-                        borderRadius: "12px",
+                        borderRadius: "8px",
                         border: `1px solid ${accent.border}`,
                         background: accent.background,
                         cursor: "pointer",
@@ -3763,7 +3691,6 @@ export function IntegrationsPanel({
               </TableHead>
               <TableBody>
                 {[
-                  { name: "Web Search", enabled: true, statusRaw: "connected", detail: `${channelForm.search_primary || "lightpanda"} \u2192 ${channelForm.search_fallback1 || "duckduckgo"} \u2192 ${channelForm.search_fallback2 || "none"}`, onSetup: openSearchSetup, ready: true },
                   { name: "Telegram", enabled: telegramEnabledSaved, statusRaw: telegramConnectionStatusRaw, detail: telegramConnectionDetail || (telegramTokenConfigured ? "Token set" : "Not configured"), onSetup: () => openTelegramSetup(!channelForm.telegram_enabled), ready: telegramDeliveryReady, actionLabel: channelForm.telegram_enabled ? "Setup" : "Enable" },
                   { name: "WhatsApp", enabled: channelForm.whatsapp_enabled, statusRaw: whatsappConnectionStatusRaw, detail: whatsappConnectionDetail || whatsappModeSummary, onSetup: () => openWhatsAppSetup(!channelForm.whatsapp_enabled), ready: messagingDisplayState(whatsappConnectionStatusRaw, channelForm.whatsapp_enabled) === "ready", actionLabel: channelForm.whatsapp_enabled ? "Setup" : "Enable" },
                   { name: "Slack", enabled: toBool(settings.slack_enabled), statusRaw: slackConnectionStatusRaw, detail: slackConnectionDetail || "Not configured", onSetup: () => openSlackSetup(!channelForm.slack_enabled), ready: toBool(settings.slack_delivery_ready), actionLabel: channelForm.slack_enabled ? "Setup" : "Enable" },
@@ -3821,13 +3748,7 @@ export function IntegrationsPanel({
               {messagingSetups.map((setup) => {
                 const displayState = messagingDisplayState(setup.status, setup.enabled);
                 const accent = integrationCardAccent(
-                  displayState === "ready"
-                    ? "enabled"
-                    : displayState === "error"
-                      ? "error"
-                      : displayState === "needs_setup"
-                        ? "needs_auth"
-                        : "not_configured"
+                  displayState === "ready" ? "enabled" : "disabled"
                 );
                 return (
                   <Grid2 key={setup.id} size={{ xs: 12, sm: 6, lg: 3 }} sx={{ display: "flex" }}>
@@ -3900,7 +3821,7 @@ export function IntegrationsPanel({
         </Box>
       ) : null}
 
-      {/* Messaging Channels accordion removed — dedicated "Messaging Channels" tab exists in sidebar */}
+      {/* Messaging Channels accordion removed - dedicated "Messaging Channels" tab exists in sidebar */}
       {false ? (<Box>
         <Box className="list-shell">
           <Typography variant="subtitle2" sx={{ mb: 1 }}>
@@ -3921,23 +3842,6 @@ export function IntegrationsPanel({
                 </TableRow>
               </TableHead>
               <TableBody>
-                <TableRow>
-                  <TableCell>Web Search</TableCell>
-                  <TableCell>
-                    <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.75 }}>
-                      <Box component="span" sx={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, bgcolor: "rgba(74,210,157,0.85)" }} />
-                      <Typography variant="body2" color="text.secondary" noWrap>Active</Typography>
-                    </Box>
-                  </TableCell>
-                  <TableCell>
-                    <Typography variant="body2" color="text.secondary" noWrap>
-                      {channelForm.search_primary || "lightpanda"} → {channelForm.search_fallback1 || "duckduckgo"} → {channelForm.search_fallback2 || "none"}
-                    </Typography>
-                  </TableCell>
-                  <TableCell align="right">
-                    <Button size="small" variant="text" onClick={openSearchSetup} sx={{ minWidth: 0 }}>Setup</Button>
-                  </TableCell>
-                </TableRow>
                 <TableRow>
                   <TableCell>Telegram</TableCell>
                   <TableCell>
@@ -4010,13 +3914,7 @@ export function IntegrationsPanel({
               {messagingSetups.map((setup) => {
                 const displayState = messagingDisplayState(setup.status, setup.enabled);
                 const accent = integrationCardAccent(
-                  displayState === "ready"
-                    ? "enabled"
-                    : displayState === "error"
-                      ? "error"
-                      : displayState === "needs_setup"
-                        ? "needs_auth"
-                        : "not_configured"
+                  displayState === "ready" ? "enabled" : "disabled"
                 );
                 return (
                   <Grid2 key={setup.id} size={{ xs: 12, sm: 6, lg: 3 }} sx={{ display: "flex" }}>
@@ -4183,7 +4081,7 @@ export function IntegrationsPanel({
         </Accordion>
       ) : null}
 
-      {/* Messaging onboarding section removed — duplicates Setup Wizards above */}
+      {/* Messaging onboarding section removed - duplicates Setup Wizards above */}
 
       {false && showCatalog ? (
         <Accordion
@@ -4224,8 +4122,7 @@ export function IntegrationsPanel({
               const cardState = integrationCardState(integration);
               const isEnabled = cardState === "enabled";
               const accent = integrationCardAccent(cardState);
-              const sc = statusColor(integration.status);
-              const dotColor = sc === "success" ? "#4ad29d" : sc === "error" ? "rgba(255,88,88,0.85)" : sc === "warning" ? "rgba(255,180,50,0.85)" : "rgba(255,255,255,0.25)";
+              const dotColor = integrationCardDotColor(cardState);
               return (
                 <Grid2 key={integration.id} size={{ xs: 6, sm: 4, md: 3, lg: 2 }}>
                   <Box
@@ -4263,7 +4160,7 @@ export function IntegrationsPanel({
                     sx={{
                       height: "100%",
                       p: 1.2,
-                      borderRadius: "10px",
+                      borderRadius: "8px",
                       border: `1px solid ${accent.border}`,
                       background: accent.background,
                       cursor: "pointer",
@@ -4525,99 +4422,6 @@ export function IntegrationsPanel({
             </Grid2>
           )}
         </Box>
-      ) : null}
-
-      {showIntegrations ? (
-      <Dialog open={searchSetupOpen} onClose={() => setSearchSetupOpen(false)} maxWidth="sm" fullWidth>
-        <DialogTitle>Web Search Setup</DialogTitle>
-        <DialogContent dividers>
-          <Stack spacing={1.5}>
-            <Typography variant="body2" color="text.secondary">
-              Choose search priority and optional API providers. Playwright works without any API key.
-            </Typography>
-            <TextField
-              fullWidth
-              size="small"
-              select
-              label="Primary"
-              value={channelForm.search_primary}
-              onChange={(e) => setChannelField("search_primary", e.target.value)}
-            >
-              <MenuItem value="lightpanda">lightpanda</MenuItem>
-              <MenuItem value="playwright">playwright</MenuItem>
-              <MenuItem value="serper">serper</MenuItem>
-              <MenuItem value="brave_api">brave_api</MenuItem>
-              <MenuItem value="duckduckgo">duckduckgo</MenuItem>
-            </TextField>
-            <TextField
-              fullWidth
-              size="small"
-              select
-              label="Fallback 1"
-              value={channelForm.search_fallback1}
-              onChange={(e) => setChannelField("search_fallback1", e.target.value)}
-            >
-              <MenuItem value="none">none</MenuItem>
-              <MenuItem value="lightpanda">lightpanda</MenuItem>
-              <MenuItem value="playwright">playwright</MenuItem>
-              <MenuItem value="serper">serper</MenuItem>
-              <MenuItem value="brave_api">brave_api</MenuItem>
-              <MenuItem value="duckduckgo">duckduckgo</MenuItem>
-            </TextField>
-            <TextField
-              fullWidth
-              size="small"
-              select
-              label="Fallback 2"
-              value={channelForm.search_fallback2}
-              onChange={(e) => setChannelField("search_fallback2", e.target.value)}
-            >
-              <MenuItem value="none">none</MenuItem>
-              <MenuItem value="lightpanda">lightpanda</MenuItem>
-              <MenuItem value="playwright">playwright</MenuItem>
-              <MenuItem value="serper">serper</MenuItem>
-              <MenuItem value="brave_api">brave_api</MenuItem>
-              <MenuItem value="duckduckgo">duckduckgo</MenuItem>
-            </TextField>
-            {[channelForm.search_primary, channelForm.search_fallback1, channelForm.search_fallback2].includes("serper") ? (
-              <TextField
-                fullWidth
-                size="small"
-                type="password"
-                label={`Serper API Key (${searchSerperConfigured ? "configured" : "not configured"})`}
-                value={channelForm.search_serper_key}
-                onChange={(e) => setChannelField("search_serper_key", e.target.value)}
-                placeholder={searchSerperConfigured ? "Leave blank to keep current key" : "Enter Serper API key"}
-              />
-            ) : null}
-            {[channelForm.search_primary, channelForm.search_fallback1, channelForm.search_fallback2].includes("brave_api") ? (
-              <TextField
-                fullWidth
-                size="small"
-                type="password"
-                label={`Brave Search API Key (${searchBraveConfigured ? "configured" : "not configured"})`}
-                value={channelForm.search_brave_key}
-                onChange={(e) => setChannelField("search_brave_key", e.target.value)}
-                placeholder={searchBraveConfigured ? "Leave blank to keep current key" : "Enter Brave Search API key"}
-              />
-            ) : null}
-          </Stack>
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setSearchSetupOpen(false)} disabled={saveChannelsMutation.isPending}>
-            Cancel
-          </Button>
-          <Button
-            variant="contained"
-            disabled={saveChannelsMutation.isPending || settingsQ.isLoading}
-            onClick={() => {
-              void saveChannelDialog(() => setSearchSetupOpen(false));
-            }}
-          >
-            {saveChannelsMutation.isPending ? "Saving..." : "Save"}
-          </Button>
-        </DialogActions>
-      </Dialog>
       ) : null}
 
       {showIntegrations ? (
@@ -5593,21 +5397,7 @@ export function IntegrationsPanel({
               {active?.description}
             </Typography>
             <Typography variant="caption" color="text.secondary">
-              {active?.status === "connected"
-                ? active?.enabled
-                  ? "Connected"
-                  : "Connected but disabled"
-                : active?.status === "configured"
-                  ? active?.enabled
-                    ? "Configured and enabled"
-                    : "Configured but disabled"
-                : active?.status === "starting"
-                  ? "Starting"
-                : active?.status === "needs_auth"
-                  ? "Needs sign-in"
-                : active?.status === "error"
-                  ? "Validation failed"
-                  : "Not configured"}
+              {integrationDialogStatusLabel(active)}
             </Typography>
             {activeHasSavedConfig && !editingConnected ? (
               <Stack spacing={1.5}>
@@ -5615,10 +5405,8 @@ export function IntegrationsPanel({
                   {activeIsVerified
                     ? active?.enabled
                       ? "This integration is connected and active."
-                      : "This integration has valid credentials but is currently disabled for agent use."
-                    : active?.enabled
-                      ? "Credentials are saved and agent use is enabled, but live connectivity has not been confirmed yet."
-                      : "Credentials are saved, but this integration is currently disabled and still waiting for a live validation run."}
+                      : "This integration is connected, but currently disabled for agent use."
+                    : "Credentials are saved, but this integration remains disabled until a live connection is confirmed."}
                 </Alert>
                 <Stack direction="row" spacing={1} alignItems="center">
                   <FormControlLabel
@@ -5647,8 +5435,8 @@ export function IntegrationsPanel({
             {activeHasSavedConfig && !active?.enabled && editingConnected ? (
               <Alert severity="info">
                 {activeIsVerified
-                  ? "This integration has valid credentials but is currently disabled for agent use."
-                  : "Credentials are saved, but this integration is currently disabled and has not been live-validated yet."}
+                  ? "This integration is connected, but currently disabled for agent use."
+                  : "Credentials are saved, but this integration remains disabled until a live connection is confirmed."}
               </Alert>
             ) : null}
             {active?.status === "error" && active?.status_detail ? (
@@ -5659,9 +5447,7 @@ export function IntegrationsPanel({
             ) : null}
             {active?.status === "not_configured" ? (
               <Alert severity="info">
-                {active?.id === "google_workspace"
-                  ? "Google Workspace is not connected yet."
-                  : "No saved credentials were found for this integration in the running AgentArk instance."}
+                This integration is disabled until you connect it.
               </Alert>
             ) : null}
             {(!activeHasSavedConfig || editingConnected) && activeNeedsOauth ? (
@@ -5697,7 +5483,7 @@ export function IntegrationsPanel({
                 </Stack>
                 {googleWorkspaceHelpOpen ? (
                   <Alert severity="info" sx={{ mt: 1.25 }}>
-                    Create or open a Google Cloud project, configure the OAuth consent screen, add yourself as a test user if the app is still in testing, then create an OAuth client and copy its client ID and client secret. Add the redirect URI <strong>http://localhost:8990/oauth/callback</strong>, and enable the Google APIs you want AgentArk to use such as Gmail API, Google Calendar API, Drive API, Docs API, Sheets API, Google Chat API, and Admin SDK. Google’s official setup guide is at <strong>developers.google.com/accounts/docs/OAuth2Login</strong>.
+                    Create or open a Google Cloud project, configure the OAuth consent screen, add yourself as a test user if the app is still in testing, then create an OAuth client and copy its client ID and client secret. Add the redirect URI <strong>http://localhost:8990/oauth/callback</strong>, and enable the Google APIs you want AgentArk to use such as Gmail API, Google Calendar API, Drive API, Docs API, Sheets API, Google Chat API, and Admin SDK. Google's official setup guide is at <strong>developers.google.com/accounts/docs/OAuth2Login</strong>.
                   </Alert>
                 ) : null}
               </Box>

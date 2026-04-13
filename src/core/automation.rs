@@ -3,6 +3,8 @@ use chrono::{DateTime, Duration, Utc};
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::actions::{ActionAuthorizationContext, ActionCallerPrincipal, ActionExecutionSurface};
 const AUTOMATION_RUNS_LIMIT: usize = 600;
 const AUTOMATION_MAX_ATTEMPTS_CAP: u32 = 12;
 const AUTOMATION_MAX_STALL_TIMEOUT_SECS: u64 = 365 * 24 * 60 * 60;
@@ -15,6 +17,16 @@ pub struct AutomationOriginContext {
     pub conversation_id: Option<String>,
     pub project_id: Option<String>,
     pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AutomationAuthorizationContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<ActionCallerPrincipal>,
+    #[serde(default)]
+    pub direct_user_intent: bool,
+    #[serde(default)]
+    pub current_turn_is_explicit_approval: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -251,6 +263,50 @@ pub fn inject_context(
     next
 }
 
+fn persistable_authorization_context(
+    authorization: Option<&ActionAuthorizationContext>,
+) -> Option<AutomationAuthorizationContext> {
+    let authorization = authorization?;
+    let principal = authorization.principal.as_ref()?.clone();
+    if !principal.trusted || !authorization.direct_user_intent {
+        return None;
+    }
+    Some(AutomationAuthorizationContext {
+        principal: Some(principal),
+        direct_user_intent: true,
+        current_turn_is_explicit_approval: authorization.current_turn_is_explicit_approval,
+    })
+}
+
+pub fn inject_authorization_context(
+    arguments: &Value,
+    authorization: Option<&ActionAuthorizationContext>,
+) -> Value {
+    let Some(persisted) = persistable_authorization_context(authorization) else {
+        return arguments.clone();
+    };
+
+    let mut next = arguments.clone();
+    if !next.is_object() {
+        next = serde_json::json!({});
+    }
+    let Some(root) = next.as_object_mut() else {
+        return next;
+    };
+
+    let existing_meta = root
+        .remove("_automation")
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    let mut meta = serde_json::Map::from_iter(existing_meta);
+    meta.insert(
+        "authorization".to_string(),
+        serde_json::to_value(persisted).unwrap_or(Value::Null),
+    );
+    root.insert("_automation".to_string(), Value::Object(meta));
+    next
+}
+
 pub fn origin_from_arguments(arguments: &Value) -> AutomationOriginContext {
     arguments
         .get("_automation")
@@ -258,6 +314,29 @@ pub fn origin_from_arguments(arguments: &Value) -> AutomationOriginContext {
         .cloned()
         .and_then(|value| serde_json::from_value::<AutomationOriginContext>(value).ok())
         .unwrap_or_default()
+}
+
+pub fn authorization_from_arguments(arguments: &Value) -> Option<AutomationAuthorizationContext> {
+    arguments
+        .get("_automation")
+        .and_then(|value| value.get("authorization"))
+        .cloned()
+        .and_then(|value| serde_json::from_value::<AutomationAuthorizationContext>(value).ok())
+}
+
+pub fn runtime_authorization_context_from_arguments(
+    arguments: &Value,
+    surface: ActionExecutionSurface,
+) -> ActionAuthorizationContext {
+    let persisted = authorization_from_arguments(arguments).unwrap_or_default();
+    ActionAuthorizationContext {
+        principal: persisted.principal,
+        surface,
+        direct_user_intent: persisted.direct_user_intent,
+        current_turn_is_explicit_approval: persisted.current_turn_is_explicit_approval,
+        agent_name: None,
+        agent_access_scope: None,
+    }
 }
 
 pub fn policy_from_arguments(
@@ -359,52 +438,91 @@ pub fn compute_retry_at(
     now + Duration::seconds(delay_secs as i64)
 }
 
+fn structured_success_state(value: &Value) -> Option<bool> {
+    for path in [
+        "success",
+        "ok",
+        "result.success",
+        "result.ok",
+        "_automation.success",
+    ] {
+        if let Some(flag) = json_value_at_path(value, path).and_then(|item| item.as_bool()) {
+            return Some(flag);
+        }
+    }
+
+    for path in ["status", "state", "result.status", "result.state"] {
+        if let Some(status) = json_value_at_path(value, path).and_then(|item| item.as_str()) {
+            return Some(matches!(
+                status.trim().to_ascii_lowercase().as_str(),
+                "ok" | "success" | "completed"
+            ));
+        }
+    }
+
+    None
+}
+
+fn structured_retryable_state(value: &Value) -> Option<bool> {
+    for path in [
+        "retryable",
+        "should_retry",
+        "transient",
+        "error.retryable",
+        "_automation.retryable",
+    ] {
+        if let Some(flag) = json_value_at_path(value, path).and_then(|item| item.as_bool()) {
+            return Some(flag);
+        }
+    }
+
+    for path in ["retry_after_secs", "retry.after_secs"] {
+        if json_value_at_path(value, path)
+            .and_then(|item| item.as_u64())
+            .filter(|value| *value > 0)
+            .is_some()
+        {
+            return Some(true);
+        }
+    }
+
+    if json_value_at_path(value, "next_retry_at").is_some() {
+        return Some(true);
+    }
+
+    for path in ["status", "state", "error.code"] {
+        if let Some(status) = json_value_at_path(value, path).and_then(|item| item.as_str()) {
+            return Some(matches!(
+                status.trim().to_ascii_lowercase().as_str(),
+                "retrying" | "pending" | "queued" | "throttled" | "transient_error"
+            ));
+        }
+    }
+
+    None
+}
+
 pub fn validate_result(validation: &AutomationValidation, output: &str) -> bool {
     let trimmed = output.trim();
     let normalized = validation.normalized();
     let parsed_json = serde_json::from_str::<Value>(trimmed).ok();
     match validation.mode {
         AutomationValidationMode::None => true,
-        AutomationValidationMode::NonEmptyResult => !trimmed.is_empty(),
+        AutomationValidationMode::NonEmptyResult => {
+            if parsed_json.is_some() {
+                !primary_result_text(trimmed).trim().is_empty()
+            } else {
+                !trimmed.is_empty()
+            }
+        }
         AutomationValidationMode::StructuredSuccess => {
             if trimmed.is_empty() {
                 return false;
             }
             if let Some(value) = parsed_json.as_ref() {
-                if value
-                    .get("success")
-                    .and_then(|item| item.as_bool())
-                    .unwrap_or(false)
-                    || value
-                        .get("ok")
-                        .and_then(|item| item.as_bool())
-                        .unwrap_or(false)
-                {
-                    return true;
-                }
-                let status = value
-                    .get("status")
-                    .or_else(|| value.get("state"))
-                    .and_then(|item| item.as_str())
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
-                return matches!(
-                    status.as_str(),
-                    "ok" | "success"
-                        | "connected"
-                        | "completed"
-                        | "running"
-                        | "triggered"
-                        | "posted"
-                        | "claimed"
-                        | "published"
-                );
+                return structured_success_state(value).unwrap_or(false);
             }
-            let lower = trimmed.to_ascii_lowercase();
-            lower.contains("success")
-                || lower.contains("connected")
-                || lower.contains("completed")
-                || lower.contains("running")
+            false
         }
         AutomationValidationMode::ContainsText => normalized
             .text
@@ -486,27 +604,13 @@ pub fn critique_result(
     let normalized = validation.normalized();
     let error_text = error.unwrap_or_default().trim();
     let output_text = output.unwrap_or_default().trim();
-    let haystack = if !error_text.is_empty() {
-        error_text
-    } else {
-        output_text
-    }
-    .to_ascii_lowercase();
-    let retryable = !haystack.is_empty()
-        && [
-            "timeout",
-            "temporar",
-            "rate limit",
-            "429",
-            "unavailable",
-            "busy",
-            "pending",
-            "connection reset",
-            "network",
-            "retry later",
-        ]
-        .iter()
-        .any(|token| haystack.contains(token));
+    let error_json = serde_json::from_str::<Value>(error_text).ok();
+    let output_json = serde_json::from_str::<Value>(output_text).ok();
+    let retryable = error_json
+        .as_ref()
+        .and_then(structured_retryable_state)
+        .or_else(|| output_json.as_ref().and_then(structured_retryable_state))
+        .unwrap_or(false);
     let summary = if !error_text.is_empty() {
         format!("Execution failed: {}", truncate_text(error_text, 180))
     } else if !validation_passed {
@@ -603,6 +707,17 @@ fn json_value_to_text(value: &Value) -> String {
     }
 }
 
+pub fn primary_result_text(raw_output: &str) -> String {
+    let trimmed = raw_output.trim();
+    let Some(value) = serde_json::from_str::<Value>(trimmed).ok() else {
+        return raw_output.to_string();
+    };
+    let Some(output) = json_value_at_path(&value, "output") else {
+        return raw_output.to_string();
+    };
+    json_value_to_text(output)
+}
+
 fn validation_target_text(
     validation: &AutomationValidation,
     raw_output: &str,
@@ -613,6 +728,9 @@ fn validation_target_text(
             return json_value_to_text(target);
         }
     }
+    if parsed_json.is_some() {
+        return primary_result_text(raw_output);
+    }
     raw_output.to_string()
 }
 
@@ -621,5 +739,56 @@ pub fn truncate_text(value: &str, max_chars: usize) -> String {
         value.to_string()
     } else {
         format!("{}...", value.chars().take(max_chars).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structured_success_requires_structured_signal() {
+        let validation = AutomationValidation {
+            mode: AutomationValidationMode::StructuredSuccess,
+            ..AutomationValidation::default()
+        };
+
+        assert!(validate_result(&validation, r#"{"success":true}"#));
+        assert!(!validate_result(&validation, "completed successfully"));
+    }
+
+    #[test]
+    fn critique_result_prefers_structured_retryability() {
+        let validation = AutomationValidation {
+            mode: AutomationValidationMode::StructuredSuccess,
+            ..AutomationValidation::default()
+        };
+
+        let critique = critique_result(
+            &validation,
+            Some(r#"{"success":false,"retryable":true}"#),
+            None,
+        );
+        assert!(critique.retryable);
+
+        let critique = critique_result(&validation, None, Some("temporary network issue"));
+        assert!(!critique.retryable);
+    }
+
+    #[test]
+    fn non_empty_validation_uses_wrapped_output_field() {
+        let validation = AutomationValidation {
+            mode: AutomationValidationMode::NonEmptyResult,
+            ..AutomationValidation::default()
+        };
+
+        assert!(!validate_result(
+            &validation,
+            r#"{"output":"","error":null,"exit_code":0}"#
+        ));
+        assert!(validate_result(
+            &validation,
+            r#"{"output":"{\"new_person\": false}","error":null,"exit_code":0}"#
+        ));
     }
 }

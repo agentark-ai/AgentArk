@@ -325,6 +325,24 @@ fn stream_event_payload(event: &StreamEvent) -> (String, RunEventPriority, serde
                 "resumed": resumed,
             }),
         ),
+        StreamEvent::ChatTaskStarted {
+            task_id,
+            description,
+            work_type,
+            conversation_id,
+            project_id,
+        } => (
+            "task_started".to_string(),
+            RunEventPriority::Critical,
+            serde_json::json!({
+                "task_id": task_id,
+                "description": description,
+                "status": "in_progress",
+                "work_type": work_type,
+                "conversation_id": conversation_id,
+                "project_id": project_id,
+            }),
+        ),
         StreamEvent::Token(content) => (
             "token".to_string(),
             RunEventPriority::Low,
@@ -419,6 +437,7 @@ fn stream_event_payload(event: &StreamEvent) -> (String, RunEventPriority, serde
             step_title,
             status,
             detail,
+            substeps,
         } => (
             "plan_step_update".to_string(),
             match status {
@@ -433,6 +452,7 @@ fn stream_event_payload(event: &StreamEvent) -> (String, RunEventPriority, serde
                 "step_title": step_title,
                 "status": status,
                 "detail": detail,
+                "substeps": substeps,
             }),
         ),
     }

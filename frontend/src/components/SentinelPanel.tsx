@@ -13,6 +13,7 @@ import {
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
+import { formatUiRelativeDateTimeMeta } from "../lib/dateFormat";
 import { SuggestionRunDialog, type SuggestionRunState } from "./SuggestionRunDialog";
 import { WorkspacePageHeader, WorkspacePageShell } from "./WorkspacePage";
 import type {
@@ -64,14 +65,7 @@ function errMessage(error: unknown): string {
 }
 
 function humanTs(value: string): { label: string; tip: string } {
-  const raw = (value || "").trim();
-  if (!raw) return { label: "-", tip: "" };
-  const date = new Date(raw);
-  if (Number.isNaN(date.getTime())) return { label: raw, tip: raw };
-  return {
-    label: date.toLocaleString(),
-    tip: date.toISOString(),
-  };
+  return formatUiRelativeDateTimeMeta(value, { fallback: "-" });
 }
 
 function traceStepColor(stepType: string): "default" | "success" | "warning" | "error" | "info" {

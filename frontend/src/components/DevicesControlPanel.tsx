@@ -19,6 +19,7 @@ import {
   Typography
 } from "@mui/material";
 import { useMemo, useState } from "react";
+import { formatUiDateTime } from "../lib/dateFormat";
 
 export type DeviceCapability =
   | "camera"
@@ -107,10 +108,7 @@ function capabilityLabel(kind: DeviceCapability): string {
 }
 
 function formatDate(raw?: string): string {
-  if (!raw) return "Never";
-  const dt = new Date(raw);
-  if (Number.isNaN(dt.getTime())) return raw;
-  return dt.toLocaleString();
+  return formatUiDateTime(raw, { fallback: "Never" });
 }
 
 export function DevicesControlPanel({
@@ -143,7 +141,7 @@ export function DevicesControlPanel({
           <Typography variant="overline" className="workspace-shell-kicker">
             Devices
           </Typography>
-          <Typography variant="h5" sx={{ fontWeight: 700, letterSpacing: "-0.03em" }}>
+          <Typography variant="h5" sx={{ fontWeight: 700, letterSpacing: 0 }}>
             Companion nodes and capability grants
           </Typography>
           <Typography variant="body2" color="text.secondary" sx={{ maxWidth: 840 }}>

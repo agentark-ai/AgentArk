@@ -1,0 +1,87 @@
+name: Security
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  AGENTARK_RELEASE_FEATURES: telegram,docker,ssh
+
+jobs:
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Dependency review
+        uses: actions/dependency-review-action@v4
+
+  cargo-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-audit-
+            ${{ runner.os }}-cargo-
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --force
+
+      - name: Audit Rust dependencies
+        run: cargo audit --deny warnings
+
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-deny-${{ hashFiles('**/Cargo.lock', 'deny.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-deny-
+            ${{ runner.os }}-cargo-
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked --force
+
+      - name: Run cargo-deny
+        run: cargo deny --all-features check advisories bans licenses sources

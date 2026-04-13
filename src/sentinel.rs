@@ -388,10 +388,7 @@ async fn should_emit_arkpulse_growth_notification(
             .await;
     }
     let _ = storage
-        .set(
-            ARKPULSE_GROWTH_LAST_SENT_KEY,
-            now_ts.to_string().as_bytes(),
-        )
+        .set(ARKPULSE_GROWTH_LAST_SENT_KEY, now_ts.to_string().as_bytes())
         .await;
     true
 }
@@ -1755,12 +1752,14 @@ async fn run_resource_checks(
         ctx.storage.count_documents(None).await,
         ctx.storage.count_document_chunks().await,
     ) {
-        (Ok(episodes), Ok(facts), Ok(documents), Ok(document_chunks)) => Some(KnowledgeStoreCounts {
-            episodes,
-            facts,
-            documents,
-            document_chunks,
-        }),
+        (Ok(episodes), Ok(facts), Ok(documents), Ok(document_chunks)) => {
+            Some(KnowledgeStoreCounts {
+                episodes,
+                facts,
+                documents,
+                document_chunks,
+            })
+        }
         (episode_res, fact_res, document_res, chunk_res) => {
             let mut errors = Vec::new();
             if let Err(error) = episode_res {
@@ -1787,7 +1786,8 @@ async fn run_resource_checks(
                 "Could not inspect durable knowledge growth",
                 errors.join(" | "),
                 "Storage growth could not be evaluated for durable documents and memories.",
-                "Open ArkPulse again after verifying Postgres connectivity and count queries".to_string(),
+                "Open ArkPulse again after verifying Postgres connectivity and count queries"
+                    .to_string(),
             );
             None
         }
@@ -2515,7 +2515,7 @@ impl Default for SentinelConfig {
         Self {
             _process_check_interval: 30,
             scheduler_interval: 30,
-            watcher_interval: 15,
+            watcher_interval: 1,
             integration_sync_interval: 120,
             consolidation_interval: 600,
             experience_consolidation_interval: 600,
@@ -3158,16 +3158,17 @@ async fn run_watchers(agent: &SharedAgent) {
     for watcher in due_watchers {
         let poll_result = {
             let agent = agent.read().await;
+            let authorization =
+                crate::core::automation::runtime_authorization_context_from_arguments(
+                    &watcher.poll_arguments,
+                    crate::actions::ActionExecutionSurface::Background,
+                );
             match tokio::time::timeout(
                 Duration::from_secs(*WATCHER_POLL_TIMEOUT_SECS),
                 agent.runtime.execute_action_with_context(
                     &watcher.poll_action,
                     &watcher.poll_arguments,
-                    &crate::actions::ActionAuthorizationContext {
-                        principal: None,
-                        surface: crate::actions::ActionExecutionSurface::Background,
-                        direct_user_intent: false,
-                    },
+                    &authorization,
                 ),
             )
             .await
@@ -3184,18 +3185,57 @@ async fn run_watchers(agent: &SharedAgent) {
 
         match poll_result {
             Ok(result) => {
-                let matched = match &watcher.condition {
-                    crate::core::watcher::WatchCondition::Custom { description } => {
+                let policy = crate::core::automation::policy_from_arguments(
+                    &watcher.poll_arguments,
+                    crate::core::automation::AutomationValidation::default(),
+                );
+                let critique = crate::core::automation::critique_result(
+                    &policy.validation,
+                    Some(&result),
+                    None,
+                );
+                if !critique.validation_passed {
+                    let error_text = critique.summary.clone();
+                    {
                         let agent = agent.read().await;
                         agent
-                            .evaluate_custom_watcher_condition(
-                                &watcher.description,
-                                description,
-                                &result,
-                            )
-                            .await
+                            .watcher_manager
+                            .record_poll_error(watcher.id, new_count, error_text.clone())
+                            .await;
                     }
-                    _ => watcher.condition.evaluate(&result),
+                    tracing::warn!(
+                        "Watcher '{}' poll #{} failed validation: {}",
+                        watcher.description,
+                        new_count,
+                        error_text
+                    );
+                    continue;
+                }
+                let matched = {
+                    let agent = agent.read().await;
+                    match agent
+                        .evaluate_watcher_condition(
+                            &watcher.description,
+                            &watcher.condition,
+                            &result,
+                        )
+                        .await
+                    {
+                        Ok(matched) => matched,
+                        Err(error_text) => {
+                            agent
+                                .watcher_manager
+                                .record_poll_error(watcher.id, new_count, error_text.clone())
+                                .await;
+                            tracing::warn!(
+                                "Watcher '{}' poll #{} failed condition evaluation: {}",
+                                watcher.description,
+                                new_count,
+                                error_text
+                            );
+                            continue;
+                        }
+                    }
                 };
                 {
                     let agent = agent.read().await;
@@ -3213,11 +3253,12 @@ async fn run_watchers(agent: &SharedAgent) {
                     matched
                 );
                 if matched {
+                    let trigger_result = result.clone();
                     {
                         let agent = agent.read().await;
                         agent
                             .watcher_manager
-                            .mark_triggered(watcher.id, result.clone())
+                            .mark_triggered(watcher.id, trigger_result.clone())
                             .await;
                     }
 
@@ -3229,7 +3270,7 @@ async fn run_watchers(agent: &SharedAgent) {
                         };
                         let agent_guard = agent.read().await;
                         agent_guard
-                            .handle_watcher_trigger_supervised(watcher, result)
+                            .handle_watcher_trigger_supervised(watcher, trigger_result)
                             .await;
                     });
                 }
@@ -4515,7 +4556,12 @@ pub async fn run_pulse(agent: &SharedAgent) {
     if let Some((signature, body)) = growth_notification {
         if should_emit_arkpulse_growth_notification(&storage, &signature).await {
             agent_guard
-                .emit_notification("Knowledge growth warning", &body, "warning", "arkpulse_growth")
+                .emit_notification(
+                    "Knowledge growth warning",
+                    &body,
+                    "warning",
+                    "arkpulse_growth",
+                )
                 .await;
             tracing::warn!(
                 "ArkPulse: emitted throttled knowledge growth notification (cooldown={}s)",

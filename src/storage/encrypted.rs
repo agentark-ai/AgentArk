@@ -49,10 +49,31 @@ impl EncryptedStorage {
             "user_profile",
             crate::core::observability::OBSERVABILITY_LOG_KEY,
             crate::sentinel::PULSE_LOG_KEY,
+            crate::core::config::SETTINGS_CONFIG_KEY,
+            crate::core::config::SETTINGS_SECRETS_KEY,
+            crate::core::config::SETTINGS_SEARCH_KEY,
+            crate::core::config::SETTINGS_RUNTIME_KEY,
+            crate::core::config::SETTINGS_DISABLED_ACTIONS_KEY,
+            crate::core::config::SETTINGS_ACTION_REVIEWS_KEY,
+            crate::core::config::SETTINGS_REMOVED_BUNDLED_ACTIONS_KEY,
+            crate::core::config::SETTINGS_APPROVED_PERMISSIONS_KEY,
         ];
 
+        let lineage_record = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "fingerprint": new_key.fingerprint(),
+            "recorded_at": chrono::Utc::now().to_rfc3339(),
+        }))?;
         self.storage
-            .reencrypt_sensitive_payloads(old_key.as_ref(), new_key.as_ref(), ROTATED_KV_KEYS)
+            .reencrypt_sensitive_payloads(
+                old_key.as_ref(),
+                new_key.as_ref(),
+                ROTATED_KV_KEYS,
+                Some((
+                    crate::core::config::SETTINGS_KEY_LINEAGE_KEY.to_string(),
+                    lineage_record,
+                )),
+            )
             .await?;
         self.replace_key_manager(new_key);
         Ok(())
@@ -129,7 +150,10 @@ impl EncryptedStorage {
         Ok(self.decrypt_episode_content(episodes))
     }
 
-    pub async fn get_episodes_by_ids_decrypted(&self, ids: &[String]) -> Result<Vec<episode::Model>> {
+    pub async fn get_episodes_by_ids_decrypted(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<episode::Model>> {
         let episodes = self.storage.get_episodes_by_ids(ids).await?;
         Ok(self.decrypt_episode_content(episodes))
     }
@@ -160,6 +184,7 @@ impl EncryptedStorage {
     // ==================== Encrypted Semantic Facts ====================
 
     /// Insert a semantic fact with encrypted content
+    #[cfg(test)]
     pub async fn insert_fact_encrypted(
         &self,
         id: &str,
@@ -212,7 +237,10 @@ impl EncryptedStorage {
         Ok(self.decrypt_fact_content(facts))
     }
 
-    pub async fn get_facts_by_ids_decrypted(&self, ids: &[String]) -> Result<Vec<semantic_fact::Model>> {
+    pub async fn get_facts_by_ids_decrypted(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<semantic_fact::Model>> {
         let facts = self.storage.get_facts_by_ids(ids).await?;
         Ok(self.decrypt_fact_content(facts))
     }
@@ -404,6 +432,19 @@ mod tests {
         assert_eq!(
             new_key.decrypt(&raw_profile).unwrap(),
             br#"{"name":"Ada"}"#.to_vec()
+        );
+        let lineage_raw = storage
+            .get(crate::core::config::SETTINGS_KEY_LINEAGE_KEY)
+            .await
+            .unwrap()
+            .expect("lineage metadata should be written during re-encryption");
+        let lineage: serde_json::Value = serde_json::from_slice(&lineage_raw).unwrap();
+        assert_eq!(
+            lineage
+                .get("fingerprint")
+                .and_then(|value| value.as_str())
+                .unwrap(),
+            new_key.fingerprint()
         );
         let raw_observability = storage
             .get(crate::core::observability::OBSERVABILITY_LOG_KEY)

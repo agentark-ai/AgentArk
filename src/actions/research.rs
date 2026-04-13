@@ -8,8 +8,10 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
+use tokio::sync::mpsc::UnboundedSender;
 
-use super::search::{SearchBackend, SearchClient, SearchConfig, SearchResult};
+use super::search::{SearchConfig, SearchResult};
 
 /// Research request parameters
 #[derive(Debug, Clone, Deserialize)]
@@ -124,6 +126,164 @@ struct RankedResearchResult {
     score: f32,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ResearchProgressUpdate {
+    pub phase: String,
+    pub label: String,
+    pub detail: String,
+    pub status: String,
+    pub elapsed_secs: u64,
+    pub stream_key: String,
+}
+
+#[derive(Clone)]
+pub struct ResearchProgressReporter {
+    tx: UnboundedSender<ResearchProgressUpdate>,
+    started_at: Instant,
+}
+
+impl ResearchProgressReporter {
+    pub fn new(tx: UnboundedSender<ResearchProgressUpdate>) -> Self {
+        Self {
+            tx,
+            started_at: Instant::now(),
+        }
+    }
+
+    pub fn emit(
+        &self,
+        phase: &str,
+        label: &str,
+        detail: impl Into<String>,
+        status: &str,
+        stream_key: &str,
+    ) {
+        let detail = detail.into().trim().to_string();
+        if detail.is_empty() {
+            return;
+        }
+        let _ = self.tx.send(ResearchProgressUpdate {
+            phase: phase.trim().to_string(),
+            label: label.trim().to_string(),
+            detail,
+            status: status.trim().to_string(),
+            elapsed_secs: self.started_at.elapsed().as_secs(),
+            stream_key: stream_key.trim().to_string(),
+        });
+    }
+}
+
+fn summarize_progress_text(value: &str, max_chars: usize) -> String {
+    let normalized = value
+        .trim()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    let mut shortened = normalized
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    shortened.push_str("...");
+    shortened
+}
+
+fn backend_display_name(name: &str) -> &'static str {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "serper" => "Serper",
+        "brave" | "brave_api" => "Brave API",
+        "exa" => "Exa",
+        "tavily" => "Tavily",
+        "perplexity" => "Perplexity",
+        "firecrawl" => "Firecrawl",
+        "searxng" => "SearXNG",
+        "duckduckgo" => "DuckDuckGo",
+        "bing_rss" => "Bing RSS",
+        "playwright" => "Playwright",
+        "lightpanda" => "Lightpanda",
+        _ => "search backend",
+    }
+}
+
+fn source_label(result: &SearchResult) -> String {
+    let title = summarize_progress_text(&result.title, 72);
+    if !title.is_empty() {
+        return title;
+    }
+    summarize_progress_text(&result.url, 72)
+}
+
+fn source_host_label(url: &str) -> String {
+    let trimmed = url.trim();
+    let without_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    let host = without_scheme
+        .split('/')
+        .next()
+        .unwrap_or(without_scheme)
+        .trim();
+    summarize_progress_text(host, 48)
+}
+
+fn summarize_error(err: &anyhow::Error) -> String {
+    summarize_progress_text(&err.to_string(), 120)
+}
+
+fn research_result_failure_reason(result: &ResearchResult) -> Option<String> {
+    let has_sources = result.sources.iter().any(|source| {
+        !source.url.trim().is_empty()
+            || !source.title.trim().is_empty()
+            || !source.description.trim().is_empty()
+    });
+    let primary_findings = if result.key_findings.is_empty() {
+        &result.findings
+    } else {
+        &result.key_findings
+    };
+    let has_findings = primary_findings
+        .iter()
+        .any(|finding| !finding.content.trim().is_empty());
+    let summary_lower = result.summary.trim().to_ascii_lowercase();
+    let placeholder_summary = summary_lower.starts_with("no relevant information found for:");
+
+    if !has_sources {
+        Some("No usable sources were found across the available search backends.".to_string())
+    } else if !has_findings || placeholder_summary {
+        Some(
+            "The search returned pages, but none produced enough usable evidence to draft a research report."
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+fn ensure_research_result_has_evidence(
+    result: &ResearchResult,
+    progress: Option<&ResearchProgressReporter>,
+) -> Result<()> {
+    let Some(reason) = research_result_failure_reason(result) else {
+        return Ok(());
+    };
+    if let Some(progress) = progress {
+        progress.emit(
+            "synthesis",
+            "Research failed",
+            reason.clone(),
+            "failed",
+            "phase-status:research:synthesis",
+        );
+    }
+    Err(anyhow!(
+        "Unable to complete research because {}",
+        reason.trim_end_matches('.').to_ascii_lowercase()
+    ))
+}
+
 /// Research client
 pub struct ResearchClient {
     search_config: SearchConfig,
@@ -144,12 +304,15 @@ impl ResearchClient {
         }
     }
 
-    /// Perform research on a topic
-    pub async fn research(&self, args: &ResearchArgs) -> Result<ResearchResult> {
+    pub async fn research_with_progress(
+        &self,
+        args: &ResearchArgs,
+        progress: Option<&ResearchProgressReporter>,
+    ) -> Result<ResearchResult> {
         match args.depth {
-            ResearchDepth::Quick => self.quick_research(args).await,
-            ResearchDepth::Standard => self.standard_research(args).await,
-            ResearchDepth::Deep => self.deep_research(args).await,
+            ResearchDepth::Quick => self.quick_research(args, progress).await,
+            ResearchDepth::Standard => self.standard_research(args, progress).await,
+            ResearchDepth::Deep => self.deep_research(args, progress).await,
         }
     }
 
@@ -163,11 +326,65 @@ impl ResearchClient {
     }
 
     /// Quick research - just search results
-    async fn quick_research(&self, args: &ResearchArgs) -> Result<ResearchResult> {
+    async fn quick_research(
+        &self,
+        args: &ResearchArgs,
+        progress: Option<&ResearchProgressReporter>,
+    ) -> Result<ResearchResult> {
         let max_sources = self.effective_max_sources(args);
+        if let Some(progress) = progress {
+            progress.emit(
+                "planning",
+                "Preparing research",
+                format!(
+                    "Running a quick source scan for {}.",
+                    summarize_progress_text(&args.query, 96)
+                ),
+                "running",
+                "phase-status:research:planning",
+            );
+            progress.emit(
+                "planning",
+                "Preparing research",
+                "Quick research scope confirmed.",
+                "completed",
+                "phase-status:research:planning",
+            );
+            progress.emit(
+                "searching",
+                "Searching sources",
+                format!(
+                    "Looking for up to {} source{} on {}.",
+                    max_sources,
+                    if max_sources == 1 { "" } else { "s" },
+                    summarize_progress_text(&args.query, 96)
+                ),
+                "running",
+                "phase-status:research:searching",
+            );
+        }
         let search_results = self
-            .search(&args.query, max_sources, &args.backend)
+            .search(
+                &args.query,
+                max_sources,
+                &args.backend,
+                progress,
+                "phase-status:research:searching",
+            )
             .await?;
+        if let Some(progress) = progress {
+            progress.emit(
+                "searching",
+                "Searching sources",
+                format!(
+                    "Found {} candidate source{}.",
+                    search_results.len(),
+                    if search_results.len() == 1 { "" } else { "s" }
+                ),
+                "completed",
+                "phase-status:research:searching",
+            );
+        }
 
         let findings: Vec<Finding> = search_results
             .iter()
@@ -191,8 +408,7 @@ impl ResearchClient {
             .collect();
 
         let summary = self.generate_summary(&args.query, &findings);
-
-        Ok(ResearchResult {
+        let result = ResearchResult {
             query: args.query.clone(),
             summary,
             key_findings: findings.clone(),
@@ -201,15 +417,94 @@ impl ResearchClient {
             contradictions: Vec::new(),
             sources,
             related_topics: self.extract_related_topics(&search_results),
-        })
+        };
+        ensure_research_result_has_evidence(&result, progress)?;
+        if let Some(progress) = progress {
+            progress.emit(
+                "synthesis",
+                "Research complete",
+                format!(
+                    "Quick research finished with {} source{} and {} finding{}.",
+                    result.sources.len(),
+                    if result.sources.len() == 1 { "" } else { "s" },
+                    result.findings.len(),
+                    if result.findings.len() == 1 { "" } else { "s" }
+                ),
+                "completed",
+                "phase-status:research:synthesis",
+            );
+        }
+
+        Ok(result)
     }
 
     /// Standard research - search + fetch content
-    async fn standard_research(&self, args: &ResearchArgs) -> Result<ResearchResult> {
+    async fn standard_research(
+        &self,
+        args: &ResearchArgs,
+        progress: Option<&ResearchProgressReporter>,
+    ) -> Result<ResearchResult> {
+        let query_terms = self.normalized_query_terms(&args.query);
         let max_sources = self.effective_max_sources(args);
+        if let Some(progress) = progress {
+            progress.emit(
+                "planning",
+                "Preparing research",
+                format!(
+                    "Setting up a standard research pass for {}.",
+                    summarize_progress_text(&args.query, 96)
+                ),
+                "running",
+                "phase-status:research:planning",
+            );
+            progress.emit(
+                "planning",
+                "Preparing research",
+                "Research scope is ready.",
+                "completed",
+                "phase-status:research:planning",
+            );
+            progress.emit(
+                "searching",
+                "Searching sources",
+                format!(
+                    "Looking for up to {} source{}.",
+                    max_sources,
+                    if max_sources == 1 { "" } else { "s" }
+                ),
+                "running",
+                "phase-status:research:searching",
+            );
+        }
         let search_results = self
-            .search(&args.query, max_sources, &args.backend)
+            .search(
+                &args.query,
+                max_sources,
+                &args.backend,
+                progress,
+                "phase-status:research:searching",
+            )
             .await?;
+        if let Some(progress) = progress {
+            progress.emit(
+                "searching",
+                "Searching sources",
+                format!(
+                    "Selected {} candidate source{} for reading.",
+                    search_results.len(),
+                    if search_results.len() == 1 { "" } else { "s" }
+                ),
+                "completed",
+                "phase-status:research:searching",
+            );
+            progress.emit(
+                "reading",
+                "Reading sources",
+                "Opening the strongest sources and extracting evidence.",
+                "running",
+                "phase-status:research:reading",
+            );
+        }
 
         let mut sources: Vec<Source> = Vec::new();
         let mut findings: Vec<Finding> = Vec::new();
@@ -224,7 +519,24 @@ impl ResearchClient {
             });
 
             // Try to fetch and extract content
-            match self.fetch_content(&result.url).await {
+            if let Some(progress) = progress {
+                progress.emit(
+                    "reading",
+                    "Reading sources",
+                    format!(
+                        "Source {}/{}: reading {}.",
+                        i + 1,
+                        max_sources.min(search_results.len()),
+                        source_label(result)
+                    ),
+                    "running",
+                    "phase-status:research:reading",
+                );
+            }
+            match self
+                .fetch_content(&result.url, progress, "phase-status:research:reading")
+                .await
+            {
                 Ok(content) => {
                     // Extract key points from the content
                     let key_points = self.extract_key_points(&content, &args.query);
@@ -239,19 +551,17 @@ impl ResearchClient {
                 }
                 Err(_) => {
                     // Fall back to snippet
-                    findings.push(Finding {
-                        content: result.snippet.clone(),
-                        confidence: 0.6,
-                        source_index: i,
-                        supporting_source_indices: vec![i],
-                    });
+                    if let Some(finding) =
+                        self.build_snippet_finding(&result.snippet, &query_terms, i, 0.6)
+                    {
+                        findings.push(finding);
+                    }
                 }
             }
         }
 
         let summary = self.generate_summary(&args.query, &findings);
-
-        Ok(ResearchResult {
+        let result = ResearchResult {
             query: args.query.clone(),
             summary,
             key_findings: findings.clone(),
@@ -260,45 +570,186 @@ impl ResearchClient {
             contradictions: Vec::new(),
             sources,
             related_topics: self.extract_related_topics(&search_results),
-        })
+        };
+        ensure_research_result_has_evidence(&result, progress)?;
+        if let Some(progress) = progress {
+            progress.emit(
+                "reading",
+                "Reading sources",
+                format!(
+                    "Read {} source{} and captured {} finding{}.",
+                    result.sources.len(),
+                    if result.sources.len() == 1 { "" } else { "s" },
+                    result.findings.len(),
+                    if result.findings.len() == 1 { "" } else { "s" }
+                ),
+                "completed",
+                "phase-status:research:reading",
+            );
+            progress.emit(
+                "synthesis",
+                "Synthesizing report",
+                format!(
+                    "Writing the standard research summary from {} finding{}.",
+                    result.findings.len(),
+                    if result.findings.len() == 1 { "" } else { "s" }
+                ),
+                "running",
+                "phase-status:research:synthesis",
+            );
+            progress.emit(
+                "synthesis",
+                "Research complete",
+                format!(
+                    "Standard research finished with {} source{}.",
+                    result.sources.len(),
+                    if result.sources.len() == 1 { "" } else { "s" }
+                ),
+                "completed",
+                "phase-status:research:synthesis",
+            );
+        }
+
+        Ok(result)
     }
 
     /// Deep research - multiple searches + comprehensive analysis
-    async fn deep_research(&self, args: &ResearchArgs) -> Result<ResearchResult> {
+    async fn deep_research(
+        &self,
+        args: &ResearchArgs,
+        progress: Option<&ResearchProgressReporter>,
+    ) -> Result<ResearchResult> {
+        let query_terms = self.normalized_query_terms(&args.query);
         let max_sources = self.effective_max_sources(args);
+        if let Some(progress) = progress {
+            progress.emit(
+                "planning",
+                "Preparing research",
+                format!(
+                    "Breaking {} into a deeper evidence-gathering plan.",
+                    summarize_progress_text(&args.query, 96)
+                ),
+                "running",
+                "phase-status:research:planning",
+            );
+        }
         let queries = self.generate_research_queries(&args.query);
+        if let Some(progress) = progress {
+            progress.emit(
+                "planning",
+                "Preparing research",
+                format!(
+                    "Prepared {} search angle{} for this run.",
+                    queries.len(),
+                    if queries.len() == 1 { "" } else { "s" }
+                ),
+                "completed",
+                "phase-status:research:planning",
+            );
+            progress.emit(
+                "searching",
+                "Searching sources",
+                "Scanning primary, recent, comparison, and risk angles.",
+                "running",
+                "phase-status:research:searching",
+            );
+        }
         let prefers_official_sources = self.prefers_official_sources(&args.query);
         let mut results_by_url: HashMap<String, RankedResearchResult> = HashMap::new();
+        let mut search_errors = Vec::new();
 
-        for query in &queries {
-            if let Ok(results) = self.search(&query.text, 4, &args.backend).await {
-                for result in results {
-                    let normalized_url = result.url.trim().to_lowercase();
-                    if normalized_url.is_empty() {
-                        continue;
-                    }
-                    let score = self.research_rank_score(
-                        &result,
-                        &args.query,
-                        prefers_official_sources,
-                        query.category,
-                    );
-                    results_by_url
-                        .entry(normalized_url)
-                        .and_modify(|existing| {
-                            existing.categories.insert(query.category);
-                            if score > existing.score {
-                                existing.result = result.clone();
-                                existing.score = score;
-                            }
-                        })
-                        .or_insert_with(|| RankedResearchResult {
-                            result,
-                            categories: HashSet::from([query.category]),
-                            score,
-                        });
-                }
+        for (query_index, query) in queries.iter().enumerate() {
+            if let Some(progress) = progress {
+                progress.emit(
+                    "searching",
+                    "Searching sources",
+                    format!(
+                        "Angle {}/{}: {}.",
+                        query_index + 1,
+                        queries.len(),
+                        summarize_progress_text(&query.text, 104)
+                    ),
+                    "running",
+                    "phase-status:research:searching",
+                );
             }
+            match self
+                .search(
+                    &query.text,
+                    4,
+                    &args.backend,
+                    progress,
+                    "phase-status:research:searching",
+                )
+                .await
+            {
+                Ok(results) => {
+                    for result in results {
+                        let normalized_url = result.url.trim().to_lowercase();
+                        if normalized_url.is_empty() {
+                            continue;
+                        }
+                        let score = self.research_rank_score(
+                            &result,
+                            &args.query,
+                            prefers_official_sources,
+                            query.category,
+                        );
+                        if score <= 0.0 {
+                            continue;
+                        }
+                        results_by_url
+                            .entry(normalized_url)
+                            .and_modify(|existing| {
+                                existing.categories.insert(query.category);
+                                if score > existing.score {
+                                    existing.result = result.clone();
+                                    existing.score = score;
+                                }
+                            })
+                            .or_insert_with(|| RankedResearchResult {
+                                result,
+                                categories: HashSet::from([query.category]),
+                                score,
+                            });
+                    }
+                }
+                Err(error) => search_errors.push(error.to_string()),
+            }
+        }
+        if results_by_url.is_empty() && !search_errors.is_empty() {
+            if let Some(provider_setup_error) = search_errors
+                .iter()
+                .find(|error| error.contains(super::search::SEARCH_PROVIDER_SETUP_REQUIRED_MESSAGE))
+            {
+                return Err(anyhow!(provider_setup_error.clone()));
+            }
+            return Err(anyhow!(
+                "Unable to complete research because all search angles failed: {}",
+                search_errors.join(" | ")
+            ));
+        }
+        if let Some(progress) = progress {
+            progress.emit(
+                "searching",
+                "Searching sources",
+                format!(
+                    "Collected {} unique candidate source{} across {} angle{}.",
+                    results_by_url.len(),
+                    if results_by_url.len() == 1 { "" } else { "s" },
+                    queries.len(),
+                    if queries.len() == 1 { "" } else { "s" }
+                ),
+                "completed",
+                "phase-status:research:searching",
+            );
+            progress.emit(
+                "ranking",
+                "Selecting sources",
+                "Scoring diverse sources and keeping the strongest set.",
+                "running",
+                "phase-status:research:ranking",
+            );
         }
 
         let ranked_results = self.select_diverse_results(
@@ -306,6 +757,26 @@ impl ResearchClient {
             max_sources,
             prefers_official_sources,
         );
+        if let Some(progress) = progress {
+            progress.emit(
+                "ranking",
+                "Selecting sources",
+                format!(
+                    "Selected {} source{} for closer reading.",
+                    ranked_results.len(),
+                    if ranked_results.len() == 1 { "" } else { "s" }
+                ),
+                "completed",
+                "phase-status:research:ranking",
+            );
+            progress.emit(
+                "reading",
+                "Reading sources",
+                "Opening the selected sources and extracting evidence.",
+                "running",
+                "phase-status:research:reading",
+            );
+        }
         let all_results = ranked_results
             .into_iter()
             .map(|entry| entry.result)
@@ -323,16 +794,35 @@ impl ResearchClient {
                 reliability,
             });
 
-            match self.fetch_content(&result.url).await {
+            if let Some(progress) = progress {
+                progress.emit(
+                    "reading",
+                    "Reading sources",
+                    format!(
+                        "Source {}/{}: reading {}.",
+                        i + 1,
+                        all_results.len(),
+                        source_label(result)
+                    ),
+                    "running",
+                    "phase-status:research:reading",
+                );
+            }
+            match self
+                .fetch_content(&result.url, progress, "phase-status:research:reading")
+                .await
+            {
                 Ok(content) => {
                     let key_points = self.extract_key_points(&content, &args.query);
                     if key_points.is_empty() {
-                        findings.push(Finding {
-                            content: result.snippet.clone(),
-                            confidence: (0.58 + reliability * 0.25).min(0.92),
-                            source_index: i,
-                            supporting_source_indices: vec![i],
-                        });
+                        if let Some(finding) = self.build_snippet_finding(
+                            &result.snippet,
+                            &query_terms,
+                            i,
+                            (0.58 + reliability * 0.25).min(0.92),
+                        ) {
+                            findings.push(finding);
+                        }
                     } else {
                         for point in key_points {
                             findings.push(Finding {
@@ -344,15 +834,59 @@ impl ResearchClient {
                         }
                     }
                 }
-                Err(_) => {
-                    findings.push(Finding {
-                        content: result.snippet.clone(),
-                        confidence: (0.44 + reliability * 0.2).min(0.8),
-                        source_index: i,
-                        supporting_source_indices: vec![i],
-                    });
+                Err(err) => {
+                    if let Some(progress) = progress {
+                        progress.emit(
+                            "reading",
+                            "Reading sources",
+                            format!(
+                                "Source {}/{}: using the search snippet after the page read failed ({}).",
+                                i + 1,
+                                all_results.len(),
+                                summarize_error(&err)
+                            ),
+                            "running",
+                            "phase-status:research:reading",
+                        );
+                    }
+                    if let Some(finding) = self.build_snippet_finding(
+                        &result.snippet,
+                        &query_terms,
+                        i,
+                        (0.44 + reliability * 0.2).min(0.8),
+                    ) {
+                        findings.push(finding);
+                    }
                 }
             }
+        }
+        if let Some(progress) = progress {
+            progress.emit(
+                "reading",
+                "Reading sources",
+                format!(
+                    "Read {} source{} and captured {} raw finding{}.",
+                    sources.len(),
+                    if sources.len() == 1 { "" } else { "s" },
+                    findings.len(),
+                    if findings.len() == 1 { "" } else { "s" }
+                ),
+                "completed",
+                "phase-status:research:reading",
+            );
+            progress.emit(
+                "synthesis",
+                "Synthesizing report",
+                format!(
+                    "Weighing {} raw finding{} across {} source{}.",
+                    findings.len(),
+                    if findings.len() == 1 { "" } else { "s" },
+                    sources.len(),
+                    if sources.len() == 1 { "" } else { "s" }
+                ),
+                "running",
+                "phase-status:research:synthesis",
+            );
         }
 
         findings = self.deduplicate_findings(findings);
@@ -367,8 +901,7 @@ impl ResearchClient {
             &open_questions,
             &contradictions,
         );
-
-        Ok(ResearchResult {
+        let result = ResearchResult {
             query: args.query.clone(),
             summary,
             findings,
@@ -377,7 +910,29 @@ impl ResearchClient {
             contradictions,
             sources,
             related_topics: self.extract_related_topics(&all_results),
-        })
+        };
+        ensure_research_result_has_evidence(&result, progress)?;
+        if let Some(progress) = progress {
+            progress.emit(
+                "synthesis",
+                "Research complete",
+                format!(
+                    "Finished with {} source{}, {} key finding{}, {} open question{}, and {} contradiction{} to verify.",
+                    result.sources.len(),
+                    if result.sources.len() == 1 { "" } else { "s" },
+                    result.key_findings.len(),
+                    if result.key_findings.len() == 1 { "" } else { "s" },
+                    result.open_questions.len(),
+                    if result.open_questions.len() == 1 { "" } else { "s" },
+                    result.contradictions.len(),
+                    if result.contradictions.len() == 1 { "" } else { "s" }
+                ),
+                "completed",
+                "phase-status:research:synthesis",
+            );
+        }
+
+        Ok(result)
     }
 
     /// Search using configured backend with fallback chain
@@ -386,71 +941,89 @@ impl ResearchClient {
         query: &str,
         num_results: usize,
         backend_preference: &Option<String>,
+        progress: Option<&ResearchProgressReporter>,
+        stream_key: &str,
     ) -> Result<Vec<SearchResult>> {
-        if let Some(explicit) = backend_preference.as_deref() {
-            let backend = match explicit {
-                "serper" => self
-                    .search_config
-                    .serper
-                    .clone()
-                    .ok_or_else(|| anyhow!("Serper not configured"))?,
-                "brave" | "brave_api" => self
-                    .search_config
-                    .brave
-                    .clone()
-                    .ok_or_else(|| anyhow!("Brave not configured"))?,
-                "playwright" => self
-                    .search_config
-                    .playwright
-                    .clone()
-                    .ok_or_else(|| anyhow!("Playwright not configured"))?,
-                "duckduckgo" => SearchBackend::DuckDuckGo,
-                "lightpanda" => SearchBackend::Lightpanda,
-                other => return Err(anyhow!("Unknown search backend: {}", other)),
-            };
-            let client = SearchClient::new(backend);
-            let response = client.search(query, num_results).await?;
-            return Ok(response.results);
+        if let Some(progress) = progress {
+            let label = backend_preference
+                .as_deref()
+                .map(backend_display_name)
+                .unwrap_or("search providers");
+            progress.emit(
+                "searching",
+                "Searching sources",
+                format!(
+                    "Trying {} for {}.",
+                    label,
+                    summarize_progress_text(query, 96)
+                ),
+                "running",
+                stream_key,
+            );
         }
-
-        let chain = self.search_config.ordered_backend_names();
-        let mut last_err = None;
-        for name in &chain {
-            if let Some(backend) = self.search_config.resolve_backend(name) {
-                let client = SearchClient::new(backend);
-                match client.search(query, num_results).await {
-                    Ok(response) if !response.results.is_empty() => {
-                        return Ok(response.results);
-                    }
-                    Ok(_) => {
-                        tracing::warn!(
-                            "Research: search backend '{}' returned 0 results, trying next",
-                            name
-                        );
-                        last_err = Some(anyhow!("Backend '{}' returned 0 results", name));
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Research: search backend '{}' failed: {}, trying next",
-                            name,
-                            e
-                        );
-                        last_err = Some(e);
-                    }
+        let response = super::search::search_with_config(
+            query,
+            num_results,
+            backend_preference.as_deref(),
+            &self.search_config,
+        )
+        .await;
+        match response {
+            Ok(response) => {
+                let filtered_results =
+                    self.filter_search_results_for_query(query, response.results);
+                if let Some(progress) = progress {
+                    progress.emit(
+                        "searching",
+                        "Searching sources",
+                        format!(
+                            "{} returned {} result{} for {}.",
+                            backend_display_name(&response.backend),
+                            filtered_results.len(),
+                            if filtered_results.len() == 1 { "" } else { "s" },
+                            summarize_progress_text(query, 96)
+                        ),
+                        "running",
+                        stream_key,
+                    );
                 }
-            } else {
-                tracing::debug!(
-                    "Research: search backend '{}' not configured, trying next",
-                    name
-                );
+                return Ok(filtered_results);
+            }
+            Err(error) => {
+                if let Some(progress) = progress {
+                    progress.emit(
+                        "searching",
+                        "Searching sources",
+                        format!(
+                            "Search failed for {} ({}).",
+                            summarize_progress_text(query, 96),
+                            summarize_error(&error)
+                        ),
+                        "running",
+                        stream_key,
+                    );
+                }
+                return Err(error);
             }
         }
-
-        Err(last_err.unwrap_or_else(|| anyhow!("All search backends failed")))
     }
 
     /// Fetch content from a URL
-    async fn fetch_content(&self, url: &str) -> Result<String> {
+    async fn fetch_content(
+        &self,
+        url: &str,
+        progress: Option<&ResearchProgressReporter>,
+        stream_key: &str,
+    ) -> Result<String> {
+        if let Some(progress) = progress {
+            progress.emit(
+                "reading",
+                "Reading sources",
+                format!("Opening {}.", source_host_label(url)),
+                "running",
+                stream_key,
+            );
+        }
         // Fast-path: Lightpanda returns clean markdown (no HTML stripping needed)
         match crate::integrations::lightpanda::fetch_markdown(url).await {
             Ok(markdown) => return Ok(markdown),
@@ -459,6 +1032,19 @@ impl ResearchClient {
                     "Lightpanda unavailable for research fetch, falling back to reqwest: {}",
                     e
                 );
+                if let Some(progress) = progress {
+                    progress.emit(
+                        "reading",
+                        "Reading sources",
+                        format!(
+                            "Using direct fetch for {} after Lightpanda fallback ({}).",
+                            source_host_label(url),
+                            summarize_error(&e)
+                        ),
+                        "running",
+                        stream_key,
+                    );
+                }
             }
         }
 
@@ -473,6 +1059,184 @@ impl ResearchClient {
 
         // Extract text content from HTML
         Ok(self.extract_text_from_html(&html))
+    }
+
+    fn filter_search_results_for_query(
+        &self,
+        query: &str,
+        results: Vec<SearchResult>,
+    ) -> Vec<SearchResult> {
+        let query_terms = self.normalized_query_terms(query);
+        results
+            .into_iter()
+            .filter_map(|result| self.normalize_search_result(result))
+            .filter(|result| {
+                query_terms.is_empty()
+                    || self.search_result_matches_query_terms(result, &query_terms)
+            })
+            .collect()
+    }
+
+    fn normalize_search_result(&self, mut result: SearchResult) -> Option<SearchResult> {
+        let normalized_url = self.normalize_source_url(&result.url)?;
+        result.url = normalized_url;
+        result.title = result.title.trim().to_string();
+        result.snippet = result.snippet.trim().to_string();
+        Some(result)
+    }
+
+    fn normalize_source_url(&self, url: &str) -> Option<String> {
+        let trimmed = url.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            return Some(trimmed.to_string());
+        }
+        if trimmed.starts_with("//") {
+            return Some(format!("https:{}", trimmed));
+        }
+        if trimmed.starts_with('/') {
+            return None;
+        }
+
+        let host = trimmed.split(['/', '?', '#']).next().unwrap_or("").trim();
+        let host_is_domain_like = host.contains('.')
+            && !host.contains(' ')
+            && host
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '.');
+        if host_is_domain_like {
+            Some(format!("https://{}", trimmed))
+        } else {
+            None
+        }
+    }
+
+    fn normalized_query_terms(&self, query: &str) -> Vec<String> {
+        let mut seen = HashSet::new();
+        query
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .map(|term| term.trim().to_ascii_lowercase())
+            .filter(|term| !term.is_empty())
+            .filter(|term| term.len() >= 2)
+            .filter(|term| {
+                !matches!(
+                    term.as_str(),
+                    "a" | "an"
+                        | "and"
+                        | "are"
+                        | "as"
+                        | "at"
+                        | "be"
+                        | "between"
+                        | "by"
+                        | "for"
+                        | "from"
+                        | "how"
+                        | "in"
+                        | "into"
+                        | "is"
+                        | "latest"
+                        | "of"
+                        | "on"
+                        | "or"
+                        | "recent"
+                        | "report"
+                        | "research"
+                        | "should"
+                        | "source"
+                        | "sources"
+                        | "that"
+                        | "the"
+                        | "their"
+                        | "these"
+                        | "this"
+                        | "those"
+                        | "to"
+                        | "what"
+                        | "when"
+                        | "where"
+                        | "which"
+                        | "who"
+                        | "why"
+                        | "with"
+                )
+            })
+            .filter(|term| seen.insert(term.clone()))
+            .collect()
+    }
+
+    fn search_result_matches_query_terms(
+        &self,
+        result: &SearchResult,
+        query_terms: &[String],
+    ) -> bool {
+        let haystack = format!("{} {}", result.title, result.snippet);
+        self.text_relevance_score(&haystack, query_terms).is_some()
+    }
+
+    fn text_relevance_score(&self, text: &str, query_terms: &[String]) -> Option<f32> {
+        if query_terms.is_empty() {
+            return Some(0.0);
+        }
+
+        let text_lower = text.to_ascii_lowercase();
+        let total_matches = query_terms
+            .iter()
+            .filter(|term| text_lower.contains(term.as_str()))
+            .count();
+        let specific_matches = query_terms
+            .iter()
+            .filter(|term| self.is_specific_query_term(term))
+            .filter(|term| text_lower.contains(term.as_str()))
+            .count();
+        let minimum_matches = self.minimum_query_matches(query_terms.len());
+
+        if total_matches < minimum_matches {
+            return None;
+        }
+        if query_terms.len() >= 4 && specific_matches == 0 {
+            return None;
+        }
+
+        Some(total_matches as f32 + (specific_matches as f32 * 0.35))
+    }
+
+    fn minimum_query_matches(&self, query_term_count: usize) -> usize {
+        if query_term_count >= 8 {
+            3
+        } else if query_term_count >= 4 {
+            2
+        } else {
+            1
+        }
+    }
+
+    fn is_specific_query_term(&self, term: &str) -> bool {
+        term.len() >= 6 || (term.len() == 4 && term.chars().all(|ch| ch.is_ascii_digit()))
+    }
+
+    fn build_snippet_finding(
+        &self,
+        snippet: &str,
+        query_terms: &[String],
+        source_index: usize,
+        confidence: f32,
+    ) -> Option<Finding> {
+        let content = snippet.trim();
+        if content.is_empty() {
+            return None;
+        }
+        if self.text_relevance_score(content, query_terms).is_none() {
+            return None;
+        }
+        Some(Finding {
+            content: content.to_string(),
+            confidence,
+            source_index,
+            supporting_source_indices: vec![source_index],
+        })
     }
 
     /// Extract text content from HTML
@@ -523,11 +1287,7 @@ impl ResearchClient {
 
     /// Extract key points from content relevant to the query
     fn extract_key_points(&self, content: &str, query: &str) -> Vec<String> {
-        let query_lower = query.to_lowercase();
-        let query_words: Vec<String> = query_lower
-            .split_whitespace()
-            .map(|s| s.to_string())
-            .collect();
+        let query_terms = self.normalized_query_terms(query);
         let mut candidates: Vec<(String, f32)> = Vec::new();
 
         for sentence in content.split(['.', '!', '?', '\n']) {
@@ -537,15 +1297,9 @@ impl ResearchClient {
             }
 
             let sentence_lower = sentence.to_lowercase();
-            let relevance: usize = query_words
-                .iter()
-                .filter(|w| sentence_lower.contains(w.as_str()))
-                .count();
-            if relevance == 0 {
+            let Some(mut score) = self.text_relevance_score(sentence, &query_terms) else {
                 continue;
-            }
-
-            let mut score = relevance as f32;
+            };
             if sentence.chars().any(|ch| ch.is_ascii_digit()) {
                 score += 0.35;
             }
@@ -564,10 +1318,7 @@ impl ResearchClient {
             candidates.push((sentence.to_string(), score));
         }
 
-        candidates.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let mut key_points: Vec<String> = Vec::new();
         for (candidate, _) in candidates {
@@ -621,29 +1372,8 @@ impl ResearchClient {
     }
 
     fn prefers_official_sources(&self, query: &str) -> bool {
-        let query_lower = query.to_lowercase();
-        [
-            "api",
-            "sdk",
-            "library",
-            "framework",
-            "package",
-            "crate",
-            "npm",
-            "docs",
-            "documentation",
-            "standard",
-            "spec",
-            "specification",
-            "protocol",
-            "implementation",
-            "config",
-            "configuration",
-            "release notes",
-            "changelog",
-        ]
-        .iter()
-        .any(|keyword| query_lower.contains(keyword))
+        let _ = query;
+        false
     }
 
     fn looks_like_primary_source(&self, url: &str) -> bool {
@@ -665,18 +1395,17 @@ impl ResearchClient {
         prefers_official_sources: bool,
         category: ResearchQueryCategory,
     ) -> f32 {
+        let query_terms = self.normalized_query_terms(query);
         let mut score = self.estimate_reliability(&result.url);
-        let haystack = format!("{} {}", result.title.to_lowercase(), result.snippet.to_lowercase());
-        let query_terms: Vec<&str> = query
-            .split_whitespace()
-            .map(str::trim)
-            .filter(|term| term.len() > 2)
-            .collect();
-        let match_count = query_terms
-            .iter()
-            .filter(|term| haystack.contains(&term.to_lowercase()))
-            .count();
-        score += (match_count.min(5) as f32) * 0.04;
+        let haystack = format!(
+            "{} {}",
+            result.title.to_lowercase(),
+            result.snippet.to_lowercase()
+        );
+        let Some(relevance_score) = self.text_relevance_score(&haystack, &query_terms) else {
+            return 0.0;
+        };
+        score += relevance_score.min(6.0) * 0.04;
         if prefers_official_sources && self.looks_like_primary_source(&result.url) {
             score += 0.18;
         }
@@ -705,18 +1434,9 @@ impl ResearchClient {
         let mut selected = Vec::new();
         let mut used_urls = HashSet::new();
         let mut quotas = vec![
-            (
-                ResearchQueryCategory::Recent,
-                1usize,
-            ),
-            (
-                ResearchQueryCategory::Comparison,
-                1usize,
-            ),
-            (
-                ResearchQueryCategory::Risks,
-                1usize,
-            ),
+            (ResearchQueryCategory::Recent, 1usize),
+            (ResearchQueryCategory::Comparison, 1usize),
+            (ResearchQueryCategory::Risks, 1usize),
         ];
 
         if prefers_official_sources {
@@ -778,14 +1498,11 @@ impl ResearchClient {
         let mut clustered_findings = clusters
             .into_iter()
             .filter_map(|cluster| {
-                let representative = cluster
-                    .iter()
-                    .cloned()
-                    .max_by(|a, b| {
-                        a.confidence
-                            .partial_cmp(&b.confidence)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })?;
+                let representative = cluster.iter().cloned().max_by(|a, b| {
+                    a.confidence
+                        .partial_cmp(&b.confidence)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })?;
                 let support_count = cluster
                     .iter()
                     .flat_map(|finding| {
@@ -810,9 +1527,11 @@ impl ResearchClient {
                     .into_iter()
                     .collect::<Vec<_>>();
                 support_indices.sort_unstable();
-                let average_confidence =
-                    cluster.iter().map(|finding| finding.confidence).sum::<f32>()
-                        / cluster.len().max(1) as f32;
+                let average_confidence = cluster
+                    .iter()
+                    .map(|finding| finding.confidence)
+                    .sum::<f32>()
+                    / cluster.len().max(1) as f32;
                 Some(Finding {
                     content: if support_count > 1 {
                         format!(
@@ -822,7 +1541,8 @@ impl ResearchClient {
                     } else {
                         representative.content
                     },
-                    confidence: (average_confidence + (support_count.saturating_sub(1) as f32 * 0.06))
+                    confidence: (average_confidence
+                        + (support_count.saturating_sub(1) as f32 * 0.06))
                         .min(0.98),
                     source_index: representative.source_index,
                     supporting_source_indices: support_indices,
@@ -894,7 +1614,12 @@ impl ResearchClient {
     ) -> Vec<String> {
         let mut questions = Vec::new();
 
-        if sources.iter().filter(|source| source.reliability >= 0.85).count() < 2 {
+        if sources
+            .iter()
+            .filter(|source| source.reliability >= 0.85)
+            .count()
+            < 2
+        {
             questions.push(
                 "Official or primary-source coverage is limited, so the latest documentation should still be checked directly."
                     .to_string(),
@@ -963,7 +1688,13 @@ impl ResearchClient {
         if compact.len() <= max_len {
             compact
         } else {
-            format!("{}...", compact.chars().take(max_len.saturating_sub(3)).collect::<String>())
+            format!(
+                "{}...",
+                compact
+                    .chars()
+                    .take(max_len.saturating_sub(3))
+                    .collect::<String>()
+            )
         }
     }
 
@@ -1005,40 +1736,34 @@ impl ResearchClient {
         let avg_reliability: f32 =
             sources.iter().map(|s| s.reliability).sum::<f32>() / sources.len().max(1) as f32;
 
-        let top_findings: Vec<String> = key_findings
-            .iter()
-            .take(4)
-            .enumerate()
-            .map(|(i, f)| format!("{}. {}", i + 1, f.content))
-            .collect();
-
         let contradiction_line = if contradictions.is_empty() {
             "No major source contradictions surfaced in the top findings.".to_string()
         } else {
-            format!("{} contradiction(s) still need judgment.", contradictions.len())
+            format!(
+                "{} contradiction(s) still need judgment.",
+                contradictions.len()
+            )
         };
         let open_question_line = if open_questions.is_empty() {
             "Most major questions were answered by the collected sources.".to_string()
         } else {
-            format!("{} open question(s) remain for follow-up.", open_questions.len())
+            format!(
+                "{} open question(s) remain for follow-up.",
+                open_questions.len()
+            )
         };
 
         format!(
-            "# Research Summary: {}\n\n\
-            **Sources analyzed:** {}\n\
+            "**Sources analyzed:** {}\n\
             **Average confidence:** {:.0}%\n\
             **Average source reliability:** {:.0}%\n\
             **Contradictions:** {}\n\
-            **Open questions:** {}\n\n\
-            ## Key Findings\n\
-            {}",
-            query,
+            **Open questions:** {}",
             sources.len(),
             avg_confidence * 100.0,
             avg_reliability * 100.0,
             contradiction_line,
-            open_question_line,
-            top_findings.join("\n")
+            open_question_line
         )
     }
 
@@ -1172,8 +1897,16 @@ impl ResearchClient {
 
 /// Execute a research request
 pub async fn execute_research(args: &ResearchArgs, config: &SearchConfig) -> Result<String> {
+    execute_research_with_progress(args, config, None).await
+}
+
+pub async fn execute_research_with_progress(
+    args: &ResearchArgs,
+    config: &SearchConfig,
+    progress: Option<&ResearchProgressReporter>,
+) -> Result<String> {
     let client = ResearchClient::new(config.clone());
-    let result = client.research(args).await?;
+    let result = client.research_with_progress(args, progress).await?;
 
     // Format output
     let mut output = format!("# Research: {}\n\n", result.query);
@@ -1218,13 +1951,22 @@ pub async fn execute_research(args: &ResearchArgs, config: &SearchConfig) -> Res
     if !result.sources.is_empty() {
         output.push_str("## Sources\n\n");
         for (i, source) in result.sources.iter().enumerate() {
-            output.push_str(&format!(
-                "{}. [{}]({}) - reliability: {:.0}%\n",
-                i + 1,
-                source.title,
-                source.url,
-                source.reliability * 100.0
-            ));
+            if let Some(url) = client.normalize_source_url(&source.url) {
+                output.push_str(&format!(
+                    "{}. [{}]({}) - reliability: {:.0}%\n",
+                    i + 1,
+                    source.title,
+                    url,
+                    source.reliability * 100.0
+                ));
+            } else {
+                output.push_str(&format!(
+                    "{}. {} - reliability: {:.0}%\n",
+                    i + 1,
+                    source.title,
+                    source.reliability * 100.0
+                ));
+            }
         }
     }
 
@@ -1281,9 +2023,15 @@ mod tests {
         let client = test_client();
         let queries = client.generate_research_queries("rust agent framework");
 
-        assert!(queries.iter().any(|query| query.text.contains("primary sources")));
-        assert!(queries.iter().any(|query| query.text.contains("recent coverage")));
-        assert!(queries.iter().any(|query| query.text.contains("comparison alternatives")));
+        assert!(queries
+            .iter()
+            .any(|query| query.text.contains("primary sources")));
+        assert!(queries
+            .iter()
+            .any(|query| query.text.contains("recent coverage")));
+        assert!(queries
+            .iter()
+            .any(|query| query.text.contains("comparison alternatives")));
         assert!(queries
             .iter()
             .any(|query| query.text.contains("risks limitations open questions")));
@@ -1324,5 +2072,56 @@ mod tests {
 
         let contradictions = client.detect_contradictions(&findings, &sources);
         assert!(!contradictions.is_empty());
+    }
+
+    #[test]
+    fn extract_key_points_filters_unrelated_sentences_for_long_queries() {
+        let client = test_client();
+        let content = "Report workplace sexual harassment complaints on SHe-Box portal, the Government of India's online complaint system.\nPrototype Fast Breeder Reactor at Kalpakkam, Tamil Nadu attains First Criticality.\nIndia's AI talent pipeline remains concentrated in a few universities, while startup formation is strongest around Bengaluru and Hyderabad.\n";
+
+        let key_points = client.extract_key_points(
+            content,
+            "India AI research capacity 2025-2026 universities labs talent pipeline publications startups",
+        );
+
+        assert_eq!(key_points.len(), 1);
+        assert!(key_points[0].contains("talent pipeline"));
+    }
+
+    #[test]
+    fn normalize_source_url_adds_https_to_scheme_less_domains() {
+        let client = test_client();
+        assert_eq!(
+            client.normalize_source_url("pib.gov.in/PressReleasePage.aspx?PRID=1"),
+            Some("https://pib.gov.in/PressReleasePage.aspx?PRID=1".to_string())
+        );
+        assert_eq!(client.normalize_source_url("/local/path"), None);
+    }
+
+    #[test]
+    fn generate_comprehensive_summary_omits_duplicate_key_findings_block() {
+        let client = test_client();
+        let summary = client.generate_comprehensive_summary(
+            "India AI research capacity",
+            &[Finding {
+                content: "AI research output is concentrated in a small number of institutes."
+                    .to_string(),
+                confidence: 0.91,
+                source_index: 0,
+                supporting_source_indices: vec![0],
+            }],
+            &[Source {
+                title: "Example".to_string(),
+                url: "https://example.com".to_string(),
+                description: String::new(),
+                reliability: 0.8,
+            }],
+            &[],
+            &[],
+        );
+
+        assert!(summary.contains("**Sources analyzed:** 1"));
+        assert!(!summary.contains("# Research Summary:"));
+        assert!(!summary.contains("## Key Findings"));
     }
 }

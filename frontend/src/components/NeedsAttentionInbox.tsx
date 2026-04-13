@@ -242,7 +242,7 @@ export function NeedsAttentionInbox({
                               color: meta.accent,
                               fontSize: "0.68rem",
                               fontWeight: 700,
-                              letterSpacing: "0.08em",
+                              letterSpacing: 0,
                               textTransform: "uppercase",
                             }}
                           >

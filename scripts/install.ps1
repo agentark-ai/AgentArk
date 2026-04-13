@@ -77,7 +77,7 @@ if "%CMD%"=="pulse" (
     goto :eof
 )
 if "%CMD%"=="start" (
-    docker compose -f "%~dp0source\docker-compose.yml" up -d --build
+    docker compose -f "%~dp0source\docker-compose.yml" up -d
     echo.
     echo AgentArk is running!
     echo   Web UI: http://localhost:8990
@@ -90,7 +90,7 @@ if "%CMD%"=="stop" (
 )
 if "%CMD%"=="restart" (
     docker compose -f "%~dp0source\docker-compose.yml" down
-    docker compose -f "%~dp0source\docker-compose.yml" up -d --build
+    docker compose -f "%~dp0source\docker-compose.yml" up -d
     goto :eof
 )
 if "%CMD%"=="logs" (
@@ -103,7 +103,7 @@ if "%CMD%"=="status" (
 )
 if "%CMD%"=="update" (
     docker run --rm -v "%~dp0:/work" -w /work alpine/git git -C /work/source pull --ff-only
-    docker compose -f "%~dp0source\docker-compose.yml" build
+    docker compose -f "%~dp0source\docker-compose.yml" pull
     docker compose -f "%~dp0source\docker-compose.yml" up -d
     echo Update complete!
     goto :eof
@@ -124,7 +124,7 @@ echo   stop       Stop AgentArk
 echo   restart    Restart AgentArk
 echo   logs       View live logs
 echo   status     Show running containers
-echo   update     Pull latest source and rebuild
+echo   update     Pull latest image and restart
 echo   setup      Run setup wizard
 '@
 
@@ -160,7 +160,7 @@ function Write-AgentArkPortWarning {
 
 # ── Step 5: Build and start ────────────────────────────────────────────────
 
-Write-Host "Building AgentArk from source (this may take a few minutes)..." -ForegroundColor Cyan
+Write-Host "Downloading AgentArk container image (first run may take a few minutes)..." -ForegroundColor Cyan
 $postgresPort = 5432
 if ($env:AGENTARK_POSTGRES_PORT -match '^\d+$') {
     $postgresPort = [int]$env:AGENTARK_POSTGRES_PORT
@@ -172,7 +172,8 @@ try {
     Write-Host "[4/4] Starting AgentArk..." -ForegroundColor Green
     Push-Location $SourceDir
     try {
-        docker compose up -d --build
+        docker compose pull
+        docker compose up -d
     } finally {
         Pop-Location
     }
@@ -191,7 +192,7 @@ Write-Host "  Commands (run from anywhere):" -ForegroundColor White
 Write-Host "    agentark chat       Interactive CLI chat"
 Write-Host "    agentark pulse      Run ArkPulse health check"
 Write-Host "    agentark stop       Stop AgentArk"
-Write-Host "    agentark update     Pull latest source and rebuild"
+Write-Host "    agentark update     Pull latest image and restart"
 Write-Host "    agentark logs       View logs"
 Write-Host "    agentark status     Show status"
 Write-Host ""

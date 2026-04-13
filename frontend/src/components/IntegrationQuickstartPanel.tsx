@@ -261,7 +261,7 @@ export function IntegrationQuickstartPanel({
       px: 1,
       fontSize: "0.63rem",
       fontWeight: 700,
-      letterSpacing: "0.08em",
+      letterSpacing: 0,
       textTransform: "uppercase"
     }
   } as const;
@@ -275,7 +275,7 @@ export function IntegrationQuickstartPanel({
       px: 1,
       fontSize: "0.64rem",
       fontWeight: 700,
-      letterSpacing: "0.08em",
+      letterSpacing: 0,
       textTransform: "uppercase"
     }
   } as const;

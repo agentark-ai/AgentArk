@@ -1,6 +1,7 @@
 //! Lightweight specialist agent
 
 use super::agent_trait::*;
+use super::AgentAccessScope;
 use crate::actions::ActionDef;
 use crate::core::llm::{LlmClient, LlmProvider};
 use crate::core::orchestra::SubAgentType;
@@ -8,6 +9,7 @@ use crate::core::prompt_policy::delegated_policy_v2_block;
 use crate::memory::MemoryEntry;
 use anyhow::Result;
 use async_trait::async_trait;
+use std::collections::HashSet;
 
 /// Configuration for a specialist agent
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -23,6 +25,8 @@ pub struct SpecialistConfig {
     pub max_memory_retrieval: usize,
     #[serde(default)]
     pub capabilities: Vec<AgentCapability>,
+    #[serde(default)]
+    pub access_scope: AgentAccessScope,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 }
@@ -141,6 +145,44 @@ impl SpecialistAgent {
             LlmProvider::Ollama { model, .. } => model.clone(),
         }
     }
+
+    fn relevance_tokens(text: &str) -> HashSet<String> {
+        text.to_ascii_lowercase()
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .filter_map(|token| {
+                let trimmed = token.trim();
+                if trimmed.len() < 3 || trimmed.chars().all(|ch| ch.is_ascii_digit()) {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            })
+            .collect()
+    }
+
+    fn relevance_score(task_tokens: &HashSet<String>, candidate_tokens: &HashSet<String>) -> f32 {
+        if task_tokens.is_empty() || candidate_tokens.is_empty() {
+            return 0.0;
+        }
+        let overlap = task_tokens.intersection(candidate_tokens).count() as f32;
+        let coverage = overlap / task_tokens.len() as f32;
+        let precision = overlap / candidate_tokens.len() as f32;
+        (0.8 * coverage + 0.2 * (precision * 6.0).min(1.0)).clamp(0.0, 1.0)
+    }
+
+    fn profile_tokens(&self) -> HashSet<String> {
+        let mut tokens = Self::relevance_tokens(&self.config.name);
+        tokens.extend(Self::relevance_tokens(&self.config.agent_type.name()));
+        tokens.extend(Self::relevance_tokens(&self.system_prompt()));
+        for capability in &self.config.capabilities {
+            tokens.extend(Self::relevance_tokens(&capability.name));
+            tokens.extend(Self::relevance_tokens(&capability.description));
+            for keyword in &capability.keywords {
+                tokens.extend(Self::relevance_tokens(keyword));
+            }
+        }
+        tokens
+    }
 }
 
 #[async_trait]
@@ -161,68 +203,26 @@ impl SwarmAgent for SpecialistAgent {
     }
 
     fn can_handle(&self, task_description: &str) -> f32 {
-        let task_lower = task_description.to_lowercase();
-        let mut score = 0.0f32;
-        let mut total_keywords = 0;
+        let task_tokens = Self::relevance_tokens(task_description);
+        if task_tokens.is_empty() {
+            return 0.0;
+        }
 
-        for cap in &self.config.capabilities {
-            for keyword in &cap.keywords {
-                total_keywords += 1;
-                if task_lower.contains(&keyword.to_lowercase()) {
-                    score += 1.0;
+        let profile_score = Self::relevance_score(&task_tokens, &self.profile_tokens());
+        let capability_score = self
+            .config
+            .capabilities
+            .iter()
+            .map(|capability| {
+                let mut tokens = Self::relevance_tokens(&capability.name);
+                tokens.extend(Self::relevance_tokens(&capability.description));
+                for keyword in &capability.keywords {
+                    tokens.extend(Self::relevance_tokens(keyword));
                 }
-            }
-        }
+                Self::relevance_score(&task_tokens, &tokens)
+            })
+            .fold(0.0f32, f32::max);
 
-        // Also check agent type keywords
-        let type_keywords = match self.config.agent_type {
-            SubAgentType::Researcher => vec![
-                "research",
-                "search",
-                "find",
-                "look up",
-                "information",
-                "data",
-            ],
-            SubAgentType::Coder => vec![
-                "code",
-                "program",
-                "debug",
-                "script",
-                "function",
-                "implement",
-            ],
-            SubAgentType::Analyst => vec![
-                "analyze",
-                "analysis",
-                "data",
-                "pattern",
-                "trend",
-                "statistics",
-            ],
-            SubAgentType::Writer => vec![
-                "write", "draft", "compose", "article", "content", "document",
-            ],
-            SubAgentType::Validator => {
-                vec!["verify", "check", "validate", "review", "test", "audit"]
-            }
-            SubAgentType::Planner => vec![
-                "plan", "schedule", "organize", "strategy", "roadmap", "timeline",
-            ],
-            SubAgentType::Custom { .. } => vec![],
-        };
-
-        for keyword in &type_keywords {
-            total_keywords += 1;
-            if task_lower.contains(keyword) {
-                score += 1.0;
-            }
-        }
-
-        if total_keywords == 0 {
-            return 0.1; // base score for custom agents
-        }
-
-        (score / total_keywords as f32).min(1.0)
+        (0.35 * profile_score + 0.65 * capability_score.max(profile_score)).clamp(0.0, 1.0)
     }
 }

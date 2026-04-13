@@ -8,6 +8,10 @@ import type {
   SkillSecretsUpdateRequest,
   SkillTestResponse,
   BriefingResponse,
+  ExtensionPackConnectionView,
+  ExtensionPackEventsResponse,
+  ExtensionPackSearchResponse,
+  ExtensionPackView,
   IntegrationItem,
   IntegrationSyncFeedItem,
   IntegrationSyncStatus,
@@ -37,6 +41,17 @@ declare global {
   interface Window {
     __AGENTARK_BOOTSTRAP_TOKEN__?: string;
   }
+}
+
+const DEV_API_ORIGIN = String(import.meta.env.VITE_AGENTARK_API_ORIGIN || "")
+  .trim()
+  .replace(/\/+$/, "");
+
+export function apiUrl(path: string): string {
+  if (!DEV_API_ORIGIN) return path;
+  if (/^https?:\/\//i.test(path)) return path;
+  if (path.startsWith("/")) return `${DEV_API_ORIGIN}${path}`;
+  return `${DEV_API_ORIGIN}/${path}`;
 }
 
 function extractErrorMessage(text: string): string {
@@ -102,7 +117,7 @@ type LocalBootstrapAttempt = {
 async function redeemLocalBootstrapToken(token: string): Promise<LocalBootstrapAttempt> {
   if (!token.trim()) return { ok: false };
   try {
-    const response = await fetch("/session/bootstrap/local", {
+    const response = await fetch(apiUrl("/session/bootstrap/local"), {
       method: "POST",
       credentials: "include",
       cache: "no-store",
@@ -118,7 +133,7 @@ async function redeemLocalBootstrapToken(token: string): Promise<LocalBootstrapA
 
 async function requestLocalBootstrapToken(): Promise<{ token: string | null; error?: string }> {
   try {
-    const response = await fetch("/session/bootstrap/local", {
+    const response = await fetch(apiUrl("/session/bootstrap/local"), {
       method: "GET",
       credentials: "include",
       cache: "no-store",
@@ -173,7 +188,7 @@ async function refreshUiSessionCookie(): Promise<void> {
 
   const bootstrapWithApiKey = async (apiKey: string): Promise<boolean> => {
     try {
-      const response = await fetch("/session/bootstrap", {
+      const response = await fetch(apiUrl("/session/bootstrap"), {
         method: "POST",
         credentials: "include",
         cache: "no-store",
@@ -193,7 +208,7 @@ async function refreshUiSessionCookie(): Promise<void> {
 
   const probeProtectedSession = async (): Promise<boolean> => {
     try {
-      const response = await fetch("/autonomy/settings", {
+      const response = await fetch(apiUrl("/autonomy/settings"), {
         method: "GET",
         credentials: "include",
         cache: "no-store",
@@ -212,7 +227,7 @@ async function refreshUiSessionCookie(): Promise<void> {
     if (firstSilentBootstrap.ok) return;
 
     try {
-      await fetch("/ui/v2", {
+      await fetch(apiUrl("/ui/v2"), {
         method: "GET",
         credentials: "include",
         cache: "no-store",
@@ -260,7 +275,7 @@ export async function initializeUiSession(): Promise<void> {
 
 export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const doFetch = () =>
-    fetch(path, {
+    fetch(apiUrl(path), {
       credentials: "include",
       ...init
       ,
@@ -285,7 +300,7 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export async function requestForm<T>(path: string, formData: FormData, init?: RequestInit): Promise<T> {
   const doFetch = () =>
-    fetch(path, {
+    fetch(apiUrl(path), {
       credentials: "include",
       ...init,
       headers: buildHeaders(init?.headers, { json: false }),
@@ -374,7 +389,7 @@ async function streamSseJson(
   handlers: ChatStreamHandlers = {}
 ): Promise<void> {
   const doFetch = () =>
-    fetch(path, {
+    fetch(apiUrl(path), {
       method: "POST",
       credentials: "include",
       signal: handlers.signal,
@@ -508,7 +523,7 @@ async function streamRun(runId: string, sinceSeq = 0, handlers: ChatStreamHandle
   const query = sinceSeq > 0 ? `?since_seq=${encodeURIComponent(String(sinceSeq))}` : "";
   const path = `/runs/${encodeURIComponent(runId)}/stream${query}`;
   const doFetch = () =>
-    fetch(path, {
+    fetch(apiUrl(path), {
       method: "GET",
       credentials: "include",
       signal: handlers.signal,
@@ -744,6 +759,82 @@ export const api = {
     ),
   getBriefing: () => request<BriefingResponse>("/autonomy/briefing"),
   getIntegrations: () => request<{ integrations: IntegrationItem[] }>("/integrations"),
+  getExtensionPacks: (params?: { query?: string; kind?: string }) => {
+    const query = new URLSearchParams();
+    if (params?.query) query.set("query", params.query);
+    if (params?.kind) query.set("kind", params.kind);
+    const suffix = query.toString();
+    return request<ExtensionPackSearchResponse>(
+      `/extension-packs${suffix ? `?${suffix}` : ""}`
+    );
+  },
+  getExtensionPack: (id: string) =>
+    request<{ pack: ExtensionPackView; connections: ExtensionPackConnectionView[] }>(
+      `/extension-packs/${encodeURIComponent(id)}`
+    ),
+  getExtensionPackEvents: (id: string, limit = 25) =>
+    request<ExtensionPackEventsResponse>(
+      `/extension-packs/${encodeURIComponent(id)}/events?limit=${encodeURIComponent(String(limit))}`
+    ),
+  installExtensionPack: (payload: Record<string, unknown>) =>
+    request<{ status: string; pack: ExtensionPackView }>("/extension-packs/install", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  uploadExtensionPack: (formData: FormData) =>
+    requestForm<{ status: string; pack: ExtensionPackView }>("/extension-packs/upload", formData, {
+      method: "POST"
+    }),
+  scaffoldExtensionPack: (payload: Record<string, unknown>) =>
+    request<{ status: string; pack: ExtensionPackView }>("/extension-packs/scaffold", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  upsertExtensionPackConnection: (id: string, payload: Record<string, unknown>) =>
+    request<{ status: string; connection: ExtensionPackConnectionView }>(
+      `/extension-packs/${encodeURIComponent(id)}/connections`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      }
+    ),
+  getExtensionPackConnectUrl: (id: string, redirectUri?: string) => {
+    const query = new URLSearchParams();
+    if (redirectUri) query.set("redirect_uri", redirectUri);
+    const suffix = query.toString();
+    return request<{ url: string; auth_url: string; redirect_uri: string }>(
+      `/extension-packs/${encodeURIComponent(id)}/connect-url${suffix ? `?${suffix}` : ""}`
+    );
+  },
+  testExtensionPackConnection: (id: string, connectionId: string) =>
+    request<{ status: string; result: Record<string, unknown> }>(
+      `/extension-packs/${encodeURIComponent(id)}/connections/${encodeURIComponent(connectionId)}/test`,
+      {
+        method: "POST",
+        body: JSON.stringify({})
+      }
+    ),
+  setExtensionPackEnabled: (id: string, enabled: boolean) =>
+    request<{ status: string; pack: ExtensionPackView }>(
+      `/extension-packs/${encodeURIComponent(id)}/enabled`,
+      {
+        method: "POST",
+        body: JSON.stringify({ enabled })
+      }
+    ),
+  deleteExtensionPack: (id: string, params?: { remove_connections?: boolean }) => {
+    const query = new URLSearchParams();
+    if (typeof params?.remove_connections === "boolean") {
+      query.set("remove_connections", String(params.remove_connections));
+    }
+    const suffix = query.toString();
+    return request<{ status: string }>(
+      `/extension-packs/${encodeURIComponent(id)}${suffix ? `?${suffix}` : ""}`,
+      {
+        method: "DELETE"
+      }
+    );
+  },
   getIntegrationSyncStatus: () => request<{ statuses: IntegrationSyncStatus[] }>("/integrations/sync/status"),
   getIntegrationSyncFeed: (params?: { integration_id?: string; limit?: number }) => {
     const query = new URLSearchParams();
@@ -1066,15 +1157,15 @@ export const api = {
     }),
   runStream: (runId: string, sinceSeq?: number, handlers?: ChatStreamHandlers) =>
     streamRun(runId, sinceSeq, handlers),
-  approveTask: (id: string) =>
+  approveTask: (id: string, comment?: string) =>
     request<{ status: string }>(`/tasks/${encodeURIComponent(id)}/approve`, {
       method: "POST",
-      body: JSON.stringify({})
+      body: JSON.stringify({ comment: comment?.trim() || undefined })
     }),
-  rejectTask: (id: string) =>
+  rejectTask: (id: string, comment?: string) =>
     request<{ status: string }>(`/tasks/${encodeURIComponent(id)}/reject`, {
       method: "POST",
-      body: JSON.stringify({})
+      body: JSON.stringify({ comment: comment?.trim() || undefined })
     }),
   retryTask: (id: string) =>
     request<{ status: string }>(`/tasks/${encodeURIComponent(id)}/retry`, {

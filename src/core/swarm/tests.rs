@@ -339,6 +339,7 @@ mod swarm_tests {
                     description: "analysis".into(),
                     keywords: vec!["data".into(), "statistics".into(), "analysis".into()],
                 }],
+                access_scope: crate::core::swarm::AgentAccessScope::default(),
                 enabled: true,
             },
             vec![],
@@ -374,6 +375,7 @@ mod swarm_tests {
                 system_prompt_override: None,
                 max_memory_retrieval: 3,
                 capabilities: vec![],
+                access_scope: crate::core::swarm::AgentAccessScope::default(),
                 enabled: true,
             },
             vec![],
@@ -394,6 +396,7 @@ mod swarm_tests {
                 system_prompt_override: None,
                 max_memory_retrieval: 3,
                 capabilities: vec![],
+                access_scope: crate::core::swarm::AgentAccessScope::default(),
                 enabled: true,
             },
             vec![],
@@ -541,6 +544,7 @@ mod swarm_tests {
             system_prompt_override: None,
             max_memory_retrieval: 3,
             capabilities: vec![],
+            access_scope: crate::core::swarm::AgentAccessScope::default(),
             enabled: true,
         }
     }

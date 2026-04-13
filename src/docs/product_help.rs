@@ -82,6 +82,53 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
     },
     BundledHelpDoc {
+        title: "User/system data contract",
+        slug: "user-system-data-contract",
+        tags: &[
+            "data_contract",
+            "data_ownership",
+            "updates",
+            "upgrades",
+            "docker",
+            "persistence",
+            "skills",
+            "memory",
+            "settings",
+        ],
+        summary: "AgentArk separates personal runtime data from release-owned system files so upgrades can refresh the app without overwriting custom state.",
+        sections: &[
+            BundledHelpSection {
+                label: "user-owned",
+                items: &[
+                    "`/app/data/**`.",
+                    "`/app/config/bootstrap.toml`.",
+                    "Encrypted `settings:*` KV.",
+                    "Memory/profile/preferences.",
+                    "Tasks.",
+                    "`/app/data/skills/**`.",
+                    "`/app/data/cli_skills/**`.",
+                ],
+            },
+            BundledHelpSection {
+                label: "system-owned",
+                items: &[
+                    "`/app/skills/**`.",
+                    "Built-in prompt bundles.",
+                    "Frontend/runtime image files.",
+                    "Default extension packs.",
+                ],
+            },
+            BundledHelpSection {
+                label: "release rule",
+                items: &[
+                    "Release updates may replace system-owned files.",
+                    "Release updates must not mutate user-owned data except through explicit user actions or future versioned migrations with backups.",
+                    "`docker compose down -v` is a reset operation because it removes the Docker volumes that hold user-owned data.",
+                ],
+            },
+        ],
+    },
+    BundledHelpDoc {
         title: "Settings and navigation map",
         slug: "settings-and-navigation",
         tags: &[
@@ -111,9 +158,9 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Sentinel: ambient proposals, observations, and Background learning status.",
                     "Watchers: monitor and poll-until workflows.",
                     "Apps: generated or managed apps, deployment, and app status.",
-                    "Goals / Agents / ArkPulse: long-running outcomes, specialist agents, and operational guidance.",
+                    "Goals / Agents / Evolution / ArkPulse: long-running outcomes, specialist agents, self-learning status, and operational guidance.",
                     "Trace / Analytics: what the agent did and how it performed.",
-                    "Settings > Security / Advanced / Evolution: security controls, expert settings, and self-learning or deploy-guard behavior.",
+                    "Settings > Security / Advanced: security controls and expert settings.",
                 ],
             },
             BundledHelpSection {
@@ -128,6 +175,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Image or video generation providers live in Settings > Media.",
                     "Moltbook uses the top-level Moltbook page.",
                     "Scheduled work uses Tasks; condition-based monitoring uses Watchers.",
+                    "Self-learning history, impact, canary tests, review, and deploy-guard defaults use Evolution.",
                     "Background learning and Sentinel proposals are inspected in Sentinel.",
                     "Behavior debugging uses Trace or Analytics.",
                     "Specialist agents and delegation use Agents.",
@@ -196,20 +244,19 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             BundledHelpSection {
                 label: "secret save",
                 items: &[
-                    "Web chat: `set secret KEY=VALUE`.",
-                    "Messaging channels: `/setsecret KEY=VALUE`.",
+                    "Chat: `/setsecret KEY=VALUE`.",
                     "These flows keep the value encrypted and out of normal LLM-visible arguments and traces.",
                 ],
             },
             BundledHelpSection {
                 label: "notifications",
-                items: &["`pause notifications`.", "`resume notifications`.", "`notification status`."],
+                items: &["`/notifications pause`.", "`/notifications resume`.", "`/notifications status`."],
             },
             BundledHelpSection {
                 label: "delegation",
                 items: &[
                     "`/delegate <task description>`.",
-                    "Natural-language variants like `delegate this task ...` may also work.",
+                    "Use the explicit `/delegate` command when you want to force multi-agent delegation.",
                 ],
             },
             BundledHelpSection {
@@ -839,7 +886,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                 items: &[
                     "Ask in Chat to build or deploy an app.",
                     "Use Apps to inspect existing deployed apps.",
-                    "Use Settings > Admin > Evolution to control the default deploy-guard behavior for new app deploys.",
+                    "Use Evolution > Controls to control the default deploy-guard behavior for new app deploys.",
                 ],
             },
             BundledHelpSection {
@@ -855,7 +902,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                 label: "access guard",
                 items: &[
                     "Access guard protects a deployed app with an access key.",
-                    "The default policy for new deploys can be changed in Settings > Admin > Evolution.",
+                    "The default policy for new deploys can be changed in Evolution > Controls.",
                     "Existing apps can have guard enabled or disabled individually from the Apps page.",
                     "If guard is enabled, visitors must provide the access key before viewing the app.",
                 ],
@@ -922,7 +969,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Use Settings > Integrations > Messaging Channels and Settings > Integrations > Prebuilt Connectors for connected systems.",
                     "Use Settings > Knowledge > Memory and Library > Documents for memory and indexed files.",
                     "Use Tasks, Watchers, Goals, Apps, Trace, Analytics, and ArkPulse for durable work and operational investigation.",
-                    "Use Settings > Security, Settings > Advanced, Settings > Observability, and Settings > Admin > Evolution for approvals, runtime policy, export, and deploy-guard behavior.",
+                    "Use Settings > Security, Settings > Advanced, Settings > Observability, and Evolution > Controls for approvals, runtime policy, export, and deploy-guard behavior.",
                 ],
             },
             BundledHelpSection {
@@ -1017,7 +1064,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             "sentinel",
             "settings",
         ],
-        summary: "Settings > Admin > Evolution covers local memory-driven learning and self-evolve controls; Sentinel shows live Background learning status.",
+        summary: "Evolution is the top-level page for local memory-driven learning, impact, canary tests, review, and self-evolve controls; Sentinel shows live Background learning status.",
         sections: &[
             BundledHelpSection {
                 label: "learning pipeline",
@@ -1051,16 +1098,11 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             BundledHelpSection {
                 label: "Evolution page",
                 items: &[
-                    "Whether self-evolve is on.",
-                    "Whether learning is on.",
-                    "Whether learning is local-only.",
-                    "Learning queue counts.",
-                    "Canary rollout status.",
-                    "Learned memory.",
-                    "Learned procedures.",
-                    "Recent experience runs.",
-                    "Learning candidates.",
-                    "Strategy and canary diagnostics.",
+                    "Evolution > What happened explains recent tested or promoted changes in plain language.",
+                    "Evolution > What helped summarizes measured impact from recent prompt, classifier, specialist, and routing changes.",
+                    "Evolution > Tests running shows canary rollout, baseline version, candidate version, and gate result for each evolvable surface.",
+                    "Evolution > Review lists draft learning candidates and keeps them as suggestions until approved.",
+                    "Evolution > Controls includes self-evolve, learning, local-only learning, deploy-guard default, and developer-mode canary actions.",
                 ],
             },
             BundledHelpSection {
@@ -1075,7 +1117,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                 label: "answer rules",
                 items: &[
                     "If the user asks how self-learning works, explain the pipeline first and then the current instance status.",
-                    "If the user asks whether it is enabled or what it has learned, report current toggles and counts first and then explain the meaning.",
+                    "If the user asks whether it is enabled or what it has learned, point to Evolution first, report current toggles and counts, then explain the meaning.",
                     "If the user asks about background learning status or why it is not running, lead with the live Sentinel background learning state and per-job status first.",
                     "Use live status rather than stale docs when debugging background learning.",
                     "Do not describe the current product as continuously retraining base model weights unless that deployment explicitly has a parameter-updating feature enabled.",
@@ -1306,21 +1348,41 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         title: "__PRODUCT_NAME__ capabilities overview",
         slug: "capabilities-overview",
         tags: &["capabilities", "features", "overview", "general"],
-        summary: "__PRODUCT_NAME__ is a self-hosted personal AI assistant for daily life and work that combines private chat, durable memory, daily briefs, secure secrets, approvals, and optional power-user automation.",
+        summary: "__PRODUCT_NAME__ is a self-hosted personal AI assistant for daily life and work that combines private chat, durable memory, daily briefs, secure secrets, approvals, smart model routing, evolution, and optional power-user automation.",
         sections: &[
             BundledHelpSection {
                 label: "core capabilities",
                 items: &[
-                    "Chat and daily help across the web UI, CLI, Telegram, and WhatsApp for summaries, drafts, reminders, follow-up, research, and action requests.",
-                    "Memory and personal continuity through durable facts, preferences, user data, uploaded files, and reusable knowledge-base items.",
-                    "Daily Brief and channel delivery through a configured messaging channel.",
-                    "Security and trust controls including encrypted secret handling, security logs, approvals, guarded execution, privacy controls, and advanced admin settings.",
+                    "Daily personal-assistant workflow across the web UI, CLI, Telegram, and WhatsApp for summaries, drafts, reminders, follow-up, research, and action requests.",
                     "Mission Control for daily overview, approvals, highlights, suggestions, and attention items.",
-                    "Tasks, Watchers, and automation for one-off tasks, recurring jobs, and condition-based monitoring.",
-                    "Integrations and channels such as Google Workspace, Gmail, Calendar, GitHub, Notion, Twilio, Moltbook, and others depending on configuration.",
-                    "Research and documents through search, document inspection, summarization, and grounded answers from indexed content.",
-                    "App building and deployment with managed apps, tunnel exposure, and app status tracking.",
-                    "Advanced power features including swarm agents, execution supervision, traces, analytics, plugins, custom APIs, webhooks, and self-evolve.",
+                    "Memory and personal continuity through durable facts, preferences, user data, uploaded files, reusable knowledge-base items, and local embeddings by default.",
+                    "Security and trust controls including encrypted secret handling, model-privacy controls, security logs, approvals, guarded execution, sender verification, and advanced admin settings.",
+                    "Smart model routing through Primary, Fast, Code, Research, and Fallback slots so routine personal-assistant work can use cheaper capable models while harder work can use stronger specialized models.",
+                    "Tasks, Watchers, and Goals for one-off tasks, recurring jobs, and condition-based monitoring.",
+                    "Integrations and channels such as Google Workspace, Gmail, Calendar, GitHub, Notion, Twilio, Moltbook, webhooks, plugins, custom APIs, MCP servers, and others depending on configuration.",
+                    "Research, browser automation, and documents through web search, deeper source-backed research, website interaction, document inspection, summarization, and grounded answers from indexed content.",
+                    "App building and deployment with managed apps, tunnel exposure, restore state, and app status tracking.",
+                    "Evolution and self-learning through learned memory, learned procedures, background learning, candidate review, replay gates, canary rollout, and impact tracking. This improves retrieval context, prompts, routing, and policy state; it is not silent base-model weight retraining by default.",
+                    "Operational power features including swarm agents, execution supervision, traces, analytics, ArkPulse, plugins, custom APIs, webhooks, and extension packs.",
+                ],
+            },
+            BundledHelpSection {
+                label: "how it evolves over time",
+                items: &[
+                    "Completed or corrected runs can become evidence for durable memory, lessons, and procedures.",
+                    "Background learning can consolidate experience, induce patterns, and create draft candidates for review.",
+                    "Self-evolve tests routing-policy candidates through replay gates and canary rollout before promotion.",
+                    "Evolution pages show what changed, what helped, what is under test, and what still needs review.",
+                    "Do not imply that __PRODUCT_NAME__ silently retrains base model weights unless that deployment explicitly adds parameter-updating learning with documented controls.",
+                ],
+            },
+            BundledHelpSection {
+                label: "security and cost posture",
+                items: &[
+                    "Secrets are stored encrypted and handled separately from normal model generation.",
+                    "Approval, model-privacy, guarded-execution, sender-verification, and security-log surfaces exist for trust and auditability.",
+                    "The model pool lets users choose lower-cost fast models for normal personal-assistant traffic and keep stronger models for code, research, fallback, or difficult tasks.",
+                    "Settings > Models and Analytics help operators inspect the configured model mix and cost trends.",
                 ],
             },
             BundledHelpSection {
@@ -1334,12 +1396,18 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Settings > Integrations > Prebuilt Connectors for external services.",
                     "Settings > Knowledge > Memory for structured memory and reusable knowledge items.",
                     "Library > Documents for uploaded files and indexed documents.",
+                    "Evolution for learning history, impact, canary tests, review, and self-evolve controls.",
+                    "Sentinel > Background learning for live reflection, consolidation, pattern induction, and candidate generation status.",
                     "Tasks / Watchers / Goals / Apps / Trace / Analytics / ArkPulse for deeper operational workflows.",
                 ],
             },
             BundledHelpSection {
                 label: "answer rule",
-                items: &["When the user asks what __PRODUCT_NAME__ can do, answer with the first five capability areas first and then narrow to the exact feature path they need next."],
+                items: &[
+                    "When the user asks what __PRODUCT_NAME__ can do, answer with a short product-specific Markdown list, not a generic AI assistant skill list.",
+                    "Include evolution, security/trust, model-cost routing, memory/documents, integrations/actions, automation/apps/research, and daily personal-assistant workflow when answering a broad capabilities question.",
+                    "Mention live configured status separately from stable product capability so missing credentials are not confused with missing product features.",
+                ],
             },
         ],
     },

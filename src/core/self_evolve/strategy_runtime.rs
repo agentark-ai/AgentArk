@@ -10,6 +10,9 @@ use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 
+use crate::actions::ActionDef;
+use crate::core::RequestShapeAssessment;
+
 pub const TOOL_STRATEGY_PROFILE_KEY: &str = "tool_strategy_profile_v1";
 pub const TOOL_STRATEGY_PROFILE_CANARY_KEY: &str = "tool_strategy_profile_canary_v1";
 pub const TOOL_STRATEGY_CANARY_STATE_KEY: &str = "tool_strategy_canary_state_v1";
@@ -111,37 +114,75 @@ pub struct ReplayEvaluationResult {
     pub reason: String,
 }
 
-pub fn infer_task_type(message: &str) -> String {
-    let text = message.to_ascii_lowercase();
-    if text.contains("deploy")
-        || text.contains("dashboard")
-        || text.contains("web app")
-        || text.contains("website")
-    {
-        return "app_deploy".to_string();
+fn task_type_for_action_name(action_name: &str) -> Option<&'static str> {
+    match action_name.trim().to_ascii_lowercase().as_str() {
+        "app_deploy" | "app_restart" | "app_stop" | "app_delete" | "app_inspect" => {
+            Some("app_deploy")
+        }
+        "file_read" | "file_write" | "shell" | "code_execute" | "local_cli"
+        | "connector_request" => Some("coding"),
+        "research" | "web_search" | "page_fetch" | "rank_signals" => Some("research"),
+        "gmail_scan" | "gmail_reply" | "calendar_today" | "calendar_list" | "calendar_free"
+        | "calendar_create" | "notify_user" => Some("communication"),
+        _ => None,
     }
-    if text.contains("code")
-        || text.contains("rust")
-        || text.contains("python")
-        || text.contains("bug")
-        || text.contains("test")
-    {
-        return "coding".to_string();
+}
+
+pub fn infer_task_type_from_action_names<I, S>(action_names: I) -> String
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut saw_app = false;
+    let mut saw_code = false;
+    let mut saw_research = false;
+    let mut saw_communication = false;
+
+    for action_name in action_names {
+        match task_type_for_action_name(action_name.as_ref()) {
+            Some("app_deploy") => saw_app = true,
+            Some("coding") => saw_code = true,
+            Some("research") => saw_research = true,
+            Some("communication") => saw_communication = true,
+            _ => {}
+        }
     }
-    if text.contains("research")
-        || text.contains("analyze")
-        || text.contains("compare")
-        || text.contains("report")
-    {
-        return "research".to_string();
+
+    if saw_app {
+        "app_deploy".to_string()
+    } else if saw_code {
+        "coding".to_string()
+    } else if saw_research {
+        "research".to_string()
+    } else if saw_communication {
+        "communication".to_string()
+    } else {
+        "general".to_string()
     }
-    if text.contains("email")
-        || text.contains("calendar")
-        || text.contains("message")
-        || text.contains("reply")
-    {
-        return "communication".to_string();
+}
+
+pub fn infer_task_type_from_request_context(
+    request_shape: Option<&RequestShapeAssessment>,
+    actions: &[ActionDef],
+) -> String {
+    let from_actions =
+        infer_task_type_from_action_names(actions.iter().map(|action| action.name.as_str()));
+    if from_actions != "general" {
+        return from_actions;
     }
+
+    if let Some(shape) = request_shape {
+        if shape.shape_is("app") {
+            return "app_deploy".to_string();
+        }
+        if shape.is_integration_request() {
+            return "communication".to_string();
+        }
+        if shape.shape_is("watcher") || shape.shape_is("goal") || shape.is_execution_request() {
+            return "general".to_string();
+        }
+    }
+
     "general".to_string()
 }
 
@@ -225,6 +266,39 @@ pub fn evaluate_canary_by_policy_version(
         min_success_gain,
         max_sign_test_p_value,
     )
+}
+
+#[cfg(test)]
+mod task_type_tests {
+    use super::*;
+
+    #[test]
+    fn infers_task_type_from_action_names_without_message_keywords() {
+        let task_type =
+            infer_task_type_from_action_names(["app_restart", "file_write", "notify_user"]);
+        assert_eq!(task_type, "app_deploy");
+
+        let task_type = infer_task_type_from_action_names(["research", "page_fetch"]);
+        assert_eq!(task_type, "research");
+    }
+
+    #[test]
+    fn infers_task_type_from_request_shape_when_actions_are_empty() {
+        let shape = RequestShapeAssessment {
+            shape: "integration".to_string(),
+            execution_mode: "immediate".to_string(),
+            confidence: 0.91,
+            should_confirm: false,
+            confirmation_question: None,
+            reasoning: String::new(),
+            preferred_actions: vec![],
+            integration_id: None,
+            ..Default::default()
+        };
+
+        let task_type = infer_task_type_from_request_context(Some(&shape), &[]);
+        assert_eq!(task_type, "communication");
+    }
 }
 
 pub fn evaluate_experience_canary_by_prompt_version(

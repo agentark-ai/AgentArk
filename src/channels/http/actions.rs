@@ -465,38 +465,61 @@ struct ImportRiskSummary {
     contextual_findings: usize,
 }
 
-fn is_contextual_import_finding(finding: &crate::security::action_guard::AnalysisFinding) -> bool {
-    let is_placeholder = |raw: &str| {
-        let lower = raw.to_ascii_lowercase();
-        let placeholders = [
-            "your-api-key",
-            "your_api_key",
-            "example",
-            "dummy",
-            "changeme",
-            "replace_me",
-            "test-key",
-            "sample-key",
-        ];
-        lower.contains('$')
-            || lower.contains("${")
-            || placeholders.iter().any(|token| lower.contains(token))
-    };
+#[derive(Debug, Clone, Copy)]
+struct ImportRiskPolicy {
+    severity_score_divisor: f32,
+    max_score: f32,
+    contextual_discount_strong_ratio: f32,
+    contextual_discount_strong_multiplier: f32,
+    contextual_discount_partial_ratio: f32,
+    contextual_discount_partial_multiplier: f32,
+    contextual_floor_ratio: f32,
+    contextual_malicious_floor: f32,
+    review_floor: f32,
+    risky_floor: f32,
+    secure_band_max: f32,
+    review_band_max: f32,
+}
 
-    match finding.category {
-        crate::security::action_guard::FindingCategory::NetworkAccess
-        | crate::security::action_guard::FindingCategory::EnvironmentAccess => true,
-        crate::security::action_guard::FindingCategory::CredentialPattern => {
-            is_placeholder(&finding.matched_text)
-        }
-        _ => false,
-    }
+const IMPORT_RISK_POLICY: ImportRiskPolicy = ImportRiskPolicy {
+    severity_score_divisor: 4.0,
+    max_score: 10.0,
+    contextual_discount_strong_ratio: 0.75,
+    contextual_discount_strong_multiplier: 0.65,
+    contextual_discount_partial_ratio: 0.5,
+    contextual_discount_partial_multiplier: 0.8,
+    contextual_floor_ratio: 0.8,
+    contextual_malicious_floor: 4.0,
+    review_floor: 5.0,
+    risky_floor: 8.5,
+    secure_band_max: 5.0,
+    review_band_max: 8.0,
+};
+
+fn is_contextual_import_finding(finding: &crate::security::action_guard::AnalysisFinding) -> bool {
+    finding.is_contextual_import_signal()
+}
+
+fn import_finding_json(
+    finding: &crate::security::action_guard::AnalysisFinding,
+) -> serde_json::Value {
+    serde_json::json!({
+        "category": format!("{:?}", finding.category),
+        "label": finding.import_label(),
+        "description": finding.description,
+        "explanation": finding.import_explanation(),
+        "matched_text": finding.matched_text,
+        "line": finding.line_number,
+        "severity": finding.severity,
+        "contextual": finding.is_contextual_import_signal(),
+    })
 }
 
 fn compute_import_risk_summary(
     static_analysis: &crate::security::action_guard::StaticAnalysisResult,
     blocked: bool,
 ) -> ImportRiskSummary {
+    let policy = IMPORT_RISK_POLICY;
     let total_findings = static_analysis.findings.len();
     let contextual_findings = static_analysis
         .findings
@@ -504,42 +527,43 @@ fn compute_import_risk_summary(
         .filter(|f| is_contextual_import_finding(f))
         .count();
 
-    let mut score = ((static_analysis.total_severity as f32) / 4.0).min(10.0);
+    let mut score = ((static_analysis.total_severity as f32) / policy.severity_score_divisor)
+        .min(policy.max_score);
     let contextual_ratio = if total_findings > 0 {
         (contextual_findings as f32) / (total_findings as f32)
     } else {
         0.0
     };
-    if contextual_ratio >= 0.75 {
-        score *= 0.65;
-    } else if contextual_ratio >= 0.5 {
-        score *= 0.8;
+    if contextual_ratio >= policy.contextual_discount_strong_ratio {
+        score *= policy.contextual_discount_strong_multiplier;
+    } else if contextual_ratio >= policy.contextual_discount_partial_ratio {
+        score *= policy.contextual_discount_partial_multiplier;
     }
 
     match static_analysis.threat_level {
         crate::security::action_guard::ThreatLevel::Malicious => {
             // When most findings are standard integration patterns (env refs,
-            // placeholder keys, curl/https), don't force the score to 8.5.
-            if contextual_ratio >= 0.8 {
-                score = score.max(4.0);
+            // credential examples, curl/https), keep the score explainable.
+            if contextual_ratio >= policy.contextual_floor_ratio {
+                score = score.max(policy.contextual_malicious_floor);
             } else {
-                score = score.max(8.5);
+                score = score.max(policy.risky_floor);
             }
         }
         crate::security::action_guard::ThreatLevel::Suspicious => {
-            score = score.max(5.0);
+            score = score.max(policy.review_floor);
         }
         crate::security::action_guard::ThreatLevel::Clean => {}
     }
-    if blocked && contextual_ratio < 0.8 {
-        score = score.max(8.5);
+    if blocked && contextual_ratio < policy.contextual_floor_ratio {
+        score = score.max(policy.risky_floor);
     } else if blocked {
-        score = score.max(5.0);
+        score = score.max(policy.review_floor);
     }
-    let score_10 = ((score.clamp(0.0, 10.0)) * 10.0).round() / 10.0;
-    let band = if score_10 < 5.0 {
+    let score_10 = ((score.clamp(0.0, policy.max_score)) * 10.0).round() / 10.0;
+    let band = if score_10 < policy.secure_band_max {
         "secure"
-    } else if score_10 < 8.0 {
+    } else if score_10 < policy.review_band_max {
         "review"
     } else {
         "risky"
@@ -1048,15 +1072,7 @@ pub(super) async fn create_action(
                     .static_analysis
                     .findings
                     .iter()
-                    .map(|f| {
-                        serde_json::json!({
-                            "category": format!("{:?}", f.category),
-                            "description": f.description,
-                            "matched_text": f.matched_text,
-                            "line": f.line_number,
-                            "severity": f.severity,
-                        })
-                    })
+                    .map(import_finding_json)
                     .collect();
                 (
                     blocked,
@@ -2042,15 +2058,7 @@ pub(crate) async fn import_action_from_content_with_agent(
                     .static_analysis
                     .findings
                     .iter()
-                    .map(|f| {
-                        serde_json::json!({
-                            "category": format!("{:?}", f.category),
-                            "description": f.description,
-                            "matched_text": f.matched_text,
-                            "line": f.line_number,
-                            "severity": f.severity,
-                        })
-                    })
+                    .map(import_finding_json)
                     .collect();
                 (
                     blocked,

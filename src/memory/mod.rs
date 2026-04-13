@@ -104,6 +104,7 @@ pub struct CognitiveMemory {
     decay_config: MemoryDecayConfig,
 }
 
+#[cfg(test)]
 fn truncate_chars(input: &str, max_chars: usize) -> String {
     let mut chars = input.chars();
     let truncated: String = chars.by_ref().take(max_chars).collect();
@@ -125,10 +126,7 @@ const MEMORY_CONSOLIDATION_LEASE_TTL_SECS: i64 = 30 * 60;
 static MEMORY_CONSOLIDATION_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 fn shortlist_limit(multiplier: usize, min: usize, max: usize, limit: usize) -> u64 {
-    let bounded = limit
-        .max(1)
-        .saturating_mul(multiplier)
-        .clamp(min, max);
+    let bounded = limit.max(1).saturating_mul(multiplier).clamp(min, max);
     bounded as u64
 }
 
@@ -309,32 +307,6 @@ impl CognitiveMemory {
         Ok(id)
     }
 
-    /// Add a semantic fact
-    pub async fn add_fact(
-        &self,
-        fact: String,
-        confidence: f32,
-        sources: Vec<Uuid>,
-        project_id: Option<&str>,
-    ) -> Result<Uuid> {
-        let id = Uuid::new_v4();
-        let embedding = self.embed_text(&fact).await;
-        let sources_json = serde_json::to_string(&sources)?;
-
-        self.encrypted_storage
-            .insert_fact_encrypted(
-                &id.to_string(),
-                &fact,
-                confidence,
-                &sources_json,
-                embedding,
-                project_id,
-            )
-            .await?;
-
-        Ok(id)
-    }
-
     async fn load_semantic_facts_for_scope(
         &self,
         project_id: Option<&str>,
@@ -393,8 +365,8 @@ impl CognitiveMemory {
                     merged.push(fact);
                 }
             }
-              merged
-          } else {
+            merged
+        } else {
             match self.encrypted_storage.get_facts_decrypted().await {
                 Ok(rows) => rows,
                 Err(error) => {
@@ -429,7 +401,11 @@ impl CognitiveMemory {
                     }
                 }
             } else {
-                match self.encrypted_storage.get_all_episodes_for_scoring_decrypted().await {
+                match self
+                    .encrypted_storage
+                    .get_all_episodes_for_scoring_decrypted()
+                    .await
+                {
                     Ok(rows) => rows,
                     Err(error) => {
                         tracing::warn!("Episode fallback load failed: {}", error);
@@ -722,119 +698,9 @@ impl CognitiveMemory {
         Ok(top_entries)
     }
 
-    /// Check if a new fact is too similar to any existing fact (deduplication)
-    /// Returns true if a duplicate/near-duplicate exists
-    async fn is_duplicate_fact(&self, new_fact: &str, project_id: Option<&str>) -> bool {
-        let existing = self.load_semantic_facts_for_scope(project_id).await;
-        if existing.is_empty() {
-            return false;
-        }
-
-        let new_lower = new_fact.to_lowercase();
-        let new_words: std::collections::HashSet<&str> = new_lower
-            .split_whitespace()
-            .filter(|w| w.len() > 2)
-            .collect();
-
-        for fact in &existing {
-            let existing_lower = fact.fact.to_lowercase();
-
-            // Exact or near-exact match
-            if existing_lower == new_lower {
-                return true;
-            }
-
-            // Substring containment (one contains the other)
-            if existing_lower.contains(&new_lower) || new_lower.contains(&existing_lower) {
-                return true;
-            }
-
-            // High word overlap (Jaccard > 0.7)
-            let existing_words: std::collections::HashSet<&str> = existing_lower
-                .split_whitespace()
-                .filter(|w| w.len() > 2)
-                .collect();
-
-            if !new_words.is_empty() && !existing_words.is_empty() {
-                let intersection = new_words.intersection(&existing_words).count();
-                let union = new_words.union(&existing_words).count();
-                let jaccard = intersection as f32 / union as f32;
-                if jaccard > 0.7 {
-                    return true;
-                }
-            }
-        }
-
-        false
-    }
-
-    /// Check if a fact passes minimum quality bar for long-term storage
-    fn is_quality_fact(fact_text: &str) -> bool {
-        let text = fact_text.trim();
-
-        // Too short to be useful
-        if text.len() < 15 {
-            return false;
-        }
-
-        // Reject facts that are just describing a request/action (not durable knowledge)
-        let transient_patterns = [
-            "user requested",
-            "user asked",
-            "user wants to",
-            "user said",
-            "was requested",
-            "was asked",
-            "tried to",
-            "attempted to",
-            "failed to",
-            "error occurred",
-            "error when",
-            "socket not found",
-            "connection failed",
-            "docker socket",
-            "execution failed",
-            "generated a",
-            "created a",
-            "built a",
-            "ran a",
-            "the conversation",
-            "in this session",
-            "during the chat",
-            "the system",
-            "the agent",
-            "the bot",
-        ];
-        let lower = text.to_lowercase();
-        for pattern in &transient_patterns {
-            if lower.contains(pattern) {
-                return false;
-            }
-        }
-
-        // Reject if it's mostly about a single transient event
-        let event_starters = [
-            "a qr code",
-            "a code was",
-            "code was executed",
-            "the code",
-            "an image was",
-            "a file was",
-            "output was",
-        ];
-        for starter in &event_starters {
-            if lower.starts_with(starter) {
-                return false;
-            }
-        }
-
-        true
-    }
-
-    /// LLM-powered memory consolidation
-    /// Groups unconsolidated episodes, sends batches to LLM for summarization/dedup,
-    /// stores consolidated facts, and marks episodes as processed.
-    pub async fn run_llm_consolidation(&self, llm: &crate::core::LlmClient) -> Result<String> {
+    /// Legacy episode consolidation no longer writes semantic facts.
+    /// User memory is captured by the lifecycle-aware chat memory path.
+    pub async fn run_llm_consolidation(&self, _llm: &crate::core::LlmClient) -> Result<String> {
         let Ok(_guard) = MEMORY_CONSOLIDATION_LOCK.try_lock() else {
             return Ok("Memory consolidation already in progress.".to_string());
         };
@@ -850,46 +716,12 @@ impl CognitiveMemory {
         {
             true => {}
             false => {
-                return Ok("Memory consolidation already in progress on another worker.".to_string())
+                return Ok(
+                    "Memory consolidation already in progress on another worker.".to_string(),
+                )
             }
         }
-        let heartbeat_storage = self.storage.clone();
-        let heartbeat_owner = lease_owner.clone();
-        let (lease_stop_tx, mut lease_stop_rx) = tokio::sync::watch::channel(false);
-        let lease_heartbeat = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    changed = lease_stop_rx.changed() => {
-                        if changed.is_err() || *lease_stop_rx.borrow() {
-                            break;
-                        }
-                    }
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-                        match heartbeat_storage
-                            .refresh_kv_lease(
-                                MEMORY_CONSOLIDATION_LEASE_KEY,
-                                &heartbeat_owner,
-                                MEMORY_CONSOLIDATION_LEASE_TTL_SECS,
-                            )
-                            .await
-                        {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                tracing::warn!("Memory consolidation lease heartbeat lost ownership");
-                                break;
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    "Memory consolidation lease heartbeat refresh failed: {}",
-                                    error
-                                );
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        });
+
         let result = async {
             let episodes = self
                 .encrypted_storage
@@ -899,282 +731,19 @@ impl CognitiveMemory {
                 return Ok("No unconsolidated episodes found.".to_string());
             }
 
-        tracing::info!("LLM consolidation: processing {} episodes", episodes.len());
-
-        // Load existing facts for dedup context (decrypted)
-        let existing_facts: Vec<String> = self
-            .encrypted_storage
-            .get_facts_decrypted()
-            .await
-            .unwrap_or_default()
-            .iter()
-            .map(|f| f.fact.clone())
-            .collect();
-
-        let existing_facts_text = if existing_facts.is_empty() {
-            "None yet.".to_string()
-        } else {
-            existing_facts
+            let episode_ids = episodes
                 .iter()
-                .enumerate()
-                .map(|(i, f)| format!("  {}. {}", i + 1, f))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-
-        // Group episodes into batches of ~10 for LLM processing
-        let batch_size = 10;
-        let mut total_facts = 0;
-        let mut skipped_dupes = 0;
-        let mut skipped_quality = 0;
-        let mut consolidated_episode_count = 0;
-        let mut fact_store_failures = 0;
-        let mut summaries = Vec::new();
-
-        for batch in episodes.chunks(batch_size) {
-            match self
-                .storage
-                .refresh_kv_lease(
-                    MEMORY_CONSOLIDATION_LEASE_KEY,
-                    &lease_owner,
-                    MEMORY_CONSOLIDATION_LEASE_TTL_SECS,
-                )
-                .await
-            {
-                Ok(true) => {}
-                Ok(false) => {
-                    tracing::warn!("Lost memory consolidation lease before batch execution");
-                    summaries.push(
-                        "Stopped remaining batches after losing the consolidation lease."
-                            .to_string(),
-                    );
-                    break;
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        "Failed to refresh memory consolidation lease before batch: {}",
-                        error
-                    );
-                    summaries.push(format!(
-                        "Stopped remaining batches after lease refresh failure: {}",
-                        error
-                    ));
-                    break;
-                }
-            }
-
-            // Build a prompt with the batch of memories
-            let memories_text: String = batch
-                .iter()
-                .enumerate()
-                .map(|(i, ep)| {
-                    let timestamp = &ep.timestamp;
-                    let content = truncate_chars(&ep.content, 300);
-                    format!("{}. [{}] {}", i + 1, timestamp, content)
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            let consolidation_prompt = format!(
-                r#"You are a STRICT memory consolidation engine for a personal AI assistant. Your job is to extract ONLY information worth remembering permanently about the USER — like how a close friend would naturally remember things about someone over time.
-
-MEMORIES TO PROCESS:
-{memories}
-
-ALREADY STORED FACTS (do NOT duplicate these):
-{existing}
-
-WHAT TO EXTRACT (only if clearly present):
-- PREF: User preferences, likes, dislikes, habits, communication style
-  Example: "PREF: User prefers dark mode and minimal UIs"
-  Example: "PREF: User communicates directly and dislikes verbose explanations"
-- FACT: Durable personal facts about the user — name, job, skills, location, tools they use
-  Example: "FACT: User is a backend developer working with Rust and Python"
-  Example: "FACT: User's name is Alex and they work at a startup"
-- PATTERN: Recurring behaviors or workflows the user consistently follows
-  Example: "PATTERN: User typically tests features by asking the agent to generate QR codes"
-
-WHAT TO REJECT (never extract these):
-- Individual requests ("user asked to generate a QR code") — these are transient actions, not lasting knowledge
-- System errors or technical failures ("Docker socket not found", "connection failed")
-- Descriptions of what the agent/system did ("agent executed code", "response was generated")
-- One-time events that don't reveal anything lasting about the user
-- Anything already captured in the existing facts above (even if worded differently)
-- Greetings, small talk, or conversational filler
-- Facts about the AI system itself rather than the user
-
-RULES:
-- Be extremely selective — it's better to extract NOTHING than to store noise
-- Each fact must be about the USER, not about a specific interaction
-- Each fact must be useful weeks or months from now
-- If the memories are routine interactions with no personal insight, respond with "NO_FACTS"
-- Maximum 3 items per batch — quality over quantity
-
-Output ONLY prefixed lines (FACT:/PATTERN:/PREF:) or "NO_FACTS". Nothing else."#,
-                memories = memories_text,
-                existing = existing_facts_text,
-            );
-
-            // Use simple chat (no tools needed)
-            let mut should_mark_batch = false;
-            match llm.chat(
-                "You are a strict memory filter. Only extract genuinely useful, durable personal facts about the user. When in doubt, output NO_FACTS.",
-                &consolidation_prompt,
-                &[],
-                &[],
-            ).await {
-                Ok(response) => {
-                    let text = response.content.trim();
-                    if text == "NO_FACTS" || text.is_empty() {
-                        should_mark_batch = true;
-                        summaries.push(format!("Batch: {} episodes -> no durable facts", batch.len()));
-                    } else {
-                        // Parse extracted facts
-                        let mut batch_fact_store_failed = false;
-                        for line in text.lines() {
-                            let line = line.trim();
-                            if line.is_empty() { continue; }
-
-                            let (fact_text, confidence) = if line.starts_with("FACT: ") {
-                                (line.strip_prefix("FACT: ").unwrap_or(line), 0.7)
-                            } else if line.starts_with("PATTERN: ") {
-                                (line.strip_prefix("PATTERN: ").unwrap_or(line), 0.8)
-                            } else if line.starts_with("PREF: ") {
-                                (line.strip_prefix("PREF: ").unwrap_or(line), 0.9)
-                            } else {
-                                continue; // Skip unformatted lines
-                            };
-
-                            // Quality gate: reject trivial/transient facts
-                            if !Self::is_quality_fact(fact_text) {
-                                tracing::debug!("Rejected low-quality fact ({} chars)", fact_text.len());
-                                skipped_quality += 1;
-                                continue;
-                            }
-
-                            // Dedup gate: reject if too similar to existing facts
-                            if self.is_duplicate_fact(fact_text, None).await {
-                                tracing::debug!("Rejected duplicate fact ({} chars)", fact_text.len());
-                                skipped_dupes += 1;
-                                continue;
-                            }
-
-                            // Store as semantic fact
-                            let source_ids: Vec<uuid::Uuid> = batch.iter()
-                                .filter_map(|ep| uuid::Uuid::parse_str(&ep.id).ok())
-                                .collect();
-
-                            if let Err(e) = self.add_fact(
-                                fact_text.to_string(),
-                                confidence,
-                                source_ids,
-                                None,
-                            ).await {
-                                tracing::warn!("Failed to store consolidated fact: {}", e);
-                                batch_fact_store_failed = true;
-                                fact_store_failures += 1;
-                            } else {
-                                total_facts += 1;
-                            }
-                        }
-
-                        if batch_fact_store_failed {
-                            summaries.push(format!(
-                                "Batch deferred for retry after fact-write failure ({} episodes)",
-                                batch.len()
-                            ));
-                        } else {
-                            should_mark_batch = true;
-                            summaries.push(format!(
-                                "Batch: {} episodes -> {} lines",
-                                batch.len(),
-                                text.lines().count()
-                            ));
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("LLM consolidation batch failed: {}", e);
-                    summaries.push(format!("Batch failed: {}", e));
-                }
-            }
-
-            if should_mark_batch {
-                let batch_ids = batch
-                    .iter()
-                    .map(|episode| episode.id.clone())
-                    .collect::<Vec<_>>();
-                match self.storage.mark_episodes_consolidated(&batch_ids).await {
-                    Ok(()) => {
-                        consolidated_episode_count += batch.len();
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            "Failed to mark episodes consolidated for batch: {}",
-                            error
-                        );
-                        summaries.push(format!(
-                            "Failed to mark {} episodes consolidated: {}",
-                            batch.len(),
-                            error
-                        ));
-                    }
-                }
-            }
-
-            match self
-                .storage
-                .refresh_kv_lease(
-                    MEMORY_CONSOLIDATION_LEASE_KEY,
-                    &lease_owner,
-                    MEMORY_CONSOLIDATION_LEASE_TTL_SECS,
-                )
-                .await
-            {
-                Ok(true) => {}
-                Ok(false) => {
-                    tracing::warn!("Lost memory consolidation lease after batch execution");
-                    summaries.push(
-                        "Stopped remaining batches after losing the consolidation lease."
-                            .to_string(),
-                    );
-                    break;
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        "Failed to refresh memory consolidation lease after batch: {}",
-                        error
-                    );
-                    summaries.push(format!(
-                        "Stopped remaining batches after lease refresh failure: {}",
-                        error
-                    ));
-                    break;
-                }
-            }
-        }
-
+                .map(|episode| episode.id.clone())
+                .collect::<Vec<_>>();
+            self.storage.mark_episodes_consolidated(&episode_ids).await?;
             let summary = format!(
-                "Consolidated {} episodes into {} facts (skipped {} dupes, {} low-quality, {} fact-write failures). {}",
-                consolidated_episode_count,
-                total_facts,
-                skipped_dupes,
-                skipped_quality,
-                fact_store_failures,
-                summaries.join(" | ")
+                "Skipped legacy semantic-fact consolidation for {} episodes; lifecycle-aware chat memory capture is the durable user-memory writer.",
+                episode_ids.len()
             );
-            tracing::info!("LLM consolidation complete: {}", summary);
+            tracing::info!("Legacy memory consolidation disabled: {}", summary);
             Ok(summary)
         }
         .await;
-
-        let _ = lease_stop_tx.send(true);
-        if let Err(error) = lease_heartbeat.await {
-            tracing::warn!(
-                "Failed to join memory consolidation lease heartbeat: {}",
-                error
-            );
-        }
 
         if let Err(error) = self
             .storage
@@ -1186,7 +755,6 @@ Output ONLY prefixed lines (FACT:/PATTERN:/PREF:) or "NO_FACTS". Nothing else."#
 
         result
     }
-
     /// Get total entry count
     pub fn entry_count(&self) -> usize {
         self.episode_count.load(Ordering::Relaxed)

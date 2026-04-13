@@ -76,6 +76,7 @@ async fn load_config(agent: &Agent) -> Result<Option<SignalChannelConfig>> {
     Ok(agent.config.signal.clone())
 }
 
+#[allow(dead_code)]
 async fn load_destination(agent: &Agent) -> Result<Option<SignalDestinationContext>> {
     if let Ok(Some(raw)) = agent.storage.get(LAST_DESTINATION_STORAGE_KEY).await {
         if let Ok(context) = serde_json::from_slice::<SignalDestinationContext>(&raw) {
@@ -114,13 +115,7 @@ fn http_client() -> Result<reqwest::Client> {
         .build()?)
 }
 
-async fn resolve_destination(
-    agent: &Agent,
-    config: &SignalChannelConfig,
-) -> Result<SignalDestinationContext> {
-    if let Some(destination) = load_destination(agent).await? {
-        return Ok(destination);
-    }
+fn resolve_destination(config: &SignalChannelConfig) -> Result<SignalDestinationContext> {
     if !config.default_recipient.trim().is_empty() || !config.default_group_id.trim().is_empty() {
         return Ok(SignalDestinationContext {
             recipient: if config.default_recipient.trim().is_empty() {
@@ -137,9 +132,7 @@ async fn resolve_destination(
             sender_label: None,
         });
     }
-    Err(anyhow!(
-        "Signal has no delivery destination yet; configure a default peer or wait for an inbound message"
-    ))
+    Err(anyhow!("Signal has no configured notification destination"))
 }
 
 async fn send_to_destination(
@@ -192,9 +185,8 @@ pub async fn send_message(agent: &Agent, text: &str) -> Result<()> {
     let config = load_config(agent)
         .await?
         .ok_or_else(|| anyhow!("Signal is not configured"))?;
-    let destination = resolve_destination(agent, &config).await?;
+    let destination = resolve_destination(&config)?;
     send_to_destination(&config, &destination, text).await?;
-    persist_destination(agent, &destination).await?;
     Ok(())
 }
 
@@ -292,4 +284,23 @@ pub async fn handle_webhook(
     send_to_destination(&config, &destination, &reply).await?;
     persist_destination(&agent, &destination).await?;
     Ok("ok".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proactive_signal_destination_uses_configured_target_only() {
+        let config = SignalChannelConfig {
+            bridge_url: "https://bridge.example.com".to_string(),
+            bridge_token: "token".to_string(),
+            default_recipient: "signal-user".to_string(),
+            default_group_id: String::new(),
+        };
+
+        let destination = resolve_destination(&config).unwrap();
+        assert_eq!(destination.recipient.as_deref(), Some("signal-user"));
+        assert_eq!(destination.group_id, None);
+    }
 }

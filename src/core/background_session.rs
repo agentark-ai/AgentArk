@@ -361,24 +361,28 @@ impl BackgroundSessionManager {
         self.sessions.read().await.get(normalized).cloned()
     }
 
-    pub async fn find_active_for_conversation(
+    pub async fn list_for_conversation(
         &self,
         conversation_id: &str,
-    ) -> Option<BackgroundSession> {
+        include_closed: bool,
+    ) -> Vec<BackgroundSession> {
         let conversation_id = conversation_id.trim();
         if conversation_id.is_empty() {
-            return None;
+            return Vec::new();
         }
-        self.sessions
+        let mut sessions = self
+            .sessions
             .read()
             .await
             .values()
             .filter(|session| {
-                !session.status.is_closed()
+                (include_closed || !session.status.is_closed())
                     && session.conversation_id.as_deref().map(str::trim) == Some(conversation_id)
             })
             .cloned()
-            .max_by(|left, right| left.updated_at.cmp(&right.updated_at))
+            .collect::<Vec<_>>();
+        sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        sessions
     }
 
     pub async fn create(
@@ -922,6 +926,21 @@ impl BackgroundSessionManager {
                             actor,
                         ),
                     );
+                    if session.linked_task_ids.is_empty()
+                        && session.linked_watcher_ids.is_empty()
+                        && !session.status.is_closed()
+                    {
+                        session.status = BackgroundSessionStatus::Completed;
+                        push_event(
+                            &mut session.events,
+                            build_event(
+                                "completed",
+                                "Background session closed after all linked work moved elsewhere.",
+                                None,
+                                actor,
+                            ),
+                        );
+                    }
                     changed = true;
                 }
             }

@@ -1,7 +1,10 @@
-//! Agent configuration with encryption for sensitive data
+//! Agent configuration with encryption for sensitive data.
 //!
-//! Non-sensitive config is stored in config.toml (readable)
-//! Sensitive data (API keys, tokens) is stored encrypted in secrets.enc
+//! Mutable runtime settings are stored in encrypted Postgres KV records when
+//! storage is available. Only bootstrap metadata needed before the database is
+//! unlocked stays on disk. This module participates in the user-owned side of
+//! the data contract: `/app/config/bootstrap.toml` and encrypted `settings:*`
+//! KV records must survive release updates.
 
 use super::llm::LlmProvider;
 use super::runtime_image;
@@ -13,22 +16,54 @@ use crate::channels::{
     teams::TeamsTransportConfig, wechat::WeChatChannelConfig, whatsapp::WhatsAppChannelConfig,
 };
 use crate::crypto::KeyManager;
+use crate::security::ModelPrivacyConfig;
 use anyhow::{anyhow, Result};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::runtime::Builder;
 
 /// Global key manager set at startup (from master password or keyfile).
 /// All SecureConfigManager instances use this when available, ensuring
 /// consistent encryption across the entire process after password changes.
 static GLOBAL_KEY_MANAGER: std::sync::OnceLock<std::sync::RwLock<Option<Arc<KeyManager>>>> =
     std::sync::OnceLock::new();
+static GLOBAL_SETTINGS_STORAGE: std::sync::OnceLock<
+    std::sync::RwLock<Option<crate::storage::Storage>>,
+> = std::sync::OnceLock::new();
 static SECRETS_FILE_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
 pub const HTTP_API_KEY_TTL_SECS: i64 = 24 * 60 * 60;
+pub(crate) const SETTINGS_BOOTSTRAP_FILE: &str = "bootstrap.toml";
+pub(crate) const SETTINGS_CONFIG_KEY: &str = "settings:agent_config:v2";
+pub(crate) const SETTINGS_SECRETS_KEY: &str = "settings:secrets:v2";
+pub(crate) const SETTINGS_SEARCH_KEY: &str = "settings:search:v1";
+pub(crate) const SETTINGS_RUNTIME_KEY: &str = "settings:runtime:v1";
+pub(crate) const SETTINGS_DISABLED_ACTIONS_KEY: &str = "settings:runtime:disabled_actions:v1";
+pub(crate) const SETTINGS_ACTION_REVIEWS_KEY: &str = "settings:runtime:action_reviews:v1";
+pub(crate) const SETTINGS_REMOVED_BUNDLED_ACTIONS_KEY: &str =
+    "settings:runtime:removed_bundled_actions:v1";
+pub(crate) const SETTINGS_APPROVED_PERMISSIONS_KEY: &str =
+    "settings:security:approved_permissions:v1";
+pub(crate) const SETTINGS_KEY_LINEAGE_KEY: &str = "settings:security:key_lineage:v1";
+pub(crate) const SETTINGS_ENCRYPTED_KV_KEYS: &[&str] = &[
+    SETTINGS_CONFIG_KEY,
+    SETTINGS_SECRETS_KEY,
+    SETTINGS_SEARCH_KEY,
+    SETTINGS_RUNTIME_KEY,
+    SETTINGS_DISABLED_ACTIONS_KEY,
+    SETTINGS_ACTION_REVIEWS_KEY,
+    SETTINGS_REMOVED_BUNDLED_ACTIONS_KEY,
+    SETTINGS_APPROVED_PERMISSIONS_KEY,
+];
 
 fn global_key_manager_cell() -> &'static std::sync::RwLock<Option<Arc<KeyManager>>> {
     GLOBAL_KEY_MANAGER.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+fn global_settings_storage_cell() -> &'static std::sync::RwLock<Option<crate::storage::Storage>> {
+    GLOBAL_SETTINGS_STORAGE.get_or_init(|| std::sync::RwLock::new(None))
 }
 
 fn secrets_file_lock() -> &'static std::sync::Mutex<()> {
@@ -48,6 +83,87 @@ pub fn global_key_manager() -> Option<Arc<KeyManager>> {
         .read()
         .ok()
         .and_then(|guard| guard.clone())
+}
+
+pub fn set_global_settings_storage(storage: crate::storage::Storage) {
+    if let Ok(mut guard) = global_settings_storage_cell().write() {
+        *guard = Some(storage);
+    }
+}
+
+pub fn global_settings_storage() -> Option<crate::storage::Storage> {
+    global_settings_storage_cell()
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BootstrapMetadata {
+    #[serde(default)]
+    deployment_mode: DeploymentMode,
+}
+
+impl Default for BootstrapMetadata {
+    fn default() -> Self {
+        Self {
+            deployment_mode: DeploymentMode::default(),
+        }
+    }
+}
+
+pub fn bootstrap_metadata_path(config_dir: &Path) -> PathBuf {
+    config_dir.join(SETTINGS_BOOTSTRAP_FILE)
+}
+
+pub fn bootstrap_metadata_exists(config_dir: &Path) -> bool {
+    bootstrap_metadata_path(config_dir).exists()
+}
+
+pub fn load_bootstrap_deployment_mode(config_dir: &Path) -> DeploymentMode {
+    std::fs::read_to_string(bootstrap_metadata_path(config_dir))
+        .ok()
+        .and_then(|raw| toml::from_str::<BootstrapMetadata>(&raw).ok())
+        .map(|metadata| metadata.deployment_mode)
+        .unwrap_or_default()
+}
+
+pub fn save_bootstrap_deployment_mode(
+    config_dir: &Path,
+    deployment_mode: DeploymentMode,
+) -> Result<()> {
+    let content = toml::to_string_pretty(&BootstrapMetadata { deployment_mode })?;
+    crate::crypto::atomic_write_file(&bootstrap_metadata_path(config_dir), content.as_bytes())?;
+    Ok(())
+}
+
+fn block_on_storage_future<T, F>(future: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T>> + Send + 'static,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        match handle.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| handle.block_on(future))
+            }
+            _ => {
+                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                std::thread::spawn(move || {
+                    let result = (|| -> Result<T> {
+                        let runtime = Builder::new_current_thread().enable_all().build()?;
+                        runtime.block_on(future)
+                    })();
+                    let _ = tx.send(result);
+                });
+                rx.recv()
+                    .map_err(|_| anyhow!("settings storage worker dropped before completing"))?
+            }
+        }
+    } else {
+        let runtime = Builder::new_current_thread().enable_all().build()?;
+        runtime.block_on(future)
+    }
 }
 
 /// Role determines when a model slot is used
@@ -412,6 +528,9 @@ pub struct AgentConfig {
     /// Optional external trace export
     #[serde(default)]
     pub observability: ObservabilityConfig,
+    /// Controls what sensitive content may enter model prompts.
+    #[serde(default)]
+    pub model_privacy: ModelPrivacyConfig,
     /// Deployment/security posture for the control plane.
     #[serde(default)]
     pub deployment_mode: DeploymentMode,
@@ -462,6 +581,7 @@ impl Default for AgentConfig {
             browser: BrowserConfig::default(),
             tunnel: TunnelConfig::default(),
             observability: ObservabilityConfig::default(),
+            model_privacy: ModelPrivacyConfig::default(),
             deployment_mode: DeploymentMode::default(),
             public_apps: PublicAppsConfig::default(),
             mcp: McpConfig::default(),
@@ -693,6 +813,7 @@ pub const AUTO_APPROVE_BLOCKED: &[&str] = &[
     "file_move",
     "docker_exec",
     "http_request",
+    "lan_discover",
     "gmail_send", // Sending unsolicited emails is always gated
                   // gmail_reply is intentionally NOT blocked — user can enable auto-reply in settings
 ];
@@ -832,6 +953,31 @@ pub struct SecureConfigManager {
     config_dir: std::path::PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct SecureConfigRuntimeState {
+    pub config: AgentConfig,
+    pub config_degraded: bool,
+    pub config_issue: Option<String>,
+    pub secrets_degraded: bool,
+    pub secrets_issue: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StorageKeyLineageStatus {
+    pub local_fingerprint: String,
+    pub stored_fingerprint: Option<String>,
+    pub mismatch: bool,
+    pub initialized: bool,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SettingsKeyLineageRecord {
+    version: u32,
+    fingerprint: String,
+    recorded_at: String,
+}
+
 impl SecureConfigManager {
     /// Create a new secure config manager
     /// Optionally accepts a data_dir for keyfile separation (security hardening)
@@ -883,11 +1029,354 @@ impl SecureConfigManager {
         }
     }
 
+    fn storage_backend(&self) -> Option<crate::storage::Storage> {
+        global_settings_storage()
+    }
+
+    pub(crate) fn uses_storage_backend(&self) -> bool {
+        self.storage_backend().is_some()
+    }
+
+    fn short_fingerprint(fingerprint: &str) -> String {
+        fingerprint.chars().take(12).collect()
+    }
+
+    fn storage_key_lineage_record(&self) -> SettingsKeyLineageRecord {
+        SettingsKeyLineageRecord {
+            version: 1,
+            fingerprint: self.key_manager.fingerprint(),
+            recorded_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    fn load_storage_key_lineage_record(
+        &self,
+    ) -> Result<(Option<SettingsKeyLineageRecord>, Option<String>)> {
+        let Some(storage) = self.storage_backend() else {
+            return Ok((None, None));
+        };
+        let raw =
+            block_on_storage_future(async move { storage.get(SETTINGS_KEY_LINEAGE_KEY).await })?;
+        let Some(raw) = raw else {
+            return Ok((None, None));
+        };
+        match serde_json::from_slice::<SettingsKeyLineageRecord>(&raw) {
+            Ok(record) => Ok((Some(record), None)),
+            Err(error) => Ok((
+                None,
+                Some(format!(
+                    "Stored key-lineage metadata is unreadable: {}",
+                    error
+                )),
+            )),
+        }
+    }
+
+    fn persist_storage_key_lineage_record(&self, record: &SettingsKeyLineageRecord) -> Result<()> {
+        let Some(storage) = self.storage_backend() else {
+            anyhow::bail!("settings storage backend is unavailable");
+        };
+        let payload = serde_json::to_vec(record)?;
+        block_on_storage_future(
+            async move { storage.set(SETTINGS_KEY_LINEAGE_KEY, &payload).await },
+        )
+    }
+
+    fn probe_existing_settings_payloads(&self) -> Result<Option<String>> {
+        let Some(storage) = self.storage_backend() else {
+            return Ok(None);
+        };
+        let key_manager = self.key_manager.clone();
+        block_on_storage_future(async move {
+            for key in SETTINGS_ENCRYPTED_KV_KEYS {
+                let Some(raw) = storage.get(key).await? else {
+                    continue;
+                };
+                if raw.is_empty() {
+                    continue;
+                }
+                if key_manager.decrypt(&raw).is_ok() {
+                    continue;
+                }
+                if serde_json::from_slice::<serde_json::Value>(&raw).is_ok() {
+                    continue;
+                }
+                return Ok(Some(format!(
+                    "Stored settings payload '{}' cannot be decrypted with the active key and does not look like legacy plaintext JSON.",
+                    key
+                )));
+            }
+            Ok(None)
+        })
+    }
+
+    pub fn verify_or_initialize_storage_key_lineage(&self) -> Result<StorageKeyLineageStatus> {
+        let local_fingerprint = self.key_manager.fingerprint();
+        if !self.uses_storage_backend() {
+            return Ok(StorageKeyLineageStatus {
+                local_fingerprint,
+                stored_fingerprint: None,
+                mismatch: false,
+                initialized: false,
+                detail: None,
+            });
+        }
+
+        let (record, record_issue) = self.load_storage_key_lineage_record()?;
+        if let Some(record) = record {
+            if record.fingerprint == local_fingerprint {
+                return Ok(StorageKeyLineageStatus {
+                    local_fingerprint,
+                    stored_fingerprint: Some(record.fingerprint),
+                    mismatch: false,
+                    initialized: false,
+                    detail: None,
+                });
+            }
+
+            return Ok(StorageKeyLineageStatus {
+                local_fingerprint: local_fingerprint.clone(),
+                stored_fingerprint: Some(record.fingerprint.clone()),
+                mismatch: true,
+                initialized: false,
+                detail: Some(format!(
+                    "Settings storage key lineage mismatch: Postgres expects key fingerprint {} but the active config volume provides {}. This usually means the database volume and /app/config volume came from different installs or restore points.",
+                    Self::short_fingerprint(&record.fingerprint),
+                    Self::short_fingerprint(&local_fingerprint)
+                )),
+            });
+        }
+
+        if let Some(detail) = self.probe_existing_settings_payloads()? {
+            let mut issue = record_issue.unwrap_or_default();
+            if !issue.is_empty() {
+                issue.push(' ');
+            }
+            issue.push_str(&detail);
+            return Ok(StorageKeyLineageStatus {
+                local_fingerprint,
+                stored_fingerprint: None,
+                mismatch: true,
+                initialized: false,
+                detail: Some(issue),
+            });
+        }
+
+        let record = self.storage_key_lineage_record();
+        self.persist_storage_key_lineage_record(&record)?;
+
+        Ok(StorageKeyLineageStatus {
+            local_fingerprint,
+            stored_fingerprint: Some(record.fingerprint),
+            mismatch: false,
+            initialized: true,
+            detail: record_issue,
+        })
+    }
+
+    fn ensure_storage_key_lineage_writable(&self) -> Result<()> {
+        let lineage = self.verify_or_initialize_storage_key_lineage()?;
+        if lineage.mismatch {
+            anyhow::bail!(
+                "{}",
+                lineage.detail.unwrap_or_else(|| {
+                    "Settings storage key lineage does not match the active config key.".to_string()
+                })
+            );
+        }
+        Ok(())
+    }
+
+    fn default_runtime_agent_config() -> AgentConfig {
+        let mut config = AgentConfig::default();
+        config.memory.retention_enabled = true;
+        config
+    }
+
+    fn recovery_dir(config_dir: &Path) -> PathBuf {
+        config_dir.join("recovery")
+    }
+
+    fn recovery_stem_for_key(key: &str) -> String {
+        let mut stem = String::with_capacity(key.len());
+        for ch in key.chars() {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                stem.push(ch);
+            } else {
+                stem.push('_');
+            }
+        }
+        stem
+    }
+
+    fn persist_unreadable_storage_payload(
+        config_dir: &Path,
+        key: &'static str,
+        encrypted: &[u8],
+        detail: &str,
+    ) -> Result<PathBuf> {
+        #[derive(Serialize)]
+        struct RecoveryMetadata<'a> {
+            key: &'a str,
+            detail: &'a str,
+            captured_at: String,
+        }
+
+        let recovery_dir = Self::recovery_dir(config_dir);
+        std::fs::create_dir_all(&recovery_dir)?;
+
+        let stem = Self::recovery_stem_for_key(key);
+        let payload_path = recovery_dir.join(format!("{}.bin", stem));
+        let metadata_path = recovery_dir.join(format!("{}.json", stem));
+
+        crate::crypto::atomic_write_file(&payload_path, encrypted)?;
+        let metadata = RecoveryMetadata {
+            key,
+            detail,
+            captured_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let metadata_raw = serde_json::to_vec_pretty(&metadata)?;
+        crate::crypto::atomic_write_file(&metadata_path, &metadata_raw)?;
+
+        Ok(payload_path)
+    }
+
+    fn is_recoverable_storage_payload_error(error: &anyhow::Error) -> bool {
+        error
+            .to_string()
+            .contains("Failed to decrypt encrypted settings payload for '")
+    }
+
+    fn load_storage_payload(&self, key: &'static str) -> Result<Option<Vec<u8>>> {
+        let Some(storage) = self.storage_backend() else {
+            return Ok(None);
+        };
+        let key_manager = self.key_manager.clone();
+        let config_dir = self.config_dir.clone();
+        block_on_storage_future(async move {
+            let Some(encrypted) = storage.get(key).await? else {
+                return Ok(None);
+            };
+            if encrypted.is_empty() {
+                return Ok(None);
+            }
+            let decrypted = key_manager.decrypt(&encrypted).map_err(|error| {
+                let mut detail = format!(
+                    "Failed to decrypt encrypted settings payload for '{}': {}",
+                    key, error
+                );
+                match Self::persist_unreadable_storage_payload(
+                    &config_dir,
+                    key,
+                    &encrypted,
+                    &detail,
+                ) {
+                    Ok(path) => {
+                        detail.push_str(&format!(
+                            ". Raw encrypted payload was preserved at {}",
+                            path.display()
+                        ));
+                    }
+                    Err(backup_error) => {
+                        tracing::warn!(
+                            "Failed to preserve unreadable encrypted settings payload for '{}': {}",
+                            key,
+                            backup_error
+                        );
+                    }
+                }
+                anyhow!(detail)
+            })?;
+            Ok(Some(decrypted))
+        })
+    }
+
+    fn save_storage_payload(&self, key: &'static str, payload: &[u8]) -> Result<()> {
+        let Some(storage) = self.storage_backend() else {
+            anyhow::bail!("settings storage backend is unavailable");
+        };
+        let key_manager = self.key_manager.clone();
+        let payload = payload.to_vec();
+        block_on_storage_future(async move {
+            let encrypted = key_manager.encrypt(&payload)?;
+            storage.set(key, &encrypted).await
+        })
+    }
+
+    pub(crate) fn load_encrypted_json<T>(&self, key: &'static str) -> Result<Option<T>>
+    where
+        T: DeserializeOwned + Send + 'static,
+    {
+        let Some(raw) = self.load_storage_payload(key)? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_slice::<T>(&raw)?))
+    }
+
+    pub(crate) fn save_encrypted_json<T>(&self, key: &'static str, value: &T) -> Result<()>
+    where
+        T: Serialize + DeserializeOwned + Send + 'static,
+    {
+        if self.uses_storage_backend() {
+            self.ensure_storage_key_lineage_writable()?;
+            self.ensure_encrypted_json_writable::<T>(key)?;
+        }
+        let payload = serde_json::to_vec(value)?;
+        self.save_storage_payload(key, &payload)
+    }
+
+    fn load_encrypted_json_runtime_state<T>(
+        &self,
+        key: &'static str,
+    ) -> Result<(Option<T>, bool, Option<String>)>
+    where
+        T: DeserializeOwned + Send + 'static,
+    {
+        match self.load_storage_payload(key) {
+            Ok(None) => Ok((None, false, None)),
+            Ok(Some(raw)) => match serde_json::from_slice::<T>(&raw) {
+                Ok(value) => Ok((Some(value), false, None)),
+                Err(error) => {
+                    let detail = format!(
+                        "Failed to parse encrypted settings payload for '{}': {}",
+                        key, error
+                    );
+                    Ok((None, true, Some(detail)))
+                }
+            },
+            Err(error) if Self::is_recoverable_storage_payload_error(&error) => {
+                Ok((None, true, Some(error.to_string())))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn ensure_encrypted_json_writable<T>(&self, key: &'static str) -> Result<()>
+    where
+        T: DeserializeOwned + Send + 'static,
+    {
+        let (_value, degraded, detail) = self.load_encrypted_json_runtime_state::<T>(key)?;
+        if degraded {
+            anyhow::bail!(
+                "Refusing to overwrite encrypted settings payload for '{}': {}. Restore the original key material or repair the stored payload before saving.",
+                key,
+                detail.unwrap_or_else(|| "the current payload is unreadable".to_string())
+            );
+        }
+        Ok(())
+    }
+
     fn secrets_path(&self) -> PathBuf {
         self.config_dir.join("secrets.enc")
     }
 
     pub(crate) fn load_secrets_unlocked(&self) -> Result<Secrets> {
+        if self.uses_storage_backend() {
+            return Ok(self
+                .load_encrypted_json::<Secrets>(SETTINGS_SECRETS_KEY)?
+                .unwrap_or_default());
+        }
+
         let secrets_path = self.secrets_path();
         if !secrets_path.exists() {
             return Ok(Secrets::default());
@@ -917,24 +1406,225 @@ impl SecureConfigManager {
         }
     }
 
-    fn load_secrets_runtime_state_unlocked(&self) -> Result<(Secrets, bool)> {
+    fn load_secrets_runtime_state_unlocked_detail(
+        &self,
+    ) -> Result<(Secrets, bool, Option<String>)> {
         match self.load_secrets_unlocked() {
-            Ok(secrets) => Ok((secrets, false)),
+            Ok(secrets) => Ok((secrets, false, None)),
             Err(e) => {
+                let detail = e.to_string();
                 tracing::error!(
-                    "Failed to decrypt secrets.enc with the active key: {}. \
+                    "Failed to load encrypted settings from storage: {}. \
                      Starting with empty runtime secrets; encrypted data was preserved for recovery.",
-                    e
+                    detail
                 );
-                Ok((Secrets::default(), true))
+                Ok((Secrets::default(), true, Some(detail)))
             }
         }
     }
 
+    fn load_secrets_runtime_state_unlocked(&self) -> Result<(Secrets, bool)> {
+        let (secrets, degraded, _detail) = self.load_secrets_runtime_state_unlocked_detail()?;
+        Ok((secrets, degraded))
+    }
+
+    fn load_config_runtime_state_unlocked(&self) -> Result<(AgentConfig, bool, Option<String>)> {
+        if self.uses_storage_backend() {
+            let (config, degraded, detail) =
+                self.load_encrypted_json_runtime_state::<AgentConfig>(SETTINGS_CONFIG_KEY)?;
+            if let Some(config) = config {
+                return Ok((config, false, None));
+            }
+            if degraded {
+                return Ok((Self::default_runtime_agent_config(), true, detail));
+            }
+
+            let config = Self::default_runtime_agent_config();
+            self.save_config_only(&config)?;
+            return Ok((config, false, None));
+        }
+
+        let config_path = self.config_dir.join("config.toml");
+        if config_path.exists() {
+            let content = std::fs::read_to_string(&config_path)?;
+            return Ok((toml::from_str(&content)?, false, None));
+        }
+
+        let config = Self::default_runtime_agent_config();
+        self.save_config_only(&config)?;
+        Ok((config, false, None))
+    }
+
+    pub fn load_runtime_state(&self) -> Result<SecureConfigRuntimeState> {
+        let (mut config, config_degraded, config_issue) =
+            self.load_config_runtime_state_unlocked()?;
+        if config_degraded {
+            tracing::error!(
+                "Failed to load encrypted agent config from settings storage: {}. \
+                 Starting with default runtime config; encrypted data was preserved for recovery and settings writes will stay blocked until the original key is restored.",
+                config_issue.as_deref().unwrap_or("unknown settings load failure")
+            );
+        }
+
+        let (
+            secrets,
+            _changed,
+            created,
+            rotated,
+            persisted_change,
+            secrets_degraded,
+            secrets_issue,
+        ) = if self.uses_storage_backend() {
+            self.with_secrets_lock(|manager| {
+                let (mut secrets, degraded, detail) =
+                    manager.load_secrets_runtime_state_unlocked_detail()?;
+                let (changed, created, rotated) =
+                    Self::ensure_http_api_key_in_secrets(&mut secrets);
+                let persisted_change = changed && !degraded;
+                if persisted_change {
+                    manager.save_secrets_unlocked(&secrets)?;
+                }
+                Ok((
+                    secrets,
+                    changed,
+                    created,
+                    rotated,
+                    persisted_change,
+                    degraded,
+                    detail,
+                ))
+            })?
+        } else if self.secrets_path().exists() {
+            self.with_secrets_lock(|manager| {
+                let (mut secrets, degraded, detail) =
+                    manager.load_secrets_runtime_state_unlocked_detail()?;
+                let (changed, created, rotated) =
+                    Self::ensure_http_api_key_in_secrets(&mut secrets);
+                let persisted_change = changed && !degraded;
+                if persisted_change {
+                    manager.save_secrets_unlocked(&secrets)?;
+                }
+                Ok((
+                    secrets,
+                    changed,
+                    created,
+                    rotated,
+                    persisted_change,
+                    degraded,
+                    detail,
+                ))
+            })?
+        } else {
+            self.migrate_from_plain_config(&mut config)?;
+
+            let (changed, created, rotated) = self.with_secrets_lock(|manager| {
+                let mut secrets = manager.load_secrets_unlocked()?;
+                let (changed, created, rotated) =
+                    Self::ensure_http_api_key_in_secrets(&mut secrets);
+                if changed {
+                    manager.save_secrets_unlocked(&secrets)?;
+                }
+                Ok((changed, created, rotated))
+            })?;
+
+            let secrets = self.with_secrets_lock(|manager| manager.load_secrets_unlocked())?;
+            (secrets, changed, created, rotated, changed, false, None)
+        };
+
+        if persisted_change {
+            if rotated {
+                tracing::info!("Rotated expired HTTP API key");
+            } else if created {
+                tracing::info!("Generated new HTTP API key for authentication");
+            }
+        }
+        self.inject_secrets(&mut config, &secrets);
+
+        if config.model_pool.slots.is_empty() {
+            let legacy_llm_configured = match &config.llm {
+                LlmProvider::Ollama { base_url, model } => {
+                    !base_url.trim().is_empty() && !model.trim().is_empty()
+                }
+                LlmProvider::Anthropic { api_key, model } => {
+                    !api_key.trim().is_empty() && !model.trim().is_empty()
+                }
+                LlmProvider::OpenAI {
+                    api_key,
+                    model,
+                    base_url,
+                } => {
+                    !api_key.trim().is_empty()
+                        && !model.trim().is_empty()
+                        && (base_url.is_none()
+                            || base_url.as_ref().is_some_and(|url| !url.trim().is_empty()))
+                }
+            };
+            if legacy_llm_configured || config.llm_fallback.is_some() {
+                let primary_slot = ModelSlot {
+                    id: "primary".to_string(),
+                    label: "Primary".to_string(),
+                    role: ModelRole::Primary,
+                    provider: config.llm.clone(),
+                    enabled: true,
+                    capability_tier: ModelCapabilityTier::Balanced,
+                    cost_tier: ModelCostTier::Medium,
+                    auto_escalate: true,
+                    escalation_rank: 0,
+                    health_scope: ModelHealthScope::Provider,
+                };
+                config.model_pool.slots.push(primary_slot);
+
+                if let Some(fallback) = &config.llm_fallback {
+                    let fallback_slot = ModelSlot {
+                        id: "fallback".to_string(),
+                        label: "Fallback".to_string(),
+                        role: ModelRole::Fallback,
+                        provider: fallback.clone(),
+                        enabled: true,
+                        capability_tier: ModelCapabilityTier::Premium,
+                        cost_tier: ModelCostTier::High,
+                        auto_escalate: true,
+                        escalation_rank: 100,
+                        health_scope: ModelHealthScope::Provider,
+                    };
+                    config.model_pool.slots.push(fallback_slot);
+                }
+                tracing::info!(
+                    "Migrated legacy llm config to model_pool ({} slots)",
+                    config.model_pool.slots.len()
+                );
+            }
+        }
+
+        Self::migrate_embeddings_config(&mut config);
+
+        Ok(SecureConfigRuntimeState {
+            config,
+            config_degraded,
+            config_issue,
+            secrets_degraded,
+            secrets_issue,
+        })
+    }
+
     pub(crate) fn save_secrets_unlocked(&self, secrets: &Secrets) -> Result<()> {
+        if self.uses_storage_backend() {
+            self.save_encrypted_json(SETTINGS_SECRETS_KEY, secrets)?;
+            return Ok(());
+        }
         let json = serde_json::to_vec(secrets)?;
         let encrypted = self.key_manager.encrypt(&json)?;
-        crate::crypto::atomic_write_file(&self.secrets_path(), &encrypted)
+        crate::crypto::atomic_write_file(&self.secrets_path(), &encrypted)?;
+        Ok(())
+    }
+
+    pub(crate) fn save_secrets_unlocked_for_rekey(&self, secrets: &Secrets) -> Result<()> {
+        if self.uses_storage_backend() {
+            let payload = serde_json::to_vec(secrets)?;
+            self.save_storage_payload(SETTINGS_SECRETS_KEY, &payload)?;
+            return Ok(());
+        }
+        self.save_secrets_unlocked(secrets)
     }
 
     pub(crate) fn with_secrets_lock<T, F>(&self, op: F) -> Result<T>
@@ -955,7 +1645,7 @@ impl SecureConfigManager {
             let (mut secrets, degraded) = manager.load_secrets_runtime_state_unlocked()?;
             if degraded {
                 anyhow::bail!(
-                    "Refusing to update encrypted secrets because secrets.enc could not be decrypted with the active key. Restore the correct key material before mutating secrets."
+                    "Refusing to update encrypted secrets because the active settings payload could not be decrypted with the current key. Restore the correct key material before mutating secrets."
                 );
             }
             let out = update(&mut secrets)?;
@@ -1097,129 +1787,7 @@ impl SecureConfigManager {
 
     /// Load configuration with decrypted secrets
     pub fn load(&self) -> Result<AgentConfig> {
-        let config_path = self.config_dir.join("config.toml");
-        let secrets_path = self.secrets_path();
-
-        // Load base config
-        let mut config = if config_path.exists() {
-            let content = std::fs::read_to_string(&config_path)?;
-            toml::from_str(&content)?
-        } else {
-            let mut config = AgentConfig::default();
-            // Fresh installs should start with conservative episode retention enabled.
-            // Existing installs keep whatever is already persisted in config.toml.
-            config.memory.retention_enabled = true;
-            self.save_config_only(&config)?;
-            config
-        };
-
-        // Load and decrypt secrets
-        if secrets_path.exists() {
-            let (secrets, _changed, created, rotated, persisted_change) =
-                self.with_secrets_lock(|manager| {
-                    let (mut secrets, degraded) = manager.load_secrets_runtime_state_unlocked()?;
-                    let (changed, created, rotated) =
-                        Self::ensure_http_api_key_in_secrets(&mut secrets);
-                    let persisted_change = changed && !degraded;
-                    if persisted_change {
-                        manager.save_secrets_unlocked(&secrets)?;
-                    }
-                    Ok((secrets, changed, created, rotated, persisted_change))
-                })?;
-            if persisted_change {
-                if rotated {
-                    tracing::info!("Rotated expired HTTP API key");
-                } else if created {
-                    tracing::info!("Generated new HTTP API key for authentication");
-                }
-            }
-            // Inject secrets into config
-            self.inject_secrets(&mut config, &secrets);
-        } else {
-            // Migrate from old plain config if secrets exist there
-            self.migrate_from_plain_config(&mut config)?;
-
-            // Ensure API key exists even on first run (no secrets.enc yet)
-            let (changed, created, rotated) = self.with_secrets_lock(|manager| {
-                let mut secrets = manager.load_secrets_unlocked()?;
-                let (changed, created, rotated) =
-                    Self::ensure_http_api_key_in_secrets(&mut secrets);
-                if changed {
-                    manager.save_secrets_unlocked(&secrets)?;
-                }
-                Ok((changed, created, rotated))
-            })?;
-            if changed {
-                if rotated {
-                    tracing::info!("Rotated expired HTTP API key");
-                } else if created {
-                    tracing::info!("Generated HTTP API key for authentication (first run)");
-                }
-            }
-        }
-
-        // Auto-migrate legacy llm/llm_fallback to model_pool if slots is empty.
-        // Fresh installs now start with an unconfigured placeholder, so only
-        // migrate when the legacy provider contains usable settings.
-        if config.model_pool.slots.is_empty() {
-            let legacy_llm_configured = match &config.llm {
-                LlmProvider::Ollama { base_url, model } => {
-                    !base_url.trim().is_empty() && !model.trim().is_empty()
-                }
-                LlmProvider::Anthropic { api_key, model } => {
-                    !api_key.trim().is_empty() && !model.trim().is_empty()
-                }
-                LlmProvider::OpenAI {
-                    api_key,
-                    model,
-                    base_url,
-                } => {
-                    !api_key.trim().is_empty()
-                        && !model.trim().is_empty()
-                        && (base_url.is_none()
-                            || base_url.as_ref().is_some_and(|url| !url.trim().is_empty()))
-                }
-            };
-            if legacy_llm_configured || config.llm_fallback.is_some() {
-                let primary_slot = ModelSlot {
-                    id: "primary".to_string(),
-                    label: "Primary".to_string(),
-                    role: ModelRole::Primary,
-                    provider: config.llm.clone(),
-                    enabled: true,
-                    capability_tier: ModelCapabilityTier::Balanced,
-                    cost_tier: ModelCostTier::Medium,
-                    auto_escalate: true,
-                    escalation_rank: 0,
-                    health_scope: ModelHealthScope::Provider,
-                };
-                config.model_pool.slots.push(primary_slot);
-
-                if let Some(fallback) = &config.llm_fallback {
-                    let fallback_slot = ModelSlot {
-                        id: "fallback".to_string(),
-                        label: "Fallback".to_string(),
-                        role: ModelRole::Fallback,
-                        provider: fallback.clone(),
-                        enabled: true,
-                        capability_tier: ModelCapabilityTier::Premium,
-                        cost_tier: ModelCostTier::High,
-                        auto_escalate: true,
-                        escalation_rank: 100,
-                        health_scope: ModelHealthScope::Provider,
-                    };
-                    config.model_pool.slots.push(fallback_slot);
-                }
-                tracing::info!(
-                    "Migrated legacy llm config to model_pool ({} slots)",
-                    config.model_pool.slots.len()
-                );
-            }
-        }
-
-        Self::migrate_embeddings_config(&mut config);
-
-        Ok(config)
+        Ok(self.load_runtime_state()?.config)
     }
 
     /// Save configuration with encrypted secrets
@@ -1237,22 +1805,21 @@ impl SecureConfigManager {
         // Create sanitized config (without secrets)
         let sanitized = self.sanitize_config(config);
 
-        // Save non-sensitive config as TOML
+        // Save sanitized mutable settings
         self.save_config_only(&sanitized)?;
 
-        // Guard: don't overwrite existing secrets.enc with empty data.
-        // This prevents data loss when decryption fails (key mismatch)
-        // but the user saves settings via the web UI.
         self.with_secrets_lock(|manager| {
-            let secrets_path = manager.secrets_path();
             let (existing, degraded) = manager.load_secrets_runtime_state_unlocked()?;
             if degraded {
                 anyhow::bail!(
-                    "Refusing to save encrypted secrets because secrets.enc could not be decrypted with the active key."
+                    "Refusing to save encrypted secrets because the active settings payload could not be decrypted with the current key."
                 );
             }
             let secrets = manager.extract_secrets_from_base(existing, config);
-            if !Self::has_real_secrets(&secrets) && secrets_path.exists() {
+            if !manager.uses_storage_backend()
+                && !Self::has_real_secrets(&secrets)
+                && manager.secrets_path().exists()
+            {
                 tracing::warn!(
                     "Skipping secrets.enc overwrite: extracted secrets are empty but file exists. \
                  This likely means decryption failed — preserving existing encrypted secrets."
@@ -1266,11 +1833,20 @@ impl SecureConfigManager {
         Ok(())
     }
 
-    /// Save only the config.toml (without encryption)
+    /// Save sanitized mutable settings.
     fn save_config_only(&self, config: &AgentConfig) -> Result<()> {
-        let config_path = self.config_dir.join("config.toml");
-        let content = toml::to_string_pretty(config)?;
-        crate::crypto::atomic_write_file(&config_path, content.as_bytes())?;
+        if self.uses_storage_backend() {
+            self.ensure_storage_key_lineage_writable()?;
+            self.ensure_encrypted_json_writable::<AgentConfig>(SETTINGS_CONFIG_KEY)?;
+        }
+        save_bootstrap_deployment_mode(&self.config_dir, config.deployment_mode)?;
+        if self.uses_storage_backend() {
+            self.save_encrypted_json(SETTINGS_CONFIG_KEY, config)?;
+        } else {
+            let config_path = self.config_dir.join("config.toml");
+            let content = toml::to_string_pretty(config)?;
+            crate::crypto::atomic_write_file(&config_path, content.as_bytes())?;
+        }
         Ok(())
     }
 
@@ -1281,7 +1857,12 @@ impl SecureConfigManager {
 
     pub(crate) fn load_secrets(&self) -> Result<Secrets> {
         self.with_secrets_lock(|manager| {
-            let (secrets, _degraded) = manager.load_secrets_runtime_state_unlocked()?;
+            let (secrets, degraded) = manager.load_secrets_runtime_state_unlocked()?;
+            if degraded {
+                anyhow::bail!(
+                    "Encrypted settings are temporarily unavailable from storage. Refusing to continue with empty runtime secrets."
+                );
+            }
             Ok(secrets)
         })
         /*

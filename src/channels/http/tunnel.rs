@@ -242,11 +242,9 @@ pub(super) fn parse_tunnel_command(message: &str) -> Option<TunnelControlCommand
         return None;
     }
     match text.as_str() {
-        "start tunnel" | "/tunnel start" | "/start_tunnel" => Some(TunnelControlCommand::Start),
-        "stop tunnel" | "/tunnel stop" | "/stop_tunnel" => Some(TunnelControlCommand::Stop),
-        "tunnel status" | "status tunnel" | "/tunnel" | "/tunnel status" | "/tunnel_status" => {
-            Some(TunnelControlCommand::Status)
-        }
+        "/tunnel start" | "/start tunnel" => Some(TunnelControlCommand::Start),
+        "/tunnel stop" | "/stop tunnel" => Some(TunnelControlCommand::Stop),
+        "/tunnel" | "/tunnel status" => Some(TunnelControlCommand::Status),
         _ => None,
     }
 }
@@ -592,7 +590,7 @@ pub(super) async fn handle_tunnel_control_command(
                 ))
             } else {
                 Ok(format!(
-                    "{} is starting. URL is pending; try 'tunnel status' in ~10s.",
+                    "{} is starting. URL is pending; try `/tunnel status` in ~10s.",
                     tunnel_provider_label(provider)
                 ))
             }

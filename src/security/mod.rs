@@ -9,9 +9,17 @@
 //! - Memory isolation
 
 pub mod action_guard;
+pub mod model_input;
 pub mod outbound;
 pub mod pii;
 pub use action_guard::ActionGuard;
+#[allow(unused_imports)]
+pub use model_input::{
+    render_model_input_fallback, sanitize_model_input_json, sanitize_model_input_text,
+    CurrentChatPiiPolicy, ModelInputContext, ModelInputPrivacyDecision,
+    ModelInputPrivacyJsonResult, ModelInputPrivacyMode, ModelInputPrivacyTextResult,
+    ModelPrivacyConfig,
+};
 pub use outbound::{
     check_outbound_text, format_outbound_privacy_block, sanitize_outbound_json,
     OutboundPrivacyDecision, OutboundPrivacyPolicy, OutboundPrivacyTextResult,

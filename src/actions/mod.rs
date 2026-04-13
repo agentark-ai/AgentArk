@@ -6,6 +6,7 @@ pub mod app;
 pub mod calendar;
 pub mod gmail;
 pub mod google_workspace;
+pub mod lan;
 pub mod research;
 pub mod search;
 #[cfg(feature = "ssh")]
@@ -102,9 +103,30 @@ pub struct ActionEgressPolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ActionChannelTarget {
+    pub argument_key: String,
+    pub default_target: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ActionAccessMetadata {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permission_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub integration_ids: Vec<String>,
+    #[serde(default)]
+    pub requires_ssh_connection: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channel_targets: Vec<ActionChannelTarget>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ActionAuthorization {
     #[serde(default)]
     pub risk_level: ActionRiskLevel,
+    /// Machine-readable access requirements used by agent access planning and enforcement.
+    #[serde(default)]
+    pub access: ActionAccessMetadata,
     #[serde(default)]
     pub requires_auth: bool,
     #[serde(default)]
@@ -170,6 +192,12 @@ pub struct ActionAuthorizationContext {
     pub surface: ActionExecutionSurface,
     #[serde(default)]
     pub direct_user_intent: bool,
+    #[serde(default)]
+    pub current_turn_is_explicit_approval: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_access_scope: Option<crate::core::swarm::AgentAccessScope>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -238,9 +266,10 @@ pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata 
         .capabilities
         .iter()
         .map(|value| value.trim().to_ascii_lowercase())
-        .collect::<Vec<_>>();
+        .collect::<std::collections::HashSet<_>>();
 
     let mut meta = ActionPlannerMetadata::default();
+    meta.requires_auth = action.authorization.requires_auth;
 
     match name.as_str() {
         "current_time" => {
@@ -342,9 +371,9 @@ pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata 
         _ => {}
     }
 
-    if capabilities
-        .iter()
-        .any(|cap| cap == "watcher" || cap == "scheduler")
+    if capabilities.contains("watcher")
+        || capabilities.contains("scheduler")
+        || capabilities.contains("orchestration")
     {
         meta.role = PlannerActionRole::Orchestration;
         meta.integration_class = PlannerIntegrationClass::Internal;
@@ -353,60 +382,37 @@ pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata 
         return meta;
     }
 
-    if name.starts_with("list_") || capabilities.iter().any(|cap| cap.contains("inventory")) {
+    if capabilities.contains("watcher_inventory")
+        || capabilities.contains("integration_inventory")
+        || capabilities.contains("memory")
+        || capabilities.contains("documents")
+    {
         meta.role = PlannerActionRole::Inspection;
         meta.integration_class = PlannerIntegrationClass::Internal;
         meta.cost = PlannerCostTier::Low;
         return meta;
     }
 
-    if name.contains("telegram")
-        || name.contains("whatsapp")
-        || name.contains("slack")
-        || name.contains("discord")
-        || name.contains("matrix")
-        || name.contains("teams")
-    {
+    if capabilities.contains("notify") {
         meta.role = PlannerActionRole::Delivery;
-        meta.requires_auth = true;
-        meta.integration_class = PlannerIntegrationClass::Messaging;
+        meta.integration_class = PlannerIntegrationClass::Internal;
         meta.side_effect_level = PlannerSideEffectLevel::Notify;
         return meta;
     }
 
-    if name.contains("gmail")
-        || name.contains("calendar")
-        || name.contains("google_workspace")
-        || name.contains("google_drive")
-        || name.contains("google_docs")
-        || name.contains("google_sheets")
-        || name.contains("google_chat")
-    {
-        meta.role = if name.contains("create") || name.contains("reply") {
-            PlannerActionRole::Mutation
-        } else {
-            PlannerActionRole::DataSource
-        };
-        meta.requires_auth = true;
+    if capabilities.contains("gmail") || capabilities.contains("google_workspace") {
+        meta.role = PlannerActionRole::DataSource;
         meta.integration_class = PlannerIntegrationClass::Workspace;
-        meta.side_effect_level = if name.contains("create") || name.contains("reply") {
-            PlannerSideEffectLevel::Write
-        } else {
-            PlannerSideEffectLevel::None
-        };
         return meta;
     }
 
-    if capabilities
-        .iter()
-        .any(|cap| cap == "search" || cap == "research")
-    {
+    if capabilities.contains("search") || capabilities.contains("research") {
         meta.role = PlannerActionRole::DataSource;
         meta.integration_class = PlannerIntegrationClass::Search;
         return meta;
     }
 
-    if capabilities.iter().any(|cap| cap == "browser") {
+    if capabilities.contains("browser") {
         meta.role = PlannerActionRole::Mutation;
         meta.integration_class = PlannerIntegrationClass::Browser;
         meta.cost = PlannerCostTier::High;
@@ -414,14 +420,99 @@ pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata 
         return meta;
     }
 
-    if capabilities.iter().any(|cap| cap.contains("notify")) {
-        meta.role = PlannerActionRole::Delivery;
-        meta.integration_class = PlannerIntegrationClass::Messaging;
-        meta.side_effect_level = PlannerSideEffectLevel::Notify;
+    if capabilities.contains("app_hosting") {
+        meta.role = PlannerActionRole::Mutation;
+        meta.integration_class = PlannerIntegrationClass::App;
+        meta.cost = PlannerCostTier::Medium;
+        meta.side_effect_level = PlannerSideEffectLevel::Write;
+        return meta;
+    }
+
+    if capabilities.contains("file_read") {
+        meta.role = PlannerActionRole::Inspection;
+        meta.integration_class = PlannerIntegrationClass::Filesystem;
+        meta.cost = PlannerCostTier::Low;
+        return meta;
+    }
+
+    if capabilities.contains("file_write") {
+        meta.role = PlannerActionRole::Mutation;
+        meta.integration_class = PlannerIntegrationClass::Filesystem;
+        meta.cost = PlannerCostTier::Low;
+        meta.side_effect_level = PlannerSideEffectLevel::Write;
+        return meta;
+    }
+
+    if capabilities.contains("shell")
+        || capabilities.contains("code_execute")
+        || capabilities.contains("local_cli")
+    {
+        meta.role = PlannerActionRole::Mutation;
+        meta.integration_class = PlannerIntegrationClass::Code;
+        meta.cost = PlannerCostTier::High;
+        meta.side_effect_level = PlannerSideEffectLevel::Write;
+        return meta;
+    }
+
+    if capabilities.contains("ssh") {
+        meta.role = PlannerActionRole::Mutation;
+        meta.integration_class = PlannerIntegrationClass::Network;
+        meta.cost = PlannerCostTier::High;
+        meta.side_effect_level = PlannerSideEffectLevel::Write;
+        return meta;
+    }
+
+    if capabilities.contains("local_network_discovery") {
+        meta.role = PlannerActionRole::DataSource;
+        meta.integration_class = PlannerIntegrationClass::Network;
+        meta.cost = PlannerCostTier::Medium;
+        return meta;
+    }
+
+    if capabilities.contains("network") {
+        meta.role = PlannerActionRole::DataSource;
+        meta.integration_class = PlannerIntegrationClass::Network;
+        meta.cost = PlannerCostTier::Medium;
+        return meta;
+    }
+
+    if capabilities.contains("analytics") {
+        meta.role = PlannerActionRole::DataSource;
+        meta.integration_class = PlannerIntegrationClass::Analytics;
+        return meta;
+    }
+
+    if capabilities.contains("image_generation") || capabilities.contains("video_generation") {
+        meta.role = PlannerActionRole::Mutation;
+        meta.integration_class = PlannerIntegrationClass::Media;
+        meta.cost = PlannerCostTier::High;
+        meta.side_effect_level = PlannerSideEffectLevel::Write;
         return meta;
     }
 
     meta
+}
+
+#[cfg(test)]
+pub fn action_requires_nontrivial_direct_execution(action: &ActionDef) -> bool {
+    let metadata = planner_metadata_for_action(action);
+    matches!(metadata.role, PlannerActionRole::Orchestration)
+        || matches!(
+            metadata.integration_class,
+            PlannerIntegrationClass::App
+                | PlannerIntegrationClass::Code
+                | PlannerIntegrationClass::Browser
+                | PlannerIntegrationClass::Network
+                | PlannerIntegrationClass::Commerce
+                | PlannerIntegrationClass::Media
+        )
+}
+
+pub fn action_prefers_code_execution_companion(action: &ActionDef) -> bool {
+    matches!(
+        planner_metadata_for_action(action).role,
+        PlannerActionRole::Orchestration
+    )
 }
 
 /// Action source type
@@ -487,4 +578,67 @@ impl Default for ActionDef {
 
 fn default_action_source() -> ActionSource {
     ActionSource::System
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn planner_metadata_does_not_infer_delivery_from_name_alone() {
+        let action = ActionDef {
+            name: "telegram_bridge".to_string(),
+            description: "Internal helper with no messaging semantics".to_string(),
+            ..ActionDef::default()
+        };
+
+        let metadata = planner_metadata_for_action(&action);
+        assert_eq!(metadata.role, PlannerActionRole::Unknown);
+        assert_eq!(metadata.integration_class, PlannerIntegrationClass::Unknown);
+    }
+
+    #[test]
+    fn planner_metadata_uses_exact_workspace_capability() {
+        let action = ActionDef {
+            name: "workspace_reader".to_string(),
+            capabilities: vec!["google_workspace".to_string()],
+            authorization: ActionAuthorization {
+                requires_auth: true,
+                ..ActionAuthorization::default()
+            },
+            ..ActionDef::default()
+        };
+
+        let metadata = planner_metadata_for_action(&action);
+        assert_eq!(metadata.role, PlannerActionRole::DataSource);
+        assert_eq!(
+            metadata.integration_class,
+            PlannerIntegrationClass::Workspace
+        );
+        assert!(metadata.requires_auth);
+    }
+
+    #[test]
+    fn orchestration_actions_require_nontrivial_direct_execution() {
+        let action = ActionDef {
+            name: "watch".to_string(),
+            capabilities: vec!["watcher".to_string()],
+            ..ActionDef::default()
+        };
+
+        assert!(action_requires_nontrivial_direct_execution(&action));
+        assert!(action_prefers_code_execution_companion(&action));
+    }
+
+    #[test]
+    fn search_actions_stay_simple_direct_execution_candidates() {
+        let action = ActionDef {
+            name: "web_search".to_string(),
+            capabilities: vec!["search".to_string()],
+            ..ActionDef::default()
+        };
+
+        assert!(!action_requires_nontrivial_direct_execution(&action));
+        assert!(!action_prefers_code_execution_companion(&action));
+    }
 }

@@ -8,6 +8,7 @@ import {
   Typography,
 } from "@mui/material";
 import { useMemo } from "react";
+import { formatUiDateTime } from "../lib/dateFormat";
 import type { Notification, Task } from "../types";
 
 const ACTIVE_TASK_STALE_MS = 24 * 60 * 60 * 1000;
@@ -33,10 +34,7 @@ function formatStatus(task: Task): string {
 }
 
 function formatWhen(raw?: string): string {
-  if (!raw) return "-";
-  const dt = new Date(raw);
-  if (Number.isNaN(dt.getTime())) return raw;
-  return dt.toLocaleString();
+  return formatUiDateTime(raw, { fallback: "-" });
 }
 
 function isFreshInProgressTask(task: Task): boolean {
@@ -84,7 +82,7 @@ export function InboxPane({ tasks, notifications, onNavigateToView }: Props) {
         <Typography variant="overline" className="workspace-shell-kicker">
           Inbox
         </Typography>
-        <Typography variant="h4" sx={{ fontWeight: 700, letterSpacing: "-0.04em", mb: 0.45 }}>
+        <Typography variant="h4" sx={{ fontWeight: 700, letterSpacing: 0, mb: 0.45 }}>
           Human input, blocked work, and alerts.
         </Typography>
         <Typography variant="body2" color="text.secondary" sx={{ maxWidth: 860 }}>

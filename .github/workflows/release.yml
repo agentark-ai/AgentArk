@@ -1,9 +1,11 @@
-name: Build & Publish Docker Images
+name: Release
 
 on:
   push:
-    branches: [main]
-    tags: ['v*']
+    branches:
+      - main
+    tags:
+      - "v*"
   workflow_dispatch:
 
 concurrency:
@@ -14,9 +16,13 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   AGENTARK_RELEASE_FEATURES: telegram,docker,ssh
+  RELEASE_ASSET_NAME: agentark-x86_64-unknown-linux-gnu.tar.gz
+
+permissions:
+  contents: read
 
 jobs:
-  test:
+  validate:
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -43,6 +49,13 @@ jobs:
         with:
           components: clippy
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
       - name: Cache cargo dependencies
         uses: actions/cache@v4
         with:
@@ -50,8 +63,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-release-validate-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-validate-
+            ${{ runner.os }}-cargo-
 
       - name: cargo check
         run: cargo check --locked --no-default-features --features "${{ env.AGENTARK_RELEASE_FEATURES }}"
@@ -59,16 +74,28 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --locked --no-default-features --features "${{ env.AGENTARK_RELEASE_FEATURES }}"
 
-      - name: cargo test (unit)
+      - name: cargo test
         run: cargo test --locked --no-default-features --features "${{ env.AGENTARK_RELEASE_FEATURES }}"
 
-  build-and-push:
-    needs: test
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+  docker:
+    needs: validate
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-
+      id-token: write
+      attestations: write
+    outputs:
+      image_digest: ${{ steps.build.outputs.digest }}
+      image_tags: ${{ steps.meta.outputs.tags }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -89,14 +116,18 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=semver,pattern={{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=sha,prefix=sha-,format=long
           labels: |
             org.opencontainers.image.title=AgentArk
             org.opencontainers.image.description=AgentArk container image
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
 
-      - name: Build and push
+      - name: Build and push image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -116,3 +147,119 @@ jobs:
           cache-from: type=gha,scope=release
           cache-to: type=gha,mode=max,scope=release
           platforms: linux/amd64
+          provenance: false
+          sbom: false
+
+      - name: Attest container image provenance
+        if: ${{ github.event.repository.private == false || vars.AGENTARK_ENABLE_PRIVATE_ATTESTATIONS == 'true' }}
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  release-assets:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: docker
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-
+            ${{ runner.os }}-cargo-
+
+      - name: Install cargo-auditable
+        run: cargo install cargo-auditable --locked --force
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend assets
+        working-directory: frontend
+        run: npm run build
+
+      - name: Build auditable Linux release binary
+        run: cargo auditable build --locked --release --no-default-features --features "${{ env.AGENTARK_RELEASE_FEATURES }}"
+
+      - name: Assemble release artifacts
+        run: |
+          package_root="dist/agentark-x86_64-unknown-linux-gnu"
+          mkdir -p "${package_root}/frontend"
+          cp target/release/agentark "${package_root}/agentark"
+          cp README.md SECURITY.md VERIFY.md "${package_root}/"
+          cp -R assets "${package_root}/assets"
+          cp -R config "${package_root}/config"
+          cp -R skills "${package_root}/skills"
+          cp -R frontend/dist "${package_root}/frontend/dist"
+          tar -C dist -czf "dist/${{ env.RELEASE_ASSET_NAME }}" agentark-x86_64-unknown-linux-gnu
+          sha256sum "dist/${{ env.RELEASE_ASSET_NAME }}" > dist/SHA256SUMS
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.9.1
+
+      - name: Sign release artifacts with Sigstore keyless
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          cosign sign-blob --yes \
+            --output-signature "dist/${{ env.RELEASE_ASSET_NAME }}.sig" \
+            --output-certificate "dist/${{ env.RELEASE_ASSET_NAME }}.pem" \
+            "dist/${{ env.RELEASE_ASSET_NAME }}"
+          cosign sign-blob --yes \
+            --output-signature "dist/SHA256SUMS.sig" \
+            --output-certificate "dist/SHA256SUMS.pem" \
+            dist/SHA256SUMS
+
+      - name: Attest release tarball provenance
+        if: ${{ github.event.repository.private == false || vars.AGENTARK_ENABLE_PRIVATE_ATTESTATIONS == 'true' }}
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/${{ env.RELEASE_ASSET_NAME }}
+
+      - name: Attest checksum file provenance
+        if: ${{ github.event.repository.private == false || vars.AGENTARK_ENABLE_PRIVATE_ATTESTATIONS == 'true' }}
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/SHA256SUMS
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/*
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" > /dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" dist/* --title "${GITHUB_REF_NAME}" --generate-notes
+          fi

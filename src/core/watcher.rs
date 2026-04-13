@@ -66,45 +66,244 @@ pub struct WatcherNotificationAttempt {
     pub error: Option<String>,
 }
 
-/// Condition to evaluate against poll results
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum WatchCondition {
-    /// Result is not empty / not "No messages found" etc.
+pub enum WatchConditionLogic {
+    #[default]
+    All,
+    Any,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchConditionOperator {
+    Exists,
+    NotExists,
+    Eq,
+    Ne,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+    Contains,
+    NotContains,
+    NonEmpty,
+    Empty,
+    True,
+    False,
+    Regex,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WatchJsonPredicate {
+    pub path: String,
+    pub operator: WatchConditionOperator,
+    #[serde(default)]
+    pub value: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WatchConditionMatcher {
     NotEmpty,
-    /// Result contains a keyword (case-insensitive)
-    Contains { keyword: String },
-    /// Result matches a regex pattern
-    Matches { pattern: String },
-    /// Custom condition described in natural language (evaluated by LLM)
-    Custom { description: String },
+    TextContains {
+        text: String,
+        #[serde(default)]
+        case_sensitive: bool,
+    },
+    Regex {
+        pattern: String,
+    },
+    JsonPredicate {
+        path: String,
+        operator: WatchConditionOperator,
+        #[serde(default)]
+        value: Option<serde_json::Value>,
+    },
+    JsonLogic {
+        #[serde(default)]
+        logic: WatchConditionLogic,
+        rules: Vec<WatchJsonPredicate>,
+    },
+    Llm,
+}
+
+/// Condition contract authored by the model for a watcher.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WatchCondition {
+    pub description: String,
+    #[serde(flatten)]
+    pub matcher: WatchConditionMatcher,
 }
 
 impl WatchCondition {
-    /// Evaluate the condition against a poll result
-    pub fn evaluate(&self, result: &str) -> bool {
-        let trimmed = result.trim();
-        match self {
-            WatchCondition::NotEmpty => {
-                !trimmed.is_empty()
-                    && !trimmed.eq_ignore_ascii_case("no messages found.")
-                    && !trimmed.eq_ignore_ascii_case("no results")
-                    && !trimmed.eq_ignore_ascii_case("no results found")
-                    && !trimmed.starts_with("Error")
+    pub fn summary(&self) -> String {
+        let description = self.description.trim();
+        if !description.is_empty() {
+            return description.to_string();
+        }
+
+        match &self.matcher {
+            WatchConditionMatcher::NotEmpty => {
+                "Trigger when the poll result is not empty".to_string()
             }
-            WatchCondition::Contains { keyword } => {
-                trimmed.to_lowercase().contains(&keyword.to_lowercase())
+            WatchConditionMatcher::TextContains { text, .. } => {
+                format!("Trigger when the poll result contains \"{}\"", text)
             }
-            WatchCondition::Matches { pattern } => regex::Regex::new(pattern)
-                .map(|re| re.is_match(trimmed))
-                .unwrap_or(false),
-            WatchCondition::Custom { .. } => {
-                // Custom conditions need LLM evaluation — treated as NotEmpty
-                // for the poll loop. The agent re-evaluates with LLM after trigger.
-                !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("no messages found.")
+            WatchConditionMatcher::Regex { pattern } => {
+                format!("Trigger when the poll result matches {}", pattern)
+            }
+            WatchConditionMatcher::JsonPredicate {
+                path,
+                operator,
+                value,
+            } => match value {
+                Some(value) => format!(
+                    "Trigger when {} {} {}",
+                    if path.trim().is_empty() {
+                        "$"
+                    } else {
+                        path.trim()
+                    },
+                    watch_condition_operator_label(operator),
+                    value
+                ),
+                None => format!(
+                    "Trigger when {} {}",
+                    if path.trim().is_empty() {
+                        "$"
+                    } else {
+                        path.trim()
+                    },
+                    watch_condition_operator_label(operator)
+                ),
+            },
+            WatchConditionMatcher::JsonLogic { logic, rules } => format!(
+                "Trigger when {} of {} structured rule(s) match",
+                match logic {
+                    WatchConditionLogic::All => "all",
+                    WatchConditionLogic::Any => "any",
+                },
+                rules.len()
+            ),
+            WatchConditionMatcher::Llm => {
+                "Trigger when the model judges the condition satisfied".to_string()
             }
         }
     }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.description.trim().is_empty() {
+            return Err("watcher condition requires a non-empty `description`".to_string());
+        }
+
+        match &self.matcher {
+            WatchConditionMatcher::NotEmpty | WatchConditionMatcher::Llm => Ok(()),
+            WatchConditionMatcher::TextContains { text, .. } => {
+                if text.trim().is_empty() {
+                    Err("watcher text condition requires non-empty `text`".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+            WatchConditionMatcher::Regex { pattern } => {
+                if pattern.trim().is_empty() {
+                    return Err("watcher regex condition requires non-empty `pattern`".to_string());
+                }
+                regex::Regex::new(pattern)
+                    .map(|_| ())
+                    .map_err(|error| format!("watcher regex condition is invalid: {}", error))
+            }
+            WatchConditionMatcher::JsonPredicate {
+                path,
+                operator,
+                value,
+            } => validate_watch_json_predicate(path, operator, value),
+            WatchConditionMatcher::JsonLogic { rules, .. } => {
+                if rules.is_empty() {
+                    return Err(
+                        "watcher json_logic condition requires at least one rule".to_string()
+                    );
+                }
+                for rule in rules {
+                    validate_watch_json_predicate(&rule.path, &rule.operator, &rule.value)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn watch_condition_operator_label(operator: &WatchConditionOperator) -> &'static str {
+    match operator {
+        WatchConditionOperator::Exists => "exists",
+        WatchConditionOperator::NotExists => "not_exists",
+        WatchConditionOperator::Eq => "eq",
+        WatchConditionOperator::Ne => "ne",
+        WatchConditionOperator::Gt => "gt",
+        WatchConditionOperator::Gte => "gte",
+        WatchConditionOperator::Lt => "lt",
+        WatchConditionOperator::Lte => "lte",
+        WatchConditionOperator::Contains => "contains",
+        WatchConditionOperator::NotContains => "not_contains",
+        WatchConditionOperator::NonEmpty => "non_empty",
+        WatchConditionOperator::Empty => "empty",
+        WatchConditionOperator::True => "true",
+        WatchConditionOperator::False => "false",
+        WatchConditionOperator::Regex => "regex",
+    }
+}
+
+fn watch_operator_requires_value(operator: &WatchConditionOperator) -> bool {
+    matches!(
+        operator,
+        WatchConditionOperator::Eq
+            | WatchConditionOperator::Ne
+            | WatchConditionOperator::Gt
+            | WatchConditionOperator::Gte
+            | WatchConditionOperator::Lt
+            | WatchConditionOperator::Lte
+            | WatchConditionOperator::Contains
+            | WatchConditionOperator::NotContains
+            | WatchConditionOperator::Regex
+    )
+}
+
+fn validate_watch_json_predicate(
+    path: &str,
+    operator: &WatchConditionOperator,
+    value: &Option<serde_json::Value>,
+) -> Result<(), String> {
+    if path.trim().is_empty()
+        && !matches!(
+            operator,
+            WatchConditionOperator::Exists
+                | WatchConditionOperator::NotExists
+                | WatchConditionOperator::NonEmpty
+                | WatchConditionOperator::Empty
+        )
+    {
+        return Err("watcher json predicate requires a non-empty `path`".to_string());
+    }
+
+    if watch_operator_requires_value(operator) && value.is_none() {
+        return Err(format!(
+            "watcher json predicate operator {:?} requires a `value`",
+            operator
+        ));
+    }
+
+    if matches!(operator, WatchConditionOperator::Regex) {
+        let pattern = value
+            .as_ref()
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "watcher regex predicate requires string `value`".to_string())?;
+        regex::Regex::new(pattern)
+            .map(|_| ())
+            .map_err(|error| format!("watcher regex predicate is invalid: {}", error))?;
+    }
+
+    Ok(())
 }
 
 /// A background watcher definition
@@ -422,8 +621,47 @@ impl WatcherManager {
         }
     }
 
-    pub async fn upsert_similar(&self, watcher: Watcher) -> (Uuid, bool, usize) {
+    fn replace_watcher(existing: &mut Watcher, watcher: Watcher) {
+        existing.description = watcher.description;
+        existing.poll_action = watcher.poll_action;
+        existing.poll_arguments = watcher.poll_arguments;
+        existing.condition = watcher.condition;
+        existing.on_trigger = watcher.on_trigger;
+        existing.interval_secs = watcher.interval_secs;
+        existing.timeout_secs = watcher.timeout_secs;
+        existing.notify_channel = watcher.notify_channel;
+        existing.status = WatcherStatus::Active;
+        existing.created_at = Utc::now();
+        existing.last_poll_at = None;
+        existing.poll_count = 0;
+        existing.trigger_result = None;
+        existing.last_result = None;
+        existing.last_error = None;
+        existing.consecutive_failures = 0;
+        existing.next_poll_not_before = None;
+        existing.last_poll_outcome = None;
+        existing.notification_attempts.clear();
+    }
+
+    pub async fn upsert_similar(
+        &self,
+        watcher: Watcher,
+        target_watcher_id: Option<Uuid>,
+    ) -> Result<(Uuid, bool, usize), String> {
         let mut watchers = self.watchers.write().await;
+        if let Some(target_id) = target_watcher_id {
+            let existing = watchers.get_mut(&target_id).ok_or_else(|| {
+                format!(
+                    "Watcher `{}` was not found. Use `list_watchers` to choose an active watcher.",
+                    target_id
+                )
+            })?;
+            Self::replace_watcher(existing, watcher);
+            drop(watchers);
+            self.persist().await;
+            return Ok((target_id, true, 0));
+        }
+
         let matching_ids = watchers
             .iter()
             .filter(|(_, existing)| {
@@ -437,39 +675,21 @@ impl WatcherManager {
 
         if let Some(keeper_id) = matching_ids.first().copied() {
             if let Some(existing) = watchers.get_mut(&keeper_id) {
-                existing.description = watcher.description;
-                existing.poll_action = watcher.poll_action;
-                existing.poll_arguments = watcher.poll_arguments;
-                existing.condition = watcher.condition;
-                existing.on_trigger = watcher.on_trigger;
-                existing.interval_secs = watcher.interval_secs;
-                existing.timeout_secs = watcher.timeout_secs;
-                existing.notify_channel = watcher.notify_channel;
-                existing.status = WatcherStatus::Active;
-                existing.created_at = Utc::now();
-                existing.last_poll_at = None;
-                existing.poll_count = 0;
-                existing.trigger_result = None;
-                existing.last_result = None;
-                existing.last_error = None;
-                existing.consecutive_failures = 0;
-                existing.next_poll_not_before = None;
-                existing.last_poll_outcome = None;
-                existing.notification_attempts.clear();
+                Self::replace_watcher(existing, watcher);
             }
             for duplicate_id in matching_ids.iter().skip(1) {
                 watchers.remove(duplicate_id);
             }
             drop(watchers);
             self.persist().await;
-            return (keeper_id, true, matching_ids.len().saturating_sub(1));
+            return Ok((keeper_id, true, matching_ids.len().saturating_sub(1)));
         }
 
         let id = watcher.id;
         watchers.insert(id, watcher);
         drop(watchers);
         self.persist().await;
-        (id, false, 0)
+        Ok((id, false, 0))
     }
 
     /// Get all watchers
@@ -888,8 +1108,12 @@ mod tests {
                     }
                 }
             }),
-            condition: WatchCondition::Contains {
-                keyword: "breaking".to_string(),
+            condition: WatchCondition {
+                description: "Trigger when results contain breaking".to_string(),
+                matcher: WatchConditionMatcher::TextContains {
+                    text: "breaking".to_string(),
+                    case_sensitive: false,
+                },
             },
             on_trigger: "Notify me".to_string(),
             interval_secs: 60,

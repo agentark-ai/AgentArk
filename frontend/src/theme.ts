@@ -5,87 +5,96 @@ export const appTheme = createTheme({
   palette: {
     mode: "dark",
     primary: {
-      main: "#39d0ff",
-      light: "#6cdbff",
-      dark: "#2196f3",
+      main: "#4a7fae",
+      light: "#6b97bf",
+      dark: "#2d587f",
     },
     secondary: {
-      main: "#0fe3c2",
-      light: "#4ad29d",
+      main: "#8fa3c9",
+      light: "#bcc8df",
     },
     success: {
-      main: "#4ad29d",
+      main: "#89d7ab",
     },
     warning: {
-      main: "#ff9f43",
+      main: "#ffbf82",
     },
     error: {
-      main: "#ff6b6b",
+      main: "#ff9b9b",
     },
     info: {
-      main: "#39d0ff",
+      main: "#7ab8ff",
     },
     background: {
-      default: "#02050f",
-      paper: "#0a1220",
+      default: "#0d0e11",
+      paper: "#17181c",
     },
     text: {
-      primary: "#e8f4ff",
-      secondary: "rgba(214, 228, 255, 0.6)",
+      primary: "#f5f6f8",
+      secondary: "rgba(213, 216, 223, 0.72)",
     },
-    divider: "rgba(64, 196, 255, 0.12)",
+    divider: "rgba(255, 255, 255, 0.08)",
   },
   shape: {
-    borderRadius: 14,
+    borderRadius: 16,
   },
   typography: {
-    fontFamily: "'Space Grotesk', 'IBM Plex Sans', 'Segoe UI', sans-serif",
-    fontSize: 13,
+    fontFamily: "'IBM Plex Sans', 'Segoe UI', sans-serif",
+    fontSize: 14,
     h3: {
+      fontFamily: "'Space Grotesk', 'IBM Plex Sans', 'Segoe UI', sans-serif",
       fontWeight: 700,
       fontSize: "1.6rem",
       lineHeight: 1.24,
       letterSpacing: "-0.01em",
     },
     h4: {
+      fontFamily: "'Space Grotesk', 'IBM Plex Sans', 'Segoe UI', sans-serif",
       fontWeight: 700,
       fontSize: "1.4rem",
       lineHeight: 1.28,
       letterSpacing: "-0.01em",
     },
     h5: {
+      fontFamily: "'Space Grotesk', 'IBM Plex Sans', 'Segoe UI', sans-serif",
       fontWeight: 700,
       fontSize: "1.2rem",
       lineHeight: 1.32,
       letterSpacing: "-0.015em",
     },
     h6: {
+      fontFamily: "'Space Grotesk', 'IBM Plex Sans', 'Segoe UI', sans-serif",
       fontWeight: 600,
-      fontSize: "1.04rem",
-      lineHeight: 1.38,
+      fontSize: "1rem",
+      lineHeight: 1.34,
     },
     subtitle1: {
-      fontSize: "0.95rem",
+      fontFamily: "'IBM Plex Sans', 'Segoe UI', sans-serif",
+      fontSize: "0.9rem",
       fontWeight: 600,
-      lineHeight: 1.42,
+      lineHeight: 1.4,
     },
     subtitle2: {
-      fontSize: "0.88rem",
+      fontFamily: "'IBM Plex Sans', 'Segoe UI', sans-serif",
+      fontSize: "0.82rem",
       fontWeight: 600,
-      lineHeight: 1.44,
+      lineHeight: 1.4,
     },
     body1: {
-      fontSize: "0.95rem",
-      lineHeight: 1.6,
-    },
-    body2: {
-      fontSize: "0.9rem",
+      fontFamily: "'IBM Plex Sans', 'Segoe UI', sans-serif",
+      fontSize: "0.94rem",
       lineHeight: 1.58,
     },
+    body2: {
+      fontFamily: "'IBM Plex Sans', 'Segoe UI', sans-serif",
+      fontSize: "0.88rem",
+      lineHeight: 1.54,
+    },
     caption: {
-      fontSize: "0.76rem",
-      lineHeight: 1.45,
-      color: "rgba(214, 228, 255, 0.6)",
+      fontFamily: "'IBM Plex Sans', 'Segoe UI', sans-serif",
+      fontSize: "0.72rem",
+      lineHeight: 1.4,
+      color: "rgba(213, 216, 223, 0.68)",
     },
   },
   components: {
@@ -100,14 +109,14 @@ export const appTheme = createTheme({
     MuiCard: {
       styleOverrides: {
         root: {
-          border: "1px solid rgba(118, 152, 190, 0.12)",
-          background: "rgba(8, 18, 35, 0.84)",
-          backdropFilter: "blur(10px)",
-          borderRadius: 18,
+          border: "1px solid rgba(255, 255, 255, 0.08)",
+          background: "linear-gradient(180deg, rgba(24, 24, 27, 0.94), rgba(17, 17, 20, 0.92))",
+          backdropFilter: "blur(14px)",
+          borderRadius: 20,
           transition: "border-color 0.25s ease, box-shadow 0.25s ease, transform 0.2s ease",
           "&:hover": {
-            borderColor: "rgba(118, 152, 190, 0.18)",
-            boxShadow: "0 10px 20px rgba(0, 0, 0, 0.14)",
+            borderColor: "rgba(255, 255, 255, 0.12)",
+            boxShadow: "0 12px 28px rgba(0, 0, 0, 0.18)",
           },
         },
       },
@@ -115,9 +124,9 @@ export const appTheme = createTheme({
     MuiCardContent: {
       styleOverrides: {
         root: {
-          padding: "16px",
+          padding: "12px",
           "&:last-child": {
-            paddingBottom: "16px",
+            paddingBottom: "12px",
           },
         },
       },
@@ -131,9 +140,9 @@ export const appTheme = createTheme({
         root: {
           textTransform: "none" as const,
           fontWeight: 600,
-          fontSize: "0.8rem",
-          lineHeight: 1.18,
-          letterSpacing: "0.015em",
+          fontSize: "0.78rem",
+          lineHeight: 1.16,
+          letterSpacing: "0.012em",
           borderRadius: "var(--button-radius)",
           minHeight: "var(--button-height-sm)",
           padding: "0 var(--button-pad-x-sm)",
@@ -153,17 +162,17 @@ export const appTheme = createTheme({
         sizeSmall: {
           minHeight: "var(--button-height-sm)",
           padding: "0 var(--button-pad-x-sm)",
-          fontSize: "0.8rem",
+          fontSize: "0.78rem",
         },
         sizeMedium: {
           minHeight: "var(--button-height-md)",
           padding: "0 var(--button-pad-x-md)",
-          fontSize: "0.85rem",
+          fontSize: "0.82rem",
         },
         sizeLarge: {
           minHeight: "var(--button-height-lg)",
           padding: "0 var(--button-pad-x-lg)",
-          fontSize: "0.9rem",
+          fontSize: "0.88rem",
         },
         containedSizeMedium: {
           minHeight: "var(--button-height-md)",
@@ -177,22 +186,22 @@ export const appTheme = createTheme({
         contained: {
           background: "var(--button-bg-primary)",
           color: "var(--button-text-strong)",
-          borderColor: "rgba(124, 230, 255, 0.24)",
+          borderColor: "rgba(158, 185, 212, 0.24)",
           boxShadow: "var(--button-shadow-primary)",
           "&:hover": {
             background: "var(--button-bg-primary-hover)",
-            borderColor: "rgba(141, 235, 255, 0.34)",
+            borderColor: "rgba(173, 199, 224, 0.3)",
             boxShadow: "var(--button-shadow-hover)",
           },
         },
         containedPrimary: {
           background: "var(--button-bg-primary)",
           color: "var(--button-text-strong)",
-          borderColor: "rgba(124, 230, 255, 0.24)",
+          borderColor: "rgba(158, 185, 212, 0.24)",
           boxShadow: "var(--button-shadow-primary)",
           "&:hover": {
             background: "var(--button-bg-primary-hover)",
-            borderColor: "rgba(141, 235, 255, 0.34)",
+            borderColor: "rgba(173, 199, 224, 0.3)",
             boxShadow: "var(--button-shadow-hover)",
           },
         },
@@ -217,7 +226,7 @@ export const appTheme = createTheme({
           color: "#f7fbff",
         },
         outlined: {
-          background: "rgba(8, 18, 34, 0.48)",
+          background: "rgba(22, 22, 26, 0.78)",
           borderColor: "var(--button-border)",
           boxShadow: "none",
           "&:hover": {
@@ -227,7 +236,7 @@ export const appTheme = createTheme({
           },
         },
         outlinedPrimary: {
-          color: "#8be7ff",
+          color: "var(--button-text)",
         },
         outlinedSuccess: {
           borderColor: "rgba(74, 210, 157, 0.28)",
@@ -259,7 +268,7 @@ export const appTheme = createTheme({
           background: "transparent",
           "&:hover": {
             color: "var(--button-text)",
-            background: "rgba(12, 29, 51, 0.7)",
+            background: "rgba(255, 255, 255, 0.05)",
           },
         },
         textPrimary: {
@@ -277,9 +286,9 @@ export const appTheme = createTheme({
       styleOverrides: {
         root: {
           fontFamily: "'IBM Plex Sans', 'Space Grotesk', sans-serif",
-          fontSize: "0.72rem",
+          fontSize: "0.68rem",
           fontWeight: 500,
-          letterSpacing: "0.03em",
+          letterSpacing: "0.025em",
           borderRadius: 999,
           transition: "all 0.2s ease",
           "&:hover": {
@@ -309,7 +318,7 @@ export const appTheme = createTheme({
     MuiTableContainer: {
       styleOverrides: {
         root: {
-          borderRadius: 18,
+          borderRadius: 14,
           border: "1px solid rgba(118, 152, 190, 0.12)",
           background: "rgba(255, 255, 255, 0.018)",
         },
@@ -322,11 +331,11 @@ export const appTheme = createTheme({
             background: "rgba(8, 18, 33, 0.74)",
             color: "rgba(214, 228, 255, 0.55)",
             fontWeight: 500,
-            fontSize: "0.72rem",
+            fontSize: "0.68rem",
             letterSpacing: "0.04em",
             textTransform: "uppercase" as const,
             borderBottom: "1px solid rgba(118, 152, 190, 0.12)",
-            padding: "12px 16px",
+            padding: "8px 12px",
           },
         },
       },
@@ -342,8 +351,8 @@ export const appTheme = createTheme({
           },
           "& .MuiTableCell-body": {
             borderBottom: "1px solid rgba(118, 152, 190, 0.06)",
-            padding: "12px 16px",
-            fontSize: "0.84rem",
+            padding: "8px 12px",
+            fontSize: "0.81rem",
             color: "#e8f4ff",
           },
         },
@@ -398,7 +407,7 @@ export const appTheme = createTheme({
     MuiMenuItem: {
       styleOverrides: {
         root: {
-          fontSize: "0.78rem",
+          fontSize: "0.76rem",
           color: "#e8f4ff",
           "&:hover": {
             background: "rgba(57, 208, 255, 0.06)",
@@ -415,8 +424,8 @@ export const appTheme = createTheme({
     MuiOutlinedInput: {
       styleOverrides: {
         root: {
-          borderRadius: 12,
-          fontSize: "0.84rem",
+          borderRadius: 10,
+          fontSize: "0.82rem",
           color: "#e8f4ff",
           "& .MuiOutlinedInput-notchedOutline": {
             borderColor: "rgba(118, 152, 190, 0.12)",
@@ -431,7 +440,7 @@ export const appTheme = createTheme({
           },
         },
         input: {
-          padding: "11px 13px",
+          padding: "9px 11px",
           color: "#e8f4ff",
           "&::placeholder": {
             color: "rgba(140, 170, 210, 0.4)",
@@ -445,7 +454,7 @@ export const appTheme = createTheme({
         paper: {
           background: "#0a1220",
           border: "1px solid rgba(118, 152, 190, 0.14)",
-          borderRadius: 18,
+          borderRadius: 16,
           backdropFilter: "blur(14px)",
         },
       },
@@ -453,8 +462,8 @@ export const appTheme = createTheme({
     MuiAlert: {
       styleOverrides: {
         root: {
-          borderRadius: 12,
-          fontSize: "0.84rem",
+          borderRadius: 10,
+          fontSize: "0.82rem",
         },
         standardInfo: {
           background: "rgba(57, 208, 255, 0.06)",
@@ -489,7 +498,7 @@ export const appTheme = createTheme({
         root: {
           textTransform: "none" as const,
           fontWeight: 500,
-          fontSize: "0.82rem",
+          fontSize: "0.78rem",
           letterSpacing: "0.01em",
           color: "rgba(214, 228, 255, 0.55)",
           transition: "color 0.2s ease",
@@ -508,7 +517,7 @@ export const appTheme = createTheme({
         root: {
           background: "transparent",
           border: "1px solid rgba(118, 152, 190, 0.12)",
-          borderRadius: "14px !important",
+          borderRadius: "12px !important",
           "&:before": {
             display: "none",
           },
@@ -518,14 +527,14 @@ export const appTheme = createTheme({
     MuiIconButton: {
       styleOverrides: {
         root: {
-          padding: 7,
+          padding: 6,
           borderRadius: "var(--button-radius)",
           border: "1px solid transparent",
           color: "var(--button-text-muted)",
           transition: "background 0.18s ease, border-color 0.18s ease, color 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease",
           "&:hover": {
-            background: "rgba(12, 29, 51, 0.72)",
-            borderColor: "rgba(118, 152, 190, 0.18)",
+            background: "var(--button-bg-subtle-hover)",
+            borderColor: "var(--button-border-strong)",
             color: "var(--button-text)",
             boxShadow: "none",
           },
@@ -539,7 +548,7 @@ export const appTheme = createTheme({
     MuiToolbar: {
       styleOverrides: {
         regular: {
-          minHeight: 58,
+          minHeight: 50,
         },
       },
     },
@@ -548,8 +557,8 @@ export const appTheme = createTheme({
         tooltip: {
           background: "rgba(6, 14, 28, 0.95)",
           border: "1px solid rgba(118, 152, 190, 0.14)",
-          borderRadius: 10,
-          fontSize: "0.76rem",
+          borderRadius: 8,
+          fontSize: "0.72rem",
           backdropFilter: "blur(8px)",
         },
       },

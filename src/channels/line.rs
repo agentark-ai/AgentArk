@@ -153,6 +153,7 @@ fn verify_line_signature(secret: &str, raw_body: &[u8], signature: Option<&str>)
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn load_destination(agent: &Agent) -> Result<Option<LineDestinationContext>> {
     if let Ok(Some(raw)) = agent.storage.get(LAST_DESTINATION_STORAGE_KEY).await {
         if let Ok(value) = serde_json::from_slice::<LineDestinationContext>(&raw) {
@@ -173,13 +174,8 @@ async fn persist_destination(agent: &Agent, destination: &LineDestinationContext
 
 fn resolve_destination(
     config: &LineChannelConfig,
-    last_destination: Option<LineDestinationContext>,
+    _last_destination: Option<LineDestinationContext>,
 ) -> Result<LineDestinationContext> {
-    if let Some(destination) = last_destination {
-        if !destination.target.trim().is_empty() {
-            return Ok(destination);
-        }
-    }
     let Some(target) = config
         .default_target
         .clone()
@@ -228,9 +224,8 @@ pub async fn send_message(agent: &Agent, text: &str) -> Result<()> {
         .line
         .clone()
         .ok_or_else(|| anyhow!("LINE is not configured"))?;
-    let destination = resolve_destination(&config, load_destination(agent).await?)?;
+    let destination = resolve_destination(&config, None)?;
     send_message_to_destination(&config, &destination, text).await?;
-    persist_destination(agent, &destination).await?;
     Ok(())
 }
 
@@ -358,4 +353,27 @@ pub async fn handle_webhook(
     }
 
     Ok("ok".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proactive_line_destination_uses_configured_target_only() {
+        let config = LineChannelConfig {
+            channel_access_token: "token".to_string(),
+            channel_secret: "secret".to_string(),
+            default_target: Some("U-config".to_string()),
+            ..Default::default()
+        };
+        let last_destination = Some(LineDestinationContext {
+            target: "U-last".to_string(),
+            scope_id: Some("scope".to_string()),
+        });
+
+        let destination = resolve_destination(&config, last_destination).unwrap();
+        assert_eq!(destination.target, "U-config");
+        assert_eq!(destination.scope_id, None);
+    }
 }

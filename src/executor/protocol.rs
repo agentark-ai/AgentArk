@@ -41,6 +41,10 @@ pub struct CodeExecuteRequest {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub network_access: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_contract: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_context: Option<crate::actions::ActionAuthorizationContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

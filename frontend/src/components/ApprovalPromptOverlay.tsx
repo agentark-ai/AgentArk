@@ -7,6 +7,7 @@ import {
   Chip,
   IconButton,
   Stack,
+  TextField,
   Typography
 } from "@mui/material";
 import { useEffect, useMemo, useState } from "react";
@@ -31,10 +32,12 @@ type Props = {
   tasks: Task[];
   busyTaskId?: string | null;
   errorMessage?: string | null;
-  onApprove: (id: string) => void;
-  onReject: (id: string) => void;
+  onApprove: (id: string, comment?: string) => void;
+  onReject: (id: string, comment?: string) => void;
   onOpenTasks: () => void;
 };
+
+const UNAVAILABLE_APPROVAL_DESCRIPTION = "Older task details unavailable";
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -60,11 +63,22 @@ function buildApprovalCard(task: ApprovalTask): ApprovalCard | null {
   if (normalizeTaskStatus(task.status) !== "awaiting_approval") return null;
   const argumentsRecord = asRecord(task.arguments);
   const approval = asRecord(argumentsRecord._approval);
+  const description = str(task.description, "").trim();
   const riskScoreRaw = approval.risk_score;
   const riskScore =
     typeof riskScoreRaw === "number" && Number.isFinite(riskScoreRaw)
       ? String(Math.round(riskScoreRaw))
       : str(riskScoreRaw, "").trim();
+  const hasDisplayDetails =
+    Boolean(str(approval.title, "").trim()) ||
+    Boolean(str(approval.summary, "").trim()) ||
+    Boolean(str(approval.reason, "").trim()) ||
+    Boolean(str(approval.risk_level, "").trim()) ||
+    Boolean(riskScore) ||
+    Boolean(str(approval.source, "").trim());
+  if (description === UNAVAILABLE_APPROVAL_DESCRIPTION && !hasDisplayDetails) {
+    return null;
+  }
   return {
     id: str(task.id, ""),
     title: str(approval.title, str(task.description, "Approval needed")).trim() || "Approval needed",
@@ -92,6 +106,7 @@ export function ApprovalPromptOverlay({
   onOpenTasks
 }: Props) {
   const [dismissedIds, setDismissedIds] = useState<string[]>([]);
+  const [comment, setComment] = useState("");
 
   const approvals = useMemo(
     () =>
@@ -107,6 +122,11 @@ export function ApprovalPromptOverlay({
   }, [approvals]);
 
   const activeApproval = approvals.find((task) => !dismissedIds.includes(task.id)) ?? null;
+
+  useEffect(() => {
+    setComment("");
+  }, [activeApproval?.id]);
+
   if (!activeApproval) return null;
 
   const remainingCount = approvals.filter((task) => !dismissedIds.includes(task.id)).length;
@@ -121,7 +141,7 @@ export function ApprovalPromptOverlay({
         width: { xs: "calc(100vw - 24px)", sm: 430 },
         maxWidth: "calc(100vw - 24px)",
         zIndex: 1450,
-        borderRadius: "18px",
+        borderRadius: "8px",
         border: "1px solid rgba(255, 179, 71, 0.24)",
         background: "linear-gradient(165deg, rgba(24, 15, 6, 0.96), rgba(12, 18, 33, 0.95))",
         boxShadow: "0 24px 56px rgba(0, 0, 0, 0.46), 0 0 0 1px rgba(255, 179, 71, 0.08)",
@@ -137,7 +157,7 @@ export function ApprovalPromptOverlay({
               sx={{
                 width: 34,
                 height: 34,
-                borderRadius: "12px",
+                borderRadius: "8px",
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "center",
@@ -207,7 +227,7 @@ export function ApprovalPromptOverlay({
 
         <Box
           sx={{
-            borderRadius: "14px",
+            borderRadius: "8px",
             p: 1.25,
             background: "rgba(255,255,255,0.025)",
             border: "1px solid rgba(255,255,255,0.05)"
@@ -234,11 +254,30 @@ export function ApprovalPromptOverlay({
           </Alert>
         ) : null}
 
+        <TextField
+          size="small"
+          label="Comment"
+          value={comment}
+          onChange={(event) => setComment(event.target.value)}
+          placeholder="Optional note for the agent"
+          multiline
+          minRows={2}
+          disabled={busy}
+          sx={{
+            "& .MuiInputBase-root": {
+              color: "rgba(241, 248, 255, 0.95)",
+              background: "rgba(255,255,255,0.03)"
+            },
+            "& .MuiInputLabel-root": { color: "rgba(255, 219, 174, 0.72)" },
+            "& .MuiOutlinedInput-notchedOutline": { borderColor: "rgba(255,255,255,0.12)" }
+          }}
+        />
+
         <Stack direction={{ xs: "column", sm: "row" }} spacing={0.9}>
           <Button
             variant="contained"
             color="success"
-            onClick={() => onApprove(activeApproval.id)}
+            onClick={() => onApprove(activeApproval.id, comment)}
             disabled={busy}
             sx={{ textTransform: "none", flex: 1 }}
           >
@@ -247,7 +286,7 @@ export function ApprovalPromptOverlay({
           <Button
             variant="outlined"
             color="warning"
-            onClick={() => onReject(activeApproval.id)}
+            onClick={() => onReject(activeApproval.id, comment)}
             disabled={busy}
             sx={{ textTransform: "none", flex: 1 }}
           >

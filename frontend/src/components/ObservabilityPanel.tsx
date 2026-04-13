@@ -17,6 +17,7 @@ import {
   TextField,
   Typography
 } from "@mui/material";
+import { formatUiDateTimeMeta } from "../lib/dateFormat";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -48,14 +49,7 @@ function str(value: unknown, fallback = ""): string {
 }
 
 function humanTs(value: string): { label: string; tip: string } {
-  const trimmed = (value || "").trim();
-  if (!trimmed) return { label: "-", tip: "-" };
-  const parsed = new Date(trimmed);
-  if (Number.isNaN(parsed.getTime())) return { label: trimmed, tip: trimmed };
-  return {
-    label: parsed.toLocaleString(),
-    tip: parsed.toISOString()
-  };
+  return formatUiDateTimeMeta(value, { fallback: "-" });
 }
 
 export function ObservabilityPanel({

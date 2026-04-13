@@ -14,6 +14,7 @@ import {
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
+import { formatUiDateTime } from "../lib/dateFormat";
 import type { Task, TraceSummary } from "../types";
 import { NativeWorkspace, type WorkspaceView } from "./NativeWorkspace";
 
@@ -66,10 +67,7 @@ function formatTaskStatus(task: Task): string {
 }
 
 function formatWhen(raw?: string): string {
-  if (!raw) return "-";
-  const dt = new Date(raw);
-  if (Number.isNaN(dt.getTime())) return raw;
-  return dt.toLocaleString();
+  return formatUiDateTime(raw, { fallback: "-" });
 }
 
 const DRAWER_VIEWS: Array<{ view: DrawerView; label: string; detail: string }> = [
@@ -192,7 +190,7 @@ export function WorkspaceHub({
             <Typography variant="overline" className="workspace-shell-kicker">
               Active Workspace
             </Typography>
-            <Typography variant="h5" sx={{ fontWeight: 700, letterSpacing: "-0.03em", mb: 0.35 }}>
+            <Typography variant="h5" sx={{ fontWeight: 700, letterSpacing: 0, mb: 0.35 }}>
               Ask naturally. Deeper work stays one click away.
             </Typography>
             <Typography variant="body2" color="text.secondary" sx={{ maxWidth: 860 }}>

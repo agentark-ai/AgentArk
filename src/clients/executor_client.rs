@@ -25,7 +25,7 @@ impl ExecutorClientConfig {
             timeout_secs: std::env::var("AGENTARK_EXECUTOR_TIMEOUT_SECS")
                 .ok()
                 .and_then(|value| value.parse().ok())
-                .unwrap_or(30),
+                .unwrap_or(600),
         }
     }
 }
@@ -40,7 +40,7 @@ impl ExecutorClient {
     pub fn new(config: ExecutorClientConfig) -> Result<Self> {
         super::validate_internal_service_base_url(&config.base_url, "Executor service")?;
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(config.timeout_secs))
+            .timeout(Duration::from_secs(config.timeout_secs.max(1)))
             .build()
             .context("Failed to build executor client")?;
         Ok(Self { config, client })
@@ -129,6 +129,10 @@ pub struct CodeExecuteRequest {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub network_access: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_contract: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_context: Option<crate::actions::ActionAuthorizationContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

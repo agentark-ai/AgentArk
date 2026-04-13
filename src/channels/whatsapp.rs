@@ -30,11 +30,9 @@ fn parse_tunnel_command(text: &str) -> Option<TunnelControlCommand> {
     let normalized = text.trim().to_ascii_lowercase().replace(['_', '-'], " ");
     let compact = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
     match compact.as_str() {
-        "start tunnel" | "/tunnel start" | "/start_tunnel" => Some(TunnelControlCommand::Start),
-        "stop tunnel" | "/tunnel stop" | "/stop_tunnel" => Some(TunnelControlCommand::Stop),
-        "tunnel status" | "status tunnel" | "/tunnel" | "/tunnel status" | "/tunnel_status" => {
-            Some(TunnelControlCommand::Status)
-        }
+        "/tunnel start" | "/start tunnel" => Some(TunnelControlCommand::Start),
+        "/tunnel stop" | "/stop tunnel" => Some(TunnelControlCommand::Stop),
+        "/tunnel" | "/tunnel status" => Some(TunnelControlCommand::Status),
         _ => None,
     }
 }
@@ -360,6 +358,19 @@ fn normalize_whatsapp_sender(value: &str) -> String {
         .collect::<String>()
 }
 
+pub(crate) fn configured_notification_recipient(config: &WhatsAppChannelConfig) -> Option<String> {
+    let mut recipients = config
+        .allowed_numbers
+        .iter()
+        .map(|value| normalize_whatsapp_sender(value))
+        .filter(|value| !value.is_empty());
+    let first = recipients.next()?;
+    if recipients.next().is_some() {
+        return None;
+    }
+    Some(first)
+}
+
 fn whatsapp_sender_identity(from: &str, preview: Option<&str>) -> SenderIdentity {
     SenderIdentity {
         channel: SenderChannel::Whatsapp,
@@ -400,41 +411,7 @@ async fn approve_whatsapp_sender(storage: &Storage, from: &str, approved_by: &st
 }
 
 fn parse_set_secret(text: &str) -> Option<(String, String)> {
-    // Accept both:
-    // - "/setsecret KEY=VALUE" (WhatsApp slash command)
-    // - "set secret KEY=VALUE" (plain text; mainly for parity)
-    let trimmed = text.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    let rest = if lower.starts_with("/setsecret ") || lower.starts_with("set secret ") {
-        trimmed[10..].trim() // len("set secret ") == 10
-    } else {
-        return None;
-    };
-    if rest.is_empty() {
-        return None;
-    }
-
-    let (key, value) = if let Some(eq) = rest.find('=') {
-        let (k, v) = rest.split_at(eq);
-        (k.trim(), v[1..].trim())
-    } else {
-        let mut parts = rest.splitn(2, char::is_whitespace);
-        let k = parts.next().unwrap_or("").trim();
-        let v = parts.next().unwrap_or("").trim();
-        (k, v)
-    };
-
-    if key.is_empty() || value.is_empty() {
-        return None;
-    }
-    if key.chars().any(|c| c.is_whitespace()) {
-        return None;
-    }
-    if key.contains('\n') || key.contains('\r') {
-        return None;
-    }
-
-    Some((key.to_string(), value.to_string()))
+    crate::core::secrets::parse_set_secret_command(text)
 }
 
 fn parse_use_current_llm_key(text: &str) -> Option<String> {
@@ -507,7 +484,7 @@ async fn link_current_llm_key_for_chat(agent: &SharedAgent, key: &str) -> Result
         available_keys.join(", ")
     };
     Err(format!(
-        "I can't map '{}' from current model settings. Available model-backed keys: {}. You can set it manually with: set secret {}=VALUE",
+        "I can't map '{}' from current model settings. Available model-backed keys: {}. You can set it manually with: /setsecret {}=VALUE",
         key, available, key
     ))
 }
@@ -778,8 +755,7 @@ async fn mark_as_read(config: &WhatsAppChannelConfig, message_id: &str) -> Resul
 /// Send a push notification to the last known WhatsApp sender.
 ///
 /// This mirrors the Telegram `send_message` helper — it looks up the most
-/// recent chat partner from storage and delivers a text message. Useful for
-/// scheduled task results, alerts, reminders, etc.
+/// Sends a proactive text message to the configured WhatsApp notification target.
 ///
 /// Routes through the Baileys bridge or Meta Cloud API depending on config mode.
 pub async fn send_message(agent: &Agent, text: &str) -> Result<()> {
@@ -789,21 +765,12 @@ pub async fn send_message(agent: &Agent, text: &str) -> Result<()> {
         return Err(anyhow!(message));
     };
 
-    let phone_bytes = agent.storage.get("whatsapp:last_sender").await?;
-    let Some(bytes) = phone_bytes else {
+    let Some(phone_number) = configured_notification_recipient(config) else {
         let message =
-            "WhatsApp has no delivery target yet. Send the agent a WhatsApp message first.";
+            "WhatsApp proactive delivery is fail-closed until exactly one allowed number is configured.";
         tracing::warn!("WhatsApp send_message: {}", message);
         return Err(anyhow!(message));
     };
-
-    let phone_number = String::from_utf8_lossy(&bytes).to_string();
-    if phone_number.is_empty() {
-        let message =
-            "WhatsApp has no delivery target yet. Send the agent a WhatsApp message first.";
-        tracing::warn!("WhatsApp send_message: {}", message);
-        return Err(anyhow!(message));
-    }
 
     send_message_to_recipient(config, &phone_number, &agent.config.name, text).await
 }
@@ -966,7 +933,6 @@ pub async fn verify_webhook(
 ///
 /// Returns `"ok"` on success (Meta expects a 200 response quickly).
 pub async fn handle_webhook(agent: SharedAgent, body: &serde_json::Value) -> Result<String> {
-    let is_baileys = body.get("_source").and_then(|value| value.as_str()) == Some("baileys");
     let config = {
         let agent_read = agent.read().await;
         agent_read
@@ -975,7 +941,16 @@ pub async fn handle_webhook(agent: SharedAgent, body: &serde_json::Value) -> Res
             .clone()
             .ok_or_else(|| anyhow!("WhatsApp is not configured"))?
     };
+    handle_webhook_with_config(agent, &config, body).await
+}
 
+pub async fn handle_webhook_with_config(
+    agent: SharedAgent,
+    config: &WhatsAppChannelConfig,
+    body: &serde_json::Value,
+) -> Result<String> {
+    let is_baileys = body.get("_source").and_then(|value| value.as_str()) == Some("baileys");
+    let config = config.clone();
     match (is_baileys, config.mode) {
         (true, WhatsAppMode::Baileys) | (false, WhatsAppMode::CloudApi) => {}
         (true, _) => {
@@ -1032,6 +1007,12 @@ pub async fn handle_webhook(agent: SharedAgent, body: &serde_json::Value) -> Res
             "WhatsApp: rejected message from unauthorized number {}",
             from
         );
+        {
+            let agent_read = agent.read().await;
+            agent_read
+                .security_events
+                .record_unauthorized_channel_attempt();
+        }
         return Ok("ok".to_string());
     }
 
@@ -1201,7 +1182,7 @@ pub async fn handle_webhook(agent: SharedAgent, body: &serde_json::Value) -> Res
         return Ok("ok".to_string());
     }
 
-    // Also support plain-language tunnel commands for non-technical users.
+    // Explicit tunnel control commands are handled before LLM processing.
     if let Some(cmd) = parse_tunnel_command(&text) {
         let response = execute_tunnel_command(&agent, cmd).await;
         send_reply(&config, from, &response).await?;
@@ -1322,7 +1303,7 @@ pub async fn handle_webhook(agent: SharedAgent, body: &serde_json::Value) -> Res
     Ok("ok".to_string())
 }
 
-/// Send a video to the last known WhatsApp sender.
+/// Send a video to the configured WhatsApp notification target.
 ///
 /// For Baileys mode: sends base64-encoded video to the bridge /send-video endpoint.
 /// For Cloud API mode: sends a download link (WhatsApp Cloud API requires media upload).
@@ -1336,14 +1317,9 @@ pub async fn send_video(
         return Ok(());
     };
 
-    let phone_bytes = agent.storage.get("whatsapp:last_sender").await?;
-    let Some(bytes) = phone_bytes else {
+    let Some(phone_number) = configured_notification_recipient(config) else {
         return Ok(());
     };
-    let phone_number = String::from_utf8_lossy(&bytes).to_string();
-    if phone_number.is_empty() {
-        return Ok(());
-    }
 
     match config.mode {
         WhatsAppMode::Baileys => {
@@ -1389,7 +1365,7 @@ pub async fn send_video(
     }
 }
 
-/// Send an image preview to the last known WhatsApp sender.
+/// Send an image preview to the configured WhatsApp notification target.
 ///
 /// For Baileys mode: sends base64-encoded image to the bridge /send-image endpoint.
 /// For Cloud API mode: sends caption + preview link text (no media upload path here yet).
@@ -1403,14 +1379,9 @@ pub async fn send_image(
         return Ok(());
     };
 
-    let phone_bytes = agent.storage.get("whatsapp:last_sender").await?;
-    let Some(bytes) = phone_bytes else {
+    let Some(phone_number) = configured_notification_recipient(config) else {
         return Ok(());
     };
-    let phone_number = String::from_utf8_lossy(&bytes).to_string();
-    if phone_number.is_empty() {
-        return Ok(());
-    }
 
     match config.mode {
         WhatsAppMode::Baileys => {
@@ -1926,6 +1897,22 @@ mod tests {
             infer_bridge_runtime_from_url("https://bridge.example.com"),
             WhatsAppBridgeRuntime::External
         );
+    }
+
+    #[test]
+    fn configured_notification_recipient_requires_exactly_one_allowed_number() {
+        let mut config = test_cloud_config();
+        config.allowed_numbers = vec!["+1 (555) 123-4567".to_string()];
+        assert_eq!(
+            configured_notification_recipient(&config),
+            Some("15551234567".to_string())
+        );
+
+        config.allowed_numbers.clear();
+        assert_eq!(configured_notification_recipient(&config), None);
+
+        config.allowed_numbers = vec!["15551234567".to_string(), "15557654321".to_string()];
+        assert_eq!(configured_notification_recipient(&config), None);
     }
 
     #[test]

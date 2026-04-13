@@ -12,16 +12,26 @@ import {
   Divider,
   FormControlLabel,
   Grid2,
+  IconButton,
+  Menu,
   MenuItem,
   Stack,
   Tab,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
   Tabs,
   TextField,
   Typography,
 } from "@mui/material";
+import MoreVertIcon from "@mui/icons-material/MoreVert";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
+import { formatUiDateTime } from "../lib/dateFormat";
 import type { BackgroundSessionDetail, BackgroundSessionSummary } from "../types";
 import { WorkspacePageHeader, WorkspacePageShell } from "./WorkspacePage";
 
@@ -37,6 +47,13 @@ type SelectableWatcher = {
   poll_action: string;
   status: string;
   history_only: boolean;
+};
+type RowMenuAction = {
+  label: string;
+  onClick: () => void | Promise<void>;
+  disabled?: boolean;
+  tone?: "default" | "warning" | "error";
+  divider?: boolean;
 };
 
 type SessionFormState = {
@@ -120,9 +137,7 @@ function statusLabel(status: string): string {
 }
 
 function formatTimestamp(value?: string | null): string {
-  if (!value) return "-";
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+  return formatUiDateTime(value, { fallback: "-" });
 }
 
 function sessionFormFromDetail(detail: BackgroundSessionDetail): SessionFormState {
@@ -143,6 +158,42 @@ function sessionFormFromDetail(detail: BackgroundSessionDetail): SessionFormStat
 
 function sessionCount(session: BackgroundSessionSummary): number {
   return (session.counts?.tasks_total || 0) + (session.counts?.watchers_total || 0);
+}
+
+function RowOpsMenu({ actions, ariaLabel = "Row actions" }: { actions: RowMenuAction[]; ariaLabel?: string }) {
+  const [anchorEl, setAnchorEl] = useState<HTMLElement | null>(null);
+  const open = Boolean(anchorEl);
+  const closeMenu = () => setAnchorEl(null);
+  return (
+    <>
+      <IconButton size="small" aria-label={ariaLabel} onClick={(e) => setAnchorEl(e.currentTarget)}>
+        <MoreVertIcon fontSize="small" />
+      </IconButton>
+      <Menu anchorEl={anchorEl} open={open} onClose={closeMenu}>
+        {actions.map((action, idx) => (
+          <MenuItem
+            key={`${action.label}-${idx}`}
+            divider={action.divider}
+            disabled={action.disabled}
+            onClick={() => {
+              closeMenu();
+              if (action.disabled) return;
+              void action.onClick();
+            }}
+            sx={
+              action.tone === "error"
+                ? { color: "error.main" }
+                : action.tone === "warning"
+                  ? { color: "warning.main" }
+                  : undefined
+            }
+          >
+            {action.label}
+          </MenuItem>
+        ))}
+      </Menu>
+    </>
+  );
 }
 
 export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolean }) {
@@ -185,12 +236,8 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
   const sessions = sessionsQ.data?.sessions || [];
 
   useEffect(() => {
-    if (!sessions.length) {
-      if (selectedId !== null) setSelectedId(null);
-      return;
-    }
-    if (!selectedId || !sessions.some((session) => session.id === selectedId)) {
-      setSelectedId(sessions[0]?.id || null);
+    if (!sessions.length && selectedId !== null) {
+      setSelectedId(null);
     }
   }, [selectedId, sessions]);
 
@@ -336,8 +383,8 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
     setDialogOpen(true);
   };
 
-  const openEditDialog = () => {
-    if (!detailQ.data) return;
+  const openEditDialog = (session: BackgroundSessionSummary) => {
+    if (!detailQ.data || detailQ.data.session.id !== session.id) return;
     setEditingSessionId(detailQ.data.session.id);
     setForm(sessionFormFromDetail(detailQ.data));
     setFormError(null);
@@ -363,396 +410,354 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
         }
       />
 
-      <Grid2 container spacing={2}>
+      {/* Compact stat strip */}
+      <Box className="list-shell stat-strip">
         {[
           { label: "Active", value: activeCount },
           { label: "Waiting", value: waitingCount },
           { label: "Paused", value: pausedCount },
           { label: "Closed", value: closedCount },
         ].map((item) => (
-          <Grid2 key={item.label} size={{ xs: 6, md: 3 }}>
-            <Box className="list-shell" sx={{ minHeight: 96 }}>
-              <Typography variant="caption" color="text.secondary">
-                {item.label}
-              </Typography>
-              <Typography variant="h5">{item.value}</Typography>
-            </Box>
-          </Grid2>
+          <div key={item.label} className="stat-strip-item">
+            <span className="stat-strip-label">{item.label}</span>
+            <span className="stat-strip-value">{item.value}</span>
+          </div>
         ))}
-      </Grid2>
+      </Box>
 
-      {sessionsQ.isLoading ? (
-        <Box className="list-shell" sx={{ py: 6, textAlign: "center" }}>
-          <CircularProgress size={28} />
-        </Box>
-      ) : sessions.length === 0 ? (
-        <Box className="list-shell" sx={{ py: 7, textAlign: "center" }}>
-          <Typography variant="h6" color="text.secondary">
-            No background sessions yet
-          </Typography>
-          <Typography variant="body2" color="text.secondary" sx={{ mt: 0.75, mb: 2 }}>
-            Create a session when work should persist beyond one chat turn and stay observable over time.
-          </Typography>
-          <Button variant="outlined" onClick={openCreateDialog}>
-            Create your first session
-          </Button>
-        </Box>
-      ) : (
-        <Grid2 container spacing={2} alignItems="stretch">
-          <Grid2 size={{ xs: 12, md: 5, xl: 4 }}>
-            <Stack spacing={1.25}>
-              {sessions.map((session) => {
-                const isSelected = session.id === selectedId;
-                return (
-                  <Box
-                    key={session.id}
-                    className="list-shell"
-                    onClick={() => setSelectedId(session.id)}
-                    sx={{
-                      cursor: "pointer",
-                      borderColor: isSelected ? "rgba(47, 212, 255, 0.4)" : undefined,
-                      background: isSelected ? "rgba(11, 24, 43, 0.92)" : undefined,
-                    }}
-                  >
-                    <Stack spacing={1}>
-                      <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between">
-                        <Typography variant="subtitle1" sx={{ fontWeight: 700 }} noWrap title={session.title}>
+      {/* Sessions table — same pattern as Tasks page */}
+      <Box className="list-shell">
+        <Typography variant="h6" mb={1}>
+          Session List
+        </Typography>
+        {sessionsQ.isLoading ? (
+          <Box sx={{ py: 6, textAlign: "center" }}>
+            <CircularProgress size={28} />
+          </Box>
+        ) : sessions.length === 0 ? (
+          <Box sx={{ py: 5, textAlign: "center" }}>
+            <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+              No background sessions yet. Create a session when work should persist beyond one chat turn.
+            </Typography>
+            <Button variant="outlined" onClick={openCreateDialog}>
+              Create your first session
+            </Button>
+          </Box>
+        ) : (
+          <TableContainer className="table-shell" sx={{ width: "100%", overflowX: "auto" }}>
+            <Table size="small" sx={{ minWidth: 860 }}>
+              <TableHead>
+                <TableRow>
+                  <TableCell>Title</TableCell>
+                  <TableCell>Objective</TableCell>
+                  <TableCell>Status</TableCell>
+                  <TableCell>Tasks</TableCell>
+                  <TableCell>Watchers</TableCell>
+                  <TableCell>Updated</TableCell>
+                  <TableCell align="right">Ops</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {sessions.map((session) => {
+                  const isPaused = session.status === "paused";
+                  const isTerminal = ["completed", "failed", "cancelled"].includes(session.status);
+                  const rowActions: RowMenuAction[] = [
+                    {
+                      label: "View",
+                      onClick: () => {
+                        setSelectedId(session.id);
+                        setDetailTab("overview");
+                      },
+                    },
+                    {
+                      label: "Edit",
+                      onClick: () => {
+                        setSelectedId(session.id);
+                        // Need detail loaded first — open edit after a tick
+                        setTimeout(() => openEditDialog(session), 200);
+                      },
+                    },
+                    {
+                      label: isPaused ? "Resume" : "Pause",
+                      disabled: isTerminal,
+                      onClick: () =>
+                        actionMutation.mutate({
+                          kind: isPaused ? "resume" : "pause",
+                          sessionId: session.id,
+                        }),
+                    },
+                    {
+                      label: "Stop",
+                      tone: "warning",
+                      disabled: isTerminal,
+                      onClick: () =>
+                        actionMutation.mutate({ kind: "cancel", sessionId: session.id }),
+                    },
+                    {
+                      label: "Delete",
+                      tone: "error",
+                      divider: true,
+                      onClick: () => {
+                        const confirmed = window.confirm(
+                          "Delete this background session? Linked tasks and watchers will be detached but not deleted.",
+                        );
+                        if (!confirmed) return;
+                        actionMutation.mutate({ kind: "delete", sessionId: session.id });
+                      },
+                    },
+                  ];
+
+                  return (
+                    <TableRow key={session.id}>
+                      <TableCell sx={{ maxWidth: 280 }}>
+                        <Typography variant="body2" noWrap title={session.title}>
                           {session.title}
                         </Typography>
+                      </TableCell>
+                      <TableCell sx={{ maxWidth: 420 }}>
+                        <Typography variant="body2" noWrap title={session.live_summary || session.objective}>
+                          {session.live_summary || session.objective}
+                        </Typography>
+                      </TableCell>
+                      <TableCell>
                         <Chip size="small" label={statusLabel(session.status)} color={chipColor(session.status)} />
-                      </Stack>
-                      <Typography variant="body2" color="text.secondary" sx={{ minHeight: 38 }}>
-                        {session.live_summary || session.objective}
-                      </Typography>
-                      <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
-                        <Chip size="small" variant="outlined" label={`${session.counts.tasks_total} tasks`} />
-                        <Chip size="small" variant="outlined" label={`${session.counts.watchers_total} watchers`} />
-                        <Chip size="small" variant="outlined" label={`${sessionCount(session)} linked`} />
-                      </Stack>
-                      <Typography variant="caption" color="text.secondary">
-                        Updated {formatTimestamp(session.updated_at)}
-                      </Typography>
-                    </Stack>
-                  </Box>
-                );
-              })}
-            </Stack>
-          </Grid2>
+                      </TableCell>
+                      <TableCell>{session.counts.tasks_total}</TableCell>
+                      <TableCell>{session.counts.watchers_total}</TableCell>
+                      <TableCell sx={{ whiteSpace: "nowrap" }} title={formatTimestamp(session.updated_at)}>
+                        {formatTimestamp(session.updated_at)}
+                      </TableCell>
+                      <TableCell align="right">
+                        <RowOpsMenu actions={rowActions} ariaLabel="Session options" />
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          </TableContainer>
+        )}
+      </Box>
 
-          <Grid2 size={{ xs: 12, md: 7, xl: 8 }}>
-            <Box className="list-shell" sx={{ minHeight: { xs: 0, md: 520 } }}>
-              {!selectedId || detailQ.isLoading ? (
-                <Box sx={{ py: 10, textAlign: "center" }}>
-                  <CircularProgress size={28} />
-                </Box>
-              ) : detailQ.error || !selectedSession ? (
-                <Alert severity="error">{errMessage(detailQ.error)}</Alert>
-              ) : (
-                <Stack spacing={2}>
-                  <Stack
-                    direction={{ xs: "column", md: "row" }}
-                    spacing={1.25}
-                    justifyContent="space-between"
-                    alignItems={{ xs: "flex-start", md: "center" }}
-                  >
-                    <Box>
-                      <Stack direction="row" spacing={1} alignItems="center" useFlexGap flexWrap="wrap">
-                        <Typography variant="h6">{selectedSession.title}</Typography>
-                        <Chip
-                          size="small"
-                          label={statusLabel(selectedSession.status)}
-                          color={chipColor(selectedSession.status)}
-                        />
-                      </Stack>
-                      <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                        {selectedSession.live_summary}
+      {/* Session detail dialog — opened via "View" in ops menu */}
+      <Dialog open={selectedId != null} onClose={() => setSelectedId(null)} maxWidth="md" fullWidth>
+        <DialogTitle sx={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={selectedSession?.title || "Session"}>{selectedSession?.title || "Session"}</DialogTitle>
+        <DialogContent>
+          {!selectedId || detailQ.isLoading ? (
+            <Box sx={{ py: 4, textAlign: "center" }}>
+              <CircularProgress size={28} />
+            </Box>
+          ) : detailQ.error || !selectedSession ? (
+            <Alert severity="error">{errMessage(detailQ.error)}</Alert>
+          ) : (
+            <Stack spacing={1}>
+              <Stack direction="row" spacing={1} flexWrap="wrap" alignItems="center">
+                <Chip
+                  size="small"
+                  label={statusLabel(selectedSession.status)}
+                  color={chipColor(selectedSession.status)}
+                />
+                <Chip size="small" variant="outlined" label={`${selectedSession.counts.tasks_total} tasks`} />
+                <Chip size="small" variant="outlined" label={`${selectedSession.counts.watchers_total} watchers`} />
+                <Chip size="small" variant="outlined" label={`${sessionCount(selectedSession)} linked`} />
+              </Stack>
+
+              <Typography variant="caption" color="text.secondary">
+                Updated: {formatTimestamp(selectedSession.updated_at)}
+              </Typography>
+
+              <Tabs value={detailTab} onChange={(_event, value: DetailTab) => setDetailTab(value)}>
+                <Tab value="overview" label="Overview" />
+                <Tab value="work" label="Work" />
+                <Tab value="trace" label="Trace" />
+              </Tabs>
+              <Divider />
+
+              {detailTab === "overview" ? (
+                <Stack spacing={1.5}>
+                  <Box className="metadata-box">
+                    <Typography variant="caption" color="text.secondary">Objective</Typography>
+                    <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
+                      {selectedSession.objective}
+                    </Typography>
+                  </Box>
+                  {selectedSession.summary ? (
+                    <Box className="metadata-box">
+                      <Typography variant="caption" color="text.secondary">Summary</Typography>
+                      <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
+                        {selectedSession.summary}
                       </Typography>
                     </Box>
-                    <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
-                      <Button variant="outlined" size="small" onClick={openEditDialog}>
-                        Edit
-                      </Button>
-                      {selectedSession.status === "paused" ? (
-                        <Button
-                          variant="outlined"
-                          size="small"
-                          disabled={actionMutation.isPending}
-                          onClick={() => actionMutation.mutate({ kind: "resume", sessionId: selectedSession.id })}
-                        >
-                          Resume
-                        </Button>
-                      ) : (
-                        <Button
-                          variant="outlined"
-                          size="small"
-                          disabled={actionMutation.isPending}
-                          onClick={() => actionMutation.mutate({ kind: "pause", sessionId: selectedSession.id })}
-                        >
-                          Pause
-                        </Button>
-                      )}
-                      <Button
-                        variant="outlined"
-                        color="warning"
-                        size="small"
-                        disabled={actionMutation.isPending}
-                        onClick={() => actionMutation.mutate({ kind: "cancel", sessionId: selectedSession.id })}
-                      >
-                        Stop
-                      </Button>
-                      <Button
-                        variant="outlined"
-                        color="error"
-                        size="small"
-                        disabled={actionMutation.isPending}
-                        onClick={() => {
-                          const confirmed = window.confirm(
-                            "Delete this background session? Linked tasks and watchers will be detached but not deleted.",
-                          );
-                          if (!confirmed) return;
-                          actionMutation.mutate({ kind: "delete", sessionId: selectedSession.id });
-                        }}
-                      >
-                        Delete
-                      </Button>
-                    </Stack>
-                  </Stack>
-
-                  <Tabs value={detailTab} onChange={(_event, value: DetailTab) => setDetailTab(value)}>
-                    <Tab value="overview" label="Overview" />
-                    <Tab value="work" label="Work" />
-                    <Tab value="trace" label="Trace" />
-                  </Tabs>
-                  <Divider />
-
-                  {detailTab === "overview" ? (
-                    <Stack spacing={1.5}>
-                      <Box className="metadata-box micro-surface">
-                        <Typography className="micro-surface-kicker">Session</Typography>
-                        <Typography className="micro-surface-title">Objective</Typography>
-                        <Typography className="micro-surface-copy" sx={{ whiteSpace: "pre-wrap" }}>
-                          {selectedSession.objective}
-                        </Typography>
-                      </Box>
-                      {selectedSession.summary ? (
-                        <Box className="metadata-box micro-surface">
-                          <Typography className="micro-surface-kicker">Session</Typography>
-                          <Typography className="micro-surface-title">Summary</Typography>
-                          <Typography className="micro-surface-copy" sx={{ whiteSpace: "pre-wrap" }}>
-                            {selectedSession.summary}
-                          </Typography>
-                        </Box>
-                      ) : null}
-
-                      <Grid2 container spacing={1.25}>
-                        {[
-                          { label: "Current Focus", value: selectedSession.current_focus || "Not set yet." },
-                          { label: "Waiting On", value: selectedSession.waiting_on || "Nothing blocking right now." },
-                          {
-                            label: "Next Expected Action",
-                            value: selectedSession.next_expected_action || "No next step recorded yet.",
-                          },
-                        ].map((item) => (
-                          <Grid2 key={item.label} size={{ xs: 12, md: 4 }}>
-                            <Box className="metadata-box micro-surface" sx={{ height: "100%" }}>
-                              <Typography className="micro-surface-kicker">Session</Typography>
-                              <Typography className="micro-surface-title">{item.label}</Typography>
-                              <Typography className="micro-surface-copy">
-                                {item.value}
-                              </Typography>
-                            </Box>
-                          </Grid2>
-                        ))}
-                      </Grid2>
-
-                      <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
-                        <Chip size="small" variant="outlined" label={`${selectedSession.counts.tasks_total} tasks`} />
-                        <Chip size="small" variant="outlined" label={`${selectedSession.counts.watchers_total} watchers`} />
-                        <Chip size="small" variant="outlined" label={`${selectedSession.counts.tasks_running} running`} />
-                        <Chip size="small" variant="outlined" label={`${selectedSession.counts.tasks_waiting} waiting`} />
-                        <Chip size="small" variant="outlined" label={`${selectedSession.counts.watchers_active} active watchers`} />
-                      </Stack>
-
-                      {detailQ.data?.session_detail.working_memory ? (
-                        <Box className="metadata-box micro-surface">
-                          <Typography className="micro-surface-kicker">Session</Typography>
-                          <Typography className="micro-surface-title">Working memory</Typography>
-                          <Typography className="micro-surface-copy" sx={{ whiteSpace: "pre-wrap" }}>
-                            {detailQ.data.session_detail.working_memory}
-                          </Typography>
-                        </Box>
-                      ) : null}
-
-                      {selectedSession.last_error ? <Alert severity="error">{selectedSession.last_error}</Alert> : null}
-
-                      {(detailQ.data?.missing_links.task_ids.length || detailQ.data?.missing_links.watcher_ids.length) ? (
-                        <Alert severity="warning">
-                          Some previously linked work is no longer live. Missing tasks:{" "}
-                          {detailQ.data?.missing_links.task_ids.length || 0}, missing watchers:{" "}
-                          {detailQ.data?.missing_links.watcher_ids.length || 0}.
-                        </Alert>
-                      ) : null}
-                    </Stack>
                   ) : null}
 
-                  {detailTab === "work" ? (
-                    <Grid2 container spacing={1.5}>
-                      <Grid2 size={{ xs: 12, md: 6 }}>
-                        <Box className="metadata-box micro-surface" sx={{ height: "100%" }}>
-                          <Box className="micro-surface-head">
-                            <Typography className="micro-surface-kicker">Session work</Typography>
-                            <Typography className="micro-surface-title">Linked tasks</Typography>
-                            <Typography className="micro-surface-copy">Tasks currently attached to this session.</Typography>
-                          </Box>
-                          {detailQ.data?.linked_tasks.length ? (
-                            <Stack spacing={0.9}>
-                              {detailQ.data.linked_tasks.map((task) => (
-                                <Box
-                                  key={task.id}
-                                  className="micro-surface-list-item"
-                                >
-                                  <Stack direction="row" spacing={1} justifyContent="space-between" alignItems="center">
-                                    <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap title={task.description}>
-                                      {task.description}
-                                    </Typography>
-                                    <Chip size="small" label={statusLabel(task.status)} color={chipColor(task.status)} />
-                                  </Stack>
-                                  <Typography variant="caption" color="text.secondary">
-                                    {task.action || "task"} | {formatTimestamp(task.created_at)}
-                                  </Typography>
-                                </Box>
-                              ))}
-                            </Stack>
-                          ) : (
-                            <Typography variant="body2" color="text.secondary">
-                              No tasks linked to this session.
-                            </Typography>
-                          )}
+                  <Grid2 container spacing={1.25}>
+                    {[
+                      { label: "Current Focus", value: selectedSession.current_focus || "Not set yet." },
+                      { label: "Waiting On", value: selectedSession.waiting_on || "Nothing blocking right now." },
+                      {
+                        label: "Next Expected Action",
+                        value: selectedSession.next_expected_action || "No next step recorded yet.",
+                      },
+                    ].map((item) => (
+                      <Grid2 key={item.label} size={{ xs: 12, md: 4 }}>
+                        <Box className="metadata-box" sx={{ height: "100%" }}>
+                          <Typography variant="caption" color="text.secondary">{item.label}</Typography>
+                          <Typography variant="body2">{item.value}</Typography>
                         </Box>
                       </Grid2>
+                    ))}
+                  </Grid2>
 
-                      <Grid2 size={{ xs: 12, md: 6 }}>
-                        <Box className="metadata-box micro-surface" sx={{ height: "100%" }}>
-                          <Box className="micro-surface-head">
-                            <Typography className="micro-surface-kicker">Session work</Typography>
-                            <Typography className="micro-surface-title">Linked watchers</Typography>
-                            <Typography className="micro-surface-copy">Watchers currently attached to this session.</Typography>
-                          </Box>
-                          {detailQ.data?.linked_watchers.length ? (
-                            <Stack spacing={0.9}>
-                              {detailQ.data.linked_watchers.map((watcher) => (
-                                <Box
-                                  key={watcher.id}
-                                  className="micro-surface-list-item"
-                                >
-                                  <Stack direction="row" spacing={1} justifyContent="space-between" alignItems="center">
-                                    <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap title={watcher.description}>
-                                      {watcher.description}
-                                    </Typography>
-                                    <Chip size="small" label={statusLabel(watcher.status)} color={chipColor(watcher.status)} />
-                                  </Stack>
-                                  <Typography variant="caption" color="text.secondary">
-                                    {watcher.poll_action || "watcher"} | {formatTimestamp(watcher.created_at)}
-                                  </Typography>
-                                </Box>
-                              ))}
-                            </Stack>
-                          ) : (
-                            <Typography variant="body2" color="text.secondary">
-                              No watchers linked to this session.
-                            </Typography>
-                          )}
-                        </Box>
-                      </Grid2>
-                    </Grid2>
+                  {detailQ.data?.session_detail.working_memory ? (
+                    <Box className="metadata-box">
+                      <Typography variant="caption" color="text.secondary">Working memory</Typography>
+                      <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
+                        {detailQ.data.session_detail.working_memory}
+                      </Typography>
+                    </Box>
                   ) : null}
 
-                  {detailTab === "trace" ? (
-                    <Grid2 container spacing={1.5}>
-                      <Grid2 size={{ xs: 12, md: 6 }}>
-                        <Box className="metadata-box micro-surface" sx={{ height: "100%" }}>
-                          <Box className="micro-surface-head">
-                            <Typography className="micro-surface-kicker">Session trace</Typography>
-                            <Typography className="micro-surface-title">Recent runs</Typography>
-                            <Typography className="micro-surface-copy">Latest recorded runs attached to this session.</Typography>
-                          </Box>
-                          {detailQ.data?.recent_runs.length ? (
-                            <Stack spacing={0.9}>
-                              {detailQ.data.recent_runs.map((run) => (
-                                <Box
-                                  key={run.id}
-                                  className="micro-surface-list-item"
-                                >
-                                  <Stack direction="row" spacing={1} justifyContent="space-between" alignItems="center">
-                                    <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap title={run.title}>
-                                      {run.title}
-                                    </Typography>
-                                    <Chip size="small" label={statusLabel(run.status)} color={chipColor(run.status)} />
-                                  </Stack>
-                                  <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.5 }}>
-                                    {run.summary}
-                                  </Typography>
-                                  <Typography variant="caption" color="text.secondary">
-                                    {formatTimestamp(run.started_at)}
-                                  </Typography>
-                                </Box>
-                              ))}
-                            </Stack>
-                          ) : (
-                            <Typography variant="body2" color="text.secondary">
-                              No recorded runs for this session yet.
-                            </Typography>
-                          )}
-                        </Box>
-                      </Grid2>
+                  {selectedSession.last_error ? <Alert severity="error">{selectedSession.last_error}</Alert> : null}
 
-                      <Grid2 size={{ xs: 12, md: 6 }}>
-                        <Box className="metadata-box micro-surface" sx={{ height: "100%" }}>
-                          <Box className="micro-surface-head">
-                            <Typography className="micro-surface-kicker">Session trace</Typography>
-                            <Typography className="micro-surface-title">Session timeline</Typography>
-                            <Typography className="micro-surface-copy">Important events recorded across the life of this session.</Typography>
-                          </Box>
-                          {detailQ.data?.session_detail.events.length ? (
-                            <Stack spacing={0.9}>
-                              {detailQ.data.session_detail.events
-                                .slice()
-                                .reverse()
-                                .map((event) => (
-                                  <Box
-                                    key={event.id}
-                                    className="micro-surface-list-item"
-                                  >
-                                    <Typography variant="body2" sx={{ fontWeight: 600 }}>
-                                      {event.summary}
-                                    </Typography>
-                                    {event.detail ? (
-                                      <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.35 }}>
-                                        {event.detail}
-                                      </Typography>
-                                    ) : null}
-                                    <Typography variant="caption" color="text.secondary">
-                                      {formatTimestamp(event.at)}
-                                    </Typography>
-                                  </Box>
-                                ))}
-                            </Stack>
-                          ) : (
-                            <Typography variant="body2" color="text.secondary">
-                              No session events yet.
-                            </Typography>
-                          )}
-                        </Box>
-                      </Grid2>
-                    </Grid2>
+                  {(detailQ.data?.missing_links.task_ids.length || detailQ.data?.missing_links.watcher_ids.length) ? (
+                    <Alert severity="warning">
+                      Some previously linked work is no longer live. Missing tasks:{" "}
+                      {detailQ.data?.missing_links.task_ids.length || 0}, missing watchers:{" "}
+                      {detailQ.data?.missing_links.watcher_ids.length || 0}.
+                    </Alert>
                   ) : null}
                 </Stack>
-              )}
-            </Box>
-          </Grid2>
-        </Grid2>
-      )}
+              ) : null}
 
+              {detailTab === "work" ? (
+                <Grid2 container spacing={1.5}>
+                  <Grid2 size={{ xs: 12, md: 6 }}>
+                    <Box className="metadata-box" sx={{ height: "100%" }}>
+                      <Typography variant="subtitle2" sx={{ mb: 1 }}>Linked tasks</Typography>
+                      {detailQ.data?.linked_tasks.length ? (
+                        <Stack spacing={0.9}>
+                          {detailQ.data.linked_tasks.map((task) => (
+                            <Box key={task.id} className="micro-surface-list-item">
+                              <Stack direction="row" spacing={1} justifyContent="space-between" alignItems="center">
+                                <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap title={task.description}>
+                                  {task.description}
+                                </Typography>
+                                <Chip size="small" label={statusLabel(task.status)} color={chipColor(task.status)} />
+                              </Stack>
+                              <Typography variant="caption" color="text.secondary">
+                                {task.action || "task"} | {formatTimestamp(task.created_at)}
+                              </Typography>
+                            </Box>
+                          ))}
+                        </Stack>
+                      ) : (
+                        <Typography variant="body2" color="text.secondary">
+                          No tasks linked to this session.
+                        </Typography>
+                      )}
+                    </Box>
+                  </Grid2>
+
+                  <Grid2 size={{ xs: 12, md: 6 }}>
+                    <Box className="metadata-box" sx={{ height: "100%" }}>
+                      <Typography variant="subtitle2" sx={{ mb: 1 }}>Linked watchers</Typography>
+                      {detailQ.data?.linked_watchers.length ? (
+                        <Stack spacing={0.9}>
+                          {detailQ.data.linked_watchers.map((watcher) => (
+                            <Box key={watcher.id} className="micro-surface-list-item">
+                              <Stack direction="row" spacing={1} justifyContent="space-between" alignItems="center">
+                                <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap title={watcher.description}>
+                                  {watcher.description}
+                                </Typography>
+                                <Chip size="small" label={statusLabel(watcher.status)} color={chipColor(watcher.status)} />
+                              </Stack>
+                              <Typography variant="caption" color="text.secondary">
+                                {watcher.poll_action || "watcher"} | {formatTimestamp(watcher.created_at)}
+                              </Typography>
+                            </Box>
+                          ))}
+                        </Stack>
+                      ) : (
+                        <Typography variant="body2" color="text.secondary">
+                          No watchers linked to this session.
+                        </Typography>
+                      )}
+                    </Box>
+                  </Grid2>
+                </Grid2>
+              ) : null}
+
+              {detailTab === "trace" ? (
+                <Grid2 container spacing={1.5}>
+                  <Grid2 size={{ xs: 12, md: 6 }}>
+                    <Box className="metadata-box" sx={{ height: "100%" }}>
+                      <Typography variant="subtitle2" sx={{ mb: 1 }}>Recent runs</Typography>
+                      {detailQ.data?.recent_runs.length ? (
+                        <Stack spacing={0.9}>
+                          {detailQ.data.recent_runs.map((run) => (
+                            <Box key={run.id} className="micro-surface-list-item">
+                              <Stack direction="row" spacing={1} justifyContent="space-between" alignItems="center">
+                                <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap title={run.title}>
+                                  {run.title}
+                                </Typography>
+                                <Chip size="small" label={statusLabel(run.status)} color={chipColor(run.status)} />
+                              </Stack>
+                              <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.5 }}>
+                                {run.summary}
+                              </Typography>
+                              <Typography variant="caption" color="text.secondary">
+                                {formatTimestamp(run.started_at)}
+                              </Typography>
+                            </Box>
+                          ))}
+                        </Stack>
+                      ) : (
+                        <Typography variant="body2" color="text.secondary">
+                          No recorded runs for this session yet.
+                        </Typography>
+                      )}
+                    </Box>
+                  </Grid2>
+
+                  <Grid2 size={{ xs: 12, md: 6 }}>
+                    <Box className="metadata-box" sx={{ height: "100%" }}>
+                      <Typography variant="subtitle2" sx={{ mb: 1 }}>Session timeline</Typography>
+                      {detailQ.data?.session_detail.events.length ? (
+                        <Stack spacing={0.9}>
+                          {detailQ.data.session_detail.events
+                            .slice()
+                            .reverse()
+                            .map((event) => (
+                              <Box key={event.id} className="micro-surface-list-item">
+                                <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                                  {event.summary}
+                                </Typography>
+                                {event.detail ? (
+                                  <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.35 }}>
+                                    {event.detail}
+                                  </Typography>
+                                ) : null}
+                                <Typography variant="caption" color="text.secondary">
+                                  {formatTimestamp(event.at)}
+                                </Typography>
+                              </Box>
+                            ))}
+                        </Stack>
+                      ) : (
+                        <Typography variant="body2" color="text.secondary">
+                          No session events yet.
+                        </Typography>
+                      )}
+                    </Box>
+                  </Grid2>
+                </Grid2>
+              ) : null}
+            </Stack>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* Create/Edit form dialog */}
       <Dialog open={dialogOpen} onClose={() => setDialogOpen(false)} maxWidth="md" fullWidth>
         <DialogTitle>{editingSessionId ? "Edit Background Session" : "Create Background Session"}</DialogTitle>
         <DialogContent dividers>

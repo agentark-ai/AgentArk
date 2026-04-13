@@ -15,6 +15,7 @@ import {
   Typography
 } from "@mui/material";
 import { useMemo, useState } from "react";
+import { formatUiDateTime } from "../lib/dateFormat";
 
 export type RouteTarget = {
   id: string;
@@ -59,10 +60,7 @@ export type RoutingControlPanelProps = {
 };
 
 function formatDate(raw?: string): string {
-  if (!raw) return "Never";
-  const dt = new Date(raw);
-  if (Number.isNaN(dt.getTime())) return raw;
-  return dt.toLocaleString();
+  return formatUiDateTime(raw, { fallback: "Never" });
 }
 
 function scopeLabel(scope: RouteRule["scope"]): string {
@@ -105,7 +103,7 @@ export function RoutingControlPanel({
           <Typography variant="overline" className="workspace-shell-kicker">
             Conversation Routing
           </Typography>
-          <Typography variant="h5" sx={{ fontWeight: 700, letterSpacing: "-0.03em" }}>
+          <Typography variant="h5" sx={{ fontWeight: 700, letterSpacing: 0 }}>
             Keep the right channel tied to the right agent
           </Typography>
           <Typography variant="body2" color="text.secondary" sx={{ maxWidth: 840 }}>

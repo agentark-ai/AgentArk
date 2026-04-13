@@ -11,6 +11,7 @@ pub mod browser_session;
 pub mod config;
 pub mod connect_flow;
 pub mod connector;
+pub(crate) mod data_contract;
 pub mod data_lifecycle;
 pub(crate) mod document_search;
 pub mod embeddings;
@@ -28,11 +29,11 @@ pub mod net;
 pub mod nodes;
 pub mod observability;
 pub mod orchestra;
-pub mod parallel;
 pub mod pipeline;
 pub mod planner;
 pub mod product_help;
 pub mod prompt_policy;
+pub mod request_shape;
 pub mod runtime_image;
 pub mod secrets;
 pub mod self_evolve;
@@ -46,7 +47,6 @@ pub mod watcher;
 
 pub(crate) use agent::chat_model_is_configured;
 pub(crate) use agent::queue_stream_event;
-pub(crate) use agent::ChatExecutionIntentDecision;
 pub use agent::{
     Agent, ConversationMessage, ExecutionStep, ExecutionTrace, RequestExecutionHints,
     RequestPlanConfirmationMode, SecurityEvents, SecuritySnapshot, StreamEvent, UserProfile,
@@ -109,5 +109,6 @@ pub use nodes::{
     NodeControlPlaneStatus, NodeHeartbeat, NodeHeartbeatRequest, NodeState, NodeTransportKind,
     NodeUpsertRequest, PairedNode,
 };
-pub use planner::{ExecutionPlan, PlanPromptMode, PlanStep, PlanStepStatus};
+pub use planner::{ExecutionPlan, PlanPromptMode, PlanStep, PlanStepStatus, PlanSubstep};
+pub use request_shape::RequestShapeAssessment;
 pub use task::{status_for_task_approval, Task, TaskApproval, TaskQueue, TaskStatus};

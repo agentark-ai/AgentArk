@@ -130,11 +130,11 @@ export function WelcomeHero({
       className="welcome-hero-card mission-panel mission-panel--hero"
       sx={{
         height: "100%",
-        borderRadius: 3.5,
-        border: "1px solid rgba(108, 156, 212, 0.12)",
+        borderRadius: 2,
+        border: "1px solid rgba(255, 255, 255, 0.08)",
         background:
-          "radial-gradient(circle at 18% 0%, rgba(47, 212, 255, 0.18), rgba(0,0,0,0) 34%)," +
-          "linear-gradient(160deg, rgba(9, 21, 39, 0.97), rgba(8, 18, 33, 0.84))",
+          "radial-gradient(circle at 18% 0%, rgba(255, 255, 255, 0.06), rgba(0,0,0,0) 34%)," +
+          "linear-gradient(160deg, rgba(24, 24, 28, 0.98), rgba(15, 15, 18, 0.94))",
         boxShadow: "0 18px 34px rgba(0, 0, 0, 0.16)",
         overflow: "hidden",
       }}
@@ -153,13 +153,13 @@ export function WelcomeHero({
                       width: { xs: 44, md: 52 },
                       height: { xs: 44, md: 52 },
                       flexShrink: 0,
-                      filter: "drop-shadow(0 0 14px rgba(47, 212, 255, 0.22))",
+                      filter: "drop-shadow(0 0 14px rgba(255, 255, 255, 0.08))",
                     }}
                   />
                   <Box sx={{ minWidth: 0 }}>
                     <Typography
                       variant="overline"
-                      sx={{ color: "rgba(142, 191, 234, 0.74)", letterSpacing: "0.12em", display: "block", lineHeight: 1 }}
+                      sx={{ color: "rgba(183, 188, 196, 0.68)", letterSpacing: 0, display: "block", lineHeight: 1 }}
                     >
                       AgentArk | Secure Daily Assistant
                     </Typography>
@@ -168,7 +168,7 @@ export function WelcomeHero({
                       sx={{
                         fontWeight: 700,
                         lineHeight: 1.08,
-                        letterSpacing: "-0.03em",
+                        letterSpacing: 0,
                         fontSize: { xs: "1.32rem", md: "1.52rem" },
                       }}
                     >

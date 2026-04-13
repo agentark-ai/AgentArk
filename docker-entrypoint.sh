@@ -11,6 +11,9 @@ YELLOW='\033[1;33m'
 GREEN='\033[0;32m'
 NC='\033[0m'
 CHILD_PIDS=""
+TAILSCALE_RESTARTS=0
+PLAYWRIGHT_RESTARTS=0
+MAX_OPTIONAL_SERVICE_RESTARTS=${AGENTARK_OPTIONAL_SERVICE_RESTARTS:-1}
 
 track_child() {
     if [ -n "${1:-}" ]; then
@@ -26,10 +29,104 @@ cleanup_children() {
     done
 }
 
+normalized_stack_role() {
+    local role
+    role=$(printf '%s' "${AGENTARK_STACK_ROLE:-}" | tr '[:upper:]' '[:lower:]')
+    case "$role" in
+        control-plane)
+            echo "control"
+            ;;
+        *)
+            echo "$role"
+            ;;
+    esac
+}
+
+truthy_env() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|on)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+falsy_env() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        0|false|no|off)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+role_uses_local_docker() {
+    local role
+    role=$(normalized_stack_role)
+    [ -z "$role" ] || [ "$role" = "executor" ]
+}
+
+should_start_tailscale_daemon() {
+    if [ -n "${AGENTARK_START_TAILSCALE_DAEMON:-}" ]; then
+        truthy_env "$AGENTARK_START_TAILSCALE_DAEMON" && return 0
+        falsy_env "$AGENTARK_START_TAILSCALE_DAEMON" && return 1
+    fi
+
+    if [ -n "${AGENTARK_TUNNEL:-}" ]; then
+        truthy_env "$AGENTARK_TUNNEL" && return 0
+        falsy_env "$AGENTARK_TUNNEL" && return 1
+    fi
+
+    local role
+    role=$(normalized_stack_role)
+    [ -z "$role" ] || [ "$role" = "control" ]
+}
+
+should_start_playwright_bridge() {
+    if [ -n "${AGENTARK_START_PLAYWRIGHT_BRIDGE:-}" ]; then
+        truthy_env "$AGENTARK_START_PLAYWRIGHT_BRIDGE" && return 0
+        falsy_env "$AGENTARK_START_PLAYWRIGHT_BRIDGE" && return 1
+    fi
+
+    local role
+    role=$(normalized_stack_role)
+    [ -z "$role" ] || [ "$role" = "control" ]
+}
+
+print_startup_banner() {
+    local role
+    role=$(normalized_stack_role)
+
+    echo ""
+    echo "============================================"
+    case "$role" in
+        executor)
+            echo "  AgentArk Executor Starting..."
+            echo "  Internal Executor API: 0.0.0.0:8991"
+            ;;
+        workspace)
+            echo "  AgentArk Workspace Service Starting..."
+            echo "  Internal Workspace API: 0.0.0.0:8992"
+            ;;
+        *)
+            echo "  AgentArk Starting..."
+            echo "  Web UI: http://localhost:8990"
+            ;;
+    esac
+    echo "============================================"
+    echo ""
+}
+
 trap cleanup_children EXIT INT TERM
 
 # Ensure directories exist with proper permissions
 ensure_directories() {
+    # User-owned layer: release updates may recreate image files, but these
+    # mounted data/config paths must persist across normal rebuilds.
     mkdir -p /app/data/skills 2>/dev/null || true
     mkdir -p /app/data/tailscale 2>/dev/null || true
     mkdir -p /app/config 2>/dev/null || true
@@ -100,20 +197,29 @@ EOF
 
 # Fix Docker socket permissions so 'agent' can spawn sandboxed containers
 setup_docker_socket() {
+    local role
+    role=$(normalized_stack_role)
+
     if [ -S /var/run/docker.sock ]; then
-        # Direct socket mount — fix permissions
+        # Direct socket mount - fix permissions
         DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)
-        if ! getent group "$DOCKER_GID" > /dev/null 2>&1; then
+        if ! getent group "$DOCKER_GID" >/dev/null 2>&1; then
             groupadd -g "$DOCKER_GID" dockerhost 2>/dev/null || true
         fi
         DOCKER_GROUP=$(getent group "$DOCKER_GID" | cut -d: -f1)
         usermod -aG "$DOCKER_GROUP" agent 2>/dev/null || true
-        echo -e "${GREEN}Docker socket available — sandboxed code execution enabled${NC}"
-    elif [ -n "$DOCKER_HOST" ]; then
-        # TCP proxy (docker-socket-proxy) — no socket permissions needed
-        echo -e "${GREEN}Docker available via proxy ($DOCKER_HOST) — sandboxed code execution enabled${NC}"
+        echo -e "${GREEN}Docker socket available - sandboxed code execution enabled${NC}"
+    elif [ -n "${DOCKER_HOST:-}" ]; then
+        # TCP proxy (docker-socket-proxy) - no socket permissions needed
+        echo -e "${GREEN}Docker available via proxy ($DOCKER_HOST) - sandboxed code execution enabled${NC}"
+    elif role_uses_local_docker; then
+        echo -e "${YELLOW}Docker not available - sandboxed code execution is unavailable${NC}"
+    elif [ "$role" = "control" ]; then
+        echo -e "${GREEN}Docker socket not mounted for control role - sandboxed execution is delegated to the executor service${NC}"
+    elif [ "$role" = "workspace" ]; then
+        echo -e "${GREEN}Docker socket not mounted for workspace role - this service does not execute sandboxed code${NC}"
     else
-        echo -e "${YELLOW}Docker not available — sandboxed code execution is unavailable${NC}"
+        echo -e "${GREEN}Docker socket not mounted for this service role${NC}"
     fi
 }
 
@@ -149,11 +255,7 @@ check_bundled_skills() {
 
     BUNDLED_SKILL_COUNT=$(find /app/skills -mindepth 2 -maxdepth 2 -name SKILL.md 2>/dev/null | wc -l | tr -d ' ')
     if [ "${BUNDLED_SKILL_COUNT:-0}" -eq 0 ]; then
-        if [ -f /app/data/removed_bundled_actions.json ]; then
-            echo -e "${YELLOW}No bundled SKILL.md files are currently present under /app/skills. They may have been deleted for this install.${NC}"
-        else
-            echo -e "${RED}No bundled SKILL.md files found under /app/skills. Bundled skills will not appear in the UI.${NC}"
-        fi
+        echo -e "${YELLOW}No bundled SKILL.md files are currently present under /app/skills. They may have been removed for this install or omitted from the image.${NC}"
     else
         echo -e "${GREEN}Bundled skills available - ${BUNDLED_SKILL_COUNT} SKILL.md files found under /app/skills${NC}"
     fi
@@ -170,18 +272,29 @@ load_internal_service_tokens
 
 # Confirm Docker secret is available for direct app reads (if present)
 if [ -f /run/secrets/agentark_master_key ]; then
-    echo -e "${GREEN}Docker secret found — application will read the encryption secret directly from /run/secrets${NC}"
+    echo -e "${GREEN}Docker secret found - application will read the encryption secret directly from /run/secrets${NC}"
 fi
 
 # Print startup banner
-echo ""
-echo "============================================"
-echo "  AgentArk Starting..."
-echo "  Web UI: http://localhost:8990"
-echo "============================================"
-echo ""
+print_startup_banner
 
 start_tailscale_daemon() {
+    local role
+    role=$(normalized_stack_role)
+    TAILSCALE_PID=""
+
+    # Split-stack containers share /app/data, so only the control/default role
+    # should own the shared Tailscale state directory unless explicitly
+    # overridden.
+    if ! should_start_tailscale_daemon; then
+        if [ -n "$role" ]; then
+            echo -e "${GREEN}Skipping Tailscale daemon for ${role} role${NC}"
+        else
+            echo -e "${GREEN}Skipping Tailscale daemon because remote access is disabled${NC}"
+        fi
+        return
+    fi
+
     export TS_STATE_DIR=${TS_STATE_DIR:-/app/data/tailscale}
     export TS_SOCKET=${TS_SOCKET:-/app/data/tailscale/tailscaled.sock}
     export TS_USERSPACE=${TS_USERSPACE:-true}
@@ -216,6 +329,17 @@ start_tailscale_daemon
 
 # Start Playwright bridge in background (localhost-only)
 start_playwright_bridge() {
+    local role
+    role=$(normalized_stack_role)
+    PLAYWRIGHT_PID=""
+
+    if ! should_start_playwright_bridge; then
+        if [ -n "$role" ]; then
+            echo -e "${GREEN}Skipping Playwright bridge for ${role} role${NC}"
+        fi
+        return
+    fi
+
     if ! command -v node >/dev/null 2>&1 || [ ! -f /app/bridges/playwright-bridge/index.js ] || [ ! -d /app/bridges/playwright-bridge/node_modules ]; then
         echo -e "${YELLOW}Playwright bridge not available (Node.js or bridge dependencies missing)${NC}"
         return
@@ -243,6 +367,33 @@ start_playwright_bridge() {
 
 start_playwright_bridge
 
+handle_optional_service_exit() {
+    local name="$1"
+    local restart_fn="$2"
+    local -n pid_ref="$3"
+    local -n restart_ref="$4"
+
+    if [ -z "${pid_ref:-}" ] || kill -0 "$pid_ref" >/dev/null 2>&1; then
+        return
+    fi
+
+    local pid="$pid_ref"
+    local status=0
+    wait "$pid" >/dev/null 2>&1 || status=$?
+    pid_ref=""
+
+    echo -e "${YELLOW}${name} exited unexpectedly (PID: $pid, status: $status). ${NC}"
+    echo -e "${YELLOW}AgentArk will continue without ${name}.${NC}"
+
+    if [ "$restart_ref" -lt "$MAX_OPTIONAL_SERVICE_RESTARTS" ]; then
+        restart_ref=$((restart_ref + 1))
+        echo -e "${YELLOW}Restarting optional service '${name}' (${restart_ref}/${MAX_OPTIONAL_SERVICE_RESTARTS})...${NC}"
+        "$restart_fn"
+    else
+        echo -e "${YELLOW}${name} reached the restart limit; leaving it disabled for this container session.${NC}"
+    fi
+}
+
 # WhatsApp bridge: started by AgentArk on demand for Baileys bundled bridge mode only
 
 # Drop privileges to 'agent' user and start the app under supervision
@@ -256,14 +407,8 @@ while true; do
         exit $?
     fi
 
-    for pid in ${TAILSCALE_PID:-} ${PLAYWRIGHT_PID:-}; do
-        if [ -n "$pid" ] && ! kill -0 "$pid" >/dev/null 2>&1; then
-            echo -e "${RED}Background service exited unexpectedly (PID: $pid); stopping AgentArk${NC}"
-            kill "$MAIN_PID" >/dev/null 2>&1 || true
-            wait "$MAIN_PID" || true
-            exit 1
-        fi
-    done
+    handle_optional_service_exit "Tailscale daemon" start_tailscale_daemon TAILSCALE_PID TAILSCALE_RESTARTS
+    handle_optional_service_exit "Playwright bridge" start_playwright_bridge PLAYWRIGHT_PID PLAYWRIGHT_RESTARTS
 
     sleep 5
 done

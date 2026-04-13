@@ -68,6 +68,7 @@ async fn load_config(agent: &Agent) -> Result<Option<WeChatChannelConfig>> {
     Ok(agent.config.wechat.clone())
 }
 
+#[allow(dead_code)]
 async fn load_destination(agent: &Agent) -> Result<Option<WeChatDestinationContext>> {
     if let Ok(Some(raw)) = agent.storage.get(LAST_DESTINATION_STORAGE_KEY).await {
         if let Ok(context) = serde_json::from_slice::<WeChatDestinationContext>(&raw) {
@@ -94,13 +95,7 @@ fn http_client() -> Result<reqwest::Client> {
         .build()?)
 }
 
-async fn resolve_destination(
-    agent: &Agent,
-    config: &WeChatChannelConfig,
-) -> Result<WeChatDestinationContext> {
-    if let Some(destination) = load_destination(agent).await? {
-        return Ok(destination);
-    }
+fn resolve_destination(config: &WeChatChannelConfig) -> Result<WeChatDestinationContext> {
     if !config.default_target_id.trim().is_empty() {
         return Ok(WeChatDestinationContext {
             target_id: config.default_target_id.clone(),
@@ -108,9 +103,7 @@ async fn resolve_destination(
             sender_label: None,
         });
     }
-    Err(anyhow!(
-        "WeChat has no delivery destination yet; configure a default target or wait for an inbound message"
-    ))
+    Err(anyhow!("WeChat has no configured notification destination"))
 }
 
 async fn send_to_destination(
@@ -150,9 +143,8 @@ pub async fn send_message(agent: &Agent, text: &str) -> Result<()> {
     let config = load_config(agent)
         .await?
         .ok_or_else(|| anyhow!("WeChat is not configured"))?;
-    let destination = resolve_destination(agent, &config).await?;
+    let destination = resolve_destination(&config)?;
     send_to_destination(&config, &destination, text).await?;
-    persist_destination(agent, &destination).await?;
     Ok(())
 }
 
@@ -247,4 +239,22 @@ pub async fn handle_webhook(
     send_to_destination(&config, &destination, &reply).await?;
     persist_destination(&agent, &destination).await?;
     Ok("ok".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proactive_wechat_destination_uses_configured_target_only() {
+        let config = WeChatChannelConfig {
+            bridge_url: "https://bridge.example.com".to_string(),
+            bridge_token: "token".to_string(),
+            default_target_id: "wechat-target".to_string(),
+        };
+
+        let destination = resolve_destination(&config).unwrap();
+        assert_eq!(destination.target_id, "wechat-target");
+        assert_eq!(destination.sender_id, None);
+    }
 }

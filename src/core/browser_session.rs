@@ -37,7 +37,11 @@ pub struct PersistedBrowserSession {
 pub enum SessionStatus {
     Active,
     WaitingForUser {
+        #[allow(dead_code)]
         screenshot: Vec<u8>,
+        question: String,
+    },
+    AwaitingResume {
         question: String,
     },
     Interrupted {
@@ -60,6 +64,15 @@ pub struct BrowserSession {
     pub created_at: String,
     pub updated_at: String,
     pub user_response_tx: Option<oneshot::Sender<String>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WaitingSessionSummary {
+    pub id: String,
+    pub task_description: String,
+    pub question: String,
+    pub updated_at: String,
+    pub can_accept_response: bool,
 }
 
 #[derive(Clone)]
@@ -178,22 +191,54 @@ impl BrowserSessionManager {
         false
     }
 
-    pub fn get_waiting_session(&self, chat_id: &str) -> Option<(String, Vec<u8>, String)> {
+    pub fn waiting_sessions_for_chat(&self, chat_id: &str) -> Vec<WaitingSessionSummary> {
         if chat_id.trim().is_empty() {
-            return None;
+            return Vec::new();
         }
-        for entry in self.sessions.iter() {
-            if entry.chat_id == chat_id {
-                if let SessionStatus::WaitingForUser {
-                    ref screenshot,
-                    ref question,
-                } = entry.status
-                {
-                    return Some((entry.id.clone(), screenshot.clone(), question.clone()));
+        let mut waiting = self
+            .sessions
+            .iter()
+            .filter_map(|entry| {
+                if entry.chat_id != chat_id {
+                    return None;
                 }
+                match &entry.status {
+                    SessionStatus::WaitingForUser { question, .. } => Some(WaitingSessionSummary {
+                        id: entry.id.clone(),
+                        task_description: entry.task_description.clone(),
+                        question: question.clone(),
+                        updated_at: entry.updated_at.clone(),
+                        can_accept_response: true,
+                    }),
+                    SessionStatus::AwaitingResume { question } => Some(WaitingSessionSummary {
+                        id: entry.id.clone(),
+                        task_description: entry.task_description.clone(),
+                        question: question.clone(),
+                        updated_at: entry.updated_at.clone(),
+                        can_accept_response: false,
+                    }),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        waiting.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        waiting
+    }
+
+    #[cfg(test)]
+    pub fn get_waiting_session(&self, chat_id: &str) -> Option<(String, Vec<u8>, String)> {
+        self.sessions.iter().find_map(|entry| {
+            if entry.chat_id != chat_id {
+                return None;
             }
-        }
-        None
+            match &entry.status {
+                SessionStatus::WaitingForUser {
+                    screenshot,
+                    question,
+                } => Some((entry.id.clone(), screenshot.clone(), question.clone())),
+                _ => None,
+            }
+        })
     }
 
     pub fn get_status(&self, session_id: &str) -> Option<SessionStatus> {
@@ -219,7 +264,9 @@ impl BrowserSessionManager {
             .filter(|entry| {
                 matches!(
                     entry.status,
-                    SessionStatus::Active | SessionStatus::WaitingForUser { .. }
+                    SessionStatus::Active
+                        | SessionStatus::WaitingForUser { .. }
+                        | SessionStatus::AwaitingResume { .. }
                 )
             })
             .count()
@@ -361,18 +408,26 @@ impl BrowserSession {
                 },
                 true,
             ),
-            "waiting_for_user" => {
-                let reason = status_detail
-                    .filter(|value| !value.trim().is_empty())
-                    .map(|value| {
-                        format!(
-                            "{} Last prompt before restart: {}",
-                            INTERRUPTED_BROWSER_SESSION_REASON, value
-                        )
-                    })
-                    .unwrap_or_else(|| INTERRUPTED_BROWSER_SESSION_REASON.to_string());
-                (SessionStatus::Interrupted { reason }, true)
-            }
+            "waiting_for_user" => (
+                SessionStatus::AwaitingResume {
+                    question: status_detail
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or_else(|| {
+                            "Browser session was waiting for your input before restart.".to_string()
+                        }),
+                },
+                true,
+            ),
+            "awaiting_resume" => (
+                SessionStatus::AwaitingResume {
+                    question: status_detail
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or_else(|| {
+                            "Browser session is waiting for you to restart it.".to_string()
+                        }),
+                },
+                false,
+            ),
             "interrupted" => (
                 SessionStatus::Interrupted {
                     reason: status_detail
@@ -422,6 +477,7 @@ impl SessionStatus {
         match self {
             Self::Active => "active",
             Self::WaitingForUser { .. } => "waiting_for_user",
+            Self::AwaitingResume { .. } => "awaiting_resume",
             Self::Interrupted { .. } => "interrupted",
             Self::Completed { .. } => "completed",
             Self::Failed(_) => "failed",
@@ -432,6 +488,7 @@ impl SessionStatus {
         match self {
             Self::Active => None,
             Self::WaitingForUser { question, .. } => Some(question.clone()),
+            Self::AwaitingResume { question } => Some(question.clone()),
             Self::Interrupted { reason } => Some(reason.clone()),
             Self::Completed { summary } => Some(summary.clone()),
             Self::Failed(error) => Some(error.clone()),
@@ -717,7 +774,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_marks_incomplete_sessions_interrupted() {
+    fn restore_preserves_waiting_sessions_as_awaiting_resume() {
         let persisted = PersistedBrowserSession {
             id: "session-1".to_string(),
             status: "waiting_for_user".to_string(),
@@ -734,9 +791,8 @@ mod tests {
 
         assert!(changed);
         match session.status {
-            SessionStatus::Interrupted { reason } => {
-                assert!(reason.contains("interrupted"));
-                assert!(reason.contains("Please confirm"));
+            SessionStatus::AwaitingResume { question } => {
+                assert!(question.contains("Please confirm"));
             }
             other => panic!("unexpected restored status: {:?}", other),
         }

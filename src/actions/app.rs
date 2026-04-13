@@ -37,6 +37,7 @@ const APP_ACCESS_SESSION_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 const APP_ACCESS_BOOTSTRAP_MAX_TOKENS: usize = 4096;
 const APP_ACCESS_SESSION_MAX_TOKENS: usize = 8192;
 const MAX_REPO_CLONE_TIMEOUT_SECS: u64 = 240;
+const REPO_DEPLOY_INFLIGHT_STALE_SECS: u64 = MAX_REPO_CLONE_TIMEOUT_SECS + 300;
 const MAX_REPO_COMMAND_COUNT: usize = 120;
 const MAX_REPO_TEXT_FILE_BYTES: usize = 512 * 1024;
 const MAX_REPO_TOTAL_TEXT_BYTES: usize = 8 * 1024 * 1024;
@@ -1160,6 +1161,239 @@ async fn clone_repo(
     Ok(())
 }
 
+fn repo_service_mode_label(mode: RepoServiceMode) -> &'static str {
+    match mode {
+        RepoServiceMode::Auto => "auto",
+        RepoServiceMode::Frontend => "frontend",
+        RepoServiceMode::Backend => "backend",
+        RepoServiceMode::Fullstack => "fullstack",
+    }
+}
+
+fn repo_deploy_fingerprint(
+    repo_url: &str,
+    repo_ref: Option<&str>,
+    repo_subdir: Option<&str>,
+    repo_title: &str,
+    service_mode: RepoServiceMode,
+    runtime_preference: RuntimePreference,
+    expose_public: bool,
+    access_guard_enabled: bool,
+    runtime_image: Option<&serde_json::Value>,
+) -> String {
+    let payload = serde_json::json!({
+        "repo_url": repo_url,
+        "repo_ref": repo_ref,
+        "repo_subdir": repo_subdir,
+        "title": repo_title,
+        "service_mode": repo_service_mode_label(service_mode),
+        "runtime_preference": runtime_preference.as_str(),
+        "expose_public": expose_public,
+        "access_guard": access_guard_enabled,
+        "runtime_image": runtime_image,
+    });
+    blake3::hash(payload.to_string().as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+fn build_repo_deploy_lock_metadata(
+    bundle_id: &str,
+    fingerprint: &str,
+    repo_url: &str,
+    repo_ref: Option<&str>,
+    repo_subdir: Option<&str>,
+    repo_title: &str,
+    service_mode: RepoServiceMode,
+    runtime_preference: RuntimePreference,
+    expose_public: bool,
+    access_guard_enabled: bool,
+    runtime_image: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "bundle_id": bundle_id,
+        "fingerprint": fingerprint,
+        "repo_url": repo_url,
+        "repo_ref": repo_ref,
+        "repo_subdir": repo_subdir,
+        "title": repo_title,
+        "service_mode": repo_service_mode_label(service_mode),
+        "runtime_preference": runtime_preference.as_str(),
+        "expose_public": expose_public,
+        "access_guard": access_guard_enabled,
+        "runtime_image": runtime_image,
+        "started_at": chrono::Utc::now().to_rfc3339(),
+        "started_at_unix": chrono::Utc::now().timestamp(),
+    })
+}
+
+async fn read_repo_deploy_lock_metadata(lock_path: &Path) -> Option<serde_json::Value> {
+    let raw = tokio::fs::read_to_string(lock_path).await.ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+async fn repo_deploy_lock_is_stale(lock_path: &Path) -> bool {
+    if let Some(metadata) = read_repo_deploy_lock_metadata(lock_path).await {
+        if let Some(started_at_unix) = metadata
+            .get("started_at_unix")
+            .and_then(|value| value.as_i64())
+        {
+            let age = chrono::Utc::now()
+                .timestamp()
+                .saturating_sub(started_at_unix);
+            return age >= REPO_DEPLOY_INFLIGHT_STALE_SECS as i64;
+        }
+    }
+    if let Ok(metadata) = tokio::fs::metadata(lock_path).await {
+        if let Ok(modified) = metadata.modified() {
+            if let Ok(age) = std::time::SystemTime::now().duration_since(modified) {
+                return age.as_secs() >= REPO_DEPLOY_INFLIGHT_STALE_SECS;
+            }
+        }
+    }
+    false
+}
+
+fn format_existing_repo_deploy_lock_message(metadata: Option<&serde_json::Value>) -> String {
+    let Some(metadata) = metadata else {
+        return "A matching repo deployment is already in progress. Wait for it to finish instead of starting another clone.".to_string();
+    };
+
+    let bundle_id = metadata
+        .get("bundle_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let started_at = metadata
+        .get("started_at")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let mut message = "A matching repo deployment is already in progress".to_string();
+    if let Some(bundle_id) = bundle_id {
+        message.push_str(&format!(" (bundle {})", bundle_id));
+    }
+    if let Some(started_at) = started_at {
+        message.push_str(&format!(", started at {}", started_at));
+    }
+    message.push_str(". Wait for it to finish instead of starting another clone.");
+    message
+}
+
+#[derive(Debug)]
+struct RepoDeployInFlightGuard {
+    lock_path: PathBuf,
+}
+
+impl RepoDeployInFlightGuard {
+    async fn acquire(
+        data_dir: &Path,
+        fingerprint: &str,
+        metadata: &serde_json::Value,
+    ) -> Result<Self> {
+        let inflight_dir = data_dir.join("repo-deployments").join(".inflight");
+        tokio::fs::create_dir_all(&inflight_dir).await?;
+        let lock_path = inflight_dir.join(format!("{fingerprint}.json"));
+        let payload = serde_json::to_vec_pretty(metadata)?;
+        let mut reclaimed_stale_lock = false;
+
+        loop {
+            match tokio::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&lock_path)
+                .await
+            {
+                Ok(mut file) => {
+                    file.write_all(&payload).await?;
+                    file.flush().await?;
+                    return Ok(Self { lock_path });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if !reclaimed_stale_lock && repo_deploy_lock_is_stale(&lock_path).await {
+                        reclaimed_stale_lock = true;
+                        tracing::warn!("Reclaiming stale repo deploy lock {}", lock_path.display());
+                        match tokio::fs::remove_file(&lock_path).await {
+                            Ok(_) => continue,
+                            Err(remove_error)
+                                if remove_error.kind() == std::io::ErrorKind::NotFound =>
+                            {
+                                continue;
+                            }
+                            Err(remove_error) => {
+                                tracing::warn!(
+                                    "Failed to remove stale repo deploy lock {}: {}",
+                                    lock_path.display(),
+                                    remove_error
+                                );
+                            }
+                        }
+                    }
+                    let existing_metadata = read_repo_deploy_lock_metadata(&lock_path).await;
+                    anyhow::bail!(
+                        "{}",
+                        format_existing_repo_deploy_lock_message(existing_metadata.as_ref())
+                    );
+                }
+                Err(error) => {
+                    anyhow::bail!(
+                        "Failed to create repo deploy lock '{}': {}",
+                        lock_path.display(),
+                        error
+                    );
+                }
+            }
+        }
+    }
+}
+
+impl Drop for RepoDeployInFlightGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.lock_path);
+    }
+}
+
+struct RepoDeployWorkspaceGuard {
+    bundle_dir: PathBuf,
+    preserve_bundle: bool,
+}
+
+impl RepoDeployWorkspaceGuard {
+    async fn create(bundle_dir: PathBuf) -> Result<Self> {
+        tokio::fs::create_dir_all(&bundle_dir).await?;
+        Ok(Self {
+            bundle_dir,
+            preserve_bundle: false,
+        })
+    }
+
+    fn preserve_bundle(&mut self) {
+        self.preserve_bundle = true;
+    }
+}
+
+impl Drop for RepoDeployWorkspaceGuard {
+    fn drop(&mut self) {
+        if self.preserve_bundle {
+            return;
+        }
+        let _ = std::fs::remove_dir_all(&self.bundle_dir);
+    }
+}
+
+fn should_deploy_repo_bundle(arguments: &serde_json::Value) -> bool {
+    let has_repo_url = arguments
+        .get("repo_url")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_repo_bundle_id = arguments
+        .get("repo_bundle_id")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| !value.trim().is_empty());
+    has_repo_url && !has_repo_bundle_id
+}
+
 async fn deploy_repo_bundle(
     config_dir: &Path,
     data_dir: &Path,
@@ -1222,10 +1456,50 @@ async fn deploy_repo_bundle(
         .unwrap_or(false);
     let runtime_image = arguments.get("runtime_image").cloned();
 
+    let fingerprint = repo_deploy_fingerprint(
+        repo_url,
+        repo_ref,
+        repo_subdir.as_deref(),
+        &repo_title,
+        service_mode,
+        runtime_preference,
+        expose_public,
+        access_guard_enabled,
+        runtime_image.as_ref(),
+    );
     let bundle_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+    let lock_metadata = build_repo_deploy_lock_metadata(
+        &bundle_id,
+        &fingerprint,
+        repo_url,
+        repo_ref,
+        repo_subdir.as_deref(),
+        &repo_title,
+        service_mode,
+        runtime_preference,
+        expose_public,
+        access_guard_enabled,
+        runtime_image.as_ref(),
+    );
+    let _inflight_guard =
+        match RepoDeployInFlightGuard::acquire(data_dir, &fingerprint, &lock_metadata).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                emit_progress(&stream_tx, &error.to_string()).await;
+                return Err(error);
+            }
+        };
+    tracing::info!(
+        "Starting repo bundle deploy: bundle={} repo={} ref={:?} subdir={:?} fingerprint={}",
+        bundle_id,
+        repo_url,
+        repo_ref,
+        repo_subdir,
+        &fingerprint[..12]
+    );
     let bundle_dir = data_dir.join("repo-deployments").join(&bundle_id);
     let source_dir = bundle_dir.join("source");
-    tokio::fs::create_dir_all(&bundle_dir).await?;
+    let mut workspace_guard = RepoDeployWorkspaceGuard::create(bundle_dir.clone()).await?;
     clone_repo(repo_url, repo_ref, &source_dir, &stream_tx).await?;
 
     let repo_root = if let Some(subdir) = repo_subdir.as_ref() {
@@ -1347,6 +1621,11 @@ async fn deploy_repo_bundle(
         }
         if let Some(command) = plan.entry_command.as_ref() {
             service_args.insert("entry_command".to_string(), serde_json::json!(command));
+            service_args.insert("runtime_required".to_string(), serde_json::json!(true));
+            service_args.insert(
+                "runtime_reason".to_string(),
+                serde_json::json!("Repo service plan detected a runnable server command."),
+            );
         }
 
         match std::pin::Pin::from(Box::new(app_deploy(
@@ -1488,12 +1767,7 @@ async fn deploy_repo_bundle(
         "repo_ref": repo_ref,
         "repo_subdir": repo_subdir,
         "title": repo_title,
-        "service_mode": match service_mode {
-            RepoServiceMode::Auto => "auto",
-            RepoServiceMode::Frontend => "frontend",
-            RepoServiceMode::Backend => "backend",
-            RepoServiceMode::Fullstack => "fullstack",
-        },
+        "service_mode": repo_service_mode_label(service_mode),
         "status": summary_status,
         "readme_file": readme_file,
         "readme_mentions_compose": readme_mentions_compose,
@@ -1505,7 +1779,18 @@ async fn deploy_repo_bundle(
         serde_json::to_string_pretty(&manifest)?,
     )
     .await?;
+    workspace_guard.preserve_bundle();
     let _ = tokio::fs::remove_dir_all(&source_dir).await;
+    tracing::info!(
+        "Finished repo bundle deploy: bundle={} status={} services={}",
+        bundle_id,
+        summary_status,
+        manifest
+            .get("services")
+            .and_then(|value| value.as_array())
+            .map(|value| value.len())
+            .unwrap_or(0)
+    );
 
     Ok(serde_json::json!({
         "status": summary_status,
@@ -4682,11 +4967,7 @@ pub async fn app_deploy(
     llm_env: &HashMap<String, String>,
     stream_tx: Option<Sender<StreamEvent>>,
 ) -> Result<String> {
-    if arguments
-        .get("repo_url")
-        .and_then(|value| value.as_str())
-        .is_some_and(|value| !value.trim().is_empty())
-    {
+    if should_deploy_repo_bundle(arguments) {
         return deploy_repo_bundle(
             config_dir, data_dir, arguments, registry, llm_env, stream_tx,
         )
@@ -4975,7 +5256,7 @@ pub async fn app_deploy(
             "missing_env": missing_sensitive,
             "missing_config": missing_config,
             "llm_reuse_candidates": llm_reuse_candidates,
-            "message": "Missing required inputs. For sensitive keys use: set secret KEY=VALUE (or use current llm key for KEY when offered). For non-sensitive values pass config.{KEY} when deploying/restarting."
+            "message": "Missing required inputs. For sensitive keys use: /setsecret KEY=VALUE (or /usecurrentkey KEY when offered). For non-sensitive values pass config.{KEY} when deploying/restarting."
         })
         .to_string());
     }
@@ -5255,6 +5536,146 @@ $ npm run dev
                     .as_deref()
                     .is_some_and(|command| command.contains("uvicorn"))
         }));
+    }
+
+    #[tokio::test]
+    async fn repo_deploy_inflight_guard_blocks_matching_request_until_release() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let fingerprint = repo_deploy_fingerprint(
+            "https://github.com/example/repo-template",
+            None,
+            None,
+            "repo-template",
+            RepoServiceMode::Auto,
+            RuntimePreference::Container,
+            false,
+            false,
+            None,
+        );
+        let metadata = build_repo_deploy_lock_metadata(
+            "bundle123",
+            &fingerprint,
+            "https://github.com/example/repo-template",
+            None,
+            None,
+            "repo-template",
+            RepoServiceMode::Auto,
+            RuntimePreference::Container,
+            false,
+            false,
+            None,
+        );
+
+        let guard = RepoDeployInFlightGuard::acquire(data_dir.path(), &fingerprint, &metadata)
+            .await
+            .expect("first lock should succeed");
+        let error = RepoDeployInFlightGuard::acquire(data_dir.path(), &fingerprint, &metadata)
+            .await
+            .expect_err("second matching lock should be blocked");
+        assert!(error.to_string().contains("already in progress"));
+
+        drop(guard);
+
+        RepoDeployInFlightGuard::acquire(data_dir.path(), &fingerprint, &metadata)
+            .await
+            .expect("lock should be released after guard drop");
+    }
+
+    #[tokio::test]
+    async fn repo_deploy_inflight_guard_reclaims_stale_lock() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let fingerprint = repo_deploy_fingerprint(
+            "https://github.com/example/repo-template",
+            Some("main"),
+            Some("web"),
+            "repo-template",
+            RepoServiceMode::Frontend,
+            RuntimePreference::Container,
+            false,
+            false,
+            None,
+        );
+        let lock_dir = data_dir.path().join("repo-deployments").join(".inflight");
+        tokio::fs::create_dir_all(&lock_dir)
+            .await
+            .expect("lock dir should exist");
+        let lock_path = lock_dir.join(format!("{fingerprint}.json"));
+        tokio::fs::write(
+            &lock_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "bundle_id": "stale1234",
+                "started_at": "2026-04-08T00:00:00Z",
+                "started_at_unix": chrono::Utc::now().timestamp()
+                    - REPO_DEPLOY_INFLIGHT_STALE_SECS as i64
+                    - 1,
+            }))
+            .expect("stale lock should serialize"),
+        )
+        .await
+        .expect("stale lock should be written");
+
+        let metadata = build_repo_deploy_lock_metadata(
+            "bundle5678",
+            &fingerprint,
+            "https://github.com/example/repo-template",
+            Some("main"),
+            Some("web"),
+            "repo-template",
+            RepoServiceMode::Frontend,
+            RuntimePreference::Container,
+            false,
+            false,
+            None,
+        );
+
+        let guard = RepoDeployInFlightGuard::acquire(data_dir.path(), &fingerprint, &metadata)
+            .await
+            .expect("stale lock should be reclaimed");
+        let persisted = read_repo_deploy_lock_metadata(&lock_path)
+            .await
+            .expect("fresh lock metadata should be readable");
+        assert_eq!(
+            persisted.get("bundle_id").and_then(|value| value.as_str()),
+            Some("bundle5678")
+        );
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn repo_deploy_workspace_guard_cleans_failed_bundle_dir() {
+        let bundle_dir = tempfile::tempdir()
+            .expect("parent dir")
+            .path()
+            .join("repo-deployments")
+            .join("bundle1234");
+        let guard = RepoDeployWorkspaceGuard::create(bundle_dir.clone())
+            .await
+            .expect("bundle dir should be created");
+        tokio::fs::write(bundle_dir.join("partial.txt"), "partial")
+            .await
+            .expect("partial file should be written");
+
+        drop(guard);
+
+        assert!(
+            !bundle_dir.exists(),
+            "failed repo deploy workspace should be cleaned up"
+        );
+    }
+
+    #[test]
+    fn should_deploy_repo_bundle_for_top_level_repo_request_only() {
+        assert!(should_deploy_repo_bundle(&serde_json::json!({
+            "repo_url": "https://github.com/example/repo-template"
+        })));
+
+        assert!(!should_deploy_repo_bundle(&serde_json::json!({
+            "repo_url": "https://github.com/example/repo-template",
+            "repo_bundle_id": "bundle1234",
+            "files": {
+                "package.json": "{}"
+            }
+        })));
     }
 
     #[tokio::test]

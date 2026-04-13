@@ -11,7 +11,8 @@
 #   ./scripts/start.sh stop         - Stop AgentArk
 #   ./scripts/start.sh restart      - Restart AgentArk
 #   ./scripts/start.sh logs         - View logs
-#   ./scripts/start.sh update       - Rebuild and restart (preserves data)
+#   ./scripts/start.sh update       - Pull latest image and restart (preserves data)
+#   ./scripts/start.sh build        - Build from this checkout and restart
 #   ./scripts/start.sh backup       - Backup your data
 #   ./scripts/start.sh status       - Show running containers
 
@@ -35,7 +36,7 @@ fi
 case "${1:-start}" in
     start)
         echo -e "${GREEN}Starting AgentArk...${NC}"
-        docker compose up -d --build
+        docker compose up -d
         echo ""
         echo -e "${GREEN}AgentArk is running!${NC}"
         echo -e "  Web UI:  ${CYAN}http://localhost:8990${NC}"
@@ -82,7 +83,7 @@ case "${1:-start}" in
         fi
 
         echo -e "${GREEN}Starting AgentArk with remote access...${NC}"
-        AGENTARK_TUNNEL=true docker compose up -d --build
+        AGENTARK_TUNNEL=true docker compose up -d
         echo ""
         echo -e "${GREEN}AgentArk is starting with secure tunnel!${NC}"
         echo ""
@@ -120,9 +121,14 @@ case "${1:-start}" in
         ;;
     update)
         echo -e "${YELLOW}Updating AgentArk (your data will be preserved)...${NC}"
-        docker compose build
+        docker compose pull
         docker compose up -d
         echo -e "${GREEN}Update complete! Your data is intact.${NC}"
+        ;;
+    build)
+        echo -e "${YELLOW}Building AgentArk from this checkout (your data will be preserved)...${NC}"
+        AGENTARK_IMAGE=${AGENTARK_IMAGE:-agentark:dev} docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+        echo -e "${GREEN}Local build complete! Your data is intact.${NC}"
         ;;
     backup)
         BACKUP_DIR="./backups/$(date +%Y%m%d_%H%M%S)"
@@ -144,7 +150,7 @@ case "${1:-start}" in
         docker exec -it agentark-control /app/agentark --chat <<< "run arkpulse now"
         ;;
     *)
-        echo "Usage: ./scripts/start.sh [start|tunnel|stop|restart|logs|update|backup|status|chat|pulse]"
+        echo "Usage: ./scripts/start.sh [start|tunnel|stop|restart|logs|update|build|backup|status|chat|pulse]"
         echo ""
         echo "  start          Start AgentArk (local access only)"
         echo "  tunnel         Start with remote access (auto-starts Cloudflare tunnel)"
@@ -152,7 +158,8 @@ case "${1:-start}" in
         echo "  stop           Stop AgentArk"
         echo "  restart        Restart AgentArk"
         echo "  logs           View logs"
-        echo "  update         Rebuild and restart (preserves data)"
+        echo "  update         Pull latest image and restart (preserves data)"
+        echo "  build          Build from this checkout and restart"
         echo "  backup         Backup your data"
         echo "  status         Show running containers"
         echo "  chat           Interactive CLI chat with the agent"

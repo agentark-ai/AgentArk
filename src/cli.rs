@@ -20,6 +20,7 @@ pub enum Command {
     Node(NodeCommandArgs),
     Browser(BrowserCommandArgs),
     Failover(FailoverCommandArgs),
+    LanHelper(LanHelperCommandArgs),
     Doctor(StatusCommandArgs),
     Onboard(StatusCommandArgs),
 }
@@ -28,6 +29,16 @@ pub enum Command {
 pub struct StatusCommandArgs {
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+pub struct LanHelperCommandArgs {
+    /// Host-side bind address for Docker-aware LAN discovery.
+    #[arg(long, default_value = "127.0.0.1:8995")]
+    pub bind: String,
+    /// Bearer token required by AgentArk when the helper is called from Docker.
+    #[arg(long, env = "AGENTARK_LAN_HELPER_TOKEN")]
+    pub token: Option<String>,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -289,6 +300,9 @@ pub async fn run(agent: crate::core::Agent, command: Command) -> Result<()> {
         Command::Node(args) => run_nodes(agent, args).await,
         Command::Browser(args) => run_browser(agent, args).await,
         Command::Failover(args) => run_failover(agent, args).await,
+        Command::LanHelper(args) => {
+            crate::actions::lan::run_lan_helper(args.bind, args.token).await
+        }
         Command::Doctor(args) => run_doctor(agent, args.json).await,
         Command::Onboard(args) => run_onboard(agent, args.json).await,
     }

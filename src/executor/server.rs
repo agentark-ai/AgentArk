@@ -128,7 +128,40 @@ pub async fn run_service(config: ExecutorServiceConfig) -> Result<()> {
         config.data_dir.clone(),
         std::env::vars().collect(),
     );
-    let runtime = Arc::new(ActionRuntime::new(&config.config_dir, &config.data_dir).await?);
+    let mut runtime = ActionRuntime::new(&config.config_dir, &config.data_dir).await?;
+    if let Some(storage) = crate::core::config::global_settings_storage() {
+        runtime.set_storage(storage);
+    }
+    match crate::identity::IdentityManager::load_or_create(&config.data_dir).await {
+        Ok(identity) => {
+            match crate::security::ActionGuard::new(
+                identity.signing_key(),
+                identity.did(),
+                &config.config_dir,
+                &config.data_dir,
+            )
+            .await
+            {
+                Ok(guard) => {
+                    tracing::info!("Executor action security guard initialized");
+                    runtime.set_action_guard(Arc::new(guard));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "Failed to initialize executor action security guard: {} - user-added skills will remain blocked",
+                        error
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                "Failed to load executor identity: {} - user-added skills will remain blocked",
+                error
+            );
+        }
+    }
+    let runtime = Arc::new(runtime);
     runtime.load_all_actions().await?;
 
     let state = ExecutorState {
@@ -654,11 +687,13 @@ async fn code_execute(
         "code": request.code,
         "env": request.env,
         "network_access": request.network_access,
+        "execution_contract": request.execution_contract,
         "file_payloads": request.file_payloads,
     });
+    let auth_context = request.auth_context.unwrap_or_default();
     match state
         .runtime
-        .execute_action("code_execute", &arguments)
+        .execute_action_with_context("code_execute", &arguments, &auth_context)
         .await
     {
         Ok(raw_result) => {

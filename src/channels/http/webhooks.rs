@@ -1283,7 +1283,7 @@ async fn route_event(
     let queued = {
         let agent = state.agent.read().await;
         agent
-            .add_or_update_similar_task(task.clone(), source.allow_duplicate)
+            .add_or_update_similar_task(task.clone(), source.allow_duplicate, None)
             .await
     };
     match queued {

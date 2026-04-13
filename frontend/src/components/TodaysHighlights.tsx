@@ -27,11 +27,11 @@ function Sparkline({ values }: { values: number[] }) {
 
   return (
     <svg width="100%" height={height} viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" aria-hidden>
-      <polygon points={area} fill="rgba(20, 241, 149, 0.15)" />
+      <polygon points={area} fill="rgba(255, 255, 255, 0.08)" />
       <polyline
         points={line}
         fill="none"
-        stroke="rgba(20, 241, 149, 0.8)"
+        stroke="rgba(124, 230, 255, 0.72)"
         strokeWidth="2"
         strokeLinejoin="round"
         strokeLinecap="round"
@@ -155,20 +155,20 @@ export function TodaysHighlights({ tasks, traces }: Props) {
             </Typography>
           ) : (
             <Stack direction="row" alignItems="center" spacing={0.55} useFlexGap flexWrap="wrap">
-              <Typography variant="body2" sx={{ color: "rgba(225, 239, 255, 0.96)", fontWeight: 600 }}>
+              <Typography variant="body2" sx={{ color: "text.primary", fontWeight: 600 }}>
                 {completedToday > 0 ? `${completedToday} completions` : "No completions yet"}
               </Typography>
               {trendPct !== 0 ? (
                 <Stack direction="row" alignItems="center" spacing={0.25}>
                   {trendPct > 0 ? (
-                    <TrendingUpRoundedIcon sx={{ fontSize: 15, color: "#14f195" }} />
+                    <TrendingUpRoundedIcon sx={{ fontSize: 15, color: "#82f7c1" }} />
                   ) : (
                     <TrendingDownRoundedIcon sx={{ fontSize: 15, color: "#ff9800" }} />
                   )}
                   <Typography
                     variant="caption"
                     fontWeight={700}
-                    sx={{ color: trendPct > 0 ? "#14f195" : "#ff9800" }}
+                    sx={{ color: trendPct > 0 ? "#82f7c1" : "#ff9800" }}
                   >
                     {trendPct > 0 ? "+" : ""}
                     {trendPct}% vs avg
@@ -209,7 +209,7 @@ export function TodaysHighlights({ tasks, traces }: Props) {
             <Stack spacing={0.55} className="mission-panel-section">
               {completedList.map((task, index) => (
                 <Stack key={task.id || index} direction="row" spacing={0.75} alignItems="center">
-                  <CheckCircleRoundedIcon sx={{ fontSize: 14, color: "#14f195", flexShrink: 0 }} />
+                  <CheckCircleRoundedIcon sx={{ fontSize: 14, color: "#82f7c1", flexShrink: 0 }} />
                   <Typography variant="body2" noWrap sx={{ minWidth: 0 }} title={String(task.description || "")}>
                     {String(task.description || "Task completed")}
                   </Typography>
@@ -228,7 +228,7 @@ export function TodaysHighlights({ tasks, traces }: Props) {
             <Stack direction={{ xs: "column", sm: "row" }} spacing={0.85} useFlexGap flexWrap="wrap">
               {todayUsageRows.map((row) => (
                 <Typography key={row.label} variant="caption" color="text.secondary">
-                  {row.label}: <span style={{ color: "rgba(230, 241, 255, 0.94)" }}>{row.value}</span>
+                  {row.label}: <span style={{ color: "rgba(244, 245, 247, 0.92)" }}>{row.value}</span>
                 </Typography>
               ))}
             </Stack>
@@ -236,7 +236,7 @@ export function TodaysHighlights({ tasks, traces }: Props) {
 
           {nextScheduled ? (
             <Stack direction="row" spacing={0.75} alignItems="center">
-              <ScheduleRoundedIcon sx={{ fontSize: 14, color: "#2fd4ff", flexShrink: 0 }} />
+              <ScheduleRoundedIcon sx={{ fontSize: 14, color: "rgba(244, 245, 247, 0.78)", flexShrink: 0 }} />
               <Typography variant="body2" color="text.secondary">
                 Next scheduled: {String(nextScheduled.description || "Scheduled task").slice(0, 56)}
               </Typography>

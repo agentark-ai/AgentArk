@@ -1,0 +1,40 @@
+name: Scorecard
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "41 2 * * 1"
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+  issues: read
+  pull-requests: read
+  security-events: write
+
+jobs:
+  scorecard:
+    if: ${{ github.event.repository.private == false || vars.AGENTARK_ENABLE_PRIVATE_SCORECARD == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run OpenSSF Scorecard
+        uses: ossf/scorecard-action@v2.3.3
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+
+      - name: Upload scorecard SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
+
+      - name: Upload scorecard artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: scorecard-results
+          path: results.sarif

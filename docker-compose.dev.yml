@@ -1,0 +1,33 @@
+# =============================================================================
+# AgentArk - local source build override
+# =============================================================================
+#
+# Use this only when you intentionally want to build AgentArk from the current
+# checkout instead of using the published GHCR image:
+#
+#   AGENTARK_IMAGE=agentark:dev docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+#
+# Keep AGENTARK_IMAGE set so AGENTARK_SELF_IMAGE also points at the local tag.
+#
+# =============================================================================
+
+services:
+  agentark-control:
+    build:
+      context: .
+      args:
+        AGENTARK_DOCKER_FEATURES: ${AGENTARK_DOCKER_FEATURES:-telegram,docker,ssh}
+        INSTALL_PLAYWRIGHT_RUNTIME: ${AGENTARK_INSTALL_PLAYWRIGHT_RUNTIME:-true}
+        INSTALL_TAILSCALE: ${AGENTARK_INSTALL_TAILSCALE:-true}
+        INSTALL_CLOUDFLARED: ${AGENTARK_INSTALL_CLOUDFLARED:-true}
+        INSTALL_LIGHTPANDA: ${AGENTARK_INSTALL_LIGHTPANDA:-true}
+        INSTALL_GWS: ${AGENTARK_INSTALL_GWS:-true}
+        INSTALL_DOCKER_CLI: ${AGENTARK_INSTALL_DOCKER_CLI:-true}
+        INSTALL_WHATSAPP_BRIDGE: ${AGENTARK_INSTALL_WHATSAPP_BRIDGE:-true}
+    image: ${AGENTARK_IMAGE:-agentark:dev}
+
+  agentark-executor:
+    image: ${AGENTARK_IMAGE:-agentark:dev}
+
+  agentark-workspace:
+    image: ${AGENTARK_IMAGE:-agentark:dev}

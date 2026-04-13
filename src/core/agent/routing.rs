@@ -2,10 +2,14 @@ use super::*;
 
 const ROUTING_COMPLEXITY_POLICY_KEY: &str = "routing_complexity_policy_v1";
 const ROUTING_COMPLEXITY_POLICY_DEFAULT_VERSION: &str = "routing-policy-default-v2";
-const ROUTER_CALL_TIMEOUT_MS: u64 = 3500;
+const ROUTER_CALL_TIMEOUT_MS: u64 = 12_000;
 
-fn message_contains_any(lower: &str, tokens: &[&str]) -> bool {
-    tokens.iter().any(|token| lower.contains(token))
+fn router_call_timeout_ms() -> u64 {
+    std::env::var("AGENTARK_ROUTER_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| *ms >= 500 && *ms <= 60_000)
+        .unwrap_or(ROUTER_CALL_TIMEOUT_MS)
 }
 
 fn extract_first_json_object(raw: &str) -> Option<String> {
@@ -78,7 +82,6 @@ fn parse_routing_decision_from_text(
 pub(crate) enum SwarmDirective {
     Auto,
     Force,
-    Disable,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -346,45 +349,23 @@ impl Agent {
         let (routing_policy_hint, routing_policy_version) = self
             .load_routing_complexity_policy_for_message(message)
             .await;
-        let mut scored_actions: Vec<(f32, &crate::actions::ActionDef)> = actions
-            .iter()
-            .map(|action| {
-                (
-                    crate::core::intent::action_intent_score(message, action),
-                    action,
-                )
-            })
-            .collect();
-        scored_actions.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1.name.cmp(&b.1.name))
-        });
-        let action_hint_block = if scored_actions.is_empty() {
+        let action_hint_block = if actions.is_empty() {
             "No registered actions available.".to_string()
         } else {
-            scored_actions
+            actions
                 .iter()
                 .take(8)
-                .map(|(score, action)| {
+                .map(|action| {
                     format!(
-                        "- {} ({:.2}): {}",
+                        "- {}: {}",
                         action.name,
-                        score,
                         super::safe_truncate(action.description.trim(), 120)
                     )
                 })
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        let action_discussion_context =
-            crate::core::intent::looks_like_action_discussion_context(message);
-        let preferred_direct_action = if action_discussion_context {
-            "none".to_string()
-        } else {
-            crate::core::intent::preferred_direct_action_name(message, actions)
-                .unwrap_or_else(|| "none".to_string())
-        };
+        let preferred_direct_action = "none".to_string();
         let policy_hint_block = format!(
             "Active routing policy version: {}\n\
 Routing fallback signals are structure-first (not keyword lists).\n\
@@ -414,11 +395,7 @@ Thresholds: long_question_word_threshold={}, long_message_word_threshold={}, mul
         let empty_actions: Vec<crate::actions::ActionDef> = Vec::new();
         let mut router_response: Option<crate::core::llm::LlmResponse> = None;
         let mut router_errors: Vec<String> = Vec::new();
-        let timeout_ms = std::env::var("AGENTARK_ROUTER_TIMEOUT_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|ms| *ms >= 500 && *ms <= 20000)
-            .unwrap_or(ROUTER_CALL_TIMEOUT_MS);
+        let timeout_ms = router_call_timeout_ms();
         for (idx, candidate) in router_candidates.iter().enumerate() {
             if idx > 0 {
                 tracing::warn!(
@@ -474,59 +451,6 @@ Thresholds: long_question_word_threshold={}, long_message_word_threshold={}, mul
                                 0.65
                             };
                         }
-
-                        let preferred_direct_action =
-                            crate::core::intent::preferred_direct_action_name(message, actions);
-                        if !action_discussion_context
-                            && has_execution_intent(message, actions)
-                            && preferred_direct_action.is_some()
-                        {
-                            decision.needs_delegation = false;
-                            decision.complexity = QueryComplexity::Simple;
-                            decision.sub_agents.clear();
-                            decision.reasoning = format!(
-                                "{} | Clear direct action match: {}",
-                                decision.reasoning,
-                                preferred_direct_action.as_deref().unwrap_or("unknown")
-                            );
-                            decision.confidence = decision.confidence.max(0.90);
-                        }
-
-                        if !action_discussion_context
-                            && has_execution_intent(message, actions)
-                            && decision.needs_delegation
-                            && decision.confidence < 0.90
-                        {
-                            decision.needs_delegation = false;
-                            decision.complexity = QueryComplexity::Simple;
-                            decision.sub_agents.clear();
-                            decision.reasoning = format!(
-                                "{} | Execution task routed to direct tool path (confidence below 0.90)",
-                                decision.reasoning
-                            );
-                        }
-
-                        // When the LLM router succeeds, trust its judgment about clarification.
-                        // Only boost confidence when keyword heuristics confirm clear intent —
-                        // never override the LLM to FORCE clarification via keyword scoring.
-                        if !action_discussion_context
-                            && has_execution_intent(message, actions)
-                            && decision.confidence < 0.90
-                        {
-                            let best_score = best_execution_intent_score(message, actions);
-                            let ambiguous = is_ambiguous_user_request(message, actions);
-                            let detailed_brief = is_detailed_execution_brief(message, actions);
-                            let clear_enough = detailed_brief || (!ambiguous && best_score >= 0.55);
-                            if clear_enough || best_score >= 0.80 {
-                                decision.confidence = decision.confidence.max(0.90);
-                                decision.should_clarify = false;
-                                decision.clarification_question = None;
-                            }
-                            // Otherwise: keep the LLM router's original should_clarify value.
-                            // Don't override it with keyword heuristics — the LLM understands
-                            // semantic intent better than token overlap scoring.
-                        }
-
                         decision
                     }
                     None => {
@@ -547,70 +471,28 @@ Thresholds: long_question_word_threshold={}, long_message_word_threshold={}, mul
         }
     }
 
-    /// Fallback: structural complexity classification (used when LLM routing fails)
+    /// Conservative fallback used when semantic routing is unavailable.
     pub(crate) async fn classify_complexity_fallback(
         &self,
         message: &str,
         actions: &[crate::actions::ActionDef],
     ) -> crate::core::task_router::RoutingDecision {
-        let mut complexity = self.classify_complexity(message).await;
-        let execution_intent = has_execution_intent(message, actions);
-        if execution_intent && matches!(complexity, QueryComplexity::Complex) {
-            complexity = QueryComplexity::Medium;
-        }
-
-        // Fallback classifier uses keyword heuristics which can't reliably
-        // determine if clarification is needed — never ask for clarification here.
-        // The processing LLM will ask for clarification itself if truly confused.
+        let _ = (self, message, actions);
         crate::core::task_router::RoutingDecision {
-            needs_delegation: matches!(complexity, QueryComplexity::Complex) && !execution_intent,
-            complexity,
+            needs_delegation: false,
+            complexity: QueryComplexity::Simple,
             sub_agents: vec![],
-            reasoning: "Fallback structural classification".to_string(),
-            confidence: 0.60,
+            reasoning: "Conservative fallback classification".to_string(),
+            confidence: 0.40,
             should_clarify: false,
             clarification_question: None,
         }
     }
-
     pub(crate) fn detect_swarm_directive(&self, message: &str) -> SwarmDirective {
-        let lower = message.trim().to_ascii_lowercase();
-        if lower.is_empty() {
-            return SwarmDirective::Auto;
-        }
-
-        if message_contains_any(
-            &lower,
-            &[
-                "single agent only",
-                "single-agent only",
-                "do this yourself",
-                "handle this yourself",
-                "no swarm",
-                "no sub-agent",
-                "no subagent",
-                "no multiple agents",
-                "without swarm",
-            ],
-        ) {
-            return SwarmDirective::Disable;
-        }
-
-        if message_contains_any(
-            &lower,
-            &[
-                "use swarm",
-                "use multiple agents",
-                "use a few agents",
-                "use specialist agents",
-                "spin up sub-agents",
-                "spin up subagents",
-                "delegate this",
-                "split this across agents",
-                "have multiple agents",
-                "fan this out",
-            ],
-        ) {
+        let trimmed = message.trim();
+        if trimmed.eq_ignore_ascii_case("/delegate")
+            || trimmed.to_ascii_lowercase().starts_with("/delegate ")
+        {
             return SwarmDirective::Force;
         }
 
@@ -622,105 +504,104 @@ Thresholds: long_question_word_threshold={}, long_message_word_threshold={}, mul
         message: &str,
         actions: &[crate::actions::ActionDef],
     ) -> Vec<crate::core::task_router::SubAgentSpec> {
-        let lower = message.trim().to_ascii_lowercase();
-        let code_or_execution = has_execution_intent(message, actions)
-            || message_contains_any(
-                &lower,
-                &[
-                    "code",
-                    "implement",
-                    "fix",
-                    "build",
-                    "refactor",
-                    "debug",
-                    "review",
-                ],
-            );
-        let research_heavy = message_contains_any(
-            &lower,
-            &[
-                "research",
-                "compare",
-                "investigate",
-                "find sources",
-                "look up",
-                "analyze",
-            ],
-        );
-
-        if code_or_execution {
-            return vec![
-                crate::core::task_router::SubAgentSpec {
-                    agent_type: "Planner".to_string(),
-                    task: format!(
-                        "Break this request into an execution plan with dependencies, risks, and acceptance criteria: {}",
+        let preferred_action = crate::core::intent::preferred_direct_action_name(message, actions)
+            .and_then(|name| actions.iter().find(|action| action.name == name));
+        let (primary_agent_type, primary_task, primary_role) = preferred_action
+            .map(|action| {
+                let metadata = action.planner_metadata();
+                if matches!(
+                    metadata.integration_class,
+                    crate::actions::PlannerIntegrationClass::Code
+                        | crate::actions::PlannerIntegrationClass::Filesystem
+                        | crate::actions::PlannerIntegrationClass::App
+                ) || matches!(metadata.role, crate::actions::PlannerActionRole::Mutation)
+                {
+                    (
+                        "Coder".to_string(),
+                        format!(
+                            "Drive the implementation or technical solution for this request using the best matching action path: {}",
+                            message.trim()
+                        ),
+                        Some("Code".to_string()),
+                    )
+                } else if matches!(
+                    metadata.integration_class,
+                    crate::actions::PlannerIntegrationClass::Search
+                        | crate::actions::PlannerIntegrationClass::Analytics
+                        | crate::actions::PlannerIntegrationClass::Network
+                ) || matches!(metadata.role, crate::actions::PlannerActionRole::DataSource)
+                {
+                    (
+                        "Researcher".to_string(),
+                        format!(
+                            "Gather the key facts, sources, and relevant context for this delegated request: {}",
+                            message.trim()
+                        ),
+                        Some("Research".to_string()),
+                    )
+                } else if matches!(
+                    metadata.integration_class,
+                    crate::actions::PlannerIntegrationClass::Messaging
+                        | crate::actions::PlannerIntegrationClass::Workspace
+                ) || matches!(metadata.role, crate::actions::PlannerActionRole::Delivery)
+                {
+                    (
+                        "Writer".to_string(),
+                        format!(
+                            "Draft the user-facing communication or delivery artifact for this request: {}",
+                            message.trim()
+                        ),
+                        None,
+                    )
+                } else {
+                    (
+                        "Analyst".to_string(),
+                        format!(
+                            "Evaluate the strongest execution path, tradeoffs, and risks for this delegated request: {}",
+                            message.trim()
+                        ),
+                        None,
+                    )
+                }
+            })
+            .unwrap_or_else(|| {
+                (
+                    "Analyst".to_string(),
+                    format!(
+                        "Evaluate the strongest execution path, tradeoffs, and risks for this delegated request: {}",
                         message.trim()
                     ),
-                    preferred_model_role: None,
-                    depends_on: vec![],
-                },
-                crate::core::task_router::SubAgentSpec {
-                    agent_type: "Coder".to_string(),
-                    task: format!(
-                        "Drive the implementation or technical solution for this request: {}",
-                        message.trim()
-                    ),
-                    preferred_model_role: Some("Code".to_string()),
-                    depends_on: vec![],
-                },
-                crate::core::task_router::SubAgentSpec {
-                    agent_type: "Validator".to_string(),
-                    task: format!(
-                        "Review the plan and solution, checking correctness, risks, and missing tests for: {}",
-                        message.trim()
-                    ),
-                    preferred_model_role: None,
-                    depends_on: vec![0, 1],
-                },
-            ];
-        }
-
-        if research_heavy {
-            return vec![
-                crate::core::task_router::SubAgentSpec {
-                    agent_type: "Researcher".to_string(),
-                    task: format!(
-                        "Gather the key facts, sources, and relevant context for: {}",
-                        message.trim()
-                    ),
-                    preferred_model_role: Some("Research".to_string()),
-                    depends_on: vec![],
-                },
-                crate::core::task_router::SubAgentSpec {
-                    agent_type: "Analyst".to_string(),
-                    task: format!(
-                        "Synthesize the strongest findings, tradeoffs, and recommendations for: {}",
-                        message.trim()
-                    ),
-                    preferred_model_role: None,
-                    depends_on: vec![0],
-                },
-            ];
-        }
+                    None,
+                )
+            });
 
         vec![
             crate::core::task_router::SubAgentSpec {
                 agent_type: "Planner".to_string(),
                 task: format!(
-                    "Decompose this request into a few execution tracks with dependencies and next actions: {}",
+                    "Decompose this request into clear execution tracks with dependencies, risks, and acceptance criteria: {}",
                     message.trim()
                 ),
                 preferred_model_role: None,
                 depends_on: vec![],
+                plan_step_id: None,
             },
             crate::core::task_router::SubAgentSpec {
-                agent_type: "Analyst".to_string(),
+                agent_type: primary_agent_type,
+                task: primary_task,
+                preferred_model_role: primary_role,
+                depends_on: vec![],
+                plan_step_id: None,
+            },
+            crate::core::task_router::SubAgentSpec {
+                agent_type: "Validator".to_string(),
                 task: format!(
-                    "Evaluate tradeoffs, risks, and the strongest recommendation for: {}",
+                    "Review the plan and delegated result for correctness, risks, and missing checks: {}",
                     message.trim()
                 ),
                 preferred_model_role: None,
-                depends_on: vec![0],
+                depends_on: vec![0, 1],
+                plan_step_id: None,
             },
         ]
     }
@@ -733,14 +614,6 @@ Thresholds: long_question_word_threshold={}, long_message_word_threshold={}, mul
         directive: SwarmDirective,
     ) {
         match directive {
-            SwarmDirective::Disable => {
-                decision.needs_delegation = false;
-                decision.sub_agents.clear();
-                decision.reasoning = format!(
-                    "{} | Explicit user preference: single-agent execution.",
-                    decision.reasoning
-                );
-            }
             SwarmDirective::Force => {
                 decision.needs_delegation = true;
                 decision.complexity = QueryComplexity::Complex;
@@ -749,7 +622,7 @@ Thresholds: long_question_word_threshold={}, long_message_word_threshold={}, mul
                 }
                 decision.confidence = decision.confidence.max(0.96);
                 decision.reasoning = format!(
-                    "{} | Explicit user preference: use multiple agents.",
+                    "{} | Explicit structured delegation command forced multi-agent execution.",
                     decision.reasoning
                 );
             }

@@ -6,7 +6,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait, Schem
 
 use super::entities::*;
 
-const CURRENT_SCHEMA_VERSION: i64 = 2;
+const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 pub fn latest_version() -> i64 {
     CURRENT_SCHEMA_VERSION
@@ -41,10 +41,70 @@ async fn ensure_optional_sql(
     sql: impl Into<String>,
     description: &str,
 ) -> Result<()> {
-    if let Err(error) = db.execute(Statement::from_string(backend, sql.into())).await {
+    if let Err(error) = db
+        .execute(Statement::from_string(backend, sql.into()))
+        .await
+    {
         tracing::warn!("Skipping optional {}: {}", description, error);
     }
     Ok(())
+}
+
+fn sql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn vector_type_has_dimensions(formatted_type: &str) -> bool {
+    let normalized = formatted_type.trim().to_ascii_lowercase();
+    normalized.starts_with("vector(") || normalized.contains(".vector(")
+}
+
+async fn pgvector_column_has_dimensions(
+    db: &DatabaseConnection,
+    table: &str,
+    column: &str,
+) -> Result<bool> {
+    let sql = format!(
+        "SELECT format_type(a.atttypid, a.atttypmod) AS formatted_type \
+         FROM pg_attribute a \
+         JOIN pg_class c ON c.oid = a.attrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = current_schema() \
+           AND c.relname = {} \
+           AND a.attname = {} \
+           AND a.attnum > 0 \
+           AND NOT a.attisdropped",
+        sql_string_literal(table),
+        sql_string_literal(column),
+    );
+    let row = db
+        .query_one(Statement::from_string(DbBackend::Postgres, sql))
+        .await?;
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    let formatted_type: String = row.try_get("", "formatted_type")?;
+    Ok(vector_type_has_dimensions(&formatted_type))
+}
+
+async fn ensure_pgvector_hnsw_index(
+    db: &DatabaseConnection,
+    backend: DbBackend,
+    table: &str,
+    column: &str,
+    sql: impl Into<String>,
+    description: &str,
+) -> Result<()> {
+    if !pgvector_column_has_dimensions(db, table, column).await? {
+        tracing::info!(
+            "Skipping optional {} because {}.{} uses an unconstrained vector type; HNSW indexes require vector(n)",
+            description,
+            table,
+            column
+        );
+        return Ok(());
+    }
+    ensure_optional_sql(db, backend, sql, description).await
 }
 
 macro_rules! ensure_table_list {
@@ -117,6 +177,14 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
         ]
     );
 
+    ensure_optional_sql(
+        db,
+        backend,
+        "ALTER TABLE swarm_agents ADD COLUMN IF NOT EXISTS access_scope TEXT NOT NULL DEFAULT '{}'",
+        "swarm_agents.access_scope column",
+    )
+    .await?;
+
     ensure_index(
         db,
         backend,
@@ -173,9 +241,11 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
             .to_owned(),
     )
     .await?;
-    ensure_optional_sql(
+    ensure_pgvector_hnsw_index(
         db,
         backend,
+        "episodes",
+        "embedding",
         "CREATE INDEX IF NOT EXISTS idx_episodes_embedding_hnsw \
          ON episodes USING hnsw (embedding vector_cosine_ops) \
          WHERE embedding IS NOT NULL",
@@ -396,9 +466,11 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
             .to_owned(),
     )
     .await?;
-    ensure_optional_sql(
+    ensure_pgvector_hnsw_index(
         db,
         backend,
+        "document_chunks",
+        "embedding",
         "CREATE INDEX IF NOT EXISTS idx_document_chunks_embedding_hnsw \
          ON document_chunks USING hnsw (embedding vector_cosine_ops) \
          WHERE embedding IS NOT NULL",
@@ -515,9 +587,11 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
             .to_owned(),
     )
     .await?;
-    ensure_optional_sql(
+    ensure_pgvector_hnsw_index(
         db,
         backend,
+        "semantic_facts",
+        "embedding",
         "CREATE INDEX IF NOT EXISTS idx_semantic_facts_embedding_hnsw \
          ON semantic_facts USING hnsw (embedding vector_cosine_ops) \
          WHERE embedding IS NOT NULL",
@@ -1120,4 +1194,17 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::vector_type_has_dimensions;
+
+    #[test]
+    fn vector_type_dimension_detection_requires_explicit_dimensions() {
+        assert!(vector_type_has_dimensions("vector(384)"));
+        assert!(vector_type_has_dimensions("public.vector(1536)"));
+        assert!(!vector_type_has_dimensions("vector"));
+        assert!(!vector_type_has_dimensions("text"));
+    }
 }

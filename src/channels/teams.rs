@@ -935,23 +935,9 @@ async fn persist_destination(
     Ok(())
 }
 
-async fn load_default_destination(
-    storage: &Storage,
+fn load_default_destination(
     config: &TeamsTransportConfig,
 ) -> Result<Option<TeamsReplyDestination>> {
-    if let Ok(Some(raw)) = storage.get(LAST_DESTINATION_STORAGE_KEY).await {
-        if let Ok(mut destination) = serde_json::from_slice::<TeamsReplyDestination>(&raw) {
-            if let Some(service_url) = destination.service_url.as_deref() {
-                if let Ok(normalized) = normalize_service_url(service_url) {
-                    destination.service_url = Some(normalized);
-                    return Ok(Some(destination));
-                }
-            } else {
-                return Ok(Some(destination));
-            }
-        }
-    }
-
     let conversation_id = if let Some(chat_id) = config
         .chat_id
         .as_deref()
@@ -996,13 +982,21 @@ async fn load_default_destination(
     }))
 }
 
+pub fn default_destination_for_config(
+    config: &TeamsTransportConfig,
+) -> Result<Option<TeamsReplyDestination>> {
+    load_default_destination(config)
+}
+
+pub fn validate_transport_config(config: &TeamsTransportConfig) -> Result<()> {
+    validate_config(config)
+}
+
 pub async fn send_message(agent: &Agent, text: &str) -> Result<()> {
     let config = load_config(agent)
         .await?
         .ok_or_else(|| anyhow!("Teams is not configured"))?;
-    let storage = agent.storage.clone();
-    let destination = load_default_destination(&storage, &config)
-        .await?
+    let destination = load_default_destination(&config)?
         .ok_or_else(|| anyhow!("Teams has no delivery destination yet"))?;
     send_message_to_destination(
         &config,
@@ -1437,5 +1431,22 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn proactive_destination_uses_configured_scope_without_reply_to() {
+        let config = TeamsTransportConfig {
+            service_url: "https://smba.trafficmanager.net/teams".to_string(),
+            access_token: "token".to_string(),
+            bot_app_id: Some("bot-app-id".to_string()),
+            team_id: Some("team-1".to_string()),
+            channel_id: Some("channel-1".to_string()),
+            ..Default::default()
+        };
+
+        let destination = load_default_destination(&config).unwrap().unwrap();
+        assert_eq!(destination.conversation_id, "team-1:channel-1");
+        assert_eq!(destination.last_reply_to_id, None);
+        assert_eq!(destination.chat_id, None);
     }
 }

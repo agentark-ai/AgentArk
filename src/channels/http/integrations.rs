@@ -16,7 +16,7 @@ pub(super) struct OAuthCallbackParams {
 }
 
 #[derive(Debug, Serialize)]
-struct IntegrationResponse {
+pub(super) struct IntegrationResponse {
     pub id: String,
     pub name: String,
     pub description: String,
@@ -1501,9 +1501,7 @@ body {{ font-family: system-ui; background: #1a1a2e; color: #eee; display: flex;
     }
 }
 
-/// List all integrations with their status
-pub(super) async fn list_integrations(State(state): State<AppState>) -> Response {
-    let agent = state.agent.read().await;
+pub(super) async fn collect_integrations(agent: &crate::core::Agent) -> Vec<IntegrationResponse> {
     let config_dir = agent.config_dir.clone();
     let manager = crate::core::config::SecureConfigManager::new_with_data_dir(
         &agent.config_dir,
@@ -1663,6 +1661,13 @@ pub(super) async fn list_integrations(State(state): State<AppState>) -> Response
         });
     }
 
+    integrations
+}
+
+/// List all integrations with their status
+pub(super) async fn list_integrations(State(state): State<AppState>) -> Response {
+    let agent = state.agent.read().await;
+    let integrations = collect_integrations(&agent).await;
     (
         StatusCode::OK,
         Json(serde_json::json!({ "integrations": integrations })),

@@ -250,7 +250,22 @@ async fn save_approved(storage: &Storage, items: &[ApprovedSender]) -> Result<()
 }
 
 pub async fn load_settings(storage: &Storage) -> Result<SenderVerificationSettings> {
-    load_json(storage, SETTINGS_KEY).await
+    let Some(bytes) = storage.get_encrypted(SETTINGS_KEY).await? else {
+        return Ok(SenderVerificationSettings::default());
+    };
+
+    match serde_json::from_slice::<SenderVerificationSettings>(&bytes) {
+        Ok(settings) => Ok(settings),
+        Err(error) => {
+            tracing::warn!(
+                key = SETTINGS_KEY,
+                payload_bytes = bytes.len(),
+                "Ignoring unreadable sender verification settings payload: {}",
+                error
+            );
+            Ok(SenderVerificationSettings::default())
+        }
+    }
 }
 
 pub async fn save_settings(storage: &Storage, settings: &SenderVerificationSettings) -> Result<()> {
@@ -511,5 +526,26 @@ mod tests {
 
         let pending = list_pending(&storage).await.unwrap();
         assert_eq!(pending.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unreadable_settings_payload_falls_back_to_defaults() {
+        let _dir = tempfile::tempdir().unwrap();
+        let storage = Storage::connect(
+            crate::storage::DatabaseConfig::for_tests().expect("test database config"),
+        )
+        .await
+        .unwrap();
+
+        storage
+            .set_encrypted(SETTINGS_KEY, b"{ definitely-not-json")
+            .await
+            .unwrap();
+
+        let settings = load_settings(&storage).await.unwrap();
+        assert_eq!(settings.google_chat.policy, SenderTrustPolicy::Open);
+        assert!(settings.google_chat.allowed_senders.is_empty());
+        assert_eq!(settings.slack.policy, SenderTrustPolicy::Open);
+        assert!(settings.slack.allowed_senders.is_empty());
     }
 }

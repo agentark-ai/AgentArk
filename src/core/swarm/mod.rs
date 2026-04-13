@@ -15,6 +15,7 @@ pub mod specialist;
 pub use activity::{SwarmActivityAgent, SwarmActivityRun, SwarmActivityTracker};
 pub use agent_trait::{AgentCapability, AgentId};
 pub use coordinator::{SwarmConfig, SwarmManager};
+pub use persistence::AgentAccessScope;
 pub use specialist::SpecialistConfig;
 
 #[cfg(test)]

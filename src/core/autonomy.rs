@@ -99,12 +99,7 @@ pub struct AutopilotWatcher {
     pub poll_arguments: serde_json::Value,
     pub interval_secs: u64,
     pub timeout_secs: u64,
-    #[serde(default)]
-    pub condition_contains: Option<String>,
-    #[serde(default)]
-    pub condition_matches: Option<String>,
-    #[serde(default)]
-    pub condition_custom: Option<String>,
+    pub condition: crate::core::watcher::WatchCondition,
     pub on_trigger: String,
     pub notify_channel: String,
 }

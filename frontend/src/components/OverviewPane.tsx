@@ -16,6 +16,7 @@ import CloseIcon from "@mui/icons-material/Close";
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
+import { formatUiDateTime, formatUiRelativeDateTimeMeta } from "../lib/dateFormat";
 import { useUiStore } from "../store/uiStore";
 import { AgentStatusBar } from "./AgentStatusBar";
 import { WelcomeHero } from "./WelcomeHero";
@@ -137,9 +138,7 @@ function automationStatusColor(status: string): "success" | "warning" | "error" 
 }
 
 function formatAutomationTime(value?: string | null): string {
-  if (!value) return "-";
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+  return formatUiDateTime(value, { fallback: "-" });
 }
 
 function targetViewForAutomation(item: AutomationObject): string {
@@ -172,14 +171,7 @@ function errMessage(error: unknown): string {
 }
 
 function humanTs(value: string): { label: string; tip: string } {
-  const raw = (value || "").trim();
-  if (!raw) return { label: "-", tip: "" };
-  const date = new Date(raw);
-  if (Number.isNaN(date.getTime())) return { label: raw, tip: raw };
-  return {
-    label: date.toLocaleString(),
-    tip: date.toISOString()
-  };
+  return formatUiRelativeDateTimeMeta(value, { fallback: "-" });
 }
 
 function traceStepColor(stepType: string): "default" | "success" | "warning" | "error" | "info" {
@@ -598,11 +590,11 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
 
   // --- Mutations ---
   const approveMutation = useMutation({
-    mutationFn: api.approveTask,
+    mutationFn: (id: string) => api.approveTask(id),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["tasks"] }),
   });
   const rejectMutation = useMutation({
-    mutationFn: api.rejectTask,
+    mutationFn: (id: string) => api.rejectTask(id),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["tasks"] }),
   });
   const retryMutation = useMutation({
@@ -857,7 +849,7 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
                   <Typography variant="overline" className="overview-inline-note__kicker">
                     Operator Queue
                   </Typography>
-                  <Typography variant="body2" sx={{ color: "rgba(225, 239, 255, 0.94)", fontWeight: 600 }}>
+                  <Typography variant="body2" sx={{ color: "text.primary", fontWeight: 600 }}>
                     No approvals, failures, or urgent interventions are waiting.
                   </Typography>
                 </Box>
@@ -873,13 +865,13 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
               <Stack spacing={1}>
                 <Stack direction={{ xs: "column", sm: "row" }} spacing={1} alignItems={{ xs: "flex-start", sm: "center" }} justifyContent="space-between">
                   <Box>
-                    <Typography variant="overline" className="overview-inline-note__kicker">
-                      Active Sessions
-                    </Typography>
-                    <Typography variant="body2" sx={{ color: "rgba(225, 239, 255, 0.94)", fontWeight: 600 }}>
-                      {`${activeBackgroundSessions.length} background session${activeBackgroundSessions.length === 1 ? "" : "s"} currently have ongoing work or supervision state.`}
-                    </Typography>
-                  </Box>
+                  <Typography variant="overline" className="overview-inline-note__kicker">
+                    Active Sessions
+                  </Typography>
+                  <Typography variant="body2" sx={{ color: "text.primary", fontWeight: 600 }}>
+                    {`${activeBackgroundSessions.length} background session${activeBackgroundSessions.length === 1 ? "" : "s"} currently have ongoing work or supervision state.`}
+                  </Typography>
+                </Box>
                   <Button variant="outlined" size="small" onClick={() => navigateToView("sessions")}>
                     Open Sessions
                   </Button>
@@ -894,9 +886,9 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
                       sx={{
                         px: 0.9,
                         py: 0.75,
-                        borderRadius: 2.5,
-                        background: "rgba(7, 18, 32, 0.38)",
-                        border: "1px solid rgba(108, 156, 212, 0.08)",
+                        borderRadius: 2,
+                        background: "rgba(255, 255, 255, 0.03)",
+                        border: "1px solid rgba(255, 255, 255, 0.08)",
                       }}
                     >
                       <Chip size="small" label={session.status.replace(/_/g, " ")} color={automationStatusColor(session.status)} />
@@ -924,8 +916,8 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
                       <Typography
                         variant="overline"
                         sx={{
-                          color: "rgba(140, 190, 236, 0.8)",
-                          letterSpacing: "0.12em",
+                          color: "rgba(183, 188, 196, 0.68)",
+                          letterSpacing: 0,
                           display: "block",
                           mb: 0.35
                         }}
@@ -986,9 +978,9 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
                             sx={{
                               px: 0.9,
                               py: 0.7,
-                              borderRadius: 2.5,
-                              background: "rgba(7, 18, 32, 0.42)",
-                              border: "1px solid rgba(108, 156, 212, 0.1)",
+                              borderRadius: 2,
+                              background: "rgba(255, 255, 255, 0.03)",
+                              border: "1px solid rgba(255, 255, 255, 0.08)",
                             }}
                           >
                             <Chip size="small" label={automationKindLabel(item.kind)} />
@@ -1062,8 +1054,8 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
         fullWidth
         PaperProps={{
           sx: {
-            background: "rgba(10, 15, 28, 0.97)",
-            border: "1px solid rgba(47, 212, 255, 0.18)",
+            background: "rgba(22, 22, 26, 0.98)",
+            border: "1px solid rgba(255, 255, 255, 0.08)",
             backdropFilter: "blur(20px)",
           },
         }}
@@ -1209,8 +1201,8 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
         fullWidth
         PaperProps={{
           sx: {
-            background: "rgba(10, 15, 28, 0.97)",
-            border: "1px solid rgba(47, 212, 255, 0.18)",
+            background: "rgba(22, 22, 26, 0.98)",
+            border: "1px solid rgba(255, 255, 255, 0.08)",
             backdropFilter: "blur(20px)",
           },
         }}
@@ -1245,8 +1237,8 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
         fullWidth
         PaperProps={{
           sx: {
-            background: "rgba(10, 15, 28, 0.97)",
-            border: "1px solid rgba(47, 212, 255, 0.18)",
+            background: "rgba(22, 22, 26, 0.98)",
+            border: "1px solid rgba(255, 255, 255, 0.08)",
             backdropFilter: "blur(20px)",
           },
         }}
@@ -1327,8 +1319,8 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
                     sx={{
                       p: 1.25,
                       borderRadius: 2,
-                      border: "1px solid rgba(108, 156, 212, 0.16)",
-                      background: "rgba(7, 14, 28, 0.72)",
+                      border: "1px solid rgba(255, 255, 255, 0.08)",
+                      background: "rgba(24, 24, 28, 0.9)",
                     }}
                   >
                     <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
@@ -1411,7 +1403,7 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
 
               {briefingQ.data ? (
                 <Typography variant="caption" color="text.secondary">
-                  Current briefing snapshot timestamp: {String((briefingQ.data as { generated_at?: string }).generated_at || "-")}
+                  Current briefing snapshot timestamp: {formatAutomationTime((briefingQ.data as { generated_at?: string }).generated_at)}
                 </Typography>
               ) : null}
             </Stack>

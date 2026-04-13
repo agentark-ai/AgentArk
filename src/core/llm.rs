@@ -342,6 +342,74 @@ fn tool_argument_phase(tool_name: &str) -> (&'static str, &'static str) {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ModelRequestMode {
+    PrimaryAssistantTurn,
+    Helper,
+}
+
+fn sanitize_model_request_bundle(
+    mode: ModelRequestMode,
+    system_prompt: &str,
+    user_message: &str,
+    history: &[ConversationMessage],
+    policy: &crate::security::ModelPrivacyConfig,
+    allow_sensitive_context: bool,
+) -> (String, String, Vec<ConversationMessage>) {
+    let system_context = match mode {
+        ModelRequestMode::PrimaryAssistantTurn => crate::security::ModelInputContext::SystemPrompt,
+        ModelRequestMode::Helper => crate::security::ModelInputContext::InternalHelperPrompt,
+    };
+    let user_context = match mode {
+        ModelRequestMode::PrimaryAssistantTurn => {
+            crate::security::ModelInputContext::CurrentUserMessage
+        }
+        ModelRequestMode::Helper => crate::security::ModelInputContext::InternalHelperPrompt,
+    };
+
+    (
+        sanitize_model_request_text(
+            system_prompt,
+            system_context,
+            policy,
+            allow_sensitive_context,
+        ),
+        sanitize_model_request_text(user_message, user_context, policy, allow_sensitive_context),
+        sanitize_model_request_history(history, policy, allow_sensitive_context),
+    )
+}
+
+fn sanitize_model_request_text(
+    text: &str,
+    context: crate::security::ModelInputContext,
+    policy: &crate::security::ModelPrivacyConfig,
+    allow_sensitive_context: bool,
+) -> String {
+    let result =
+        crate::security::sanitize_model_input_text(text, policy, context, allow_sensitive_context);
+    crate::security::render_model_input_fallback(&result, context)
+}
+
+fn sanitize_model_request_history(
+    history: &[ConversationMessage],
+    policy: &crate::security::ModelPrivacyConfig,
+    allow_sensitive_context: bool,
+) -> Vec<ConversationMessage> {
+    history
+        .iter()
+        .map(|message| ConversationMessage {
+            role: message.role.clone(),
+            content: sanitize_model_request_text(
+                &message.content,
+                crate::security::ModelInputContext::HistoryMessage,
+                policy,
+                allow_sensitive_context,
+            ),
+            _timestamp: message._timestamp,
+        })
+        .collect()
+}
+
 async fn emit_stream_tool_progress(
     token_tx: &Sender<StreamEvent>,
     name: &str,
@@ -886,7 +954,8 @@ fn normalize_openai_tool_schema_in_place(node: &mut serde_json::Value, is_root: 
 mod tests {
     use super::{
         extract_partial_draft_files, json_contains_tool_call_indicators,
-        normalize_openai_tool_schema, parse_partial_tool_arguments,
+        normalize_openai_tool_schema, openai_stream_data_has_terminal_finish_reason,
+        parse_partial_tool_arguments,
     };
 
     #[test]
@@ -1041,6 +1110,19 @@ mod tests {
             parsed.0.get("content").and_then(|value| value.as_str()),
             Some("<main>Hello")
         );
+    }
+
+    #[test]
+    fn openai_stream_terminal_finish_reason_detected() {
+        assert!(openai_stream_data_has_terminal_finish_reason(
+            r#"{"choices":[{"finish_reason":"stop","delta":{}}]}"#
+        ));
+        assert!(openai_stream_data_has_terminal_finish_reason(
+            r#"{"choices":[{"finish_reason":"tool_calls","delta":{}}]}"#
+        ));
+        assert!(!openai_stream_data_has_terminal_finish_reason(
+            r#"{"choices":[{"delta":{"content":"hello"}}]}"#
+        ));
     }
 }
 
@@ -1278,6 +1360,66 @@ fn is_retryable_error(err: &anyhow::Error) -> bool {
 /// Retry backoff delays in milliseconds for each attempt (attempt 1, 2, 3)
 const RETRY_DELAYS_MS: [u64; 3] = [500, 1500, 3000];
 const MAX_RETRY_ATTEMPTS: u32 = 3;
+const DEFAULT_LLM_HTTP_TIMEOUT_SECS: u64 = 600;
+const DEFAULT_LLM_STREAM_FIRST_TOKEN_TIMEOUT_SECS: u64 = 90;
+const DEFAULT_LLM_STREAM_INTER_CHUNK_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_LLM_STREAM_TOTAL_TIMEOUT_SECS: u64 = 240;
+
+fn llm_http_timeout_secs() -> u64 {
+    std::env::var("AGENTARK_LLM_HTTP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|secs| *secs >= 30 && *secs <= 1800)
+        .unwrap_or(DEFAULT_LLM_HTTP_TIMEOUT_SECS)
+}
+
+fn llm_stream_first_token_timeout_secs() -> u64 {
+    std::env::var("AGENTARK_LLM_STREAM_FIRST_TOKEN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|secs| *secs >= 30 && *secs <= 1800)
+        .unwrap_or(DEFAULT_LLM_STREAM_FIRST_TOKEN_TIMEOUT_SECS)
+}
+
+fn llm_stream_inter_chunk_timeout_secs() -> u64 {
+    std::env::var("AGENTARK_LLM_STREAM_INTER_CHUNK_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|secs| *secs >= 5 && *secs <= 600)
+        .unwrap_or(DEFAULT_LLM_STREAM_INTER_CHUNK_TIMEOUT_SECS)
+}
+
+fn llm_stream_total_timeout_secs() -> u64 {
+    std::env::var("AGENTARK_LLM_STREAM_TOTAL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|secs| *secs >= 30 && *secs <= 1800)
+        .unwrap_or(DEFAULT_LLM_STREAM_TOTAL_TIMEOUT_SECS)
+}
+
+fn openai_stream_data_has_terminal_finish_reason(data: &str) -> bool {
+    #[derive(Deserialize)]
+    struct TerminalChunk {
+        #[serde(default)]
+        choices: Vec<TerminalChoice>,
+    }
+
+    #[derive(Deserialize)]
+    struct TerminalChoice {
+        #[serde(default)]
+        finish_reason: Option<String>,
+    }
+
+    serde_json::from_str::<TerminalChunk>(data)
+        .ok()
+        .is_some_and(|chunk| {
+            chunk
+                .choices
+                .iter()
+                .filter_map(|choice| choice.finish_reason.as_deref())
+                .any(|reason| !reason.trim().is_empty())
+        })
+}
 
 impl LlmClient {
     /// Get the model name string for this client
@@ -1299,7 +1441,7 @@ impl LlmClient {
 
     pub fn new(provider: &LlmProvider) -> Result<Self> {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
+            .timeout(std::time::Duration::from_secs(llm_http_timeout_secs()))
             .build()?;
 
         Ok(Self {
@@ -1316,9 +1458,16 @@ impl LlmClient {
         _memories: &[crate::memory::MemoryEntry],
         actions: &[crate::actions::ActionDef],
     ) -> Result<LlmResponse> {
-        // Call with empty history for backwards compatibility
-        self.chat_with_history(system_prompt, user_message, &[], _memories, actions)
-            .await
+        self.chat_with_history_for_helper(
+            system_prompt,
+            user_message,
+            &[],
+            _memories,
+            actions,
+            &crate::security::ModelPrivacyConfig::default(),
+            false,
+        )
+        .await
     }
 
     /// Simple chat with just system prompt and user message (no tools/actions)
@@ -1328,7 +1477,36 @@ impl LlmClient {
         system_prompt: &str,
         user_message: &str,
     ) -> Result<LlmResponse> {
-        self.chat(system_prompt, user_message, &[], &[]).await
+        self.chat_for_helper_request(
+            system_prompt,
+            user_message,
+            &[],
+            &[],
+            &crate::security::ModelPrivacyConfig::default(),
+            false,
+        )
+        .await
+    }
+
+    pub async fn chat_for_helper_request(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        memories: &[crate::memory::MemoryEntry],
+        actions: &[crate::actions::ActionDef],
+        policy: &crate::security::ModelPrivacyConfig,
+        allow_sensitive_context: bool,
+    ) -> Result<LlmResponse> {
+        self.chat_with_history_for_helper(
+            system_prompt,
+            user_message,
+            &[],
+            memories,
+            actions,
+            policy,
+            allow_sensitive_context,
+        )
+        .await
     }
 
     /// Send a chat request with conversation history
@@ -1340,6 +1518,84 @@ impl LlmClient {
         _memories: &[crate::memory::MemoryEntry],
         actions: &[crate::actions::ActionDef],
     ) -> Result<LlmResponse> {
+        self.chat_with_history_for_helper(
+            system_prompt,
+            user_message,
+            history,
+            _memories,
+            actions,
+            &crate::security::ModelPrivacyConfig::default(),
+            false,
+        )
+        .await
+    }
+
+    pub async fn chat_with_history_for_helper(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        history: &[ConversationMessage],
+        _memories: &[crate::memory::MemoryEntry],
+        actions: &[crate::actions::ActionDef],
+        policy: &crate::security::ModelPrivacyConfig,
+        allow_sensitive_context: bool,
+    ) -> Result<LlmResponse> {
+        self.chat_with_history_in_mode(
+            ModelRequestMode::Helper,
+            system_prompt,
+            user_message,
+            history,
+            _memories,
+            actions,
+            policy,
+            allow_sensitive_context,
+        )
+        .await
+    }
+
+    pub async fn chat_for_primary_assistant_turn(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        history: &[ConversationMessage],
+        _memories: &[crate::memory::MemoryEntry],
+        actions: &[crate::actions::ActionDef],
+        policy: &crate::security::ModelPrivacyConfig,
+        allow_sensitive_context: bool,
+    ) -> Result<LlmResponse> {
+        self.chat_with_history_in_mode(
+            ModelRequestMode::PrimaryAssistantTurn,
+            system_prompt,
+            user_message,
+            history,
+            _memories,
+            actions,
+            policy,
+            allow_sensitive_context,
+        )
+        .await
+    }
+
+    async fn chat_with_history_in_mode(
+        &self,
+        mode: ModelRequestMode,
+        system_prompt: &str,
+        user_message: &str,
+        history: &[ConversationMessage],
+        _memories: &[crate::memory::MemoryEntry],
+        actions: &[crate::actions::ActionDef],
+        policy: &crate::security::ModelPrivacyConfig,
+        allow_sensitive_context: bool,
+    ) -> Result<LlmResponse> {
+        let (system_prompt, user_message, sanitized_history) = sanitize_model_request_bundle(
+            mode,
+            system_prompt,
+            user_message,
+            history,
+            policy,
+            allow_sensitive_context,
+        );
+        let history = sanitized_history;
         let (provider_name, model_name) = match &self.provider {
             LlmProvider::Anthropic { model, .. } => ("anthropic", model.as_str()),
             LlmProvider::OpenAI {
@@ -1366,9 +1622,9 @@ impl LlmClient {
                 self.chat_anthropic_with_history(
                     api_key,
                     model,
-                    system_prompt,
-                    user_message,
-                    history,
+                    &system_prompt,
+                    &user_message,
+                    &history,
                     actions,
                 )
                 .await
@@ -1382,16 +1638,22 @@ impl LlmClient {
                     api_key,
                     model,
                     base_url: base_url.as_deref(),
-                    system_prompt,
-                    user_message,
-                    history,
+                    system_prompt: &system_prompt,
+                    user_message: &user_message,
+                    history: &history,
                     actions,
                 })
                 .await
             }
             LlmProvider::Ollama { base_url, model } => {
-                self.chat_ollama_with_history(base_url, model, system_prompt, user_message, history)
-                    .await
+                self.chat_ollama_with_history(
+                    base_url,
+                    model,
+                    &system_prompt,
+                    &user_message,
+                    &history,
+                )
+                .await
             }
         };
 
@@ -2040,6 +2302,7 @@ impl LlmClient {
     }
 
     /// Streaming chat with history. Sends token events when supported by the provider.
+    #[allow(dead_code)]
     pub async fn chat_with_history_stream(
         &self,
         system_prompt: &str,
@@ -2049,6 +2312,91 @@ impl LlmClient {
         actions: &[crate::actions::ActionDef],
         token_tx: Sender<StreamEvent>,
     ) -> Result<LlmResponse> {
+        self.chat_with_history_stream_for_helper(
+            system_prompt,
+            user_message,
+            history,
+            _memories,
+            actions,
+            token_tx,
+            &crate::security::ModelPrivacyConfig::default(),
+            false,
+        )
+        .await
+    }
+
+    #[allow(dead_code)]
+    pub async fn chat_with_history_stream_for_helper(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        history: &[ConversationMessage],
+        _memories: &[crate::memory::MemoryEntry],
+        actions: &[crate::actions::ActionDef],
+        token_tx: Sender<StreamEvent>,
+        policy: &crate::security::ModelPrivacyConfig,
+        allow_sensitive_context: bool,
+    ) -> Result<LlmResponse> {
+        self.chat_with_history_stream_in_mode(
+            ModelRequestMode::Helper,
+            system_prompt,
+            user_message,
+            history,
+            _memories,
+            actions,
+            token_tx,
+            policy,
+            allow_sensitive_context,
+        )
+        .await
+    }
+
+    pub async fn chat_for_primary_assistant_turn_stream(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        history: &[ConversationMessage],
+        _memories: &[crate::memory::MemoryEntry],
+        actions: &[crate::actions::ActionDef],
+        token_tx: Sender<StreamEvent>,
+        policy: &crate::security::ModelPrivacyConfig,
+        allow_sensitive_context: bool,
+    ) -> Result<LlmResponse> {
+        self.chat_with_history_stream_in_mode(
+            ModelRequestMode::PrimaryAssistantTurn,
+            system_prompt,
+            user_message,
+            history,
+            _memories,
+            actions,
+            token_tx,
+            policy,
+            allow_sensitive_context,
+        )
+        .await
+    }
+
+    async fn chat_with_history_stream_in_mode(
+        &self,
+        mode: ModelRequestMode,
+        system_prompt: &str,
+        user_message: &str,
+        history: &[ConversationMessage],
+        _memories: &[crate::memory::MemoryEntry],
+        actions: &[crate::actions::ActionDef],
+        token_tx: Sender<StreamEvent>,
+        policy: &crate::security::ModelPrivacyConfig,
+        allow_sensitive_context: bool,
+    ) -> Result<LlmResponse> {
+        let (system_prompt, user_message, sanitized_history) = sanitize_model_request_bundle(
+            mode,
+            system_prompt,
+            user_message,
+            history,
+            policy,
+            allow_sensitive_context,
+        );
+        let history = sanitized_history;
         let provider_name = self.provider_name().to_string();
         let model_name = self.model_name().to_string();
         let start = std::time::Instant::now();
@@ -2057,9 +2405,9 @@ impl LlmClient {
                 self.chat_anthropic_with_history_stream(AnthropicStreamParams {
                     api_key,
                     model,
-                    system_prompt,
-                    user_message,
-                    history,
+                    system_prompt: &system_prompt,
+                    user_message: &user_message,
+                    history: &history,
                     actions,
                     token_tx,
                 })
@@ -2074,9 +2422,9 @@ impl LlmClient {
                     api_key,
                     model,
                     base_url: base_url.as_deref(),
-                    system_prompt,
-                    user_message,
-                    history,
+                    system_prompt: &system_prompt,
+                    user_message: &user_message,
+                    history: &history,
                     actions,
                     token_tx,
                 })
@@ -2086,9 +2434,9 @@ impl LlmClient {
                 self.chat_ollama_with_history_stream(
                     base_url,
                     model,
-                    system_prompt,
-                    user_message,
-                    history,
+                    &system_prompt,
+                    &user_message,
+                    &history,
                     token_tx,
                 )
                 .await
@@ -2436,6 +2784,8 @@ impl LlmClient {
         struct OpenAIStreamChoice {
             #[serde(default)]
             delta: OpenAIStreamDelta,
+            #[serde(default)]
+            finish_reason: Option<String>,
         }
 
         #[derive(Deserialize, Default)]
@@ -2647,8 +2997,10 @@ impl LlmClient {
         let mut reasoning: Option<String> = None;
         let mut tool_builders: HashMap<usize, ToolBuilder> = HashMap::new();
         let mut first_token = true;
-        const INTER_CHUNK_TIMEOUT_SECS: u64 = 30;
-        const FIRST_TOKEN_TIMEOUT_SECS: u64 = 300; // Slow models (GLM-5) may need minutes for TTFT
+        let inter_chunk_timeout_secs = llm_stream_inter_chunk_timeout_secs();
+        let first_token_timeout_secs = llm_stream_first_token_timeout_secs();
+        let total_timeout_secs = llm_stream_total_timeout_secs();
+        let mut last_meaningful_progress_at = std::time::Instant::now();
 
         // Spawn heartbeat: emit Thinking events every 5s while waiting for first token
         let heartbeat_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2674,11 +3026,19 @@ impl LlmClient {
         let mut stream = response.bytes_stream();
         let mut stream_broken = false;
         loop {
+            if send_start.elapsed().as_secs() >= total_timeout_secs {
+                tracing::warn!(
+                    "Stream exceeded total timeout ({}s), breaking with partial response",
+                    total_timeout_secs,
+                );
+                stream_broken = true;
+                break;
+            }
             // Use a much longer timeout while waiting for the first token
             let timeout_secs = if first_token {
-                FIRST_TOKEN_TIMEOUT_SECS
+                first_token_timeout_secs
             } else {
-                INTER_CHUNK_TIMEOUT_SECS
+                inter_chunk_timeout_secs
             };
             let chunk = match tokio::time::timeout(
                 std::time::Duration::from_secs(timeout_secs),
@@ -2704,12 +3064,14 @@ impl LlmClient {
                 Err(_) => {
                     tracing::warn!(
                         "Stream stalled ({}s no data), breaking with partial response",
-                        INTER_CHUNK_TIMEOUT_SECS,
+                        timeout_secs,
                     );
                     stream_broken = true;
                     break;
                 }
             };
+            let chunk_received_at = std::time::Instant::now();
+            let mut chunk_had_meaningful_progress = false;
             buffer.push_str(&String::from_utf8_lossy(&chunk));
             let lines: Vec<&str> = buffer.split('\n').collect();
             let last = lines.last().copied().unwrap_or("");
@@ -2722,6 +3084,7 @@ impl LlmClient {
                 let data = line.trim_start_matches("data:").trim();
                 if data == "[DONE]" {
                     done = true;
+                    chunk_had_meaningful_progress = true;
                     break;
                 }
 
@@ -2734,6 +3097,7 @@ impl LlmClient {
                     if let Some(rc) = choice.delta.reasoning_content {
                         let r = reasoning.get_or_insert_with(String::new);
                         r.push_str(&rc);
+                        chunk_had_meaningful_progress = true;
                     }
                     if let Some(content_delta) = choice.delta.content {
                         if let Some(tok) = extract_openai_delta_text(&content_delta) {
@@ -2748,9 +3112,22 @@ impl LlmClient {
                             }
                             content.push_str(&tok);
                             queue_stream_event(&token_tx, StreamEvent::Token(tok));
+                            chunk_had_meaningful_progress = true;
                         }
                     }
                     if let Some(tcs) = choice.delta.tool_calls {
+                        if first_token {
+                            tracing::info!(
+                                "LLM stream first tool delta after {}ms",
+                                send_start.elapsed().as_millis()
+                            );
+                            first_token = false;
+                            // Stop the heartbeat now that usable output is flowing.
+                            heartbeat_done.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        if !tcs.is_empty() {
+                            chunk_had_meaningful_progress = true;
+                        }
                         for tc in tcs {
                             let progress_update = {
                                 let entry = tool_builders.entry(tc.index).or_default();
@@ -2866,12 +3243,53 @@ impl LlmClient {
                             }
                         }
                     }
+                    if let Some(finish_reason) = choice.finish_reason.as_deref() {
+                        if !finish_reason.trim().is_empty() {
+                            tracing::info!(
+                                "LLM stream finish_reason={} after {}ms",
+                                finish_reason,
+                                send_start.elapsed().as_millis()
+                            );
+                            chunk_had_meaningful_progress = true;
+                            done = true;
+                        }
+                    }
                 }
             }
 
             buffer = last.to_string();
+            if chunk_had_meaningful_progress {
+                last_meaningful_progress_at = chunk_received_at;
+            }
             if done {
                 break;
+            }
+            let allowed_idle_secs = if first_token {
+                first_token_timeout_secs
+            } else {
+                inter_chunk_timeout_secs
+            };
+            if last_meaningful_progress_at.elapsed().as_secs() >= allowed_idle_secs {
+                tracing::warn!(
+                    "Stream received bytes but no meaningful SSE progress for {}s, breaking with partial response",
+                    allowed_idle_secs,
+                );
+                stream_broken = true;
+                break;
+            }
+        }
+
+        let trailing = buffer.trim_end_matches('\r').trim();
+        if !done && trailing.starts_with("data:") {
+            let trailing_data = trailing.trim_start_matches("data:").trim();
+            if trailing_data == "[DONE]"
+                || openai_stream_data_has_terminal_finish_reason(trailing_data)
+            {
+                tracing::info!(
+                    "LLM stream terminal marker recovered from trailing buffer after {}ms",
+                    send_start.elapsed().as_millis()
+                );
+                done = true;
             }
         }
 
@@ -2879,10 +3297,18 @@ impl LlmClient {
         heartbeat_done.store(true, std::sync::atomic::Ordering::Relaxed);
         heartbeat_handle.abort();
 
+        let has_content = !content.trim().is_empty();
+        let has_tools =
+            !tool_builders.is_empty() && tool_builders.values().any(|tb| !tb.name.is_empty());
+
+        if !done && !stream_broken && !has_content && !has_tools {
+            return Err(anyhow!(
+                "Stream ended without content or tool calls after {}ms",
+                send_start.elapsed().as_millis()
+            ));
+        }
+
         if stream_broken && !done {
-            let has_content = !content.trim().is_empty();
-            let has_tools =
-                !tool_builders.is_empty() && tool_builders.values().any(|tb| !tb.name.is_empty());
             if has_content || has_tools {
                 tracing::warn!(
                     "Stream broke prematurely but we have partial data (content={}chars, tools={}), returning partial response",

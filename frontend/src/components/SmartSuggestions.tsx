@@ -58,7 +58,7 @@ export function SmartSuggestions({
       <CardContent sx={{ p: 1.2, display: "flex", flexDirection: "column" }}>
         <Stack spacing={1.15} className="mission-panel-content">
           <Stack direction="row" alignItems="center" spacing={0.75}>
-            <AutoAwesomeRoundedIcon sx={{ fontSize: 18, color: "#2fd4ff" }} />
+            <AutoAwesomeRoundedIcon sx={{ fontSize: 18, color: "rgba(244, 245, 247, 0.82)" }} />
             <Box sx={{ flex: 1 }}>
               <Typography variant="body1" sx={{ fontWeight: 700 }}>
                 Recommended Skills
@@ -77,7 +77,7 @@ export function SmartSuggestions({
                 sx={{
                   p: "8px 10px",
                   background:
-                    "linear-gradient(180deg, rgba(8, 18, 34, 0.72), rgba(6, 14, 28, 0.66))",
+                    "linear-gradient(180deg, rgba(24, 24, 28, 0.92), rgba(15, 15, 18, 0.88))",
                 }}
               >
                 <Stack spacing={0.5}>
@@ -93,11 +93,11 @@ export function SmartSuggestions({
                         width: 22,
                         height: 22,
                         borderRadius: "50%",
-                        border: "1px solid rgba(94, 184, 243, 0.28)",
+                        border: "1px solid rgba(255, 255, 255, 0.1)",
                         display: "inline-flex",
                         alignItems: "center",
                         justifyContent: "center",
-                        color: "rgba(144, 221, 255, 0.98)",
+                        color: "rgba(239, 241, 244, 0.88)",
                         fontSize: "0.68rem",
                         fontWeight: 700,
                         flexShrink: 0,
@@ -115,9 +115,9 @@ export function SmartSuggestions({
                     <Typography
                       variant="caption"
                       sx={{
-                        color: "rgba(141, 192, 231, 0.72)",
+                        color: "rgba(173, 177, 186, 0.62)",
                         textTransform: "uppercase",
-                        letterSpacing: "0.08em",
+                        letterSpacing: 0,
                       }}
                     >
                       Recommended skill

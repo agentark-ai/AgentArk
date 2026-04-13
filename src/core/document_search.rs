@@ -131,23 +131,12 @@ pub(crate) fn looks_like_document_question(text: &str) -> bool {
         return false;
     }
 
-    let question_like = lower.ends_with('?')
-        || lower.contains("summarize")
-        || lower.contains("summary")
-        || lower.contains("what does")
-        || lower.contains("what is in")
-        || lower.contains("explain")
-        || lower.contains("review");
-    let document_like = lower.contains("doc:")
-        || lower.contains("document")
-        || lower.contains("attachment")
+    lower.contains("doc:")
         || lower.contains(".pdf")
         || lower.contains(".docx")
         || lower.contains(".txt")
         || lower.contains(".md")
-        || lower.contains(".csv");
-
-    question_like && document_like
+        || lower.contains(".csv")
 }
 
 /// Decide whether clarification should be skipped when document context is
@@ -490,11 +479,17 @@ pub(crate) async fn embed_document_chunks(
 }
 
 fn dense_chunk_shortlist_limit(limit: usize) -> u64 {
-    limit.max(1).saturating_mul(12).clamp(96, MAX_VECTOR_SHORTLIST_CHUNKS) as u64
+    limit
+        .max(1)
+        .saturating_mul(12)
+        .clamp(96, MAX_VECTOR_SHORTLIST_CHUNKS) as u64
 }
 
 fn recent_chunk_shortlist_limit(limit: usize) -> u64 {
-    limit.max(1).saturating_mul(4).clamp(24, MAX_RECENT_SHORTLIST_CHUNKS) as u64
+    limit
+        .max(1)
+        .saturating_mul(4)
+        .clamp(24, MAX_RECENT_SHORTLIST_CHUNKS) as u64
 }
 
 fn merge_shortlist_ids(primary: Vec<String>, secondary: Vec<String>) -> Vec<String> {
@@ -583,7 +578,11 @@ pub(crate) async fn search_documents(
                 }
             }
             Err(error) => {
-                tracing::warn!(doc_id = doc_id, "Explicit document chunk load failed: {}", error);
+                tracing::warn!(
+                    doc_id = doc_id,
+                    "Explicit document chunk load failed: {}",
+                    error
+                );
             }
         }
     }
@@ -630,10 +629,16 @@ pub(crate) async fn search_documents(
     }
 
     let query_embedding = if let Some(client) = embedding_client {
-        match client.embed_texts(std::slice::from_ref(&query_without_refs)).await {
+        match client
+            .embed_texts(std::slice::from_ref(&query_without_refs))
+            .await
+        {
             Ok(mut embeddings) => embeddings.drain(..).next(),
             Err(error) => {
-                tracing::warn!("Document query embedding failed; falling back to lexical search: {}", error);
+                tracing::warn!(
+                    "Document query embedding failed; falling back to lexical search: {}",
+                    error
+                );
                 None
             }
         }

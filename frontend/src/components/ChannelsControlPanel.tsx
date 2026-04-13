@@ -15,6 +15,7 @@ import {
   TextField,
   Typography
 } from "@mui/material";
+import { formatUiDateTime } from "../lib/dateFormat";
 
 export type ChannelConnectionState =
   | "connected"
@@ -90,10 +91,7 @@ function statusHint(channel: ChannelItem): string {
 }
 
 function formatDate(raw?: string): string {
-  if (!raw) return "Never";
-  const dt = new Date(raw);
-  if (Number.isNaN(dt.getTime())) return raw;
-  return dt.toLocaleString();
+  return formatUiDateTime(raw, { fallback: "Never" });
 }
 
 function overviewCount(channels: ChannelItem[], predicate: (item: ChannelItem) => boolean): number {
@@ -129,7 +127,7 @@ export function ChannelsControlPanel({
           <Typography variant="overline" className="workspace-shell-kicker">
             Channels
           </Typography>
-          <Typography variant="h5" sx={{ fontWeight: 700, letterSpacing: "-0.03em" }}>
+          <Typography variant="h5" sx={{ fontWeight: 700, letterSpacing: 0 }}>
             Gateway surface and delivery readiness
           </Typography>
           <Typography variant="body2" color="text.secondary" sx={{ maxWidth: 780 }}>

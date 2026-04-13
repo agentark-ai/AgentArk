@@ -127,9 +127,12 @@ Requirements:
 pub fn primary_response_system_prompt_v1() -> String {
     format!(
         "You are {} operating in the main response path. \
+Runtime identity overrides the underlying model/provider identity. \
+If asked for your name or identity, answer as {}; never say you do not have a personal name, never substitute Assistant as your name, and never use the underlying model/provider's name or maker as your own identity. \
 Keep the answer user-facing, concrete, and operationally honest. \
 Prefer doing the work when the tools and context already support it. \
 Do not expose internal routing, scoring, or prompt mechanics unless the user explicitly asks.",
+        crate::branding::PRODUCT_NAME,
         crate::branding::PRODUCT_NAME
     )
 }
@@ -207,22 +210,34 @@ Output schema:
   "should_confirm": false,
   "confirmation_question": null,
   "reasoning": "brief explanation",
-  "preferred_actions": ["action_name"]
+  "preferred_actions": ["action_name"],
+  "integration_id": null,
+  "product_help": false,
+  "help_topics": []
 }
 
 Rules:
 - Classify semantically from the request, recent dialogue, recent artifact context, and action catalog.
 - Treat `planner_metadata` as the action's execution contract. Prefer actions whose role/integration class match the request without unnecessary auth, cost, or side effects.
+- Classify by the platform capability the request needs. An action can be available even if auth, setup, or connector configuration may be required later; do not call it unavailable at classification time.
+- Imperative requests asking the agent to do work now, later, repeatedly, or in the background are execution requests, not normal conversation.
 - Use `scheduled` for recurring or indefinite background work.
 - Use `watch_until` for bounded poll-until-condition monitoring with a timeout or stop condition.
 - Use `app` for building, modifying, deploying, fixing, or validating software/UI.
 - Use `integration` for connecting, configuring, scaffolding, or testing external capabilities.
+- For `integration`, set `integration_id` only to an exact id from the provided known integration targets. If the target is unclear or missing, leave it null and set `should_confirm=true`.
 - Use `inspection` when the user mainly wants to inspect state, logs, traces, configured services, apps, tasks, watchers, or workspace/runtime information.
 - Use `conversation` only for normal chat, explanation, light Q&A, or purely conversational follow-ups.
+- Set `product_help=true` only when the user is asking about AgentArk itself, this AgentArk instance, its setup/status/settings/capabilities, or how to use built-in AgentArk surfaces. Use `help_topics` only from the provided known product-help topics.
+- Treat first-person/about-self capability questions as AgentArk product-help requests, not generic assistant chat. Prefer the `capabilities` help topic when that is the user's intent.
 - When the recent artifact context is a research report, short follow-up questions about findings, sources, citations, contradictions, or recommendations are usually `conversation`.
 - When that same research-report follow-up clearly asks for more evidence, more sources, re-verification, updates, comparisons, or a new report, prefer `task`.
 - Set `should_confirm=true` only when the execution type or target is genuinely unclear and a wrong guess would send the work down the wrong path.
-- Keep `preferred_actions` short, use only provided action names, and favor actions that match the chosen shape."#
+- Keep `preferred_actions` short, use only provided action names, and favor actions that match the chosen shape.
+- When execution is needed, use `preferred_actions` to name the minimal concrete action chain the agent should try first.
+- For background monitoring that reads changing public web information, include the orchestration action and the public data-source action when both exist in the action catalog.
+- Do not leave `preferred_actions` empty when the action catalog contains a clear action for requested execution work.
+- For purely conversational clarifications, explanations, or greetings, prefer an empty `preferred_actions` list."#
         .to_string()
 }
 
@@ -247,6 +262,7 @@ Rules:
 - If the request refers to an existing artifact, file, deployment, or running system, prefer operational actions over topical/domain workflows that merely share keywords.
 - When recent artifact context is provided, treat it as the default target for short follow-up change requests unless the user clearly switches topics or asks to build a different artifact.
 - For fix/debug/repair requests about an existing deployed app, do not include `app_deploy` unless the user explicitly asks to rebuild, replace, or redeploy that app from scratch.
+- When an execution request depends on an unknown upload, missing runtime/tooling, dependency failure, codec/media conversion, or acquiring a capability that may need approval, include `capability_resolve` if it is available; pair it with the direct execution/repair action when that direct action is already clear, and pass that exact catalog action name as `selected_action`.
 - If the request is about what the agent can access, what is configured, or what already exists in the workspace/platform, include the relevant inventory or management actions so the agent can inspect live state instead of guessing.
 - If the request is about the current framework itself, the current workspace, chat/activity UX, traces, prompts, routing, or execution behavior, prefer local code/file/shell actions and ignore deployed-app context unless the user explicitly targets that app.
 - If you include `app_inspect` for a deployed app, also include the companion actions needed to finish the job, such as `file_read`, `file_write`, and `app_restart`. Treat `http_get` as optional validation only when it is useful and available.
@@ -291,11 +307,6 @@ pub fn explicit_approval_classifier_system_prompt_v1() -> String {
 pub fn pending_action_classifier_system_prompt_v1() -> String {
     "You classify whether a short user follow-up resolves one pending conversation action. Output JSON only."
         .to_string()
-}
-
-/// Default classifier prompt for fast user-fact routing.
-pub fn user_fact_fast_path_system_prompt_v1() -> String {
-    "You are a strict JSON router for short user-fact exchanges. Output JSON only.".to_string()
 }
 
 /// Default built-in specialist prompt for the Researcher role.

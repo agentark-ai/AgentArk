@@ -147,14 +147,14 @@ case "${1:-help}" in
         ;;
     start)
         echo -e "${GREEN}Starting AgentArk...${NC}"
-        compose up -d --build
+        compose up -d
         echo ""
         echo -e "${GREEN}AgentArk is running!${NC}"
         echo -e "  Web UI:  ${CYAN}http://localhost:8990${NC}"
         ;;
     tunnel)
         echo -e "${GREEN}Starting AgentArk with remote access...${NC}"
-        AGENTARK_TUNNEL=true compose up -d --build
+        AGENTARK_TUNNEL=true compose up -d
         echo ""
         echo -e "  Local:   ${CYAN}http://localhost:8990${NC}"
         echo -e "  Remote:  ${CYAN}Your Cloudflare URL will appear in the Web UI${NC}"
@@ -169,9 +169,9 @@ case "${1:-help}" in
         compose down && compose up -d
         ;;
     update)
-        echo -e "${YELLOW}Updating AgentArk source and rebuilding...${NC}"
+        echo -e "${YELLOW}Updating AgentArk compose files and pulling the latest image...${NC}"
         docker run --rm -v "$AGENTARK_DIR:/work" -w /work alpine/git git -C /work/source pull --ff-only || true
-        compose build
+        compose pull
         compose up -d
         echo -e "${GREEN}Updated! Your data is intact.${NC}"
         ;;
@@ -206,7 +206,7 @@ case "${1:-help}" in
         echo "  restart    Restart AgentArk"
         echo "  logs       View live logs"
         echo "  status     Show running containers"
-        echo "  update     Pull latest and rebuild (preserves data)"
+        echo "  update     Pull latest image and restart (preserves data)"
         echo "  setup      Run setup wizard"
         echo "  uninstall  Stop and remove containers"
         ;;
@@ -227,7 +227,7 @@ else
     echo -e "  export PATH=\"$INSTALL_DIR:\$PATH\""
 fi
 
-echo -e "${CYAN}Building AgentArk image from local source (this may take a few minutes)...${NC}"
+echo -e "${CYAN}Downloading AgentArk container image (first run may take a few minutes)...${NC}"
 cd "$SOURCE_DIR"
 
 port_in_use() {
@@ -256,7 +256,8 @@ warn_if_port_in_use "$POSTGRES_PORT" "Postgres"
 warn_if_port_in_use "8990" "AgentArk Web UI"
 
 echo -e "${GREEN}[4/4] Starting AgentArk...${NC}"
-$COMPOSE up -d --build
+$COMPOSE pull
+$COMPOSE up -d
 
 echo ""
 echo -e "${BOLD}=========================================${NC}"
@@ -269,11 +270,11 @@ echo -e "  Commands (run from anywhere):"
 echo -e "    ${BOLD}agentark chat${NC}       Interactive CLI chat"
 echo -e "    ${BOLD}agentark pulse${NC}      Run ArkPulse health check"
 echo -e "    ${BOLD}agentark stop${NC}       Stop AgentArk"
-echo -e "    ${BOLD}agentark update${NC}     Pull latest and rebuild"
+echo -e "    ${BOLD}agentark update${NC}     Pull latest image and restart"
 echo -e "    ${BOLD}agentark logs${NC}       View logs"
 echo -e "    ${BOLD}agentark status${NC}     Show status"
 echo ""
-echo -e "${YELLOW}Writable source checkout: $SOURCE_DIR${NC}"
-echo -e "${YELLOW}App data is stored in Docker volumes and survives rebuilds.${NC}"
+echo -e "${YELLOW}Compose checkout: $SOURCE_DIR${NC}"
+echo -e "${YELLOW}App data is stored in Docker volumes and survives updates.${NC}"
 echo -e "${YELLOW}Postgres lives in its own volume; use 'docker compose down -v' to reset everything.${NC}"
 echo ""

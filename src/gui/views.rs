@@ -850,15 +850,24 @@ impl SetupWizard {
             } else {
                 None
             },
+            exa: None,
+            tavily: None,
+            perplexity: None,
+            firecrawl: None,
+            searxng: None,
             playwright: None, // Auto-detected at runtime via bridge health check
             primary: None,
             fallback1: None,
             fallback2: None,
+            provider_order: Vec::new(),
+            health: crate::actions::search::SearchBackendHealthState::default(),
         };
 
-        let search_config_path = self.agent.config_dir.join("search.toml");
-        let search_content = toml::to_string_pretty(&search_config)?;
-        std::fs::write(search_config_path, search_content)?;
+        crate::runtime::save_persisted_search_config(
+            &self.agent.config_dir,
+            Some(&self.agent.data_dir),
+            &search_config,
+        )?;
 
         Ok(())
     }

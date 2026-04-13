@@ -732,17 +732,6 @@ fn decorate_action_for_sentinel(
     next
 }
 
-fn proposal_summary_from_chat_suggestion(suggestion: &super::ChatAutomationSuggestion) -> String {
-    if suggestion.detail.trim().is_empty() {
-        format!(
-            "Turn '{}' into a concrete automation run.",
-            suggestion.title.trim()
-        )
-    } else {
-        suggestion.detail.trim().to_string()
-    }
-}
-
 fn build_integration_prompt(
     item: &crate::core::integration_sync::IntegrationSyncFeedItem,
 ) -> String {
@@ -776,72 +765,6 @@ async fn build_candidates(
     let now = now_rfc3339();
     let mut observations = Vec::new();
     let mut proposals = Vec::new();
-
-    if settings.sentinel.watch_in_app && settings.sentinel.infer_new_automations {
-        let chat_suggestions = super::load_chat_suggestions(&agent.storage).await;
-        for suggestion in chat_suggestions
-            .into_iter()
-            .filter(|item| item.status == "open")
-        {
-            if suggestion.confidence < settings.sentinel.confidence_threshold {
-                continue;
-            }
-            let fingerprint = normalize_fingerprint(&[
-                "chat_suggestion",
-                suggestion.id.as_str(),
-                suggestion.fingerprint.as_str(),
-            ]);
-            observations.push(SentinelObservation {
-                id: String::new(),
-                fingerprint: fingerprint.clone(),
-                kind: "chat_suggestion".to_string(),
-                title: suggestion.title.clone(),
-                detail: suggestion.detail.clone(),
-                source_kind: "chat".to_string(),
-                source_id: Some(suggestion.id.clone()),
-                source_label: Some(suggestion.conversation_title.clone()),
-                confidence: suggestion.confidence,
-                priority: 4,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-                metadata: serde_json::json!({
-                    "conversation_id": suggestion.conversation_id,
-                    "conversation_channel": suggestion.conversation_channel,
-                    "source_message_id": suggestion.source_message_id,
-                    "source_snippet": suggestion.source_snippet,
-                }),
-            });
-
-            proposals.push(SentinelProposal {
-                id: uuid::Uuid::new_v4().to_string(),
-                fingerprint: normalize_fingerprint(&[
-                    "proposal",
-                    "chat_suggestion",
-                    suggestion.id.as_str(),
-                ]),
-                proposal_kind: "chat_suggestion_accept".to_string(),
-                status: "open".to_string(),
-                title: suggestion.title.clone(),
-                detail: proposal_summary_from_chat_suggestion(&suggestion),
-                rationale: suggestion.rationale.clone(),
-                source_kind: "chat".to_string(),
-                source_id: Some(suggestion.id.clone()),
-                source_label: Some(suggestion.conversation_title.clone()),
-                confidence: suggestion.confidence,
-                priority: 4,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-                snoozed_until: None,
-                approved_at: None,
-                dismissed_at: None,
-                trace_id: suggestion.accepted_trace_id.clone(),
-                run_status: suggestion.run_status.clone(),
-                last_run_summary: suggestion.last_run_error.clone(),
-                action: None,
-                chat_suggestion_id: Some(suggestion.id.clone()),
-            });
-        }
-    }
 
     let mut connected_services = 0usize;
     let mut important_service_events = 0usize;
@@ -1190,6 +1113,10 @@ pub(crate) async fn run_sentinel_scan_tick(
 
     let mut observations = load_observations(&storage).await;
     let mut proposals = load_proposals(&storage).await;
+    observations.retain(|item| item.kind != "chat_suggestion");
+    proposals.retain(|item| {
+        item.proposal_kind != "chat_suggestion_accept" && item.chat_suggestion_id.is_none()
+    });
     refresh_snoozed_proposals(&mut proposals, now);
 
     let (candidate_observations, candidate_proposals, connected_services, important_service_events) =

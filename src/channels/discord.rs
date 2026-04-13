@@ -209,6 +209,7 @@ pub async fn load_config_from_storage(storage: &Storage) -> Result<Option<Discor
     }))
 }
 
+#[allow(dead_code)]
 async fn load_destination(agent: &Agent) -> Result<Option<DiscordDestinationContext>> {
     if let Ok(Some(raw)) = agent.storage.get(LAST_DESTINATION_STORAGE_KEY).await {
         if let Ok(context) = serde_json::from_slice::<DiscordDestinationContext>(&raw) {
@@ -388,14 +389,7 @@ async fn send_via_bot(
     Ok(())
 }
 
-async fn resolve_destination(
-    agent: &Agent,
-    config: &DiscordChannelConfig,
-) -> Result<DiscordDestinationContext> {
-    if let Some(context) = load_destination(agent).await? {
-        return Ok(context);
-    }
-
+fn resolve_destination(config: &DiscordChannelConfig) -> Result<DiscordDestinationContext> {
     if !config.default_channel_id.trim().is_empty() {
         return Ok(DiscordDestinationContext {
             channel_id: config.default_channel_id.clone(),
@@ -411,7 +405,7 @@ async fn resolve_destination(
     }
 
     Err(anyhow!(
-        "Discord has no delivery destination yet; wait for an inbound message or configure a default channel"
+        "Discord has no configured notification destination"
     ))
 }
 
@@ -712,18 +706,14 @@ async fn send_message_to_destination(
     }
 }
 
-/// Send a Discord message using the last seen destination or a configured default.
+/// Send a Discord message using the configured proactive notification destination.
 pub async fn send_message(agent: &Agent, text: &str) -> Result<()> {
     let maybe_config = load_config(agent).await?;
-    let destination = if let Some(config) = maybe_config.as_ref() {
-        resolve_destination(agent, config).await?
-    } else {
-        load_destination(agent)
-            .await?
-            .ok_or_else(|| anyhow!("Discord is not configured"))?
-    };
+    let config = maybe_config
+        .as_ref()
+        .ok_or_else(|| anyhow!("Discord is not configured"))?;
+    let destination = resolve_destination(config)?;
     send_message_to_destination(agent, &destination, text).await?;
-    persist_destination(agent, &destination).await?;
     Ok(())
 }
 
@@ -1008,5 +998,21 @@ mod tests {
             webhook_id: None,
         };
         assert!(!matches_configured_scope(&message, &config));
+    }
+
+    #[test]
+    fn proactive_destination_uses_configured_channel_and_thread_only() {
+        let config = DiscordChannelConfig {
+            bot_token: "token".to_string(),
+            guild_id: Some("guild-1".to_string()),
+            default_channel_id: "chan-config".to_string(),
+            default_thread_id: None,
+            ..Default::default()
+        };
+
+        let destination = resolve_destination(&config).unwrap();
+        assert_eq!(destination.channel_id, "chan-config");
+        assert_eq!(destination.thread_id, None);
+        assert_eq!(destination.guild_id.as_deref(), Some("guild-1"));
     }
 }

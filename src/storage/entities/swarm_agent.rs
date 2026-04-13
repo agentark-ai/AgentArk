@@ -14,6 +14,7 @@ pub struct Model {
     pub capabilities: String,
     #[sea_orm(nullable)]
     pub system_prompt: Option<String>,
+    pub access_scope: String,
     #[sea_orm(column_type = "Integer")]
     pub enabled: i32,
     pub created_at: String,

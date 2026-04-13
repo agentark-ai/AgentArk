@@ -6,10 +6,10 @@
 #
 #   ./scripts/start.sh  (Linux/Mac)
 #   scripts/start.bat   (Windows)
-#   docker compose up -d --build
+#   docker compose up -d
 #
 # Your app data (conversations, skills, settings) is automatically preserved
-# across rebuilds when using docker compose. The primary database lives in Postgres.
+# across updates when using docker compose. The primary database lives in Postgres.
 #
 # =============================================================================
 # DEFAULT IMAGE

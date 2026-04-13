@@ -48,7 +48,7 @@ export function AgentStatusBar({
     label = "Offline";
   } else if (serverStatus) {
     if (currentTaskDesc) {
-      dotColor = "#2fd4ff";
+      dotColor = "#d5d9e1";
       label = `Working: ${currentTaskDesc.length > 60 ? currentTaskDesc.slice(0, 57) + "..." : currentTaskDesc}`;
       pulse = true;
     } else {
@@ -79,7 +79,7 @@ export function AgentStatusBar({
       label: "Model",
       value: hasLlmConfigured ? "Configured" : "Needs setup",
       detail: hasLlmConfigured ? "Primary reasoning stack ready" : "Add an LLM in Settings",
-      tone: hasLlmConfigured ? "#84d8ff" : "#ff8f8f",
+      tone: hasLlmConfigured ? "#d7dae1" : "#ff8f8f",
     },
     {
       label: "Runtime",
@@ -88,7 +88,7 @@ export function AgentStatusBar({
         pendingCount > 0
           ? `${summarizeRuntime(automationCounts)} \u2022 ${pendingCount} pending`
           : summarizeRuntime(automationCounts),
-      tone: runtimeCount > 0 || pendingCount > 0 ? "#84d8ff" : "#9fb6cf",
+      tone: runtimeCount > 0 || pendingCount > 0 ? "#d7dae1" : "#9fa6b2",
     },
   ];
 
@@ -107,7 +107,7 @@ export function AgentStatusBar({
         <Stack spacing={0.45} sx={{ minWidth: 0, flex: 1 }}>
           <Typography
             variant="overline"
-            sx={{ color: "rgba(142, 191, 234, 0.74)", letterSpacing: "0.12em", display: "block" }}
+            sx={{ color: "rgba(183, 188, 196, 0.68)", letterSpacing: 0, display: "block" }}
           >
             System Posture
           </Typography>
@@ -127,7 +127,7 @@ export function AgentStatusBar({
                 },
               }}
             />
-            <Typography variant="subtitle2" sx={{ color: "rgba(232, 243, 255, 0.96)", fontWeight: 700 }}>
+            <Typography variant="subtitle2" sx={{ color: "rgba(244, 245, 247, 0.96)", fontWeight: 700 }}>
               {label}
             </Typography>
           </Stack>
@@ -140,12 +140,12 @@ export function AgentStatusBar({
             px: 1,
             py: 0.5,
             borderRadius: 999,
-            border: "1px solid rgba(108, 156, 212, 0.18)",
-            background: "rgba(8, 18, 34, 0.54)",
+            border: "1px solid rgba(255, 255, 255, 0.08)",
+            background: "rgba(255, 255, 255, 0.03)",
             color: agentPaused ? "#ffbc7c" : "#82f7c1",
             fontSize: "0.66rem",
             fontWeight: 700,
-            letterSpacing: "0.08em",
+            letterSpacing: 0,
             textTransform: "uppercase",
             flexShrink: 0,
           }}

@@ -358,7 +358,7 @@ async fn load_config(agent: &Agent) -> Result<Option<MatrixTransportConfig>> {
 }
 
 fn choose_outbound_destination(
-    state: &MatrixSyncState,
+    _state: &MatrixSyncState,
     config: &MatrixTransportConfig,
 ) -> Option<(String, Option<String>)> {
     if let Some(default_room_id) = config
@@ -367,18 +367,9 @@ fn choose_outbound_destination(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        let thread_root_event_id = state
-            .rooms
-            .get(default_room_id)
-            .and_then(|room| room.thread_root_event_id.clone());
-        return Some((default_room_id.to_string(), thread_root_event_id));
+        return Some((default_room_id.to_string(), None));
     }
-
-    state
-        .rooms
-        .values()
-        .max_by(|left, right| left.last_sync_at.cmp(&right.last_sync_at))
-        .map(|room| (room.room_id.clone(), room.thread_root_event_id.clone()))
+    None
 }
 
 pub async fn send_message(agent: &Agent, text: &str) -> Result<()> {
@@ -637,5 +628,36 @@ mod tests {
             "content": { "msgtype": "m.text", "body": " hello " }
         });
         assert_eq!(extract_message_body(&event), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn proactive_destination_requires_default_room_and_drops_threads() {
+        let mut state = MatrixSyncState::default();
+        state.rooms.insert(
+            "!room:example.org".to_string(),
+            MatrixRoomContext {
+                room_id: "!room:example.org".to_string(),
+                thread_root_event_id: Some("$thread".to_string()),
+                ..Default::default()
+            },
+        );
+        let config = MatrixTransportConfig {
+            homeserver_url: "https://matrix.example.org".to_string(),
+            access_token: "token".to_string(),
+            user_id: "@bot:example.org".to_string(),
+            default_room_id: Some("!room:example.org".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            choose_outbound_destination(&state, &config),
+            Some(("!room:example.org".to_string(), None))
+        );
+
+        let no_default = MatrixTransportConfig {
+            default_room_id: None,
+            ..config
+        };
+        assert_eq!(choose_outbound_destination(&state, &no_default), None);
     }
 }

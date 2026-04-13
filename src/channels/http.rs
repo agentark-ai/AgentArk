@@ -40,6 +40,7 @@ mod auth;
 mod auth_profiles_control;
 mod browser_profiles_control;
 mod custom_apis;
+mod extension_packs;
 mod gateway_control;
 mod gateway_ops_control;
 mod integration_sync;
@@ -108,6 +109,7 @@ const DEFAULT_RATE_LIMIT_MAX_TRACKED_IPS: usize = 4096;
 const SERVER_BUSY_TRACE_WINDOW_SECS: i64 = 20 * 60;
 const SERVER_BUSY_TASK_WINDOW_SECS: i64 = 20 * 60;
 const MAX_CHAT_MESSAGE_BYTES: usize = 100_000;
+const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const UI_SESSION_TTL_SECS: i64 = 24 * 60 * 60;
 const UI_SESSION_MAX_TRACKED: usize = 4096;
 const HEADER_X_FRAME_OPTIONS: HeaderName = HeaderName::from_static("x-frame-options");
@@ -568,8 +570,6 @@ pub struct ChatRequest {
     #[serde(default)]
     pub deep_research: bool,
     #[serde(default)]
-    pub execution_mode: Option<String>,
-    #[serde(default)]
     pub plan_confirmation_mode: Option<String>,
     #[serde(default)]
     pub attachments_present: bool,
@@ -579,17 +579,16 @@ fn default_channel() -> String {
     "http".to_string()
 }
 
-async fn register_chat_task_cancellation(
+async fn bind_chat_task_cancellation_sender(
     state: &AppState,
     task_id: &str,
-) -> tokio::sync::watch::Receiver<bool> {
-    let (tx, rx) = tokio::sync::watch::channel(false);
+    sender: tokio::sync::watch::Sender<bool>,
+) {
     state
         .chat_task_cancellations
         .write()
         .await
-        .insert(task_id.to_string(), tx);
-    rx
+        .insert(task_id.to_string(), sender);
 }
 
 async fn signal_chat_task_cancellation(state: &AppState, task_id: &str) {
@@ -854,6 +853,91 @@ async fn open_url_in_default_browser(url: &str) -> std::result::Result<(), Strin
     }
 }
 
+fn normalize_model_credential_base_url(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_end_matches('/').to_string())
+}
+
+fn model_slot_credential_scope(slot: &ModelSlot) -> (String, Option<String>) {
+    match &slot.provider {
+        LlmProvider::Anthropic { .. } => ("anthropic".to_string(), None),
+        LlmProvider::Ollama { base_url, .. } => (
+            "ollama".to_string(),
+            normalize_model_credential_base_url(Some(base_url.as_str())),
+        ),
+        LlmProvider::OpenAI { base_url, .. } => (
+            openai_provider_label(base_url.as_deref()).to_string(),
+            normalize_model_credential_base_url(
+                display_openai_base_url(base_url.as_ref()).as_deref(),
+            ),
+        ),
+    }
+}
+
+fn model_slot_request_credential_scope(
+    request: &ModelSlotRequest,
+) -> std::result::Result<(String, Option<String>), String> {
+    if request.provider.trim().is_empty() {
+        return Err("Provider is required".to_string());
+    }
+    let Some(provider_id) = canonical_provider_id(request.provider.as_str()) else {
+        return Err(format!("Unknown provider: {}", request.provider));
+    };
+    let base_url = request.base_url.as_deref().and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+
+    match provider_id {
+        "anthropic" => Ok(("anthropic".to_string(), None)),
+        "ollama" => {
+            if base_url.is_none() {
+                return Err("Ollama base URL is required".to_string());
+            }
+            Ok((
+                "ollama".to_string(),
+                normalize_model_credential_base_url(base_url.as_deref()),
+            ))
+        }
+        "openai" | "openai-compatible" | "openrouter" | "openai-subscription" => {
+            let compat_base_url = normalize_openai_base_url(provider_id, base_url)?;
+            Ok((
+                openai_provider_label(compat_base_url.as_deref()).to_string(),
+                normalize_model_credential_base_url(
+                    display_openai_base_url(compat_base_url.as_ref()).as_deref(),
+                ),
+            ))
+        }
+        _ => Ok((
+            provider_id.to_string(),
+            normalize_model_credential_base_url(base_url.as_deref()),
+        )),
+    }
+}
+
+fn can_reuse_model_slot_api_key(
+    slot: &ModelSlot,
+    request: &ModelSlotRequest,
+) -> std::result::Result<bool, String> {
+    if request.clear_api_key.unwrap_or(false) {
+        return Ok(false);
+    }
+    Ok(model_slot_credential_scope(slot) == model_slot_request_credential_scope(request)?)
+}
+
+fn llm_provider_requires_api_key(provider_id: &str) -> bool {
+    matches!(
+        provider_id,
+        "anthropic" | "openai" | "openrouter" | "openai-subscription"
+    )
+}
+
 async fn provider_from_model_slot_request(
     request: &ModelSlotRequest,
     existing_api_key: Option<String>,
@@ -891,6 +975,12 @@ async fn provider_from_model_slot_request(
     }
     if provider_id == "ollama" && base_url.is_none() {
         return Err("Ollama base URL is required".to_string());
+    }
+    if provider_id == "openai-compatible" && compat_base_url.is_none() {
+        return Err("Base URL is required for OpenAI-Compatible providers".to_string());
+    }
+    if llm_provider_requires_api_key(provider_id) && api_key.trim().is_empty() {
+        return Err("API key is required for the selected provider".to_string());
     }
 
     let provider = match provider_id {
@@ -942,62 +1032,7 @@ fn is_env_var_style_key(key: &str) -> bool {
 }
 
 fn parse_set_secret_command(message: &str) -> Option<(String, String)> {
-    // Syntax:
-    // - "set secret KEY=VALUE"
-    // - "set secret KEY VALUE"
-    let trimmed = message.trim();
-    let prefixes: &[&[&str]] = &[
-        &["set", "secret"],
-        &["set", "the", "secret"],
-        &["set", "my", "secret"],
-        &["save", "secret"],
-        &["save", "the", "secret"],
-        &["save", "my", "secret"],
-        &["store", "secret"],
-        &["store", "the", "secret"],
-        &["store", "my", "secret"],
-        &["add", "secret"],
-        &["add", "the", "secret"],
-        &["add", "my", "secret"],
-        &["update", "secret"],
-        &["update", "the", "secret"],
-        &["update", "my", "secret"],
-        &["remember", "secret"],
-        &["remember", "the", "secret"],
-        &["remember", "my", "secret"],
-        &["secret", "set"],
-        &["secret", "save"],
-    ];
-    let prefix_end = command_prefix_end(trimmed, prefixes)?;
-    let rest = trimmed[prefix_end..]
-        .trim_start_matches(|c: char| c.is_whitespace() || ":,-".contains(c))
-        .trim();
-    if rest.is_empty() {
-        return None;
-    }
-
-    let (key, value) = if let Some(eq) = rest.find('=') {
-        let (k, v) = rest.split_at(eq);
-        (k.trim(), v[1..].trim())
-    } else {
-        let mut parts = rest.splitn(2, char::is_whitespace);
-        let k = parts.next().unwrap_or("").trim();
-        let v = parts.next().unwrap_or("").trim();
-        (k, v)
-    };
-
-    if key.is_empty() || value.is_empty() {
-        return None;
-    }
-    if key.chars().any(|c| c.is_whitespace()) {
-        return None;
-    }
-    // Avoid accidentally capturing multi-line pastes into the key name.
-    if key.contains('\n') || key.contains('\r') {
-        return None;
-    }
-
-    Some((key.to_string(), value.to_string()))
+    crate::core::secrets::parse_set_secret_command(message)
 }
 
 fn normalize_origin(value: &str) -> Option<String> {
@@ -1143,6 +1178,13 @@ fn bind_addr_is_loopback(bind_addr: &str) -> bool {
         .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "::1"))
 }
 
+fn should_warn_for_direct_control_plane_exposure(
+    deployment_mode: DeploymentMode,
+    bind_addr: &str,
+) -> bool {
+    deployment_mode == DeploymentMode::InternetFacing && !bind_addr_is_loopback(bind_addr)
+}
+
 fn validate_public_app_listener_posture(
     deployment_mode: DeploymentMode,
     public_app_bind_addr: Option<&str>,
@@ -1209,185 +1251,16 @@ fn escape_html(text: &str) -> String {
         .replace('\'', "&#x27;")
 }
 
-#[derive(Debug, Clone)]
-struct CommandToken {
-    text: String,
-    end: usize,
-}
-
-fn tokenize_command_text(text: &str) -> Vec<CommandToken> {
-    let mut tokens = Vec::new();
-    let mut token_start: Option<usize> = None;
-
-    for (idx, ch) in text.char_indices() {
-        if ch.is_ascii_alphanumeric() {
-            if token_start.is_none() {
-                token_start = Some(idx);
-            }
-        } else if let Some(start) = token_start.take() {
-            tokens.push(CommandToken {
-                text: text[start..idx].to_ascii_lowercase(),
-                end: idx,
-            });
-        }
-    }
-
-    if let Some(start) = token_start {
-        tokens.push(CommandToken {
-            text: text[start..].to_ascii_lowercase(),
-            end: text.len(),
-        });
-    }
-
-    tokens
-}
-
-fn token_is_one_edit_away(left: &str, right: &str) -> bool {
-    if left == right {
-        return true;
-    }
-    if left.is_empty() || right.is_empty() {
-        return false;
-    }
-    let left = left.as_bytes();
-    let right = right.as_bytes();
-    let (short, long) = if left.len() <= right.len() {
-        (left, right)
-    } else {
-        (right, left)
-    };
-    if long.len() - short.len() > 1 {
-        return false;
-    }
-
-    let mut i = 0usize;
-    let mut j = 0usize;
-    let mut edits = 0usize;
-    while i < short.len() && j < long.len() {
-        if short[i] == long[j] {
-            i += 1;
-            j += 1;
-            continue;
-        }
-        edits += 1;
-        if edits > 1 {
-            return false;
-        }
-        if short.len() == long.len() {
-            i += 1;
-            j += 1;
-        } else {
-            j += 1;
-        }
-    }
-
-    edits + (short.len() - i) + (long.len() - j) <= 1
-}
-
-fn token_matches_command(expected: &str, actual: &str) -> bool {
-    let expected = expected.trim().to_ascii_lowercase();
-    let actual = actual.trim().to_ascii_lowercase();
-    if expected == actual {
-        return true;
-    }
-    if expected.strip_suffix('s') == Some(actual.as_str())
-        || actual.strip_suffix('s') == Some(expected.as_str())
-    {
-        return true;
-    }
-    if token_is_one_edit_away(&expected, &actual) {
-        return true;
-    }
-    let expected_compact = expected.replace(' ', "");
-    let actual_compact = actual.replace(' ', "");
-    expected_compact == actual_compact || token_is_one_edit_away(&expected_compact, &actual_compact)
-}
-
-fn command_opener_span(tokens: &[CommandToken]) -> usize {
-    const OPENERS: &[&[&str]] = &[
-        &["please", "can", "you"],
-        &["please", "could", "you"],
-        &["please", "would", "you"],
-        &["can", "you", "please"],
-        &["could", "you", "please"],
-        &["would", "you", "please"],
-        &["can", "you"],
-        &["could", "you"],
-        &["would", "you"],
-        &["agent", "ark"],
-        &["please"],
-        &["hey"],
-        &["hi"],
-        &["agentark"],
-    ];
-
-    for opener in OPENERS {
-        if tokens.len() < opener.len() {
-            continue;
-        }
-        if tokens
-            .iter()
-            .take(opener.len())
-            .zip(opener.iter())
-            .all(|(token, expected)| token_matches_command(expected, &token.text))
-        {
-            return opener.len();
-        }
-    }
-
-    0
-}
-
-fn command_prefix_end(message: &str, phrases: &[&[&str]]) -> Option<usize> {
-    let trimmed = message.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let tokens = tokenize_command_text(trimmed);
-    if tokens.is_empty() {
-        return None;
-    }
-
-    let start = command_opener_span(&tokens);
-    let tokens = &tokens[start..];
-    for phrase in phrases {
-        if tokens.len() < phrase.len() {
-            continue;
-        }
-        if tokens
-            .iter()
-            .take(phrase.len())
-            .zip(phrase.iter())
-            .all(|(token, expected)| token_matches_command(expected, &token.text))
-        {
-            return Some(tokens[phrase.len() - 1].end);
-        }
-    }
-
-    None
-}
-
 fn parse_autonomy_quick_command(message: &str) -> Option<AutonomyQuickCommand> {
     let trimmed = message.trim();
-    let normalized = trimmed.to_ascii_lowercase().replace(['_', '-'], " ");
+    let command = trimmed.strip_prefix('/')?;
+    let normalized = command.to_ascii_lowercase().replace(['_', '-'], " ");
     let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
-    let normalized = normalized
-        .strip_prefix('/')
-        .unwrap_or(&normalized)
-        .to_string();
-    if normalized == "triage" || normalized == "triage inbox" || normalized == "inbox triage" {
+    if normalized == "triage" {
         return Some(AutonomyQuickCommand::TriageInbox);
     }
-    let delegate_prefixes: &[&[&str]] = &[
-        &["delegate"],
-        &["delegate", "task"],
-        &["delegate", "this"],
-        &["delegate", "the", "task"],
-    ];
-    if let Some(prefix_end) = command_prefix_end(trimmed, delegate_prefixes) {
-        let task = trimmed[prefix_end..]
-            .trim_start_matches(|c: char| c.is_whitespace() || ",:-".contains(c))
-            .trim();
+    if let Some(task) = command.strip_prefix("delegate ") {
+        let task = task.trim();
         if task.is_empty() {
             return None;
         }
@@ -1396,11 +1269,8 @@ fn parse_autonomy_quick_command(message: &str) -> Option<AutonomyQuickCommand> {
             require_approval: false,
         });
     }
-    let rollback_prefixes: &[&[&str]] = &[&["rollback"], &["roll", "back"], &["revert"], &["undo"]];
-    if let Some(prefix_end) = command_prefix_end(trimmed, rollback_prefixes) {
-        let rest = trimmed[prefix_end..]
-            .trim_start_matches(|c: char| c.is_whitespace() || ",:-".contains(c))
-            .trim();
+    if let Some(rest) = command.strip_prefix("rollback ") {
+        let rest = rest.trim();
         if rest.is_empty() {
             return None;
         }
@@ -1439,54 +1309,20 @@ fn parse_autonomy_quick_command(message: &str) -> Option<AutonomyQuickCommand> {
 }
 
 fn parse_notification_control_command(message: &str) -> Option<NotificationControlCommand> {
-    let pause_variants: &[&[&str]] = &[
-        &["pause", "notifications"],
-        &["pause", "notification"],
-        &["pause", "push", "notifications"],
-        &["pause", "push", "notification"],
-        &["mute", "notifications"],
-        &["mute", "notification"],
-        &["disable", "notifications"],
-        &["turn", "off", "notifications"],
-        &["turn", "notifications", "off"],
-        &["notifications", "pause"],
-        &["notifications", "mute"],
-        &["notifications", "off"],
-        &["stop", "notifications"],
-    ];
-    let resume_variants: &[&[&str]] = &[
-        &["resume", "notifications"],
-        &["resume", "notification"],
-        &["resume", "push", "notifications"],
-        &["resume", "push", "notification"],
-        &["unmute", "notifications"],
-        &["unmute", "notification"],
-        &["enable", "notifications"],
-        &["turn", "on", "notifications"],
-        &["turn", "notifications", "on"],
-        &["notifications", "resume"],
-        &["notifications", "unmute"],
-        &["notifications", "on"],
-        &["start", "notifications"],
-    ];
-    let status_variants: &[&[&str]] = &[
-        &["notification", "status"],
-        &["notifications", "status"],
-        &["status", "notifications"],
-        &["status", "notification"],
-        &["push", "notifications", "status"],
-    ];
-
-    if command_prefix_end(message, pause_variants).is_some() {
-        return Some(NotificationControlCommand::Pause24h);
+    let command = message.trim().strip_prefix('/')?;
+    match command
+        .to_ascii_lowercase()
+        .replace(['_', '-'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .as_str()
+    {
+        "notifications pause" => Some(NotificationControlCommand::Pause24h),
+        "notifications resume" => Some(NotificationControlCommand::Resume),
+        "notifications status" => Some(NotificationControlCommand::Status),
+        _ => None,
     }
-    if command_prefix_end(message, resume_variants).is_some() {
-        return Some(NotificationControlCommand::Resume);
-    }
-    if command_prefix_end(message, status_variants).is_some() {
-        return Some(NotificationControlCommand::Status);
-    }
-    None
 }
 
 async fn handle_notification_control_command(
@@ -1503,7 +1339,7 @@ async fn handle_notification_control_command(
             let until = chrono::DateTime::<chrono::Utc>::from_timestamp(until_ts, 0)
                 .unwrap_or_else(chrono::Utc::now);
             Ok(format!(
-                "Push notifications paused until {}. Type 'resume notifications' anytime to re-enable.",
+                "Push notifications paused until {}. Use `/notifications resume` anytime to re-enable.",
                 until.format("%Y-%m-%d %H:%M:%S UTC")
             ))
         }
@@ -1638,22 +1474,12 @@ async fn handle_autonomy_quick_command(
                         .unwrap_or_default()
                         .iter()
                         .map(|m| {
-                            let snippet = m
-                                .get("snippet")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_ascii_lowercase();
-                            let label = if snippet.contains("urgent") || snippet.contains("asap")
-                            {
-                                "Act now"
-                            } else {
-                                "Delegate"
-                            };
+                            let label = "Review";
                             serde_json::json!({
                                 "message_id": m.get("id").cloned().unwrap_or(serde_json::json!("")),
                                 "label": label,
-                                "reason": "Heuristic fallback classification",
-                                "draft_reply": if label == "Act now" { "Acknowledged. I will handle this today." } else { "Received. Delegating to the right owner and will track status." },
+                                "reason": "LLM triage unavailable; conservative fallback",
+                                "draft_reply": "",
                             })
                         })
                         .collect();
@@ -1724,7 +1550,9 @@ async fn handle_autonomy_quick_command(
                 );
                 approval_task.status = TaskStatus::AwaitingApproval;
                 approval_task.approval = TaskApproval::RequireApproval;
-                let queued = agent.add_or_update_similar_task(approval_task, false).await;
+                let queued = agent
+                    .add_or_update_similar_task(approval_task, false, None)
+                    .await;
                 if let Err(e) = queued {
                     return Err(format!("Failed to queue delegation approval: {}", e));
                 }
@@ -1767,6 +1595,11 @@ async fn handle_autonomy_quick_command(
                 .swarm
                 .as_ref()
                 .map(|manager| manager.specialists.clone());
+            let action_scope_hints = agent
+                .runtime
+                .list_action_scope_hints()
+                .await
+                .unwrap_or_default();
             let trace = Arc::new(RwLock::new(crate::core::ExecutionTrace {
                 id: uuid::Uuid::new_v4().to_string(),
                 message: task.clone(),
@@ -1791,6 +1624,7 @@ async fn handle_autonomy_quick_command(
                         specialists: &specialists,
                         memories: &empty_memories,
                         actions: &actions,
+                        action_scope_hints: &action_scope_hints,
                         trace: &trace,
                         token_tx: None,
                         swarm_activity: Some(&agent.swarm_activity),
@@ -1823,9 +1657,6 @@ async fn handle_autonomy_quick_command(
                 }
                 Ok(crate::core::task_router::TaskRouterResult::Direct) => {
                     Err("Delegation unexpectedly routed to a direct path.".to_string())
-                }
-                Ok(crate::core::task_router::TaskRouterResult::UseParallelThinking) => {
-                    Err("Delegation unexpectedly routed to parallel thinking.".to_string())
                 }
                 Err(e) => Err(format!("Delegation failed: {}", e)),
             }
@@ -2025,6 +1856,12 @@ pub struct UpdateTaskRequest {
 }
 
 #[derive(Debug, Deserialize, Default)]
+pub struct ApprovalDecisionRequest {
+    pub comment: Option<String>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
 pub struct CreateBackgroundSessionRequest {
     #[serde(default)]
     pub title: Option<String>,
@@ -2140,6 +1977,9 @@ pub struct SettingsResponse {
     pub llm_fallback_model: Option<String>,
     pub llm_fallback_base_url: Option<String>,
     pub has_fallback_api_key: bool,
+    pub default_model_input_mode: String,
+    pub current_chat_pii_policy: String,
+    pub request_scoped_sensitive_approval_enabled: bool,
     // Model pool
     pub model_pool: Vec<ModelSlotSummary>,
     pub smart_routing: bool,
@@ -2260,11 +2100,15 @@ pub struct SettingsResponse {
     pub qq_delivery_ready: bool,
     pub auto_approve: Vec<String>,
     // Search
-    pub search_primary: String,
-    pub search_fallback1: String,
-    pub search_fallback2: String,
+    pub search_provider_order: Vec<String>,
     pub search_serper_configured: bool,
     pub search_brave_configured: bool,
+    pub search_exa_configured: bool,
+    pub search_tavily_configured: bool,
+    pub search_perplexity_configured: bool,
+    pub search_firecrawl_configured: bool,
+    pub search_searxng_base_url: String,
+    pub search_builtin_cooldown_hours: u64,
     pub settings_complete: bool,
     // Moltbook
     pub moltbook_enabled: bool,
@@ -2316,6 +2160,8 @@ pub struct ModelSlotRequest {
     pub model: String,
     pub base_url: Option<String>,
     pub api_key: Option<String>,
+    #[serde(default)]
+    pub clear_api_key: Option<bool>,
     pub enabled: Option<bool>,
 }
 
@@ -2351,6 +2197,12 @@ pub struct SettingsUpdate {
     pub llm_fallback_model: Option<String>,
     pub llm_fallback_base_url: Option<String>,
     pub llm_fallback_api_key: Option<String>,
+    #[serde(default)]
+    pub default_model_input_mode: Option<String>,
+    #[serde(default)]
+    pub current_chat_pii_policy: Option<String>,
+    #[serde(default)]
+    pub request_scoped_sensitive_approval_enabled: Option<bool>,
     // Telegram
     #[serde(default)]
     pub telegram_enabled: Option<bool>,
@@ -2485,21 +2337,42 @@ pub struct SettingsUpdate {
     pub default_video_provider: Option<String>,
     /// Fallback provider for video generation
     pub fallback_video_provider: Option<String>,
-    /// Search: primary backend
+    /// Search: configured provider precedence
     #[serde(default)]
-    pub search_primary: Option<String>,
-    /// Search: first fallback backend
-    #[serde(default)]
-    pub search_fallback1: Option<String>,
-    /// Search: second fallback backend
-    #[serde(default)]
-    pub search_fallback2: Option<String>,
+    pub search_provider_order: Option<Vec<String>>,
     /// Search: Serper API key
     #[serde(default)]
     pub search_serper_key: Option<String>,
+    #[serde(default)]
+    pub clear_search_serper_key: Option<bool>,
     /// Search: Brave API key
     #[serde(default)]
     pub search_brave_key: Option<String>,
+    #[serde(default)]
+    pub clear_search_brave_key: Option<bool>,
+    /// Search: Exa API key
+    #[serde(default)]
+    pub search_exa_key: Option<String>,
+    #[serde(default)]
+    pub clear_search_exa_key: Option<bool>,
+    /// Search: Tavily API key
+    #[serde(default)]
+    pub search_tavily_key: Option<String>,
+    #[serde(default)]
+    pub clear_search_tavily_key: Option<bool>,
+    /// Search: Perplexity API key
+    #[serde(default)]
+    pub search_perplexity_key: Option<String>,
+    #[serde(default)]
+    pub clear_search_perplexity_key: Option<bool>,
+    /// Search: Firecrawl API key
+    #[serde(default)]
+    pub search_firecrawl_key: Option<String>,
+    #[serde(default)]
+    pub clear_search_firecrawl_key: Option<bool>,
+    /// Search: SearXNG base URL
+    #[serde(default)]
+    pub search_searxng_base_url: Option<String>,
     // Moltbook (optional)
     #[serde(default)]
     pub moltbook_api_key: Option<String>,
@@ -2586,6 +2459,56 @@ pub struct DataLifecycleSettingsUpdate {
     pub security_cleanup_interval_days: Option<u64>,
     #[serde(default)]
     pub security_cleanup_idle_threshold_secs: Option<u64>,
+}
+
+fn model_input_privacy_mode_label(mode: crate::security::ModelInputPrivacyMode) -> &'static str {
+    match mode {
+        crate::security::ModelInputPrivacyMode::DefaultRedact => "default_redact",
+        crate::security::ModelInputPrivacyMode::ZeroExposure => "zero_exposure",
+        crate::security::ModelInputPrivacyMode::SecretsOnly => "secrets_only",
+    }
+}
+
+fn parse_model_input_privacy_mode(
+    value: &str,
+) -> std::result::Result<crate::security::ModelInputPrivacyMode, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "default_redact" | "default-redact" => {
+            Ok(crate::security::ModelInputPrivacyMode::DefaultRedact)
+        }
+        "zero_exposure" | "zero-exposure" => {
+            Ok(crate::security::ModelInputPrivacyMode::ZeroExposure)
+        }
+        "secrets_only" | "secrets-only" => Ok(crate::security::ModelInputPrivacyMode::SecretsOnly),
+        other => Err(format!(
+            "default_model_input_mode must be one of default_redact, zero_exposure, or secrets_only (got '{other}')"
+        )),
+    }
+}
+
+fn current_chat_pii_policy_label(policy: crate::security::CurrentChatPiiPolicy) -> &'static str {
+    match policy {
+        crate::security::CurrentChatPiiPolicy::RawCurrentTurn => "raw_current_turn",
+        crate::security::CurrentChatPiiPolicy::MaskChatPii => "mask_chat_pii",
+        crate::security::CurrentChatPiiPolicy::BlockSensitiveChat => "block_sensitive_chat",
+    }
+}
+
+fn parse_current_chat_pii_policy(
+    value: &str,
+) -> std::result::Result<crate::security::CurrentChatPiiPolicy, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "raw_current_turn" | "raw-current-turn" => {
+            Ok(crate::security::CurrentChatPiiPolicy::RawCurrentTurn)
+        }
+        "mask_chat_pii" | "mask-chat-pii" => Ok(crate::security::CurrentChatPiiPolicy::MaskChatPii),
+        "block_sensitive_chat" | "block-sensitive-chat" => {
+            Ok(crate::security::CurrentChatPiiPolicy::BlockSensitiveChat)
+        }
+        other => Err(format!(
+            "current_chat_pii_policy must be one of raw_current_turn, mask_chat_pii, or block_sensitive_chat (got '{other}')"
+        )),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -2679,6 +2602,8 @@ struct VoiceCommandRequest {
     command: String,
     #[serde(default)]
     action_id: Option<String>,
+    #[serde(default)]
+    conversation_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2877,6 +2802,22 @@ fn normalize_daily_brief_time(value: &str) -> Option<String> {
     Some(format!("{:02}:{:02}", parsed.hour(), parsed.minute()))
 }
 
+fn notification_represents_missing_input(
+    notification: &crate::storage::entities::notification::Model,
+) -> bool {
+    let source = notification.source.to_ascii_lowercase();
+    if source == "autonomy_attention" || source.contains("approval") {
+        return false;
+    }
+    let title = notification.title.to_ascii_lowercase();
+    let body = notification.body.to_ascii_lowercase();
+    source == "workflow_inputs"
+        || title.contains("missing input")
+        || body.contains("missing input")
+        || title.contains("required input")
+        || body.contains("required input")
+}
+
 fn daily_brief_time_from_cron(cron: &str) -> Option<String> {
     let parts: Vec<&str> = cron.split_whitespace().collect();
     let (hour_raw, minute_raw) = match parts.as_slice() {
@@ -3004,15 +2945,6 @@ struct ChatAutomationSuggestion {
     accepted_outcomes: Vec<suggestions::ChatSuggestionOutcome>,
 }
 
-fn summarize_text(input: &str) -> String {
-    let trimmed = input.trim();
-    if trimmed.len() <= 160 {
-        trimmed.to_string()
-    } else {
-        format!("{} -¬ -...", trimmed.chars().take(160).collect::<String>())
-    }
-}
-
 fn parse_rfc3339_utc(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(value)
         .ok()
@@ -3044,16 +2976,6 @@ fn suggestion_kind_title(kind: &str) -> &'static str {
         "task" => "Task",
         "app" => "App",
         _ => "Automation",
-    }
-}
-
-fn suggestion_goal_title(kind: &str, title: &str) -> String {
-    match kind {
-        "watcher" => format!("Draft watcher: {}", title),
-        "app" => format!("Draft app: {}", title),
-        "workflow" => format!("Draft workflow: {}", title),
-        "task" => format!("Draft task: {}", title),
-        _ => format!("Draft automation: {}", title),
     }
 }
 
@@ -3211,14 +3133,19 @@ async fn conversation_has_recent_app_artifact(
         .ok()
         .flatten()
         .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok());
-    artifact
-        .as_ref()
-        .and_then(|artifact| {
-            artifact
-                .get("artifact_type")
+    let has_recent_app = artifact.as_ref().is_some_and(|artifact| match artifact {
+        serde_json::Value::Array(items) => items.iter().any(|item| {
+            item.get("artifact_type")
                 .and_then(|value| value.as_str())
-        })
-        .is_some_and(|artifact_type| artifact_type.eq_ignore_ascii_case("app"))
+                .is_some_and(|artifact_type| artifact_type.eq_ignore_ascii_case("app"))
+        }),
+        serde_json::Value::Object(map) => map
+            .get("artifact_type")
+            .and_then(|value| value.as_str())
+            .is_some_and(|artifact_type| artifact_type.eq_ignore_ascii_case("app")),
+        _ => false,
+    });
+    has_recent_app
         || storage
             .get(&Agent::conversation_last_deployed_app_key(conversation_id))
             .await
@@ -3304,212 +3231,11 @@ fn extract_latest_signal_user_message(
         .cloned()
 }
 
-fn normalize_suggestion_fingerprint(kind: &str, title: &str, conversation_id: &str) -> String {
-    let mut out = String::new();
-    for ch in format!("{}:{}:{}", kind, conversation_id, title)
-        .to_ascii_lowercase()
-        .chars()
-    {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch);
-        } else if !out.ends_with('-') {
-            out.push('-');
-        }
-    }
-    out.trim_matches('-').to_string()
-}
-
-fn chat_opportunity_text(input: &str) -> String {
-    let normalized = normalize_chat_suggestion_text(input);
-    let trimmed = normalized.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    let prefixes = [
-        "i wish ",
-        "it would be nice if ",
-        "would be nice if ",
-        "it would help if ",
-        "i need a way to ",
-        "i want a way to ",
-        "i always have to ",
-        "i keep forgetting to ",
-        "can you remind me to ",
-        "please remind me to ",
-        "tell me when ",
-        "let me know when ",
-        "notify me when ",
-        "alert me when ",
-        "watch for ",
-        "watch ",
-        "monitor ",
-    ];
-    let lower = trimmed.to_ascii_lowercase();
-    for prefix in prefixes {
-        if let Some(rest) = lower.strip_prefix(prefix) {
-            if !rest.trim().is_empty() {
-                return trimmed
-                    .chars()
-                    .skip(prefix.chars().count())
-                    .collect::<String>()
-                    .trim()
-                    .trim_end_matches('.')
-                    .to_string();
-            }
-        }
-    }
-    trimmed.trim_end_matches('.').to_string()
-}
-
 fn infer_chat_automation_suggestion(
-    conversation: &crate::storage::entities::conversation::Model,
-    source_message: &crate::storage::entities::message::Model,
+    _conversation: &crate::storage::entities::conversation::Model,
+    _source_message: &crate::storage::entities::message::Model,
 ) -> Option<ChatAutomationSuggestion> {
-    let raw = normalize_chat_suggestion_text(&source_message.content);
-    let lower = raw.to_ascii_lowercase();
-    if raw.is_empty() {
-        return None;
-    }
-
-    let watcher_phrases = [
-        "tell me when",
-        "let me know when",
-        "notify me when",
-        "alert me when",
-        "keep an eye on",
-        "watch for",
-        "monitor",
-        "track ",
-    ];
-    let app_phrases = [
-        "dashboard",
-        "portal",
-        "admin panel",
-        "app for",
-        "interface for",
-        "ui for",
-        "tool for",
-        "console for",
-    ];
-    let workflow_phrases = [
-        "every day",
-        "every week",
-        "every month",
-        "daily",
-        "weekly",
-        "monthly",
-        "recurring",
-        "routine",
-        "manual",
-        "manually",
-        "automate",
-        "automation",
-        "run every",
-        "keep forgetting",
-        "remind me",
-    ];
-    let desire_phrases = [
-        "i wish",
-        "would be nice if",
-        "it would help if",
-        "i need a way to",
-        "i want a way to",
-        "i always have to",
-    ];
-
-    let kind = if watcher_phrases.iter().any(|phrase| lower.contains(phrase)) {
-        "watcher"
-    } else if app_phrases.iter().any(|phrase| lower.contains(phrase)) {
-        "app"
-    } else if workflow_phrases.iter().any(|phrase| lower.contains(phrase)) {
-        "workflow"
-    } else if desire_phrases.iter().any(|phrase| lower.contains(phrase)) {
-        "task"
-    } else {
-        return None;
-    };
-
-    if lower.contains("build this")
-        || lower.contains("make this now")
-        || lower.contains("implement this")
-        || lower.contains("create this now")
-    {
-        return None;
-    }
-
-    let focus = chat_opportunity_text(&raw);
-    if focus.is_empty() {
-        return None;
-    }
-
-    let title = match kind {
-        "watcher" => format!("Monitor {}", summarize_text(&focus).trim_end_matches('.')),
-        "app" => format!("App for {}", summarize_text(&focus).trim_end_matches('.')),
-        "workflow" => format!("Automate {}", summarize_text(&focus).trim_end_matches('.')),
-        "task" => format!("Capture {}", summarize_text(&focus).trim_end_matches('.')),
-        _ => summarize_text(&focus),
-    };
-    let detail = match kind {
-        "watcher" => format!(
-            "Draft a watcher so {} can keep tabs on {} without you asking again.",
-            crate::branding::PRODUCT_NAME,
-            summarize_text(&focus)
-        ),
-        "app" => format!(
-            "Draft a dedicated app or dashboard around {} instead of leaving it buried in chat.",
-            summarize_text(&focus)
-        ),
-        "workflow" => format!(
-            "Draft a repeatable workflow for {} so it can become a routine later.",
-            summarize_text(&focus)
-        ),
-        _ => format!(
-            "Capture {} as a structured draft so it can be turned into automation later.",
-            summarize_text(&focus)
-        ),
-    };
-    let rationale = match kind {
-        "watcher" => "This chat sounded like you wanted ongoing monitoring, not just a one-off answer.",
-        "app" => "This chat described a durable interface or dashboard rather than a single response.",
-        "workflow" => "This chat described recurring or repetitive work that should probably become automation.",
-        _ => "This chat sounded like a useful follow-up the system should not lose.",
-    };
-    let confidence = match kind {
-        "watcher" => 0.88,
-        "app" => 0.83,
-        "workflow" => 0.80,
-        _ => 0.72,
-    };
-    let now = chrono::Utc::now().to_rfc3339();
-
-    Some(ChatAutomationSuggestion {
-        id: uuid::Uuid::new_v4().to_string(),
-        status: "open".to_string(),
-        kind: kind.to_string(),
-        title: title.clone(),
-        detail,
-        rationale: rationale.to_string(),
-        confidence,
-        created_at: now.clone(),
-        updated_at: now,
-        conversation_id: conversation.id.clone(),
-        conversation_title: summarize_text(&conversation.title),
-        conversation_channel: conversation.channel.clone(),
-        source_message_id: source_message.id.clone(),
-        source_snippet: summarize_text(&source_message.content),
-        fingerprint: normalize_suggestion_fingerprint(kind, &title, &conversation.id),
-        goal_title: suggestion_goal_title(kind, &title),
-        goal_detail: Some(focus),
-        accepted_goal_id: None,
-        dismissed_at: None,
-        accepted_at: None,
-        accepted_trace_id: None,
-        run_status: None,
-        last_run_error: None,
-        last_run_started_at: None,
-        last_run_completed_at: None,
-        accepted_outcomes: Vec::new(),
-    })
+    None
 }
 
 fn build_chat_suggestion_execution_prompt(suggestion: &ChatAutomationSuggestion) -> String {
@@ -3846,6 +3572,11 @@ pub async fn serve(
         // WhatsApp webhook (public - Meta calls without auth)
         .route("/webhook/whatsapp", get(whatsapp_webhook_verify))
         .route("/webhook/whatsapp", post(whatsapp_webhook_handler))
+        .route(
+            "/extension-packs/{id}/webhook",
+            get(extension_packs::verify_extension_pack_webhook)
+                .post(extension_packs::handle_extension_pack_webhook),
+        )
         .route("/webhook/google-chat", post(google_chat_webhook_handler))
         .route("/webhook/signal", post(signal_webhook_handler))
         .route("/webhook/imessage", post(imessage_webhook_handler))
@@ -4207,6 +3938,51 @@ pub async fn serve(
         // Integrations routes
         .route("/integrations", get(integrations::list_integrations))
         .route(
+            "/extension-packs",
+            get(extension_packs::list_extension_packs),
+        )
+        .route(
+            "/extension-packs/install",
+            post(extension_packs::install_extension_pack),
+        )
+        .route(
+            "/extension-packs/upload",
+            post(extension_packs::upload_extension_pack),
+        )
+        .route(
+            "/extension-packs/scaffold",
+            post(extension_packs::scaffold_extension_pack),
+        )
+        .route(
+            "/extension-packs/invoke",
+            post(extension_packs::invoke_extension_pack_feature),
+        )
+        .route(
+            "/extension-packs/{id}",
+            get(extension_packs::get_extension_pack).delete(extension_packs::delete_extension_pack),
+        )
+        .route(
+            "/extension-packs/{id}/events",
+            get(extension_packs::list_extension_pack_events),
+        )
+        .route(
+            "/extension-packs/{id}/connections",
+            get(extension_packs::list_extension_pack_connections)
+                .post(extension_packs::upsert_extension_pack_connection),
+        )
+        .route(
+            "/extension-packs/{id}/connect-url",
+            get(extension_packs::get_extension_pack_connect_url),
+        )
+        .route(
+            "/extension-packs/{id}/enabled",
+            post(extension_packs::set_extension_pack_enabled),
+        )
+        .route(
+            "/extension-packs/{id}/connections/{connection_id}/test",
+            post(extension_packs::test_extension_pack_connection),
+        )
+        .route(
             "/integrations/sync/status",
             get(integration_sync::list_integration_sync_statuses),
         )
@@ -4317,6 +4093,12 @@ pub async fn serve(
         // Swarm routes
         .route("/swarm/status", get(swarm_status))
         .route("/swarm/agents", get(swarm_list_agents))
+        .route(
+            "/swarm/agents/builder/options",
+            get(swarm_agent_builder_options),
+        )
+        .route("/swarm/agents/access-plan", post(swarm_agent_access_plan))
+        .route("/swarm/agents/draft", post(swarm_draft_agent))
         .route("/swarm/agents", post(swarm_add_agent))
         .route(
             "/swarm/agents/{id}",
@@ -4951,8 +4733,11 @@ pub async fn serve(
                 .map_err(|e| anyhow::anyhow!("Failed to load TLS certs: {}", e))?;
         tracing::info!("HTTPS server listening on https://{}", bind_addr);
         tracing::info!("Web UI available at https://{}/", bind_addr);
-        if bind_addr.starts_with("0.0.0.0") {
-            tracing::warn!("Server bound to 0.0.0.0 -- accessible from all network interfaces. Ensure authentication is enabled.");
+        if should_warn_for_direct_control_plane_exposure(state.deployment_mode, &bind_addr) {
+            tracing::warn!(
+                "Internet-facing control plane is listening on '{}'. Ensure API/UI authentication remains enabled.",
+                bind_addr
+            );
         }
         let handle = axum_server::Handle::new();
         let mut tls_shutdown = shutdown_rx.clone();
@@ -4990,12 +4775,13 @@ pub async fn serve(
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     tracing::info!("HTTP server listening on http://{}", bind_addr);
     tracing::info!("Web UI available at http://{}/", bind_addr);
-    if bind_addr.starts_with("0.0.0.0") {
-        tracing::warn!("Server bound to 0.0.0.0 -- accessible from all network interfaces. Ensure authentication is enabled.");
-    }
-    if !bind_addr.starts_with("127.0.0.1") && !bind_addr.starts_with("localhost") {
+    if should_warn_for_direct_control_plane_exposure(state.deployment_mode, &bind_addr) {
         tracing::warn!(
-            "Non-localhost bind without TLS -- traffic is unencrypted. Consider enabling TLS."
+            "Internet-facing control plane is listening on '{}'. Ensure API/UI authentication remains enabled.",
+            bind_addr
+        );
+        tracing::warn!(
+            "Internet-facing control plane is using direct HTTP without TLS. Put it behind HTTPS or use secure remote access before exposing it publicly."
         );
     }
 
@@ -5997,6 +5783,24 @@ fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value> {
     // --- Swarm ---
     add("/swarm/status", "GET", "Swarm status", "Swarm");
     add("/swarm/agents", "GET", "List swarm agents", "Swarm");
+    add(
+        "/swarm/agents/builder/options",
+        "GET",
+        "List attachable swarm agent resources",
+        "Swarm",
+    );
+    add(
+        "/swarm/agents/access-plan",
+        "POST",
+        "Plan elevated access for a drafted swarm agent",
+        "Swarm",
+    );
+    add(
+        "/swarm/agents/draft",
+        "POST",
+        "Generate a swarm agent draft from a description",
+        "Swarm",
+    );
     add("/swarm/agents", "POST", "Add swarm agent", "Swarm");
     add("/swarm/agents/{id}", "POST", "Update swarm agent", "Swarm");
     add(
@@ -8360,6 +8164,10 @@ struct AppServeRequestContext {
     body: axum::body::Body,
 }
 
+fn should_proxy_app_request_to_executor(is_static: bool, executor_configured: bool) -> bool {
+    executor_configured && !is_static
+}
+
 /// Inner handler: serve static file or reverse proxy to dynamic app
 async fn serve_app_file_inner(
     state: &AppState,
@@ -8496,6 +8304,8 @@ async fn serve_app_file_inner(
         }
     }
 
+    let is_static = state.app_registry.is_static(app_id).await;
+
     state.app_registry.touch(app_id).await;
     let clean_query = if access_guard_enabled {
         strip_query_param(uri.query(), "grant")
@@ -8528,158 +8338,164 @@ async fn serve_app_file_inner(
         })
     };
 
-    if let Some(executor) = state.executor_client.as_ref() {
-        let mut proxy_path = if normalized_path.is_empty() {
-            format!("/internal/v1/apps/{}/proxy", app_id)
-        } else {
-            format!("/internal/v1/apps/{}/proxy/{}", app_id, normalized_path)
-        };
-        if let Some(q) = clean_query.as_deref().filter(|q| !q.is_empty()) {
-            proxy_path.push('?');
-            proxy_path.push_str(q);
-        }
-        if is_ws_request {
-            if method != Method::GET {
-                return StatusCode::METHOD_NOT_ALLOWED.into_response();
-            }
-
-            let Some(ws_upgrade) = ws else {
-                return (StatusCode::BAD_REQUEST, "Invalid websocket upgrade request")
-                    .into_response();
+    if should_proxy_app_request_to_executor(is_static, state.executor_client.is_some()) {
+        if let Some(executor) = state.executor_client.as_ref() {
+            let mut proxy_path = if normalized_path.is_empty() {
+                format!("/internal/v1/apps/{}/proxy", app_id)
+            } else {
+                format!("/internal/v1/apps/{}/proxy/{}", app_id, normalized_path)
             };
+            if let Some(q) = clean_query.as_deref().filter(|q| !q.is_empty()) {
+                proxy_path.push('?');
+                proxy_path.push_str(q);
+            }
+            if is_ws_request {
+                if method != Method::GET {
+                    return StatusCode::METHOD_NOT_ALLOWED.into_response();
+                }
 
-            let upstream_url = format!(
-                "{}{}",
-                executor_websocket_base_url(executor.base_url()),
-                proxy_path
+                let Some(ws_upgrade) = ws else {
+                    return (StatusCode::BAD_REQUEST, "Invalid websocket upgrade request")
+                        .into_response();
+                };
+
+                let upstream_url = format!(
+                    "{}{}",
+                    executor_websocket_base_url(executor.base_url()),
+                    proxy_path
+                );
+                let requested_protocols = headers
+                    .get("Sec-WebSocket-Protocol")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|raw| {
+                        raw.split(',')
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string())
+                            .collect::<Vec<String>>()
+                    })
+                    .unwrap_or_default();
+                let mut ws_forward_headers: Vec<(String, String)> = Vec::new();
+                if let Some(v) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+                    ws_forward_headers.push(("origin".to_string(), v.to_string()));
+                }
+                if let Some(v) = headers
+                    .get(header::USER_AGENT)
+                    .and_then(|v| v.to_str().ok())
+                {
+                    ws_forward_headers.push(("user-agent".to_string(), v.to_string()));
+                }
+                if let Some(v) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
+                    ws_forward_headers.push(("x-forwarded-host".to_string(), v.to_string()));
+                }
+                if let Some(token) = executor.bearer_token() {
+                    ws_forward_headers
+                        .push(("authorization".to_string(), format!("Bearer {}", token)));
+                }
+                let forwarded_proto = headers
+                    .get("x-forwarded-proto")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("http");
+                ws_forward_headers
+                    .push(("x-forwarded-proto".to_string(), forwarded_proto.to_string()));
+                ws_forward_headers.push((
+                    "x-forwarded-prefix".to_string(),
+                    format!("/apps/{}", app_id),
+                ));
+                if let Some(raw_cookie) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok())
+                {
+                    if let Some(filtered) = filter_proxy_cookie(raw_cookie, app_id) {
+                        ws_forward_headers.push(("cookie".to_string(), filtered));
+                    }
+                }
+
+                let ws_upgrade = if requested_protocols.is_empty() {
+                    ws_upgrade
+                } else {
+                    ws_upgrade.protocols(requested_protocols.clone())
+                };
+                return ws_upgrade
+                    .on_upgrade(move |socket| async move {
+                        proxy_websocket_connection(
+                            socket,
+                            upstream_url,
+                            requested_protocols,
+                            ws_forward_headers,
+                        )
+                        .await;
+                    })
+                    .into_response();
+            }
+
+            let mut upstream = executor.request(
+                reqwest::Method::from_bytes(method.as_str().as_bytes())
+                    .unwrap_or(reqwest::Method::GET),
+                &proxy_path,
             );
-            let requested_protocols = headers
-                .get("Sec-WebSocket-Protocol")
-                .and_then(|v| v.to_str().ok())
-                .map(|raw| {
-                    raw.split(',')
-                        .map(|s| s.trim())
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string())
-                        .collect::<Vec<String>>()
-                })
-                .unwrap_or_default();
-            let mut ws_forward_headers: Vec<(String, String)> = Vec::new();
-            if let Some(v) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-                ws_forward_headers.push(("origin".to_string(), v.to_string()));
+            for (name, value) in &headers {
+                let lower = name.as_str().to_ascii_lowercase();
+                if is_hop_by_hop_header(&lower)
+                    || lower == "host"
+                    || lower == "content-length"
+                    || lower == "authorization"
+                {
+                    continue;
+                }
+                if lower == "cookie" {
+                    if let Ok(raw_cookie) = value.to_str() {
+                        if let Some(filtered) = filter_proxy_cookie(raw_cookie, app_id) {
+                            upstream = upstream.header(header::COOKIE, filtered);
+                        }
+                    }
+                    continue;
+                }
+                upstream = upstream.header(name, value);
             }
-            if let Some(v) = headers
-                .get(header::USER_AGENT)
-                .and_then(|v| v.to_str().ok())
-            {
-                ws_forward_headers.push(("user-agent".to_string(), v.to_string()));
-            }
-            if let Some(v) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
-                ws_forward_headers.push(("x-forwarded-host".to_string(), v.to_string()));
-            }
-            if let Some(token) = executor.bearer_token() {
-                ws_forward_headers.push(("authorization".to_string(), format!("Bearer {}", token)));
+            if let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
+                upstream = upstream.header("x-forwarded-host", host);
             }
             let forwarded_proto = headers
                 .get("x-forwarded-proto")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("http");
-            ws_forward_headers.push(("x-forwarded-proto".to_string(), forwarded_proto.to_string()));
-            ws_forward_headers.push((
-                "x-forwarded-prefix".to_string(),
-                format!("/apps/{}", app_id),
-            ));
-            if let Some(raw_cookie) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) {
-                if let Some(filtered) = filter_proxy_cookie(raw_cookie, app_id) {
-                    ws_forward_headers.push(("cookie".to_string(), filtered));
-                }
-            }
+            upstream = upstream
+                .header("x-forwarded-proto", forwarded_proto)
+                .header("x-forwarded-prefix", format!("/apps/{}", app_id));
+            upstream = upstream.body(body_bytes.clone().unwrap_or_default());
 
-            let ws_upgrade = if requested_protocols.is_empty() {
-                ws_upgrade
-            } else {
-                ws_upgrade.protocols(requested_protocols.clone())
-            };
-            return ws_upgrade
-                .on_upgrade(move |socket| async move {
-                    proxy_websocket_connection(
-                        socket,
-                        upstream_url,
-                        requested_protocols,
-                        ws_forward_headers,
-                    )
-                    .await;
-                })
-                .into_response();
-        }
-
-        let mut upstream = executor.request(
-            reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET),
-            &proxy_path,
-        );
-        for (name, value) in &headers {
-            let lower = name.as_str().to_ascii_lowercase();
-            if is_hop_by_hop_header(&lower)
-                || lower == "host"
-                || lower == "content-length"
-                || lower == "authorization"
-            {
-                continue;
-            }
-            if lower == "cookie" {
-                if let Ok(raw_cookie) = value.to_str() {
-                    if let Some(filtered) = filter_proxy_cookie(raw_cookie, app_id) {
-                        upstream = upstream.header(header::COOKIE, filtered);
-                    }
-                }
-                continue;
-            }
-            upstream = upstream.header(name, value);
-        }
-        if let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
-            upstream = upstream.header("x-forwarded-host", host);
-        }
-        let forwarded_proto = headers
-            .get("x-forwarded-proto")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("http");
-        upstream = upstream
-            .header("x-forwarded-proto", forwarded_proto)
-            .header("x-forwarded-prefix", format!("/apps/{}", app_id));
-        upstream = upstream.body(body_bytes.clone().unwrap_or_default());
-
-        match upstream.send().await {
-            Ok(resp) => {
-                let status =
-                    StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-                let response_headers = resp.headers().clone();
-                match resp.bytes().await {
-                    Ok(response_body) => {
-                        let mut builder = Response::builder().status(status);
-                        for (name, value) in &response_headers {
-                            if !is_hop_by_hop_header(name.as_str()) {
-                                builder = builder.header(name, value);
+            match upstream.send().await {
+                Ok(resp) => {
+                    let status = StatusCode::from_u16(resp.status().as_u16())
+                        .unwrap_or(StatusCode::BAD_GATEWAY);
+                    let response_headers = resp.headers().clone();
+                    match resp.bytes().await {
+                        Ok(response_body) => {
+                            let mut builder = Response::builder().status(status);
+                            for (name, value) in &response_headers {
+                                if !is_hop_by_hop_header(name.as_str()) {
+                                    builder = builder.header(name, value);
+                                }
                             }
+                            let response_body = if method == Method::HEAD {
+                                axum::body::Body::empty()
+                            } else {
+                                axum::body::Body::from(response_body)
+                            };
+                            return builder
+                                .body(response_body)
+                                .unwrap_or(StatusCode::BAD_GATEWAY.into_response());
                         }
-                        let response_body = if method == Method::HEAD {
-                            axum::body::Body::empty()
-                        } else {
-                            axum::body::Body::from(response_body)
-                        };
-                        return builder
-                            .body(response_body)
-                            .unwrap_or(StatusCode::BAD_GATEWAY.into_response());
+                        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
                     }
-                    Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
                 }
-            }
-            Err(error) => {
-                tracing::warn!(
-                    "Executor proxy failed for app {} on path '{}': {}",
-                    app_id,
-                    proxy_path,
-                    error
-                );
+                Err(error) => {
+                    tracing::warn!(
+                        "Executor proxy failed for app {} on path '{}': {}",
+                        app_id,
+                        proxy_path,
+                        error
+                    );
+                }
             }
         }
     }
@@ -8836,7 +8652,7 @@ async fn serve_app_file_inner(
                 (StatusCode::SERVICE_UNAVAILABLE, "App server not responding").into_response()
             }
         }
-    } else if state.app_registry.is_static(app_id).await {
+    } else if is_static {
         if method != Method::GET && method != Method::HEAD {
             return StatusCode::METHOD_NOT_ALLOWED.into_response();
         }
@@ -9326,7 +9142,7 @@ async fn restart_app(State(state): State<AppState>, Path(app_id): Path<String>) 
                     "required_secrets": required_secret_keys.clone(),
                     "required_env": required_secret_keys,
                     "required_config": required_config_keys,
-                    "message": "Missing required inputs. Use set secret KEY=VALUE for sensitive values; provide config for non-sensitive values."
+                    "message": "Missing required inputs. Use /setsecret KEY=VALUE for sensitive values; provide config for non-sensitive values."
                 })),
             )
                 .into_response();
@@ -9942,7 +9758,9 @@ async fn build_runtime_health_payload(
                 .filter(|value| !value.is_empty())
                 .is_some(),
             agent.startup_issues_handle(),
-            if state.server_role == HttpServerRole::ControlPlane {
+            if state.server_role == HttpServerRole::ControlPlane
+                && crate::runtime::ActionRuntime::should_manage_local_sandbox_containers()
+            {
                 agent.runtime.docker_available().await
             } else {
                 true
@@ -10019,7 +9837,14 @@ async fn build_runtime_health_payload(
         && auto_analysis_loop_ok
         && restore_ready
         && blocking_startup_issue_count == 0;
-    let overall_ok = if readiness_mode { ready } else { healthy };
+    let overall_ok = if readiness_mode { ready } else { true };
+    let status_text = if readiness_mode {
+        if ready { "ok" } else { "not_ready" }
+    } else if healthy {
+        "ok"
+    } else {
+        "degraded"
+    };
 
     (
         if overall_ok {
@@ -10028,13 +9853,7 @@ async fn build_runtime_health_payload(
             StatusCode::SERVICE_UNAVAILABLE
         },
         serde_json::json!({
-            "status": if overall_ok {
-                "ok"
-            } else if readiness_mode {
-                "not_ready"
-            } else {
-                "degraded"
-            },
+            "status": status_text,
             "mode": if readiness_mode { "readiness" } else { "health" },
             "ready": ready,
             "server_role": match state.server_role {
@@ -10101,13 +9920,48 @@ async fn build_runtime_health_payload(
     )
 }
 
+fn timed_out_health_payload(readiness_mode: bool) -> (StatusCode, serde_json::Value) {
+    (
+        if readiness_mode {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::OK
+        },
+        serde_json::json!({
+            "status": if readiness_mode { "not_ready" } else { "degraded" },
+            "mode": if readiness_mode { "readiness" } else { "health" },
+            "ready": false,
+            "checks": {
+                "health_probe_timeout": true,
+            },
+            "error": "Health probe timed out before dependency checks completed.",
+        }),
+    )
+}
+
 async fn health(State(state): State<AppState>) -> Response {
-    let (status, payload) = build_runtime_health_payload(&state, false).await;
+    let (status, payload) = match tokio::time::timeout(
+        HEALTH_PROBE_TIMEOUT,
+        build_runtime_health_payload(&state, false),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => timed_out_health_payload(false),
+    };
     (status, Json(payload)).into_response()
 }
 
 async fn readiness(State(state): State<AppState>) -> Response {
-    let (status, payload) = build_runtime_health_payload(&state, true).await;
+    let (status, payload) = match tokio::time::timeout(
+        HEALTH_PROBE_TIMEOUT,
+        build_runtime_health_payload(&state, true),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => timed_out_health_payload(true),
+    };
     (status, Json(payload)).into_response()
 }
 
@@ -10318,17 +10172,51 @@ async fn get_conversation_latest_run(
 }
 
 async fn resume_run(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    maybe_caller: Option<Extension<crate::actions::ActionCallerPrincipal>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    (
-        StatusCode::CONFLICT,
-        Json(serde_json::json!({
-            "error": "Run resume is disabled until checkpoint-based recovery is implemented",
-            "run_id": id,
-        })),
-    )
-        .into_response()
+    let result = {
+        let agent = state.agent.read().await;
+        agent
+            .resume_execution_run(&id, maybe_caller.as_ref().map(|caller| &caller.0))
+            .await
+    };
+
+    match result {
+        Ok(processed) => (
+            StatusCode::OK,
+            Json(ChatResponse {
+                response: processed.response,
+                proof_id: None,
+                conversation_id: processed.conversation_id,
+                conversation_title: processed.conversation_title,
+                run_id: processed.run_id,
+                run_status: processed.run_status,
+                trace_id: processed.trace_id,
+                degradation: processed.degradation,
+                attempted_models: processed.attempted_models,
+                user_outcome: processed.user_outcome,
+            }),
+        )
+            .into_response(),
+        Err(error) if error.to_string() == "Run not found" => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "Run not found",
+                "run_id": id,
+            })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Failed to resume run: {}", error),
+                "run_id": id,
+            })),
+        )
+            .into_response(),
+    }
 }
 
 // - WhatsApp Webhook -
@@ -11419,6 +11307,16 @@ async fn stop_whatsapp_bridge(bridge_arc: Arc<RwLock<WhatsAppBridgeState>>) {
 }
 
 /// List active watchers
+fn watcher_history_error_is_notification_summary_failure(error: Option<&str>) -> bool {
+    let Some(error) = error else {
+        return false;
+    };
+    let lower = error.to_ascii_lowercase();
+    lower.contains("watcher notification")
+        || lower.contains("notification summary")
+        || lower.contains("follow-up summary")
+}
+
 async fn get_watchers(State(state): State<AppState>) -> Json<serde_json::Value> {
     let (watchers, supervisor_states) = {
         let agent = state.agent.read().await;
@@ -11473,8 +11371,20 @@ async fn get_watchers(State(state): State<AppState>) -> Json<serde_json::Value> 
                     .clone()
                     .or_else(|| state.last_run_at.clone())
                     .or_else(|| state.last_success_at.clone());
-                let status = state.status.clone();
-                let status_error = state.last_error.clone();
+                let notification_summary_failure = state.status == "failed"
+                    && watcher_history_error_is_notification_summary_failure(
+                        state.last_error.as_deref(),
+                    );
+                let status = if notification_summary_failure {
+                    "triggered".to_string()
+                } else {
+                    state.status.clone()
+                };
+                let status_error = if notification_summary_failure {
+                    None
+                } else {
+                    state.last_error.clone()
+                };
                 let last_poll_outcome = match status.as_str() {
                     "triggered" => Some("matched"),
                     "failed" | "timed_out" => Some("error"),
@@ -11490,14 +11400,14 @@ async fn get_watchers(State(state): State<AppState>) -> Json<serde_json::Value> 
                     "status_error": status_error,
                     "interval_secs": serde_json::Value::Null,
                     "timeout_secs": serde_json::Value::Null,
-                    "poll_count": serde_json::Value::Null,
+                    "poll_count": state.attempt_count,
                     "created_at": created_at,
                     "last_poll_at": state.last_run_at,
                     "notify_channel": serde_json::Value::Null,
                     "on_trigger": serde_json::Value::Null,
                     "trigger_result": serde_json::Value::Null,
                     "last_result": serde_json::Value::Null,
-                    "last_error": state.last_error,
+                    "last_error": status_error,
                     "last_poll_outcome": last_poll_outcome,
                     "notification_attempts": Vec::<serde_json::Value>::new(),
                     "history_only": true,
@@ -11719,6 +11629,9 @@ async fn browser_session_status(
                     question, ..
                 } => {
                     format!("waiting_for_user: {}", question)
+                }
+                crate::core::browser_session::SessionStatus::AwaitingResume { question } => {
+                    format!("awaiting_resume: {}", question)
                 }
                 crate::core::browser_session::SessionStatus::Interrupted { reason } => {
                     format!("interrupted: {}", reason)
@@ -12752,6 +12665,7 @@ fn build_request_execution_hints(
     caller: Option<&crate::actions::ActionCallerPrincipal>,
     surface: crate::actions::ActionExecutionSurface,
     direct_user_intent: bool,
+    attachments_present: bool,
     plan_confirmation_mode: crate::core::RequestPlanConfirmationMode,
     plan_override: Option<crate::core::ExecutionPlan>,
 ) -> crate::core::RequestExecutionHints {
@@ -12761,8 +12675,10 @@ fn build_request_execution_hints(
         caller_principal: caller.cloned(),
         execution_surface: surface,
         direct_user_intent,
+        attachments_present,
         plan_confirmation_mode,
         plan_override,
+        allow_sensitive_model_context_once: false,
     }
 }
 
@@ -12786,6 +12702,9 @@ pub(super) fn build_direct_action_auth_context(
         principal: caller.cloned(),
         surface,
         direct_user_intent,
+        current_turn_is_explicit_approval: false,
+        agent_name: None,
+        agent_access_scope: None,
     }
 }
 
@@ -12830,7 +12749,7 @@ async fn chat(
         }
     }
 
-    // Two-tier secrets UX: allow "set secret KEY=VALUE" without engaging the LLM.
+    // Two-tier secrets UX: allow "/setsecret KEY=VALUE" without engaging the LLM.
     // This bypasses conversation history + traces, and stores the value encrypted in secrets.enc.
     if let Some((key, value)) = parse_set_secret_command(&request.message) {
         let cid = request.conversation_id.clone();
@@ -13061,28 +12980,44 @@ async fn chat(
         }
     }
 
+    let original_conversation_id = request.conversation_id.clone();
+    let message = request.message.clone();
+    let channel = request.channel.clone();
+    let conversation_id = request.conversation_id.clone();
+    let project_id = request.project_id.clone();
+    let deep_research = request.deep_research;
+    let attachments_present = request.attachments_present;
+    let plan_confirmation_mode =
+        normalized_chat_plan_confirmation_mode(request.plan_confirmation_mode.as_deref());
+    let caller_principal = maybe_caller.as_ref().map(|Extension(value)| value.clone());
+    let agent_for_chat = state.agent.clone();
+
     let result = {
-        let agent_guard = state.agent.read().await;
-        let caller = maybe_caller.as_ref().map(|Extension(value)| value);
-        agent_guard
-            .process_message_with_meta_and_hints(
-                &request.message,
-                &request.channel,
-                request.conversation_id.as_deref(),
-                request.project_id.as_deref(),
-                build_request_execution_hints(
-                    request.deep_research,
-                    None,
-                    caller,
-                    crate::actions::ActionExecutionSurface::Chat,
-                    true,
-                    normalized_chat_plan_confirmation_mode(
-                        request.plan_confirmation_mode.as_deref(),
+        let worker = tokio::spawn(async move {
+            let agent_guard = agent_for_chat.read().await;
+            agent_guard
+                .process_message_with_meta_and_hints(
+                    &message,
+                    &channel,
+                    conversation_id.as_deref(),
+                    project_id.as_deref(),
+                    build_request_execution_hints(
+                        deep_research,
+                        None,
+                        caller_principal.as_ref(),
+                        crate::actions::ActionExecutionSurface::Chat,
+                        true,
+                        attachments_present,
+                        plan_confirmation_mode,
+                        None,
                     ),
-                    None,
-                ),
-            )
-            .await
+                )
+                .await
+        });
+        match worker.await {
+            Ok(result) => result,
+            Err(error) => Err(anyhow::anyhow!("Chat worker failed: {}", error)),
+        }
     };
 
     match result {
@@ -13093,7 +13028,7 @@ async fn chat(
                 Json(ChatResponse {
                     response: processed.response,
                     proof_id: None,
-                    conversation_id: processed.conversation_id.or(request.conversation_id),
+                    conversation_id: processed.conversation_id.or(original_conversation_id),
                     conversation_title: processed.conversation_title,
                     run_id: processed.run_id,
                     run_status: processed.run_status,
@@ -13125,7 +13060,7 @@ async fn chat(
                 Json(ChatResponse {
                     response,
                     proof_id: None,
-                    conversation_id: request.conversation_id,
+                    conversation_id: original_conversation_id,
                     conversation_title: None,
                     run_id: None,
                     run_status: Some("platform_failed".to_string()),
@@ -13266,6 +13201,9 @@ fn normalize_stream_heartbeat_status(status: &str) -> String {
     if lower.contains("context") {
         return "Preparing conversation context. No new output yet.".to_string();
     }
+    if lower.contains("execution plan") || lower.contains("research plan") {
+        return "Preparing research plan. No new output yet.".to_string();
+    }
     if lower.contains("tool") {
         return "Waiting on tool execution. No new output yet.".to_string();
     }
@@ -13297,6 +13235,26 @@ fn normalize_stream_event_for_sse(
                     "conversation_id": conversation_id,
                     "trace_id": trace_id,
                     "resumed": resumed,
+                }),
+            )),
+            String::new(),
+        ),
+        crate::core::StreamEvent::ChatTaskStarted {
+            task_id,
+            description,
+            work_type,
+            conversation_id,
+            project_id,
+        } => (
+            Some((
+                "task_started",
+                serde_json::json!({
+                    "task_id": task_id,
+                    "description": description,
+                    "status": "in_progress",
+                    "work_type": work_type,
+                    "conversation_id": conversation_id,
+                    "project_id": project_id,
                 }),
             )),
             String::new(),
@@ -13453,6 +13411,7 @@ fn normalize_stream_event_for_sse(
             step_title,
             status,
             detail,
+            substeps,
         } => {
             let title = match status {
                 crate::core::PlanStepStatus::Pending => "Plan Step Queued",
@@ -13486,6 +13445,7 @@ fn normalize_stream_event_for_sse(
                         "step_title": step_title,
                         "status": status,
                         "detail": detail_text,
+                        "substeps": substeps,
                     }),
                 )),
                 String::new(),
@@ -13729,41 +13689,6 @@ fn truncate_stream_task_text(text: &str, max_chars: usize) -> String {
     out
 }
 
-fn normalized_chat_execution_mode(mode: Option<&str>) -> &'static str {
-    match mode.unwrap_or("").trim().to_ascii_lowercase().as_str() {
-        "chat" | "ask" => "chat",
-        "task" | "do" | "agent" => "task",
-        _ => "auto",
-    }
-}
-
-fn chat_message_contains_any(lower: &str, tokens: &[&str]) -> bool {
-    tokens.iter().any(|token| lower.contains(token))
-}
-
-fn build_chat_task_description(message: &str, work_type: &str) -> String {
-    let trimmed = truncate_stream_task_text(message, 140);
-    if trimmed.is_empty() {
-        return "Run agent task".to_string();
-    }
-    let lower = message.trim().to_ascii_lowercase();
-    let prefix = match work_type {
-        "app" => {
-            if chat_message_contains_any(&lower, &["fix", "debug", "repair", "update", "improve"]) {
-                "App task"
-            } else {
-                "Build app"
-            }
-        }
-        "import" => "Import",
-        "automation" => "Automation",
-        "workspace" => "Workspace task",
-        "research" => "Research",
-        _ => "Task",
-    };
-    format!("{}: {}", prefix, trimmed)
-}
-
 fn chat_task_status_key(status: &crate::core::TaskStatus) -> &'static str {
     match status {
         crate::core::TaskStatus::Pending => "pending",
@@ -13794,7 +13719,8 @@ fn chat_task_terminal_status(response: &str) -> crate::core::TaskStatus {
 
 #[derive(Clone)]
 struct StreamedChatTask {
-    task: crate::core::Task,
+    task_id: String,
+    description: String,
     work_type: String,
     user_message_already_recorded: bool,
 }
@@ -13802,10 +13728,7 @@ struct StreamedChatTask {
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 enum ChatStreamTaskMode {
-    CreateIfNeeded {
-        execution_mode: Option<String>,
-        attachments_present: bool,
-    },
+    CreateIfNeeded,
     Existing(Box<StreamedChatTask>),
 }
 
@@ -13816,6 +13739,7 @@ struct ChatStreamRunRequest {
     conversation_id: Option<String>,
     project_id: Option<String>,
     deep_research: bool,
+    attachments_present: bool,
     plan_confirmation_mode: crate::core::RequestPlanConfirmationMode,
     plan_override: Option<crate::core::ExecutionPlan>,
     caller_principal: Option<crate::actions::ActionCallerPrincipal>,
@@ -13832,6 +13756,7 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
     let conversation_id = request.conversation_id.clone();
     let project_id = request.project_id.clone();
     let deep_research = request.deep_research;
+    let attachments_present = request.attachments_present;
     let plan_confirmation_mode = request.plan_confirmation_mode;
     let plan_override = request.plan_override.clone();
     let caller_principal = request.caller_principal.clone();
@@ -13840,113 +13765,11 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
 
     tokio::spawn(async move {
         let tracked_task = match task_mode {
-            ChatStreamTaskMode::CreateIfNeeded {
-                execution_mode,
-                attachments_present,
-            } => {
-                let routing = if deep_research
-                    && matches!(
-                        plan_confirmation_mode,
-                        crate::core::RequestPlanConfirmationMode::BeforeExecution
-                    )
-                {
-                    crate::core::ChatExecutionIntentDecision {
-                        create_task: true,
-                        work_type: "research",
-                    }
-                } else {
-                    match normalized_chat_execution_mode(execution_mode.as_deref()) {
-                        "chat" => crate::core::ChatExecutionIntentDecision {
-                            create_task: false,
-                            work_type: "task",
-                        },
-                        "task" => crate::core::ChatExecutionIntentDecision {
-                            create_task: true,
-                            work_type: if deep_research {
-                                "research"
-                            } else if attachments_present {
-                                "workspace"
-                            } else {
-                                "task"
-                            },
-                        },
-                        _ => {
-                            let agent_guard = agent_ref.read().await;
-                            agent_guard
-                                .classify_chat_execution_intent(
-                                    &channel,
-                                    &message,
-                                    deep_research,
-                                    attachments_present,
-                                )
-                                .await
-                        }
-                    }
-                };
-                if routing.create_task {
-                    let work_type = routing.work_type.to_string();
-                    let description = build_chat_task_description(&message, &work_type);
-                    let mut task = crate::core::Task::new(
-                        description.clone(),
-                        "chat_request".to_string(),
-                        serde_json::json!({
-                            "_task_kind": "chat_request",
-                            "_origin": "chat",
-                            "_execution_mode": normalized_chat_execution_mode(execution_mode.as_deref()),
-                            "_work_type": work_type,
-                            "message": message.clone(),
-                            "channel": channel.clone(),
-                            "conversation_id": conversation_id.clone(),
-                            "project_id": project_id.clone(),
-                            "deep_research": deep_research,
-                            "plan_confirmation_mode": match plan_confirmation_mode {
-                                crate::core::RequestPlanConfirmationMode::BeforeExecution => "before_execution",
-                                crate::core::RequestPlanConfirmationMode::None => "none",
-                            },
-                            "attachments_present": attachments_present,
-                        }),
-                    );
-                    task.status = crate::core::TaskStatus::InProgress;
-                    task.approval = crate::core::TaskApproval::Auto;
-
-                    let add_result = {
-                        let agent_guard = agent_ref.read().await;
-                        agent_guard.add_task(task.clone()).await
-                    };
-
-                    match add_result {
-                        Ok(()) => {
-                            let payload = serde_json::json!({
-                                "task_id": task.id.to_string(),
-                                "description": description,
-                                "status": "in_progress",
-                                "work_type": work_type,
-                                "conversation_id": conversation_id.clone(),
-                                "project_id": project_id.clone(),
-                            });
-                            let event = Event::default()
-                                .event("task_started")
-                                .data(serde_json::to_string(&payload).unwrap_or_default());
-                            let _ = tx.send(Ok(event)).await;
-                            Some(StreamedChatTask {
-                                task,
-                                work_type: work_type.clone(),
-                                user_message_already_recorded: false,
-                            })
-                        }
-                        Err(error) => {
-                            tracing::warn!("Failed to create chat task anchor: {}", error);
-                            None
-                        }
-                    }
-                } else {
-                    None
-                }
-            }
+            ChatStreamTaskMode::CreateIfNeeded => None,
             ChatStreamTaskMode::Existing(task) => {
                 let payload = serde_json::json!({
-                    "task_id": task.task.id.to_string(),
-                    "description": task.task.description.clone(),
+                    "task_id": task.task_id.clone(),
+                    "description": task.description.clone(),
                     "status": "in_progress",
                     "work_type": task.work_type.clone(),
                     "conversation_id": conversation_id.clone(),
@@ -13959,21 +13782,42 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                 Some(*task)
             }
         };
-
-        let mut cancel_rx = if let Some(task) = tracked_task.as_ref() {
-            Some(register_chat_task_cancellation(&app_state, &task.task.id.to_string()).await)
-        } else {
-            None
-        };
+        let tracked_task_ref = Arc::new(RwLock::new(tracked_task));
+        let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+        if let Some(task) = tracked_task_ref.read().await.as_ref() {
+            bind_chat_task_cancellation_sender(&app_state, &task.task_id, cancel_tx.clone()).await;
+        }
 
         // Stream model tokens + tool progress as dedicated SSE events.
         let (stream_tx, mut stream_rx) =
             tokio::sync::mpsc::channel::<crate::core::StreamEvent>(256);
         let stream_forwarder = {
             let tx = tx.clone();
+            let tracked_task_ref = tracked_task_ref.clone();
+            let app_state = app_state.clone();
+            let cancel_tx = cancel_tx.clone();
             tokio::spawn(async move {
                 let mut last_thinking_detail = String::new();
                 while let Some(ev) = stream_rx.recv().await {
+                    if let crate::core::StreamEvent::ChatTaskStarted {
+                        task_id,
+                        description,
+                        work_type,
+                        ..
+                    } = &ev
+                    {
+                        {
+                            let mut tracked = tracked_task_ref.write().await;
+                            *tracked = Some(StreamedChatTask {
+                                task_id: task_id.clone(),
+                                description: description.clone(),
+                                work_type: work_type.clone(),
+                                user_message_already_recorded: false,
+                            });
+                        }
+                        bind_chat_task_cancellation_sender(&app_state, task_id, cancel_tx.clone())
+                            .await;
+                    }
                     let (maybe_event, next_thinking_detail) =
                         normalize_stream_event_for_sse(ev, &last_thinking_detail);
                     last_thinking_detail = next_thinking_detail;
@@ -14102,10 +13946,14 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
         );
         let _ = tx.send(Ok(initial_status)).await;
 
-        let user_message_already_recorded = tracked_task
+        let tracked_task_snapshot = tracked_task_ref.read().await.clone();
+        let user_message_already_recorded = tracked_task_snapshot
             .as_ref()
             .map(|task| task.user_message_already_recorded)
             .unwrap_or(false);
+        let chat_task_id = tracked_task_snapshot
+            .as_ref()
+            .map(|task| task.task_id.clone());
         let mut process_handle = {
             let agent_ref = agent_ref.clone();
             let message = message.clone();
@@ -14113,7 +13961,7 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
             let conversation_id = conversation_id.clone();
             let project_id = project_id.clone();
             let trace_ref = trace_ref.clone();
-            let chat_task_id = tracked_task.as_ref().map(|task| task.task.id.to_string());
+            let chat_task_id = chat_task_id.clone();
             let caller_principal = caller_principal.clone();
             let plan_override = plan_override.clone();
             tokio::spawn(async move {
@@ -14133,6 +13981,7 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                                 caller_principal.as_ref(),
                                 crate::actions::ActionExecutionSurface::Chat,
                                 true,
+                                attachments_present,
                                 plan_confirmation_mode,
                                 plan_override.clone(),
                             ),
@@ -14153,6 +14002,7 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                                 caller_principal.as_ref(),
                                 crate::actions::ActionExecutionSurface::Chat,
                                 true,
+                                attachments_present,
                                 plan_confirmation_mode,
                                 plan_override.clone(),
                             ),
@@ -14163,10 +14013,25 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
         };
 
         let mut was_cancelled = false;
-        let result = if let Some(ref mut cancel_rx) = cancel_rx {
-            tokio::select! {
-                worker = &mut process_handle => {
-                    match worker {
+        let result = tokio::select! {
+            worker = &mut process_handle => {
+                match worker {
+                    Ok(result) => result,
+                    Err(error) if error.is_cancelled() => {
+                        was_cancelled = true;
+                        Err(anyhow::anyhow!("Chat run cancelled"))
+                    }
+                    Err(error) => Err(anyhow::anyhow!("Chat worker failed: {}", error)),
+                }
+            }
+            changed = cancel_rx.changed() => {
+                if changed.is_ok() && *cancel_rx.borrow() {
+                    was_cancelled = true;
+                    process_handle.abort();
+                    let _ = process_handle.await;
+                    Err(anyhow::anyhow!("Chat run cancelled"))
+                } else {
+                    match process_handle.await {
                         Ok(result) => result,
                         Err(error) if error.is_cancelled() => {
                             was_cancelled = true;
@@ -14175,32 +14040,6 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                         Err(error) => Err(anyhow::anyhow!("Chat worker failed: {}", error)),
                     }
                 }
-                changed = cancel_rx.changed() => {
-                    if changed.is_ok() && *cancel_rx.borrow() {
-                        was_cancelled = true;
-                        process_handle.abort();
-                        let _ = process_handle.await;
-                        Err(anyhow::anyhow!("Chat run cancelled"))
-                    } else {
-                        match process_handle.await {
-                            Ok(result) => result,
-                            Err(error) if error.is_cancelled() => {
-                                was_cancelled = true;
-                                Err(anyhow::anyhow!("Chat run cancelled"))
-                            }
-                            Err(error) => Err(anyhow::anyhow!("Chat worker failed: {}", error)),
-                        }
-                    }
-                }
-            }
-        } else {
-            match process_handle.await {
-                Ok(result) => result,
-                Err(error) if error.is_cancelled() => {
-                    was_cancelled = true;
-                    Err(anyhow::anyhow!("Chat run cancelled"))
-                }
-                Err(error) => Err(anyhow::anyhow!("Chat worker failed: {}", error)),
             }
         };
 
@@ -14214,12 +14053,56 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
         let _ = trace_poller.await;
         let _ = stream_forwarder.await;
 
+        let tracked_task = tracked_task_ref.read().await.clone();
+
         if let Some(task) = tracked_task.as_ref() {
-            unregister_chat_task_cancellation(&app_state, &task.task.id.to_string()).await;
+            unregister_chat_task_cancellation(&app_state, &task.task_id).await;
         }
 
         match result {
             Ok(processed) => {
+                let resolved_conversation_id = processed
+                    .conversation_id
+                    .clone()
+                    .or(conversation_id.clone());
+                let updated_arguments_json = if let Some(task) = tracked_task.as_ref() {
+                    let mut tasks = app_state.tasks.write().await;
+                    task.task_id
+                        .parse::<uuid::Uuid>()
+                        .ok()
+                        .and_then(|task_id| tasks.get_mut(task_id))
+                        .and_then(|entry| {
+                            backfill_chat_task_origin_metadata(
+                                entry,
+                                resolved_conversation_id.as_deref(),
+                                project_id.as_deref(),
+                            )
+                        })
+                } else {
+                    None
+                };
+                if let (Some(task), Some(arguments_json)) =
+                    (tracked_task.as_ref(), updated_arguments_json)
+                {
+                    let agent_guard = agent_ref.read().await;
+                    if task.task_id.parse::<uuid::Uuid>().is_err() {
+                        tracing::warn!(
+                            "Failed to parse streamed chat task id '{}' during finalize",
+                            task.task_id
+                        );
+                    }
+                    if let Err(error) = agent_guard
+                        .storage
+                        .update_task(&task.task_id, None, Some(arguments_json), None, None)
+                        .await
+                    {
+                        tracing::warn!(
+                            "Failed to backfill streamed chat task '{}' conversation metadata: {}",
+                            task.task_id,
+                            error
+                        );
+                    }
+                }
                 if let Some(task) = tracked_task.as_ref() {
                     let terminal_status = chat_task_terminal_status(&processed.response);
                     let result_preview = truncate_stream_task_text(
@@ -14232,39 +14115,66 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                     );
                     {
                         let agent_guard = agent_ref.read().await;
-                        if let Err(error) = agent_guard
-                            .finalize_task(
-                                task.task.id,
-                                terminal_status.clone(),
-                                Some(result_preview.clone()),
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                "Failed to finalize streamed chat task '{}': {}",
-                                task.task.id,
-                                error
-                            );
+                        match task.task_id.parse::<uuid::Uuid>() {
+                            Ok(task_uuid) => {
+                                if let Err(error) = agent_guard
+                                    .finalize_task(
+                                        task_uuid,
+                                        terminal_status.clone(),
+                                        Some(result_preview.clone()),
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "Failed to finalize streamed chat task '{}': {}",
+                                        task.task_id,
+                                        error
+                                    );
+                                }
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    "Failed to parse streamed chat task id '{}' during success finalize",
+                                    task.task_id
+                                );
+                            }
                         }
                     }
                     let status_event = Event::default().event("task_status").data(
                         serde_json::json!({
-                            "task_id": task.task.id.to_string(),
-                            "description": task.task.description.clone(),
+                            "task_id": task.task_id.clone(),
+                            "description": task.description.clone(),
                             "status": chat_task_status_key(&terminal_status),
                             "work_type": task.work_type.clone(),
                             "result_preview": result_preview,
-                            "conversation_id": processed.conversation_id.clone().or(conversation_id.clone()),
+                            "conversation_id": resolved_conversation_id.clone(),
                             "project_id": project_id.clone(),
                         })
                         .to_string(),
                     );
                     let _ = tx.send(Ok(status_event)).await;
+                    if deep_research
+                        && matches!(terminal_status, crate::core::TaskStatus::Completed)
+                    {
+                        let title = "Deep research completed";
+                        let body = format!(
+                            "{} is ready. Open Chat to review the completed report.",
+                            processed
+                                .conversation_title
+                                .as_deref()
+                                .filter(|value| !value.trim().is_empty())
+                                .unwrap_or(task.description.as_str())
+                        );
+                        let agent_guard = agent_ref.read().await;
+                        agent_guard
+                            .emit_notification(title, &body, "info", "deep_research")
+                            .await;
+                    }
                 }
 
                 let mut content = serde_json::json!({
                     "content": processed.response,
-                    "conversation_id": processed.conversation_id.or(conversation_id),
+                    "conversation_id": resolved_conversation_id,
                     "run_id": processed.run_id,
                     "run_status": processed.run_status,
                     "trace_id": processed.trace_id,
@@ -14300,43 +14210,53 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                         agent_guard
                             .swarm_activity
                             .interrupt_run(
-                                &task.task.id.to_string(),
+                                &task.task_id,
                                 "Cancelled by user before the delegated run completed.",
                             )
                             .await;
                         if let Err(storage_error) = agent_guard
                             .storage
                             .mark_swarm_run_interrupted(
-                                &task.task.id.to_string(),
+                                &task.task_id,
                                 "Cancelled by user before the delegated run completed.",
                             )
                             .await
                         {
                             tracing::warn!(
                                 "Failed to persist interrupted swarm run '{}' after cancellation: {}",
-                                task.task.id,
+                                task.task_id,
                                 storage_error
                             );
                         }
-                        if let Err(finalize_error) = agent_guard
-                            .finalize_task(
-                                task.task.id,
-                                crate::core::TaskStatus::Cancelled,
-                                Some(result_preview.to_string()),
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                "Failed to finalize cancelled streamed chat task '{}': {}",
-                                task.task.id,
-                                finalize_error
-                            );
+                        match task.task_id.parse::<uuid::Uuid>() {
+                            Ok(task_uuid) => {
+                                if let Err(finalize_error) = agent_guard
+                                    .finalize_task(
+                                        task_uuid,
+                                        crate::core::TaskStatus::Cancelled,
+                                        Some(result_preview.to_string()),
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "Failed to finalize cancelled streamed chat task '{}': {}",
+                                        task.task_id,
+                                        finalize_error
+                                    );
+                                }
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    "Failed to parse streamed chat task id '{}' during cancellation finalize",
+                                    task.task_id
+                                );
+                            }
                         }
                     }
                     let status_event = Event::default().event("task_status").data(
                         serde_json::json!({
-                            "task_id": task.task.id.to_string(),
-                            "description": task.task.description.clone(),
+                            "task_id": task.task_id.clone(),
+                            "description": task.description.clone(),
                             "status": "cancelled",
                             "work_type": task.work_type.clone(),
                             "result_preview": result_preview,
@@ -14369,27 +14289,37 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                     let error_text = error.to_string();
                     {
                         let agent_guard = agent_ref.read().await;
-                        if let Err(finalize_error) = agent_guard
-                            .finalize_task(
-                                task.task.id,
-                                crate::core::TaskStatus::Failed {
-                                    error: error_text.clone(),
-                                },
-                                Some(truncate_stream_task_text(&error_text, 400)),
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                "Failed to finalize failed streamed chat task '{}': {}",
-                                task.task.id,
-                                finalize_error
-                            );
+                        match task.task_id.parse::<uuid::Uuid>() {
+                            Ok(task_uuid) => {
+                                if let Err(finalize_error) = agent_guard
+                                    .finalize_task(
+                                        task_uuid,
+                                        crate::core::TaskStatus::Failed {
+                                            error: error_text.clone(),
+                                        },
+                                        Some(truncate_stream_task_text(&error_text, 400)),
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "Failed to finalize failed streamed chat task '{}': {}",
+                                        task.task_id,
+                                        finalize_error
+                                    );
+                                }
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    "Failed to parse streamed chat task id '{}' during failure finalize",
+                                    task.task_id
+                                );
+                            }
                         }
                     }
                     let status_event = Event::default().event("task_status").data(
                         serde_json::json!({
-                            "task_id": task.task.id.to_string(),
-                            "description": task.task.description.clone(),
+                            "task_id": task.task_id.clone(),
+                            "description": task.description.clone(),
                             "status": "failed",
                             "work_type": task.work_type.clone(),
                             "result_preview": truncate_stream_task_text(&error_text, 400),
@@ -14448,6 +14378,7 @@ struct ResumableChatTaskRequest {
     conversation_id: String,
     project_id: Option<String>,
     deep_research: bool,
+    attachments_present: bool,
     work_type: String,
     stored_plan_override: Option<serde_json::Value>,
     paused_for_plan_confirmation: bool,
@@ -14457,6 +14388,52 @@ struct ResumableChatTaskRequest {
 struct ResumeChatTaskStreamRequest {
     #[serde(default)]
     plan_override: Option<serde_json::Value>,
+}
+
+fn backfill_chat_task_origin_metadata(
+    task: &mut crate::core::Task,
+    conversation_id: Option<&str>,
+    project_id: Option<&str>,
+) -> Option<String> {
+    let mut arguments = task.arguments.as_object().cloned().unwrap_or_default();
+    let mut changed = false;
+
+    if let Some(cid) = conversation_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let current = arguments
+            .get("conversation_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim();
+        if current != cid {
+            arguments.insert(
+                "conversation_id".to_string(),
+                serde_json::json!(cid.to_string()),
+            );
+            changed = true;
+        }
+    }
+
+    if let Some(pid) = project_id.map(str::trim).filter(|value| !value.is_empty()) {
+        let current = arguments
+            .get("project_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim();
+        if current != pid {
+            arguments.insert("project_id".to_string(), serde_json::json!(pid.to_string()));
+            changed = true;
+        }
+    }
+
+    if !changed {
+        return None;
+    }
+
+    task.arguments = serde_json::Value::Object(arguments);
+    serde_json::to_string(&task.arguments).ok()
 }
 
 fn extract_resumable_web_chat_task(
@@ -14579,6 +14556,7 @@ fn extract_resumable_web_chat_task(
         conversation_id,
         project_id,
         deep_research,
+        attachments_present,
         work_type,
         stored_plan_override,
         paused_for_plan_confirmation,
@@ -14643,7 +14621,7 @@ async fn chat_stream(
         }
     }
 
-    // Two-tier secrets UX: allow "set secret KEY=VALUE" without engaging the LLM.
+    // Two-tier secrets UX: allow "/setsecret KEY=VALUE" without engaging the LLM.
     if let Some((key, value)) = parse_set_secret_command(&request.message) {
         let cid = request.conversation_id.clone();
         let (config_dir, data_dir) = {
@@ -14892,15 +14870,13 @@ async fn chat_stream(
             conversation_id: request.conversation_id,
             project_id: request.project_id,
             deep_research: request.deep_research,
+            attachments_present: request.attachments_present,
             plan_confirmation_mode: normalized_chat_plan_confirmation_mode(
                 request.plan_confirmation_mode.as_deref(),
             ),
             plan_override: None,
             caller_principal: maybe_caller.as_ref().map(|Extension(value)| value.clone()),
-            task_mode: ChatStreamTaskMode::CreateIfNeeded {
-                execution_mode: request.execution_mode,
-                attachments_present: request.attachments_present,
-            },
+            task_mode: ChatStreamTaskMode::CreateIfNeeded,
         },
     )
 }
@@ -15024,18 +15000,7 @@ fn automation_run_status_label(status: &crate::core::AutomationRunStatus) -> Str
 }
 
 fn automation_watcher_condition_label(condition: &crate::core::watcher::WatchCondition) -> String {
-    match condition {
-        crate::core::watcher::WatchCondition::NotEmpty => {
-            "Trigger when results are not empty".to_string()
-        }
-        crate::core::watcher::WatchCondition::Contains { keyword } => {
-            format!("Trigger when results contain \"{}\"", keyword)
-        }
-        crate::core::watcher::WatchCondition::Matches { pattern } => {
-            format!("Trigger when results match {}", pattern)
-        }
-        crate::core::watcher::WatchCondition::Custom { description } => description.clone(),
-    }
+    condition.summary()
 }
 
 fn automation_watcher_next_run_at(watcher: &crate::core::watcher::Watcher) -> Option<String> {
@@ -16898,7 +16863,7 @@ async fn create_task(
     let save_result = {
         let agent = state.agent.read().await;
         agent
-            .add_or_update_similar_task(task.clone(), request.allow_duplicate)
+            .add_or_update_similar_task(task.clone(), request.allow_duplicate, None)
             .await
     };
     let (task_id, reused_existing, removed_duplicates) = match save_result {
@@ -17080,7 +17045,11 @@ async fn delete_task(State(state): State<AppState>, Path(id): Path<String>) -> R
 }
 
 /// Approve a task for execution
-async fn approve_task(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+async fn approve_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Option<Json<ApprovalDecisionRequest>>,
+) -> Response {
     let uuid = match uuid::Uuid::parse_str(&id) {
         Ok(v) => v,
         Err(_) => {
@@ -17095,7 +17064,15 @@ async fn approve_task(State(state): State<AppState>, Path(id): Path<String>) -> 
     };
 
     let agent = state.agent.read().await;
-    match agent.approve_task_request(uuid, "api").await {
+    let comment = body
+        .as_ref()
+        .and_then(|payload| payload.0.comment.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match agent
+        .approve_task_request_with_comment(uuid, "api", comment)
+        .await
+    {
         Ok(Some(_)) => (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -17115,7 +17092,11 @@ async fn approve_task(State(state): State<AppState>, Path(id): Path<String>) -> 
 }
 
 /// Reject a task
-async fn reject_task(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+async fn reject_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Option<Json<ApprovalDecisionRequest>>,
+) -> Response {
     let uuid = match uuid::Uuid::parse_str(&id) {
         Ok(v) => v,
         Err(_) => {
@@ -17130,10 +17111,13 @@ async fn reject_task(State(state): State<AppState>, Path(id): Path<String>) -> R
     };
 
     let agent = state.agent.read().await;
-    match agent
-        .reject_task_request(uuid, "api", "Task was rejected and will not be executed.")
-        .await
-    {
+    let comment = body
+        .as_ref()
+        .and_then(|payload| payload.0.comment.as_deref().or(payload.0.reason.as_deref()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Task was rejected and will not be executed.");
+    match agent.reject_task_request(uuid, "api", comment).await {
         Ok(Some(_)) => (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -17432,11 +17416,7 @@ async fn resume_chat_task_stream(
             .clone()
             .or_else(|| resume_request.stored_plan_override.clone());
         if resume_request.paused_for_plan_confirmation {
-            let mut updated_arguments = task
-                .arguments
-                .as_object()
-                .cloned()
-                .unwrap_or_default();
+            let mut updated_arguments = task.arguments.as_object().cloned().unwrap_or_default();
             updated_arguments.remove("_pause_kind");
             if let Some(raw_plan) = effective_plan_override.clone() {
                 let mut preview = updated_arguments
@@ -17486,11 +17466,7 @@ async fn resume_chat_task_stream(
             if let Some(task) = tasks.get_mut(uuid) {
                 *task = previous_task;
             }
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse { error }),
-            )
-                .into_response();
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response();
         }
     };
 
@@ -17530,11 +17506,13 @@ async fn resume_chat_task_stream(
             conversation_id: Some(resume_request.conversation_id),
             project_id: resume_request.project_id,
             deep_research: resume_request.deep_research,
+            attachments_present: resume_request.attachments_present,
             plan_confirmation_mode: crate::core::RequestPlanConfirmationMode::None,
             plan_override: parsed_plan_override,
             caller_principal: maybe_caller.as_ref().map(|Extension(value)| value.clone()),
             task_mode: ChatStreamTaskMode::Existing(Box::new(StreamedChatTask {
-                task: resumed_task,
+                task_id: resumed_task.id.to_string(),
+                description: resumed_task.description.clone(),
                 work_type: resume_request.work_type,
                 user_message_already_recorded: true,
             })),
@@ -17735,14 +17713,90 @@ async fn plan_task(
     }
 }
 
+fn strip_markdown_code_fence(text: &str) -> Option<&str> {
+    let trimmed = text.trim();
+    if !trimmed.starts_with("```") {
+        return None;
+    }
+    let after_ticks = &trimmed[3..];
+    let body_start = after_ticks.find('\n')?;
+    let body = &after_ticks[body_start + 1..];
+    let fence_end = body.rfind("```")?;
+    Some(body[..fence_end].trim())
+}
+
+fn find_json_value_bounds(raw: &str) -> Option<(usize, usize)> {
+    let mut stack: Vec<char> = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (idx, ch) in raw.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' | '[' => {
+                if stack.is_empty() {
+                    start = Some(idx);
+                }
+                stack.push(ch);
+            }
+            '}' => {
+                if stack.last() == Some(&'{') {
+                    stack.pop();
+                    if stack.is_empty() {
+                        if let Some(value_start) = start {
+                            return Some((value_start, idx + ch.len_utf8()));
+                        }
+                    }
+                }
+            }
+            ']' => {
+                if stack.last() == Some(&'[') {
+                    stack.pop();
+                    if stack.is_empty() {
+                        if let Some(value_start) = start {
+                            return Some((value_start, idx + ch.len_utf8()));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
 fn extract_json(text: &str) -> Option<serde_json::Value> {
-    serde_json::from_str::<serde_json::Value>(text)
-        .ok()
-        .or_else(|| {
-            let start = text.find('{')?;
-            let end = text.rfind('}')?;
-            serde_json::from_str::<serde_json::Value>(&text[start..=end]).ok()
-        })
+    for candidate in [Some(text.trim()), strip_markdown_code_fence(text)] {
+        let Some(candidate) = candidate.map(str::trim).filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) {
+            return Some(value);
+        }
+        if let Some((start, end)) = find_json_value_bounds(candidate) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&candidate[start..end]) {
+                return Some(value);
+            }
+        }
+    }
+    None
 }
 
 fn risk_level_label(level: &RiskLevel) -> &'static str {
@@ -18535,7 +18589,7 @@ async fn run_recommended_action(
         approval_task.approval = TaskApproval::RequireApproval;
         approval_task.status = TaskStatus::AwaitingApproval;
         let (task_id, reused_existing, removed_duplicates) = agent
-            .add_or_update_similar_task(approval_task, false)
+            .add_or_update_similar_task(approval_task, false, None)
             .await
             .map_err(|e| e.to_string())?;
         return Ok(serde_json::json!({
@@ -18713,7 +18767,12 @@ fn mask_secret_value(value: &str) -> String {
 fn settings_secret_source_for_custom_key(key: &str) -> &'static str {
     match key {
         "moltbook_api_key" => "moltbook",
-        "search_serper_key" | "search_brave_key" => "search",
+        "search_serper_key"
+        | "search_brave_key"
+        | "search_exa_key"
+        | "search_tavily_key"
+        | "search_perplexity_key"
+        | "search_firecrawl_key" => "search",
         crate::core::observability::OBSERVABILITY_AUTH_TOKEN_SECRET_KEY => "observability",
         _ => "custom",
     }
@@ -19386,9 +19445,7 @@ async fn promote_tool_strategy_candidate_to_baseline(
         .await
 }
 
-async fn rollback_tool_strategy_baseline(
-    storage: &crate::storage::Storage,
-) -> Result<String> {
+async fn rollback_tool_strategy_baseline(storage: &crate::storage::Storage) -> Result<String> {
     storage.rollback_tool_strategy_baseline().await
 }
 
@@ -20924,12 +20981,8 @@ async fn get_evolution_dev(
     };
     let limit = query.limit.unwrap_or(5000).clamp(100, 100_000);
     Json(
-        build_evolution_dev_response(
-            &storage,
-            limit,
-            query.include_superseded.unwrap_or(false),
-        )
-        .await,
+        build_evolution_dev_response(&storage, limit, query.include_superseded.unwrap_or(false))
+            .await,
     )
     .into_response()
 }
@@ -21236,8 +21289,9 @@ async fn run_evolution_dev_action(
                         return (
                             StatusCode::BAD_REQUEST,
                             Json(ErrorResponse {
-                                error: "No matching tool-strategy canary is active for that candidate."
-                                    .to_string(),
+                                error:
+                                    "No matching tool-strategy canary is active for that candidate."
+                                        .to_string(),
                             }),
                         )
                             .into_response();
@@ -21941,10 +21995,13 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
         .flatten()
         .and_then(|b| String::from_utf8(b).ok());
     let data_lifecycle = load_data_lifecycle_settings(&storage).await;
-    let search_cfg = tokio::fs::read_to_string(config_dir.join("search.toml"))
-        .await
-        .ok()
-        .and_then(|c| toml::from_str::<crate::actions::SearchConfig>(&c).ok());
+    let mut search_cfg = Some(crate::runtime::load_persisted_search_config(
+        &config_dir,
+        Some(&data_dir),
+    ));
+    if let Some(cfg) = search_cfg.as_mut() {
+        cfg.ensure_default_chain();
+    }
     let embeddings_cfg = config.embeddings_config();
     let embeddings_provider = match embeddings_cfg.provider {
         EmbeddingsProviderKind::LocalHf => "local-hf",
@@ -22042,23 +22099,6 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
             }
             None => (None, None, None, false),
         };
-
-    let telegram_last_chat_id = storage
-        .get("telegram:last_chat_id")
-        .await
-        .ok()
-        .flatten()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .and_then(|value| value.trim().parse::<i64>().ok())
-        .filter(|chat_id| *chat_id != 0);
-    let whatsapp_last_sender = storage
-        .get("whatsapp:last_sender")
-        .await
-        .ok()
-        .flatten()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
 
     let (
         slack_enabled,
@@ -22253,7 +22293,8 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
                 !tg.bot_token.is_empty() && tg.bot_token != "[ENCRYPTED]",
                 !tg.bot_token.is_empty()
                     && tg.bot_token != "[ENCRYPTED]"
-                    && (telegram_last_chat_id.is_some() || !tg.allowed_users.is_empty()),
+                    && tg.allowed_users.len() == 1
+                    && tg.allowed_users.first().copied().unwrap_or_default() != 0,
             ),
             None => (false, vec![], false, false),
         };
@@ -22280,10 +22321,7 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
             let bridge_runtime = wa.bridge_runtime();
             let inbound_ready = match wa.mode {
                 crate::channels::whatsapp::WhatsAppMode::CloudApi => {
-                    has_token
-                        && has_app_secret
-                        && !wa.phone_number_id.trim().is_empty()
-                        && has_verify_token
+                    has_token && !wa.phone_number_id.trim().is_empty()
                 }
                 crate::channels::whatsapp::WhatsAppMode::Baileys => match bridge_runtime {
                     crate::channels::whatsapp::WhatsAppBridgeRuntime::Embedded => true,
@@ -22312,7 +22350,8 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
                 has_app_secret,
                 has_verify_token,
                 has_bridge_token,
-                inbound_ready && whatsapp_last_sender.is_some(),
+                inbound_ready
+                    && crate::channels::whatsapp::configured_notification_recipient(wa).is_some(),
             )
         }
         None => (
@@ -22502,10 +22541,11 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
             ),
         };
 
-    // Settings are complete if name is set AND at least one non-default LLM is configured.
+    // Settings are complete if name is set AND at least one usable chat model is configured.
     let has_legacy_llm = settings_has_configured_legacy_llm(&config, has_key);
     let has_model_pool = !config.model_pool.slots.is_empty();
-    let settings_complete = !config.name.trim().is_empty() && (has_legacy_llm || has_model_pool);
+    let settings_complete =
+        !config.name.trim().is_empty() && crate::core::chat_model_is_configured(&config);
 
     // Build model pool summary
     let model_pool_summary: Vec<ModelSlotSummary> = config
@@ -22585,6 +22625,17 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
         llm_fallback_model: fallback_model,
         llm_fallback_base_url: fallback_base_url,
         has_fallback_api_key: has_fallback_key,
+        default_model_input_mode: model_input_privacy_mode_label(
+            config.model_privacy.default_model_input_mode,
+        )
+        .to_string(),
+        current_chat_pii_policy: current_chat_pii_policy_label(
+            config.model_privacy.current_chat_pii_policy,
+        )
+        .to_string(),
+        request_scoped_sensitive_approval_enabled: config
+            .model_privacy
+            .request_scoped_sensitive_approval_enabled,
         model_pool: model_pool_summary,
         smart_routing: config.model_pool.smart_routing,
         embeddings_provider,
@@ -22690,18 +22741,10 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
         qq_default_target_id,
         qq_delivery_ready,
         auto_approve: crate::core::config::sanitize_auto_approve_actions(&config.auto_approve),
-        search_primary: search_cfg
+        search_provider_order: search_cfg
             .as_ref()
-            .and_then(|c| c.primary.clone())
-            .unwrap_or("lightpanda".to_string()),
-        search_fallback1: search_cfg
-            .as_ref()
-            .and_then(|c| c.fallback1.clone())
-            .unwrap_or("duckduckgo".to_string()),
-        search_fallback2: search_cfg
-            .as_ref()
-            .and_then(|c| c.fallback2.clone())
-            .unwrap_or("none".to_string()),
+            .map(|cfg| cfg.provider_order.clone())
+            .unwrap_or_default(),
         search_serper_configured: search_cfg
             .as_ref()
             .map(|cfg| cfg.serper.is_some())
@@ -22710,6 +22753,30 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
             .as_ref()
             .map(|cfg| cfg.brave.is_some())
             .unwrap_or(false),
+        search_exa_configured: search_cfg
+            .as_ref()
+            .map(|cfg| cfg.exa.is_some())
+            .unwrap_or(false),
+        search_tavily_configured: search_cfg
+            .as_ref()
+            .map(|cfg| cfg.tavily.is_some())
+            .unwrap_or(false),
+        search_perplexity_configured: search_cfg
+            .as_ref()
+            .map(|cfg| cfg.perplexity.is_some())
+            .unwrap_or(false),
+        search_firecrawl_configured: search_cfg
+            .as_ref()
+            .map(|cfg| cfg.firecrawl.is_some())
+            .unwrap_or(false),
+        search_searxng_base_url: search_cfg
+            .as_ref()
+            .and_then(|cfg| match cfg.searxng.as_ref() {
+                Some(crate::actions::SearchBackend::Searxng { base_url }) => Some(base_url.clone()),
+                _ => None,
+            })
+            .unwrap_or_default(),
+        search_builtin_cooldown_hours: 24,
         settings_complete,
         moltbook_enabled: moltbook_settings.enabled,
         moltbook_mode: moltbook_settings.mode,
@@ -23026,11 +23093,20 @@ async fn update_settings(
     State(state): State<AppState>,
     Json(settings): Json<SettingsUpdate>,
 ) -> Response {
-    let search_primary = settings.search_primary.clone();
-    let search_fallback1 = settings.search_fallback1.clone();
-    let search_fallback2 = settings.search_fallback2.clone();
+    let search_provider_order = settings.search_provider_order.clone();
     let search_serper_key = settings.search_serper_key.clone();
+    let clear_search_serper_key = settings.clear_search_serper_key.unwrap_or(false);
     let search_brave_key = settings.search_brave_key.clone();
+    let clear_search_brave_key = settings.clear_search_brave_key.unwrap_or(false);
+    let search_exa_key = settings.search_exa_key.clone();
+    let clear_search_exa_key = settings.clear_search_exa_key.unwrap_or(false);
+    let search_tavily_key = settings.search_tavily_key.clone();
+    let clear_search_tavily_key = settings.clear_search_tavily_key.unwrap_or(false);
+    let search_perplexity_key = settings.search_perplexity_key.clone();
+    let clear_search_perplexity_key = settings.clear_search_perplexity_key.unwrap_or(false);
+    let search_firecrawl_key = settings.search_firecrawl_key.clone();
+    let clear_search_firecrawl_key = settings.clear_search_firecrawl_key.unwrap_or(false);
+    let search_searxng_base_url = settings.search_searxng_base_url.clone();
     let moltbook_api_key = settings.moltbook_api_key.clone();
     let observability_auth_token = settings
         .observability
@@ -23769,8 +23845,7 @@ async fn update_settings(
                     Err(_) => String::new(),
                 };
             }
-            if llm_provider_id != "ollama"
-                && llm_provider_id != "openai-compatible"
+            if llm_provider_requires_api_key(llm_provider_id)
                 && api_key_for_provider.trim().is_empty()
             {
                 return (
@@ -23892,6 +23967,18 @@ async fn update_settings(
                             .unwrap_or_default(),
                         Err(_) => String::new(),
                     };
+                }
+                if llm_provider_requires_api_key(fb_provider_id)
+                    && resolved_fallback_api_key.trim().is_empty()
+                {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "Fallback API key is required for the selected provider"
+                                .to_string(),
+                        }),
+                    )
+                        .into_response();
                 }
                 let fallback_compat_base_url =
                     match normalize_openai_base_url(fb_provider_id, fallback_base_url.clone()) {
@@ -25137,6 +25224,32 @@ async fn update_settings(
         if let Some(v) = settings.smart_routing {
             agent_guard.config.model_pool.smart_routing = v;
         }
+        if let Some(mode) = settings.default_model_input_mode.as_ref() {
+            let parsed_mode = match parse_model_input_privacy_mode(mode) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error }))
+                        .into_response();
+                }
+            };
+            agent_guard.config.model_privacy.default_model_input_mode = parsed_mode;
+        }
+        if let Some(policy) = settings.current_chat_pii_policy.as_ref() {
+            let parsed_policy = match parse_current_chat_pii_policy(policy) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error }))
+                        .into_response();
+                }
+            };
+            agent_guard.config.model_privacy.current_chat_pii_policy = parsed_policy;
+        }
+        if let Some(enabled) = settings.request_scoped_sensitive_approval_enabled {
+            agent_guard
+                .config
+                .model_privacy
+                .request_scoped_sensitive_approval_enabled = enabled;
+        }
         if let Some(mode) = settings.deployment_mode.as_ref() {
             let normalized = mode.trim().to_ascii_lowercase();
             let parsed_mode = match normalized.as_str() {
@@ -25325,11 +25438,20 @@ async fn update_settings(
 
         // Runtime media provider syncing is done after lock release.
 
-        if search_primary.is_some()
-            || search_fallback1.is_some()
-            || search_fallback2.is_some()
+        if search_provider_order.is_some()
             || search_serper_key.is_some()
+            || clear_search_serper_key
             || search_brave_key.is_some()
+            || clear_search_brave_key
+            || search_exa_key.is_some()
+            || clear_search_exa_key
+            || search_tavily_key.is_some()
+            || clear_search_tavily_key
+            || search_perplexity_key.is_some()
+            || clear_search_perplexity_key
+            || search_firecrawl_key.is_some()
+            || clear_search_firecrawl_key
+            || search_searxng_base_url.is_some()
         {
             deferred_search_config_dir = Some(agent_guard.config_dir.clone());
         }
@@ -25343,7 +25465,17 @@ async fn update_settings(
             && (observability_auth_token.is_some()
                 || moltbook_api_key.is_some()
                 || search_serper_key.is_some()
-                || search_brave_key.is_some())
+                || clear_search_serper_key
+                || search_brave_key.is_some()
+                || clear_search_brave_key
+                || search_exa_key.is_some()
+                || clear_search_exa_key
+                || search_tavily_key.is_some()
+                || clear_search_tavily_key
+                || search_perplexity_key.is_some()
+                || clear_search_perplexity_key
+                || search_firecrawl_key.is_some()
+                || clear_search_firecrawl_key)
         {
             let manager = crate::core::config::SecureConfigManager::new_with_data_dir(
                 &agent_guard.config_dir,
@@ -25381,6 +25513,8 @@ async fn update_settings(
                                 api_key.trim().to_string(),
                             );
                         }
+                    } else if clear_search_serper_key {
+                        custom.remove("search_serper_key");
                     }
                     if let Some(api_key) = search_brave_key.as_ref() {
                         if api_key.trim().is_empty() {
@@ -25389,6 +25523,53 @@ async fn update_settings(
                             custom
                                 .insert("search_brave_key".to_string(), api_key.trim().to_string());
                         }
+                    } else if clear_search_brave_key {
+                        custom.remove("search_brave_key");
+                    }
+                    if let Some(api_key) = search_exa_key.as_ref() {
+                        if api_key.trim().is_empty() {
+                            custom.remove("search_exa_key");
+                        } else {
+                            custom.insert("search_exa_key".to_string(), api_key.trim().to_string());
+                        }
+                    } else if clear_search_exa_key {
+                        custom.remove("search_exa_key");
+                    }
+                    if let Some(api_key) = search_tavily_key.as_ref() {
+                        if api_key.trim().is_empty() {
+                            custom.remove("search_tavily_key");
+                        } else {
+                            custom.insert(
+                                "search_tavily_key".to_string(),
+                                api_key.trim().to_string(),
+                            );
+                        }
+                    } else if clear_search_tavily_key {
+                        custom.remove("search_tavily_key");
+                    }
+                    if let Some(api_key) = search_perplexity_key.as_ref() {
+                        if api_key.trim().is_empty() {
+                            custom.remove("search_perplexity_key");
+                        } else {
+                            custom.insert(
+                                "search_perplexity_key".to_string(),
+                                api_key.trim().to_string(),
+                            );
+                        }
+                    } else if clear_search_perplexity_key {
+                        custom.remove("search_perplexity_key");
+                    }
+                    if let Some(api_key) = search_firecrawl_key.as_ref() {
+                        if api_key.trim().is_empty() {
+                            custom.remove("search_firecrawl_key");
+                        } else {
+                            custom.insert(
+                                "search_firecrawl_key".to_string(),
+                                api_key.trim().to_string(),
+                            );
+                        }
+                    } else if clear_search_firecrawl_key {
+                        custom.remove("search_firecrawl_key");
                     }
                     Ok(())
                 })
@@ -25463,11 +25644,7 @@ async fn update_settings(
     }
 
     if let Some(config_dir) = deferred_search_config_dir.as_ref() {
-        let mut search_config = tokio::fs::read_to_string(config_dir.join("search.toml"))
-            .await
-            .ok()
-            .and_then(|c| toml::from_str::<crate::actions::SearchConfig>(&c).ok())
-            .unwrap_or_default();
+        let mut search_config = crate::runtime::load_persisted_search_config(config_dir, None);
 
         if let Some(key) = &search_serper_key {
             search_config.serper = if key.trim().is_empty() {
@@ -25477,6 +25654,8 @@ async fn update_settings(
                     api_key: String::new(),
                 })
             };
+        } else if clear_search_serper_key {
+            search_config.serper = None;
         }
         if let Some(key) = &search_brave_key {
             search_config.brave = if key.trim().is_empty() {
@@ -25486,31 +25665,87 @@ async fn update_settings(
                     api_key: String::new(),
                 })
             };
+        } else if clear_search_brave_key {
+            search_config.brave = None;
+        }
+        if let Some(key) = &search_exa_key {
+            search_config.exa = if key.trim().is_empty() {
+                None
+            } else {
+                Some(crate::actions::SearchBackend::Exa {
+                    api_key: String::new(),
+                })
+            };
+        } else if clear_search_exa_key {
+            search_config.exa = None;
+        }
+        if let Some(key) = &search_tavily_key {
+            search_config.tavily = if key.trim().is_empty() {
+                None
+            } else {
+                Some(crate::actions::SearchBackend::Tavily {
+                    api_key: String::new(),
+                })
+            };
+        } else if clear_search_tavily_key {
+            search_config.tavily = None;
+        }
+        if let Some(key) = &search_perplexity_key {
+            search_config.perplexity = if key.trim().is_empty() {
+                None
+            } else {
+                Some(crate::actions::SearchBackend::Perplexity {
+                    api_key: String::new(),
+                })
+            };
+        } else if clear_search_perplexity_key {
+            search_config.perplexity = None;
+        }
+        if let Some(key) = &search_firecrawl_key {
+            search_config.firecrawl = if key.trim().is_empty() {
+                None
+            } else {
+                Some(crate::actions::SearchBackend::Firecrawl {
+                    api_key: String::new(),
+                })
+            };
+        } else if clear_search_firecrawl_key {
+            search_config.firecrawl = None;
+        }
+        if let Some(base_url) = &search_searxng_base_url {
+            let normalized = base_url.trim().trim_end_matches('/').to_string();
+            search_config.searxng = if normalized.is_empty() {
+                None
+            } else {
+                Some(crate::actions::SearchBackend::Searxng {
+                    base_url: normalized,
+                })
+            };
         }
 
-        let all_backends = [
-            search_primary.as_deref(),
-            search_fallback1.as_deref(),
-            search_fallback2.as_deref(),
-        ];
-        if all_backends.iter().any(|b| b == &Some("playwright"))
-            && search_config.playwright.is_none()
+        if let Some(order) = &search_provider_order {
+            search_config.provider_order = order
+                .iter()
+                .filter_map(|value| {
+                    let normalized = value.trim().to_ascii_lowercase();
+                    if normalized.is_empty() {
+                        None
+                    } else {
+                        Some(normalized)
+                    }
+                })
+                .collect();
+        }
+
+        search_config.primary = None;
+        search_config.fallback1 = None;
+        search_config.fallback2 = None;
+        search_config.ensure_default_chain();
+
+        if let Err(e) =
+            crate::runtime::save_persisted_search_config(config_dir, None, &search_config)
         {
-            let bridge_url = std::env::var("PLAYWRIGHT_BRIDGE_URL")
-                .unwrap_or("http://127.0.0.1:3100".to_string());
-            search_config.playwright =
-                Some(crate::actions::SearchBackend::Playwright { bridge_url });
-        }
-
-        search_config.primary = search_primary.clone();
-        search_config.fallback1 = search_fallback1.clone();
-        search_config.fallback2 = search_fallback2.clone();
-
-        let search_path = config_dir.join("search.toml");
-        if let Ok(content) = toml::to_string_pretty(&search_config) {
-            if let Err(e) = tokio::fs::write(&search_path, content).await {
-                tracing::warn!("Failed to save search config: {}", e);
-            }
+            tracing::warn!("Failed to save search config: {}", e);
         }
     }
 
@@ -26453,11 +26688,11 @@ fn collect_model_catalog_rows(body: &serde_json::Value) -> Vec<serde_json::Value
 
 fn filter_openai_chat_model_ids(ids: &mut Vec<String>) {
     ids.retain(|id| {
-        (id.starts_with("gpt-")
-            || id.starts_with("o1")
-            || id.starts_with("o3")
-            || id.starts_with("o4")
-            || id.starts_with("chatgpt-"))
+        let is_o_series = id
+            .strip_prefix('o')
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(|ch| ch.is_ascii_digit());
+        (id.starts_with("gpt-") || is_o_series || id.starts_with("chatgpt-"))
             && !id.contains("codex")
             && !id.contains("realtime")
             && !id.contains("audio")
@@ -26470,28 +26705,6 @@ fn filter_openai_chat_model_ids(ids: &mut Vec<String>) {
     });
     ids.sort();
     ids.dedup();
-    ids.sort_by(|a, b| {
-        let rank = |s: &str| -> u8 {
-            if s.contains("5.2") {
-                0
-            } else if s.contains("5.1") {
-                1
-            } else if s.starts_with("gpt-5") && !s.contains('.') {
-                2
-            } else if s.starts_with("o4") {
-                3
-            } else if s.starts_with("o3") {
-                4
-            } else if s.contains("4.1") {
-                5
-            } else if s.contains("4o") {
-                6
-            } else {
-                10
-            }
-        };
-        rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
-    });
 }
 
 async fn fetch_openai_catalog_models(
@@ -27000,6 +27213,15 @@ async fn update_model(
                 }
             }
         }
+        let existing_key =
+            match can_reuse_model_slot_api_key(&agent.config.model_pool.slots[idx], &request) {
+                Ok(true) => existing_key,
+                Ok(false) => None,
+                Err(error) => {
+                    return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error }))
+                        .into_response();
+                }
+            };
         let provider = match provider_from_model_slot_request(&request, existing_key).await {
             Ok(provider) => provider,
             Err(error) => {
@@ -27485,6 +27707,8 @@ async fn swarm_list_agents(State(state): State<AppState>) -> Response {
                         }
                         LlmProvider::Ollama { base_url, .. } => Some(base_url.clone()),
                     };
+                    let access_scope =
+                        crate::core::swarm::persistence::parse_access_scope(Some(&a.access_scope));
                     let live = live_by_id.get(&a.id);
                     let recent_activity = recent_by_agent_id.get(&a.id);
                     let display_name =
@@ -27503,6 +27727,7 @@ async fn swarm_list_agents(State(state): State<AppState>) -> Response {
                             .map(|cap| cap.description)
                             .collect::<Vec<_>>(),
                         "system_prompt": a.system_prompt,
+                        "access_scope": access_scope,
                         "enabled": a.enabled == 1,
                         "status": live
                             .map(|info| format!("{:?}", info.status))
@@ -27547,6 +27772,96 @@ pub struct AddSwarmAgentRequest {
     pub system_prompt: Option<String>,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub access_scope: crate::core::swarm::AgentAccessScope,
+}
+
+#[derive(Debug, Deserialize)]
+struct SwarmAgentDraftRequest {
+    pub description: String,
+    #[serde(default)]
+    pub model_profile_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SwarmAgentDraftResponse {
+    pub name: String,
+    pub agent_type: String,
+    pub capabilities: Vec<String>,
+    pub system_prompt: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SwarmAgentAccessPlanRequest {
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub agent_type: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub system_prompt: String,
+    #[serde(default)]
+    pub access_scope: crate::core::swarm::AgentAccessScope,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SwarmAgentAccessPlanAction {
+    pub name: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SwarmAgentAccessPlanDetail {
+    pub action_name: String,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permission_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SwarmAgentAccessPlanGroup {
+    pub id: String,
+    pub scope_field: String,
+    pub label: String,
+    pub summary: String,
+    pub reason: String,
+    pub review_band: String,
+    pub selection_mode: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggested_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub details: Vec<SwarmAgentAccessPlanDetail>,
+}
+
+#[derive(Debug, Serialize)]
+struct SwarmAgentAccessPlanResponse {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub implicit_access: Vec<SwarmAgentAccessPlanGroup>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requested_access: Vec<SwarmAgentAccessPlanGroup>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggested_actions: Vec<SwarmAgentAccessPlanAction>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+fn resolve_swarm_draft_client(
+    agent: &Agent,
+    requested_model_profile_id: Option<&str>,
+) -> crate::core::LlmClient {
+    if let Some(slot_index) = requested_model_profile_id
+        .and_then(|value| resolve_model_slot_index(&agent.config.model_pool.slots, value))
+    {
+        if let Some(slot) = agent.config.model_pool.slots.get(slot_index) {
+            if let Some((_, client)) = agent.model_pool.get(&slot.id) {
+                return client.clone();
+            }
+        }
+    }
+    agent.llm.clone()
 }
 
 fn build_swarm_agent_spec(
@@ -27612,10 +27927,718 @@ fn build_swarm_agent_spec(
         capabilities: crate::core::swarm::persistence::capability_strings_to_models(
             &request.capabilities,
         ),
+        access_scope: request.access_scope.clone().normalized(),
         enabled: true,
     };
 
     Ok((llm_provider, specialist_config))
+}
+
+#[derive(Debug, Clone)]
+struct AccessPlanGroupAccumulator {
+    scope_field: String,
+    label: String,
+    summary: String,
+    review_band: String,
+    selection_mode: String,
+    suggested_ids: Vec<String>,
+    reasons: Vec<String>,
+    details: Vec<SwarmAgentAccessPlanDetail>,
+}
+
+fn title_case_access_label(value: &str) -> String {
+    value
+        .split(['_', '-', ' '])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let lower = part.to_ascii_lowercase();
+            match lower.as_str() {
+                "ssh" => "SSH".to_string(),
+                "mcp" => "MCP".to_string(),
+                "api" => "API".to_string(),
+                other => {
+                    let mut chars = other.chars();
+                    match chars.next() {
+                        Some(first) => {
+                            format!("{}{}", first.to_ascii_uppercase(), chars.as_str())
+                        }
+                        None => String::new(),
+                    }
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn access_permission_label(permission_id: &str) -> String {
+    match permission_id.trim().to_ascii_lowercase().as_str() {
+        "code_execute" => "Code execution".to_string(),
+        "shell" => "Shell commands".to_string(),
+        "file_write" => "File writes".to_string(),
+        "scheduler" => "Task scheduling".to_string(),
+        "local_network_discovery" => "Local network discovery".to_string(),
+        "browser_auto" => "Browser automation".to_string(),
+        "app_hosting" => "App hosting".to_string(),
+        "messaging_send" => "Messaging send".to_string(),
+        "broad_network" => "Broad network actions".to_string(),
+        "ssh" => "SSH execution".to_string(),
+        "gmail" => "Gmail access".to_string(),
+        "calendar_write" => "Calendar write".to_string(),
+        "google_workspace_command" => "Workspace command execution".to_string(),
+        "watcher" => "Background watchers".to_string(),
+        "capability_acquire" => "Capability acquisition".to_string(),
+        other => title_case_access_label(other),
+    }
+}
+
+fn access_scope_group_meta(
+    scope_field: &str,
+    selection_mode: &str,
+) -> (&'static str, &'static str, &'static str) {
+    match scope_field {
+        "approved_permission_ids" => (
+            "Permission approval",
+            "Approve this elevated capability for the agent.",
+            "elevated",
+        ),
+        "integration_ids" => (
+            "Integrations",
+            "Attach the integration(s) this agent needs.",
+            "elevated",
+        ),
+        "mcp_server_ids" => (
+            "MCP servers",
+            "Attach only the MCP servers this agent should use.",
+            "elevated",
+        ),
+        "custom_api_ids" => (
+            "Custom APIs",
+            "Attach only the custom APIs this agent should use.",
+            "elevated",
+        ),
+        "ssh_connection_names" => (
+            "SSH connections",
+            "Attach the SSH connections this agent may use.",
+            "elevated",
+        ),
+        "channel_ids" => (
+            "Messaging channels",
+            "Attach the delivery channels this agent may use.",
+            "elevated",
+        ),
+        _ if selection_mode == "toggle" => (
+            "Permission approval",
+            "Approve this elevated capability for the agent.",
+            "elevated",
+        ),
+        _ => (
+            "Access",
+            "Review and attach the requested access.",
+            "elevated",
+        ),
+    }
+}
+
+fn push_access_group(
+    groups: &mut HashMap<String, AccessPlanGroupAccumulator>,
+    key: String,
+    scope_field: &str,
+    selection_mode: &str,
+    label: String,
+    reason: String,
+    suggested_ids: Vec<String>,
+    detail: Option<SwarmAgentAccessPlanDetail>,
+) {
+    let (_, summary, review_band) = access_scope_group_meta(scope_field, selection_mode);
+    let entry = groups
+        .entry(key)
+        .or_insert_with(|| AccessPlanGroupAccumulator {
+            scope_field: scope_field.to_string(),
+            label,
+            summary: summary.to_string(),
+            review_band: review_band.to_string(),
+            selection_mode: selection_mode.to_string(),
+            suggested_ids: Vec::new(),
+            reasons: Vec::new(),
+            details: Vec::new(),
+        });
+    if !reason.trim().is_empty() && !entry.reasons.iter().any(|value| value == &reason) {
+        entry.reasons.push(reason);
+    }
+    for suggested_id in suggested_ids {
+        let normalized = suggested_id.trim().to_string();
+        if !normalized.is_empty() && !entry.suggested_ids.iter().any(|value| value == &normalized) {
+            entry.suggested_ids.push(normalized);
+        }
+    }
+    if let Some(detail) = detail {
+        if !entry.details.iter().any(|existing| {
+            existing.action_name == detail.action_name
+                && existing.reason == detail.reason
+                && existing.permission_ids == detail.permission_ids
+        }) {
+            entry.details.push(detail);
+        }
+    }
+}
+
+fn finalize_access_groups(
+    mut groups: Vec<AccessPlanGroupAccumulator>,
+) -> Vec<SwarmAgentAccessPlanGroup> {
+    groups.sort_by(|left, right| {
+        left.scope_field
+            .cmp(&right.scope_field)
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    groups
+        .into_iter()
+        .map(|mut group| {
+            group.suggested_ids.sort();
+            group.suggested_ids.dedup();
+            group.details.sort_by(|left, right| {
+                left.action_name
+                    .cmp(&right.action_name)
+                    .then_with(|| left.reason.cmp(&right.reason))
+            });
+            let reason = if group.reasons.is_empty() {
+                group.summary.clone()
+            } else {
+                group.reasons.join(" ")
+            };
+            SwarmAgentAccessPlanGroup {
+                id: format!(
+                    "{}:{}",
+                    group.scope_field,
+                    group
+                        .suggested_ids
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| group.label.to_ascii_lowercase().replace(' ', "_"))
+                ),
+                scope_field: group.scope_field,
+                label: group.label,
+                summary: group.summary,
+                reason,
+                review_band: group.review_band,
+                selection_mode: group.selection_mode,
+                suggested_ids: group.suggested_ids,
+                details: group.details,
+            }
+        })
+        .collect()
+}
+
+fn fallback_access_plan_actions(
+    spec_summary: &str,
+    actions: &[crate::actions::ActionDef],
+) -> Vec<SwarmAgentAccessPlanAction> {
+    let _ = (spec_summary, actions);
+    Vec::new()
+}
+
+async fn swarm_agent_builder_options(State(state): State<AppState>) -> Response {
+    fn builder_status_looks_usable(status: &str) -> bool {
+        let normalized = status.trim().to_ascii_lowercase();
+        !matches!(
+            normalized.as_str(),
+            "disabled"
+                | "not_configured"
+                | "missing_config"
+                | "missing_token"
+                | "offline"
+                | "unavailable"
+                | "disconnected"
+                | "error"
+                | "failed"
+        )
+    }
+
+    let agent = state.agent.read().await;
+    let mcp_servers = {
+        let registry = agent.mcp.read().await;
+        match registry.list_servers(true).await {
+            Ok(items) => items,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to load MCP servers: {}", error),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    };
+    let ssh_connections = match crate::actions::ssh::list_connections(&agent.config_dir) {
+        Ok(items) => items,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to load SSH connections: {}", error),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let custom_apis = match crate::custom_apis::list_custom_apis(
+        &agent.storage,
+        &agent.config_dir,
+        &agent.data_dir,
+    )
+    .await
+    {
+        Ok(items) => items,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to load custom APIs: {}", error),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let integrations = integrations::collect_integrations(&agent)
+        .await
+        .into_iter()
+        .filter(|integration| {
+            integration.enabled && builder_status_looks_usable(&integration.status)
+        })
+        .collect::<Vec<_>>();
+    let channels: Vec<crate::core::GatewayChannelDescriptor> =
+        match crate::core::load_gateway_channels(&agent.storage, &agent.config).await {
+            Ok(payload) => payload
+                .channels
+                .into_iter()
+                .filter(|channel| {
+                    channel.enabled
+                        && channel.configured
+                        && builder_status_looks_usable(&channel.status)
+                })
+                .collect(),
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to load messaging channels: {}", error),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+    let custom_api_payload: Vec<serde_json::Value> = custom_apis
+        .into_iter()
+        .map(|api| {
+            serde_json::json!({
+                "id": api.config.id,
+                "name": api.config.name,
+                "base_url": api.config.base_url,
+                "enabled": api.config.enabled,
+                "action_count": api.action_count,
+                "secret_configured": api.secret_configured,
+            })
+        })
+        .collect();
+    let channel_payload: Vec<serde_json::Value> = channels
+        .into_iter()
+        .map(|channel| {
+            serde_json::json!({
+                "id": channel.id,
+                "name": channel.name,
+                "kind": channel.kind,
+                "status": channel.status,
+                "enabled": channel.enabled,
+                "configured": channel.configured,
+                "account_count": channel.account_count,
+                "connected_account_count": channel.connected_account_count,
+            })
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "mcp_servers": mcp_servers,
+            "ssh_connections": ssh_connections,
+            "custom_apis": custom_api_payload,
+            "integrations": integrations,
+            "channels": channel_payload,
+        })),
+    )
+        .into_response()
+}
+
+async fn swarm_agent_access_plan(
+    State(state): State<AppState>,
+    Json(request): Json<SwarmAgentAccessPlanRequest>,
+) -> Response {
+    let spec_summary = vec![
+        format!("name: {}", request.name.trim()),
+        format!("role: {}", request.agent_type.trim()),
+        format!(
+            "description: {}",
+            request
+                .description
+                .trim()
+                .replace('\r', " ")
+                .replace('\n', " ")
+        ),
+        format!(
+            "capabilities: {}",
+            request
+                .capabilities
+                .iter()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        format!(
+            "system_prompt: {}",
+            request
+                .system_prompt
+                .trim()
+                .replace('\r', " ")
+                .replace('\n', " ")
+        ),
+    ]
+    .join("\n");
+
+    let agent = state.agent.read().await;
+    let actions = match agent.runtime.list_actions().await {
+        Ok(actions) => actions,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to load action catalog: {}", error),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let action_scope_hints = match agent.runtime.list_action_scope_hints().await {
+        Ok(hints) => hints,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to load action scope hints: {}", error),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let mut catalog_by_name: HashMap<String, crate::actions::ActionDef> = HashMap::new();
+    for action in &actions {
+        catalog_by_name.insert(action.name.clone(), action.clone());
+    }
+
+    let suggested_actions = fallback_access_plan_actions(&spec_summary, &actions);
+    let notes = Vec::new();
+
+    let mut implicit_groups: HashMap<String, AccessPlanGroupAccumulator> = HashMap::new();
+    let mut requested_groups: HashMap<String, AccessPlanGroupAccumulator> = HashMap::new();
+
+    for action_plan in &suggested_actions {
+        let Some(action) = catalog_by_name.get(&action_plan.name) else {
+            continue;
+        };
+        let detail = SwarmAgentAccessPlanDetail {
+            action_name: action.name.clone(),
+            reason: action_plan.reason.clone(),
+            permission_ids: crate::runtime::ActionRuntime::action_required_agent_permission_ids(
+                action,
+            ),
+        };
+
+        let safe_permissions =
+            crate::security::ActionGuard::permissions_from_capabilities(&action.capabilities)
+                .into_iter()
+                .filter(|permission| {
+                    crate::security::ActionGuard::permission_risk(permission)
+                        == crate::security::action_guard::PermissionRisk::Safe
+                        && !matches!(
+                            permission,
+                            crate::security::action_guard::Permission::Custom(_)
+                        )
+                })
+                .map(|permission| permission.to_string())
+                .collect::<Vec<_>>();
+        for permission_id in safe_permissions {
+            push_access_group(
+                &mut implicit_groups,
+                format!("approved_permission_ids:{}", permission_id),
+                "approved_permission_ids",
+                "toggle",
+                access_permission_label(&permission_id),
+                format!(
+                    "{} can stay implicit for this agent.",
+                    access_permission_label(&permission_id)
+                ),
+                vec![permission_id],
+                Some(detail.clone()),
+            );
+        }
+
+        for permission_id in
+            crate::runtime::ActionRuntime::action_required_agent_permission_ids(action)
+        {
+            push_access_group(
+                &mut requested_groups,
+                format!("approved_permission_ids:{}", permission_id),
+                "approved_permission_ids",
+                "toggle",
+                access_permission_label(&permission_id),
+                format!("{} requested this elevated capability.", action_plan.name),
+                vec![permission_id],
+                Some(detail.clone()),
+            );
+        }
+
+        let hint = action_scope_hints
+            .get(&action.name)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(server_id) = hint.mcp_server_id {
+            push_access_group(
+                &mut requested_groups,
+                "mcp_server_ids".to_string(),
+                "mcp_server_ids",
+                "exact",
+                "MCP servers".to_string(),
+                format!("{} needs a specific MCP server.", action_plan.name),
+                vec![server_id],
+                Some(detail.clone()),
+            );
+        }
+        if let Some(api_id) = hint.custom_api_id {
+            push_access_group(
+                &mut requested_groups,
+                "custom_api_ids".to_string(),
+                "custom_api_ids",
+                "exact",
+                "Custom APIs".to_string(),
+                format!("{} needs a custom API binding.", action_plan.name),
+                vec![api_id],
+                Some(detail.clone()),
+            );
+        }
+        if !hint.integration_ids.is_empty() {
+            push_access_group(
+                &mut requested_groups,
+                "integration_ids".to_string(),
+                "integration_ids",
+                "exact",
+                "Integrations".to_string(),
+                format!("{} needs external integration access.", action_plan.name),
+                hint.integration_ids.clone(),
+                Some(detail.clone()),
+            );
+        }
+        if hint.requires_ssh_connection {
+            push_access_group(
+                &mut requested_groups,
+                "ssh_connection_names".to_string(),
+                "ssh_connection_names",
+                "choose_any",
+                "SSH connections".to_string(),
+                format!("{} needs an attached SSH connection.", action_plan.name),
+                request.access_scope.ssh_connection_names.clone(),
+                Some(detail.clone()),
+            );
+        }
+        if !hint.channel_targets.is_empty() {
+            push_access_group(
+                &mut requested_groups,
+                "channel_ids".to_string(),
+                "channel_ids",
+                "choose_any",
+                "Messaging channels".to_string(),
+                format!("{} needs a delivery channel.", action_plan.name),
+                request.access_scope.channel_ids.clone(),
+                Some(detail),
+            );
+        }
+    }
+
+    for permission_id in &request.access_scope.approved_permission_ids {
+        let trimmed = permission_id.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        push_access_group(
+            &mut requested_groups,
+            format!("approved_permission_ids:{}", trimmed.to_ascii_lowercase()),
+            "approved_permission_ids",
+            "toggle",
+            access_permission_label(trimmed),
+            "Already approved for this agent.".to_string(),
+            vec![trimmed.to_string()],
+            None,
+        );
+    }
+    for (scope_field, label, selection_mode, values) in [
+        (
+            "mcp_server_ids",
+            "MCP servers",
+            "exact",
+            request.access_scope.mcp_server_ids.clone(),
+        ),
+        (
+            "custom_api_ids",
+            "Custom APIs",
+            "exact",
+            request.access_scope.custom_api_ids.clone(),
+        ),
+        (
+            "integration_ids",
+            "Integrations",
+            "exact",
+            request.access_scope.integration_ids.clone(),
+        ),
+        (
+            "ssh_connection_names",
+            "SSH connections",
+            "choose_any",
+            request.access_scope.ssh_connection_names.clone(),
+        ),
+        (
+            "channel_ids",
+            "Messaging channels",
+            "choose_any",
+            request.access_scope.channel_ids.clone(),
+        ),
+    ] {
+        if values.is_empty() {
+            continue;
+        }
+        push_access_group(
+            &mut requested_groups,
+            scope_field.to_string(),
+            scope_field,
+            selection_mode,
+            label.to_string(),
+            "Already attached for this agent.".to_string(),
+            values,
+            None,
+        );
+    }
+
+    let response = SwarmAgentAccessPlanResponse {
+        implicit_access: finalize_access_groups(implicit_groups.into_values().collect()),
+        requested_access: finalize_access_groups(requested_groups.into_values().collect()),
+        suggested_actions,
+        notes,
+    };
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+async fn swarm_draft_agent(
+    State(state): State<AppState>,
+    Json(request): Json<SwarmAgentDraftRequest>,
+) -> Response {
+    let description = request.description.trim();
+    if description.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Description is required".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let agent = state.agent.read().await;
+    let llm = resolve_swarm_draft_client(&agent, request.model_profile_id.as_deref());
+    let system_prompt = "You design custom specialist agents. Return strict JSON with keys name, agent_type, capabilities, and system_prompt. The capabilities field must be a short array of strings. The system_prompt must be a direct instruction block for the specialist.";
+    let user_prompt = format!(
+        "Create a custom specialist agent draft from this user description:\n\n{}\n\nRules:\n- Keep the name short and specific.\n- agent_type can be a built-in role or any custom role label.\n- capabilities should be 3 to 8 concise phrases.\n- system_prompt should be ready to save as the specialist prompt.\n- Return JSON only.",
+        description
+    );
+    let response = match llm.chat_with_system(system_prompt, &user_prompt).await {
+        Ok(response) => response,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse {
+                    error: format!("Failed to generate draft: {}", error),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let Some(payload) = extract_json(&response.content) else {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse {
+                error: "Draft model returned invalid JSON".to_string(),
+            }),
+        )
+            .into_response();
+    };
+    let name = payload
+        .get("name")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            description
+                .split_whitespace()
+                .take(4)
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+    let agent_type = payload
+        .get("agent_type")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "custom".to_string());
+    let capabilities = payload
+        .get("capabilities")
+        .map(|value| match value {
+            serde_json::Value::Array(items) => items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+            serde_json::Value::String(text) => text
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        })
+        .unwrap_or_default();
+    let system_prompt = payload
+        .get("system_prompt")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| description.to_string());
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(SwarmAgentDraftResponse {
+            name: if name.is_empty() {
+                "Custom Agent".to_string()
+            } else {
+                name
+            },
+            agent_type,
+            capabilities,
+            system_prompt,
+        })),
+    )
+        .into_response()
 }
 
 /// Add a specialist agent to the swarm
@@ -27645,6 +28668,9 @@ async fn swarm_add_agent(
         )
         .unwrap_or("[]".to_string()),
         system_prompt: request.system_prompt.clone(),
+        access_scope: crate::core::swarm::persistence::access_scope_to_json(
+            &specialist_config.access_scope,
+        ),
         enabled: 1,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
@@ -27761,6 +28787,9 @@ async fn swarm_update_agent(
         )
         .unwrap_or("[]".to_string()),
         system_prompt: request.system_prompt.clone(),
+        access_scope: crate::core::swarm::persistence::access_scope_to_json(
+            &specialist_config.access_scope,
+        ),
         enabled: 1,
         created_at: existing.created_at.clone(),
     };
@@ -29527,13 +30556,12 @@ async fn triage_inbox(
                 .unwrap_or_default()
                 .iter()
                 .map(|m| {
-                    let snippet = m.get("snippet").and_then(|v| v.as_str()).unwrap_or("").to_ascii_lowercase();
-                    let label = if snippet.contains("urgent") || snippet.contains("asap") { "Act now" } else { "Delegate" };
+                    let label = "Review";
                     serde_json::json!({
                                 "message_id": m.get("id").cloned().unwrap_or(serde_json::json!("")),
                         "label": label,
-                        "reason": "Heuristic fallback classification",
-                        "draft_reply": if label == "Act now" { "Acknowledged. I will handle this today." } else { "Received. Delegating to the right owner and will track status." },
+                        "reason": "LLM triage unavailable; conservative fallback",
+                        "draft_reply": "",
                     })
                 })
                 .collect();
@@ -30003,20 +31031,15 @@ pub async fn run_autonomy_analysis_tick(
             .unwrap_or_default();
         let missing = unread
             .iter()
-            .filter(|n| {
-                let source = n.source.to_ascii_lowercase();
-                let title = n.title.to_ascii_lowercase();
-                let body = n.body.to_ascii_lowercase();
-                source == "workflow_inputs"
-                    || title.contains("missing input")
-                    || body.contains("missing input")
-                    || title.contains("required input")
-                    || body.contains("required input")
-            })
+            .filter(|n| notification_represents_missing_input(n))
             .count();
         (awaiting, missing)
     };
-    let attention_signature = format!("a:{}|m:{}", awaiting_approval, missing_inputs);
+    let attention_signature = if missing_inputs > 0 {
+        Some(format!("m:{}", missing_inputs))
+    } else {
+        None
+    };
     let last_attention_signature = agent
         .storage
         .get(AUTONOMY_ATTENTION_STATE_KEY)
@@ -30024,8 +31047,8 @@ pub async fn run_autonomy_analysis_tick(
         .ok()
         .flatten()
         .and_then(|raw| String::from_utf8(raw).ok());
-    if awaiting_approval > 0 || missing_inputs > 0 {
-        if last_attention_signature.as_deref() != Some(attention_signature.as_str()) {
+    if let Some(signature) = attention_signature.as_deref() {
+        if last_attention_signature.as_deref() != Some(signature) {
             let mode_state = if settings.autonomy_mode.eq_ignore_ascii_case("auto") {
                 "ON"
             } else if settings.autonomy_mode.eq_ignore_ascii_case("assist") {
@@ -30034,9 +31057,8 @@ pub async fn run_autonomy_analysis_tick(
                 "OFF"
             };
             let body = format!(
-                "Auto Mode is {} | Waiting on you: {} approvals, {} missing input{}",
+                "Auto Mode is {} | Waiting on you: {} missing input{}",
                 mode_state,
-                awaiting_approval,
                 missing_inputs,
                 if missing_inputs == 1 { "" } else { "s" }
             );
@@ -30051,7 +31073,7 @@ pub async fn run_autonomy_analysis_tick(
             agent.notify_preferred_channel(&body).await;
             let _ = agent
                 .storage
-                .set(AUTONOMY_ATTENTION_STATE_KEY, attention_signature.as_bytes())
+                .set(AUTONOMY_ATTENTION_STATE_KEY, signature.as_bytes())
                 .await;
         }
     } else if last_attention_signature.is_some() {
@@ -30064,6 +31086,10 @@ pub async fn run_autonomy_analysis_tick(
         .await;
     drop(agent);
     let sentinel = sentinel_panel::run_sentinel_scan_tick(shared.clone(), trigger).await;
+    let ambient_intents = {
+        let agent = shared.read().await;
+        agent.revisit_ambient_intents(trigger).await
+    };
 
     serde_json::json!({
         "status":"ok",
@@ -30074,6 +31100,7 @@ pub async fn run_autonomy_analysis_tick(
             "missing_inputs": missing_inputs,
         },
         "sentinel": sentinel,
+        "ambient_intents": ambient_intents,
     })
 }
 
@@ -30266,8 +31293,13 @@ async fn handle_voice_command(
                 "Voice command: {}. Respond with a short actionable interpretation.",
                 request.command
             );
+            let conversation_id = request
+                .conversation_id
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| format!("voice:{}", uuid::Uuid::new_v4()));
             match agent
-                .process_message_with_meta(&prompt, "voice", None, None)
+                .process_message_with_meta(&prompt, "voice", Some(&conversation_id), None)
                 .await
             {
                 Ok(r) => (
@@ -32435,11 +33467,31 @@ async fn upsert_user_preference(
         )
         .await
     {
-        Ok(item) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"preference": item})),
-        )
-            .into_response(),
+        Ok(item) => {
+            if item.project_id.is_none() {
+                let source = item.source.as_deref().unwrap_or("memory_api");
+                if let Err(error) = crate::core::learning::sync_user_preference_to_experience_item(
+                    &agent.storage,
+                    &item.key,
+                    &item.value,
+                    item.confidence as f64,
+                    source,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        "Failed to sync user preference '{}' into experience memory: {}",
+                        item.key,
+                        error
+                    );
+                }
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"preference": item})),
+            )
+                .into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -32841,6 +33893,7 @@ async fn mcp_handler(
                             caller,
                             crate::actions::ActionExecutionSurface::Api,
                             true,
+                            false,
                             crate::core::RequestPlanConfirmationMode::None,
                             None,
                         ),
@@ -34103,7 +35156,7 @@ where
     let secrets = old_mgr.with_secrets_lock(|manager| manager.load_secrets_unlocked())?;
     let agent = state.agent.write().await;
 
-    new_mgr.save_secrets_unlocked(&secrets)?;
+    new_mgr.save_secrets_unlocked_for_rekey(&secrets)?;
     if let Err(storage_err) = agent
         .encrypted_storage
         .reencrypt_all_sensitive_data(old_storage_key.clone(), new_key.clone())
@@ -34112,7 +35165,7 @@ where
         let rollback_err = old_mgr.save_secrets_unlocked(&secrets).err();
         return Err(match rollback_err {
             Some(rollback_err) => anyhow::anyhow!(
-                "Encrypted storage rekey failed: {}. secrets.enc rollback also failed: {}",
+                "Encrypted storage rekey failed: {}. Settings secret rollback also failed: {}",
                 storage_err,
                 rollback_err
             ),
@@ -34129,7 +35182,7 @@ where
         let secrets_rollback_err = old_mgr.save_secrets_unlocked(&secrets).err();
         return Err(match (storage_rollback_err, secrets_rollback_err) {
             (Some(storage_rollback_err), Some(secrets_rollback_err)) => anyhow::anyhow!(
-                "Metadata update failed: {}. Encrypted storage rollback also failed: {}. secrets.enc rollback also failed: {}",
+                "Metadata update failed: {}. Encrypted storage rollback also failed: {}. Settings secret rollback also failed: {}",
                 commit_err,
                 storage_rollback_err,
                 secrets_rollback_err
@@ -34140,7 +35193,7 @@ where
                 storage_rollback_err
             ),
             (None, Some(secrets_rollback_err)) => anyhow::anyhow!(
-                "Metadata update failed: {}. secrets.enc rollback also failed: {}",
+                "Metadata update failed: {}. Settings secret rollback also failed: {}",
                 commit_err,
                 secrets_rollback_err
             ),
@@ -34627,6 +35680,94 @@ mod tests {
         );
     }
 
+    #[test]
+    fn static_apps_do_not_proxy_to_executor() {
+        assert!(!should_proxy_app_request_to_executor(true, true));
+        assert!(!should_proxy_app_request_to_executor(true, false));
+        assert!(should_proxy_app_request_to_executor(false, true));
+        assert!(!should_proxy_app_request_to_executor(false, false));
+    }
+
+    #[test]
+    fn direct_control_plane_exposure_warning_ignores_trusted_local_docker_bind() {
+        assert!(!should_warn_for_direct_control_plane_exposure(
+            DeploymentMode::TrustedLocal,
+            "0.0.0.0:8990"
+        ));
+    }
+
+    #[test]
+    fn direct_control_plane_exposure_warning_requires_internet_facing_non_loopback_bind() {
+        assert!(should_warn_for_direct_control_plane_exposure(
+            DeploymentMode::InternetFacing,
+            "0.0.0.0:8990"
+        ));
+        assert!(should_warn_for_direct_control_plane_exposure(
+            DeploymentMode::InternetFacing,
+            "192.168.1.20:8990"
+        ));
+        assert!(!should_warn_for_direct_control_plane_exposure(
+            DeploymentMode::InternetFacing,
+            "127.0.0.1:8990"
+        ));
+    }
+
+    fn test_access_planner_action(
+        name: &str,
+        description: &str,
+        capabilities: &[&str],
+        risk_level: crate::actions::ActionRiskLevel,
+        permission_ids: &[&str],
+    ) -> crate::actions::ActionDef {
+        crate::actions::ActionDef {
+            name: name.to_string(),
+            description: description.to_string(),
+            capabilities: capabilities.iter().map(|value| value.to_string()).collect(),
+            authorization: crate::actions::ActionAuthorization {
+                risk_level,
+                access: crate::actions::ActionAccessMetadata {
+                    permission_ids: permission_ids
+                        .iter()
+                        .map(|value| value.to_string())
+                        .collect(),
+                    ..crate::actions::ActionAccessMetadata::default()
+                },
+                ..crate::actions::ActionAuthorization::default()
+            },
+            ..crate::actions::ActionDef::default()
+        }
+    }
+
+    #[test]
+    fn access_planner_does_not_infer_capability_acquire_from_generic_custom_agent_text() {
+        let spec_summary = "name: Code Reviewer\nrole: coder\ncapabilities: debugging, code review, refactoring\nsystem_prompt: You are a custom coder agent. Review pull requests and explain changes.";
+        let actions = vec![
+            test_access_planner_action(
+                "capability_acquire",
+                "Scaffold a reusable integration/action when the needed capability does not already exist. Generates a reviewable custom SKILL.md backed by connector_request and/or browser_auto.",
+                &["integration_builder"],
+                crate::actions::ActionRiskLevel::High,
+                &["capability_acquire"],
+            ),
+            test_access_planner_action(
+                "code_execute",
+                "Run code and tests in a project workspace.",
+                &["code_execute"],
+                crate::actions::ActionRiskLevel::High,
+                &["code_execute"],
+            ),
+        ];
+
+        let planned = fallback_access_plan_actions(spec_summary, &actions);
+        assert!(
+            !planned
+                .iter()
+                .any(|action| action.name == "capability_acquire"),
+            "unexpected capability_acquire plan: {:?}",
+            planned
+        );
+    }
+
     #[tokio::test]
     async fn auth_middleware_does_not_bypass_when_legacy_flag_is_set() {
         let (mut state, _config_dir, _data_dir) = build_test_state().await;
@@ -34695,7 +35836,7 @@ mod tests {
             .route("/chat", post(chat))
             .with_state(state.clone());
         let body = serde_json::json!({
-            "message": "please save my secret TEST_FAST_PATH_SECRET=abc123",
+            "message": "/setsecret TEST_FAST_PATH_SECRET=abc123",
             "channel": "web",
             "conversation_id": serde_json::Value::Null,
             "project_id": serde_json::Value::Null,
@@ -34741,7 +35882,7 @@ mod tests {
             .route("/chat", post(chat))
             .with_state(state.clone());
         let body = serde_json::json!({
-            "message": "turn notifications off",
+            "message": "/notifications pause",
             "channel": "web",
             "conversation_id": serde_json::Value::Null,
             "project_id": serde_json::Value::Null,
@@ -34778,7 +35919,7 @@ mod tests {
             .route("/chat/stream", post(chat_stream))
             .with_state(state);
         let body = serde_json::json!({
-            "message": "save my secret TEST_STREAM_SECRET=stream-abc",
+            "message": "/setsecret TEST_STREAM_SECRET=stream-abc",
             "channel": "web",
             "conversation_id": serde_json::Value::Null,
             "project_id": serde_json::Value::Null,
@@ -35046,6 +36187,12 @@ mod tests {
         );
         assert_eq!(
             normalize_stream_heartbeat_status(
+                "Preparing research plan with google/gemma-4-31b-it (18s elapsed)..."
+            ),
+            "Preparing research plan. No new output yet."
+        );
+        assert_eq!(
+            normalize_stream_heartbeat_status(
                 "Memory available on demand | Scope: channel:web | Channel: web"
             ),
             "Still processing. No new output yet."
@@ -35213,6 +36360,48 @@ mod tests {
     }
 
     #[test]
+    fn normalize_stream_event_for_sse_emits_lazy_chat_task_started_payload() {
+        let (event, next_state) = normalize_stream_event_for_sse(
+            crate::core::StreamEvent::ChatTaskStarted {
+                task_id: "task-lazy-chat".to_string(),
+                description: "App task: build a static HTML page".to_string(),
+                work_type: "app".to_string(),
+                conversation_id: Some("conv-123".to_string()),
+                project_id: Some("proj-456".to_string()),
+            },
+            "",
+        );
+
+        assert!(next_state.is_empty());
+        let Some((event_name, payload)) = event else {
+            panic!("expected task_started event");
+        };
+        assert_eq!(event_name, "task_started");
+        assert_eq!(
+            payload.get("task_id").and_then(|value| value.as_str()),
+            Some("task-lazy-chat")
+        );
+        assert_eq!(
+            payload.get("description").and_then(|value| value.as_str()),
+            Some("App task: build a static HTML page")
+        );
+        assert_eq!(
+            payload.get("work_type").and_then(|value| value.as_str()),
+            Some("app")
+        );
+        assert_eq!(
+            payload
+                .get("conversation_id")
+                .and_then(|value| value.as_str()),
+            Some("conv-123")
+        );
+        assert_eq!(
+            payload.get("project_id").and_then(|value| value.as_str()),
+            Some("proj-456")
+        );
+    }
+
+    #[test]
     fn normalize_stream_event_for_sse_emits_plan_ready_for_confirmation_payload() {
         let plan = crate::core::ExecutionPlan {
             plan_id: "plan-preview".to_string(),
@@ -35221,12 +36410,12 @@ mod tests {
             steps: vec![crate::core::PlanStep {
                 id: 1,
                 title: "Scope the question".to_string(),
-                description: "Clarify the research goal before gathering sources."
-                    .to_string(),
+                description: "Clarify the research goal before gathering sources.".to_string(),
                 action: None,
                 arguments: None,
                 tool_hint: None,
                 status: Some(crate::core::PlanStepStatus::Pending),
+                substeps: Vec::new(),
             }],
         };
 
@@ -35258,6 +36447,39 @@ mod tests {
                 .and_then(|value| value.get("summary"))
                 .and_then(|value| value.as_str()),
             Some("Scope, compare, and synthesize")
+        );
+    }
+
+    #[test]
+    fn backfill_chat_task_origin_metadata_sets_missing_conversation_id() {
+        let mut task = crate::core::Task::new(
+            "Preview".to_string(),
+            "chat_request".to_string(),
+            serde_json::json!({
+                "_origin": "chat",
+                "channel": "web",
+                "conversation_id": serde_json::Value::Null,
+                "project_id": serde_json::Value::Null,
+            }),
+        );
+
+        let encoded =
+            backfill_chat_task_origin_metadata(&mut task, Some("fresh-conversation-id"), None)
+                .expect("helper should update task arguments");
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&encoded).expect("updated arguments should decode");
+        assert_eq!(
+            payload
+                .get("conversation_id")
+                .and_then(|value| value.as_str()),
+            Some("fresh-conversation-id")
+        );
+        assert_eq!(
+            task.arguments
+                .get("conversation_id")
+                .and_then(|value| value.as_str()),
+            Some("fresh-conversation-id")
         );
     }
 
@@ -36287,30 +37509,31 @@ mod tests {
     }
 
     #[test]
-    fn parse_set_secret_command_accepts_normalized_paraphrases() {
+    fn parse_set_secret_command_rejects_normalized_paraphrases() {
         assert_eq!(
             parse_set_secret_command("please save my secret OPENAI_API_KEY=abc123"),
-            Some(("OPENAI_API_KEY".to_string(), "abc123".to_string()))
+            None
         );
         assert_eq!(
             parse_set_secret_command("please save my secrret OPENAI_API_KEY=abc123"),
-            Some(("OPENAI_API_KEY".to_string(), "abc123".to_string()))
+            None
         );
         assert_eq!(
             parse_set_secret_command("secret set OPENAI_API_KEY abc123"),
-            Some(("OPENAI_API_KEY".to_string(), "abc123".to_string()))
+            None
         );
     }
 
     #[test]
-    fn parse_autonomy_quick_command_accepts_delegate_and_rollback_variants() {
-        match parse_autonomy_quick_command("can you delegate fixing login") {
+    fn parse_autonomy_quick_command_accepts_slash_commands() {
+        assert!(parse_autonomy_quick_command("can you delegate fixing login").is_none());
+        match parse_autonomy_quick_command("/delegate fixing login") {
             Some(AutonomyQuickCommand::Delegate { task, .. }) => {
                 assert_eq!(task, "fixing login");
             }
             other => panic!("unexpected delegate parse result: {:?}", other),
         }
-        match parse_autonomy_quick_command("please undo evt-123 read") {
+        match parse_autonomy_quick_command("/rollback evt-123 read") {
             Some(AutonomyQuickCommand::Rollback {
                 event_id,
                 operation,
@@ -36320,34 +37543,24 @@ mod tests {
             }
             other => panic!("unexpected rollback parse result: {:?}", other),
         }
-        match parse_autonomy_quick_command("could you please roll back evt-123 unread") {
-            Some(AutonomyQuickCommand::Rollback {
-                event_id,
-                operation,
-            }) => {
-                assert_eq!(event_id, "evt-123");
-                assert_eq!(operation.as_deref(), Some("mark_unread"));
-            }
-            other => panic!("unexpected rollback typo parse result: {:?}", other),
-        }
+        assert!(
+            parse_autonomy_quick_command("could you please roll back evt-123 unread").is_none()
+        );
     }
 
     #[test]
-    fn parse_notification_control_command_accepts_conservative_variants() {
+    fn parse_notification_control_command_accepts_slash_commands() {
         assert!(matches!(
-            parse_notification_control_command("pause push notifications"),
+            parse_notification_control_command("/notifications pause"),
             Some(NotificationControlCommand::Pause24h)
         ));
+        assert!(parse_notification_control_command("turn notifications off").is_none());
         assert!(matches!(
-            parse_notification_control_command("turn notifications off"),
-            Some(NotificationControlCommand::Pause24h)
-        ));
-        assert!(matches!(
-            parse_notification_control_command("notifications on"),
+            parse_notification_control_command("/notifications resume"),
             Some(NotificationControlCommand::Resume)
         ));
         assert!(matches!(
-            parse_notification_control_command("status notifications"),
+            parse_notification_control_command("/notifications status"),
             Some(NotificationControlCommand::Status)
         ));
     }
@@ -36570,5 +37783,155 @@ mod tests {
             .regressions
             .iter()
             .any(|line| line.contains("p95 latency regressed")));
+    }
+
+    fn test_model_slot(provider: LlmProvider) -> ModelSlot {
+        ModelSlot {
+            id: "slot-1".to_string(),
+            label: "Primary".to_string(),
+            role: ModelRole::Primary,
+            provider,
+            enabled: true,
+            capability_tier: crate::core::config::ModelCapabilityTier::Balanced,
+            cost_tier: crate::core::config::ModelCostTier::Medium,
+            auto_escalate: true,
+            escalation_rank: 0,
+            health_scope: crate::core::config::ModelHealthScope::Provider,
+        }
+    }
+
+    #[test]
+    fn model_slot_api_key_reuse_requires_matching_provider_scope() {
+        let existing_slot = test_model_slot(LlmProvider::OpenAI {
+            api_key: "existing-key".to_string(),
+            model: "gpt-5.4".to_string(),
+            base_url: None,
+        });
+
+        let same_provider_request = ModelSlotRequest {
+            label: "Primary".to_string(),
+            role: "primary".to_string(),
+            provider: "openai".to_string(),
+            model: "gpt-5.4-mini".to_string(),
+            base_url: None,
+            api_key: None,
+            clear_api_key: None,
+            enabled: Some(true),
+        };
+        assert!(can_reuse_model_slot_api_key(&existing_slot, &same_provider_request).unwrap());
+
+        let switched_provider_request = ModelSlotRequest {
+            provider: "openrouter".to_string(),
+            base_url: Some(OPENROUTER_API_BASE_URL.to_string()),
+            ..same_provider_request
+        };
+        assert!(!can_reuse_model_slot_api_key(&existing_slot, &switched_provider_request).unwrap());
+    }
+
+    #[test]
+    fn openrouter_default_base_url_still_counts_as_same_scope() {
+        let existing_slot = test_model_slot(LlmProvider::OpenAI {
+            api_key: "existing-key".to_string(),
+            model: "openrouter/model".to_string(),
+            base_url: Some(OPENROUTER_API_BASE_URL.to_string()),
+        });
+
+        let request = ModelSlotRequest {
+            label: "Primary".to_string(),
+            role: "primary".to_string(),
+            provider: "openrouter".to_string(),
+            model: "openrouter/another-model".to_string(),
+            base_url: None,
+            api_key: None,
+            clear_api_key: None,
+            enabled: Some(true),
+        };
+
+        assert!(can_reuse_model_slot_api_key(&existing_slot, &request).unwrap());
+    }
+
+    #[test]
+    fn explicit_clear_api_key_disables_reuse_even_for_same_scope() {
+        let existing_slot = test_model_slot(LlmProvider::OpenAI {
+            api_key: "existing-key".to_string(),
+            model: "gpt-5.4".to_string(),
+            base_url: None,
+        });
+
+        let request = ModelSlotRequest {
+            label: "Primary".to_string(),
+            role: "primary".to_string(),
+            provider: "openai".to_string(),
+            model: "gpt-5.4-mini".to_string(),
+            base_url: None,
+            api_key: None,
+            clear_api_key: Some(true),
+            enabled: Some(true),
+        };
+
+        assert!(!can_reuse_model_slot_api_key(&existing_slot, &request).unwrap());
+    }
+
+    #[tokio::test]
+    async fn provider_from_model_slot_request_rejects_openrouter_without_key() {
+        let request = ModelSlotRequest {
+            label: "Primary".to_string(),
+            role: "primary".to_string(),
+            provider: "openrouter".to_string(),
+            model: "z-ai/glm-5.1".to_string(),
+            base_url: None,
+            api_key: None,
+            clear_api_key: None,
+            enabled: Some(true),
+        };
+
+        let error = provider_from_model_slot_request(&request, None)
+            .await
+            .expect_err("openrouter should require an API key");
+        assert!(error.contains("API key is required"));
+    }
+
+    #[tokio::test]
+    async fn provider_from_model_slot_request_rejects_openai_compatible_without_base_url() {
+        let request = ModelSlotRequest {
+            label: "Primary".to_string(),
+            role: "primary".to_string(),
+            provider: "openai-compatible".to_string(),
+            model: "local-model".to_string(),
+            base_url: None,
+            api_key: None,
+            clear_api_key: None,
+            enabled: Some(true),
+        };
+
+        let error = provider_from_model_slot_request(&request, None)
+            .await
+            .expect_err("openai-compatible slots should require an explicit base URL");
+        assert!(error.contains("Base URL is required"));
+    }
+
+    #[test]
+    fn missing_input_detection_ignores_autonomy_attention_notifications() {
+        let autonomy_attention = crate::storage::entities::notification::Model {
+            id: "notif-1".to_string(),
+            title: "Autonomy Needs Attention".to_string(),
+            body: "Auto Mode is ASSIST | Waiting on you: 1 approvals, 1 missing input".to_string(),
+            level: "warning".to_string(),
+            source: "autonomy_attention".to_string(),
+            read: false,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let workflow_input = crate::storage::entities::notification::Model {
+            id: "notif-2".to_string(),
+            title: "Missing input".to_string(),
+            body: "API key required to continue.".to_string(),
+            level: "warning".to_string(),
+            source: "workflow_inputs".to_string(),
+            read: false,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+
+        assert!(!notification_represents_missing_input(&autonomy_attention));
+        assert!(notification_represents_missing_input(&workflow_input));
     }
 }

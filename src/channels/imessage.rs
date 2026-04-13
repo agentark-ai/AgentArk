@@ -76,6 +76,7 @@ async fn load_config(agent: &Agent) -> Result<Option<IMessageChannelConfig>> {
     Ok(agent.config.imessage.clone())
 }
 
+#[allow(dead_code)]
 async fn load_destination(agent: &Agent) -> Result<Option<IMessageDestinationContext>> {
     if let Ok(Some(raw)) = agent.storage.get(LAST_DESTINATION_STORAGE_KEY).await {
         if let Ok(context) = serde_json::from_slice::<IMessageDestinationContext>(&raw) {
@@ -114,13 +115,7 @@ fn http_client() -> Result<reqwest::Client> {
         .build()?)
 }
 
-async fn resolve_destination(
-    agent: &Agent,
-    config: &IMessageChannelConfig,
-) -> Result<IMessageDestinationContext> {
-    if let Some(destination) = load_destination(agent).await? {
-        return Ok(destination);
-    }
+fn resolve_destination(config: &IMessageChannelConfig) -> Result<IMessageDestinationContext> {
     if !config.default_chat_id.trim().is_empty() || !config.default_handle.trim().is_empty() {
         return Ok(IMessageDestinationContext {
             chat_id: if config.default_chat_id.trim().is_empty() {
@@ -138,7 +133,7 @@ async fn resolve_destination(
         });
     }
     Err(anyhow!(
-        "iMessage has no delivery destination yet; configure a default chat or wait for an inbound message"
+        "iMessage has no configured notification destination"
     ))
 }
 
@@ -192,9 +187,8 @@ pub async fn send_message(agent: &Agent, text: &str) -> Result<()> {
     let config = load_config(agent)
         .await?
         .ok_or_else(|| anyhow!("iMessage is not configured"))?;
-    let destination = resolve_destination(agent, &config).await?;
+    let destination = resolve_destination(&config)?;
     send_to_destination(&config, &destination, text).await?;
-    persist_destination(agent, &destination).await?;
     Ok(())
 }
 
@@ -292,4 +286,23 @@ pub async fn handle_webhook(
     send_to_destination(&config, &destination, &reply).await?;
     persist_destination(&agent, &destination).await?;
     Ok("ok".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proactive_imessage_destination_uses_configured_target_only() {
+        let config = IMessageChannelConfig {
+            bridge_url: "https://bridge.example.com".to_string(),
+            bridge_token: "token".to_string(),
+            default_chat_id: "chat-123".to_string(),
+            default_handle: String::new(),
+        };
+
+        let destination = resolve_destination(&config).unwrap();
+        assert_eq!(destination.chat_id.as_deref(), Some("chat-123"));
+        assert_eq!(destination.handle, None);
+    }
 }

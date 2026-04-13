@@ -33,6 +33,7 @@ import TaskRoundedIcon from "@mui/icons-material/TaskRounded";
 import VisibilityRoundedIcon from "@mui/icons-material/VisibilityRounded";
 import TimelineRoundedIcon from "@mui/icons-material/TimelineRounded";
 import AutoStoriesRoundedIcon from "@mui/icons-material/AutoStoriesRounded";
+import AutoGraphRoundedIcon from "@mui/icons-material/AutoGraphRounded";
 import AnalyticsRoundedIcon from "@mui/icons-material/AnalyticsRounded";
 import MonitorHeartRoundedIcon from "@mui/icons-material/MonitorHeartRounded";
 import MenuRoundedIcon from "@mui/icons-material/MenuRounded";
@@ -41,15 +42,11 @@ import NotificationsNoneRoundedIcon from "@mui/icons-material/NotificationsNoneR
 import SpaceDashboardRoundedIcon from "@mui/icons-material/SpaceDashboardRounded";
 import SettingsRoundedIcon from "@mui/icons-material/SettingsRounded";
 import CloseRoundedIcon from "@mui/icons-material/CloseRounded";
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { lazy, Suspense, useEffect, useMemo, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import useMediaQuery from "@mui/material/useMediaQuery";
 import { api } from "./api/client";
-import { GuidedTour } from "./components/GuidedTour";
-import { NativeWorkspace, type WorkspaceView } from "./components/NativeWorkspace";
-import { OverviewPane } from "./components/OverviewPane";
-import { ApprovalPromptOverlay } from "./components/ApprovalPromptOverlay";
-import { LibraryPane } from "./components/LibraryPane";
+import type { WorkspaceView } from "./components/NativeWorkspace";
 import { useUiStore } from "./store/uiStore";
 import type { Task } from "./types";
 
@@ -57,6 +54,33 @@ const REFRESH_MS = 8000;
 const PING_STALE_MS = 30_000;
 const APPROVAL_FALLBACK_POLL_MS = 2500;
 const NAV_HIDDEN_STORAGE_KEY = "agentark.ui.navHidden";
+
+const NativeWorkspace = lazy(() =>
+  import("./components/NativeWorkspace").then((module) => ({ default: module.NativeWorkspace }))
+);
+const OverviewPane = lazy(() =>
+  import("./components/OverviewPane").then((module) => ({ default: module.OverviewPane }))
+);
+const LibraryPane = lazy(() =>
+  import("./components/LibraryPane").then((module) => ({ default: module.LibraryPane }))
+);
+const ApprovalPromptOverlay = lazy(() =>
+  import("./components/ApprovalPromptOverlay").then((module) => ({ default: module.ApprovalPromptOverlay }))
+);
+const GuidedTour = lazy(() =>
+  import("./components/GuidedTour").then((module) => ({ default: module.GuidedTour }))
+);
+
+function WorkspacePaneFallback() {
+  return (
+    <Box className="list-shell" sx={{ minHeight: 180, p: 1.5 }}>
+      <Typography variant="body2" color="text.secondary">
+        Loading workspace...
+      </Typography>
+    </Box>
+  );
+}
+
 type ViewKey =
   | "overview"
   | "chat"
@@ -77,6 +101,7 @@ type ViewKey =
   | "memory"
   | "goals"
   | "autonomy"
+  | "evolution"
   | "sentinel"
   | "trace"
   | "status"
@@ -84,6 +109,7 @@ type ViewKey =
   | "projects"
   | "documents"
   | "analytics"
+  | "search"
   | "settings";
 
 type NavItem = { key: ViewKey; label: string; icon: ReactNode };
@@ -94,6 +120,8 @@ type NotificationStreamPayload = {
   title?: string;
   body?: string;
 };
+
+const UNAVAILABLE_APPROVAL_DESCRIPTION = "Older task details unavailable";
 
 const VIEW_ALIASES: Record<string, ViewKey> = {
   home: "overview",
@@ -111,6 +139,8 @@ const VIEW_ALIASES: Record<string, ViewKey> = {
   skills: "skills",
   goal: "goals",
   goals: "goals",
+  evolution: "evolution",
+  evolutions: "evolution",
   sentinel: "sentinel",
   agent: "swarm",
   agents: "swarm",
@@ -135,6 +165,7 @@ const VIEW_ALIASES: Record<string, ViewKey> = {
   status: "status",
   integration: "settings",
   integrations: "settings",
+  search: "search",
   ambient: "sentinel",
   memory: "settings",
   setting: "settings",
@@ -161,6 +192,7 @@ const VIEW_KEYS: ReadonlySet<ViewKey> = new Set<ViewKey>([
   "memory",
   "goals",
   "autonomy",
+  "evolution",
   "sentinel",
   "trace",
   "status",
@@ -168,6 +200,7 @@ const VIEW_KEYS: ReadonlySet<ViewKey> = new Set<ViewKey>([
   "projects",
   "documents",
   "analytics",
+  "search",
   "settings",
 ]);
 
@@ -188,6 +221,7 @@ const NAV_GROUPS: NavGroup[] = [
       { key: "apps", label: "Apps", icon: <AppsRoundedIcon fontSize="small" /> },
       { key: "swarm", label: "Agents", icon: <HubRoundedIcon fontSize="small" /> },
       { key: "goals", label: "Goals", icon: <FlagRoundedIcon fontSize="small" /> },
+      { key: "evolution", label: "Evolution", icon: <AutoGraphRoundedIcon fontSize="small" /> },
       { key: "moltbook", label: "Moltbook", icon: <AutoStoriesRoundedIcon fontSize="small" /> },
     ]
   },
@@ -233,6 +267,7 @@ const VIEW_PATH_SEGMENTS: Record<ViewKey, string> = {
   memory: "memory",
   goals: "goals",
   autonomy: "autonomy",
+  evolution: "evolution",
   sentinel: "sentinel",
   trace: "trace",
   status: "watchers",
@@ -240,6 +275,7 @@ const VIEW_PATH_SEGMENTS: Record<ViewKey, string> = {
   projects: "projects",
   documents: "documents",
   analytics: "analytics",
+  search: "search",
   settings: "settings"
 };
 
@@ -429,6 +465,54 @@ function isInputNeededNotification(notification: {
   );
 }
 
+function normalizeTaskStatus(status: unknown): string {
+  const compact = String(status || "")
+    .toLowerCase()
+    .replace(/[^a-z]/g, "");
+  if (compact.includes("awaitingapproval")) return "awaiting_approval";
+  return compact;
+}
+
+function hasRenderableApprovalTask(task: Task): boolean {
+  const approvalTask = task as Task & { arguments?: Record<string, unknown> };
+  if (normalizeTaskStatus(approvalTask.status) !== "awaiting_approval") return false;
+  const description = String(approvalTask.description || "").trim();
+  if (description && description !== UNAVAILABLE_APPROVAL_DESCRIPTION) return true;
+  const approval = asRecord(asRecord(approvalTask.arguments)._approval);
+  return (
+    Boolean(String(approval.title || "").trim()) ||
+    Boolean(String(approval.summary || "").trim()) ||
+    Boolean(String(approval.reason || "").trim()) ||
+    Boolean(String(approval.risk_level || "").trim()) ||
+    Boolean(String(approval.risk_score || "").trim()) ||
+    Boolean(String(approval.source || "").trim())
+  );
+}
+
+function isApprovalPopupDuplicateNotification(
+  notification: {
+    title?: string;
+    body?: string;
+    source?: string;
+  },
+  approvalPopupVisible: boolean
+): boolean {
+  const title = (notification.title || "").toLowerCase();
+  const body = (notification.body || "").toLowerCase();
+  const source = (notification.source || "").toLowerCase();
+  if (source.includes("approval") || title.includes("approval needed")) {
+    return approvalPopupVisible;
+  }
+  if (source === "autonomy_attention") {
+    const mentionsApprovals = body.includes(" approval") || body.includes(" approvals");
+    const approvalOnlyAttention =
+      mentionsApprovals &&
+      (body.includes("0 missing input") || body.includes("0 missing inputs"));
+    return approvalOnlyAttention || (approvalPopupVisible && mentionsApprovals);
+  }
+  return false;
+}
+
 function notificationDisplayTitle(notification: {
   title?: string;
   body?: string;
@@ -603,11 +687,21 @@ export default function App() {
     queryKey: ["notifications-count"],
     queryFn: () => api.rawGet("/notifications/count"),
     refetchInterval: autoRefresh && !notificationsStreamConnected ? REFRESH_MS : false
-  });
+    });
   const notifications = Array.isArray(notificationsQ.data) ? notificationsQ.data : [];
+  const approvalTasks = useMemo(() => pickTasks(approvalTasksQ.data), [approvalTasksQ.data]);
+  const approvalPopupVisible = useMemo(
+    () => approvalTasks.some((task) => hasRenderableApprovalTask(task)),
+    [approvalTasks]
+  );
   const visibleNotifications = useMemo(
-    () => notifications.filter((n) => shouldSurfaceNotification(n)),
-    [notifications]
+    () =>
+      notifications.filter(
+        (n) =>
+          shouldSurfaceNotification(n) &&
+          !isApprovalPopupDuplicateNotification(n, approvalPopupVisible)
+      ),
+    [notifications, approvalPopupVisible]
   );
   const unreadCountFromEndpointRaw =
     notificationsCountQ.data && typeof notificationsCountQ.data === "object"
@@ -635,7 +729,6 @@ export default function App() {
     }
     return visibleNotifications.filter((n) => isAutomationFailureNotification(n) && !isInputNeededNotification(n));
   }, [visibleNotifications, notifFilter]);
-  const approvalTasks = useMemo(() => pickTasks(approvalTasksQ.data), [approvalTasksQ.data]);
 
   useEffect(() => {
     if (typeof window === "undefined") return undefined;
@@ -772,9 +865,9 @@ export default function App() {
   });
 
   const approvalDecisionMutation = useMutation({
-    mutationFn: async (payload: { id: string; decision: "approve" | "reject" }) => {
-      if (payload.decision === "approve") return api.approveTask(payload.id);
-      return api.rejectTask(payload.id);
+    mutationFn: async (payload: { id: string; decision: "approve" | "reject"; comment?: string }) => {
+      if (payload.decision === "approve") return api.approveTask(payload.id, payload.comment);
+      return api.rejectTask(payload.id, payload.comment);
     },
     onSuccess: async () => {
       setApprovalPopupError(null);
@@ -795,10 +888,10 @@ export default function App() {
     }
   });
 
-  const handleApprovalDecision = (id: string, decision: "approve" | "reject") => {
+  const handleApprovalDecision = (id: string, decision: "approve" | "reject", comment?: string) => {
     setApprovalPopupError(null);
     setApprovalBusyTaskId(id);
-    approvalDecisionMutation.mutate({ id, decision });
+    approvalDecisionMutation.mutate({ id, decision, comment });
   };
 
   const openSettingsView = (route: "settings" | "arkpulse", initialTab: number | null = null) => {
@@ -986,34 +1079,36 @@ export default function App() {
 
             <Box className={mainPaneClassName}>
               <Box className={stageClassName}>
-                {activeView === "overview" ? (
-                  <OverviewPane
-                    navigateToView={navigateToView as (view: string, replace?: boolean) => void}
-                    serverStatus={serverQ.data}
-                    serverError={serverQ.isError}
-                    serverLoading={serverQ.isLoading && !serverQ.data}
-                  />
-                ) : activeView === "chat" ? (
-                  <NativeWorkspace
-                    view="chat"
-                    autoRefresh={settingsModalOpen ? false : autoRefresh}
-                    showAdvanced={showAdvanced}
-                    onNavigateToView={navigateToView as (view: string, replace?: boolean) => void}
-                  />
-                ) : activeView === "library" ? (
-                  <LibraryPane
-                    autoRefresh={settingsModalOpen ? false : autoRefresh}
-                    showAdvanced={showAdvanced}
-                    onNavigateToView={navigateToView as (view: string, replace?: boolean) => void}
-                  />
-                ) : (
-                  <NativeWorkspace
-                    view={workspaceView as WorkspaceView}
-                    autoRefresh={settingsModalOpen ? false : autoRefresh}
-                    showAdvanced={showAdvanced}
-                    onNavigateToView={navigateToView as (view: string, replace?: boolean) => void}
-                  />
-              )}
+                <Suspense fallback={<WorkspacePaneFallback />}>
+                  {activeView === "overview" ? (
+                    <OverviewPane
+                      navigateToView={navigateToView as (view: string, replace?: boolean) => void}
+                      serverStatus={serverQ.data}
+                      serverError={serverQ.isError}
+                      serverLoading={serverQ.isLoading && !serverQ.data}
+                    />
+                  ) : activeView === "chat" ? (
+                    <NativeWorkspace
+                      view="chat"
+                      autoRefresh={settingsModalOpen ? false : autoRefresh}
+                      showAdvanced={showAdvanced}
+                      onNavigateToView={navigateToView as (view: string, replace?: boolean) => void}
+                    />
+                  ) : activeView === "library" ? (
+                    <LibraryPane
+                      autoRefresh={settingsModalOpen ? false : autoRefresh}
+                      showAdvanced={showAdvanced}
+                      onNavigateToView={navigateToView as (view: string, replace?: boolean) => void}
+                    />
+                  ) : (
+                    <NativeWorkspace
+                      view={workspaceView as WorkspaceView}
+                      autoRefresh={settingsModalOpen ? false : autoRefresh}
+                      showAdvanced={showAdvanced}
+                      onNavigateToView={navigateToView as (view: string, replace?: boolean) => void}
+                    />
+                  )}
+                </Suspense>
             </Box>
           </Box>
         </Box>
@@ -1029,14 +1124,16 @@ export default function App() {
         </Drawer>
       </Box>
 
-      <ApprovalPromptOverlay
-        tasks={approvalTasks}
-        busyTaskId={approvalBusyTaskId}
-        errorMessage={approvalPopupError}
-        onApprove={(id) => handleApprovalDecision(id, "approve")}
-        onReject={(id) => handleApprovalDecision(id, "reject")}
-        onOpenTasks={() => navigateToView("tasks")}
-      />
+      <Suspense fallback={null}>
+        <ApprovalPromptOverlay
+          tasks={approvalTasks}
+          busyTaskId={approvalBusyTaskId}
+          errorMessage={approvalPopupError}
+          onApprove={(id, comment) => handleApprovalDecision(id, "approve", comment)}
+          onReject={(id, comment) => handleApprovalDecision(id, "reject", comment)}
+          onOpenTasks={() => navigateToView("tasks")}
+        />
+      </Suspense>
 
       <Dialog
         open={settingsModalOpen}
@@ -1049,9 +1146,9 @@ export default function App() {
             maxWidth: 1120,
             height: { xs: "92vh", md: "84vh" },
             maxHeight: "92vh",
-            borderRadius: 3,
-            border: "1px solid rgba(108, 156, 212, 0.16)",
-            background: "linear-gradient(160deg, rgba(9, 21, 39, 0.96), rgba(9, 21, 39, 0.78))",
+            borderRadius: 2.25,
+            border: "1px solid rgba(255, 255, 255, 0.08)",
+            background: "linear-gradient(160deg, rgba(24, 24, 28, 0.98), rgba(15, 15, 18, 0.95))",
             backdropFilter: "blur(18px)",
             WebkitBackdropFilter: "blur(18px)",
             overflow: "hidden"
@@ -1063,9 +1160,9 @@ export default function App() {
             display: "flex",
             alignItems: "center",
             justifyContent: "space-between",
-            py: 1.2,
-            px: 2,
-            borderBottom: "1px solid rgba(108, 156, 212, 0.16)"
+            py: 1,
+            px: 1.5,
+            borderBottom: "1px solid rgba(255, 255, 255, 0.08)"
           }}
         >
           <Typography variant="h6">Settings</Typography>
@@ -1074,13 +1171,15 @@ export default function App() {
           </IconButton>
         </DialogTitle>
         <DialogContent sx={{ p: 0, height: "100%", overflow: "hidden" }}>
-          <NativeWorkspace
-            view="settings"
-            autoRefresh={false}
-            showAdvanced={showAdvanced}
-            settingsInitialTab={settingsInitialTab}
-            onNavigateToView={navigateToView as (view: string, replace?: boolean) => void}
-          />
+          <Suspense fallback={<WorkspacePaneFallback />}>
+            <NativeWorkspace
+              view="settings"
+              autoRefresh={false}
+              showAdvanced={showAdvanced}
+              settingsInitialTab={settingsInitialTab}
+              onNavigateToView={navigateToView as (view: string, replace?: boolean) => void}
+            />
+          </Suspense>
         </DialogContent>
       </Dialog>
 
@@ -1097,8 +1196,8 @@ export default function App() {
               maxWidth: "calc(100vw - 24px)",
               borderRadius: 2.5,
               overflow: "hidden",
-              border: "1px solid rgba(108, 156, 212, 0.12)",
-              background: "rgba(9, 21, 39, 0.85)",
+              border: "1px solid rgba(255, 255, 255, 0.08)",
+              background: "rgba(22, 22, 26, 0.94)",
               boxShadow: "0 16px 48px rgba(0, 0, 0, 0.5)",
               backdropFilter: "blur(24px)",
               WebkitBackdropFilter: "blur(24px)"
@@ -1106,9 +1205,9 @@ export default function App() {
           }
         }}
       >
-        <Box sx={{ px: 1.5, pt: 1.25, pb: 1, borderBottom: "1px solid rgba(108, 156, 212, 0.08)" }}>
+        <Box sx={{ px: 1.5, pt: 1.25, pb: 1, borderBottom: "1px solid rgba(255, 255, 255, 0.08)" }}>
           <Stack direction="row" justifyContent="space-between" alignItems="center">
-            <Typography variant="subtitle1" fontWeight={600} sx={{ color: "rgba(195, 221, 252, 0.9)" }}>Notifications</Typography>
+            <Typography variant="subtitle1" fontWeight={600} sx={{ color: "rgba(244, 245, 247, 0.94)" }}>Notifications</Typography>
             <Button
               size="small"
               onClick={() => markAllMutation.mutate()}
@@ -1116,10 +1215,10 @@ export default function App() {
               sx={{
                 textTransform: "none",
                 fontSize: "0.75rem",
-                color: "rgba(195, 221, 252, 0.5)",
+                color: "rgba(171, 176, 184, 0.7)",
                 "&:hover": {
-                  color: "rgba(195, 221, 252, 0.8)",
-                  background: "rgba(108, 156, 212, 0.08)"
+                  color: "rgba(239, 241, 244, 0.88)",
+                  background: "rgba(255, 255, 255, 0.05)"
                 }
               }}
             >
@@ -1193,10 +1292,10 @@ export default function App() {
                       background: inputNeeded ? "rgba(255, 193, 7, 0.06)" : "transparent",
                       transition: "background 140ms ease",
                       "&:hover": {
-                        background: inputNeeded ? "rgba(255, 193, 7, 0.1)" : "rgba(108, 156, 212, 0.08)"
+                        background: inputNeeded ? "rgba(255, 193, 7, 0.1)" : "rgba(255, 255, 255, 0.05)"
                       },
                       "&:not(:last-child)": {
-                        borderBottom: "1px solid rgba(108, 156, 212, 0.08)"
+                        borderBottom: "1px solid rgba(255, 255, 255, 0.06)"
                       }
                     }}
                     onClick={async () => {
@@ -1213,8 +1312,8 @@ export default function App() {
                           width: 6,
                           height: 6,
                           borderRadius: "50%",
-                          background: inputNeeded ? "rgba(255, 193, 7, 0.95)" : "rgba(47, 212, 255, 0.9)",
-                          boxShadow: inputNeeded ? "0 0 6px rgba(255, 193, 7, 0.45)" : "0 0 6px rgba(47, 212, 255, 0.5)",
+                          background: inputNeeded ? "rgba(255, 193, 7, 0.95)" : "rgba(244, 245, 247, 0.88)",
+                          boxShadow: inputNeeded ? "0 0 6px rgba(255, 193, 7, 0.45)" : "0 0 6px rgba(255, 255, 255, 0.18)",
                           flexShrink: 0,
                           mt: 0.8,
                           mr: 1
@@ -1231,7 +1330,7 @@ export default function App() {
                             variant="body2"
                             fontWeight={n.read ? 400 : 600}
                             noWrap
-                            sx={{ minWidth: 0, flex: 1, color: n.read ? "rgba(195, 221, 252, 0.6)" : "rgba(195, 221, 252, 0.95)" }}
+                            sx={{ minWidth: 0, flex: 1, color: n.read ? "rgba(177, 181, 189, 0.68)" : "rgba(244, 245, 247, 0.94)" }}
                             title={n.title || displayTitle}
                           >
                             {displayTitle}
@@ -1239,7 +1338,7 @@ export default function App() {
                           <Typography
                             variant="caption"
                             noWrap
-                            sx={{ flexShrink: 0, color: "rgba(195, 221, 252, 0.35)" }}
+                            sx={{ flexShrink: 0, color: "rgba(155, 159, 169, 0.52)" }}
                             title={notifTimeAgo(n.created_at).tip}
                           >
                             {notifTimeAgo(n.created_at).label}
@@ -1252,7 +1351,7 @@ export default function App() {
                             variant="caption"
                             sx={{
                               display: "block",
-                              color: n.read ? "rgba(195, 221, 252, 0.45)" : "rgba(195, 221, 252, 0.72)",
+                              color: n.read ? "rgba(155, 159, 169, 0.6)" : "rgba(187, 191, 199, 0.78)",
                               lineHeight: 1.45
                             }}
                             noWrap
@@ -1272,7 +1371,7 @@ export default function App() {
                                 size="small"
                                 label={n.source}
                                 variant="outlined"
-                                sx={{ height: 22, color: "rgba(195, 221, 252, 0.65)", borderColor: "rgba(108, 156, 212, 0.18)" }}
+                                sx={{ height: 22, color: "rgba(187, 191, 199, 0.76)", borderColor: "rgba(255, 255, 255, 0.08)" }}
                               />
                             ) : null}
                           </Stack>
@@ -1295,8 +1394,8 @@ export default function App() {
           sx: {
             width: 520,
             maxWidth: "calc(100vw - 24px)",
-            borderLeft: "1px solid rgba(108, 156, 212, 0.18)",
-            background: "linear-gradient(160deg, rgba(9, 21, 39, 0.96), rgba(9, 21, 39, 0.78))"
+            borderLeft: "1px solid rgba(255, 255, 255, 0.08)",
+            background: "linear-gradient(160deg, rgba(24, 24, 28, 0.98), rgba(15, 15, 18, 0.95))"
           }
         }}
       >
@@ -1397,7 +1496,9 @@ export default function App() {
           </Box>
         </Box>
       </Drawer>
-      <GuidedTour openTourStep={openGuidedTourStep} currentView={view} />
+      <Suspense fallback={null}>
+        <GuidedTour openTourStep={openGuidedTourStep} currentView={view} />
+      </Suspense>
     </Box>
   );
 }

@@ -7,7 +7,10 @@
 #   scripts/start.bat    (Windows)
 #
 # OR manually:
-#   docker compose up -d --build
+#   docker compose up -d
+#
+# Local source builds:
+#   AGENTARK_IMAGE=agentark:dev docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
 #
 # RESET EVERYTHING:
 #   docker compose down -v
@@ -19,6 +22,15 @@
 #   - Scheduled tasks
 #
 # The primary database lives in Postgres and is stored in its own Docker volume.
+#
+# DATA OWNERSHIP CONTRACT:
+#   - User-owned: /app/data/**, /app/config/bootstrap.toml,
+#     encrypted settings:* KV, memory/profile/preferences, tasks,
+#     /app/data/skills/**, /app/data/cli_skills/**
+#   - System-owned: /app/skills/**, built-in prompt bundles,
+#     frontend/runtime image files, default extension packs
+#   - Release updates may replace system-owned files. User-owned data is changed
+#     only by explicit user actions or future versioned migrations with backups.
 # =============================================================================
 
 services:
@@ -26,6 +38,10 @@ services:
     image: pgvector/pgvector:pg16
     container_name: agentark-postgres
     restart: unless-stopped
+    command:
+      - postgres
+      - -c
+      - log_checkpoints=off
     security_opt:
       - no-new-privileges:true
     environment:
@@ -58,18 +74,7 @@ services:
           memory: 256M
 
   agentark-control:
-    build:
-      context: .
-      args:
-        AGENTARK_DOCKER_FEATURES: ${AGENTARK_DOCKER_FEATURES:-telegram,docker,ssh}
-        INSTALL_PLAYWRIGHT_RUNTIME: ${AGENTARK_INSTALL_PLAYWRIGHT_RUNTIME:-true}
-        INSTALL_TAILSCALE: ${AGENTARK_INSTALL_TAILSCALE:-true}
-        INSTALL_CLOUDFLARED: ${AGENTARK_INSTALL_CLOUDFLARED:-true}
-        INSTALL_LIGHTPANDA: ${AGENTARK_INSTALL_LIGHTPANDA:-true}
-        INSTALL_GWS: ${AGENTARK_INSTALL_GWS:-true}
-        INSTALL_DOCKER_CLI: ${AGENTARK_INSTALL_DOCKER_CLI:-true}
-        INSTALL_WHATSAPP_BRIDGE: ${AGENTARK_INSTALL_WHATSAPP_BRIDGE:-true}
-    image: ${AGENTARK_IMAGE:-agentark:dev}
+    image: ${AGENTARK_IMAGE:-ghcr.io/agentark-ai/agentark:latest}
     container_name: agentark-control
     restart: unless-stopped
     security_opt:
@@ -101,12 +106,14 @@ services:
       - AGENTARK_DB_SCHEMA=${AGENTARK_DB_SCHEMA:-}
       - AGENTARK_BIND=0.0.0.0:8990
       - AGENTARK_PUBLIC_APP_BIND=${AGENTARK_PUBLIC_APP_BIND:-0.0.0.0:8992}
-      - AGENTARK_SELF_IMAGE=${AGENTARK_IMAGE:-agentark:dev}
+      - AGENTARK_SELF_IMAGE=${AGENTARK_IMAGE:-ghcr.io/agentark-ai/agentark:latest}
       - AGENTARK_STACK_ROLE=control
       - AGENTARK_EXECUTOR_URL=http://agentark-executor:8991
       - AGENTARK_WORKSPACE_URL=http://agentark-workspace:8992
       - AGENTARK_DEBUG=${AGENTARK_DEBUG:-false}
       - AGENTARK_TUNNEL=${AGENTARK_TUNNEL:-false}
+      - AGENTARK_LAN_HELPER_URL=${AGENTARK_LAN_HELPER_URL:-}
+      - AGENTARK_LAN_HELPER_TOKEN=${AGENTARK_LAN_HELPER_TOKEN:-}
       - AGENTARK_MASTER_PASSWORD=${AGENTARK_MASTER_PASSWORD:-}
     networks:
       - agent-network
@@ -124,7 +131,7 @@ services:
       start_period: 5s
 
   agentark-executor:
-    image: ${AGENTARK_IMAGE:-agentark:dev}
+    image: ${AGENTARK_IMAGE:-ghcr.io/agentark-ai/agentark:latest}
     container_name: agentark-executor
     restart: unless-stopped
     security_opt:
@@ -152,7 +159,7 @@ services:
       - AGENTARK_DB_SCHEMA=${AGENTARK_DB_SCHEMA:-}
       - AGENTARK_BIND=0.0.0.0:8990
       - AGENTARK_EXECUTOR_BIND=0.0.0.0:8991
-      - AGENTARK_SELF_IMAGE=${AGENTARK_IMAGE:-agentark:dev}
+      - AGENTARK_SELF_IMAGE=${AGENTARK_IMAGE:-ghcr.io/agentark-ai/agentark:latest}
       - AGENTARK_STACK_ROLE=executor
       - AGENTARK_CONTROL_URL=http://agentark-control:8990
       - AGENTARK_WORKSPACE_URL=http://agentark-workspace:8992
@@ -175,7 +182,7 @@ services:
       start_period: 5s
 
   agentark-workspace:
-    image: ${AGENTARK_IMAGE:-agentark:dev}
+    image: ${AGENTARK_IMAGE:-ghcr.io/agentark-ai/agentark:latest}
     container_name: agentark-workspace
     restart: unless-stopped
     security_opt:

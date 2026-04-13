@@ -8,7 +8,8 @@ REM   scripts\start.bat tunnel setup - Set up permanent custom domain (free Clou
 REM   scripts\start.bat stop         - Stop AgentArk
 REM   scripts\start.bat restart      - Restart AgentArk
 REM   scripts\start.bat logs         - View logs
-REM   scripts\start.bat update       - Rebuild and restart (preserves data)
+REM   scripts\start.bat update       - Pull latest image and restart (preserves data)
+REM   scripts\start.bat build        - Build from this checkout and restart
 REM   scripts\start.bat status       - Show running containers
 
 setlocal enabledelayedexpansion
@@ -25,13 +26,14 @@ if "%1"=="stop" goto stop
 if "%1"=="restart" goto restart
 if "%1"=="logs" goto logs
 if "%1"=="update" goto update
+if "%1"=="build" goto build
 if "%1"=="status" goto status
 if "%1"=="lowmem" goto lowmem
 goto usage
 
 :start
 echo Starting AgentArk...
-docker compose up -d --build
+docker compose up -d
 echo.
 echo AgentArk is running!
 echo   Web UI:  http://localhost:8990
@@ -47,7 +49,7 @@ if "%2"=="setup" goto tunnel_setup
 
 echo Starting AgentArk with remote access...
 set AGENTARK_TUNNEL=true
-docker compose up -d --build
+docker compose up -d
 echo.
 echo AgentArk is starting with secure tunnel!
 echo.
@@ -87,7 +89,7 @@ echo Token saved to .env
 echo.
 echo Starting AgentArk with permanent tunnel...
 set AGENTARK_TUNNEL=true
-docker compose up -d --build
+docker compose up -d
 echo.
 echo AgentArk is running with your custom domain!
 echo Check your Cloudflare dashboard for the URL.
@@ -110,10 +112,16 @@ goto end
 
 :update
 echo Updating AgentArk (your data will be preserved)...
-docker compose down
-docker compose build --no-cache
+docker compose pull
 docker compose up -d
 echo Update complete! Your data is intact.
+goto end
+
+:build
+echo Building AgentArk from this checkout (your data will be preserved)...
+if "%AGENTARK_IMAGE%"=="" set AGENTARK_IMAGE=agentark:dev
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+echo Local build complete! Your data is intact.
 goto end
 
 :status
@@ -149,7 +157,7 @@ echo   wsl --shutdown
 goto end
 
 :usage
-echo Usage: scripts\start.bat [start^|tunnel^|stop^|restart^|logs^|update^|status^|lowmem]
+echo Usage: scripts\start.bat [start^|tunnel^|stop^|restart^|logs^|update^|build^|status^|lowmem]
 echo.
 echo   start          Start AgentArk (local access only)
 echo   tunnel         Start with remote access (auto-starts Cloudflare tunnel)
@@ -157,7 +165,8 @@ echo   tunnel setup   Set up permanent custom domain (free Cloudflare account)
 echo   stop           Stop AgentArk
 echo   restart        Restart AgentArk
 echo   logs           View logs
-echo   update         Rebuild and restart (preserves data)
+echo   update         Pull latest image and restart (preserves data)
+echo   build          Build from this checkout and restart
 echo   status         Show running containers
 echo   lowmem         Install low-memory config (2GB RAM / 2 CPUs) for Docker
 goto end

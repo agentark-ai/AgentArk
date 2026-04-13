@@ -440,7 +440,7 @@ impl AgentArkApp {
 
             ui.group(|ui| {
                 ui.label("LLM Provider");
-                ui.label("Configure in config.toml");
+                ui.label("Configure in Settings");
             });
 
             ui.group(|ui| {
@@ -809,6 +809,7 @@ impl AgentArkApp {
             system_prompt_override,
             max_memory_retrieval: 3,
             capabilities,
+            access_scope: crate::core::swarm::AgentAccessScope::default(),
             enabled: true,
         })
     }

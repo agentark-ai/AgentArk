@@ -170,6 +170,24 @@ impl SafetyEngine {
         action_name: &str,
         arguments: &serde_json::Value,
     ) -> Result<bool> {
+        self.is_allowed_with_authorization(action_name, arguments, None)
+            .await
+    }
+
+    pub async fn is_allowed_with_authorization(
+        &self,
+        action_name: &str,
+        arguments: &serde_json::Value,
+        auth_context: Option<&crate::actions::ActionAuthorizationContext>,
+    ) -> Result<bool> {
+        if direct_trusted_chat_overrides_safety(auth_context) {
+            tracing::debug!(
+                "Safety policy bypassed for direct trusted chat action: {}",
+                action_name
+            );
+            return Ok(true);
+        }
+
         // Clone rules to avoid borrow issues with rate limiting
         let rules = self
             .rules
@@ -511,8 +529,100 @@ impl SafetyEngine {
     }
 }
 
+fn direct_trusted_chat_overrides_safety(
+    auth_context: Option<&crate::actions::ActionAuthorizationContext>,
+) -> bool {
+    auth_context.is_some_and(|ctx| {
+        matches!(ctx.surface, crate::actions::ActionExecutionSurface::Chat)
+            && ctx.direct_user_intent
+            && ctx
+                .principal
+                .as_ref()
+                .is_some_and(|principal| principal.trusted)
+    })
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct SafetyConfig {
     #[serde(rename = "rule")]
     rules: Vec<SafetyRule>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_trusted_chat_overrides_safety_rules() {
+        let ctx = crate::actions::ActionAuthorizationContext {
+            principal: Some(crate::actions::ActionCallerPrincipal {
+                user_id: "local-user".to_string(),
+                role: "owner".to_string(),
+                trusted: true,
+                auth_source: "web".to_string(),
+            }),
+            surface: crate::actions::ActionExecutionSurface::Chat,
+            direct_user_intent: true,
+            current_turn_is_explicit_approval: false,
+            agent_name: None,
+            agent_access_scope: None,
+        };
+        assert!(direct_trusted_chat_overrides_safety(Some(&ctx)));
+    }
+
+    #[test]
+    fn automation_does_not_override_safety_rules() {
+        let ctx = crate::actions::ActionAuthorizationContext {
+            principal: Some(crate::actions::ActionCallerPrincipal {
+                user_id: "local-user".to_string(),
+                role: "owner".to_string(),
+                trusted: true,
+                auth_source: "automation".to_string(),
+            }),
+            surface: crate::actions::ActionExecutionSurface::Automation,
+            direct_user_intent: false,
+            current_turn_is_explicit_approval: false,
+            agent_name: None,
+            agent_access_scope: None,
+        };
+        assert!(!direct_trusted_chat_overrides_safety(Some(&ctx)));
+    }
+
+    #[tokio::test]
+    async fn direct_trusted_chat_allows_blocked_rule_actions() {
+        let temp = tempfile::tempdir().unwrap();
+        let safety = SafetyEngine::new(temp.path()).unwrap();
+        safety.add_rule(SafetyRule {
+            name: "test_block_all".to_string(),
+            description: "Test block rule".to_string(),
+            trigger: RuleTrigger::Always,
+            condition: None,
+            action: RuleAction::Block {
+                message: "blocked".to_string(),
+            },
+            verified: true,
+        });
+        let ctx = crate::actions::ActionAuthorizationContext {
+            principal: Some(crate::actions::ActionCallerPrincipal {
+                user_id: "local-user".to_string(),
+                role: "owner".to_string(),
+                trusted: true,
+                auth_source: "web".to_string(),
+            }),
+            surface: crate::actions::ActionExecutionSurface::Chat,
+            direct_user_intent: true,
+            current_turn_is_explicit_approval: false,
+            agent_name: None,
+            agent_access_scope: None,
+        };
+
+        assert!(safety
+            .is_allowed_with_authorization("http_get", &serde_json::json!({}), Some(&ctx))
+            .await
+            .unwrap());
+        assert!(!safety
+            .is_allowed_with_authorization("http_get", &serde_json::json!({}), None)
+            .await
+            .unwrap());
+    }
 }

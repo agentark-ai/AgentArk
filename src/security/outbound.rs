@@ -85,7 +85,10 @@ fn has_hard_blocker(text: &str, reasons: &mut Vec<String>) -> bool {
         blocked = true;
     }
     if ADDRESS_RE.is_match(text) {
-        push_unique(reasons, "street-address-like content detected in outbound content");
+        push_unique(
+            reasons,
+            "street-address-like content detected in outbound content",
+        );
         blocked = true;
     }
     if SPII_RE.is_match(text) {
@@ -311,12 +314,10 @@ mod tests {
             &OutboundPrivacyPolicy::default(),
         );
         assert!(matches!(result.decision, OutboundPrivacyDecision::Block));
-        assert!(
-            result
-                .reasons
-                .iter()
-                .any(|reason| reason.contains("user-bound"))
-        );
+        assert!(result
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("user-bound")));
     }
 
     #[test]
@@ -337,10 +338,7 @@ mod tests {
                 .sanitized_value
                 .to_string()
                 .contains("[REDACTED_API_KEY]")
-                || result
-                    .sanitized_value
-                    .to_string()
-                    .contains("[PHONE]")
+                || result.sanitized_value.to_string().contains("[PHONE]")
         );
     }
 
@@ -356,11 +354,9 @@ mod tests {
             },
         );
         assert!(matches!(result.decision, OutboundPrivacyDecision::Block));
-        assert!(
-            result
-                .reasons
-                .iter()
-                .any(|reason| reason.contains("auto-redaction is disabled"))
-        );
+        assert!(result
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("auto-redaction is disabled")));
     }
 }

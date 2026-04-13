@@ -118,6 +118,7 @@ fn http_client() -> Result<reqwest::Client> {
         .build()?)
 }
 
+#[allow(dead_code)]
 async fn load_destination(agent: &Agent) -> Result<Option<GoogleChatDestinationContext>> {
     if let Ok(Some(raw)) = agent.storage.get(LAST_DESTINATION_STORAGE_KEY).await {
         if let Ok(value) = serde_json::from_slice::<GoogleChatDestinationContext>(&raw) {
@@ -150,19 +151,14 @@ fn normalize_space(space: &str) -> String {
 
 fn resolve_destination(
     config: &GoogleChatChannelConfig,
-    last_destination: Option<GoogleChatDestinationContext>,
+    _last_destination: Option<GoogleChatDestinationContext>,
 ) -> Result<GoogleChatDestinationContext> {
-    if let Some(destination) = last_destination {
-        if !destination.space.trim().is_empty() {
-            return Ok(destination);
-        }
-    }
     let Some(space) = config
         .space
         .clone()
         .filter(|value| !value.trim().is_empty())
     else {
-        return Err(anyhow!("Google Chat space is not configured"));
+        return Err(anyhow!("Google Chat notification space is not configured"));
     };
     Ok(GoogleChatDestinationContext {
         space: normalize_space(&space),
@@ -214,9 +210,8 @@ pub async fn send_message(agent: &Agent, text: &str) -> Result<()> {
         .google_chat
         .clone()
         .ok_or_else(|| anyhow!("Google Chat is not configured"))?;
-    let destination = resolve_destination(&config, load_destination(agent).await?)?;
+    let destination = resolve_destination(&config, None)?;
     send_message_to_destination(&config, &destination, text).await?;
-    persist_destination(agent, &destination).await?;
     Ok(())
 }
 
@@ -358,4 +353,28 @@ pub async fn handle_webhook(agent: SharedAgent, payload: &serde_json::Value) -> 
 
     send_message_to_destination(&config, &destination, &response).await?;
     Ok("ok".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proactive_destination_uses_configured_space_and_thread_only() {
+        let config = GoogleChatChannelConfig {
+            access_token: "token".to_string(),
+            verify_token: "verify".to_string(),
+            space: Some("spaces/AAA".to_string()),
+            thread_key: Some("thread-config".to_string()),
+            ..Default::default()
+        };
+        let last_destination = Some(GoogleChatDestinationContext {
+            space: "spaces/OLD".to_string(),
+            thread_key: Some("thread-old".to_string()),
+        });
+
+        let destination = resolve_destination(&config, last_destination).unwrap();
+        assert_eq!(destination.space, "spaces/AAA");
+        assert_eq!(destination.thread_key.as_deref(), Some("thread-config"));
+    }
 }

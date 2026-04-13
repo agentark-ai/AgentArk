@@ -188,8 +188,26 @@ impl MasterPasswordManager {
             return Ok(None);
         }
         let bootstrap_password = self.derive_bootstrap_password()?;
-        let key = self.set_password_with_mode(&bootstrap_password, true)?;
-        Ok(Some(key))
+        let prepared = self.prepare_password_with_mode(&bootstrap_password, true)?;
+        let key = prepared.key_manager.clone();
+
+        if crate::crypto::atomic_write_file_if_absent(
+            &self.meta_path(),
+            prepared.meta_json.as_bytes(),
+        )? {
+            tracing::info!(
+                "Bootstrap master password initialized (per-install, derived from local keyfile)"
+            );
+            return Ok(Some(key));
+        }
+
+        // Another service already initialized the shared config volume. Reuse the
+        // persisted bootstrap password instead of keeping a divergent in-memory key.
+        if self.is_bootstrap_password_active()? {
+            return Ok(Some(self.unlock(&bootstrap_password)?));
+        }
+
+        Ok(None)
     }
 
     /// Remove master password - revert to auto-generated keyfile
@@ -223,9 +241,27 @@ impl MasterPasswordManager {
                 "No master password configured (master.json not found)"
             ));
         }
-        let content = std::fs::read_to_string(&path)?;
-        let meta: MasterMeta = serde_json::from_str(&content)?;
-        Ok(meta)
+        for attempt in 0..20 {
+            match std::fs::read_to_string(&path) {
+                Ok(content) if !content.trim().is_empty() => match serde_json::from_str(&content) {
+                    Ok(meta) => return Ok(meta),
+                    Err(error) if attempt < 19 => {
+                        let _ = error;
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error.into()),
+                },
+                Ok(_) if attempt < 19 => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Ok(_) => return Err(anyhow!("Corrupt master.json: empty file")),
+                Err(error) if attempt < 19 && error.kind() == std::io::ErrorKind::NotFound => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        unreachable!("master metadata read loop should have returned or errored");
     }
 }
 
@@ -280,6 +316,47 @@ mod tests {
         let encrypted = key.encrypt(plaintext).unwrap();
         let decrypted = unlocked.decrypt(&encrypted).unwrap();
         assert_eq!(plaintext, &decrypted[..]);
+    }
+
+    #[test]
+    fn bootstrap_initialization_is_atomic_across_concurrent_callers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = std::sync::Arc::new(MasterPasswordManager::new(tmp.path(), tmp.path()));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+
+        let handles = (0..8)
+            .map(|_| {
+                let mgr = mgr.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    mgr.initialize_bootstrap_password_if_needed()
+                        .expect("bootstrap init should succeed")
+                        .expect("bootstrap init should yield a key")
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let keys = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread should complete"))
+            .collect::<Vec<_>>();
+
+        let bootstrap_password = mgr
+            .bootstrap_password_if_active()
+            .expect("bootstrap state should load")
+            .expect("bootstrap password should exist");
+        let canonical = mgr
+            .unlock(&bootstrap_password)
+            .expect("bootstrap password should unlock");
+        let ciphertext = canonical.encrypt(b"bootstrap-race-roundtrip").unwrap();
+
+        for key in keys {
+            let decrypted = key
+                .decrypt(&ciphertext)
+                .expect("all callers should share one key");
+            assert_eq!(&decrypted[..], b"bootstrap-race-roundtrip");
+        }
     }
 
     #[test]

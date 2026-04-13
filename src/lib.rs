@@ -19,6 +19,7 @@ mod crypto;
 mod custom_apis;
 mod docs;
 mod executor;
+mod extension_packs;
 mod hooks;
 mod identity;
 mod integrations;
@@ -94,7 +95,7 @@ struct Args {
     command: Option<cli::Command>,
 }
 
-fn startup_deployment_mode(config_path: &Path) -> core::config::DeploymentMode {
+fn startup_deployment_mode(config_dir: &Path) -> core::config::DeploymentMode {
     if let Ok(force_mode) = std::env::var("AGENTARK_DEPLOYMENT_MODE") {
         match force_mode.trim().to_ascii_lowercase().as_str() {
             "internet_facing" | "internet-facing" => {
@@ -107,11 +108,7 @@ fn startup_deployment_mode(config_path: &Path) -> core::config::DeploymentMode {
         }
     }
 
-    std::fs::read_to_string(config_path)
-        .ok()
-        .and_then(|raw| toml::from_str::<core::config::AgentConfig>(&raw).ok())
-        .map(|config| config.deployment_mode)
-        .unwrap_or_default()
+    core::config::load_bootstrap_deployment_mode(config_dir)
 }
 
 fn startup_master_password_secret() -> Option<String> {
@@ -125,6 +122,83 @@ fn startup_master_password_secret() -> Option<String> {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
         })
+}
+
+fn resolve_background_service_key(
+    config_dir: &Path,
+    data_dir: &Path,
+    deployment_mode: core::config::DeploymentMode,
+    is_first_run: bool,
+) -> Result<std::sync::Arc<crate::crypto::KeyManager>> {
+    let master_mgr = crypto::master::MasterPasswordManager::new(config_dir, data_dir);
+    let startup_master_password = startup_master_password_secret();
+
+    if master_mgr.is_password_set() {
+        if let Some(password) = startup_master_password.as_deref() {
+            tracing::info!("Using startup-provided master password secret");
+            if let Ok(key) = master_mgr.unlock(password) {
+                return Ok(key);
+            }
+            tracing::warn!("Startup master password secret did not unlock master key");
+        }
+
+        if deployment_mode == core::config::DeploymentMode::InternetFacing
+            && master_mgr.is_bootstrap_password_active()?
+        {
+            anyhow::bail!(
+                "Internet-facing deployments do not allow bootstrap/keyfile-derived encryption. Set an operator-managed master password first, then restart."
+            );
+        }
+
+        if let Some(password) = master_mgr.bootstrap_password_if_active()? {
+            tracing::info!("Using local bootstrap password for service-mode encryption");
+            return master_mgr.unlock(&password);
+        }
+
+        anyhow::bail!(
+            "Background services require AGENTARK_MASTER_PASSWORD or /run/secrets/agentark_master_key when a master password is configured."
+        );
+    }
+
+    if deployment_mode == core::config::DeploymentMode::InternetFacing {
+        let password = startup_master_password.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Internet-facing deployments require AGENTARK_MASTER_PASSWORD or /run/secrets/agentark_master_key on startup. Bootstrap/keyfile encryption is disabled for this mode."
+            )
+        })?;
+        tracing::info!("Initializing master password from provided startup secret");
+        return master_mgr.set_password(&password);
+    }
+
+    if is_first_run {
+        if let Some(password) = startup_master_password {
+            tracing::info!("Initializing master password from provided startup secret");
+            return master_mgr.set_password(&password);
+        }
+    }
+
+    if let Some(key) = master_mgr.initialize_bootstrap_password_if_needed()? {
+        tracing::info!("Initialized bootstrap encryption password for background service startup");
+        return Ok(key);
+    }
+
+    master_mgr.prepare_keyfile_encryption()
+}
+
+async fn initialize_executor_service_globals(config_dir: &Path, data_dir: &Path) -> Result<()> {
+    let deployment_mode = startup_deployment_mode(config_dir);
+    let is_first_run = !core::config::bootstrap_metadata_exists(config_dir);
+    let unified_key =
+        resolve_background_service_key(config_dir, data_dir, deployment_mode, is_first_run)?;
+    core::config::set_global_key_manager(unified_key.clone());
+    crate::storage::install_storage_key_manager(unified_key);
+
+    let database_config = storage::DatabaseConfig::from_env().map_err(|_| {
+        anyhow::anyhow!("AGENTARK_DATABASE_URL is required for split-service executor startup")
+    })?;
+    let storage = storage::Storage::connect(database_config).await?;
+    core::config::set_global_settings_storage(storage);
+    Ok(())
 }
 
 const CLI_SETUP_COMMAND: &str = "agentark setup";
@@ -265,15 +339,19 @@ pub async fn run() -> Result<()> {
     std::fs::create_dir_all(&config_dir)?;
     std::fs::create_dir_all(&data_dir)?;
 
+    if let Some(cli::Command::LanHelper(helper_args)) = args.command.as_ref() {
+        return actions::lan::run_lan_helper(helper_args.bind.clone(), helper_args.token.clone())
+            .await;
+    }
+
     let service_mode = effective_service_mode(args.service_mode);
     if service_mode != cli::ServiceMode::Control {
         return run_service_mode(service_mode, &config_dir, &data_dir).await;
     }
 
-    // Check if this is first run (no config file exists)
-    let config_path = config_dir.join("config.toml");
-    let is_first_run = !config_path.exists();
-    let deployment_mode = startup_deployment_mode(&config_path);
+    // Check if this is first run (no bootstrap metadata exists yet)
+    let is_first_run = !core::config::bootstrap_metadata_exists(&config_dir);
+    let deployment_mode = startup_deployment_mode(&config_dir);
 
     if is_first_run && !args.setup {
         // Print welcome message
@@ -554,6 +632,7 @@ async fn run_service_mode(
     match mode {
         cli::ServiceMode::Control => Ok(()),
         cli::ServiceMode::Executor => {
+            initialize_executor_service_globals(config_dir, data_dir).await?;
             let config = executor::ExecutorServiceConfig::from_env_paths(
                 config_dir.to_path_buf(),
                 data_dir.to_path_buf(),
@@ -611,6 +690,20 @@ fn render_cli_stream_event(
         core::StreamEvent::RunStarted { run_id, .. } => {
             finish_cli_inline_response(state)?;
             println!("\x1b[3;90mRun {}\x1b[0m", &run_id[..run_id.len().min(8)]);
+        }
+        core::StreamEvent::ChatTaskStarted {
+            task_id,
+            description,
+            work_type,
+            ..
+        } => {
+            finish_cli_inline_response(state)?;
+            println!(
+                "\x1b[35m[task]\x1b[0m {} [{}] {}",
+                &task_id[..task_id.len().min(8)],
+                work_type,
+                description
+            );
         }
         core::StreamEvent::Token(token) => {
             if !state.assistant_inline_open {

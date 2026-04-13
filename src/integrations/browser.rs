@@ -104,7 +104,7 @@ impl BrowserIntegration {
     pub fn new() -> Self {
         let bridge_url = std::env::var("PLAYWRIGHT_BRIDGE_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:3100".to_string());
-        tracing::info!("BrowserIntegration initialized: bridge_url={}", bridge_url);
+        tracing::debug!("BrowserIntegration initialized: bridge_url={}", bridge_url);
         Self {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(35))

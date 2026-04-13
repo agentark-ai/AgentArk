@@ -20,33 +20,17 @@ pub(crate) struct OperationalEvent<'a> {
 }
 
 impl Agent {
-    fn detect_user_correction_signal(message: &str) -> bool {
-        let lowered = message.trim().to_ascii_lowercase();
-        if lowered.is_empty() {
-            return false;
-        }
-        let patterns = [
-            "that's wrong",
-            "that is wrong",
-            "not what i asked",
-            "not what i wanted",
-            "you missed",
-            "try again",
-            "redo",
-            "incorrect",
-            "no,",
-            "no ",
-            "instead",
-            "don't do that",
-            "do not do that",
-            "i said",
-            "fix this",
-        ];
-        patterns.iter().any(|p| lowered.contains(p))
-    }
-
     fn sanitize_operational_text(raw: &str, max_chars: usize) -> String {
-        let redacted = crate::security::redact_pii(raw);
+        let result = crate::security::sanitize_model_input_text(
+            raw,
+            &crate::security::ModelPrivacyConfig::default(),
+            crate::security::ModelInputContext::Diagnostic,
+            false,
+        );
+        let redacted = crate::security::render_model_input_fallback(
+            &result,
+            crate::security::ModelInputContext::Diagnostic,
+        );
         safe_truncate(&redacted, max_chars)
     }
 
@@ -216,8 +200,14 @@ impl Agent {
     pub(crate) async fn build_strategy_prompt_block_for_message(
         &self,
         message: &str,
+        request_shape: Option<&crate::core::RequestShapeAssessment>,
+        actions: &[crate::actions::ActionDef],
     ) -> Option<(String, String, String)> {
-        let task_type = crate::core::self_evolve::strategy_runtime::infer_task_type(message);
+        let task_type =
+            crate::core::self_evolve::strategy_runtime::infer_task_type_from_request_context(
+                request_shape,
+                actions,
+            );
         let baseline = self
             .load_tool_strategy_profile_by_key(
                 crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_PROFILE_KEY,
@@ -388,8 +378,4 @@ impl Agent {
 
         selected
     }
-}
-
-pub(super) fn message_looks_like_correction(message: &str) -> bool {
-    Agent::detect_user_correction_signal(message)
 }

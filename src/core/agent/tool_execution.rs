@@ -1,4 +1,6 @@
 use super::*;
+use crate::core::tool_handlers::ToolHandler;
+use futures::stream::{self, StreamExt};
 
 fn build_executor_client() -> Option<crate::clients::ExecutorClient> {
     let role = std::env::var("AGENTARK_STACK_ROLE")
@@ -434,7 +436,9 @@ async fn send_app_deploy_progress_to_conversation(
 
 pub(crate) struct ToolExecutionContext<'a> {
     pub request_channel: &'a str,
+    pub request_message: &'a str,
     pub current_turn_is_explicit_approval: bool,
+    pub allow_sensitive_model_context_once: bool,
     pub trace_id: Option<&'a str>,
     pub conversation_id: Option<&'a str>,
     pub project_id: Option<&'a str>,
@@ -457,6 +461,84 @@ pub(crate) struct ToolCallOutput {
 pub(crate) struct ToolExecutionBatch {
     pub outputs: Vec<ToolCallOutput>,
     pub outcomes: Vec<crate::core::ToolOutcome>,
+}
+
+const PARALLEL_READ_ONLY_TOOL_LIMIT_CAP: usize = 4;
+
+#[derive(Debug, Clone)]
+struct PreparedToolExecution {
+    original_index: usize,
+    call: crate::core::llm::ToolCall,
+    action_def: Option<crate::actions::ActionDef>,
+    side_effecting: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ExecutedToolCall {
+    original_index: usize,
+    output: ToolCallOutput,
+    outcome: crate::core::ToolOutcome,
+}
+
+struct ToolExecutionEnv<'a> {
+    trace_ref: &'a Arc<RwLock<ExecutionTrace>>,
+    stream_tx: Option<&'a tokio::sync::mpsc::Sender<StreamEvent>>,
+    request_channel: &'a str,
+    request_message: &'a str,
+    current_turn_is_explicit_approval: bool,
+    trace_id: Option<&'a str>,
+    conversation_id: Option<&'a str>,
+    project_id: Option<&'a str>,
+    strategy_version: Option<&'a str>,
+    policy_version: Option<&'a str>,
+    prompt_version: Option<&'a str>,
+    classifier_prompt_version: Option<&'a str>,
+    specialist_prompt_version: Option<&'a str>,
+    model_slot: Option<&'a str>,
+    authorization: &'a crate::actions::ActionAuthorizationContext,
+    public_base_url: Option<&'a str>,
+    integration_aliases: &'a HashMap<String, String>,
+    handlers: &'a [Box<dyn ToolHandler>],
+    user_execution_constraints: &'a super::UserExecutionConstraints,
+}
+
+fn parallel_read_only_tool_execution_limit() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().min(PARALLEL_READ_ONLY_TOOL_LIMIT_CAP))
+        .unwrap_or(PARALLEL_READ_ONLY_TOOL_LIMIT_CAP)
+        .max(1)
+}
+
+fn tool_call_supports_parallel_read_only_execution(
+    call: &crate::core::llm::ToolCall,
+    action_def: Option<&crate::actions::ActionDef>,
+    side_effecting: bool,
+) -> bool {
+    if side_effecting || action_def.is_none() {
+        return false;
+    }
+
+    matches!(
+        call.name.trim().to_ascii_lowercase().as_str(),
+        "research" | "web_search"
+    )
+}
+
+fn summarize_parallel_tool_batch(batch: &[PreparedToolExecution]) -> String {
+    let mut names = Vec::new();
+    for name in batch
+        .iter()
+        .map(|prepared| prepared.call.name.trim().to_ascii_lowercase())
+    {
+        if !names.iter().any(|existing: &String| existing == &name) {
+            names.push(name);
+        }
+    }
+    if names.is_empty() {
+        "tool".to_string()
+    } else {
+        names.join(", ")
+    }
 }
 
 fn action_has_dangerous_capabilities(action_def: Option<&crate::actions::ActionDef>) -> bool {
@@ -681,6 +763,112 @@ impl Agent {
         }
     }
 
+    fn extract_literal_request_urls(text: &str) -> Vec<String> {
+        let Ok(re) = regex::Regex::new(r#"(?i)\b[a-z][a-z0-9+.-]{1,31}://[^\s<>"'`)]+"#) else {
+            return Vec::new();
+        };
+        let mut seen = HashSet::new();
+        let mut urls = Vec::new();
+        for mat in re.find_iter(text) {
+            let candidate = mat
+                .as_str()
+                .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | ',' | ';' | ')' | '('))
+                .to_string();
+            if !candidate.is_empty() && seen.insert(candidate.clone()) {
+                urls.push(candidate);
+            }
+        }
+        urls
+    }
+
+    fn url_scheme_signature(raw: &str) -> Option<String> {
+        raw.split_once("://")
+            .map(|(scheme, _)| scheme.trim().to_ascii_lowercase())
+            .filter(|scheme| !scheme.is_empty())
+    }
+
+    fn url_authority_signature(raw: &str) -> Option<String> {
+        let (_, remainder) = raw.split_once("://")?;
+        let authority_end = remainder.find('/').unwrap_or(remainder.len());
+        Some(remainder[..authority_end].trim().to_ascii_lowercase())
+    }
+
+    fn url_suffix_signature(raw: &str) -> Option<String> {
+        let (_, remainder) = raw.split_once("://")?;
+        let authority_end = remainder.find('/').unwrap_or(remainder.len());
+        let suffix = remainder[authority_end..].trim().to_ascii_lowercase();
+        if suffix.is_empty() {
+            None
+        } else {
+            Some(suffix)
+        }
+    }
+
+    fn should_restore_literal_request_url(candidate: &str, request_url: &str) -> bool {
+        if candidate == request_url {
+            return false;
+        }
+        let Some(candidate_scheme) = Self::url_scheme_signature(candidate) else {
+            return false;
+        };
+        let Some(request_scheme) = Self::url_scheme_signature(request_url) else {
+            return false;
+        };
+        if candidate_scheme != request_scheme {
+            return false;
+        }
+        let Some(candidate_suffix) = Self::url_suffix_signature(candidate) else {
+            return false;
+        };
+        let Some(request_suffix) = Self::url_suffix_signature(request_url) else {
+            return false;
+        };
+        if candidate_suffix != request_suffix {
+            return false;
+        }
+        Self::url_authority_signature(candidate) != Self::url_authority_signature(request_url)
+    }
+
+    fn restore_literal_request_targets(
+        value: &serde_json::Value,
+        request_message: &str,
+    ) -> serde_json::Value {
+        let request_urls = Self::extract_literal_request_urls(request_message);
+        if request_urls.len() != 1 {
+            return value.clone();
+        }
+        let request_url = &request_urls[0];
+        match value {
+            serde_json::Value::Object(map) => serde_json::Value::Object(
+                map.iter()
+                    .map(|(key, inner)| {
+                        (
+                            key.clone(),
+                            Self::restore_literal_request_targets(inner, request_message),
+                        )
+                    })
+                    .collect(),
+            ),
+            serde_json::Value::Array(items) => serde_json::Value::Array(
+                items
+                    .iter()
+                    .map(|inner| Self::restore_literal_request_targets(inner, request_message))
+                    .collect(),
+            ),
+            serde_json::Value::String(text) => {
+                let candidate_urls = Self::extract_literal_request_urls(text);
+                if candidate_urls.len() == 1
+                    && Self::should_restore_literal_request_url(&candidate_urls[0], request_url)
+                {
+                    serde_json::Value::String(text.replacen(&candidate_urls[0], request_url, 1))
+                } else {
+                    value.clone()
+                }
+            }
+            _ => value.clone(),
+        }
+    }
+
     async fn classify_tool_call_side_effecting(
         &self,
         call: &crate::core::llm::ToolCall,
@@ -796,12 +984,29 @@ impl Agent {
     pub(crate) fn tool_call_signature(call: &crate::core::llm::ToolCall) -> String {
         let normalized_name = call.name.trim().to_ascii_lowercase();
         if normalized_name == "watch" {
+            let target = call
+                .arguments
+                .get("watcher_id")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("target:{}|", value))
+                .unwrap_or_default();
             return format!(
-                "watch:{}",
+                "watch:{}{}",
+                target,
                 crate::core::watcher::watcher_tool_call_signature_from_arguments(&call.arguments)
             );
         }
         if normalized_name == "schedule_task" {
+            let target = call
+                .arguments
+                .get("task_id")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("target:{}|", value))
+                .unwrap_or_default();
             let description = call
                 .arguments
                 .get("task")
@@ -820,7 +1025,8 @@ impl Agent {
             let cron_expr = call.arguments.get("cron").and_then(|value| value.as_str());
             let at_time = call.arguments.get("at").and_then(|value| value.as_str());
             return format!(
-                "schedule_task:{}",
+                "schedule_task:{}{}",
+                target,
                 crate::core::task::task_request_signature_from_fields(
                     action_name,
                     description,
@@ -2603,6 +2809,7 @@ Requirements:\n\
         );
 
         let empty_actions: Vec<crate::actions::ActionDef> = Vec::new();
+        let repair_timeout_secs = super::tool_followup_llm_timeout_secs(false, true, false);
         let repair = match super::run_timed_llm_call_with_heartbeat(
             llm_client,
             system_prompt,
@@ -2610,8 +2817,10 @@ Requirements:\n\
             &[],
             &[],
             &empty_actions,
+            &self.config.model_privacy,
+            false,
             token_tx,
-            super::TOOL_FOLLOWUP_LLM_TIMEOUT_SECS,
+            repair_timeout_secs,
             "Rebuilding deploy payload from malformed arguments",
             false,
             "app_deploy",
@@ -2623,7 +2832,7 @@ Requirements:\n\
             super::TimedLlmCallOutcome::TimedOut => {
                 anyhow::bail!(
                     "self-heal model timed out after {} seconds",
-                    super::TOOL_FOLLOWUP_LLM_TIMEOUT_SECS
+                    repair_timeout_secs
                 )
             }
         };
@@ -3034,8 +3243,10 @@ Requirements:\n\
                         crate::hooks::HookTrigger::OnError => "on_error".to_string(),
                     },
                     channel: channel.to_string(),
-                    message: message_hint.map(|m| safe_truncate(m, 500)),
-                    response: response.map(|r| safe_truncate(r, 1500)),
+                    message: message_hint
+                        .map(|m| self.sanitize_stream_preview(&safe_truncate(m, 500))),
+                    response: response
+                        .map(|r| self.sanitize_stream_preview(&safe_truncate(r, 1500))),
                     action: Some(action_name.to_string()),
                     timestamp: chrono::Utc::now().to_rfc3339(),
                 },
@@ -3049,6 +3260,7 @@ Requirements:\n\
         arguments: &serde_json::Value,
         channel: &str,
         message_hint: Option<&str>,
+        authorization: Option<&crate::actions::ActionAuthorizationContext>,
     ) -> Result<String> {
         let event_id = uuid::Uuid::new_v4().to_string();
         self.fire_action_hook(
@@ -3061,7 +3273,15 @@ Requirements:\n\
         )
         .await;
 
-        match self.runtime.execute_action(action_name, arguments).await {
+        let execution = if let Some(auth_context) = authorization {
+            self.runtime
+                .execute_action_with_context(action_name, arguments, auth_context)
+                .await
+        } else {
+            self.runtime.execute_action(action_name, arguments).await
+        };
+
+        match execution {
             Ok(result) => {
                 self.fire_action_hook(
                     crate::hooks::HookTrigger::PostAction,
@@ -3091,8 +3311,19 @@ Requirements:\n\
     }
 
     fn sanitize_stream_preview(&self, text: &str) -> String {
-        let filtered = self.security.filter_output(text);
-        safe_truncate(&filtered.text, 300)
+        let result = crate::security::sanitize_model_input_text(
+            text,
+            &self.config.model_privacy,
+            crate::security::ModelInputContext::Diagnostic,
+            false,
+        );
+        safe_truncate(
+            &crate::security::render_model_input_fallback(
+                &result,
+                crate::security::ModelInputContext::Diagnostic,
+            ),
+            300,
+        )
     }
 
     async fn load_public_base_url(&self) -> Option<String> {
@@ -3622,36 +3853,126 @@ Requirements:\n\
             .collect()
     }
 
+    fn browser_integration_action_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "create_session",
+                        "navigate",
+                        "screenshot",
+                        "click",
+                        "type_text",
+                        "scroll",
+                        "get_content",
+                        "close_session"
+                    ],
+                    "description": "Browser operation to execute. Use only the listed actions."
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Existing browser session id. Required for every action except `create_session`."
+                },
+                "url": {
+                    "type": "string",
+                    "description": "Public http/https URL for `navigate`."
+                },
+                "selector": {
+                    "type": "string",
+                    "description": "CSS selector for `click` or `type_text`."
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Text to type, or visible text target for `click`."
+                },
+                "clear": {
+                    "type": "boolean",
+                    "description": "Whether `type_text` should clear the target first."
+                },
+                "x": {
+                    "type": "integer",
+                    "description": "Optional x coordinate for `click`."
+                },
+                "y": {
+                    "type": "integer",
+                    "description": "Optional y coordinate for `click`."
+                },
+                "direction": {
+                    "type": "string",
+                    "enum": ["up", "down"],
+                    "description": "Scroll direction for `scroll`."
+                },
+                "amount": {
+                    "type": "integer",
+                    "description": "Optional scroll amount for `scroll`."
+                }
+            },
+            "required": ["action"],
+            "additionalProperties": true
+        })
+    }
+
     fn build_integration_action_def(
         &self,
         tool_name: &str,
         integration_id: &str,
         integration: &dyn crate::integrations::Integration,
     ) -> crate::actions::ActionDef {
+        let (capabilities, description, input_schema) = if integration_id == "browser" {
+            (
+                vec![
+                    "browser".to_string(),
+                    "read".to_string(),
+                    "write".to_string(),
+                ],
+                format!(
+                    "Integration tool '{}' routed to '{}'. {} Use this only for explicit manual browser control such as creating a session, navigating to a known URL, clicking, typing, scrolling, taking a screenshot, or reading page content. Do not use it for general public web search, current events, or news lookups; use built-in `web_search`, `research`, or `browse` instead.",
+                    tool_name,
+                    integration_id,
+                    integration.description()
+                ),
+                Self::browser_integration_action_schema(),
+            )
+        } else {
+            let capabilities = Self::integration_capability_labels(integration.capabilities());
+            let search_routing_hint = if capabilities.iter().any(|cap| cap == "search") {
+                " Prefer this connector only when the user explicitly wants this service, account, community, repository, or workspace. For general public web facts, current events, or news, prefer built-in `web_search` or `research`."
+            } else {
+                ""
+            };
+            (
+                capabilities,
+                format!(
+                    "Integration tool '{}' routed to '{}'. {}{} Pass an 'action' field and any connector-specific parameters.",
+                    tool_name,
+                    integration_id,
+                    integration.description(),
+                    search_routing_hint
+                ),
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "description": "Connector operation to execute"
+                        }
+                    },
+                    "additionalProperties": true
+                }),
+            )
+        };
         crate::actions::ActionDef {
             name: tool_name.to_string(),
-            description: format!(
-                "Integration tool '{}' routed to '{}'. {} Pass an 'action' field and any connector-specific parameters.",
-                tool_name,
-                integration_id,
-                integration.description()
-            ),
+            description,
             version: "1.0.0".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "description": "Connector operation to execute"
-                    }
-                },
-                "additionalProperties": true
-            }),
-            capabilities: Self::integration_capability_labels(integration.capabilities()),
+            input_schema,
+            capabilities,
             sandbox_mode: None,
             source: crate::actions::ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+            authorization: Default::default(),
         }
     }
 
@@ -3694,12 +4015,23 @@ Requirements:\n\
         }
     }
 
+    async fn legacy_tool_call_allowed_by_safety(
+        safety: &crate::safety::SafetyEngine,
+        call: &crate::core::llm::ToolCall,
+        authorization: Option<&crate::actions::ActionAuthorizationContext>,
+    ) -> Result<bool> {
+        safety
+            .is_allowed_with_authorization(&call.name, &call.arguments, authorization)
+            .await
+    }
+
     pub(crate) async fn execute_single_tool_call_legacy(
         &self,
         call: &crate::core::llm::ToolCall,
         trace_ref: &Arc<RwLock<ExecutionTrace>>,
         stream_tx: Option<tokio::sync::mpsc::Sender<StreamEvent>>,
         request_channel: &str,
+        authorization: Option<&crate::actions::ActionAuthorizationContext>,
     ) -> Result<String> {
         let call_started = std::time::Instant::now();
         let synthetic = crate::core::llm::LlmResponse {
@@ -3711,7 +4043,13 @@ Requirements:\n\
             model: "tool_dispatch".to_string(),
         };
         match self
-            .execute_tool_calls_legacy(&synthetic, trace_ref, stream_tx, request_channel)
+            .execute_tool_calls_legacy(
+                &synthetic,
+                trace_ref,
+                stream_tx,
+                request_channel,
+                authorization,
+            )
             .await
         {
             Ok(output) => {
@@ -3740,12 +4078,14 @@ Requirements:\n\
         call: &crate::core::llm::ToolCall,
         stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
         request_channel: &str,
+        authorization: Option<&crate::actions::ActionAuthorizationContext>,
     ) -> Result<String> {
         self.execute_single_tool_call_legacy(
             call,
             &Arc::new(RwLock::new(ExecutionTrace::default())),
             stream_tx.cloned(),
             request_channel,
+            authorization,
         )
         .await
     }
@@ -3756,12 +4096,14 @@ Requirements:\n\
         stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
         request_channel: &str,
         _public_base_url: Option<&str>,
+        authorization: Option<&crate::actions::ActionAuthorizationContext>,
     ) -> Result<String> {
         self.execute_single_tool_call_legacy(
             call,
             &Arc::new(RwLock::new(ExecutionTrace::default())),
             stream_tx.cloned(),
             request_channel,
+            authorization,
         )
         .await
     }
@@ -3770,12 +4112,14 @@ Requirements:\n\
         &self,
         call: &crate::core::llm::ToolCall,
         stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+        authorization: Option<&crate::actions::ActionAuthorizationContext>,
     ) -> Result<String> {
         self.execute_single_tool_call_legacy(
             call,
             &Arc::new(RwLock::new(ExecutionTrace::default())),
             stream_tx.cloned(),
             "web",
+            authorization,
         )
         .await
     }
@@ -4008,7 +4352,7 @@ Requirements:\n\
                     "required_secrets": required_secret_keys.clone(),
                     "required_env": required_secret_keys,
                     "required_config": required_config_keys,
-                    "message": "Missing required inputs. Use set secret KEY=VALUE for sensitive values; provide config for non-sensitive values."
+                    "message": "Missing required inputs. Use /setsecret KEY=VALUE for sensitive values; provide config for non-sensitive values."
                 }));
             }
 
@@ -4870,6 +5214,7 @@ Requirements:\n\
         request_channel: &str,
         conversation_id: Option<&str>,
         _public_base_url: Option<&str>,
+        authorization: Option<&crate::actions::ActionAuthorizationContext>,
     ) -> Result<String> {
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<StreamEvent>(256);
         let upstream_tx = stream_tx.cloned();
@@ -4936,6 +5281,7 @@ Requirements:\n\
                 &Arc::new(RwLock::new(ExecutionTrace::default())),
                 Some(progress_tx.clone()),
                 request_channel,
+                authorization,
             )
             .await;
         drop(progress_tx);
@@ -5509,7 +5855,7 @@ Requirements:\n\
                     .unwrap_or(goal_id.as_str())
                     .to_string();
                 let (_, reused_existing, _) = self
-                    .add_or_update_similar_task(task, allow_duplicate)
+                    .add_or_update_similar_task(task, allow_duplicate, None)
                     .await?;
                 if let Some(cid) = conversation_id.filter(|value| !value.trim().is_empty()) {
                     let summary = if reused_existing {
@@ -5937,14 +6283,16 @@ Requirements:\n\
                     .map(|last| last + chrono::Duration::seconds(watcher.interval_secs as i64))
                     .unwrap_or(watcher.created_at);
                 lines.push(format!(
-                    "- {} [{}] poll=`{}` every {}s timeout {}s polls={} next_poll={}",
+                    "- {} (id: {}) [{}] poll=`{}` every {}s timeout {}s polls={} next_poll={} condition={}",
                     watcher.description,
+                    watcher.id,
                     status,
                     watcher.poll_action,
                     watcher.interval_secs,
                     watcher.timeout_secs,
                     watcher.poll_count,
-                    next_poll.to_rfc3339()
+                    next_poll.to_rfc3339(),
+                    watcher.condition.summary()
                 ));
             }
             lines.join("\n")
@@ -5971,6 +6319,7 @@ Requirements:\n\
         request_channel: &str,
         conversation_id: Option<&str>,
         project_id: Option<&str>,
+        authorization: Option<&crate::actions::ActionAuthorizationContext>,
     ) -> Result<String> {
         if call.name == "schedule_task" {
             let result = self
@@ -5979,6 +6328,7 @@ Requirements:\n\
                     request_channel,
                     conversation_id,
                     project_id,
+                    authorization,
                 )
                 .await
                 .unwrap_or_else(|| "Failed to schedule task.".to_string());
@@ -5991,6 +6341,11 @@ Requirements:\n\
                     },
                 );
             }
+            if !result.contains("Task ID:")
+                && !result.trim_start().starts_with("Confirmation needed:")
+            {
+                anyhow::bail!("{}", result);
+            }
             return Ok(result);
         }
 
@@ -6001,6 +6356,7 @@ Requirements:\n\
                     request_channel,
                     conversation_id,
                     project_id,
+                    authorization,
                 )
                 .await
                 .unwrap_or_else(|| "Failed to create watcher.".to_string());
@@ -6013,11 +6369,115 @@ Requirements:\n\
                     },
                 );
             }
+            if !result.contains("Watcher ID:")
+                && !result.trim_start().starts_with("Confirmation needed:")
+            {
+                anyhow::bail!("{}", result);
+            }
             return Ok(result);
         }
 
-        self.execute_single_tool_call_legacy(call, trace_ref, stream_tx.cloned(), request_channel)
-            .await
+        if call.name == "research" {
+            return self.handle_research_tool_call(call, stream_tx).await;
+        }
+
+        self.execute_single_tool_call_legacy(
+            call,
+            trace_ref,
+            stream_tx.cloned(),
+            request_channel,
+            authorization,
+        )
+        .await
+    }
+
+    pub(crate) async fn handle_research_tool_call(
+        &self,
+        call: &crate::core::llm::ToolCall,
+        stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+    ) -> Result<String> {
+        if let Some(tx) = stream_tx {
+            queue_stream_event(
+                tx,
+                StreamEvent::ToolStart {
+                    name: call.name.clone(),
+                    payload: None,
+                },
+            );
+        }
+
+        let args: crate::actions::research::ResearchArgs =
+            match serde_json::from_value(call.arguments.clone()) {
+                Ok(args) => args,
+                Err(error) => {
+                    let output =
+                        format!("Error researching: invalid research arguments: {}", error);
+                    if let Some(tx) = stream_tx {
+                        queue_stream_event(
+                            tx,
+                            StreamEvent::ToolResult {
+                                name: call.name.clone(),
+                                content: output.clone(),
+                            },
+                        );
+                    }
+                    return Ok(output);
+                }
+            };
+
+        let config =
+            crate::runtime::build_search_config(&self.config_dir, Some(&self.storage)).await;
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<
+            crate::actions::research::ResearchProgressUpdate,
+        >();
+        let upstream_tx = stream_tx.cloned();
+        let relay_task = tokio::spawn(async move {
+            while let Some(update) = progress_rx.recv().await {
+                if let Some(tx) = upstream_tx.as_ref() {
+                    queue_stream_event(
+                        tx,
+                        StreamEvent::ToolProgress {
+                            name: "research".to_string(),
+                            content: update.detail.clone(),
+                            payload: Some(serde_json::json!({
+                                "kind": "phase_status",
+                                "phase": update.phase,
+                                "label": update.label,
+                                "detail": update.detail,
+                                "status": update.status,
+                                "elapsed_secs": update.elapsed_secs,
+                                "stream_key": update.stream_key,
+                            })),
+                        },
+                    );
+                }
+            }
+        });
+        let reporter = crate::actions::research::ResearchProgressReporter::new(progress_tx);
+        let output = match crate::actions::research::execute_research_with_progress(
+            &args,
+            &config,
+            Some(&reporter),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => format!("Error researching: {}", error),
+        };
+        drop(reporter);
+        let _ = relay_task.await;
+
+        if let Some(tx) = stream_tx {
+            queue_stream_event(
+                tx,
+                StreamEvent::ToolResult {
+                    name: call.name.clone(),
+                    content: self.sanitize_stream_preview(&output),
+                },
+            );
+        }
+
+        Ok(output)
     }
 
     /// Take a screenshot of a URL using the Playwright sidecar.
@@ -7998,6 +8458,574 @@ Requirements:\n\
         std::path::PathBuf::from(".")
     }
 
+    async fn execute_single_tool_call_prepared(
+        &self,
+        prepared: &PreparedToolExecution,
+        env: &ToolExecutionEnv<'_>,
+    ) -> ExecutedToolCall {
+        let mut call = prepared.call.clone();
+        let restored_arguments =
+            Self::restore_literal_request_targets(&call.arguments, env.request_message);
+        if restored_arguments != call.arguments {
+            call.arguments = restored_arguments;
+            if let Some(tx) = env.stream_tx {
+                queue_stream_event(
+                    tx,
+                    StreamEvent::ToolProgress {
+                        name: call.name.clone(),
+                        content: "Restored literal target values from the current request before execution."
+                            .to_string(),
+                        payload: Some(serde_json::json!({
+                            "kind": "literal_target_restore"
+                        })),
+                    },
+                );
+            }
+            let mut trace = env.trace_ref.write().await;
+            trace.steps.push(ExecutionStep {
+                icon: "[fix]".to_string(),
+                title: "Literal Targets Restored".to_string(),
+                detail: "Recovered literal target values from the current request before executing the tool."
+                    .to_string(),
+                step_type: "warning".to_string(),
+                data: Some(call.name.clone()),
+                timestamp: chrono::Utc::now(),
+                duration_ms: None,
+            });
+        }
+        let action_def = prepared.action_def.as_ref();
+        let call_started = std::time::Instant::now();
+        let handler_ctx = ToolHandlerContext {
+            trace_ref: env.trace_ref,
+            stream_tx: env.stream_tx,
+            request_channel: env.request_channel,
+            conversation_id: env.conversation_id,
+            project_id: env.project_id,
+            public_base_url: env.public_base_url,
+            authorization: env.authorization,
+            integration_aliases: env.integration_aliases,
+        };
+
+        let side_effect_level = if prepared.side_effecting {
+            "side_effecting"
+        } else {
+            "read_only"
+        };
+
+        let required_fields = action_def
+            .and_then(|action| action.input_schema.get("required"))
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let missing_required_fields = required_fields
+            .iter()
+            .filter(|field| {
+                !Self::required_action_argument_present(call.arguments.get(field.as_str()))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing_required_fields.is_empty() {
+            match self
+                .normalize_action_arguments(&call.name, &call.arguments, env.request_message)
+                .await
+            {
+                Ok(normalized_arguments) => {
+                    if normalized_arguments != call.arguments {
+                        let repaired_fields = required_fields
+                            .iter()
+                            .filter(|field| {
+                                Self::required_action_argument_present(
+                                    normalized_arguments.get(field.as_str()),
+                                )
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        let detail = format!(
+                            "Filled missing required tool arguments before execution: {}",
+                            repaired_fields.join(", ")
+                        );
+                        call.arguments = normalized_arguments;
+                        if let Some(tx) = env.stream_tx {
+                            queue_stream_event(
+                                tx,
+                                StreamEvent::ToolProgress {
+                                    name: call.name.clone(),
+                                    content: detail.clone(),
+                                    payload: Some(serde_json::json!({
+                                        "kind": "tool_argument_repair",
+                                        "fields": repaired_fields,
+                                    })),
+                                },
+                            );
+                        }
+                        let mut trace = env.trace_ref.write().await;
+                        trace.steps.push(ExecutionStep {
+                            icon: "[fix]".to_string(),
+                            title: "Tool Arguments Repaired".to_string(),
+                            detail,
+                            step_type: "warning".to_string(),
+                            data: Some(call.name.clone()),
+                            timestamp: chrono::Utc::now(),
+                            duration_ms: None,
+                        });
+                    }
+                }
+                Err(error) => {
+                    let content = format!("Tool '{}' could not run yet: {}", call.name, error);
+                    if let Some(tx) = env.stream_tx {
+                        queue_stream_event(
+                            tx,
+                            StreamEvent::ToolResult {
+                                name: call.name.clone(),
+                                content: content.clone(),
+                            },
+                        );
+                    }
+                    return ExecutedToolCall {
+                        original_index: prepared.original_index,
+                        output: ToolCallOutput {
+                            name: call.name.clone(),
+                            content: content.clone(),
+                        },
+                        outcome: crate::core::ToolOutcome {
+                            name: call.name.clone(),
+                            content,
+                            status: crate::core::ToolOutcomeStatus::RecoverableError,
+                            failure_class: Some(crate::core::FailureClass::Validation),
+                            retryable: true,
+                            side_effect_level: side_effect_level.to_string(),
+                            error: Some(error),
+                        },
+                    };
+                }
+            }
+        }
+
+        if !env.current_turn_is_explicit_approval
+            && (env
+                .user_execution_constraints
+                .require_explicit_approval_before_side_effects
+                || env.user_execution_constraints.show_plan_before_side_effects)
+            && prepared.side_effecting
+        {
+            let msg = blocked_by_saved_rule_message(env.user_execution_constraints);
+            let payload = serde_json::json!({
+                "handler": "user_execution_constraints",
+                "output_preview": safe_truncate(&msg, 260),
+            });
+            self.log_operational_event(super::operational::OperationalEvent {
+                event_type: "tool_call",
+                channel: env.request_channel,
+                success: false,
+                outcome: "blocked_by_saved_user_rule",
+                trace_id: env.trace_id,
+                conversation_id: env.conversation_id,
+                tool_name: Some(&call.name),
+                latency_ms: Some(call_started.elapsed().as_millis() as u64),
+                arguments: Some(&call.arguments),
+                payload: Some(&payload),
+                strategy_version: env.strategy_version,
+                policy_version: env.policy_version,
+                prompt_version: env.prompt_version,
+                classifier_prompt_version: env.classifier_prompt_version,
+                specialist_prompt_version: env.specialist_prompt_version,
+                model_slot: env.model_slot,
+            })
+            .await;
+            if let Some(tx) = env.stream_tx {
+                queue_stream_event(
+                    tx,
+                    StreamEvent::ToolResult {
+                        name: call.name.clone(),
+                        content: msg.clone(),
+                    },
+                );
+            }
+            return ExecutedToolCall {
+                original_index: prepared.original_index,
+                output: ToolCallOutput {
+                    name: call.name.clone(),
+                    content: msg.clone(),
+                },
+                outcome: crate::core::ToolOutcome {
+                    name: call.name.clone(),
+                    content: blocked_by_saved_rule_message(env.user_execution_constraints),
+                    status: crate::core::ToolOutcomeStatus::Blocked,
+                    failure_class: Some(crate::core::FailureClass::SafetyBlocked),
+                    retryable: false,
+                    side_effect_level: side_effect_level.to_string(),
+                    error: None,
+                },
+            };
+        }
+
+        let authorization_decision = match self
+            .runtime
+            .authorize_action_invocation(&call.name, action_def, &call.arguments, env.authorization)
+            .await
+        {
+            Ok(decision) => decision,
+            Err(error) => {
+                let error_text = error.to_string();
+                let payload = serde_json::json!({
+                    "handler": "runtime_authorization",
+                    "error": safe_truncate(&error_text, 260),
+                });
+                self.log_operational_event(super::operational::OperationalEvent {
+                    event_type: "tool_call",
+                    channel: env.request_channel,
+                    success: false,
+                    outcome: "authorization_error",
+                    trace_id: env.trace_id,
+                    conversation_id: env.conversation_id,
+                    tool_name: Some(&call.name),
+                    latency_ms: Some(call_started.elapsed().as_millis() as u64),
+                    arguments: Some(&call.arguments),
+                    payload: Some(&payload),
+                    strategy_version: env.strategy_version,
+                    policy_version: env.policy_version,
+                    prompt_version: env.prompt_version,
+                    classifier_prompt_version: env.classifier_prompt_version,
+                    specialist_prompt_version: env.specialist_prompt_version,
+                    model_slot: env.model_slot,
+                })
+                .await;
+                if let Some(tx) = env.stream_tx {
+                    queue_stream_event(
+                        tx,
+                        StreamEvent::ToolResult {
+                            name: call.name.clone(),
+                            content: error_text.clone(),
+                        },
+                    );
+                }
+                return ExecutedToolCall {
+                    original_index: prepared.original_index,
+                    output: ToolCallOutput {
+                        name: call.name.clone(),
+                        content: error_text.clone(),
+                    },
+                    outcome: crate::core::ToolOutcome {
+                        name: call.name.clone(),
+                        content: error_text.clone(),
+                        status: crate::core::ToolOutcomeStatus::RecoverableError,
+                        failure_class: Some(crate::core::FailureClass::HandlerError),
+                        retryable: true,
+                        side_effect_level: side_effect_level.to_string(),
+                        error: Some(error_text),
+                    },
+                };
+            }
+        };
+        if !authorization_decision.allowed {
+            let msg = authorization_decision.reason.clone();
+            let payload = serde_json::json!({
+                "handler": "runtime_authorization",
+                "output_preview": safe_truncate(&msg, 260),
+            });
+            self.log_operational_event(super::operational::OperationalEvent {
+                event_type: "tool_call",
+                channel: env.request_channel,
+                success: false,
+                outcome: "blocked_by_runtime_authorization",
+                trace_id: env.trace_id,
+                conversation_id: env.conversation_id,
+                tool_name: Some(&call.name),
+                latency_ms: Some(call_started.elapsed().as_millis() as u64),
+                arguments: Some(&call.arguments),
+                payload: Some(&payload),
+                strategy_version: env.strategy_version,
+                policy_version: env.policy_version,
+                prompt_version: env.prompt_version,
+                classifier_prompt_version: env.classifier_prompt_version,
+                specialist_prompt_version: env.specialist_prompt_version,
+                model_slot: env.model_slot,
+            })
+            .await;
+            if let Some(tx) = env.stream_tx {
+                queue_stream_event(
+                    tx,
+                    StreamEvent::ToolResult {
+                        name: call.name.clone(),
+                        content: msg.clone(),
+                    },
+                );
+            }
+            return ExecutedToolCall {
+                original_index: prepared.original_index,
+                output: ToolCallOutput {
+                    name: call.name.clone(),
+                    content: msg.clone(),
+                },
+                outcome: crate::core::ToolOutcome {
+                    name: call.name.clone(),
+                    content: msg,
+                    status: crate::core::ToolOutcomeStatus::Blocked,
+                    failure_class: Some(crate::core::FailureClass::SafetyBlocked),
+                    retryable: false,
+                    side_effect_level: side_effect_level.to_string(),
+                    error: None,
+                },
+            };
+        }
+
+        for handler in env.handlers {
+            if !handler.can_handle(self, &call, &handler_ctx) {
+                continue;
+            }
+            tracing::debug!("Tool '{}' handled by '{}'", call.name, handler.id());
+            match handler.handle(self, &call, &handler_ctx).await {
+                Ok(Some(output)) => {
+                    let latency_ms = call_started.elapsed().as_millis() as u64;
+                    let lowered = output.trim().to_ascii_lowercase();
+                    let blocked = lowered.contains("blocked by safety policy");
+                    let success = !(lowered.starts_with("error ")
+                        || lowered.starts_with("error:")
+                        || blocked);
+                    let outcome = if blocked {
+                        "blocked"
+                    } else if success {
+                        "ok"
+                    } else {
+                        "error_text"
+                    };
+                    let payload = serde_json::json!({
+                        "handler": handler.id(),
+                        "output_preview": safe_truncate(&output, 260),
+                    });
+                    self.log_operational_event(super::operational::OperationalEvent {
+                        event_type: "tool_call",
+                        channel: env.request_channel,
+                        success,
+                        outcome,
+                        trace_id: env.trace_id,
+                        conversation_id: env.conversation_id,
+                        tool_name: Some(&call.name),
+                        latency_ms: Some(latency_ms),
+                        arguments: Some(&call.arguments),
+                        payload: Some(&payload),
+                        strategy_version: env.strategy_version,
+                        policy_version: env.policy_version,
+                        prompt_version: env.prompt_version,
+                        classifier_prompt_version: env.classifier_prompt_version,
+                        specialist_prompt_version: env.specialist_prompt_version,
+                        model_slot: env.model_slot,
+                    })
+                    .await;
+                    if !blocked {
+                        self.record_self_tune_tool_outcome(&call.name, success, latency_ms)
+                            .await;
+                    }
+                    return ExecutedToolCall {
+                        original_index: prepared.original_index,
+                        output: ToolCallOutput {
+                            name: call.name.clone(),
+                            content: output.clone(),
+                        },
+                        outcome: crate::core::ToolOutcome {
+                            name: call.name.clone(),
+                            content: output.clone(),
+                            status: if blocked {
+                                crate::core::ToolOutcomeStatus::Blocked
+                            } else if success {
+                                crate::core::ToolOutcomeStatus::Success
+                            } else {
+                                crate::core::ToolOutcomeStatus::RecoverableError
+                            },
+                            failure_class: if blocked {
+                                Some(crate::core::FailureClass::SafetyBlocked)
+                            } else if success {
+                                None
+                            } else {
+                                Some(crate::core::FailureClass::ToolError)
+                            },
+                            retryable: !blocked && !success,
+                            side_effect_level: side_effect_level.to_string(),
+                            error: (!success).then_some(output),
+                        },
+                    };
+                }
+                Ok(None) => continue,
+                Err(error) => {
+                    let latency_ms = call_started.elapsed().as_millis() as u64;
+                    let error_text = error.to_string();
+                    let payload = serde_json::json!({
+                        "handler": handler.id(),
+                        "error": safe_truncate(&error_text, 260),
+                    });
+                    self.log_operational_event(super::operational::OperationalEvent {
+                        event_type: "tool_call",
+                        channel: env.request_channel,
+                        success: false,
+                        outcome: "handler_error",
+                        trace_id: env.trace_id,
+                        conversation_id: env.conversation_id,
+                        tool_name: Some(&call.name),
+                        latency_ms: Some(latency_ms),
+                        arguments: Some(&call.arguments),
+                        payload: Some(&payload),
+                        strategy_version: env.strategy_version,
+                        policy_version: env.policy_version,
+                        prompt_version: env.prompt_version,
+                        classifier_prompt_version: env.classifier_prompt_version,
+                        specialist_prompt_version: env.specialist_prompt_version,
+                        model_slot: env.model_slot,
+                    })
+                    .await;
+                    self.record_self_tune_tool_outcome(&call.name, false, latency_ms)
+                        .await;
+                    let content = format!(
+                        "Tool '{}' failed, but the request can continue: {}",
+                        call.name, error_text
+                    );
+                    if let Some(tx) = env.stream_tx {
+                        queue_stream_event(
+                            tx,
+                            StreamEvent::ToolResult {
+                                name: call.name.clone(),
+                                content: content.clone(),
+                            },
+                        );
+                    }
+                    return ExecutedToolCall {
+                        original_index: prepared.original_index,
+                        output: ToolCallOutput {
+                            name: call.name.clone(),
+                            content: content.clone(),
+                        },
+                        outcome: crate::core::ToolOutcome {
+                            name: call.name.clone(),
+                            content,
+                            status: crate::core::ToolOutcomeStatus::RecoverableError,
+                            failure_class: Some(crate::core::FailureClass::HandlerError),
+                            retryable: true,
+                            side_effect_level: side_effect_level.to_string(),
+                            error: Some(error_text),
+                        },
+                    };
+                }
+            }
+        }
+
+        let latency_ms = call_started.elapsed().as_millis() as u64;
+        let msg = format!("No handler registered for tool '{}'", call.name);
+        let payload = serde_json::json!({
+            "handler": "none",
+            "output_preview": safe_truncate(&msg, 260),
+        });
+        self.log_operational_event(super::operational::OperationalEvent {
+            event_type: "tool_call",
+            channel: env.request_channel,
+            success: false,
+            outcome: "no_handler",
+            trace_id: env.trace_id,
+            conversation_id: env.conversation_id,
+            tool_name: Some(&call.name),
+            latency_ms: Some(latency_ms),
+            arguments: Some(&call.arguments),
+            payload: Some(&payload),
+            strategy_version: env.strategy_version,
+            policy_version: env.policy_version,
+            prompt_version: env.prompt_version,
+            classifier_prompt_version: env.classifier_prompt_version,
+            specialist_prompt_version: env.specialist_prompt_version,
+            model_slot: env.model_slot,
+        })
+        .await;
+        self.record_self_tune_tool_outcome(&call.name, false, latency_ms)
+            .await;
+        if let Some(tx) = env.stream_tx {
+            queue_stream_event(
+                tx,
+                StreamEvent::ToolResult {
+                    name: call.name.clone(),
+                    content: msg.clone(),
+                },
+            );
+        }
+        ExecutedToolCall {
+            original_index: prepared.original_index,
+            output: ToolCallOutput {
+                name: call.name.clone(),
+                content: msg.clone(),
+            },
+            outcome: crate::core::ToolOutcome {
+                name: call.name.clone(),
+                content: msg,
+                status: crate::core::ToolOutcomeStatus::NoHandler,
+                failure_class: Some(crate::core::FailureClass::Validation),
+                retryable: false,
+                side_effect_level: side_effect_level.to_string(),
+                error: None,
+            },
+        }
+    }
+
+    async fn execute_parallel_read_only_tool_batch(
+        &self,
+        batch: &[PreparedToolExecution],
+        env: &ToolExecutionEnv<'_>,
+    ) -> Vec<ExecutedToolCall> {
+        if batch.is_empty() {
+            return Vec::new();
+        }
+
+        if batch.len() > 1 {
+            let tool_summary = summarize_parallel_tool_batch(batch);
+            let detail = format!(
+                "Running {} independent read-only {} call{} in parallel.",
+                batch.len(),
+                tool_summary,
+                if batch.len() == 1 { "" } else { "s" }
+            );
+            {
+                let mut trace = env.trace_ref.write().await;
+                trace.steps.push(ExecutionStep {
+                    icon: "[parallel]".to_string(),
+                    title: "Parallel Tool Batch".to_string(),
+                    detail: detail.clone(),
+                    step_type: "thinking".to_string(),
+                    data: Some(
+                        batch
+                            .iter()
+                            .map(|prepared| prepared.call.name.clone())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    ),
+                    timestamp: chrono::Utc::now(),
+                    duration_ms: None,
+                });
+            }
+            if let Some(tx) = env.stream_tx {
+                queue_stream_event(
+                    tx,
+                    StreamEvent::ToolProgress {
+                        name: batch[0].call.name.clone(),
+                        content: detail,
+                        payload: Some(serde_json::json!({
+                            "kind": "parallel_batch",
+                            "count": batch.len(),
+                            "tools": batch.iter().map(|prepared| prepared.call.name.clone()).collect::<Vec<_>>(),
+                        })),
+                    },
+                );
+            }
+        }
+
+        let concurrency = parallel_read_only_tool_execution_limit().min(batch.len());
+        stream::iter(batch.iter().cloned())
+            .map(|prepared| async move { self.execute_single_tool_call_prepared(&prepared, env).await })
+            .buffer_unordered(concurrency)
+            .collect::<Vec<_>>()
+            .await
+    }
+
     /// Execute tool calls from LLM response using modular handler dispatch.
     pub(crate) async fn execute_tool_calls(
         &self,
@@ -8010,7 +9038,9 @@ Requirements:\n\
             return Ok(ToolExecutionBatch::default());
         }
         let request_channel = ctx.request_channel;
+        let request_message = ctx.request_message;
         let current_turn_is_explicit_approval = ctx.current_turn_is_explicit_approval;
+        let _allow_sensitive_model_context_once = ctx.allow_sensitive_model_context_once;
         let trace_id = ctx.trace_id;
         let conversation_id = ctx.conversation_id;
         let project_id = ctx.project_id;
@@ -8035,352 +9065,101 @@ Requirements:\n\
         let mut side_effect_cache: HashMap<String, bool> = HashMap::new();
 
         let mut seen_signatures: HashSet<String> = HashSet::new();
-        let mut unique_calls: Vec<&crate::core::llm::ToolCall> = Vec::new();
+        let mut unique_calls: Vec<crate::core::llm::ToolCall> = Vec::new();
         for call in &response.tool_calls {
             let sig = Self::tool_call_signature(call);
             if seen_signatures.insert(sig) {
-                unique_calls.push(call);
+                unique_calls.push(call.clone());
             }
         }
-        let mut results: Vec<ToolCallOutput> = Vec::new();
-        let mut outcomes: Vec<crate::core::ToolOutcome> = Vec::new();
-        for call in unique_calls {
-            let call_started = std::time::Instant::now();
-            let action_def = action_map.get(&call.name.to_ascii_lowercase());
-            let ctx = ToolHandlerContext {
-                trace_ref,
-                stream_tx: stream_tx.as_ref(),
-                request_channel,
-                conversation_id,
-                project_id,
-                public_base_url: public_base_url.as_deref(),
-                integration_aliases: &integration_aliases,
-            };
 
-            let side_effecting = if let Some(cached) = side_effect_cache
-                .get(&Self::tool_call_signature(call))
-                .copied()
-            {
+        let mut prepared_calls = Vec::new();
+        for (original_index, call) in unique_calls.into_iter().enumerate() {
+            let action_def = action_map.get(&call.name.to_ascii_lowercase()).cloned();
+            let signature = Self::tool_call_signature(&call);
+            let side_effecting = if let Some(cached) = side_effect_cache.get(&signature).copied() {
                 cached
             } else {
                 let classified = self
-                    .classify_tool_call_side_effecting(call, action_def)
+                    .classify_tool_call_side_effecting(&call, action_def.as_ref())
                     .await;
-                side_effect_cache.insert(Self::tool_call_signature(call), classified);
+                side_effect_cache.insert(signature, classified);
                 classified
             };
-            let side_effect_level = if side_effecting {
-                "side_effecting"
-            } else {
-                "read_only"
-            };
-
-            if !current_turn_is_explicit_approval
-                && (user_execution_constraints.require_explicit_approval_before_side_effects
-                    || user_execution_constraints.show_plan_before_side_effects)
-                && side_effecting
-            {
-                let msg = blocked_by_saved_rule_message(&user_execution_constraints);
-                let payload = serde_json::json!({
-                    "handler": "user_execution_constraints",
-                    "output_preview": safe_truncate(&msg, 260),
-                });
-                self.log_operational_event(super::operational::OperationalEvent {
-                    event_type: "tool_call",
-                    channel: request_channel,
-                    success: false,
-                    outcome: "blocked_by_saved_user_rule",
-                    trace_id,
-                    conversation_id,
-                    tool_name: Some(&call.name),
-                    latency_ms: Some(call_started.elapsed().as_millis() as u64),
-                    arguments: Some(&call.arguments),
-                    payload: Some(&payload),
-                    strategy_version,
-                    policy_version,
-                    prompt_version,
-                    classifier_prompt_version,
-                    specialist_prompt_version,
-                    model_slot,
-                })
-                .await;
-                if let Some(ref tx) = stream_tx {
-                    queue_stream_event(
-                        tx,
-                        StreamEvent::ToolResult {
-                            name: call.name.clone(),
-                            content: msg.clone(),
-                        },
-                    );
-                }
-                results.push(ToolCallOutput {
-                    name: call.name.clone(),
-                    content: msg,
-                });
-                outcomes.push(crate::core::ToolOutcome {
-                    name: call.name.clone(),
-                    content: blocked_by_saved_rule_message(&user_execution_constraints),
-                    status: crate::core::ToolOutcomeStatus::Blocked,
-                    failure_class: Some(crate::core::FailureClass::SafetyBlocked),
-                    retryable: false,
-                    side_effect_level: side_effect_level.to_string(),
-                    error: None,
-                });
-                continue;
-            }
-
-            let authorization_decision = self
-                .runtime
-                .authorize_action_invocation(
-                    &call.name,
-                    action_def,
-                    &call.arguments,
-                    &authorization,
-                )
-                .await?;
-            if !authorization_decision.allowed {
-                let msg = authorization_decision.reason.clone();
-                let payload = serde_json::json!({
-                    "handler": "runtime_authorization",
-                    "output_preview": safe_truncate(&msg, 260),
-                });
-                self.log_operational_event(super::operational::OperationalEvent {
-                    event_type: "tool_call",
-                    channel: request_channel,
-                    success: false,
-                    outcome: "blocked_by_runtime_authorization",
-                    trace_id,
-                    conversation_id,
-                    tool_name: Some(&call.name),
-                    latency_ms: Some(call_started.elapsed().as_millis() as u64),
-                    arguments: Some(&call.arguments),
-                    payload: Some(&payload),
-                    strategy_version,
-                    policy_version,
-                    prompt_version,
-                    classifier_prompt_version,
-                    specialist_prompt_version,
-                    model_slot,
-                })
-                .await;
-                if let Some(ref tx) = stream_tx {
-                    queue_stream_event(
-                        tx,
-                        StreamEvent::ToolResult {
-                            name: call.name.clone(),
-                            content: msg.clone(),
-                        },
-                    );
-                }
-                results.push(ToolCallOutput {
-                    name: call.name.clone(),
-                    content: msg.clone(),
-                });
-                outcomes.push(crate::core::ToolOutcome {
-                    name: call.name.clone(),
-                    content: msg,
-                    status: crate::core::ToolOutcomeStatus::Blocked,
-                    failure_class: Some(crate::core::FailureClass::SafetyBlocked),
-                    retryable: false,
-                    side_effect_level: side_effect_level.to_string(),
-                    error: None,
-                });
-                continue;
-            }
-
-            let mut handled = false;
-            for handler in &handlers {
-                if !handler.can_handle(self, call, &ctx) {
-                    continue;
-                }
-                tracing::debug!("Tool '{}' handled by '{}'", call.name, handler.id());
-                match handler.handle(self, call, &ctx).await {
-                    Ok(Some(output)) => {
-                        let latency_ms = call_started.elapsed().as_millis() as u64;
-                        let lowered = output.trim().to_ascii_lowercase();
-                        let blocked = lowered.contains("blocked by safety policy");
-                        let success = !(lowered.starts_with("error ")
-                            || lowered.starts_with("error:")
-                            || blocked);
-                        let outcome = if blocked {
-                            "blocked"
-                        } else if success {
-                            "ok"
-                        } else {
-                            "error_text"
-                        };
-                        let payload = serde_json::json!({
-                            "handler": handler.id(),
-                            "output_preview": safe_truncate(&output, 260),
-                        });
-                        self.log_operational_event(super::operational::OperationalEvent {
-                            event_type: "tool_call",
-                            channel: request_channel,
-                            success,
-                            outcome,
-                            trace_id,
-                            conversation_id,
-                            tool_name: Some(&call.name),
-                            latency_ms: Some(latency_ms),
-                            arguments: Some(&call.arguments),
-                            payload: Some(&payload),
-                            strategy_version,
-                            policy_version,
-                            prompt_version,
-                            classifier_prompt_version,
-                            specialist_prompt_version,
-                            model_slot,
-                        })
-                        .await;
-                        if !blocked {
-                            self.record_self_tune_tool_outcome(&call.name, success, latency_ms)
-                                .await;
-                        }
-                        results.push(ToolCallOutput {
-                            name: call.name.clone(),
-                            content: output.clone(),
-                        });
-                        outcomes.push(crate::core::ToolOutcome {
-                            name: call.name.clone(),
-                            content: output.clone(),
-                            status: if blocked {
-                                crate::core::ToolOutcomeStatus::Blocked
-                            } else if success {
-                                crate::core::ToolOutcomeStatus::Success
-                            } else {
-                                crate::core::ToolOutcomeStatus::RecoverableError
-                            },
-                            failure_class: if blocked {
-                                Some(crate::core::FailureClass::SafetyBlocked)
-                            } else if success {
-                                None
-                            } else {
-                                Some(crate::core::FailureClass::ToolError)
-                            },
-                            retryable: !blocked && !success,
-                            side_effect_level: side_effect_level.to_string(),
-                            error: (!success).then_some(output),
-                        });
-                        handled = true;
-                        break;
-                    }
-                    Ok(None) => continue,
-                    Err(e) => {
-                        let latency_ms = call_started.elapsed().as_millis() as u64;
-                        let error_text = e.to_string();
-                        let payload = serde_json::json!({
-                            "handler": handler.id(),
-                            "error": safe_truncate(&error_text, 260),
-                        });
-                        self.log_operational_event(super::operational::OperationalEvent {
-                            event_type: "tool_call",
-                            channel: request_channel,
-                            success: false,
-                            outcome: "handler_error",
-                            trace_id,
-                            conversation_id,
-                            tool_name: Some(&call.name),
-                            latency_ms: Some(latency_ms),
-                            arguments: Some(&call.arguments),
-                            payload: Some(&payload),
-                            strategy_version,
-                            policy_version,
-                            prompt_version,
-                            classifier_prompt_version,
-                            specialist_prompt_version,
-                            model_slot,
-                        })
-                        .await;
-                        self.record_self_tune_tool_outcome(&call.name, false, latency_ms)
-                            .await;
-                        let content = format!(
-                            "Tool '{}' failed, but the request can continue: {}",
-                            call.name, error_text
-                        );
-                        if let Some(ref tx) = stream_tx {
-                            queue_stream_event(
-                                tx,
-                                StreamEvent::ToolResult {
-                                    name: call.name.clone(),
-                                    content: content.clone(),
-                                },
-                            );
-                        }
-                        results.push(ToolCallOutput {
-                            name: call.name.clone(),
-                            content: content.clone(),
-                        });
-                        outcomes.push(crate::core::ToolOutcome {
-                            name: call.name.clone(),
-                            content,
-                            status: crate::core::ToolOutcomeStatus::RecoverableError,
-                            failure_class: Some(crate::core::FailureClass::HandlerError),
-                            retryable: true,
-                            side_effect_level: side_effect_level.to_string(),
-                            error: Some(error_text),
-                        });
-                        handled = true;
-                        break;
-                    }
-                }
-            }
-
-            if !handled {
-                let latency_ms = call_started.elapsed().as_millis() as u64;
-                let msg = format!("No handler registered for tool '{}'", call.name);
-                let payload = serde_json::json!({
-                    "handler": "none",
-                    "output_preview": safe_truncate(&msg, 260),
-                });
-                self.log_operational_event(super::operational::OperationalEvent {
-                    event_type: "tool_call",
-                    channel: request_channel,
-                    success: false,
-                    outcome: "no_handler",
-                    trace_id,
-                    conversation_id,
-                    tool_name: Some(&call.name),
-                    latency_ms: Some(latency_ms),
-                    arguments: Some(&call.arguments),
-                    payload: Some(&payload),
-                    strategy_version,
-                    policy_version,
-                    prompt_version,
-                    classifier_prompt_version,
-                    specialist_prompt_version,
-                    model_slot,
-                })
-                .await;
-                self.record_self_tune_tool_outcome(&call.name, false, latency_ms)
-                    .await;
-                if let Some(ref tx) = stream_tx {
-                    queue_stream_event(
-                        tx,
-                        StreamEvent::ToolResult {
-                            name: call.name.clone(),
-                            content: msg.clone(),
-                        },
-                    );
-                }
-                results.push(ToolCallOutput {
-                    name: call.name.clone(),
-                    content: msg.clone(),
-                });
-                outcomes.push(crate::core::ToolOutcome {
-                    name: call.name.clone(),
-                    content: msg,
-                    status: crate::core::ToolOutcomeStatus::NoHandler,
-                    failure_class: Some(crate::core::FailureClass::Validation),
-                    retryable: false,
-                    side_effect_level: side_effect_level.to_string(),
-                    error: None,
-                });
-            }
+            prepared_calls.push(PreparedToolExecution {
+                original_index,
+                call,
+                action_def,
+                side_effecting,
+            });
         }
 
+        let env = ToolExecutionEnv {
+            trace_ref,
+            stream_tx: stream_tx.as_ref(),
+            request_channel,
+            request_message,
+            current_turn_is_explicit_approval,
+            trace_id,
+            conversation_id,
+            project_id,
+            strategy_version,
+            policy_version,
+            prompt_version,
+            classifier_prompt_version,
+            specialist_prompt_version,
+            model_slot,
+            authorization: &authorization,
+            public_base_url: public_base_url.as_deref(),
+            integration_aliases: &integration_aliases,
+            handlers: &handlers,
+            user_execution_constraints: &user_execution_constraints,
+        };
+
+        let mut executed_calls: Vec<ExecutedToolCall> = Vec::new();
+        let mut pending_parallel_batch: Vec<PreparedToolExecution> = Vec::new();
+
+        for prepared in prepared_calls {
+            if tool_call_supports_parallel_read_only_execution(
+                &prepared.call,
+                prepared.action_def.as_ref(),
+                prepared.side_effecting,
+            ) {
+                pending_parallel_batch.push(prepared);
+                continue;
+            }
+
+            if !pending_parallel_batch.is_empty() {
+                executed_calls.extend(
+                    self.execute_parallel_read_only_tool_batch(&pending_parallel_batch, &env)
+                        .await,
+                );
+                pending_parallel_batch.clear();
+            }
+
+            executed_calls.push(
+                self.execute_single_tool_call_prepared(&prepared, &env)
+                    .await,
+            );
+        }
+
+        if !pending_parallel_batch.is_empty() {
+            executed_calls.extend(
+                self.execute_parallel_read_only_tool_batch(&pending_parallel_batch, &env)
+                    .await,
+            );
+        }
+
+        executed_calls.sort_by_key(|executed| executed.original_index);
         Ok(ToolExecutionBatch {
-            outputs: results,
-            outcomes,
+            outputs: executed_calls
+                .iter()
+                .map(|executed| executed.output.clone())
+                .collect(),
+            outcomes: executed_calls
+                .into_iter()
+                .map(|executed| executed.outcome)
+                .collect(),
         })
     }
 
@@ -8392,6 +9171,7 @@ Requirements:\n\
         trace_ref: &Arc<RwLock<ExecutionTrace>>,
         stream_tx: Option<tokio::sync::mpsc::Sender<StreamEvent>>,
         request_channel: &str,
+        authorization: Option<&crate::actions::ActionAuthorizationContext>,
     ) -> Result<String> {
         if response.tool_calls.is_empty() {
             return Ok(response.content.clone());
@@ -8436,7 +9216,8 @@ Requirements:\n\
             }
 
             // Check safety policy
-            let allowed = self.safety.is_allowed(&call.name, &call.arguments).await?;
+            let allowed =
+                Self::legacy_tool_call_allowed_by_safety(&self.safety, call, authorization).await?;
             if !allowed {
                 let blocked = format!("Tool '{}' blocked by safety policy", call.name);
                 if let Some(ref tx) = stream_tx {
@@ -9471,7 +10252,7 @@ Requirements:\n\
                                     "1) Use an existing model key: not available for current missing keys.".to_string()
                                 } else {
                                     format!(
-                                        "1) Reuse your current model key for: {}.\n   Reply: use current llm key for <KEY>",
+                                        "1) Reuse your current model key for: {}.\n   Reply: /usecurrentkey <KEY>",
                                         llm_reuse_candidates
                                     )
                                 };
@@ -9492,7 +10273,7 @@ Requirements:\n\
                                       Choose one option:\n\
                                       {}\n\
                                      2) Provide your own key securely.\n\
-                                        Reply: set secret <KEY>=<VALUE>\n\n\
+                                        Reply: /setsecret <KEY>=<VALUE>\n\n\
                                       Why I'm asking: credentials are stored encrypted and handled outside model generation to reduce leak risk.\n\
                                       For non-sensitive config values, redeploy/restart with config.{{KEY}}=value.\n\
                                       Then restart app '{}'.{}",
@@ -9932,6 +10713,7 @@ Requirements:\n\
                     &call.arguments,
                     request_channel,
                     call_message_hint.as_deref(),
+                    authorization,
                 )
                 .await
             {
@@ -9945,7 +10727,13 @@ Requirements:\n\
                         && crate::runtime::parse_schedule_task_completion(&result).is_some()
                     {
                         if let Some(schedule_result) = self
-                            .handle_schedule_task(&call.arguments, request_channel, None, None)
+                            .handle_schedule_task(
+                                &call.arguments,
+                                request_channel,
+                                None,
+                                None,
+                                authorization,
+                            )
                             .await
                         {
                             if let Some(ref tx) = stream_tx {
@@ -9967,7 +10755,13 @@ Requirements:\n\
                         && crate::runtime::parse_watch_completion(&result).is_some()
                     {
                         if let Some(watch_result) = self
-                            .handle_watch(&call.arguments, request_channel, None, None)
+                            .handle_watch(
+                                &call.arguments,
+                                request_channel,
+                                None,
+                                None,
+                                authorization,
+                            )
                             .await
                         {
                             if let Some(ref tx) = stream_tx {
@@ -10198,6 +10992,7 @@ Requirements:\n\
                                             &current_args,
                                             request_channel,
                                             retry_hint.as_deref(),
+                                            authorization,
                                         )
                                         .await
                                     {
@@ -10440,12 +11235,34 @@ Requirements:\n\
                         );
 
                         let empty_actions: Vec<crate::actions::ActionDef> = Vec::new();
-                        match self.llm.chat(
-                            "You are a concise email assistant. Format email summaries with clear categorization. Use markdown.",
-                            &format_prompt,
-                            &[],
-                            &empty_actions,
-                        ).await {
+                        let raw_email_requires_approval = self
+                            .tool_output_requires_sensitive_context_approval(&result, false)
+                            .is_some();
+                        if raw_email_requires_approval {
+                            if let Some(ref tx) = stream_tx {
+                                queue_stream_event(
+                                    tx,
+                                    StreamEvent::ToolResult {
+                                        name: call.name.clone(),
+                                        content: "Gmail scan returned sensitive results awaiting approval".to_string(),
+                                    },
+                                );
+                            }
+                            results.push(result);
+                            continue;
+                        }
+                        match self
+                            .llm
+                            .chat_for_helper_request(
+                                "You are a concise email assistant. Format email summaries with clear categorization. Use markdown.",
+                                &format_prompt,
+                                &[],
+                                &empty_actions,
+                                &self.config.model_privacy,
+                                false,
+                            )
+                            .await
+                        {
                             Ok(formatted) => {
                                 self.record_llm_usage(request_channel, "gmail_format", &formatted).await;
                                 if let Some(ref tx) = stream_tx {
@@ -10643,6 +11460,24 @@ mod tests {
         }
     }
 
+    fn safety_engine_with_require_approval_rule(
+        action_name: &str,
+    ) -> (tempfile::TempDir, crate::safety::SafetyEngine) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let safety = crate::safety::SafetyEngine::new(temp.path()).expect("safety engine");
+        safety.add_rule(crate::safety::SafetyRule {
+            name: format!("permission_gate_{}", action_name),
+            description: format!("Require approval for {}", action_name),
+            trigger: crate::safety::RuleTrigger::Action {
+                name: action_name.to_string(),
+            },
+            condition: None,
+            action: crate::safety::RuleAction::RequireApproval,
+            verified: true,
+        });
+        (temp, safety)
+    }
+
     #[test]
     fn tool_call_signature_ignores_object_key_order() {
         let a = call(
@@ -10698,6 +11533,57 @@ mod tests {
 
         assert!(!action_has_dangerous_capabilities(Some(&read_only)));
         assert!(action_has_dangerous_capabilities(Some(&mutating)));
+    }
+
+    #[test]
+    fn read_only_research_call_supports_parallel_execution() {
+        let action = crate::actions::ActionDef {
+            name: "research".to_string(),
+            description: "Research a topic.".to_string(),
+            capabilities: vec!["search".to_string(), "network".to_string()],
+            ..Default::default()
+        };
+        let research_call = call("1", "research", json!({ "query": "india ai compute" }));
+
+        assert!(tool_call_supports_parallel_read_only_execution(
+            &research_call,
+            Some(&action),
+            false
+        ));
+    }
+
+    #[test]
+    fn side_effecting_or_non_research_call_stays_serial() {
+        let research_action = crate::actions::ActionDef {
+            name: "research".to_string(),
+            description: "Research a topic.".to_string(),
+            capabilities: vec!["search".to_string(), "network".to_string()],
+            ..Default::default()
+        };
+        let shell_action = crate::actions::ActionDef {
+            name: "shell".to_string(),
+            description: "Run a shell command.".to_string(),
+            capabilities: vec!["file_write".to_string()],
+            ..Default::default()
+        };
+        let research_call = call("1", "research", json!({ "query": "india ai compute" }));
+        let shell_call = call("2", "shell", json!({ "command": "echo hi" }));
+
+        assert!(!tool_call_supports_parallel_read_only_execution(
+            &research_call,
+            Some(&research_action),
+            true
+        ));
+        assert!(!tool_call_supports_parallel_read_only_execution(
+            &shell_call,
+            Some(&shell_action),
+            false
+        ));
+        assert!(!tool_call_supports_parallel_read_only_execution(
+            &research_call,
+            None,
+            false
+        ));
     }
 
     #[test]
@@ -10872,6 +11758,88 @@ mod tests {
 
         assert!(message.contains("validating"));
         assert!(message.contains("health endpoint"));
+    }
+
+    #[tokio::test]
+    async fn legacy_safety_allows_direct_trusted_chat_bypass() {
+        let (_temp, safety) = safety_engine_with_require_approval_rule("app_deploy");
+        let deploy_call = call(
+            "1",
+            "app_deploy",
+            json!({ "repo_url": "https://github.com/example/repo-template" }),
+        );
+        let direct_chat = crate::actions::ActionAuthorizationContext {
+            principal: Some(crate::actions::ActionCallerPrincipal::local_admin("web")),
+            surface: crate::actions::ActionExecutionSurface::Chat,
+            direct_user_intent: true,
+            current_turn_is_explicit_approval: false,
+            agent_name: None,
+            agent_access_scope: None,
+        };
+
+        assert!(Agent::legacy_tool_call_allowed_by_safety(
+            &safety,
+            &deploy_call,
+            Some(&direct_chat)
+        )
+        .await
+        .expect("legacy safety check should succeed"));
+        assert!(
+            !Agent::legacy_tool_call_allowed_by_safety(&safety, &deploy_call, None)
+                .await
+                .expect("legacy safety check should succeed")
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_safety_honors_auto_approved_actions() {
+        let (_temp, safety) = safety_engine_with_require_approval_rule("app_deploy");
+        safety.set_auto_approved(&[String::from("app_deploy")]);
+        let deploy_call = call(
+            "1",
+            "app_deploy",
+            json!({ "repo_url": "https://github.com/example/repo-template" }),
+        );
+
+        assert!(
+            Agent::legacy_tool_call_allowed_by_safety(&safety, &deploy_call, None)
+                .await
+                .expect("legacy safety check should succeed")
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_safety_allows_direct_trusted_chat_for_generated_app_file_write() {
+        let (_temp, safety) = safety_engine_with_require_approval_rule("file_write");
+        let file_write_call = call(
+            "1",
+            "file_write",
+            json!({
+                "path": "/app/data/apps/new/arxiv-board/index.html",
+                "content": "<!doctype html><title>Latest ArXiv</title>"
+            }),
+        );
+        let direct_chat = crate::actions::ActionAuthorizationContext {
+            principal: Some(crate::actions::ActionCallerPrincipal::local_admin("web")),
+            surface: crate::actions::ActionExecutionSurface::Chat,
+            direct_user_intent: true,
+            current_turn_is_explicit_approval: false,
+            agent_name: None,
+            agent_access_scope: None,
+        };
+
+        assert!(Agent::legacy_tool_call_allowed_by_safety(
+            &safety,
+            &file_write_call,
+            Some(&direct_chat),
+        )
+        .await
+        .expect("legacy safety check should succeed"));
+        assert!(
+            !Agent::legacy_tool_call_allowed_by_safety(&safety, &file_write_call, None)
+                .await
+                .expect("legacy safety check should succeed")
+        );
     }
 
     #[test]

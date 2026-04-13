@@ -21,11 +21,9 @@ fn parse_tunnel_command(text: &str) -> Option<TunnelControlCommand> {
     let normalized = text.trim().to_ascii_lowercase().replace(['_', '-'], " ");
     let compact = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
     match compact.as_str() {
-        "start tunnel" | "/tunnel start" | "/start_tunnel" => Some(TunnelControlCommand::Start),
-        "stop tunnel" | "/tunnel stop" | "/stop_tunnel" => Some(TunnelControlCommand::Stop),
-        "tunnel status" | "status tunnel" | "/tunnel" | "/tunnel status" | "/tunnel_status" => {
-            Some(TunnelControlCommand::Status)
-        }
+        "/tunnel start" | "/start tunnel" => Some(TunnelControlCommand::Start),
+        "/tunnel stop" | "/stop tunnel" => Some(TunnelControlCommand::Stop),
+        "/tunnel" | "/tunnel status" => Some(TunnelControlCommand::Status),
         _ => None,
     }
 }
@@ -130,39 +128,7 @@ async fn process_telegram_prompt(
 }
 
 fn parse_set_secret(text: &str) -> Option<(String, String)> {
-    // Accept both:
-    // - "/setsecret KEY=VALUE" (Telegram command)
-    // - "set secret KEY=VALUE" (plain text)
-    let trimmed = text.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    let rest = if lower.starts_with("/setsecret ") || lower.starts_with("set secret ") {
-        trimmed[10..].trim() // len("set secret ") == 10
-    } else {
-        return None;
-    };
-    if rest.is_empty() {
-        return None;
-    }
-
-    let (key, value) = if let Some(eq) = rest.find('=') {
-        let (k, v) = rest.split_at(eq);
-        (k.trim(), v[1..].trim())
-    } else {
-        let mut parts = rest.splitn(2, char::is_whitespace);
-        let k = parts.next().unwrap_or("").trim();
-        let v = parts.next().unwrap_or("").trim();
-        (k, v)
-    };
-    if key.is_empty() || value.is_empty() {
-        return None;
-    }
-    if key.chars().any(|c| c.is_whitespace()) {
-        return None;
-    }
-    if key.contains('\n') || key.contains('\r') {
-        return None;
-    }
-    Some((key.to_string(), value.to_string()))
+    crate::core::secrets::parse_set_secret_command(text)
 }
 
 fn parse_use_current_llm_key(text: &str) -> Option<String> {
@@ -235,7 +201,7 @@ async fn link_current_llm_key_for_chat(agent: &SharedAgent, key: &str) -> Result
         available_keys.join(", ")
     };
     Err(format!(
-        "I can't map '{}' from current model settings. Available model-backed keys: {}. You can set it manually with: set secret {}=VALUE",
+        "I can't map '{}' from current model settings. Available model-backed keys: {}. You can set it manually with: /setsecret {}=VALUE",
         key, available, key
     ))
 }
@@ -578,6 +544,10 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
                         user_id.unwrap_or(0),
                         username
                     );
+                    {
+                        let agent = agent.read().await;
+                        agent.security_events.record_unauthorized_channel_attempt();
+                    }
                     bot.send_message(chat_id, "You are not authorized.").await?;
                     return Ok(());
                 }
@@ -651,7 +621,7 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
                                 Err(e) => e,
                             }
                         } else {
-                            "Usage:\n/setsecret KEY=VALUE\nExample: /setsecret OPENAI_API_KEY=sk-...\n\nOr reuse your configured model key:\nuse current llm key for OPENAI_API_KEY"
+                            "Usage:\n/setsecret KEY=VALUE\nExample: /setsecret OPENAI_API_KEY=sk-...\n\nOr reuse your configured model key:\n/usecurrentkey OPENAI_API_KEY"
                                 .to_string()
                         };
 
@@ -662,7 +632,7 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
                     let response = handle_command(text, &agent, chat_id).await;
                     bot.send_message(chat_id, response).await?;
                 } else {
-                    // Allow "set secret ..." in private chat only, and only when allowlist is configured.
+                    // Allow "/setsecret ..." in private chat only, and only when allowlist is configured.
                     // This stores the secret encrypted and does not send it to the LLM.
                     let allow_set_secret = {
                         let a = agent.read().await;
@@ -779,9 +749,9 @@ pub async fn send_message(agent: &Agent, text: &str) -> Result<()> {
         return Err(anyhow!(message));
     };
 
-    let Some(chat_id) = resolve_chat_id(agent, config).await else {
+    let Some(chat_id) = configured_notification_chat_id(config) else {
         let message =
-            "Telegram has no delivery target yet. Message the bot once or add an allowed user ID.";
+            "Telegram proactive delivery is fail-closed until exactly one allowed user ID is configured.";
         tracing::warn!("Telegram send_message: {}", message);
         return Err(anyhow!(message));
     };
@@ -804,43 +774,27 @@ pub async fn send_message_to_chat(
     Ok(())
 }
 
-/// Resolve the chat_id to send to: stored last_chat_id > first allowed_user > None
-async fn resolve_chat_id(
-    agent: &Agent,
+/// Resolve the configured DM target for proactive Telegram notifications.
+pub(crate) fn configured_notification_chat_id(
     config: &crate::core::config::TelegramConfig,
 ) -> Option<i64> {
-    let stored = agent
-        .storage
-        .get("telegram:last_chat_id")
-        .await
-        .ok()
-        .flatten();
-    if let Some(bytes) = stored {
-        let id: i64 = String::from_utf8_lossy(&bytes).parse().unwrap_or_default();
-        if id != 0 {
-            return Some(id);
-        }
+    if config.allowed_users.len() != 1 {
+        return None;
     }
-    // Fallback: for private chats, user_id == chat_id
-    if let Some(&first) = config.allowed_users.first() {
-        if first != 0 {
-            tracing::info!(
-                "Telegram: no last_chat_id, falling back to allowed_users[0]={}",
-                first
-            );
-            return Some(first);
-        }
+    let chat_id = config.allowed_users.first().copied().unwrap_or_default();
+    if chat_id != 0 {
+        return Some(chat_id);
     }
     tracing::warn!("Telegram: no chat_id available — user must send a message to the bot first");
     None
 }
 
-/// Send a photo (screenshot) with optional caption to the last active Telegram chat
+/// Send a photo (screenshot) with optional caption to the configured Telegram DM target.
 pub async fn send_photo(agent: &Agent, image_bytes: &[u8], caption: &str) -> Result<()> {
     let Some(config) = &agent.config.telegram else {
         return Ok(());
     };
-    let Some(chat_id) = resolve_chat_id(agent, config).await else {
+    let Some(chat_id) = configured_notification_chat_id(config) else {
         return Ok(());
     };
 
@@ -853,12 +807,12 @@ pub async fn send_photo(agent: &Agent, image_bytes: &[u8], caption: &str) -> Res
     Ok(())
 }
 
-/// Send a video with optional caption to the last active Telegram chat
+/// Send a video with optional caption to the configured Telegram DM target.
 pub async fn send_video(agent: &Agent, video_bytes: &[u8], caption: &str) -> Result<()> {
     let Some(config) = &agent.config.telegram else {
         return Ok(());
     };
-    let Some(chat_id) = resolve_chat_id(agent, config).await else {
+    let Some(chat_id) = configured_notification_chat_id(config) else {
         return Ok(());
     };
 
@@ -1303,5 +1257,26 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
             "Unknown command: {}\n\nType /help for all commands",
             command
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_notification_chat_id_requires_exactly_one_allowed_user() {
+        let mut config = crate::core::config::TelegramConfig {
+            bot_token: "token".to_string(),
+            allowed_users: vec![12345],
+            dm_policy: "pairing".to_string(),
+        };
+        assert_eq!(configured_notification_chat_id(&config), Some(12345));
+
+        config.allowed_users.clear();
+        assert_eq!(configured_notification_chat_id(&config), None);
+
+        config.allowed_users = vec![12345, 67890];
+        assert_eq!(configured_notification_chat_id(&config), None);
     }
 }

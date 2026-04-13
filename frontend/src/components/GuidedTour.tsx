@@ -274,7 +274,7 @@ export function GuidedTour({ openTourStep, currentView }: Props) {
             left: Math.max(0, targetRect.left - pad),
             width: targetRect.width + pad * 2,
             height: targetRect.height + pad * 2,
-            borderRadius: 3,
+            borderRadius: 2,
             border: "2px solid rgba(47, 212, 255, 0.95)",
             boxShadow:
               "0 0 0 1px rgba(47, 212, 255, 0.2), 0 0 34px rgba(47, 212, 255, 0.2), inset 0 0 24px rgba(47, 212, 255, 0.06)",
@@ -294,7 +294,7 @@ export function GuidedTour({ openTourStep, currentView }: Props) {
           maxWidth: "calc(100vw - 32px)",
           minHeight: 220,
           zIndex: 10000,
-          borderRadius: 3,
+          borderRadius: 2,
           border: "1px solid rgba(47, 212, 255, 0.22)",
           background:
             "linear-gradient(160deg, rgba(10, 18, 34, 0.97), rgba(7, 14, 28, 0.95))",
@@ -311,7 +311,7 @@ export function GuidedTour({ openTourStep, currentView }: Props) {
           <Box>
             <Typography
               variant="overline"
-              sx={{ color: "rgba(47, 212, 255, 0.86)", letterSpacing: "0.1em" }}
+              sx={{ color: "rgba(47, 212, 255, 0.86)", letterSpacing: 0 }}
             >
               Guided Tour
             </Typography>

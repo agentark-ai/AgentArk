@@ -6,7 +6,71 @@
 //! - DuckDuckGo (scraping, no API key needed)
 
 use anyhow::{anyhow, Result};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Utc};
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+static HTML_TAG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)<[^>]+>").unwrap());
+static HTML_ANCHOR_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)<a\b(?P<attrs>[^>]*)>(?P<body>.*?)</a>").unwrap());
+static HTML_GENERIC_NODE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?is)<(?:span|div|a|p)\b(?P<attrs>[^>]*)>(?P<body>.*?)</(?:span|div|a|p)>")
+        .unwrap()
+});
+static LEADING_SNIPPET_DATE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?ix)
+        ^\s*
+        (?P<date>
+            \d{4}-\d{2}-\d{2}
+            |
+            \d{1,2}/\d{1,2}/\d{2,4}
+            |
+            (?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)
+            \s+\d{1,2},\s+\d{4}
+            |
+            \d+\s+(?:minute|minutes|hour|hours|day|days|week|weeks|month|months|year|years)\s+ago
+        )
+        \s*(?:[|:-]|[·•])\s*
+        (?P<rest>.+)
+        $
+        ",
+    )
+    .unwrap()
+});
+static HTML_CLASS_ATTR_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"(?is)\bclass\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#).unwrap());
+static HTML_HREF_ATTR_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"(?is)\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#).unwrap());
+static QUERY_YEAR_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b(?:19|20)\d{2}\b").unwrap());
+static RSS_ITEM_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)<item\b[^>]*>(?P<body>.*?)</item>").unwrap());
+
+const SEARCH_HTTP_ATTEMPTS: usize = 3;
+const SEARCH_HTTP_RETRY_BASE_MS: u64 = 400;
+const SEARCH_HTML_ACCEPT: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+const SEARCH_XML_ACCEPT: &str = "application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8";
+const SEARCH_BACKEND_HEALTH_KEY: &str = "search_backend_health:v1";
+const BUILTIN_BACKEND_COOLDOWN_HOURS: i64 = 24;
+
+pub const SEARCH_PROVIDER_SETUP_REQUIRED_MESSAGE: &str =
+    "Search providers are blocking anonymous HTML/browser search from this environment. Configure Serper or Brave Search API for reliable research.";
+
+fn char_prefix(value: &str, max_chars: usize) -> &str {
+    if value.chars().count() <= max_chars {
+        return value;
+    }
+    let end = value
+        .char_indices()
+        .nth(max_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(value.len());
+    &value[..end]
+}
 
 /// Search result from any backend
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,6 +79,8 @@ pub struct SearchResult {
     pub url: String,
     pub snippet: String,
     pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_date: Option<String>,
 }
 
 /// Search response
@@ -25,6 +91,156 @@ pub struct SearchResponse {
     pub backend: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct SearchBackendHealthSnapshot {
+    #[serde(default)]
+    backends: BTreeMap<String, SearchBackendHealthRecord>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct SearchBackendHealthRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cooldown_until: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_failure_at: Option<String>,
+}
+
+#[derive(Clone, Default)]
+pub struct SearchBackendHealthState {
+    snapshot: Arc<RwLock<SearchBackendHealthSnapshot>>,
+    storage: Option<crate::storage::Storage>,
+}
+
+impl std::fmt::Debug for SearchBackendHealthState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SearchBackendHealthState")
+            .field("has_storage", &self.storage.is_some())
+            .finish()
+    }
+}
+
+impl SearchBackendHealthState {
+    pub async fn load(storage: Option<&crate::storage::Storage>) -> Self {
+        let mut snapshot = if let Some(store) = storage {
+            store
+                .get(SEARCH_BACKEND_HEALTH_KEY)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|bytes| {
+                    serde_json::from_slice::<SearchBackendHealthSnapshot>(&bytes).ok()
+                })
+                .unwrap_or_default()
+        } else {
+            SearchBackendHealthSnapshot::default()
+        };
+        snapshot.prune_expired();
+        Self {
+            snapshot: Arc::new(RwLock::new(snapshot)),
+            storage: storage.cloned(),
+        }
+    }
+
+    pub fn is_in_cooldown(&self, backend: &str) -> bool {
+        self.cooldown_until(backend)
+            .map(|deadline| deadline > Utc::now())
+            .unwrap_or(false)
+    }
+
+    pub fn cooldown_until(&self, backend: &str) -> Option<DateTime<Utc>> {
+        let guard = self.snapshot.read().ok()?;
+        guard
+            .backends
+            .get(backend)
+            .and_then(|entry| entry.cooldown_until.as_deref())
+            .and_then(parse_rfc3339_utc)
+            .filter(|deadline| *deadline > Utc::now())
+    }
+
+    pub async fn mark_cooldown(&self, backend: &str, error: &str) -> Result<()> {
+        let snapshot = {
+            let mut guard = self
+                .snapshot
+                .write()
+                .map_err(|_| anyhow!("search health state lock poisoned"))?;
+            guard.backends.insert(
+                backend.to_string(),
+                SearchBackendHealthRecord {
+                    cooldown_until: Some(
+                        (Utc::now() + ChronoDuration::hours(BUILTIN_BACKEND_COOLDOWN_HOURS))
+                            .to_rfc3339(),
+                    ),
+                    last_error: Some(error.trim().to_string()),
+                    last_failure_at: Some(Utc::now().to_rfc3339()),
+                },
+            );
+            guard.clone()
+        };
+        self.persist_snapshot(&snapshot).await
+    }
+
+    pub async fn clear(&self, backend: &str) -> Result<()> {
+        let snapshot = {
+            let mut guard = self
+                .snapshot
+                .write()
+                .map_err(|_| anyhow!("search health state lock poisoned"))?;
+            if guard.backends.remove(backend).is_none() {
+                return Ok(());
+            }
+            guard.clone()
+        };
+        self.persist_snapshot(&snapshot).await
+    }
+
+    async fn persist_snapshot(&self, snapshot: &SearchBackendHealthSnapshot) -> Result<()> {
+        let Some(storage) = self.storage.as_ref() else {
+            return Ok(());
+        };
+        let bytes = serde_json::to_vec(snapshot)?;
+        storage.set(SEARCH_BACKEND_HEALTH_KEY, &bytes).await
+    }
+}
+
+impl SearchBackendHealthSnapshot {
+    fn prune_expired(&mut self) {
+        let now = Utc::now();
+        self.backends.retain(|_, record| {
+            record
+                .cooldown_until
+                .as_deref()
+                .and_then(parse_rfc3339_utc)
+                .map(|deadline| deadline > now)
+                .unwrap_or(false)
+        });
+    }
+}
+
+fn parse_rfc3339_utc(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
+}
+
+fn backend_display_name(name: &str) -> &'static str {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "serper" => "Serper",
+        "brave" | "brave_api" => "Brave API",
+        "exa" => "Exa",
+        "tavily" => "Tavily",
+        "perplexity" => "Perplexity",
+        "firecrawl" => "Firecrawl",
+        "searxng" => "SearXNG",
+        "lightpanda" => "Lightpanda",
+        "duckduckgo" => "DuckDuckGo",
+        "bing_rss" => "Bing RSS",
+        "playwright" => "Playwright",
+        _ => "search backend",
+    }
+}
+
 /// Search backend configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -33,12 +249,24 @@ pub enum SearchBackend {
     Serper { api_key: String },
     /// Brave Search API
     Brave { api_key: String },
+    /// Exa Search API
+    Exa { api_key: String },
+    /// Tavily Search API
+    Tavily { api_key: String },
+    /// Perplexity Search API
+    Perplexity { api_key: String },
+    /// Firecrawl Search API
+    Firecrawl { api_key: String },
+    /// SearXNG instance
+    Searxng { base_url: String },
     /// DuckDuckGo (no API key, uses HTML scraping)
     DuckDuckGo,
     /// Playwright browser automation (headless Chromium via bridge sidecar)
     Playwright { bridge_url: String },
     /// Lightpanda fast headless browser (CLI-based, no sidecar needed)
     Lightpanda,
+    /// Bing RSS feed results (no API key needed)
+    BingRss,
 }
 
 /// Web search client
@@ -51,6 +279,7 @@ impl SearchClient {
     pub fn new(backend: SearchBackend) -> Self {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
             .build()
             .expect("Failed to create HTTP client");
@@ -67,12 +296,79 @@ impl SearchClient {
             SearchBackend::Brave { api_key } => {
                 self.search_brave(api_key, query, num_results).await
             }
+            SearchBackend::Exa { api_key } => self.search_exa(api_key, query, num_results).await,
+            SearchBackend::Tavily { api_key } => {
+                self.search_tavily(api_key, query, num_results).await
+            }
+            SearchBackend::Perplexity { api_key } => {
+                self.search_perplexity(api_key, query, num_results).await
+            }
+            SearchBackend::Firecrawl { api_key } => {
+                self.search_firecrawl(api_key, query, num_results).await
+            }
+            SearchBackend::Searxng { base_url } => {
+                self.search_searxng(base_url, query, num_results).await
+            }
             SearchBackend::DuckDuckGo => self.search_duckduckgo(query, num_results).await,
             SearchBackend::Playwright { bridge_url } => {
                 self.search_playwright(bridge_url, query, num_results).await
             }
             SearchBackend::Lightpanda => self.search_lightpanda(query, num_results).await,
+            SearchBackend::BingRss => self.search_bing_rss(query, num_results).await,
         }
+    }
+
+    async fn get_text_with_retry(&self, url: &str, accept: &str) -> Result<String> {
+        let mut last_err: Option<anyhow::Error> = None;
+
+        for attempt in 0..SEARCH_HTTP_ATTEMPTS {
+            let response = self
+                .client
+                .get(url)
+                .header("Accept", accept)
+                .header("Accept-Language", "en-US,en;q=0.9")
+                .send()
+                .await;
+
+            match response {
+                Ok(response) => {
+                    let status = response.status();
+                    if status.is_success() {
+                        return Ok(response.text().await?);
+                    }
+
+                    let err = anyhow!("request to {} failed with HTTP {}", url, status);
+                    if attempt + 1 < SEARCH_HTTP_ATTEMPTS
+                        && (status.is_server_error() || status.as_u16() == 429)
+                    {
+                        last_err = Some(err);
+                        tokio::time::sleep(Duration::from_millis(
+                            SEARCH_HTTP_RETRY_BASE_MS * (attempt as u64 + 1),
+                        ))
+                        .await;
+                        continue;
+                    }
+
+                    return Err(err);
+                }
+                Err(err) => {
+                    let err = anyhow!(err);
+                    if attempt + 1 < SEARCH_HTTP_ATTEMPTS
+                        && should_retry_search_request(err.downcast_ref::<reqwest::Error>())
+                    {
+                        last_err = Some(err);
+                        tokio::time::sleep(Duration::from_millis(
+                            SEARCH_HTTP_RETRY_BASE_MS * (attempt as u64 + 1),
+                        ))
+                        .await;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow!("request to {} failed", url)))
     }
 
     /// Search using Serper API (Google results)
@@ -98,6 +394,13 @@ impl SearchClient {
             title: String,
             link: String,
             snippet: Option<String>,
+            #[serde(
+                default,
+                alias = "date",
+                alias = "publishedDate",
+                alias = "published_date"
+            )]
+            published_date: Option<String>,
         }
 
         let request = SerperRequest {
@@ -120,11 +423,16 @@ impl SearchClient {
             .organic
             .unwrap_or_default()
             .into_iter()
-            .map(|r| SearchResult {
-                title: r.title,
-                url: r.link,
-                snippet: r.snippet.unwrap_or_default(),
-                source: "serper".to_string(),
+            .map(|r| {
+                let (snippet_date, snippet) =
+                    split_snippet_leading_date(&r.snippet.unwrap_or_default());
+                SearchResult {
+                    title: r.title,
+                    url: r.link,
+                    snippet,
+                    source: "serper".to_string(),
+                    published_date: normalize_optional_date(r.published_date).or(snippet_date),
+                }
             })
             .collect();
 
@@ -157,6 +465,8 @@ impl SearchClient {
             title: String,
             url: String,
             description: Option<String>,
+            #[serde(default, alias = "age", alias = "page_age", alias = "pageAge")]
+            published_date: Option<String>,
         }
 
         let url = format!(
@@ -180,11 +490,16 @@ impl SearchClient {
             .map(|w| w.results)
             .unwrap_or_default()
             .into_iter()
-            .map(|r| SearchResult {
-                title: r.title,
-                url: r.url,
-                snippet: r.description.unwrap_or_default(),
-                source: "brave".to_string(),
+            .map(|r| {
+                let (snippet_date, snippet) =
+                    split_snippet_leading_date(&r.description.unwrap_or_default());
+                SearchResult {
+                    title: r.title,
+                    url: r.url,
+                    snippet,
+                    source: "brave".to_string(),
+                    published_date: normalize_optional_date(r.published_date).or(snippet_date),
+                }
             })
             .collect();
 
@@ -195,108 +510,484 @@ impl SearchClient {
         })
     }
 
-    /// Search using DuckDuckGo (HTML scraping - no API key needed)
-    async fn search_duckduckgo(&self, query: &str, num_results: usize) -> Result<SearchResponse> {
-        // DuckDuckGo HTML search
-        let url = format!(
-            "https://html.duckduckgo.com/html/?q={}",
-            urlencoding::encode(query)
-        );
+    async fn search_exa(
+        &self,
+        api_key: &str,
+        query: &str,
+        num_results: usize,
+    ) -> Result<SearchResponse> {
+        #[derive(Serialize)]
+        struct ExaRequest {
+            query: String,
+            #[serde(rename = "numResults")]
+            num_results: usize,
+            #[serde(rename = "type")]
+            search_type: String,
+            contents: serde_json::Value,
+        }
 
-        let html = self.client.get(&url).send().await?.text().await?;
+        #[derive(Deserialize)]
+        struct ExaResponse {
+            results: Vec<ExaResult>,
+        }
 
-        // Simple HTML parsing for results
+        #[derive(Deserialize)]
+        struct ExaResult {
+            title: Option<String>,
+            url: String,
+            text: Option<String>,
+            summary: Option<String>,
+            #[serde(default, rename = "publishedDate")]
+            published_date: Option<String>,
+            #[serde(default)]
+            highlights: Vec<String>,
+        }
+
+        let request = ExaRequest {
+            query: query.to_string(),
+            num_results,
+            search_type: "auto".to_string(),
+            contents: serde_json::json!({
+                "highlights": { "maxCharacters": 220 }
+            }),
+        };
+
+        let response: ExaResponse = self
+            .client
+            .post("https://api.exa.ai/search")
+            .header("x-api-key", api_key)
+            .header("Content-Type", "application/json")
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        let results = response
+            .results
+            .into_iter()
+            .map(|result| {
+                let snippet = result
+                    .highlights
+                    .into_iter()
+                    .find(|value| !value.trim().is_empty())
+                    .or(result.summary)
+                    .or(result.text)
+                    .unwrap_or_default();
+                let (snippet_date, snippet) = split_snippet_leading_date(&snippet);
+                SearchResult {
+                    title: result.title.unwrap_or_else(|| result.url.clone()),
+                    url: result.url,
+                    snippet,
+                    source: "exa".to_string(),
+                    published_date: normalize_optional_date(result.published_date).or(snippet_date),
+                }
+            })
+            .collect();
+
+        Ok(SearchResponse {
+            query: query.to_string(),
+            results,
+            backend: "exa".to_string(),
+        })
+    }
+
+    async fn search_tavily(
+        &self,
+        api_key: &str,
+        query: &str,
+        num_results: usize,
+    ) -> Result<SearchResponse> {
+        #[derive(Serialize)]
+        struct TavilyRequest {
+            query: String,
+            topic: String,
+            search_depth: String,
+            max_results: usize,
+            include_answer: bool,
+            include_raw_content: bool,
+            include_images: bool,
+            include_favicon: bool,
+        }
+
+        #[derive(Deserialize)]
+        struct TavilyResponse {
+            results: Vec<TavilyResult>,
+        }
+
+        #[derive(Deserialize)]
+        struct TavilyResult {
+            title: String,
+            url: String,
+            #[serde(default)]
+            content: Option<String>,
+            #[serde(default, alias = "published_date", alias = "date")]
+            published_date: Option<String>,
+        }
+
+        let request = TavilyRequest {
+            query: query.to_string(),
+            topic: if query_looks_freshness_sensitive(query) {
+                "news".to_string()
+            } else {
+                "general".to_string()
+            },
+            search_depth: "basic".to_string(),
+            max_results: num_results,
+            include_answer: false,
+            include_raw_content: false,
+            include_images: false,
+            include_favicon: false,
+        };
+
+        let response: TavilyResponse = self
+            .client
+            .post("https://api.tavily.com/search")
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        let results = response
+            .results
+            .into_iter()
+            .map(|result| {
+                let (snippet_date, snippet) =
+                    split_snippet_leading_date(&result.content.unwrap_or_default());
+                SearchResult {
+                    title: result.title,
+                    url: result.url,
+                    snippet,
+                    source: "tavily".to_string(),
+                    published_date: normalize_optional_date(result.published_date).or(snippet_date),
+                }
+            })
+            .collect();
+
+        Ok(SearchResponse {
+            query: query.to_string(),
+            results,
+            backend: "tavily".to_string(),
+        })
+    }
+
+    async fn search_perplexity(
+        &self,
+        api_key: &str,
+        query: &str,
+        num_results: usize,
+    ) -> Result<SearchResponse> {
+        #[derive(Serialize)]
+        struct PerplexityRequest {
+            query: String,
+            max_results: usize,
+            max_tokens: usize,
+            max_tokens_per_page: usize,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            search_recency_filter: Option<String>,
+        }
+
+        #[derive(Deserialize)]
+        struct PerplexityResponse {
+            results: Vec<PerplexityResult>,
+        }
+
+        #[derive(Deserialize)]
+        struct PerplexityResult {
+            title: String,
+            url: String,
+            #[serde(default)]
+            snippet: Option<String>,
+            #[serde(default)]
+            date: Option<String>,
+            #[serde(default)]
+            last_updated: Option<String>,
+        }
+
+        let request = PerplexityRequest {
+            query: query.to_string(),
+            max_results: num_results.min(20),
+            max_tokens: 10_000,
+            max_tokens_per_page: 2048,
+            search_recency_filter: query_looks_freshness_sensitive(query)
+                .then_some("month".to_string()),
+        };
+
+        let response: PerplexityResponse = self
+            .client
+            .post("https://api.perplexity.ai/search")
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        let results = response
+            .results
+            .into_iter()
+            .map(|result| {
+                let (snippet_date, snippet) =
+                    split_snippet_leading_date(&result.snippet.unwrap_or_default());
+                SearchResult {
+                    title: result.title,
+                    url: result.url,
+                    snippet,
+                    source: "perplexity".to_string(),
+                    published_date: normalize_optional_date(result.date.or(result.last_updated))
+                        .or(snippet_date),
+                }
+            })
+            .collect();
+
+        Ok(SearchResponse {
+            query: query.to_string(),
+            results,
+            backend: "perplexity".to_string(),
+        })
+    }
+
+    async fn search_firecrawl(
+        &self,
+        api_key: &str,
+        query: &str,
+        num_results: usize,
+    ) -> Result<SearchResponse> {
+        #[derive(Serialize)]
+        struct FirecrawlRequest {
+            query: String,
+            limit: usize,
+            sources: Vec<String>,
+        }
+
+        #[derive(Deserialize)]
+        struct FirecrawlResponse {
+            success: bool,
+            data: FirecrawlData,
+        }
+
+        #[derive(Deserialize, Default)]
+        struct FirecrawlData {
+            #[serde(default)]
+            web: Vec<FirecrawlWebResult>,
+            #[serde(default)]
+            news: Vec<FirecrawlNewsResult>,
+        }
+
+        #[derive(Deserialize)]
+        struct FirecrawlWebResult {
+            title: Option<String>,
+            url: String,
+            #[serde(default)]
+            description: Option<String>,
+            #[serde(default)]
+            markdown: Option<String>,
+        }
+
+        #[derive(Deserialize)]
+        struct FirecrawlNewsResult {
+            title: Option<String>,
+            url: String,
+            #[serde(default)]
+            snippet: Option<String>,
+            #[serde(default)]
+            date: Option<String>,
+        }
+
+        let mut sources = vec!["web".to_string()];
+        if query_looks_freshness_sensitive(query) {
+            sources.push("news".to_string());
+        }
+        let request = FirecrawlRequest {
+            query: query.to_string(),
+            limit: num_results,
+            sources,
+        };
+
+        let response: FirecrawlResponse = self
+            .client
+            .post("https://api.firecrawl.dev/v2/search")
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        if !response.success {
+            return Err(anyhow!("Firecrawl search request was not successful"));
+        }
+
         let mut results = Vec::new();
-
-        // Look for result divs - basic regex-style parsing
-        // In production, use a proper HTML parser like scraper
-        let mut remaining = html.as_str();
-
-        while results.len() < num_results {
-            // Find result link
-            let Some(link_start) = remaining.find("class=\"result__a\"") else {
-                break;
-            };
-            remaining = &remaining[link_start..];
-
-            let Some(href_start) = remaining.find("href=\"") else {
-                break;
-            };
-            remaining = &remaining[href_start + 6..];
-
-            let Some(href_end) = remaining.find('"') else {
-                break;
-            };
-            let url = &remaining[..href_end];
-            remaining = &remaining[href_end..];
-
-            // Get title
-            let Some(title_start) = remaining.find('>') else {
-                break;
-            };
-            remaining = &remaining[title_start + 1..];
-
-            let Some(title_end) = remaining.find("</a>") else {
-                break;
-            };
-            let title = html_decode(&remaining[..title_end]);
-            remaining = &remaining[title_end..];
-
-            // Get snippet
-            let snippet = if let Some(snippet_start) = remaining.find("class=\"result__snippet\"") {
-                let temp = &remaining[snippet_start..];
-                if let Some(s_start) = temp.find('>') {
-                    let temp = &temp[s_start + 1..];
-                    if let Some(s_end) = temp.find("</a>").or_else(|| temp.find("</span>")) {
-                        html_decode(&temp[..s_end])
-                    } else {
-                        String::new()
-                    }
-                } else {
-                    String::new()
-                }
-            } else {
-                String::new()
-            };
-
-            // Decode DuckDuckGo redirect URL
-            let actual_url = if url.starts_with("//duckduckgo.com/l/") {
-                // Extract actual URL from redirect
-                if let Some(uddg_start) = url.find("uddg=") {
-                    let encoded = &url[uddg_start + 5..];
-                    if let Some(end) = encoded.find('&') {
-                        urlencoding::decode(&encoded[..end])
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|_| url.to_string())
-                    } else {
-                        urlencoding::decode(encoded)
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|_| url.to_string())
-                    }
-                } else {
-                    url.to_string()
-                }
-            } else {
-                url.to_string()
-            };
-
+        for result in response.data.news.into_iter().take(num_results) {
+            let snippet = result.snippet.unwrap_or_default();
+            let (snippet_date, snippet) = split_snippet_leading_date(&snippet);
             results.push(SearchResult {
-                title,
-                url: actual_url,
+                title: result.title.unwrap_or_else(|| result.url.clone()),
+                url: result.url,
                 snippet,
-                source: "duckduckgo".to_string(),
+                source: "firecrawl".to_string(),
+                published_date: normalize_optional_date(result.date).or(snippet_date),
             });
+        }
+        if results.len() < num_results {
+            for result in response
+                .data
+                .web
+                .into_iter()
+                .take(num_results.saturating_sub(results.len()))
+            {
+                let snippet = result.description.or(result.markdown).unwrap_or_default();
+                let (snippet_date, snippet) = split_snippet_leading_date(&snippet);
+                results.push(SearchResult {
+                    title: result.title.unwrap_or_else(|| result.url.clone()),
+                    url: result.url,
+                    snippet,
+                    source: "firecrawl".to_string(),
+                    published_date: snippet_date,
+                });
+            }
         }
 
         Ok(SearchResponse {
             query: query.to_string(),
             results,
-            backend: "duckduckgo".to_string(),
+            backend: "firecrawl".to_string(),
         })
+    }
+
+    async fn search_searxng(
+        &self,
+        base_url: &str,
+        query: &str,
+        num_results: usize,
+    ) -> Result<SearchResponse> {
+        #[derive(Deserialize)]
+        struct SearxngResponse {
+            #[serde(default)]
+            results: Vec<SearxngResult>,
+        }
+
+        #[derive(Deserialize)]
+        struct SearxngResult {
+            title: String,
+            url: String,
+            #[serde(default)]
+            content: Option<String>,
+            #[serde(default, rename = "publishedDate")]
+            published_date_camel: Option<String>,
+            #[serde(default)]
+            published_date: Option<String>,
+        }
+
+        let url = format!(
+            "{}/search?q={}&format=json",
+            base_url.trim_end_matches('/'),
+            urlencoding::encode(query)
+        );
+        let response: SearxngResponse = self
+            .client
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        let results = response
+            .results
+            .into_iter()
+            .take(num_results)
+            .map(|result| {
+                let (snippet_date, snippet) =
+                    split_snippet_leading_date(&result.content.unwrap_or_default());
+                SearchResult {
+                    title: result.title,
+                    url: result.url,
+                    snippet,
+                    source: "searxng".to_string(),
+                    published_date: normalize_optional_date(
+                        result.published_date_camel.or(result.published_date),
+                    )
+                    .or(snippet_date),
+                }
+            })
+            .collect();
+
+        Ok(SearchResponse {
+            query: query.to_string(),
+            results,
+            backend: "searxng".to_string(),
+        })
+    }
+
+    async fn search_bing_rss(&self, query: &str, num_results: usize) -> Result<SearchResponse> {
+        self.search_bing_rss_fallback(query, num_results, "bing_rss")
+            .await
+    }
+
+    /// Search using DuckDuckGo (HTML scraping - no API key needed)
+    async fn search_duckduckgo(&self, query: &str, num_results: usize) -> Result<SearchResponse> {
+        let mut saw_no_results = false;
+        let mut failures = Vec::new();
+
+        for url in duckduckgo_search_urls(query) {
+            let page = self.get_text_with_retry(&url, SEARCH_HTML_ACCEPT).await;
+            match page {
+                Ok(html) => {
+                    let results = parse_duckduckgo_html_results(&html, num_results, "duckduckgo");
+                    if !results.is_empty() {
+                        return Ok(SearchResponse {
+                            query: query.to_string(),
+                            results,
+                            backend: "duckduckgo".to_string(),
+                        });
+                    }
+                    if let Some(error) = search_results_unavailable_reason("duckduckgo", &html) {
+                        failures.push(error.to_string());
+                    } else {
+                        saw_no_results = true;
+                    }
+                }
+                Err(err) => failures.push(err.to_string()),
+            }
+        }
+
+        if saw_no_results && failures.is_empty() {
+            return Ok(SearchResponse {
+                query: query.to_string(),
+                results: Vec::new(),
+                backend: "duckduckgo".to_string(),
+            });
+        }
+
+        Err(anyhow!(
+            "DuckDuckGo backend failed: {}",
+            failures.join("; ")
+        ))
     }
 
     /// Search using Playwright browser automation (headless Chromium via bridge sidecar)
     async fn search_playwright(
+        &self,
+        bridge_url: &str,
+        query: &str,
+        num_results: usize,
+    ) -> Result<SearchResponse> {
+        self.search_playwright_browser(bridge_url, query, num_results)
+            .await
+    }
+
+    async fn search_playwright_browser(
         &self,
         bridge_url: &str,
         query: &str,
@@ -309,6 +1000,8 @@ impl SearchClient {
 
         #[derive(Deserialize)]
         struct ContentResp {
+            title: Option<String>,
+            url: Option<String>,
             body_text: Option<String>,
             elements: Option<Vec<ContentElement>>,
         }
@@ -377,6 +1070,8 @@ impl SearchClient {
 
         let content: ContentResp = content_result?.error_for_status()?.json().await?;
 
+        let title = content.title.unwrap_or_default();
+        let rendered_url = content.url.unwrap_or_default();
         let body_text = content.body_text.unwrap_or_default();
         let elements = content.elements.unwrap_or_default();
 
@@ -415,18 +1110,30 @@ impl SearchClient {
             }
 
             // Try to find a snippet near this URL in the body text
-            let snippet = Self::extract_snippet_near(&body_text, &title);
+            let (published_date, snippet) =
+                split_snippet_leading_date(&Self::extract_snippet_near(&body_text, &title));
 
             results.push(SearchResult {
                 title,
                 url: el.href.clone(),
                 snippet,
                 source: "playwright".to_string(),
+                published_date,
             });
 
             if results.len() >= num_results {
                 break;
             }
+        }
+
+        if results.is_empty() {
+            let page_summary = format!("{}\n{}\n{}", title, rendered_url, body_text);
+            if let Some(error) = search_results_unavailable_reason("playwright", &page_summary) {
+                return Err(error);
+            }
+            return Err(anyhow!(
+                "Search backend 'playwright' rendered a page, but no recognizable result links were found"
+            ));
         }
 
         Ok(SearchResponse {
@@ -440,11 +1147,7 @@ impl SearchClient {
     fn extract_snippet_near(body_text: &str, title: &str) -> String {
         // Find the title (or a substring) in the body text
         let search_term = if title.chars().count() > 20 {
-            &title[..title
-                .char_indices()
-                .nth(20)
-                .map(|(i, _)| i)
-                .unwrap_or(title.len())]
+            char_prefix(title, 20)
         } else {
             title
         };
@@ -456,9 +1159,8 @@ impl SearchClient {
             if snippet_start < after.len() {
                 let snippet_text = &after[snippet_start..];
                 // Take first ~200 chars, stop at sentence boundary
-                let max_len = snippet_text.len().min(200);
-                let chunk = &snippet_text[..max_len];
-                let end = chunk.rfind(". ").map(|p| p + 1).unwrap_or(max_len);
+                let chunk = char_prefix(snippet_text, 200);
+                let end = chunk.rfind(". ").map(|p| p + 1).unwrap_or(chunk.len());
                 return chunk[..end].trim().to_string();
             }
         }
@@ -467,93 +1169,336 @@ impl SearchClient {
 
     /// Search using Lightpanda + DuckDuckGo HTML
     async fn search_lightpanda(&self, query: &str, num_results: usize) -> Result<SearchResponse> {
-        let search_url = format!(
-            "https://html.duckduckgo.com/html/?q={}",
+        let mut saw_no_results = false;
+        let mut failures = Vec::new();
+
+        for url in duckduckgo_search_urls(query) {
+            match crate::integrations::lightpanda::fetch_html(&url).await {
+                Ok(html) => {
+                    let results = parse_duckduckgo_html_results(&html, num_results, "lightpanda");
+                    if !results.is_empty() {
+                        return Ok(SearchResponse {
+                            query: query.to_string(),
+                            results,
+                            backend: "lightpanda".to_string(),
+                        });
+                    }
+                    if let Some(error) = search_results_unavailable_reason("lightpanda", &html) {
+                        failures.push(error.to_string());
+                    } else {
+                        saw_no_results = true;
+                    }
+                }
+                Err(err) => failures.push(err.to_string()),
+            }
+        }
+
+        if saw_no_results && failures.is_empty() {
+            return Ok(SearchResponse {
+                query: query.to_string(),
+                results: Vec::new(),
+                backend: "lightpanda".to_string(),
+            });
+        }
+
+        Err(anyhow!(
+            "Lightpanda backend failed: {}",
+            failures.join("; ")
+        ))
+    }
+
+    async fn search_bing_rss_fallback(
+        &self,
+        query: &str,
+        num_results: usize,
+        backend: &str,
+    ) -> Result<SearchResponse> {
+        let url = format!(
+            "https://www.bing.com/search?format=rss&q={}",
             urlencoding::encode(query)
         );
-
-        let html = crate::integrations::lightpanda::fetch_html(&search_url).await?;
-
-        let mut results = Vec::new();
-        for chunk in html.split("class=\"result__a\"") {
-            if results.len() >= num_results {
-                break;
-            }
-            let href = chunk
-                .split("href=\"")
-                .nth(1)
-                .and_then(|s| s.split('"').next())
-                .unwrap_or("")
-                .to_string();
-            if href.is_empty() || href.starts_with('#') || href.contains("duckduckgo.com") {
-                continue;
-            }
-            let url = if href.contains("uddg=") {
-                urlencoding::decode(
-                    href.split("uddg=")
-                        .nth(1)
-                        .unwrap_or(&href)
-                        .split('&')
-                        .next()
-                        .unwrap_or(&href),
-                )
-                .unwrap_or_default()
-                .to_string()
-            } else {
-                href
-            };
-            if url.is_empty() || !url.starts_with("http") {
-                continue;
-            }
-            let title = chunk
-                .split('>')
-                .nth(1)
-                .and_then(|s| s.split("</").next())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            let snippet = chunk
-                .split("result__snippet")
-                .nth(1)
-                .and_then(|s| s.split('>').nth(1))
-                .and_then(|s| s.split("</").next())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-
-            results.push(SearchResult {
-                title: strip_html_tags(&title),
-                url,
-                snippet: strip_html_tags(&snippet),
-                source: "lightpanda".to_string(),
-            });
+        let xml = self.get_text_with_retry(&url, SEARCH_XML_ACCEPT).await?;
+        let results = parse_bing_rss_results(&xml, num_results, &format!("{}_bing_rss", backend));
+        if results.is_empty() {
+            return Err(anyhow!(
+                "Bing RSS fallback returned no recognizable results for '{}'",
+                query
+            ));
         }
 
         Ok(SearchResponse {
             query: query.to_string(),
             results,
-            backend: "lightpanda".to_string(),
+            backend: backend.to_string(),
         })
     }
 }
 
-fn strip_html_tags(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut in_tag = false;
-    for ch in s.chars() {
-        if ch == '<' {
-            in_tag = true;
+fn parse_duckduckgo_html_results(
+    html: &str,
+    num_results: usize,
+    source: &str,
+) -> Vec<SearchResult> {
+    let matches = HTML_ANCHOR_RE.find_iter(html).collect::<Vec<_>>();
+    let primary_results =
+        collect_duckduckgo_anchor_results(html, &matches, num_results, source, true);
+    if !primary_results.is_empty() {
+        return primary_results;
+    }
+    collect_duckduckgo_anchor_results(html, &matches, num_results, source, false)
+}
+
+fn collect_duckduckgo_anchor_results(
+    html: &str,
+    matches: &[regex::Match<'_>],
+    num_results: usize,
+    source: &str,
+    require_result_markers: bool,
+) -> Vec<SearchResult> {
+    let mut results = Vec::new();
+    let mut seen_urls = std::collections::HashSet::new();
+
+    for (index, anchor_match) in matches.iter().enumerate() {
+        if results.len() >= num_results {
+            break;
+        }
+
+        let anchor_html = anchor_match.as_str();
+        let Some(captures) = HTML_ANCHOR_RE.captures(anchor_html) else {
+            continue;
+        };
+        let attrs = captures
+            .name("attrs")
+            .map(|value| value.as_str())
+            .unwrap_or("");
+        if require_result_markers && !anchor_attrs_look_like_duckduckgo_result(attrs) {
             continue;
         }
-        if ch == '>' {
-            in_tag = false;
+
+        let Some(raw_href) = extract_attr_value(attrs, &HTML_HREF_ATTR_RE) else {
+            continue;
+        };
+        let Some(url) = decode_duckduckgo_result_url(&raw_href) else {
+            continue;
+        };
+        let title = captures
+            .name("body")
+            .map(|value| strip_html_tags(&html_decode(value.as_str())))
+            .unwrap_or_default();
+        if title.trim().is_empty() {
             continue;
         }
-        if !in_tag {
-            out.push(ch);
+        if !require_result_markers && !looks_like_generic_search_result_title(&title) {
+            continue;
+        }
+        if !seen_urls.insert(url.clone()) {
+            continue;
+        }
+
+        let next_anchor_start = matches
+            .get(index + 1)
+            .map(|candidate| candidate.start())
+            .unwrap_or(html.len());
+        let between_anchors = &html[anchor_match.end()..next_anchor_start];
+        let snippet = {
+            let extracted = extract_duckduckgo_snippet(between_anchors);
+            if extracted.trim().is_empty() {
+                extract_generic_result_snippet(between_anchors)
+            } else {
+                extracted
+            }
+        };
+        let (published_date, snippet) = split_snippet_leading_date(&snippet);
+
+        results.push(SearchResult {
+            title,
+            url,
+            snippet,
+            source: source.to_string(),
+            published_date,
+        });
+    }
+
+    results
+}
+
+fn looks_like_generic_search_result_title(title: &str) -> bool {
+    let normalized = title.trim().to_ascii_lowercase();
+    if normalized.len() < 8 {
+        return false;
+    }
+    if [
+        "all", "news", "videos", "images", "maps", "shopping", "more", "next", "previous",
+        "feedback", "privacy", "help", "settings", "sign in",
+    ]
+    .contains(&normalized.as_str())
+    {
+        return false;
+    }
+    normalized.split_whitespace().count() >= 2 || normalized.len() >= 18
+}
+
+fn extract_duckduckgo_snippet(html_after_result: &str) -> String {
+    let preview = char_prefix(html_after_result, 4_000);
+    for captures in HTML_GENERIC_NODE_RE.captures_iter(preview) {
+        let attrs = captures
+            .name("attrs")
+            .map(|value| value.as_str())
+            .unwrap_or("");
+        if !attrs_have_class_token(attrs, "result__snippet")
+            && !attrs_have_class_token(attrs, "result-snippet")
+        {
+            continue;
+        }
+        let body = captures
+            .name("body")
+            .map(|value| value.as_str())
+            .unwrap_or("");
+        let snippet = strip_html_tags(&html_decode(body));
+        if !snippet.trim().is_empty() {
+            return snippet;
         }
     }
-    out
+
+    String::new()
+}
+
+fn extract_generic_result_snippet(html_after_result: &str) -> String {
+    let preview = char_prefix(html_after_result, 2_000);
+    let plain = strip_html_tags(&html_decode(preview));
+    let compact = plain.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.len() < 24 {
+        return String::new();
+    }
+    char_prefix(&compact, 220).trim().to_string()
+}
+
+fn decode_duckduckgo_result_url(raw_href: &str) -> Option<String> {
+    let trimmed = raw_href.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+
+    let normalized = if trimmed.starts_with("//") {
+        format!("https:{}", trimmed)
+    } else {
+        trimmed.to_string()
+    };
+
+    if let Some(redirect_start) = normalized.find("uddg=") {
+        let encoded = &normalized[redirect_start + 5..];
+        let target = encoded.split('&').next().unwrap_or(encoded);
+        if let Ok(decoded) = urlencoding::decode(target) {
+            let decoded = decoded.trim();
+            if decoded.starts_with("http://") || decoded.starts_with("https://") {
+                return Some(decoded.to_string());
+            }
+        }
+    }
+
+    if normalized.starts_with("http://") || normalized.starts_with("https://") {
+        if normalized.contains("duckduckgo.com/") {
+            return None;
+        }
+        return Some(normalized);
+    }
+
+    None
+}
+
+fn search_results_unavailable_reason(backend: &str, html: &str) -> Option<anyhow::Error> {
+    let lower = html.to_ascii_lowercase();
+    if lower.contains("no results") || lower.contains("did not match any documents") {
+        None
+    } else if lower.contains("captcha")
+        || lower.contains("unusual traffic")
+        || lower.contains("automated requests")
+        || lower.contains("anomaly")
+        || lower.contains("verify you are human")
+        || lower.contains("unfortunately, bots use duckduckgo too")
+        || lower.contains("confirm this search was made by a human")
+        || lower.contains("proof of work captcha")
+        || lower.contains("confirm you’re a human being")
+        || lower.contains("confirm you're a human being")
+        || lower.contains("one last step")
+        || lower.contains("please solve the challenge below to continue")
+        || lower.contains("i'm not a robot")
+    {
+        Some(anyhow!(
+            "Search backend '{}' received an anti-bot or challenge page instead of results",
+            backend
+        ))
+    } else {
+        Some(anyhow!(
+            "Search backend '{}' returned HTML, but no recognizable result links were found",
+            backend
+        ))
+    }
+}
+
+fn anchor_attrs_look_like_duckduckgo_result(attrs: &str) -> bool {
+    attrs_have_class_token(attrs, "result__a")
+        || attrs_have_class_token(attrs, "result-link")
+        || attrs
+            .to_ascii_lowercase()
+            .contains("data-testid=\"result-title-a\"")
+        || attrs
+            .to_ascii_lowercase()
+            .contains("data-testid='result-title-a'")
+}
+
+fn attrs_have_class_token(attrs: &str, token: &str) -> bool {
+    extract_attr_value(attrs, &HTML_CLASS_ATTR_RE)
+        .map(|value| {
+            value
+                .split_whitespace()
+                .any(|candidate| candidate.eq_ignore_ascii_case(token))
+        })
+        .unwrap_or(false)
+}
+
+fn extract_attr_value(attrs: &str, attr_re: &Regex) -> Option<String> {
+    let captures = attr_re.captures(attrs)?;
+    captures
+        .get(1)
+        .or_else(|| captures.get(2))
+        .or_else(|| captures.get(3))
+        .map(|value| value.as_str().trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn strip_html_tags(s: &str) -> String {
+    HTML_TAG_RE.replace_all(s, "").trim().to_string()
+}
+
+fn normalize_optional_date(value: Option<String>) -> Option<String> {
+    value
+        .map(|date| {
+            date.trim()
+                .trim_matches(|c| c == '-' || c == '|' || c == ':')
+                .trim()
+                .to_string()
+        })
+        .filter(|date| !date.is_empty())
+}
+
+fn split_snippet_leading_date(snippet: &str) -> (Option<String>, String) {
+    let trimmed = snippet.trim();
+    if trimmed.is_empty() {
+        return (None, String::new());
+    }
+    if let Some(captures) = LEADING_SNIPPET_DATE_RE.captures(trimmed) {
+        let date = captures
+            .name("date")
+            .map(|value| value.as_str().trim().to_string())
+            .filter(|value| !value.is_empty());
+        let rest = captures
+            .name("rest")
+            .map(|value| value.as_str().trim().to_string())
+            .unwrap_or_else(|| trimmed.to_string());
+        return (date, rest);
+    }
+    (None, trimmed.to_string())
 }
 
 /// Simple HTML entity decoder
@@ -572,6 +1517,64 @@ fn html_decode(s: &str) -> String {
         .to_string()
 }
 
+fn should_retry_search_request(err: Option<&reqwest::Error>) -> bool {
+    err.map(|err| err.is_connect() || err.is_timeout() || err.is_request())
+        .unwrap_or(false)
+}
+
+fn duckduckgo_search_urls(query: &str) -> Vec<String> {
+    let encoded = urlencoding::encode(query);
+    vec![
+        format!("https://html.duckduckgo.com/html/?q={}", encoded),
+        format!("https://lite.duckduckgo.com/lite/?q={}", encoded),
+    ]
+}
+
+fn parse_bing_rss_results(xml: &str, num_results: usize, source: &str) -> Vec<SearchResult> {
+    let mut results = Vec::new();
+
+    for captures in RSS_ITEM_RE.captures_iter(xml) {
+        if results.len() >= num_results {
+            break;
+        }
+        let body = captures
+            .name("body")
+            .map(|value| value.as_str())
+            .unwrap_or("");
+        let title = extract_xml_tag(body, "title");
+        let url = extract_xml_tag(body, "link");
+        if title.trim().is_empty() || url.trim().is_empty() {
+            continue;
+        }
+        let description = extract_xml_tag(body, "description");
+        let published_date = normalize_optional_date(Some(extract_xml_tag(body, "pubDate")));
+        results.push(SearchResult {
+            title: html_decode(&strip_html_tags(&title)),
+            url: html_decode(&url),
+            snippet: html_decode(&strip_html_tags(&description)),
+            source: source.to_string(),
+            published_date,
+        });
+    }
+
+    results
+}
+
+fn extract_xml_tag(xml: &str, tag: &str) -> String {
+    let escaped_tag = regex::escape(tag.trim());
+    let pattern = format!(
+        r"(?is)<{tag}\b[^>]*>(?P<body>.*?)</{tag}>",
+        tag = escaped_tag
+    );
+
+    Regex::new(&pattern)
+        .ok()
+        .and_then(|re| re.captures(xml))
+        .and_then(|captures| captures.name("body"))
+        .map(|value| value.as_str().trim().to_string())
+        .unwrap_or_default()
+}
+
 /// Search action arguments
 #[derive(Debug, Deserialize)]
 pub struct SearchArgs {
@@ -586,77 +1589,80 @@ fn default_num_results() -> usize {
     5
 }
 
-const DEFAULT_SEARCH_PRIMARY: &str = "lightpanda";
-const DEFAULT_SEARCH_FALLBACK1: &str = "duckduckgo";
-const DEFAULT_SEARCH_FALLBACK2: &str = "none";
+fn query_looks_freshness_sensitive(query: &str) -> bool {
+    let lower = query.to_ascii_lowercase();
+    [
+        "latest",
+        "current",
+        "today",
+        "news",
+        "headline",
+        "breaking",
+        "recent",
+        "updates",
+        "developments",
+        "what changed",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn normalize_freshness_query(raw_query: &str) -> String {
+    let compact = raw_query.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() || !query_looks_freshness_sensitive(&compact) {
+        return compact;
+    }
+
+    let current_year = chrono::Utc::now().year();
+    let distinct_years = QUERY_YEAR_RE
+        .find_iter(&compact)
+        .filter_map(|m| m.as_str().parse::<i32>().ok())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    if distinct_years.len() < 2 || distinct_years.iter().any(|year| *year >= current_year) {
+        return compact;
+    }
+
+    let stripped = QUERY_YEAR_RE.replace_all(&compact, " ").to_string();
+    let stripped = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+    if stripped.is_empty() {
+        compact
+    } else {
+        format!("{} {}", stripped, current_year)
+    }
+}
+
+const DEFAULT_CONFIGURED_PROVIDER_ORDER: &[&str] = &[
+    "serper",
+    "brave_api",
+    "exa",
+    "tavily",
+    "perplexity",
+    "firecrawl",
+    "searxng",
+];
+const DEFAULT_FREE_BACKEND_ORDER: &[&str] = &["bing_rss", "lightpanda", "duckduckgo"];
 
 /// Execute a web search
 pub async fn execute_search(args: &SearchArgs, config: &SearchConfig) -> Result<String> {
-    // When an explicit backend is requested, use it directly (no fallback)
-    if let Some(explicit) = args.backend.as_deref() {
-        let backend = match explicit {
-            "serper" => config
-                .serper
-                .clone()
-                .ok_or_else(|| anyhow!("Serper not configured"))?,
-            "brave" | "brave_api" => config
-                .brave
-                .clone()
-                .ok_or_else(|| anyhow!("Brave not configured"))?,
-            "playwright" => config
-                .playwright
-                .clone()
-                .ok_or_else(|| anyhow!("Playwright not configured"))?,
-            "duckduckgo" => SearchBackend::DuckDuckGo,
-            "lightpanda" => SearchBackend::Lightpanda,
-            other => return Err(anyhow!("Unknown search backend: {}", other)),
-        };
-        let client = SearchClient::new(backend);
-        let response = client.search(&args.query, args.num_results).await?;
-        return Ok(format_search_results(&response));
-    }
-
-    // Build fallback chain from config (primary → fallback1 → fallback2)
-    let chain = config.ordered_backend_names();
-
-    let mut last_err = None;
-    for name in &chain {
-        if let Some(backend) = config.resolve_backend(name) {
-            let client = SearchClient::new(backend);
-            match client.search(&args.query, args.num_results).await {
-                Ok(response) if !response.results.is_empty() => {
-                    return Ok(format_search_results(&response));
-                }
-                Ok(_) => {
-                    tracing::warn!("Search backend '{}' returned 0 results, trying next", name);
-                    last_err = Some(anyhow!("Backend '{}' returned 0 results", name));
-                }
-                Err(e) => {
-                    tracing::warn!("Search backend '{}' failed: {}, trying next", name, e);
-                    last_err = Some(e);
-                }
-            }
-        } else {
-            tracing::debug!("Search backend '{}' not configured, trying next", name);
-        }
-
-        // No chain configured — legacy default: prefer Playwright, fall back to DuckDuckGo
-    }
-
-    Err(last_err.unwrap_or_else(|| anyhow!("All search backends failed")))
+    let response = search_with_config(
+        &args.query,
+        args.num_results.max(1),
+        args.backend.as_deref(),
+        config,
+    )
+    .await?;
+    Ok(format_search_results(&response))
 }
-
 /// Format search results into a human-readable string
 fn format_search_results(response: &SearchResponse) -> String {
     let mut output = format!("Search results for: {}\n\n", response.query);
     for (i, result) in response.results.iter().enumerate() {
-        output.push_str(&format!(
-            "{}. {}\n   {}\n   {}\n\n",
-            i + 1,
-            result.title,
-            result.url,
-            result.snippet
-        ));
+        output.push_str(&format!("{}. {}\n   {}\n", i + 1, result.title, result.url));
+        if let Some(date) = result.published_date.as_deref() {
+            output.push_str(&format!("   Date: {}\n", date));
+        }
+        output.push_str(&format!("   {}\n\n", result.snippet));
     }
     output
 }
@@ -666,6 +1672,11 @@ fn format_search_results(response: &SearchResponse) -> String {
 pub struct SearchConfig {
     pub serper: Option<SearchBackend>,
     pub brave: Option<SearchBackend>,
+    pub exa: Option<SearchBackend>,
+    pub tavily: Option<SearchBackend>,
+    pub perplexity: Option<SearchBackend>,
+    pub firecrawl: Option<SearchBackend>,
+    pub searxng: Option<SearchBackend>,
     pub playwright: Option<SearchBackend>,
     /// Preferred primary backend name (e.g. "lightpanda", "serper", "duckduckgo")
     #[serde(default)]
@@ -676,6 +1687,10 @@ pub struct SearchConfig {
     /// Second fallback backend name
     #[serde(default)]
     pub fallback2: Option<String>,
+    #[serde(default)]
+    pub provider_order: Vec<String>,
+    #[serde(skip, default)]
+    pub health: SearchBackendHealthState,
 }
 
 impl Default for SearchConfig {
@@ -683,59 +1698,390 @@ impl Default for SearchConfig {
         Self {
             serper: None,
             brave: None,
+            exa: None,
+            tavily: None,
+            perplexity: None,
+            firecrawl: None,
+            searxng: None,
             playwright: None,
-            primary: Some(DEFAULT_SEARCH_PRIMARY.to_string()),
-            fallback1: Some(DEFAULT_SEARCH_FALLBACK1.to_string()),
-            fallback2: Some(DEFAULT_SEARCH_FALLBACK2.to_string()),
+            primary: None,
+            fallback1: None,
+            fallback2: None,
+            provider_order: Vec::new(),
+            health: SearchBackendHealthState::default(),
         }
     }
 }
 
 impl SearchConfig {
+    pub fn with_health(mut self, health: SearchBackendHealthState) -> Self {
+        self.health = health;
+        self
+    }
+
     /// Resolve a backend name to a configured SearchBackend instance
     pub fn resolve_backend(&self, name: &str) -> Option<SearchBackend> {
-        match name {
+        match normalize_backend_name(name).as_str() {
             "playwright" => self.playwright.clone(),
             "serper" => self.serper.clone(),
-            "brave_api" | "brave" => self.brave.clone(),
+            "brave_api" => self.brave.clone(),
+            "exa" => self.exa.clone(),
+            "tavily" => self.tavily.clone(),
+            "perplexity" => self.perplexity.clone(),
+            "firecrawl" => self.firecrawl.clone(),
+            "searxng" => self.searxng.clone(),
+            "bing_rss" => Some(SearchBackend::BingRss),
             "duckduckgo" => Some(SearchBackend::DuckDuckGo),
             "lightpanda" => Some(SearchBackend::Lightpanda),
             _ => None,
         }
     }
 
-    pub fn ordered_backend_names(&self) -> Vec<&str> {
-        let chain: Vec<&str> = [
-            self.primary.as_deref(),
-            self.fallback1.as_deref(),
-            self.fallback2.as_deref(),
-        ]
-        .iter()
-        .filter_map(|value| *value)
-        .filter(|value| !value.trim().is_empty() && *value != "none")
-        .collect();
+    pub fn ordered_backend_names(&self) -> Vec<String> {
+        let mut ordered = Vec::new();
 
-        if chain.is_empty() {
-            vec![DEFAULT_SEARCH_PRIMARY, DEFAULT_SEARCH_FALLBACK1]
-        } else {
-            chain
+        for name in DEFAULT_CONFIGURED_PROVIDER_ORDER {
+            let normalized = (*name).to_string();
+            if self.resolve_backend(&normalized).is_some() && !ordered.contains(&normalized) {
+                ordered.push(normalized);
+            }
+        }
+
+        for name in DEFAULT_FREE_BACKEND_ORDER {
+            let normalized = (*name).to_string();
+            if self.resolve_backend(&normalized).is_some() && !ordered.contains(&normalized) {
+                ordered.push(normalized);
+            }
+        }
+
+        ordered
+    }
+
+    pub fn ensure_default_chain(&mut self) {}
+
+    pub fn is_builtin_cooldown_backend(&self, name: &str) -> bool {
+        matches!(
+            normalize_backend_name(name).as_str(),
+            "bing_rss" | "lightpanda" | "duckduckgo"
+        )
+    }
+}
+
+pub async fn search_with_config(
+    raw_query: &str,
+    num_results: usize,
+    explicit_backend: Option<&str>,
+    config: &SearchConfig,
+) -> Result<SearchResponse> {
+    let normalized_query = normalize_freshness_query(raw_query);
+    if normalized_query != raw_query {
+        tracing::warn!(
+            "Normalized freshness search query from '{}' to '{}'",
+            raw_query,
+            normalized_query
+        );
+    }
+
+    if let Some(explicit) = explicit_backend {
+        let backend_name = normalize_backend_name(explicit);
+        let backend = config
+            .resolve_backend(&backend_name)
+            .ok_or_else(|| anyhow!("Search backend '{}' is not configured", backend_name))?;
+        let client = SearchClient::new(backend);
+        return client.search(&normalized_query, num_results).await;
+    }
+
+    let chain = config.ordered_backend_names();
+    let mut last_err = None;
+    let mut attempts = Vec::new();
+    let mut cooldowns = Vec::new();
+    let mut configured_provider_available = false;
+
+    for name in &chain {
+        if is_configurable_provider_backend(name) {
+            configured_provider_available = true;
+        }
+
+        if config.is_builtin_cooldown_backend(name) && config.health.is_in_cooldown(name) {
+            let cooldown_until = config
+                .health
+                .cooldown_until(name)
+                .map(|value| value.to_rfc3339())
+                .unwrap_or_else(|| "unknown".to_string());
+            attempts.push(format!("{}: cooling down until {}", name, cooldown_until));
+            cooldowns.push(format!(
+                "{} until {}",
+                backend_display_name(name),
+                cooldown_until
+            ));
+            continue;
+        }
+
+        let Some(backend) = config.resolve_backend(name) else {
+            attempts.push(format!("{}: not configured", name));
+            continue;
+        };
+
+        let client = SearchClient::new(backend);
+        match client.search(&normalized_query, num_results).await {
+            Ok(response) if !response.results.is_empty() => {
+                if config.is_builtin_cooldown_backend(name) {
+                    let _ = config.health.clear(name).await;
+                }
+                return Ok(response);
+            }
+            Ok(_) => {
+                last_err = Some(anyhow!("Backend '{}' returned 0 results", name));
+                attempts.push(format!("{}: returned 0 results", name));
+            }
+            Err(error) => {
+                let error_text = error.to_string();
+                let should_cooldown = config.is_builtin_cooldown_backend(name)
+                    && search_error_is_cooldown_worthy(&error);
+                if should_cooldown {
+                    let _ = config.health.mark_cooldown(name, &error_text).await;
+                    cooldowns.push(format!(
+                        "{} until {}",
+                        backend_display_name(name),
+                        (Utc::now() + ChronoDuration::hours(BUILTIN_BACKEND_COOLDOWN_HOURS))
+                            .to_rfc3339()
+                    ));
+                }
+                attempts.push(if should_cooldown {
+                    format!("{}: {} (cooldown started)", name, error_text)
+                } else {
+                    format!("{}: {}", name, error_text)
+                });
+                last_err = Some(error);
+            }
         }
     }
 
-    pub fn ensure_default_chain(&mut self) {
-        let has_explicit_chain = [
-            self.primary.as_deref(),
-            self.fallback1.as_deref(),
-            self.fallback2.as_deref(),
-        ]
-        .iter()
-        .filter_map(|value| *value)
-        .any(|value| !value.trim().is_empty() && value != "none");
-
-        if !has_explicit_chain {
-            self.primary = Some(DEFAULT_SEARCH_PRIMARY.to_string());
-            self.fallback1 = Some(DEFAULT_SEARCH_FALLBACK1.to_string());
-            self.fallback2 = Some(DEFAULT_SEARCH_FALLBACK2.to_string());
+    if !configured_provider_available {
+        let mut detail = String::from(SEARCH_PROVIDER_SETUP_REQUIRED_MESSAGE);
+        if !cooldowns.is_empty() {
+            detail.push(' ');
+            detail.push_str("Anonymous fallback cooldowns: ");
+            detail.push_str(&cooldowns.join(", "));
+            detail.push('.');
         }
+        if !attempts.is_empty() {
+            detail.push(' ');
+            detail.push_str("Attempts: ");
+            detail.push_str(&attempts.join("; "));
+        }
+        return Err(anyhow!(detail));
+    }
+
+    Err(if attempts.is_empty() {
+        last_err.unwrap_or_else(|| anyhow!("All search backends failed"))
+    } else {
+        anyhow!("All search backends failed: {}", attempts.join("; "))
+    })
+}
+
+fn normalize_backend_name(name: &str) -> String {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "brave" => "brave_api".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn is_configurable_provider_backend(name: &str) -> bool {
+    matches!(
+        normalize_backend_name(name).as_str(),
+        "serper" | "brave_api" | "exa" | "tavily" | "perplexity" | "firecrawl" | "searxng"
+    )
+}
+
+fn search_error_is_cooldown_worthy(error: &anyhow::Error) -> bool {
+    let lower = error.to_string().to_ascii_lowercase();
+    lower.contains("anti-bot") || lower.contains("challenge page")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_duckduckgo_results_decodes_redirect_links() {
+        let html = r#"
+            <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fstory%3Fid%3D42&rut=abc">Example result</a>
+            <span class="result__snippet">A useful summary.</span>
+        "#;
+
+        let results = parse_duckduckgo_html_results(html, 5, "lightpanda");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Example result");
+        assert_eq!(results[0].url, "https://example.com/story?id=42");
+        assert_eq!(results[0].snippet, "A useful summary.");
+        assert_eq!(results[0].source, "lightpanda");
+    }
+
+    #[test]
+    fn parse_duckduckgo_results_skips_internal_duckduckgo_links() {
+        let html = r#"
+            <a class="result__a" href="https://duckduckgo.com/?q=agentark">Internal</a>
+            <span class="result__snippet">Ignore me.</span>
+            <a class="result__a" href="https://example.com/docs">Docs</a>
+            <span class="result__snippet">Keep me.</span>
+        "#;
+
+        let results = parse_duckduckgo_html_results(html, 5, "duckduckgo");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Docs");
+        assert_eq!(results[0].url, "https://example.com/docs");
+        assert_eq!(results[0].snippet, "Keep me.");
+    }
+
+    #[test]
+    fn parse_duckduckgo_results_handles_extra_classes_and_single_quotes() {
+        let html = r#"
+            <a class='result__a result-link' data-testid='result-title-a' href='https://example.com/report'>
+                Example <b>report</b>
+            </a>
+            <div class='result__snippet result-snippet'>Strong <b>evidence</b> here.</div>
+        "#;
+
+        let results = parse_duckduckgo_html_results(html, 5, "lightpanda");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Example report");
+        assert_eq!(results[0].url, "https://example.com/report");
+        assert_eq!(results[0].snippet, "Strong evidence here.");
+    }
+
+    #[test]
+    fn parse_duckduckgo_results_extracts_leading_publication_date() {
+        let html = r#"
+            <a class="result__a" href="https://example.com/report">Example report</a>
+            <span class="result__snippet">April 5, 2026 - Strong evidence here.</span>
+        "#;
+
+        let results = parse_duckduckgo_html_results(html, 5, "duckduckgo");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].published_date.as_deref(), Some("April 5, 2026"));
+        assert_eq!(results[0].snippet, "Strong evidence here.");
+    }
+
+    #[test]
+    fn parse_duckduckgo_results_falls_back_to_generic_external_anchors() {
+        let html = r#"
+            <a href="https://example.com/policy/india-ai">India AI policy outlook 2026</a>
+            <p>Government strategy, compute constraints, and university talent pipeline updates.</p>
+        "#;
+
+        let results = parse_duckduckgo_html_results(html, 5, "lightpanda");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "India AI policy outlook 2026");
+        assert_eq!(results[0].url, "https://example.com/policy/india-ai");
+        assert!(results[0]
+            .snippet
+            .contains("Government strategy, compute constraints"));
+    }
+
+    #[test]
+    fn parse_bing_rss_results_extracts_items() {
+        let xml = r#"
+            <?xml version="1.0" encoding="utf-8" ?>
+            <rss version="2.0">
+              <channel>
+                <item>
+                  <title>Example report</title>
+                  <link>https://example.com/report</link>
+                  <description>Strong &amp; current evidence.</description>
+                  <pubDate>Mon, 07 Apr 2026 10:00:00 GMT</pubDate>
+                </item>
+              </channel>
+            </rss>
+        "#;
+
+        let results = parse_bing_rss_results(xml, 5, "duckduckgo_bing_rss");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Example report");
+        assert_eq!(results[0].url, "https://example.com/report");
+        assert_eq!(results[0].snippet, "Strong & current evidence.");
+        assert_eq!(
+            results[0].published_date.as_deref(),
+            Some("Mon, 07 Apr 2026 10:00:00 GMT")
+        );
+    }
+
+    #[test]
+    fn extract_xml_tag_matches_case_insensitive_closing_tags_without_panicking() {
+        let xml = r#"<TITLE>Example report</TITLE>"#;
+
+        assert_eq!(extract_xml_tag(xml, "title"), "Example report");
+    }
+
+    #[test]
+    fn extract_xml_tag_supports_namespaced_tags_without_backreference_regexes() {
+        let xml = r#"<content:encoded>Encoded body</content:encoded>"#;
+
+        assert_eq!(extract_xml_tag(xml, "content:encoded"), "Encoded body");
+    }
+
+    #[test]
+    fn search_results_unavailable_reason_detects_duckduckgo_bot_challenge() {
+        let html = "Unfortunately, bots use DuckDuckGo too. Please complete the following challenge to confirm this search was made by a human.";
+        let reason = search_results_unavailable_reason("duckduckgo", html)
+            .expect("duckduckgo challenge should be detected");
+        assert!(reason.to_string().contains("anti-bot"));
+    }
+
+    #[test]
+    fn search_results_unavailable_reason_detects_browser_challenge() {
+        let html = "One last step. Please solve the challenge below to continue. Confirm you're a human being.";
+        let reason = search_results_unavailable_reason("playwright", html)
+            .expect("browser challenge should be detected");
+        assert!(reason.to_string().contains("anti-bot"));
+    }
+
+    #[test]
+    fn ordered_backend_names_prioritizes_configured_providers_then_free_fallbacks() {
+        let mut config = SearchConfig::default();
+        config.provider_order = vec!["tavily".to_string(), "serper".to_string()];
+        config.serper = Some(SearchBackend::Serper {
+            api_key: "test".to_string(),
+        });
+        config.tavily = Some(SearchBackend::Tavily {
+            api_key: "test".to_string(),
+        });
+
+        let chain = config.ordered_backend_names();
+
+        assert_eq!(
+            chain,
+            vec![
+                "tavily".to_string(),
+                "serper".to_string(),
+                "bing_rss".to_string(),
+                "lightpanda".to_string(),
+                "duckduckgo".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn format_search_results_includes_dates_when_available() {
+        let rendered = format_search_results(&SearchResponse {
+            query: "india israel news".to_string(),
+            results: vec![SearchResult {
+                title: "Example".to_string(),
+                url: "https://example.com/story".to_string(),
+                snippet: "Summary".to_string(),
+                source: "duckduckgo".to_string(),
+                published_date: Some("2026-04-06".to_string()),
+            }],
+            backend: "duckduckgo".to_string(),
+        });
+
+        assert!(rendered.contains("Date: 2026-04-06"));
+        assert!(rendered.contains("Summary"));
     }
 }

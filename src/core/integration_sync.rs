@@ -424,35 +424,9 @@ fn parse_datetime(input: &str) -> Option<DateTime<Utc>> {
         })
 }
 
-fn keyword_importance_boost(text: &str) -> f32 {
-    let lower = text.to_ascii_lowercase();
-    let mut boost: f32 = 0.0;
-    for (needle, value) in [
-        ("critical", 0.22),
-        ("urgent", 0.2),
-        ("incident", 0.22),
-        ("security", 0.2),
-        ("failure", 0.18),
-        ("failed", 0.18),
-        ("review requested", 0.18),
-        ("assignment", 0.15),
-        ("mention", 0.12),
-        ("customer", 0.14),
-        ("contract", 0.15),
-        ("invoice", 0.12),
-        ("payment", 0.12),
-        ("escalation", 0.2),
-        ("board", 0.12),
-        ("interview", 0.12),
-        ("deadline", 0.14),
-        ("error", 0.12),
-        ("warning", 0.1),
-    ] {
-        if lower.contains(needle) {
-            boost += value;
-        }
-    }
-    boost.min(0.45)
+fn text_importance_boost(text: &str) -> f32 {
+    let _ = text;
+    0.0
 }
 
 fn recency_importance_boost(at: Option<DateTime<Utc>>) -> f32 {
@@ -1557,7 +1531,7 @@ async fn fetch_workspace_drive_items(
                     .map(|value| value.to_string()),
                 occurred_at,
                 importance: clamp_importance(
-                    0.34 + recency_importance_boost(occurred_at) + keyword_importance_boost(&title),
+                    0.34 + recency_importance_boost(occurred_at) + text_importance_boost(&title),
                 ),
             }
         })
@@ -1609,7 +1583,7 @@ async fn fetch_notion_items(
                     .map(|value| value.to_string()),
                 occurred_at,
                 importance: clamp_importance(
-                    0.34 + recency_importance_boost(occurred_at) + keyword_importance_boost(title),
+                    0.34 + recency_importance_boost(occurred_at) + text_importance_boost(title),
                 ),
             }
         })
@@ -1657,7 +1631,7 @@ async fn fetch_twitter_items(
                     .map(|value| format!("https://twitter.com/i/web/status/{}", value)),
                 occurred_at,
                 importance: clamp_importance(
-                    0.24 + recency_importance_boost(occurred_at) + keyword_importance_boost(text),
+                    0.24 + recency_importance_boost(occurred_at) + text_importance_boost(text),
                 ),
             }
         })
@@ -1697,7 +1671,7 @@ async fn fetch_onepassword_items(
                     .to_string(),
                 url: None,
                 occurred_at: None,
-                importance: clamp_importance(0.25 + keyword_importance_boost(name)),
+                importance: clamp_importance(0.25 + text_importance_boost(name)),
             }
         })
         .collect())
@@ -1761,7 +1735,7 @@ async fn fetch_twilio_items(
                     } else {
                         0.0
                     }
-                    + keyword_importance_boost(body),
+                    + text_importance_boost(body),
             ),
         });
     }
@@ -1917,7 +1891,7 @@ async fn fetch_garmin_items(
                 url: None,
                 occurred_at,
                 importance: clamp_importance(
-                    0.28 + recency_importance_boost(occurred_at) + keyword_importance_boost(&title),
+                    0.28 + recency_importance_boost(occurred_at) + text_importance_boost(&title),
                 ),
             }
         })
@@ -1962,7 +1936,7 @@ async fn fetch_whoop_items(
                 url: None,
                 occurred_at,
                 importance: clamp_importance(
-                    0.28 + recency_importance_boost(occurred_at) + keyword_importance_boost(title),
+                    0.28 + recency_importance_boost(occurred_at) + text_importance_boost(title),
                 ),
             }
         })
@@ -2126,7 +2100,7 @@ async fn fetch_social_analytics_items(
             summary,
             url: None,
             occurred_at: Some(Utc::now()),
-            importance: clamp_importance(0.34 + keyword_importance_boost(platform)),
+            importance: clamp_importance(0.34 + text_importance_boost(platform)),
         });
     }
     Ok(items)
@@ -2188,7 +2162,7 @@ async fn fetch_calendar_items(
                     .and_then(|value| value.as_str())
                     .map(|value| value.to_string()),
                 occurred_at,
-                importance: clamp_importance(0.34 + time_boost + keyword_importance_boost(title)),
+                importance: clamp_importance(0.34 + time_boost + text_importance_boost(title)),
             }
         })
         .collect())
@@ -2281,7 +2255,7 @@ async fn fetch_github_items(
                 importance: clamp_importance(
                     0.36 + reason_boost
                         + recency_importance_boost(occurred_at)
-                        + keyword_importance_boost(title),
+                        + text_importance_boost(title),
                 ),
             }
         })
@@ -2406,7 +2380,7 @@ async fn fetch_gmail_items(
             importance: clamp_importance(
                 0.4 + label_boost
                     + recency_importance_boost(occurred_at)
-                    + keyword_importance_boost(&format!("{} {}", subject, from)),
+                    + text_importance_boost(&format!("{} {}", subject, from)),
             ),
         });
     }

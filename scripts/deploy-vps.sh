@@ -128,8 +128,8 @@ rm /tmp/deploy.tar.gz
 # Stop existing containers
 docker compose down 2>/dev/null || true
 
-# Build and start
-docker compose build
+# Pull and start
+docker compose pull
 docker compose up -d
 
 # Show status
@@ -157,6 +157,7 @@ echo ""
 echo "Management commands (run on VPS):"
 echo "  cd $DEPLOY_DIR"
 echo "  docker compose logs -f          # View logs"
+echo "  docker compose pull && docker compose up -d  # Update"
 echo "  docker compose restart          # Restart"
 echo "  docker compose down             # Stop"
 echo "  docker compose up -d            # Start"

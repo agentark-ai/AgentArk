@@ -21,6 +21,18 @@ pub enum PlanStepStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanSubstep {
+    pub id: usize,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<PlanStepStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanStep {
     pub id: usize,
     pub title: String,
@@ -33,6 +45,8 @@ pub struct PlanStep {
     pub tool_hint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<PlanStepStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub substeps: Vec<PlanSubstep>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -46,7 +60,30 @@ pub struct ExecutionPlan {
 }
 
 const DEFAULT_MAX_PLAN_STEPS: usize = 8;
+pub const DEFAULT_MAX_CONFIRMATION_PLAN_STEPS: usize = 7;
 pub const DEFAULT_MAX_ACTIONS_FOR_PLAN: usize = 8;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfirmationPlanRelevance {
+    pub accepted: bool,
+    pub anchor_hits: usize,
+    pub anchor_count: usize,
+    pub grounding_ratio: f32,
+    pub request_anchors: Vec<String>,
+    pub matched_anchors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RequestOutlineSection {
+    heading: Option<String>,
+    items: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RequestOutline {
+    objective: String,
+    sections: Vec<RequestOutlineSection>,
+}
 
 fn extract_json(text: &str) -> Option<serde_json::Value> {
     serde_json::from_str::<serde_json::Value>(text)
@@ -58,16 +95,30 @@ fn extract_json(text: &str) -> Option<serde_json::Value> {
         })
 }
 
-fn action_catalog_for_prompt(actions: &[crate::actions::ActionDef]) -> Vec<serde_json::Value> {
+fn action_catalog_for_prompt(
+    actions: &[crate::actions::ActionDef],
+    compact: bool,
+) -> Vec<serde_json::Value> {
     actions
         .iter()
         .map(|action| {
-            serde_json::json!({
-                "name": action.name,
-                "description": action.description,
-                "input_schema": action.input_schema,
-                "planner_metadata": action.planner_metadata(),
-            })
+            let mut record = serde_json::Map::new();
+            record.insert("name".to_string(), serde_json::json!(action.name));
+            record.insert(
+                "description".to_string(),
+                serde_json::json!(action.description),
+            );
+            record.insert(
+                "planner_metadata".to_string(),
+                serde_json::json!(action.planner_metadata()),
+            );
+            if !compact {
+                record.insert(
+                    "input_schema".to_string(),
+                    serde_json::json!(action.input_schema),
+                );
+            }
+            serde_json::Value::Object(record)
         })
         .collect()
 }
@@ -77,6 +128,258 @@ fn allowed_action_names(actions: &[crate::actions::ActionDef]) -> HashSet<String
         .iter()
         .map(|action| action.name.trim().to_ascii_lowercase())
         .collect()
+}
+
+fn normalize_relevance_text(text: &str) -> String {
+    text.to_lowercase()
+        .chars()
+        .map(|ch| if ch.is_alphanumeric() { ch } else { ' ' })
+        .collect()
+}
+
+fn request_anchor_tokens(text: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut tokens = normalize_relevance_text(text)
+        .split_whitespace()
+        .filter(|token| token.chars().count() >= 4 && token.chars().any(|ch| ch.is_alphabetic()))
+        .filter_map(|token| {
+            let token = token.trim().to_string();
+            if token.is_empty() || !seen.insert(token.clone()) {
+                None
+            } else {
+                Some(token)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    tokens.sort_by(|left, right| {
+        right
+            .chars()
+            .count()
+            .cmp(&left.chars().count())
+            .then_with(|| left.cmp(right))
+    });
+    tokens.truncate(12);
+    tokens
+}
+
+fn trim_request_list_marker(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    for prefix in ["- ", "* ", "+ "] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            let rest = rest.trim();
+            if !rest.is_empty() {
+                return Some(rest);
+            }
+        }
+    }
+
+    let digit_prefix_len = trimmed
+        .char_indices()
+        .take_while(|(_, ch)| ch.is_ascii_digit())
+        .last()
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(0);
+    if digit_prefix_len == 0 || digit_prefix_len >= trimmed.len() {
+        return None;
+    }
+
+    let after_digits = &trimmed[digit_prefix_len..];
+    let mut after_chars = after_digits.chars();
+    let marker = after_chars.next()?;
+    if !matches!(marker, '.' | ')' | ':') {
+        return None;
+    }
+
+    let rest = after_chars.as_str().trim();
+    if rest.is_empty() {
+        None
+    } else {
+        Some(rest)
+    }
+}
+
+fn parse_request_outline_heading(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trim_request_list_marker(trimmed).is_some() {
+        return None;
+    }
+    let heading = trimmed.strip_suffix(':')?.trim();
+    if heading.is_empty() || heading.chars().count() > 90 {
+        return None;
+    }
+    Some(heading.to_string())
+}
+
+fn truncate_prompt_text(text: &str, max_chars: usize) -> String {
+    let mut truncated = text.chars().take(max_chars).collect::<String>();
+    if text.chars().count() > max_chars {
+        truncated.push_str("...");
+    }
+    truncated
+}
+
+fn push_request_outline_section(
+    sections: &mut Vec<RequestOutlineSection>,
+    heading: Option<String>,
+    items: &mut Vec<String>,
+) {
+    if items.is_empty() {
+        return;
+    }
+    sections.push(RequestOutlineSection {
+        heading,
+        items: std::mem::take(items),
+    });
+}
+
+fn extract_request_outline(request: &str) -> RequestOutline {
+    let mut outline = RequestOutline::default();
+    let mut current_heading: Option<String> = None;
+    let mut current_items: Vec<String> = Vec::new();
+
+    for raw_line in request.lines().take(240) {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if outline.objective.is_empty()
+            && trim_request_list_marker(line).is_none()
+            && parse_request_outline_heading(line).is_none()
+        {
+            outline.objective = truncate_prompt_text(line, 260);
+            continue;
+        }
+
+        if let Some(heading) = parse_request_outline_heading(line) {
+            push_request_outline_section(
+                &mut outline.sections,
+                current_heading.take(),
+                &mut current_items,
+            );
+            current_heading = Some(heading);
+            continue;
+        }
+
+        let entry = trim_request_list_marker(line).unwrap_or(line);
+        let entry = truncate_prompt_text(entry, 220);
+        if !entry.is_empty() {
+            current_items.push(entry);
+        }
+    }
+
+    push_request_outline_section(
+        &mut outline.sections,
+        current_heading.take(),
+        &mut current_items,
+    );
+    outline
+}
+
+pub fn render_confirmation_request_grounding(request: &str) -> String {
+    let outline = extract_request_outline(request);
+    let anchors = request_anchor_tokens(request);
+    let mut lines = Vec::new();
+
+    if !outline.objective.is_empty() {
+        lines.push(format!("Primary objective: {}", outline.objective));
+    }
+
+    for section in outline.sections.iter().take(8) {
+        if let Some(heading) = section.heading.as_ref() {
+            lines.push(format!("{}:", heading));
+        }
+        for item in section.items.iter().take(6) {
+            lines.push(format!("- {}", item));
+        }
+    }
+
+    if !anchors.is_empty() {
+        lines.push(format!("Anchor terms: {}", anchors.join(", ")));
+    }
+
+    lines.join("\n")
+}
+
+fn dense_alnum_text(text: &str) -> String {
+    normalize_relevance_text(text)
+        .chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .collect()
+}
+
+fn char_ngrams(text: &str, n: usize) -> HashSet<String> {
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.len() < n {
+        return HashSet::new();
+    }
+
+    (0..=chars.len() - n)
+        .map(|index| chars[index..index + n].iter().collect::<String>())
+        .collect()
+}
+
+fn confirmation_plan_text(plan: &ExecutionPlan) -> String {
+    let mut parts = Vec::new();
+    if !plan.summary.trim().is_empty() {
+        parts.push(plan.summary.trim().to_string());
+    }
+    for step in &plan.steps {
+        if !step.title.trim().is_empty() {
+            parts.push(step.title.trim().to_string());
+        }
+        if !step.description.trim().is_empty() {
+            parts.push(step.description.trim().to_string());
+        }
+    }
+    parts.join(" ")
+}
+
+pub fn assess_confirmation_plan_relevance(
+    request: &str,
+    plan: &ExecutionPlan,
+) -> ConfirmationPlanRelevance {
+    let request_anchors = request_anchor_tokens(request);
+    let plan_text = normalize_relevance_text(&confirmation_plan_text(plan));
+    let matched_anchors = request_anchors
+        .iter()
+        .filter(|anchor| plan_text.contains(anchor.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let anchor_hits = matched_anchors.len();
+
+    let request_ngrams = char_ngrams(&dense_alnum_text(request), 5);
+    let plan_ngrams = char_ngrams(&dense_alnum_text(&confirmation_plan_text(plan)), 5);
+    let grounding_overlap = request_ngrams.intersection(&plan_ngrams).count();
+    let grounding_ratio = if plan_ngrams.is_empty() {
+        0.0
+    } else {
+        grounding_overlap as f32 / plan_ngrams.len() as f32
+    };
+
+    let required_anchor_hits = match request_anchors.len() {
+        0 => 0,
+        1..=4 => 1,
+        5..=9 => 2,
+        _ => 3,
+    };
+    let accepted = if request_anchors.is_empty() {
+        grounding_ratio >= 0.18
+    } else {
+        anchor_hits >= required_anchor_hits
+            || grounding_ratio >= 0.22
+            || (anchor_hits >= 1 && grounding_ratio >= 0.14)
+    };
+
+    ConfirmationPlanRelevance {
+        accepted,
+        anchor_hits,
+        anchor_count: request_anchors.len(),
+        grounding_ratio,
+        request_anchors,
+        matched_anchors,
+    }
 }
 
 fn normalize_status(value: &serde_json::Value) -> Option<PlanStepStatus> {
@@ -151,6 +454,50 @@ fn normalize_plan_step(
         None
     };
 
+    let substeps = record
+        .get("substeps")
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .enumerate()
+                .filter_map(|(sub_index, value)| {
+                    let record = value.as_object()?;
+                    let title = record
+                        .get("title")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("Substep")
+                        .to_string();
+                    let description = record
+                        .get("description")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .unwrap_or("")
+                        .to_string();
+                    let mut tool_hint =
+                        normalize_action_name(record.get("tool_hint"), allowed_actions);
+                    if tool_hint.is_none() {
+                        tool_hint = normalize_action_name(record.get("action"), allowed_actions);
+                    }
+                    let status = if include_status {
+                        record.get("status").and_then(normalize_status)
+                    } else {
+                        None
+                    };
+                    Some(PlanSubstep {
+                        id: sub_index + 1,
+                        title,
+                        description,
+                        tool_hint,
+                        status,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
     Some(PlanStep {
         id: index + 1,
         title,
@@ -159,6 +506,7 @@ fn normalize_plan_step(
         arguments: normalize_arguments(record.get("arguments")),
         tool_hint,
         status,
+        substeps,
     })
 }
 
@@ -331,7 +679,7 @@ Rules:\n\
     let mut user = format!(
         "Request:\n{}\n\nAvailable actions:\n{}",
         request.trim(),
-        serde_json::to_string_pretty(&action_catalog_for_prompt(available_actions))
+        serde_json::to_string_pretty(&action_catalog_for_prompt(available_actions, false))
             .unwrap_or_default()
     );
 
@@ -346,6 +694,59 @@ Rules:\n\
         user.push_str(
             "\n\nIf the plan must change, return a full replacement plan for the remaining work only.",
         );
+    }
+
+    (system, user)
+}
+
+pub fn build_confirmation_plan_prompt(
+    request: &str,
+    refinement: Option<&str>,
+    available_actions: &[crate::actions::ActionDef],
+) -> (String, String) {
+    let action_names = available_actions
+        .iter()
+        .map(|action| action.name.trim())
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    let system = format!(
+        "Generate a compact, request-specific execution outline that the user can review before the run starts.\n\
+Return ONLY valid JSON with this schema:\n\
+{{\n  \"summary\": \"short plan title\",\n  \"steps\": [\n    {{\n      \"title\": \"short step title\",\n      \"description\": \"short step description\",\n      \"action\": \"action_name or null\",\n      \"arguments\": {{}} ,\n      \"tool_hint\": \"action_name or null\"\n    }}\n  ]\n}}\n\n\
+Rules:\n\
+- Use only the provided action names.\n\
+- 4-{} steps maximum.\n\
+- Every step must stay on the request's actual subject.\n\
+- Reuse the request's own entities, topics, focus items, comparisons, dates, and required sections when relevant.\n\
+- Keep titles concrete and short.\n\
+- Keep descriptions to one brief sentence.\n\
+- If a step maps directly to an available action, set both `action` and `tool_hint` to that exact action name.\n\
+- Otherwise set both `action` and `tool_hint` to null.\n\
+- Do not include `status`, `plan_id`, or `revision`.\n",
+        DEFAULT_MAX_CONFIRMATION_PLAN_STEPS
+    );
+
+    let mut user = format!(
+        "Request:\n{}\n\nRequest grounding:\n{}\n\nAvailable action names:\n{}",
+        request.trim(),
+        {
+            let request_grounding = render_confirmation_request_grounding(request);
+            if request_grounding.is_empty() {
+                "(none)".to_string()
+            } else {
+                request_grounding
+            }
+        },
+        if action_names.is_empty() {
+            "(none)".to_string()
+        } else {
+            action_names.join(", ")
+        }
+    );
+
+    if let Some(refinement) = refinement.map(str::trim).filter(|value| !value.is_empty()) {
+        user.push_str("\n\nRefinement:\n");
+        user.push_str(refinement);
     }
 
     (system, user)
@@ -407,6 +808,18 @@ pub fn prepare_plan_for_execution(plan: &ExecutionPlan) -> ExecutionPlan {
             arguments: step.arguments.clone(),
             tool_hint: step.tool_hint.clone(),
             status: Some(PlanStepStatus::Pending),
+            substeps: step
+                .substeps
+                .iter()
+                .enumerate()
+                .map(|(sub_index, substep)| PlanSubstep {
+                    id: sub_index + 1,
+                    title: substep.title.clone(),
+                    description: substep.description.clone(),
+                    tool_hint: substep.tool_hint.clone(),
+                    status: Some(PlanStepStatus::Pending),
+                })
+                .collect(),
         })
         .collect();
 
@@ -416,6 +829,19 @@ pub fn prepare_plan_for_execution(plan: &ExecutionPlan) -> ExecutionPlan {
         Some(plan.plan_id.clone()),
         plan.revision,
     )
+}
+
+pub fn truncate_plan_steps(plan: &ExecutionPlan, max_steps: usize) -> ExecutionPlan {
+    if plan.steps.len() <= max_steps {
+        return plan.clone();
+    }
+
+    let mut trimmed = plan.clone();
+    trimmed.steps.truncate(max_steps.max(1));
+    for (index, step) in trimmed.steps.iter_mut().enumerate() {
+        step.id = index + 1;
+    }
+    trimmed
 }
 
 pub fn next_revision_plan(
@@ -436,14 +862,28 @@ pub fn next_revision_plan(
         .cloned()
         .collect::<Vec<_>>();
 
-    steps.extend(replacement.steps.iter().map(|step| PlanStep {
-        id: 0,
-        title: step.title.clone(),
-        description: step.description.clone(),
-        action: step.action.clone(),
-        arguments: step.arguments.clone(),
-        tool_hint: step.tool_hint.clone(),
-        status: Some(PlanStepStatus::Pending),
+    steps.extend(replacement.steps.iter().map(|step| {
+        PlanStep {
+            id: 0,
+            title: step.title.clone(),
+            description: step.description.clone(),
+            action: step.action.clone(),
+            arguments: step.arguments.clone(),
+            tool_hint: step.tool_hint.clone(),
+            status: Some(PlanStepStatus::Pending),
+            substeps: step
+                .substeps
+                .iter()
+                .enumerate()
+                .map(|(sub_index, substep)| PlanSubstep {
+                    id: sub_index + 1,
+                    title: substep.title.clone(),
+                    description: substep.description.clone(),
+                    tool_hint: substep.tool_hint.clone(),
+                    status: Some(PlanStepStatus::Pending),
+                })
+                .collect(),
+        }
     }));
 
     for (index, step) in steps.iter_mut().enumerate() {
@@ -482,7 +922,24 @@ pub fn render_plan_for_system_prompt(plan: &ExecutionPlan) -> String {
     let steps = plan
         .steps
         .iter()
-        .map(|step| format!("{}. {} - {}", step.id, step.title, step.description))
+        .map(|step| {
+            let substeps = if step.substeps.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n{}",
+                    step.substeps
+                        .iter()
+                        .map(|substep| format!("   - {}. {}", substep.id, substep.title))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            };
+            format!(
+                "{}. {} - {}{}",
+                step.id, step.title, step.description, substeps
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
     format!(
@@ -540,6 +997,7 @@ mod tests {
             arguments: None,
             tool_hint: tool_hint.map(str::to_string),
             status,
+            substeps: Vec::new(),
         }
     }
 
@@ -672,5 +1130,91 @@ mod tests {
         assert_eq!(revised.steps[1].status, Some(PlanStepStatus::Pending));
         assert_eq!(revised.steps[2].title, "Verify again");
         assert_eq!(revised.steps[2].status, Some(PlanStepStatus::Pending));
+    }
+
+    #[test]
+    fn confirmation_prompt_uses_compact_action_catalog() {
+        let actions = vec![action("research"), action("web_search")];
+
+        let (_, user) = build_confirmation_plan_prompt(
+            "Assess alpha-beta-gamma tradeoffs for the next planning cycle",
+            None,
+            &actions,
+        );
+
+        assert!(user.contains("Request grounding:"));
+        assert!(user.contains("Available action names:\nresearch, web_search"));
+        assert!(!user.contains("\"planner_metadata\""));
+        assert!(!user.contains("\"input_schema\""));
+        assert!(!user.contains("\"description\""));
+    }
+
+    #[test]
+    fn confirmation_plan_relevance_accepts_request_aligned_plan() {
+        let plan = ExecutionPlan {
+            plan_id: "plan-confirm".to_string(),
+            revision: 1,
+            summary: "Alpha beta gamma review".to_string(),
+            steps: vec![
+                plan_step(1, "Map alpha capacity", Some("research"), None),
+                plan_step(2, "Compare beta options", Some("research"), None),
+                plan_step(3, "Evaluate gamma risks", None, None),
+            ],
+        };
+
+        let assessment = assess_confirmation_plan_relevance(
+            "Assess alpha capacity, beta infrastructure, and gamma funding priorities for the next planning cycle.",
+            &plan,
+        );
+
+        assert!(assessment.accepted);
+        assert!(assessment.anchor_hits >= 2);
+        assert!(assessment.grounding_ratio > 0.05);
+    }
+
+    #[test]
+    fn confirmation_plan_relevance_rejects_off_topic_plan() {
+        let plan = ExecutionPlan {
+            plan_id: "plan-off-topic".to_string(),
+            revision: 1,
+            summary: "Badge issuance workflow".to_string(),
+            steps: vec![
+                plan_step(1, "Collect badge request forms", None, None),
+                plan_step(2, "Approve building access", None, None),
+                plan_step(3, "Provision door credentials", None, None),
+            ],
+        };
+
+        let assessment = assess_confirmation_plan_relevance(
+            "Assess alpha capacity, beta infrastructure, and gamma funding priorities for the next planning cycle.",
+            &plan,
+        );
+
+        assert!(!assessment.accepted);
+        assert_eq!(assessment.anchor_hits, 0);
+        assert!(assessment.grounding_ratio < 0.08);
+    }
+
+    #[test]
+    fn truncate_plan_steps_keeps_summary_and_reindexes() {
+        let plan = ExecutionPlan {
+            plan_id: "plan-preview".to_string(),
+            revision: 1,
+            summary: "Compact plan".to_string(),
+            steps: vec![
+                plan_step(1, "One", Some("research"), None),
+                plan_step(2, "Two", Some("research"), None),
+                plan_step(3, "Three", Some("research"), None),
+                plan_step(4, "Four", Some("research"), None),
+            ],
+        };
+
+        let trimmed = truncate_plan_steps(&plan, 2);
+
+        assert_eq!(trimmed.summary, "Compact plan");
+        assert_eq!(trimmed.steps.len(), 2);
+        assert_eq!(trimmed.steps[0].id, 1);
+        assert_eq!(trimmed.steps[1].id, 2);
+        assert_eq!(trimmed.steps[1].title, "Two");
     }
 }

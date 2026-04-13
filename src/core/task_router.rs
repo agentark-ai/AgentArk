@@ -16,10 +16,11 @@ use super::config::{ModelRole, ModelSlot};
 use super::intent::{action_intent_score, preferred_direct_action_name};
 use super::llm::LlmClient;
 use super::orchestra::SubAgentType;
+use super::planner::{PlanStepStatus, PlanSubstep};
 use super::prompt_policy::delegated_policy_v2_block;
 use super::swarm::agent_trait::SwarmAgent;
 use super::swarm::specialist::SpecialistAgent;
-use super::swarm::{SwarmActivityAgent, SwarmActivityTracker};
+use super::swarm::{AgentAccessScope, SwarmActivityAgent, SwarmActivityTracker};
 use super::{DegradationNote, DelegationStatus, FailureKind, StreamEvent};
 use crate::actions::ActionDef;
 use crate::core::queue_stream_event;
@@ -31,6 +32,118 @@ fn compact_text(text: &str, max_chars: usize) -> String {
     } else {
         format!("{}...", text.chars().take(max_chars).collect::<String>())
     }
+}
+
+fn execution_plan_step_status(step: &crate::core::planner::PlanStep) -> PlanStepStatus {
+    step.status.unwrap_or(PlanStepStatus::Pending)
+}
+
+fn sync_execution_plan_trace_step(trace: &mut super::agent::ExecutionTrace) {
+    let Some(plan) = trace.plan.as_ref() else {
+        return;
+    };
+    let Ok(serialized) = serde_json::to_string(plan) else {
+        return;
+    };
+    let detail = format!("{} steps planned", plan.steps.len());
+    if let Some(step) =
+        trace.steps.iter_mut().rev().find(|step| {
+            step.step_type == "plan" || step.title.eq_ignore_ascii_case("Execution Plan")
+        })
+    {
+        step.detail = detail;
+        step.data = Some(serialized);
+    }
+}
+
+fn execution_plan_step_snapshot(
+    trace: &super::agent::ExecutionTrace,
+    step_id: usize,
+) -> Option<(
+    String,
+    u32,
+    String,
+    PlanStepStatus,
+    Option<Vec<PlanSubstep>>,
+)> {
+    let plan = trace.plan.as_ref()?;
+    let step = plan.steps.iter().find(|step| step.id == step_id)?;
+    Some((
+        plan.plan_id.clone(),
+        plan.revision,
+        step.title.clone(),
+        execution_plan_step_status(step),
+        if step.substeps.is_empty() {
+            None
+        } else {
+            Some(step.substeps.clone())
+        },
+    ))
+}
+
+async fn emit_execution_plan_step_update(
+    token_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+    plan_id: &str,
+    revision: u32,
+    step_id: usize,
+    step_title: Option<&str>,
+    status: PlanStepStatus,
+    detail: Option<String>,
+    substeps: Option<Vec<PlanSubstep>>,
+) {
+    if let Some(tx) = token_tx {
+        queue_stream_event(
+            tx,
+            StreamEvent::PlanStepUpdate {
+                plan_id: plan_id.to_string(),
+                revision,
+                step_id,
+                step_title: step_title.map(str::to_string),
+                status,
+                detail,
+                substeps,
+            },
+        );
+    }
+}
+
+async fn update_delegated_plan_step_status(
+    trace_ref: &Arc<RwLock<super::agent::ExecutionTrace>>,
+    token_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+    step_id: usize,
+    status: PlanStepStatus,
+    detail: Option<String>,
+) {
+    let snapshot = {
+        let mut trace = trace_ref.write().await;
+        let mut changed = false;
+        if let Some(plan) = trace.plan.as_mut() {
+            if let Some(step) = plan.steps.iter_mut().find(|step| step.id == step_id) {
+                if step.status != Some(status) {
+                    step.status = Some(status);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            sync_execution_plan_trace_step(&mut trace);
+        }
+        execution_plan_step_snapshot(&trace, step_id)
+    };
+    let Some((plan_id, revision, step_title, snapshot_status, substeps)) = snapshot else {
+        return;
+    };
+    emit_execution_plan_step_update(
+        token_tx,
+        &plan_id,
+        revision,
+        step_id,
+        Some(step_title.as_str()),
+        snapshot_status,
+        detail,
+        substeps,
+    )
+    .await;
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -295,13 +408,24 @@ fn memory_overlap_bonus(task_lower: &str, content_lower: &str) -> f32 {
         return 0.0;
     }
     if content_lower.contains(task_lower) {
-        return 0.35;
+        return 0.40;
     }
-    let overlap = task_lower
+    let task_terms = task_lower
         .split_whitespace()
-        .filter(|word| word.len() > 3 && content_lower.contains(word))
+        .filter(|word| word.len() > 3)
+        .collect::<Vec<_>>();
+    if task_terms.is_empty() {
+        return 0.0;
+    }
+    let overlap = task_terms
+        .iter()
+        .filter(|word| content_lower.contains(**word))
         .count();
-    (overlap as f32 * 0.06).min(0.30)
+    if overlap == 0 {
+        return 0.0;
+    }
+    let overlap_ratio = overlap as f32 / task_terms.len() as f32;
+    ((overlap as f32 * 0.05) + (overlap_ratio * 0.30)).min(0.45)
 }
 
 fn classify_agent_failure(error_text: &str) -> (DelegationStatus, FailureKind, String) {
@@ -616,7 +740,7 @@ fn agent_status_summary(result: &AgentExecResult) -> String {
 pub struct RoutingDecision {
     /// Whether the task needs sub-agents
     pub needs_delegation: bool,
-    /// Complexity tier (used for model selection + parallel thinking)
+    /// Complexity tier (used for model selection and execution strategy)
     pub complexity: QueryComplexity,
     /// Sub-agents to spawn (empty if no delegation)
     pub sub_agents: Vec<SubAgentSpec>,
@@ -645,32 +769,73 @@ pub struct SubAgentSpec {
     /// Dependencies on other sub-agents (by index in the array)
     #[serde(default)]
     pub depends_on: Vec<usize>,
+    /// Optional execution-plan step id that this delegated assignment owns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_step_id: Option<usize>,
 }
 
 impl SubAgentSpec {
+    fn canonical_role_label(value: &str) -> String {
+        let mut out = String::new();
+        let mut last_separator = false;
+        for ch in value.trim().to_ascii_lowercase().chars() {
+            if ch.is_ascii_alphanumeric() {
+                out.push(ch);
+                last_separator = false;
+            } else if !out.is_empty() && !last_separator {
+                out.push('_');
+                last_separator = true;
+            }
+        }
+        while out.ends_with('_') {
+            out.pop();
+        }
+        out
+    }
+
     /// Parse agent_type string into SubAgentType
     pub fn resolve_agent_type(&self) -> SubAgentType {
-        match self.agent_type.to_lowercase().as_str() {
-            "researcher" => SubAgentType::Researcher,
-            "coder" => SubAgentType::Coder,
-            "analyst" => SubAgentType::Analyst,
-            "writer" => SubAgentType::Writer,
-            "validator" => SubAgentType::Validator,
-            "planner" => SubAgentType::Planner,
-            _ => SubAgentType::Planner, // safe default
+        let label = Self::canonical_role_label(&self.agent_type);
+        match label.as_str() {
+            "researcher" | "research" | "research_agent" | "explorer" | "investigator"
+            | "scout" => SubAgentType::Researcher,
+            "coder" | "code" | "coding" | "developer" | "engineer" | "software_engineer"
+            | "programmer" | "builder" | "implementer" => SubAgentType::Coder,
+            "analyst" | "analysis" | "data_analyst" | "data" | "diagnostic" => {
+                SubAgentType::Analyst
+            }
+            "writer" | "writing" | "editor" | "docs" | "documentation" | "copywriter" => {
+                SubAgentType::Writer
+            }
+            "validator" | "validate" | "reviewer" | "review" | "qa" | "tester"
+            | "verifier" => SubAgentType::Validator,
+            "planner" | "plan" | "coordinator" | "orchestrator" | "manager" => {
+                SubAgentType::Planner
+            }
+            _ if self.agent_type.trim().is_empty() => SubAgentType::Planner,
+            _ => SubAgentType::Custom {
+                name: self.agent_type.trim().to_string(),
+                instructions: format!(
+                    "You are a specialist agent for '{}'. Work only on the assigned task, surface uncertainty explicitly, and return concrete findings or changes.",
+                    self.agent_type.trim()
+                ),
+            },
         }
     }
 
     /// Parse preferred_model_role string into ModelRole
     pub fn resolve_model_role(&self) -> Option<ModelRole> {
-        self.preferred_model_role
-            .as_ref()
-            .map(|r| match r.to_lowercase().as_str() {
-                "code" => ModelRole::Code,
-                "research" => ModelRole::Research,
-                "fast" => ModelRole::Fast,
-                _ => ModelRole::Primary,
-            })
+        self.preferred_model_role.as_ref().and_then(|r| {
+            match Self::canonical_role_label(r).as_str() {
+                "code" | "coder" | "coding" | "developer" | "engineer" => Some(ModelRole::Code),
+                "research" | "researcher" | "explorer" | "investigator" => {
+                    Some(ModelRole::Research)
+                }
+                "fast" | "quick" | "small" | "mini" => Some(ModelRole::Fast),
+                "primary" | "main" | "default" | "frontier" => Some(ModelRole::Primary),
+                _ => None,
+            }
+        })
     }
 }
 
@@ -679,8 +844,6 @@ impl SubAgentSpec {
 pub enum TaskRouterResult {
     /// Simple query — caller should do a direct LLM call
     Direct,
-    /// Medium query without delegation — use parallel thinking
-    UseParallelThinking,
     /// Delegated to auto-spawned agents — here are the results
     Delegated(Box<DelegatedResult>),
 }
@@ -771,6 +934,7 @@ pub struct TaskRouterExecuteContext<'a> {
     pub specialists: &'a Option<SpecialistRegistry>,
     pub memories: &'a [MemoryEntry],
     pub actions: &'a [ActionDef],
+    pub action_scope_hints: &'a HashMap<String, crate::runtime::ActionScopeHint>,
     pub trace: &'a Arc<RwLock<super::agent::ExecutionTrace>>,
     pub token_tx: Option<&'a tokio::sync::mpsc::Sender<StreamEvent>>,
     pub swarm_activity: Option<&'a Arc<SwarmActivityTracker>>,
@@ -800,6 +964,7 @@ impl TaskRouter {
         let specialists = ctx.specialists;
         let memories = ctx.memories;
         let actions = ctx.actions;
+        let action_scope_hints = ctx.action_scope_hints;
         let trace = ctx.trace;
         let token_tx = ctx.token_tx;
         let swarm_activity = ctx.swarm_activity;
@@ -808,7 +973,7 @@ impl TaskRouter {
         if !decision.needs_delegation {
             return match decision.complexity {
                 QueryComplexity::Simple => Ok(TaskRouterResult::Direct),
-                QueryComplexity::Medium => Ok(TaskRouterResult::UseParallelThinking),
+                QueryComplexity::Medium => Ok(TaskRouterResult::Direct),
                 QueryComplexity::Complex => Ok(TaskRouterResult::Direct), // complex but LLM said no delegation
             };
         }
@@ -907,6 +1072,7 @@ impl TaskRouter {
                         "task": spec.task.clone(),
                         "is_specialist": true,
                         "depends_on": spec.depends_on.clone(),
+                        "plan_step_id": spec.plan_step_id,
                         "sequence": index + 1,
                         "status": "assigned",
                     }),
@@ -924,7 +1090,10 @@ impl TaskRouter {
                 let llm = self.select_llm_for_spec(spec, &agent_type, model_pool, primary_llm);
                 let model_name = llm.model_name().to_string();
                 let auto_agent_name = cool_name_for_auto_agent(assignments.len(), &agent_type);
-                let agent_id = format!("{}:agent:{}", delegation_id, index + 1);
+                let agent_id = spec
+                    .plan_step_id
+                    .map(|step_id| format!("{}:plan-step:{}", delegation_id, step_id))
+                    .unwrap_or_else(|| format!("{}:agent:{}", delegation_id, index + 1));
                 // Trace: auto-spawning
                 {
                     let mut t = trace.write().await;
@@ -979,6 +1148,7 @@ impl TaskRouter {
                         "task": spec.task.clone(),
                         "is_specialist": false,
                         "depends_on": spec.depends_on.clone(),
+                        "plan_step_id": spec.plan_step_id,
                         "sequence": index + 1,
                         "status": "assigned",
                     }),
@@ -1004,6 +1174,7 @@ impl TaskRouter {
                 specialist_prompt_bundle,
                 memories,
                 actions,
+                action_scope_hints,
                 trace,
                 token_tx,
                 swarm_activity,
@@ -1333,16 +1504,9 @@ impl TaskRouter {
 
     /// Keep sub-agent tool context small by passing only task-relevant actions.
     fn select_actions_for_task(&self, task: &str, actions: &[ActionDef]) -> Vec<ActionDef> {
-        let task_lower = task.to_ascii_lowercase();
         let mut scored: Vec<(f32, ActionDef)> = actions
             .iter()
-            .map(|action| {
-                let mut score = action_intent_score(task, action);
-                if task_lower.contains(&action.name.to_ascii_lowercase()) {
-                    score = score.max(0.95);
-                }
-                (score, action.clone())
-            })
+            .map(|action| (action_intent_score(task, action), action.clone()))
             .collect();
 
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -1362,6 +1526,80 @@ impl TaskRouter {
                 .collect();
         }
         selected
+    }
+
+    fn specialist_action_is_allowed(
+        &self,
+        action: &ActionDef,
+        access_scope: &AgentAccessScope,
+        action_scope_hints: &HashMap<String, crate::runtime::ActionScopeHint>,
+    ) -> bool {
+        let required_permission_ids =
+            crate::runtime::ActionRuntime::action_required_agent_permission_ids(action);
+        if required_permission_ids.iter().any(|permission_id| {
+            !access_scope
+                .approved_permission_ids
+                .iter()
+                .any(|approved| approved.eq_ignore_ascii_case(permission_id))
+        }) {
+            return false;
+        }
+
+        let Some(hint) = action_scope_hints.get(&action.name) else {
+            return true;
+        };
+
+        if let Some(server_id) = hint.mcp_server_id.as_deref() {
+            return access_scope
+                .mcp_server_ids
+                .iter()
+                .any(|value| value == server_id);
+        }
+
+        if let Some(api_id) = hint.custom_api_id.as_deref() {
+            return access_scope
+                .custom_api_ids
+                .iter()
+                .any(|value| value == api_id);
+        }
+
+        if hint.requires_ssh_connection {
+            return !access_scope.ssh_connection_names.is_empty();
+        }
+
+        if !hint.integration_ids.is_empty()
+            && !hint.integration_ids.iter().any(|integration_id| {
+                access_scope
+                    .integration_ids
+                    .iter()
+                    .any(|value| value == integration_id)
+            })
+        {
+            return false;
+        }
+
+        if !hint.channel_targets.is_empty() && access_scope.channel_ids.is_empty() {
+            return false;
+        }
+
+        true
+    }
+
+    fn select_actions_for_specialist(
+        &self,
+        task: &str,
+        actions: &[ActionDef],
+        access_scope: &AgentAccessScope,
+        action_scope_hints: &HashMap<String, crate::runtime::ActionScopeHint>,
+    ) -> Vec<ActionDef> {
+        let allowed_actions: Vec<ActionDef> = actions
+            .iter()
+            .filter(|action| {
+                self.specialist_action_is_allowed(action, access_scope, action_scope_hints)
+            })
+            .cloned()
+            .collect();
+        self.select_actions_for_task(task, &allowed_actions)
     }
 
     /// Keep delegated memory context compact and task-relevant.
@@ -1647,6 +1885,7 @@ impl TaskRouter {
         specialist_prompt_bundle: &crate::core::self_evolve::SpecialistPromptBundleProfile,
         memories: &[MemoryEntry],
         actions: &[ActionDef],
+        action_scope_hints: &HashMap<String, crate::runtime::ActionScopeHint>,
         trace: &Arc<RwLock<super::agent::ExecutionTrace>>,
         token_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
         swarm_activity: Option<&Arc<SwarmActivityTracker>>,
@@ -1687,6 +1926,24 @@ impl TaskRouter {
                                 )
                                 .await;
                         }
+                        if let Some(plan_step_id) = assignment.spec.plan_step_id {
+                            let step_status = if restored.status == DelegationStatus::Completed {
+                                PlanStepStatus::Completed
+                            } else {
+                                PlanStepStatus::Failed
+                            };
+                            update_delegated_plan_step_status(
+                                trace,
+                                token_tx,
+                                plan_step_id,
+                                step_status,
+                                Some(
+                                    "Restored delegated progress from the previous run."
+                                        .to_string(),
+                                ),
+                            )
+                            .await;
+                        }
                         emit_delegation_event(
                             token_tx,
                             "delegation_agent_completed",
@@ -1708,6 +1965,7 @@ impl TaskRouter {
                                 "elapsed_ms": restored.execution_time_ms,
                                 "is_specialist": restored.is_specialist,
                                 "restored": true,
+                                "plan_step_id": assignment.spec.plan_step_id,
                             }),
                         );
                         results[idx] = Some(restored);
@@ -1720,6 +1978,103 @@ impl TaskRouter {
                     error
                 ),
             }
+        }
+
+        for (idx, assignment) in assignments.iter().enumerate() {
+            if completed[idx] {
+                continue;
+            }
+            let Some(plan_step_id) = assignment.spec.plan_step_id else {
+                continue;
+            };
+            let restored_step = {
+                let trace_guard = trace.read().await;
+                trace_guard
+                    .plan
+                    .as_ref()
+                    .and_then(|plan| plan.steps.iter().find(|step| step.id == plan_step_id))
+                    .map(|step| {
+                        (
+                            step.title.clone(),
+                            step.description.clone(),
+                            execution_plan_step_status(step),
+                        )
+                    })
+            };
+            let Some((step_title, step_description, step_status)) = restored_step else {
+                continue;
+            };
+            let (status, failure_kind, detail, event_kind) = match step_status {
+                PlanStepStatus::Completed => (
+                    DelegationStatus::Completed,
+                    None,
+                    format!("{} was already completed earlier in this run.", step_title),
+                    "delegation_agent_completed",
+                ),
+                PlanStepStatus::Failed | PlanStepStatus::Skipped => (
+                    DelegationStatus::Failed,
+                    Some(FailureKind::DelegationFailed),
+                    format!(
+                        "{} was already closed before this delegated pass started.",
+                        step_title
+                    ),
+                    "delegation_agent_failed",
+                ),
+                PlanStepStatus::Pending | PlanStepStatus::Running => continue,
+            };
+            let content = if step_description.trim().is_empty() {
+                detail.clone()
+            } else {
+                format!("{}\n\n{}", detail, step_description.trim())
+            };
+            let restored = AgentExecResult {
+                agent_id: assignment.agent_id.clone(),
+                agent_type: assignment.agent_type.name(),
+                task: assignment.spec.task.clone(),
+                is_specialist: matches!(&assignment.kind, AssignmentKind::Specialist(_)),
+                agent_name: Some(assignment.display_name.clone()),
+                model_name: assignment.model_name.clone(),
+                content: content.clone(),
+                llm_response: None,
+                execution_time_ms: 0,
+                status,
+                failure_kind,
+                next_action_hint: None,
+                confidence: None,
+                artifacts: Vec::new(),
+            };
+            if let Some(tracker) = swarm_activity {
+                tracker
+                    .update_agent(
+                        delegation_id,
+                        &restored.agent_id,
+                        restored.status.as_str(),
+                        &compact_text(&restored.content, 220),
+                        Some("Restored from the execution plan state."),
+                        Some(restored.execution_time_ms),
+                    )
+                    .await;
+            }
+            emit_delegation_event(
+                token_tx,
+                event_kind,
+                delegation_id,
+                detail,
+                serde_json::json!({
+                    "agent_id": restored.agent_id.clone(),
+                    "agent_name": restored.agent_name.clone().unwrap_or_default(),
+                    "agent_role": restored.agent_type.clone(),
+                    "model_name": restored.model_name.clone(),
+                    "task": restored.task.clone(),
+                    "status": restored.status.as_str(),
+                    "elapsed_ms": restored.execution_time_ms,
+                    "is_specialist": restored.is_specialist,
+                    "restored": true,
+                    "plan_step_id": plan_step_id,
+                }),
+            );
+            results[idx] = Some(restored);
+            completed[idx] = true;
         }
 
         if let Some(storage) = storage {
@@ -1795,7 +2150,15 @@ impl TaskRouter {
                     self.build_dependency_scope(assignment, assignments, &results);
                 let packet_dependency_count = dependency_scope.len();
                 let mems: Vec<MemoryEntry> = self.select_memories_for_task(&task, memories);
-                let acts: Vec<ActionDef> = self.select_actions_for_task(&task, actions);
+                let acts: Vec<ActionDef> = match &assignment.kind {
+                    AssignmentKind::Specialist(specialist) => self.select_actions_for_specialist(
+                        &task,
+                        actions,
+                        &specialist.config().access_scope,
+                        action_scope_hints,
+                    ),
+                    _ => self.select_actions_for_task(&task, actions),
+                };
                 let packet = self.build_task_packet(
                     delegation_id,
                     idx,
@@ -1810,6 +2173,7 @@ impl TaskRouter {
                 let ctx = packet.render_markdown();
                 let timeout = self.config.agent_timeout_secs;
                 let dependency_count = assignment.spec.depends_on.len();
+                let plan_step_id = assignment.spec.plan_step_id;
                 let memory_count = mems.len();
                 let action_count = acts.len();
                 if let Some(storage) = storage {
@@ -1855,6 +2219,16 @@ impl TaskRouter {
                         )
                         .await;
                 }
+                if let Some(plan_step_id) = plan_step_id {
+                    update_delegated_plan_step_status(
+                        trace,
+                        token_tx,
+                        plan_step_id,
+                        PlanStepStatus::Running,
+                        Some(format!("{} is now running in parallel.", display_name)),
+                    )
+                    .await;
+                }
                 emit_delegation_event(
                     token_tx,
                     "delegation_agent_started",
@@ -1866,6 +2240,7 @@ impl TaskRouter {
                         "agent_role": agent_type.name(),
                         "task": task.clone(),
                         "depends_on": assignment.spec.depends_on.clone(),
+                        "plan_step_id": plan_step_id,
                         "status": "running",
                         "dependency_count": dependency_count,
                         "resolved_dependency_count": packet_dependency_count,
@@ -1882,6 +2257,7 @@ impl TaskRouter {
                 let heartbeat_agent_name = display_name.clone();
                 let heartbeat_agent_role = agent_type.name();
                 let heartbeat_task = task.clone();
+                let heartbeat_plan_step_id = plan_step_id;
                 let heartbeat_handle = tokio::spawn(async move {
                     let started = std::time::Instant::now();
                     loop {
@@ -1916,6 +2292,7 @@ impl TaskRouter {
                                         "agent_role": heartbeat_agent_role.clone(),
                                         "task": heartbeat_task.clone(),
                                         "status": "running",
+                                        "plan_step_id": heartbeat_plan_step_id,
                                         "elapsed_ms": elapsed_ms,
                                     }),
                                 );
@@ -2082,6 +2459,22 @@ impl TaskRouter {
                                 )
                                 .await;
                         }
+                        if let Some(plan_step_id) = assignments[idx].spec.plan_step_id {
+                            update_delegated_plan_step_status(
+                                trace,
+                                token_tx,
+                                plan_step_id,
+                                PlanStepStatus::Completed,
+                                Some(format!(
+                                    "{} completed delegated work.",
+                                    result
+                                        .agent_name
+                                        .as_deref()
+                                        .unwrap_or(result.agent_type.as_str())
+                                )),
+                            )
+                            .await;
+                        }
                         emit_delegation_event(
                             token_tx,
                             "delegation_agent_completed",
@@ -2096,6 +2489,7 @@ impl TaskRouter {
                                 "status": "completed",
                                 "elapsed_ms": result.execution_time_ms,
                                 "is_specialist": result.is_specialist,
+                                "plan_step_id": assignments[idx].spec.plan_step_id,
                             }),
                         );
                         if let Some(storage) = storage {
@@ -2167,6 +2561,22 @@ impl TaskRouter {
                                     )
                                     .await;
                             }
+                            if let Some(plan_step_id) = assignments[idx].spec.plan_step_id {
+                                update_delegated_plan_step_status(
+                                    trace,
+                                    token_tx,
+                                    plan_step_id,
+                                    PlanStepStatus::Failed,
+                                    Some(format!(
+                                        "{} failed during delegated work.",
+                                        result
+                                            .agent_name
+                                            .as_deref()
+                                            .unwrap_or(result.agent_type.as_str())
+                                    )),
+                                )
+                                .await;
+                            }
                             emit_delegation_event(
                                 token_tx,
                                 "delegation_agent_failed",
@@ -2180,6 +2590,7 @@ impl TaskRouter {
                                     "status": result.status.as_str(),
                                     "reason": result.failure_kind.as_ref().map(|kind| format!("{:?}", kind)),
                                     "is_specialist": result.is_specialist,
+                                    "plan_step_id": assignments[idx].spec.plan_step_id,
                                 }),
                             );
                             if let Some(storage) = storage {
@@ -2251,6 +2662,22 @@ impl TaskRouter {
                                     )
                                     .await;
                             }
+                            if let Some(plan_step_id) = assignments[idx].spec.plan_step_id {
+                                update_delegated_plan_step_status(
+                                    trace,
+                                    token_tx,
+                                    plan_step_id,
+                                    PlanStepStatus::Failed,
+                                    Some(format!(
+                                        "{} panicked during delegated work.",
+                                        result
+                                            .agent_name
+                                            .as_deref()
+                                            .unwrap_or(result.agent_type.as_str())
+                                    )),
+                                )
+                                .await;
+                            }
                             emit_delegation_event(
                                 token_tx,
                                 "delegation_agent_failed",
@@ -2264,6 +2691,7 @@ impl TaskRouter {
                                     "status": result.status.as_str(),
                                     "reason": "panic",
                                     "is_specialist": result.is_specialist,
+                                    "plan_step_id": assignments[idx].spec.plan_step_id,
                                 }),
                             );
                             if let Some(storage) = storage {

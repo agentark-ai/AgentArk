@@ -102,9 +102,9 @@ export function MetricBarCard({
       className={`list-shell metric-bar-card stat-card rise-in${hasMeaningfulData ? "" : " metric-bar-card-empty"}${compact ? " metric-bar-card-compact" : ""} ${className}`.trim()}
       sx={{
         p: compact ? 1.15 : 1.6,
-        borderRadius: compact ? "14px" : "12px",
+        borderRadius: "8px",
         border: "1px solid rgba(108,156,212,0.18)",
-        background: "linear-gradient(170deg, rgba(6,15,29,0.95), rgba(3,9,21,0.9))",
+        background: "rgba(12, 18, 28, 0.86)",
       }}
     >
       <Typography variant="subtitle1" className="metric-bar-card-title">

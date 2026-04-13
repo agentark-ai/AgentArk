@@ -16,6 +16,7 @@ import {
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type Dispatch, type SetStateAction, useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
+import { formatUiDateTime } from "../lib/dateFormat";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -53,9 +54,7 @@ function errMessage(error: unknown): string {
 }
 
 function humanTs(value: string): string {
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) return value || "-";
-  return parsed.toLocaleString();
+  return formatUiDateTime(value, { fallback: "-" });
 }
 
 function csv(values: string[]): string {

@@ -124,7 +124,10 @@ pub fn provider_allows_model_discovery(provider: &str) -> bool {
 }
 
 pub fn is_openrouter_base_url(url: &str) -> bool {
-    url.to_ascii_lowercase().contains("openrouter")
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(|host| host.to_ascii_lowercase()))
+        .is_some_and(|host| host == "openrouter.ai" || host.ends_with(".openrouter.ai"))
 }
 
 pub fn is_codex_cli_base_url(url: &str) -> bool {

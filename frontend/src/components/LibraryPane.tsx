@@ -47,7 +47,7 @@ export function LibraryPane({ autoRefresh, showAdvanced, onNavigateToView }: Pro
         <Typography variant="overline" className="workspace-shell-kicker">
           Library
         </Typography>
-        <Typography variant="h4" sx={{ fontWeight: 700, letterSpacing: "-0.04em", mb: 0.45 }}>
+        <Typography variant="h4" sx={{ fontWeight: 700, letterSpacing: 0, mb: 0.45 }}>
           Reusable knowledge, capabilities, and artifacts.
         </Typography>
         <Typography variant="body2" color="text.secondary" sx={{ maxWidth: 860 }}>

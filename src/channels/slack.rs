@@ -278,6 +278,7 @@ pub async fn load_config_from_storage(storage: &Storage) -> Result<Option<SlackC
     }))
 }
 
+#[allow(dead_code)]
 async fn load_destination(agent: &Agent) -> Result<Option<SlackDestinationContext>> {
     if let Ok(Some(raw)) = agent.storage.get(LAST_DESTINATION_STORAGE_KEY).await {
         if let Ok(context) = serde_json::from_slice::<SlackDestinationContext>(&raw) {
@@ -424,14 +425,7 @@ async fn slack_api_post_message(
     Ok(())
 }
 
-async fn resolve_destination(
-    agent: &Agent,
-    config: &SlackChannelConfig,
-) -> Result<SlackDestinationContext> {
-    if let Some(context) = load_destination(agent).await? {
-        return Ok(context);
-    }
-
+fn resolve_destination(config: &SlackChannelConfig) -> Result<SlackDestinationContext> {
     if !config.default_channel_id.trim().is_empty() {
         return Ok(SlackDestinationContext {
             channel_id: config.default_channel_id.clone(),
@@ -442,9 +436,16 @@ async fn resolve_destination(
         });
     }
 
-    Err(anyhow!(
-        "Slack has no delivery destination yet; wait for an inbound event or configure a default channel"
-    ))
+    Err(anyhow!("Slack has no configured notification destination"))
+}
+
+pub fn default_destination(config: &SlackChannelConfig) -> Result<SlackDestinationContext> {
+    resolve_destination(config)
+}
+
+pub async fn send_message_with_config(config: &SlackChannelConfig, text: &str) -> Result<()> {
+    let destination = resolve_destination(config)?;
+    slack_api_post_message(config, &destination, text).await
 }
 
 fn verify_slack_signature(
@@ -598,6 +599,15 @@ fn verify_webhook_request_with_config(
     verify_slack_signature(&config.signing_secret, ts, sig, raw_body)
 }
 
+pub fn verify_webhook_request_for_config(
+    config: &SlackChannelConfig,
+    raw_body: &[u8],
+    timestamp: Option<&str>,
+    signature: Option<&str>,
+) -> Result<()> {
+    verify_webhook_request_with_config(Some(config), raw_body, timestamp, signature)
+}
+
 pub async fn verify_webhook_request(
     agent: SharedAgent,
     raw_body: &[u8],
@@ -616,9 +626,8 @@ pub async fn send_message(agent: &Agent, text: &str) -> Result<()> {
     let config = load_config(agent)
         .await?
         .ok_or_else(|| anyhow!("Slack is not configured"))?;
-    let destination = resolve_destination(agent, &config).await?;
+    let destination = resolve_destination(&config)?;
     slack_api_post_message(&config, &destination, text).await?;
-    persist_destination(agent, &destination).await?;
     Ok(())
 }
 
@@ -631,11 +640,22 @@ pub async fn handle_webhook(
     timestamp: Option<&str>,
     signature: Option<&str>,
 ) -> Result<String> {
-    let payload = slack_event_payload(raw_body)?;
     let config = {
         let agent = agent.read().await;
         load_config(&agent).await?
     };
+    handle_webhook_with_config(agent, config.as_ref(), raw_body, timestamp, signature).await
+}
+
+pub async fn handle_webhook_with_config(
+    agent: SharedAgent,
+    config: Option<&SlackChannelConfig>,
+    raw_body: &[u8],
+    timestamp: Option<&str>,
+    signature: Option<&str>,
+) -> Result<String> {
+    let payload = slack_event_payload(raw_body)?;
+    let config = config.cloned();
     verify_webhook_request_with_config(config.as_ref(), raw_body, timestamp, signature)?;
 
     if payload.event_type == "url_verification" {
@@ -860,5 +880,21 @@ mod tests {
             message_ts: None,
         };
         assert_eq!(slack_conversation_id(&context), "slack:T999:C123:1.2");
+    }
+
+    #[test]
+    fn resolve_destination_prefers_configured_channel_over_last_thread() {
+        let config = SlackChannelConfig {
+            bot_token: "token".to_string(),
+            default_channel_id: "C-config".to_string(),
+            default_thread_ts: None,
+            workspace_id: Some("T-config".to_string()),
+            ..Default::default()
+        };
+
+        let destination = resolve_destination(&config).unwrap();
+        assert_eq!(destination.channel_id, "C-config");
+        assert_eq!(destination.thread_ts, None);
+        assert_eq!(destination.team_id.as_deref(), Some("T-config"));
     }
 }

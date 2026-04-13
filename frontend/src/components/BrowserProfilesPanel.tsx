@@ -15,6 +15,7 @@ import {
   Typography
 } from "@mui/material";
 import { useMemo, useState } from "react";
+import { formatUiDateTime } from "../lib/dateFormat";
 
 export type BrowserSessionSummary = {
   id: string;
@@ -70,10 +71,7 @@ function statusLabel(status: BrowserProfile["status"]): string {
 }
 
 function formatDate(raw?: string): string {
-  if (!raw) return "Never";
-  const dt = new Date(raw);
-  if (Number.isNaN(dt.getTime())) return raw;
-  return dt.toLocaleString();
+  return formatUiDateTime(raw, { fallback: "Never" });
 }
 
 export function BrowserProfilesPanel({
@@ -107,7 +105,7 @@ export function BrowserProfilesPanel({
           <Typography variant="overline" className="workspace-shell-kicker">
             Browser
           </Typography>
-          <Typography variant="h5" sx={{ fontWeight: 700, letterSpacing: "-0.03em" }}>
+          <Typography variant="h5" sx={{ fontWeight: 700, letterSpacing: 0 }}>
             Managed browser profiles and handoff state
           </Typography>
           <Typography variant="body2" color="text.secondary" sx={{ maxWidth: 840 }}>

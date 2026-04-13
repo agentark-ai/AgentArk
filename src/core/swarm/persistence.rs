@@ -3,6 +3,55 @@ use crate::core::orchestra::SubAgentType;
 use crate::core::swarm::{AgentCapability, SpecialistConfig};
 use crate::storage::entities::swarm_agent;
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default)]
+pub struct AgentAccessScope {
+    #[serde(default)]
+    pub mcp_server_ids: Vec<String>,
+    #[serde(default)]
+    pub ssh_connection_names: Vec<String>,
+    #[serde(default)]
+    pub custom_api_ids: Vec<String>,
+    #[serde(default)]
+    pub integration_ids: Vec<String>,
+    #[serde(default)]
+    pub channel_ids: Vec<String>,
+    #[serde(default)]
+    pub approved_permission_ids: Vec<String>,
+}
+
+impl AgentAccessScope {
+    pub fn normalized(mut self) -> Self {
+        self.mcp_server_ids = normalize_string_list(&self.mcp_server_ids);
+        self.ssh_connection_names = normalize_string_list(&self.ssh_connection_names);
+        self.custom_api_ids = normalize_string_list(&self.custom_api_ids);
+        self.integration_ids = normalize_string_list(&self.integration_ids);
+        self.channel_ids = normalize_string_list(&self.channel_ids);
+        self.approved_permission_ids = normalize_string_list(&self.approved_permission_ids);
+        self
+    }
+}
+
+fn normalize_string_list(values: &[String]) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for value in values {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            seen.insert(trimmed.to_string());
+        }
+    }
+    seen.into_iter().collect()
+}
+
+pub fn parse_access_scope(raw: Option<&str>) -> AgentAccessScope {
+    raw.and_then(|value| serde_json::from_str::<AgentAccessScope>(value).ok())
+        .unwrap_or_default()
+        .normalized()
+}
+
+pub fn access_scope_to_json(scope: &AgentAccessScope) -> String {
+    serde_json::to_string(&scope.clone().normalized()).unwrap_or_else(|_| "{}".to_string())
+}
+
 fn capability_from_text(text: &str) -> Option<AgentCapability> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -104,6 +153,7 @@ pub fn specialist_config_from_storage_model(
         system_prompt_override: agent.system_prompt.clone(),
         max_memory_retrieval: 3,
         capabilities: parse_capabilities(&agent.capabilities),
+        access_scope: parse_access_scope(Some(&agent.access_scope)),
         enabled: agent.enabled != 0,
     }
 }

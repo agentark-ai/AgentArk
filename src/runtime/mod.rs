@@ -55,6 +55,29 @@ impl Default for RuntimeConfig {
     }
 }
 
+fn authorization_with_access(
+    access: crate::actions::ActionAccessMetadata,
+) -> crate::actions::ActionAuthorization {
+    crate::actions::ActionAuthorization {
+        access,
+        ..crate::actions::ActionAuthorization::default()
+    }
+}
+
+fn google_workspace_authorization() -> crate::actions::ActionAuthorization {
+    authorization_with_access(crate::actions::ActionAccessMetadata {
+        integration_ids: vec!["google_workspace".to_string()],
+        ..crate::actions::ActionAccessMetadata::default()
+    })
+}
+
+fn channel_target(argument_key: &str, default_target: &str) -> crate::actions::ActionChannelTarget {
+    crate::actions::ActionChannelTarget {
+        argument_key: argument_key.to_string(),
+        default_target: default_target.to_string(),
+    }
+}
+
 /// The action runtime that manages execution
 pub struct ActionRuntime {
     config: RuntimeConfig,
@@ -88,6 +111,9 @@ pub struct ActionRuntime {
     /// Plugin registry for third-party HTTP extensions
     plugin_registry:
         Option<std::sync::Arc<tokio::sync::RwLock<crate::plugins::registry::PluginRegistry>>>,
+    /// Generic extension-pack registry for integrations, channels, and user-installed packs
+    extension_pack_registry:
+        Option<std::sync::Arc<tokio::sync::RwLock<crate::extension_packs::ExtensionPackRegistry>>>,
     #[cfg(feature = "docker")]
     active_sandbox_containers: tokio::sync::RwLock<HashSet<String>>,
     #[cfg(feature = "docker")]
@@ -128,6 +154,7 @@ pub struct ContainerReaperStatus {
 
 struct SandboxUploadFile {
     filename: String,
+    content_type: Option<String>,
     bytes: Vec<u8>,
 }
 
@@ -145,6 +172,20 @@ struct LoadedAction {
     plugin_binding: Option<PluginBinding>,
     /// Optional imported custom API binding
     custom_api_binding: Option<CustomApiBinding>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ActionScopeHint {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_server_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_api_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub integration_ids: Vec<String>,
+    #[serde(default)]
+    pub requires_ssh_connection: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channel_targets: Vec<crate::actions::ActionChannelTarget>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,20 +383,48 @@ pub struct WorkflowMissingInputsPayload {
     pub query: String,
 }
 
-pub fn parse_workflow_action_marker(output: &str) -> Option<(String, String)> {
-    let payload = output.strip_prefix(WORKFLOW_ACTION_MARKER)?;
-    let mut parts = payload.splitn(2, ':');
-    let action = parts.next()?.trim();
-    if action.is_empty() {
-        return None;
+fn parse_json_object_output(output: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+    match serde_json::from_str::<serde_json::Value>(output.trim()).ok()? {
+        serde_json::Value::Object(object) => Some(object),
+        _ => None,
     }
-    let query = parts.next().unwrap_or("").to_string();
+}
+
+pub fn parse_workflow_action_marker(output: &str) -> Option<(String, String)> {
+    if let Some(payload) = output.trim_start().strip_prefix(WORKFLOW_ACTION_MARKER) {
+        let mut parts = payload.splitn(2, ':');
+        let action = parts.next()?.trim();
+        if action.is_empty() {
+            return None;
+        }
+        let query = parts.next().unwrap_or("").to_string();
+        return Some((action.to_string(), query));
+    }
+
+    let payload = parse_json_object_output(output)?;
+    let action = payload
+        .get("workflow_action")
+        .or_else(|| payload.get("action"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let query = payload
+        .get("query")
+        .or_else(|| payload.get("user_query"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
     Some((action.to_string(), query))
 }
 
 pub fn parse_workflow_missing_inputs_marker(output: &str) -> Option<WorkflowMissingInputsPayload> {
-    let payload = output.strip_prefix(WORKFLOW_MISSING_INPUTS_MARKER)?;
-    serde_json::from_str::<WorkflowMissingInputsPayload>(payload).ok()
+    if let Some(payload) = output
+        .trim_start()
+        .strip_prefix(WORKFLOW_MISSING_INPUTS_MARKER)
+    {
+        return serde_json::from_str::<WorkflowMissingInputsPayload>(payload).ok();
+    }
+    serde_json::from_str::<WorkflowMissingInputsPayload>(output.trim()).ok()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -367,8 +436,10 @@ pub struct StructuredToolCompletion {
 }
 
 fn parse_structured_tool_completion(output: &str) -> Option<StructuredToolCompletion> {
-    let payload = output.strip_prefix(TOOL_COMPLETION_MARKER)?;
-    serde_json::from_str::<StructuredToolCompletion>(payload).ok()
+    if let Some(payload) = output.trim_start().strip_prefix(TOOL_COMPLETION_MARKER) {
+        return serde_json::from_str::<StructuredToolCompletion>(payload).ok();
+    }
+    serde_json::from_str::<StructuredToolCompletion>(output.trim()).ok()
 }
 
 fn parse_legacy_tool_completion(
@@ -462,6 +533,21 @@ impl ContainerIsolation {
     }
 }
 
+#[cfg(feature = "docker")]
+const CODE_EXECUTE_SANDBOX_DIR: &str = "/workspace";
+#[cfg(feature = "docker")]
+const CODE_EXECUTE_HOME_DIR: &str = "/workspace/home";
+#[cfg(feature = "docker")]
+const CODE_EXECUTE_TMP_DIR: &str = "/workspace/tmp";
+#[cfg(feature = "docker")]
+const CODE_EXECUTE_CACHE_DIR: &str = "/workspace/cache";
+#[cfg(feature = "docker")]
+const CODE_EXECUTE_PIP_CACHE_DIR: &str = "/workspace/pip-cache";
+#[cfg(feature = "docker")]
+const CODE_EXECUTE_OUTPUT_RETENTION_SECS: u64 = 14 * 24 * 60 * 60;
+#[cfg(feature = "docker")]
+const CODE_EXECUTE_NATIVE_TEMP_RETENTION_SECS: u64 = 14 * 24 * 60 * 60;
+
 struct ActionReviewBuildInput<'a> {
     action_name: &'a str,
     source_kind: &'a str,
@@ -521,6 +607,12 @@ impl ActionRuntime {
                     })?;
             files.push(SandboxUploadFile {
                 filename: Self::sanitize_upload_filename(filename),
+                content_type: payload
+                    .get("content_type")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
                 bytes,
             });
         }
@@ -547,6 +639,280 @@ impl ActionRuntime {
         Ok(files)
     }
 
+    fn upload_signature(
+        filename: &str,
+        content_type: Option<&str>,
+        bytes: &[u8],
+    ) -> serde_json::Value {
+        let lower_name = filename.to_ascii_lowercase();
+        let lower_ct = content_type.unwrap_or("").to_ascii_lowercase();
+        let ext = lower_name
+            .rsplit_once('.')
+            .map(|(_, ext)| ext)
+            .unwrap_or("");
+
+        let mut detected = if bytes.starts_with(b"OggS") {
+            if bytes
+                .windows(b"OpusHead".len())
+                .any(|win| win == b"OpusHead")
+            {
+                serde_json::json!({
+                    "input_type": "audio",
+                    "media_kind": "audio",
+                    "mime": "audio/ogg; codecs=opus",
+                    "extension": "opus",
+                    "confidence": "high",
+                    "source": "magic_bytes",
+                })
+            } else {
+                serde_json::json!({
+                    "input_type": "audio",
+                    "media_kind": "audio",
+                    "mime": "audio/ogg",
+                    "extension": "ogg",
+                    "confidence": "high",
+                    "source": "magic_bytes",
+                })
+            }
+        } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
+            serde_json::json!({
+                "input_type": "audio",
+                "media_kind": "audio",
+                "mime": "audio/wav",
+                "extension": "wav",
+                "confidence": "high",
+                "source": "magic_bytes",
+            })
+        } else if bytes.starts_with(b"ID3") || bytes.starts_with(&[0xFF, 0xFB]) {
+            serde_json::json!({
+                "input_type": "audio",
+                "media_kind": "audio",
+                "mime": "audio/mpeg",
+                "extension": "mp3",
+                "confidence": "high",
+                "source": "magic_bytes",
+            })
+        } else if bytes.starts_with(b"fLaC") {
+            serde_json::json!({
+                "input_type": "audio",
+                "media_kind": "audio",
+                "mime": "audio/flac",
+                "extension": "flac",
+                "confidence": "high",
+                "source": "magic_bytes",
+            })
+        } else if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+            let brand =
+                String::from_utf8_lossy(&bytes[8..bytes.len().min(24)]).to_ascii_lowercase();
+            let audio_brand =
+                brand.contains("m4a") || brand.contains("m4b") || brand.contains("mp42");
+            serde_json::json!({
+                "input_type": if audio_brand { "audio" } else { "audio_video" },
+                "media_kind": if audio_brand { "audio" } else { "audio_or_video" },
+                "mime": if audio_brand { "audio/mp4" } else { "video/mp4" },
+                "extension": if audio_brand { "m4a" } else { "mp4" },
+                "confidence": "medium",
+                "source": "magic_bytes",
+            })
+        } else if bytes.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+            serde_json::json!({
+                "input_type": "audio_video",
+                "media_kind": "audio_or_video",
+                "mime": "video/webm",
+                "extension": "webm",
+                "confidence": "medium",
+                "source": "magic_bytes",
+            })
+        } else if bytes.starts_with(b"\x89PNG\r\n\x1A\n") {
+            serde_json::json!({
+                "input_type": "image",
+                "media_kind": "image",
+                "mime": "image/png",
+                "extension": "png",
+                "confidence": "high",
+                "source": "magic_bytes",
+            })
+        } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+            serde_json::json!({
+                "input_type": "image",
+                "media_kind": "image",
+                "mime": "image/jpeg",
+                "extension": "jpg",
+                "confidence": "high",
+                "source": "magic_bytes",
+            })
+        } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+            serde_json::json!({
+                "input_type": "image",
+                "media_kind": "image",
+                "mime": "image/gif",
+                "extension": "gif",
+                "confidence": "high",
+                "source": "magic_bytes",
+            })
+        } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+            serde_json::json!({
+                "input_type": "image",
+                "media_kind": "image",
+                "mime": "image/webp",
+                "extension": "webp",
+                "confidence": "high",
+                "source": "magic_bytes",
+            })
+        } else if bytes.starts_with(b"%PDF-") {
+            serde_json::json!({
+                "input_type": "document",
+                "media_kind": "document",
+                "mime": "application/pdf",
+                "extension": "pdf",
+                "confidence": "high",
+                "source": "magic_bytes",
+            })
+        } else if bytes.starts_with(b"PK\x03\x04") {
+            serde_json::json!({
+                "input_type": "archive",
+                "media_kind": "archive",
+                "mime": "application/zip",
+                "extension": "zip",
+                "confidence": "medium",
+                "source": "magic_bytes",
+            })
+        } else {
+            serde_json::json!({
+                "input_type": "unknown",
+                "media_kind": "unknown",
+                "mime": serde_json::Value::Null,
+                "extension": ext,
+                "confidence": "low",
+                "source": "unresolved",
+                "needs_deeper_inspection": true,
+            })
+        };
+
+        if let Some(obj) = detected.as_object_mut() {
+            obj.insert("filename".to_string(), serde_json::json!(filename));
+            obj.insert("size_bytes".to_string(), serde_json::json!(bytes.len()));
+            if let Some(content_type) = content_type {
+                obj.insert(
+                    "provided_content_type".to_string(),
+                    serde_json::json!(content_type),
+                );
+            }
+            if !lower_ct.is_empty() {
+                obj.insert(
+                    "provided_content_type_hint".to_string(),
+                    serde_json::json!(lower_ct),
+                );
+            }
+        }
+        detected
+    }
+
+    fn sanitize_missing_binary_candidate(raw: &str) -> Option<String> {
+        let candidate = raw
+            .trim()
+            .trim_matches(|ch: char| {
+                !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_' && ch != '.' && ch != '+'
+            })
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or("")
+            .trim();
+        if candidate.is_empty()
+            || candidate.len() > 80
+            || !candidate
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '+'))
+        {
+            return None;
+        }
+        Some(candidate.to_string())
+    }
+
+    fn quoted_missing_binary_candidate(line: &str) -> Option<String> {
+        for quote in ['\'', '"'] {
+            let mut parts = line.split(quote);
+            while let Some(_) = parts.next() {
+                let Some(candidate) = parts.next() else {
+                    break;
+                };
+                if let Some(cleaned) = Self::sanitize_missing_binary_candidate(candidate) {
+                    return Some(cleaned);
+                }
+            }
+        }
+        None
+    }
+
+    fn detect_missing_binary_from_output(output: &str) -> Option<String> {
+        let lower = output.to_ascii_lowercase();
+        if let Some(idx) = lower.find("agentark_missing_binary:") {
+            let raw = output[idx + "AGENTARK_MISSING_BINARY:".len()..]
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim();
+            if let Some(candidate) = Self::sanitize_missing_binary_candidate(
+                raw.split_whitespace().next().unwrap_or(raw),
+            ) {
+                return Some(candidate);
+            }
+        }
+
+        for line in output.lines() {
+            let lower_line = line.to_ascii_lowercase();
+            for pattern in [": command not found", ": not found"] {
+                if let Some(idx) = lower_line.find(pattern) {
+                    let prefix = line[..idx].trim();
+                    let after_shell_prefix = prefix.rsplit(':').next().unwrap_or(prefix);
+                    let candidate = after_shell_prefix
+                        .split_whitespace()
+                        .last()
+                        .unwrap_or(after_shell_prefix);
+                    if let Some(cleaned) = Self::sanitize_missing_binary_candidate(candidate) {
+                        return Some(cleaned);
+                    }
+                }
+            }
+
+            if lower_line.contains("no such file or directory")
+                || lower_line.contains("is not recognized")
+            {
+                if let Some(candidate) = Self::quoted_missing_binary_candidate(line) {
+                    return Some(candidate);
+                }
+            }
+        }
+        None
+    }
+
+    fn build_sandbox_transcription_code() -> &'static str {
+        r#"import json
+import pathlib
+import shutil
+import sys
+
+data_dir = pathlib.Path("/data")
+files = [p for p in data_dir.iterdir() if p.is_file()]
+if not files:
+    raise SystemExit("No uploaded audio file was injected into /data.")
+
+input_path = files[0]
+if shutil.which("ffmpeg") is None:
+    print("AGENTARK_MISSING_BINARY: ffmpeg")
+    raise SystemExit(127)
+
+import whisper
+
+model = whisper.load_model("base")
+result = model.transcribe(str(input_path))
+print(json.dumps({
+    "input_file": input_path.name,
+    "text": (result.get("text") or "").strip()
+}, ensure_ascii=False))
+"#
+    }
+
     fn control_plane_executor_client() -> Option<ExecutorClient> {
         let role = std::env::var("AGENTARK_STACK_ROLE")
             .ok()
@@ -559,7 +925,11 @@ impl ActionRuntime {
         Some(client)
     }
 
-    async fn execute_code_remote(&self, arguments: &serde_json::Value) -> Result<String> {
+    async fn execute_code_remote(
+        &self,
+        arguments: &serde_json::Value,
+        auth_context: &ActionAuthorizationContext,
+    ) -> Result<String> {
         let language = arguments["language"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'language' argument"))?
@@ -583,6 +953,7 @@ impl ActionRuntime {
             .get("network_access")
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
+        let execution_contract = arguments.get("execution_contract").cloned();
         let file_payloads = self
             .collect_code_execute_files(arguments)
             .await?
@@ -605,6 +976,8 @@ impl ActionRuntime {
                 file_payloads,
                 env,
                 network_access,
+                execution_contract,
+                auth_context: Some(auth_context.clone()),
             })
             .await?;
         if response.status.eq_ignore_ascii_case("ok") {
@@ -812,14 +1185,44 @@ impl ActionRuntime {
         }
     }
 
-    async fn validate_http_get_url(&self, raw_url: &str) -> Result<reqwest::Url> {
-        let parsed = reqwest::Url::parse(raw_url)?;
+    fn parse_http_get_url(raw_url: &str) -> Result<reqwest::Url> {
+        let trimmed = raw_url.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("Missing URL");
+        }
+        let candidate = if trimmed.contains("://") {
+            trimmed.to_string()
+        } else {
+            format!("https://{}", trimmed.trim_start_matches("//"))
+        };
+        let parsed = reqwest::Url::parse(&candidate)?;
         if !matches!(parsed.scheme(), "http" | "https") {
             anyhow::bail!("http_get only supports http:// and https:// URLs");
         }
         if parsed.host_str().is_none() {
             anyhow::bail!("URL must include a host");
         }
+        Ok(parsed)
+    }
+
+    fn http_get_url_is_privateish(url: &reqwest::Url) -> bool {
+        let host = url
+            .host_str()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        Self::host_is_explicitly_local(&host)
+            || host.ends_with(".local")
+            || host.ends_with(".internal")
+            || host.ends_with(".home")
+            || host.ends_with(".lan")
+            || host
+                .parse::<IpAddr>()
+                .is_ok_and(|ip| !Self::ip_is_public(ip))
+    }
+
+    async fn validate_http_get_url(&self, raw_url: &str) -> Result<reqwest::Url> {
+        let parsed = Self::parse_http_get_url(raw_url)?;
         if !parsed.username().is_empty() || parsed.password().is_some() {
             anyhow::bail!("Embedded credentials are not allowed in http_get URLs");
         }
@@ -865,6 +1268,17 @@ impl ActionRuntime {
         }
 
         Ok(parsed)
+    }
+
+    async fn resolve_http_get_url_for_context(
+        &self,
+        raw_url: &str,
+        auth_context: &ActionAuthorizationContext,
+    ) -> Result<reqwest::Url> {
+        if Self::direct_trusted_chat_tool_override(auth_context) {
+            return Self::parse_http_get_url(raw_url);
+        }
+        self.validate_http_get_url(raw_url).await
     }
 
     async fn validate_connector_request_url(&self, raw_url: &str) -> Result<reqwest::Url> {
@@ -959,7 +1373,11 @@ impl ActionRuntime {
             .with_context(|| format!("Failed to read upload payload '{}'", normalized_id))?;
         let filename: String = manifest.original_name.chars().collect::<String>();
         let filename = Self::sanitize_upload_filename(&filename);
-        Ok(SandboxUploadFile { filename, bytes })
+        Ok(SandboxUploadFile {
+            filename,
+            content_type: manifest.content_type,
+            bytes,
+        })
     }
 
     fn collect_native_env_overrides(
@@ -1025,7 +1443,31 @@ impl ActionRuntime {
         Ok(out)
     }
 
-    fn load_disabled_actions(path: &Path) -> HashSet<String> {
+    fn load_disabled_actions(
+        path: &Path,
+        settings: Option<&SecureConfigManager>,
+    ) -> HashSet<String> {
+        if let Some(manager) = settings.filter(|manager| manager.uses_storage_backend()) {
+            match manager.load_encrypted_json::<Vec<String>>(
+                crate::core::config::SETTINGS_DISABLED_ACTIONS_KEY,
+            ) {
+                Ok(Some(entries)) => {
+                    return entries
+                        .into_iter()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                }
+                Ok(None) => return HashSet::new(),
+                Err(error) => {
+                    tracing::warn!(
+                        "Failed to load disabled actions from settings storage: {}",
+                        error
+                    )
+                }
+            }
+        }
+
         let raw = match std::fs::read(path) {
             Ok(v) => v,
             Err(_) => return HashSet::new(),
@@ -1043,12 +1485,36 @@ impl ActionRuntime {
     async fn save_disabled_actions(&self) -> Result<()> {
         let mut list: Vec<String> = self.disabled_actions.read().await.iter().cloned().collect();
         list.sort();
-        let raw = serde_json::to_vec_pretty(&list)?;
-        tokio::fs::write(&self.disabled_actions_file, raw).await?;
+        let manager = self.settings_manager()?;
+        if manager.uses_storage_backend() {
+            manager
+                .save_encrypted_json(crate::core::config::SETTINGS_DISABLED_ACTIONS_KEY, &list)?;
+        } else {
+            let raw = serde_json::to_vec_pretty(&list)?;
+            tokio::fs::write(&self.disabled_actions_file, raw).await?;
+        }
         Ok(())
     }
 
-    fn load_action_reviews(path: &Path) -> HashMap<String, ActionReviewRecord> {
+    fn load_action_reviews(
+        path: &Path,
+        settings: Option<&SecureConfigManager>,
+    ) -> HashMap<String, ActionReviewRecord> {
+        if let Some(manager) = settings.filter(|manager| manager.uses_storage_backend()) {
+            match manager.load_encrypted_json::<HashMap<String, ActionReviewRecord>>(
+                crate::core::config::SETTINGS_ACTION_REVIEWS_KEY,
+            ) {
+                Ok(Some(reviews)) => return reviews,
+                Ok(None) => return HashMap::new(),
+                Err(error) => {
+                    tracing::warn!(
+                        "Failed to load action reviews from settings storage: {}",
+                        error
+                    )
+                }
+            }
+        }
+
         let raw = match std::fs::read(path) {
             Ok(v) => v,
             Err(_) => return HashMap::new(),
@@ -1058,8 +1524,14 @@ impl ActionRuntime {
 
     async fn save_action_reviews(&self) -> Result<()> {
         let reviews = self.action_reviews.read().await.clone();
-        let raw = serde_json::to_vec_pretty(&reviews)?;
-        tokio::fs::write(&self.action_reviews_file, raw).await?;
+        let manager = self.settings_manager()?;
+        if manager.uses_storage_backend() {
+            manager
+                .save_encrypted_json(crate::core::config::SETTINGS_ACTION_REVIEWS_KEY, &reviews)?;
+        } else {
+            let raw = serde_json::to_vec_pretty(&reviews)?;
+            tokio::fs::write(&self.action_reviews_file, raw).await?;
+        }
         Ok(())
     }
 
@@ -1128,7 +1600,29 @@ impl ActionRuntime {
             .map(|record| record.current.clone())
     }
 
-    fn load_removed_bundled_actions(path: &Path) -> HashSet<String> {
+    fn load_removed_bundled_actions(
+        path: &Path,
+        settings: Option<&SecureConfigManager>,
+    ) -> HashSet<String> {
+        if let Some(manager) = settings.filter(|manager| manager.uses_storage_backend()) {
+            match manager.load_encrypted_json::<Vec<String>>(
+                crate::core::config::SETTINGS_REMOVED_BUNDLED_ACTIONS_KEY,
+            ) {
+                Ok(Some(entries)) => {
+                    return entries
+                        .into_iter()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                }
+                Ok(None) => return HashSet::new(),
+                Err(error) => tracing::warn!(
+                    "Failed to load removed bundled actions from settings storage: {}",
+                    error
+                ),
+            }
+        }
+
         let raw = match std::fs::read(path) {
             Ok(v) => v,
             Err(_) => return HashSet::new(),
@@ -1152,14 +1646,26 @@ impl ActionRuntime {
             .cloned()
             .collect();
         list.sort();
-        let raw = serde_json::to_vec_pretty(&list)?;
-        tokio::fs::write(&self.removed_bundled_actions_file, raw).await?;
+        let manager = self.settings_manager()?;
+        if manager.uses_storage_backend() {
+            manager.save_encrypted_json(
+                crate::core::config::SETTINGS_REMOVED_BUNDLED_ACTIONS_KEY,
+                &list,
+            )?;
+        } else {
+            let raw = serde_json::to_vec_pretty(&list)?;
+            tokio::fs::write(&self.removed_bundled_actions_file, raw).await?;
+        }
         Ok(())
     }
 
     /// Get the data directory (parent of actions_dir)
     fn data_dir(&self) -> &Path {
         self.actions_dir.parent().unwrap_or(&self.actions_dir)
+    }
+
+    fn settings_manager(&self) -> Result<SecureConfigManager> {
+        SecureConfigManager::new_with_data_dir(&self.config_dir, Some(self.data_dir()))
     }
 
     fn workspace_root(&self) -> PathBuf {
@@ -2229,6 +2735,8 @@ impl ActionRuntime {
             dirs.push(candidate);
         };
 
+        // System-owned bundled skills come from the image/repo and may refresh
+        // on release updates. User overrides live under the data dir instead.
         let app_skills_dir = PathBuf::from("/app/skills");
         push_unique(app_skills_dir);
 
@@ -2297,29 +2805,55 @@ impl ActionRuntime {
     }
 
     pub async fn new(config_dir: &Path, data_dir: &Path) -> Result<Self> {
+        let settings = SecureConfigManager::new_with_data_dir(config_dir, Some(data_dir)).ok();
         let config_path = config_dir.join("runtime.toml");
-        let config: RuntimeConfig = if config_path.exists() {
-            let content = std::fs::read_to_string(&config_path)?;
-            toml::from_str(&content)?
+        let config: RuntimeConfig = if let Some(manager) = settings
+            .as_ref()
+            .filter(|manager| manager.uses_storage_backend())
+        {
+            match manager
+                .load_encrypted_json::<RuntimeConfig>(crate::core::config::SETTINGS_RUNTIME_KEY)
+            {
+                Ok(Some(config)) => config,
+                Ok(None) => {
+                    let default = RuntimeConfig::default();
+                    manager
+                        .save_encrypted_json(crate::core::config::SETTINGS_RUNTIME_KEY, &default)?;
+                    default
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "Failed to load runtime config from settings storage: {}",
+                        error
+                    );
+                    RuntimeConfig::default()
+                }
+            }
         } else {
-            let default = RuntimeConfig::default();
-            let content = toml::to_string_pretty(&default)?;
-            std::fs::write(&config_path, content)?;
-            default
+            if config_path.exists() {
+                let content = std::fs::read_to_string(&config_path)?;
+                toml::from_str(&content)?
+            } else {
+                let default = RuntimeConfig::default();
+                let content = toml::to_string_pretty(&default)?;
+                std::fs::write(&config_path, content)?;
+                default
+            }
         };
 
-        // User skills go in data dir
+        // User-owned skills go in the data dir and survive release updates.
         let actions_dir = data_dir.join("skills");
         std::fs::create_dir_all(&actions_dir)?;
         let cli_skills_dir = data_dir.join("cli_skills");
         std::fs::create_dir_all(&cli_skills_dir)?;
         let disabled_actions_file = data_dir.join("disabled_actions.json");
-        let disabled_actions = Self::load_disabled_actions(&disabled_actions_file);
+        let disabled_actions =
+            Self::load_disabled_actions(&disabled_actions_file, settings.as_ref());
         let action_reviews_file = data_dir.join("action_reviews.json");
-        let action_reviews = Self::load_action_reviews(&action_reviews_file);
+        let action_reviews = Self::load_action_reviews(&action_reviews_file, settings.as_ref());
         let removed_bundled_actions_file = data_dir.join("removed_bundled_actions.json");
         let removed_bundled_actions =
-            Self::load_removed_bundled_actions(&removed_bundled_actions_file);
+            Self::load_removed_bundled_actions(&removed_bundled_actions_file, settings.as_ref());
 
         let snapshot_dir = data_dir.join(&config.snapshot_dir);
         std::fs::create_dir_all(&snapshot_dir)?;
@@ -2347,6 +2881,7 @@ impl ActionRuntime {
             storage: None,
             mcp_registry: None,
             plugin_registry: None,
+            extension_pack_registry: None,
             #[cfg(feature = "docker")]
             active_sandbox_containers: tokio::sync::RwLock::new(HashSet::new()),
             #[cfg(feature = "docker")]
@@ -2404,6 +2939,16 @@ impl ActionRuntime {
         self.plugin_registry = Some(registry);
     }
 
+    /// Set extension-pack registry (called from Agent::init)
+    pub fn set_extension_pack_registry(
+        &mut self,
+        registry: std::sync::Arc<
+            tokio::sync::RwLock<crate::extension_packs::ExtensionPackRegistry>,
+        >,
+    ) {
+        self.extension_pack_registry = Some(registry);
+    }
+
     pub fn default_sandbox_mode(&self) -> SandboxMode {
         self.config.default_sandbox.clone()
     }
@@ -2425,16 +2970,61 @@ impl ActionRuntime {
 
     async fn unapproved_permissions_for_action(
         &self,
-        action_name: &str,
-        capabilities: &[String],
+        action: &ActionDef,
+        auth_context: &ActionAuthorizationContext,
     ) -> Vec<crate::security::action_guard::Permission> {
+        let action_name = action.name.as_str();
         if self.action_is_auto_approved(action_name) {
+            return Vec::new();
+        }
+        if auth_context.direct_user_intent
+            && auth_context
+                .principal
+                .as_ref()
+                .is_some_and(|principal| principal.trusted)
+            && (matches!(
+                auth_context.surface,
+                ActionExecutionSurface::Chat | ActionExecutionSurface::Api
+            ) || Self::is_background_surface(&auth_context.surface))
+        {
             return Vec::new();
         }
         let Some(guard) = self.action_guard.as_ref() else {
             return Vec::new();
         };
-        let requested = crate::security::ActionGuard::permissions_from_capabilities(capabilities);
+        let mut requested = Self::builtin_dangerous_permissions(action);
+        requested.extend(
+            action
+                .authorization
+                .access
+                .permission_ids
+                .iter()
+                .map(|permission| {
+                    crate::security::action_guard::Permission::Custom(
+                        permission.trim().to_ascii_lowercase(),
+                    )
+                }),
+        );
+        if !action.authorization.access.channel_targets.is_empty() {
+            requested.push(crate::security::action_guard::Permission::Custom(
+                "messaging_send".to_string(),
+            ));
+        }
+        if Self::action_demands_broad_network_consent(action) {
+            requested.push(crate::security::action_guard::Permission::Custom(
+                "broad_network".to_string(),
+            ));
+        }
+        requested.sort_by_key(|permission| permission.to_string());
+        requested.dedup_by(|left, right| left.to_string() == right.to_string());
+        if let Some(scope) = auth_context.agent_access_scope.as_ref() {
+            requested.retain(|permission| {
+                !scope
+                    .approved_permission_ids
+                    .iter()
+                    .any(|value| value.eq_ignore_ascii_case(permission.to_string().as_str()))
+            });
+        }
         if requested.is_empty() {
             return Vec::new();
         }
@@ -2600,11 +3190,56 @@ impl ActionRuntime {
                 },
                 "required": ["url"]
             }),
-            capabilities: vec!["network".to_string()],
+            capabilities: vec!["network".to_string(), "search".to_string()],
             sandbox_mode: Some(SandboxMode::Wasm),
             source: ActionSource::System,
             file_path: None,
             authorization: Default::default(),
+        })
+        .await;
+
+        self.register_builtin_action(ActionDef {
+            name: "lan_discover".to_string(),
+            description: "Discover devices and host-local apps on the user's own LAN through a dedicated local-network discovery path. Use for requests like finding Sonos, lights, local devices, or localhost apps. In Docker installs this prefers the authenticated host LAN helper and falls back to degraded container-visible discovery. Discovery is read-only inventory; ask before any device-control action.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Optional discovery target such as sonos, lights, localhost_apps, apps, devices, or all."
+                    },
+                    "cidr": {
+                        "type": "string",
+                        "description": "Optional private IPv4 CIDR scope such as 192.168.1.0/24. Public and broad ranges are rejected."
+                    },
+                    "max_hosts": {
+                        "type": "integer",
+                        "description": "Maximum bounded host scope for any CIDR hint. Default 64, hard cap 512."
+                    },
+                    "include_host_local": {
+                        "type": "boolean",
+                        "description": "Whether to include host-local app probes. Default true."
+                    },
+                    "include_http_metadata": {
+                        "type": "boolean",
+                        "description": "Whether to run light HTTP metadata probes for discovered candidates. Default true."
+                    }
+                }
+            }),
+            capabilities: vec![
+                "local_network_discovery".to_string(),
+                "network".to_string(),
+            ],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+            authorization: ActionAuthorization {
+                risk_level: ActionRiskLevel::High,
+                requires_auth: true,
+                human_approval: crate::actions::ActionHumanApproval { required: true },
+                ..Default::default()
+            },
         })
         .await;
 
@@ -2633,7 +3268,10 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+            authorization: authorization_with_access(crate::actions::ActionAccessMetadata {
+                permission_ids: vec!["app_hosting".to_string()],
+                ..crate::actions::ActionAccessMetadata::default()
+            }),
         })
         .await;
 
@@ -2662,7 +3300,10 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+            authorization: authorization_with_access(crate::actions::ActionAccessMetadata {
+                permission_ids: vec!["app_hosting".to_string()],
+                ..crate::actions::ActionAccessMetadata::default()
+            }),
         })
         .await;
 
@@ -2691,7 +3332,10 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+            authorization: authorization_with_access(crate::actions::ActionAccessMetadata {
+                permission_ids: vec!["app_hosting".to_string()],
+                ..crate::actions::ActionAccessMetadata::default()
+            }),
         })
         .await;
 
@@ -2805,13 +3449,14 @@ impl ActionRuntime {
         // Scheduler
         self.register_builtin_action(ActionDef {
             name: "schedule_task".to_string(),
-            description: "Schedule a recurring or one-time task. Use 'cron' for recurring (e.g., daily at 9am = '0 9 * * *') or 'at' for one-time (ISO timestamp).".to_string(),
+            description: "Schedule or update a recurring/one-time task. Use `task_id` when the user is changing an existing task from `list_tasks`; otherwise matching tasks are updated/reused unless allow_duplicate=true. Use 'cron' for recurring minute-or-lower-frequency schedules (e.g., daily at 9am = '0 9 * * *') or 'at' for one-time (ISO timestamp). For monitoring intervals below 60 seconds, use `watch` with `interval_secs` instead.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "task": { "type": "string", "description": "Task description - what to do" },
-                    "cron": { "type": "string", "description": "Cron expression for recurring tasks. Format: 'minute hour day month weekday'. Examples: '0 9 * * *' = daily at 9am, '0 9 * * 1' = every Monday 9am, '*/30 * * * *' = every 30 minutes" },
+                    "task_id": { "type": "string", "description": "Optional existing task ID to update. Use this after `list_tasks` or when the user explicitly references an existing routine/task." },
+                    "cron": { "type": "string", "description": "Cron expression for recurring tasks. Minute granularity only for schedule_task. Format: 'minute hour day month weekday'. Examples: '0 9 * * *' = daily at 9am, '0 9 * * 1' = every Monday 9am, '*/30 * * * *' = every 30 minutes" },
                     "at": { "type": "string", "description": "ISO 8601 timestamp for one-time task. Example: '2026-02-06T09:00:00+05:30'" },
                     "action": { "type": "string", "description": "Optional explicit action name to run for each task occurrence" },
                     "action_arguments": { "type": "object", "description": "Optional explicit arguments for the selected action" },
@@ -2842,13 +3487,21 @@ impl ActionRuntime {
                         }
                     }
                 },
-                "required": ["task"]
+                "oneOf": [
+                    { "required": ["task", "cron"] },
+                    { "required": ["task", "at"] },
+                    { "required": ["task_id", "cron"] },
+                    { "required": ["task_id", "at"] }
+                ]
             }),
             capabilities: vec!["scheduler".to_string()],
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+            authorization: authorization_with_access(crate::actions::ActionAccessMetadata {
+                channel_targets: vec![channel_target("report_to", "preferred")],
+                ..crate::actions::ActionAccessMetadata::default()
+            }),
         }).await;
 
         // Background watcher â€” poll an action until a condition is met, then act
@@ -2866,7 +3519,7 @@ impl ActionRuntime {
                 },
                 "required": ["action"]
             }),
-            capabilities: vec!["network".to_string()],
+            capabilities: vec!["network".to_string(), "search".to_string()],
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
@@ -2874,19 +3527,46 @@ impl ActionRuntime {
         }).await;
         self.register_builtin_action(ActionDef {
             name: "watch".to_string(),
-            description: "Spawn a background watcher that polls an action at regular intervals until a condition is met, then executes follow-up instructions. Use when asked to 'watch for', 'wait for', 'monitor', 'let me know when', or 'poll until'. The watcher runs autonomously and notifies the user when triggered or timed out. Default duration is 24 hours; users can extend it with timeout_hours, timeout_days, timeout_secs, or until_stopped=true.".to_string(),
+            description: "Spawn or update a background watcher that polls an action at regular intervals until a condition is met, then executes follow-up instructions. Use `watcher_id` when the user is changing an existing watcher from `list_watchers`; otherwise matching watchers are updated/reused unless allow_duplicate=true. Use when asked to 'watch for', 'wait for', 'monitor', 'let me know when', or 'poll until'. The watcher runs autonomously and notifies the user when triggered or timed out. It supports sub-minute polling via `interval_secs`. Default duration is 24 hours; users can extend it with timeout_hours, timeout_days, timeout_secs, or until_stopped=true.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "description": { "type": "string", "description": "What this watcher does (shown in UI)" },
+                    "watcher_id": { "type": "string", "description": "Optional existing watcher ID to update. Use this after `list_watchers` or when the user explicitly references an existing watcher." },
                     "poll_action": { "type": "string", "description": "Action to poll (e.g. 'gmail_scan', 'web_search', 'http_get')" },
                     "poll_arguments": { "type": "object", "description": "Arguments for the poll action" },
-                    "condition_contains": { "type": "string", "description": "Trigger when result contains this keyword (case-insensitive)" },
-                    "condition_matches": { "type": "string", "description": "Trigger when result matches this regex pattern" },
-                    "condition_custom": { "type": "string", "description": "Natural language condition description" },
+                    "condition": {
+                        "type": "object",
+                        "description": "Structured trigger condition authored by the model. Include a human-readable `description` and an explicit matcher. Prefer `json_predicate` or `json_logic` for structured poll outputs; use `llm` only when the trigger cannot be expressed safely as a deterministic contract.",
+                        "properties": {
+                            "description": { "type": "string", "description": "Human-readable summary of what counts as a match" },
+                            "type": { "type": "string", "enum": ["not_empty", "text_contains", "regex", "json_predicate", "json_logic", "llm"] },
+                            "text": { "type": "string", "description": "Used by `text_contains`" },
+                            "case_sensitive": { "type": "boolean", "description": "Optional flag for `text_contains`" },
+                            "pattern": { "type": "string", "description": "Used by `regex`" },
+                            "path": { "type": "string", "description": "Dot-path into the structured poll result. Use `$` or empty for the root object." },
+                            "operator": { "type": "string", "enum": ["exists", "not_exists", "eq", "ne", "gt", "gte", "lt", "lte", "contains", "not_contains", "non_empty", "empty", "true", "false", "regex"] },
+                            "value": { "description": "Comparison value for operators that require one" },
+                            "logic": { "type": "string", "enum": ["all", "any"], "description": "Used by `json_logic` to combine rules" },
+                            "rules": {
+                                "type": "array",
+                                "description": "Used by `json_logic`",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "path": { "type": "string" },
+                                        "operator": { "type": "string", "enum": ["exists", "not_exists", "eq", "ne", "gt", "gte", "lt", "lte", "contains", "not_contains", "non_empty", "empty", "true", "false", "regex"] },
+                                        "value": {}
+                                    },
+                                    "required": ["path", "operator"]
+                                }
+                            }
+                        },
+                        "required": ["description", "type"]
+                    },
                     "on_trigger": { "type": "string", "description": "What to do when condition is met â€” natural language instructions for the agent" },
-                    "interval_secs": { "type": "integer", "description": "Seconds between polls (default: 60)" },
+                    "interval_secs": { "type": "integer", "description": "Seconds between polls, including sub-minute monitoring intervals (default: 60)" },
                     "timeout_secs": { "type": "integer", "description": "Max seconds to watch before giving up (default: 86400 = 24 hours)" },
                     "timeout_hours": { "type": "integer", "description": "Convenience timeout override in hours. Supports very large values." },
                     "timeout_days": { "type": "integer", "description": "Convenience timeout override in days. Supports very large values." },
@@ -2918,13 +3598,20 @@ impl ActionRuntime {
                         }
                     }
                 },
-                "required": ["description", "poll_action", "on_trigger"]
+                "oneOf": [
+                    { "required": ["description", "poll_action", "condition", "on_trigger"] },
+                    { "required": ["watcher_id"] }
+                ]
             }),
             capabilities: vec!["watcher".to_string()],
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+            authorization: authorization_with_access(crate::actions::ActionAccessMetadata {
+                permission_ids: vec!["watcher".to_string()],
+                channel_targets: vec![channel_target("notify_channel", "preferred")],
+                ..crate::actions::ActionAccessMetadata::default()
+            }),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -2960,6 +3647,44 @@ impl ActionRuntime {
                 "required": ["name", "description"]
             }),
             capabilities: vec!["integration_builder".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+            authorization: authorization_with_access(crate::actions::ActionAccessMetadata {
+                permission_ids: vec!["capability_acquire".to_string()],
+                ..crate::actions::ActionAccessMetadata::default()
+            }),
+        }).await;
+
+        self.register_builtin_action(ActionDef {
+            name: "capability_resolve".to_string(),
+            description: "Inspect a user goal, attached files, and prior tool failures to choose the safest next capability path. Use before giving up when a request needs missing packages, binaries, codecs, file-type detection, media conversion/transcription, app/repo repair, connector scaffolding, downloads, or another acquired capability. Returns structured JSON with detected inputs, missing capabilities, a sandbox-first acquisition route, optional approval metadata, and suggested next tool calls; it does not run host installers itself.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "goal": { "type": "string", "description": "The user's actual goal or the blocked subgoal to resolve." },
+                    "files": { "type": "array", "items": { "type": "string" }, "description": "Upload IDs returned by /api/upload. The resolver validates them and sniffs file bytes rather than trusting filename/content type." },
+                    "file_payloads": {
+                        "type": "array",
+                        "description": "Inline file payloads for executor/control-plane callers.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "filename": { "type": "string" },
+                                "content_type": { "type": "string" },
+                                "bytes_b64": { "type": "string" }
+                            },
+                            "required": ["filename", "bytes_b64"]
+                        }
+                    },
+                    "failure_output": { "type": "string", "description": "Raw stderr/stdout or tool output from a failed attempt. Use this to detect missing binaries/packages and choose the next route." },
+                    "selected_action": { "type": "string", "description": "Optional exact action name already selected from the action catalog. This is a catalog signal, not a natural-language intent label." },
+                    "requested_capability": { "type": "string", "description": "Optional opaque capability label from the model/action selector or a concrete missing binary/package name. The resolver records this as context but does not classify natural-language intent from it." }
+                },
+                "required": ["goal"]
+            }),
+            capabilities: vec!["file_read".to_string()],
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
@@ -3021,7 +3746,10 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+            authorization: authorization_with_access(crate::actions::ActionAccessMetadata {
+                permission_ids: vec!["browser_auto".to_string()],
+                ..crate::actions::ActionAccessMetadata::default()
+            }),
         }).await;
 
         // First-class pipeline DAG spec compiler.
@@ -3113,7 +3841,10 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+            authorization: authorization_with_access(crate::actions::ActionAccessMetadata {
+                integration_ids: vec!["google_workspace".to_string()],
+                ..crate::actions::ActionAccessMetadata::default()
+            }),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -3134,18 +3865,21 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+            authorization: authorization_with_access(crate::actions::ActionAccessMetadata {
+                integration_ids: vec!["google_workspace".to_string()],
+                ..crate::actions::ActionAccessMetadata::default()
+            }),
         }).await;
 
         // Web search
         self.register_builtin_action(ActionDef {
             name: "web_search".to_string(),
-            description: "Search the web for current information. Use when asked about news, facts, prices, weather, or anything that needs up-to-date data.".to_string(),
+            description: "Search the web for current information. Use when asked about news, facts, prices, weather, or anything that needs up-to-date data. Keep the query topic-focused and do not invent specific year filters unless the user explicitly asked for them.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Search query" },
+                    "query": { "type": "string", "description": "Search query. Preserve the user's topic, but do not inject arbitrary years or date ranges unless the user explicitly requested them." },
                     "num_results": { "type": "integer", "description": "Number of results (default 5)" },
                     "backend": { "type": "string", "description": "Search backend: lightpanda, duckduckgo, playwright, brave, brave_api, serper" }
                 },
@@ -3184,7 +3918,7 @@ impl ActionRuntime {
         // Code execution sandbox
         self.register_builtin_action(ActionDef {
             name: "code_execute".to_string(),
-            description: "Execute code in an isolated Docker sandbox. Supports Python, JavaScript, TypeScript, Bash, Ruby, PHP, Perl, Lua, R, Java, C, C++, Go, Rust, Swift, Kotlin, and Jupyter notebooks (.ipynb). Use when the user asks to run, execute, or test code. Dependencies like pip/npm install work automatically. For ML/data science and EDA, use language='jupyter' to create executable notebooks with visualizations â€” they get executed and returned as downloadable .ipynb files. When the user has attached files through the upload API, pass their upload IDs in the 'files' array â€” they'll be validated and available at /data/<filename> inside the sandbox.".to_string(),
+            description: "Execute code in an isolated Docker sandbox. Supports Python, JavaScript, TypeScript, Bash, Ruby, PHP, Perl, Lua, R, Java, C, C++, Go, Rust, Swift, Kotlin, and Jupyter notebooks (.ipynb). Use when the user asks to run, execute, test, or debug code, install dependencies, set up custom local automation, bootstrap monitoring scripts, validate a repo/runtime, or perform scripted device/network/media/computer-vision checks. Ordinary sandbox-local pip/npm installs from standard registries are auto-allowed when needed; higher-risk installer paths such as host package managers, remote installer scripts, and non-registry package sources require explicit approval. For ML/data science and EDA, use language='jupyter' to create executable notebooks with visualizations; they get executed and returned as downloadable .ipynb files. When the user has attached files through the upload API, pass their upload IDs in the 'files' array; they'll be validated and available at /data/<filename> inside the sandbox.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -3192,6 +3926,17 @@ impl ActionRuntime {
                     "language": { "type": "string", "description": "Programming language: python, javascript, typescript, bash, ruby, php, perl, lua, r, java, c, cpp, go, rust, swift, kotlin, jupyter. Use 'jupyter' for EDA/ML notebooks with visualizations." },
                     "code": { "type": "string", "description": "Code to execute. For jupyter: provide valid .ipynb JSON content (notebook format). For other languages: plain code. Can include dependency installation. When files are provided, access them at /data/<filename>." },
                     "network_access": { "type": "boolean", "description": "Whether this sandbox execution may use outbound network access. Default: false. Leave disabled unless the code genuinely needs egress." },
+                    "timeout_secs": { "type": "integer", "description": "Optional execution timeout in seconds. Defaults are chosen by runtime: 60s for scripts, 120s for compiled builds, 600s for notebooks, and longer for dependency bootstrap. Max 600s for scripts/builds and 900s for notebooks." },
+                    "execution_contract": {
+                        "type": "object",
+                        "description": "Optional structured execution contract for multi-step automations. Use exact phase values `bootstrap`, `validate`, or `poll`. For validation/polling steps that prove the monitor is ready, set `target_validated_when_successful=true` and `ready_for_watch_when_successful=true` so AgentArk can chain follow-up actions without guessing from source text.",
+                        "properties": {
+                            "phase": { "type": "string", "enum": ["bootstrap", "validate", "poll"] },
+                            "target_validated_when_successful": { "type": "boolean" },
+                            "ready_for_watch_when_successful": { "type": "boolean" },
+                            "target_connectivity_required": { "type": "boolean", "description": "Set true when this step must reach a live target such as a URL, LAN device, network stream, API, or other device endpoint. AgentArk will enable sandbox network access for the step." }
+                        }
+                    },
                     "env": { "type": "object", "description": "Optional environment variables (values may include {{secret:...}} / {{env:...}} placeholders).", "additionalProperties": { "type": "string" } },
                     "files": { "type": "array", "items": { "type": "string" }, "description": "Upload IDs returned by /api/upload for user-attached files. Each file is validated before being injected into the sandbox at /data/<filename>." }
                 },
@@ -3207,7 +3952,7 @@ impl ActionRuntime {
         // List tasks/goals/routines
         self.register_builtin_action(ActionDef {
             name: "list_tasks".to_string(),
-            description: "List pending tasks, goals, routines, and scheduled items. Use when the user asks about their pending goals, tasks, agenda, or what's scheduled.".to_string(),
+            description: "List pending tasks, goals, routines, and scheduled items, including IDs that can be passed back to schedule_task.task_id for updates. Use when the user asks about their pending goals, tasks, agenda, or what's scheduled.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -3224,7 +3969,7 @@ impl ActionRuntime {
 
         self.register_builtin_action(ActionDef {
             name: "list_watchers".to_string(),
-            description: "List background watchers and their live status, poll counts, conditions, and next poll timing. Use when the user asks what the agent is watching, which watchers are active, or whether a watcher has triggered/paused/failed.".to_string(),
+            description: "List background watchers and their live status, IDs, poll counts, conditions, and next poll timing. Use watcher IDs with watch.watcher_id when updating an existing watcher. Use when the user asks what the agent is watching, which watchers are active, or whether a watcher has triggered/paused/failed.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -3394,6 +4139,184 @@ impl ActionRuntime {
         }).await;
 
         // PDF generation â€” creates PDF documents from content
+        // Generic extension-pack control plane
+        self.register_builtin_action(ActionDef {
+            name: "extension_pack_list".to_string(),
+            description: "List installed and catalog extension packs. Use when the user asks what generic integrations, messaging channels, or other packs are available.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "description": "Optional pack kind filter such as integration or messaging_channel." },
+                    "query": { "type": "string", "description": "Optional search query." }
+                }
+            }),
+            capabilities: vec!["integration_inventory".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        authorization: Default::default(),
+        }).await;
+
+        self.register_builtin_action(ActionDef {
+            name: "extension_pack_search".to_string(),
+            description: "Search installed and catalog packs, including integrations, messaging channels, and future user-added extensions. If nothing is found, use this before asking the user for a pack link or docs URL.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Pack search query." },
+                    "kind": { "type": "string", "description": "Optional kind filter such as integration or messaging_channel." }
+                },
+                "required": ["query"]
+            }),
+            capabilities: vec!["integration_inventory".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        authorization: Default::default(),
+        }).await;
+
+        self.register_builtin_action(ActionDef {
+            name: "extension_pack_install".to_string(),
+            description: "Install a bundled, linked, or inline-manifest extension pack. Use for install requests that can apply to integrations, messaging channels, or other pack types.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pack_id": { "type": "string" },
+                    "source_url": { "type": "string" },
+                    "source_path": { "type": "string" },
+                    "manifest_text": { "type": "string" },
+                    "manifest": { "type": "object" },
+                    "trust_unverified": { "type": "boolean" }
+                }
+            }),
+            capabilities: vec!["integration_admin".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        authorization: Default::default(),
+        }).await;
+
+        self.register_builtin_action(ActionDef {
+            name: "extension_pack_scaffold".to_string(),
+            description: "Scaffold a draft local extension pack from chat intent. Use when the needed integration or channel pack does not exist yet.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "kind": { "type": "string" },
+                    "description": { "type": "string" },
+                    "docs_url": { "type": "string" },
+                    "openapi_url": { "type": "string" },
+                    "openapi_text": { "type": "string" },
+                    "curl_text": { "type": "string" },
+                    "auth_mode": { "type": "string", "enum": ["none", "api_key", "basic", "oauth2_external"] },
+                    "desired_features": { "type": "array", "items": { "type": "string" } },
+                    "read_only": { "type": "boolean" },
+                    "binding_kind": { "type": "string" },
+                    "publisher": { "type": "string" },
+                    "tags": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["name"]
+            }),
+            capabilities: vec!["integration_admin".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        authorization: Default::default(),
+        }).await;
+
+        self.register_builtin_action(ActionDef {
+            name: "extension_pack_connect".to_string(),
+            description: "Create or update a pack connection. For OAuth-style packs this returns a browser connect URL when supported; for secret-based packs it stores the provided secret payload.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pack_id": { "type": "string" },
+                    "connection_id": { "type": "string" },
+                    "name": { "type": "string" },
+                    "enabled": { "type": "boolean" },
+                    "metadata": { "type": "object" },
+                    "secret": {},
+                    "clear_secret": { "type": "boolean" },
+                    "redirect_uri": { "type": "string", "description": "Optional explicit redirect URI for OAuth connect URL generation." }
+                },
+                "required": ["pack_id"]
+            }),
+            capabilities: vec!["integration_admin".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        authorization: Default::default(),
+        }).await;
+
+        self.register_builtin_action(ActionDef {
+            name: "extension_pack_test_connection".to_string(),
+            description: "Run a pack connection health test when available.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pack_id": { "type": "string" },
+                    "connection_id": { "type": "string" }
+                },
+                "required": ["pack_id", "connection_id"]
+            }),
+            capabilities: vec!["integration_inventory".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+            authorization: Default::default(),
+        })
+        .await;
+
+        self.register_builtin_action(ActionDef {
+            name: "extension_pack_list_events".to_string(),
+            description:
+                "List recent inbound webhook/event records for an installed extension pack."
+                    .to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pack_id": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
+                },
+                "required": ["pack_id"]
+            }),
+            capabilities: vec!["integration_inventory".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+            authorization: Default::default(),
+        })
+        .await;
+
+        self.register_builtin_action(ActionDef {
+            name: "extension_pack_invoke".to_string(),
+            description: "Invoke one feature from an installed extension pack. Use when the user wants to use a pack capability directly instead of going through a legacy built-in action.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pack_id": { "type": "string" },
+                    "connection_id": { "type": "string" },
+                    "feature_id": { "type": "string" },
+                    "arguments": { "type": "object" }
+                },
+                "required": ["feature_id"]
+            }),
+            capabilities: vec!["integration_inventory".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        authorization: Default::default(),
+        }).await;
+
         self.register_builtin_action(ActionDef {
             name: "pdf_generate".to_string(),
             description: "Generate a PDF document. Use when asked to create a PDF, report, invoice, or document. Supports styles: report, letter, invoice, plain.".to_string(),
@@ -3881,7 +4804,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+            authorization: google_workspace_authorization(),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -3899,12 +4822,12 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+            authorization: google_workspace_authorization(),
         }).await;
 
         self.register_builtin_action(ActionDef {
             name: "calendar_create".to_string(),
-            description: "Create a new calendar event. Use when asked to schedule a meeting, add an event, block time, etc.".to_string(),
+            description: "Create a new calendar event. Use when asked to schedule a meeting, set up a meeting, add an event, book an appointment, or block time. AgentArk schedules its own default push reminder separately unless the user says not to remind them.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -3914,7 +4837,15 @@ impl ActionRuntime {
                     "end": { "type": "string", "description": "End datetime (ISO 8601)" },
                     "description": { "type": "string", "description": "Event description/notes" },
                     "location": { "type": "string", "description": "Event location" },
-                    "attendees": { "type": "array", "items": { "type": "string" }, "description": "List of attendee email addresses" }
+                    "attendees": { "type": "array", "items": { "type": "string" }, "description": "List of attendee email addresses" },
+                    "agentark_reminder": {
+                        "type": ["boolean", "object"],
+                        "description": "AgentArk push reminder control. Omit for the default 15-minute push reminder. Use false only when the user explicitly opts out. Use {\"enabled\": true, \"minutes_before\": N} when the user requests a different AgentArk reminder lead time.",
+                        "properties": {
+                            "enabled": { "type": "boolean" },
+                            "minutes_before": { "type": "integer", "minimum": 1, "maximum": 1440 }
+                        }
+                    }
                 },
                 "required": ["summary", "start", "end"]
             }),
@@ -3922,7 +4853,11 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+            authorization: authorization_with_access(crate::actions::ActionAccessMetadata {
+                permission_ids: vec!["calendar_write".to_string()],
+                integration_ids: vec!["google_workspace".to_string()],
+                ..crate::actions::ActionAccessMetadata::default()
+            }),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -3941,7 +4876,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+            authorization: google_workspace_authorization(),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -3959,7 +4894,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+            authorization: google_workspace_authorization(),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -3977,7 +4912,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+            authorization: google_workspace_authorization(),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -3996,7 +4931,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+            authorization: google_workspace_authorization(),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -4013,7 +4948,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+            authorization: google_workspace_authorization(),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -4032,7 +4967,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+            authorization: google_workspace_authorization(),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -4053,7 +4988,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+            authorization: google_workspace_authorization(),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -4074,7 +5009,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+            authorization: google_workspace_authorization(),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -4102,7 +5037,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+            authorization: google_workspace_authorization(),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -4129,7 +5064,11 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+            authorization: authorization_with_access(crate::actions::ActionAccessMetadata {
+                permission_ids: vec!["google_workspace_command".to_string()],
+                integration_ids: vec!["google_workspace".to_string()],
+                ..crate::actions::ActionAccessMetadata::default()
+            }),
         }).await;
 
         // SSH â€” remote server execution (behind feature flag)
@@ -4151,7 +5090,11 @@ impl ActionRuntime {
                 sandbox_mode: Some(SandboxMode::Native),
                 source: ActionSource::System,
                 file_path: None,
-            authorization: Default::default(),
+                authorization: authorization_with_access(crate::actions::ActionAccessMetadata {
+                    permission_ids: vec!["ssh".to_string()],
+                    requires_ssh_connection: true,
+                    ..crate::actions::ActionAccessMetadata::default()
+                }),
             }).await;
 
             self.register_builtin_action(ActionDef {
@@ -4333,7 +5276,10 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+            authorization: authorization_with_access(crate::actions::ActionAccessMetadata {
+                permission_ids: vec!["app_hosting".to_string()],
+                ..crate::actions::ActionAccessMetadata::default()
+            }),
         }).await;
 
         // Provider-based text/image-to-video generation (Runway/Luma/Fal/Veo/etc.)
@@ -4490,6 +5436,15 @@ impl ActionRuntime {
         )
     }
 
+    fn direct_trusted_chat_tool_override(auth_context: &ActionAuthorizationContext) -> bool {
+        matches!(auth_context.surface, ActionExecutionSurface::Chat)
+            && auth_context.direct_user_intent
+            && auth_context
+                .principal
+                .as_ref()
+                .is_some_and(|principal| principal.trusted)
+    }
+
     fn risk_rank(level: &ActionRiskLevel) -> u8 {
         match level {
             ActionRiskLevel::None => 0,
@@ -4537,6 +5492,7 @@ impl ActionRuntime {
         let payload = serde_json::json!({
             "surface": auth_context.surface.as_key(),
             "direct_user_intent": auth_context.direct_user_intent,
+            "current_turn_is_explicit_approval": auth_context.current_turn_is_explicit_approval,
             "principal": principal_payload,
             "authorization": authorization,
             "decision": {
@@ -4599,11 +5555,40 @@ impl ActionRuntime {
             .map(Self::merged_authorization_for_action)
             .unwrap_or_default();
 
+        if let Some(decision) = self
+            .authorize_action_scope(action_name, arguments, auth_context)
+            .await
+        {
+            self.log_authorization_audit(
+                action_name,
+                arguments,
+                &authorization,
+                auth_context,
+                &decision,
+            )
+            .await;
+            return Ok(decision);
+        }
+
         let decision = match auth_context.surface {
             ActionExecutionSurface::Internal | ActionExecutionSurface::Test => {
                 ActionAuthorizationDecision::allow(
                     "Internal execution bypassed the interactive permission gate.",
                 )
+            }
+            _ if Self::direct_trusted_chat_tool_override(auth_context) => {
+                ActionAuthorizationDecision::allow(format!(
+                    "Tool '{}' is allowed because this is a direct authenticated chat request.",
+                    action_name
+                ))
+            }
+            _ if authorization.human_approval.required
+                && !auth_context.current_turn_is_explicit_approval =>
+            {
+                ActionAuthorizationDecision::deny(format!(
+                    "Tool '{}' requires explicit user approval before it can run.",
+                    action_name
+                ))
             }
             _ if auth_context.direct_user_intent
                 && matches!(
@@ -4617,6 +5602,18 @@ impl ActionRuntime {
             {
                 ActionAuthorizationDecision::allow(format!(
                     "Tool '{}' is allowed because this is a direct authenticated user request.",
+                    action_name
+                ))
+            }
+            _ if Self::is_background_surface(&auth_context.surface)
+                && auth_context.direct_user_intent
+                && auth_context
+                    .principal
+                    .as_ref()
+                    .is_some_and(|principal| principal.trusted) =>
+            {
+                ActionAuthorizationDecision::allow(format!(
+                    "Tool '{}' is allowed because this automation originated from a direct authenticated user request.",
                     action_name
                 ))
             }
@@ -4689,6 +5686,30 @@ impl ActionRuntime {
             &decision,
         )
         .await;
+        if !decision.allowed {
+            return Ok(decision);
+        }
+
+        if let Some(action_def) = action_def {
+            let unapproved_permissions = self
+                .unapproved_permissions_for_action(action_def, auth_context)
+                .await;
+            if !unapproved_permissions.is_empty() {
+                let denied = ActionAuthorizationDecision::deny(
+                    Self::build_permission_requirement_error(action_name, &unapproved_permissions),
+                );
+                self.log_authorization_audit(
+                    action_name,
+                    arguments,
+                    &authorization,
+                    auth_context,
+                    &denied,
+                )
+                .await;
+                return Ok(denied);
+            }
+        }
+
         Ok(decision)
     }
 
@@ -5338,6 +6359,89 @@ impl ActionRuntime {
         .await
     }
 
+    pub async fn validate_action_invocation_with_context(
+        &self,
+        action_name: &str,
+        arguments: &serde_json::Value,
+        auth_context: &ActionAuthorizationContext,
+    ) -> Result<()> {
+        let info = {
+            let actions = self.actions.read().await;
+            actions
+                .get(action_name)
+                .map(|action| action.info.clone())
+                .ok_or_else(|| anyhow::anyhow!("Unknown action: {}", action_name))?
+        };
+
+        let authorization_decision = self
+            .authorize_action_invocation(action_name, Some(&info), arguments, auth_context)
+            .await?;
+        if !authorization_decision.allowed {
+            anyhow::bail!("{}", authorization_decision.reason);
+        }
+        let chat_override = Self::direct_trusted_chat_tool_override(auth_context);
+
+        if !chat_override {
+            match self.refresh_action_review_state(action_name).await? {
+                Some(review) => {
+                    if !review.allow_execute {
+                        anyhow::bail!(
+                            "{}",
+                            review.blocked_reason.unwrap_or_else(|| {
+                                format!("Action '{}' is not ready to execute.", action_name)
+                            })
+                        );
+                    }
+                }
+                None if info.source != ActionSource::System => {
+                    anyhow::bail!(
+                        "Action '{}' has no persisted security review and cannot execute.",
+                        action_name
+                    );
+                }
+                None => {}
+            }
+        }
+
+        if !chat_override {
+            if info.source != ActionSource::System {
+                let disabled = self.disabled_actions.read().await;
+                if disabled.contains(action_name) {
+                    anyhow::bail!(
+                        "Action '{}' is disabled. Re-enable it in the UI before running.",
+                        action_name
+                    );
+                }
+            } else if !self.is_action_integration_enabled(&info) {
+                let integration_id = info
+                    .authorization
+                    .access
+                    .integration_ids
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("required");
+                anyhow::bail!(
+                    "Action '{}' is unavailable because integration '{}' is disabled.",
+                    action_name,
+                    integration_id
+                );
+            }
+        }
+
+        match action_name {
+            "http_get" => {
+                let url = arguments
+                    .get("url")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("Missing URL"))?;
+                self.resolve_http_get_url_for_context(url, auth_context).await?;
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
     pub async fn execute_action_with_context(
         &self,
         action_name: &str,
@@ -5351,7 +6455,6 @@ impl ActionRuntime {
             plugin_binding,
             custom_api_binding,
             source,
-            capabilities,
             info,
         ) = {
             let actions = self.actions.read().await;
@@ -5369,7 +6472,6 @@ impl ActionRuntime {
                 action.plugin_binding.clone(),
                 action.custom_api_binding.clone(),
                 action.info.source.clone(),
-                action.info.capabilities.clone(),
                 action.info.clone(),
             )
         };
@@ -5380,60 +6482,84 @@ impl ActionRuntime {
         if !authorization_decision.allowed {
             anyhow::bail!("{}", authorization_decision.reason);
         }
+        let chat_override = Self::direct_trusted_chat_tool_override(auth_context);
 
-        match self.refresh_action_review_state(action_name).await? {
-            Some(review) => {
-                if !review.allow_execute {
+        if !chat_override {
+            match self.refresh_action_review_state(action_name).await? {
+                Some(review) => {
+                    if !review.allow_execute {
+                        anyhow::bail!(
+                            "{}",
+                            review.blocked_reason.unwrap_or_else(|| {
+                                format!("Action '{}' is not ready to execute.", action_name)
+                            })
+                        );
+                    }
+                }
+                None if source != ActionSource::System => {
                     anyhow::bail!(
-                        "{}",
-                        review.blocked_reason.unwrap_or_else(|| {
-                            format!("Action '{}' is not ready to execute.", action_name)
-                        })
+                        "Action '{}' has no persisted security review and cannot execute.",
+                        action_name
                     );
                 }
+                None => {}
             }
-            None if source != ActionSource::System => {
-                anyhow::bail!(
-                    "Action '{}' has no persisted security review and cannot execute.",
-                    action_name
-                );
-            }
-            None => {}
         }
 
-        if source != ActionSource::System {
-            let disabled = self.disabled_actions.read().await;
-            if disabled.contains(action_name) {
+        if !chat_override {
+            if source != ActionSource::System {
+                let disabled = self.disabled_actions.read().await;
+                if disabled.contains(action_name) {
+                    return Err(anyhow::anyhow!(
+                        "Action '{}' is disabled. Re-enable it in the UI before running.",
+                        action_name
+                    ));
+                }
+            } else if !self.is_action_integration_enabled(&info) {
+                let integration_id = info
+                    .authorization
+                    .access
+                    .integration_ids
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("required");
                 return Err(anyhow::anyhow!(
-                    "Action '{}' is disabled. Re-enable it in the UI before running.",
-                    action_name
+                    "Action '{}' is unavailable because integration '{}' is disabled.",
+                    action_name,
+                    integration_id
                 ));
             }
-        } else if !self.is_builtin_integration_action_enabled(action_name) {
-            let integration_id = Self::builtin_integrations_for_action(action_name)
-                .first()
-                .copied()
-                .unwrap_or("required");
-            return Err(anyhow::anyhow!(
-                "Action '{}' is unavailable because integration '{}' is disabled.",
-                action_name,
-                integration_id
-            ));
-        }
-
-        let unapproved_permissions = self
-            .unapproved_permissions_for_action(action_name, &capabilities)
-            .await;
-        if !unapproved_permissions.is_empty() {
-            anyhow::bail!(
-                "{}",
-                Self::build_permission_requirement_error(action_name, &unapproved_permissions)
-            );
         }
 
         // Resolve secrets at execution time so they never appear in LLM-visible
         // tool-call arguments or execution traces.
         let resolved_args = self.resolve_secret_placeholders(action_name, arguments)?;
+
+        #[cfg(feature = "ssh")]
+        if matches!(action_name, "ssh" | "ssh_connections") {
+            let allowed_connections = auth_context
+                .agent_access_scope
+                .as_ref()
+                .map(|scope| scope.ssh_connection_names.as_slice());
+            return match action_name {
+                "ssh" => {
+                    crate::actions::ssh::ssh_execute_scoped(
+                        &self.config_dir,
+                        &resolved_args,
+                        allowed_connections,
+                    )
+                    .await
+                }
+                "ssh_connections" => {
+                    crate::actions::ssh::ssh_list_connections_scoped(
+                        &self.config_dir,
+                        allowed_connections,
+                    )
+                    .await
+                }
+                _ => unreachable!(),
+            };
+        }
 
         if let Some(binding) = cli_binding {
             return self
@@ -5476,8 +6602,14 @@ impl ActionRuntime {
         // Execute based on sandbox mode
         let result = match sandbox_mode {
             SandboxMode::Native => self.execute_native(action_name, &resolved_args).await,
-            SandboxMode::Wasm => self.execute_wasm(action_name, &resolved_args).await,
-            SandboxMode::Docker => self.execute_docker(action_name, &resolved_args).await,
+            SandboxMode::Wasm => {
+                self.execute_wasm(action_name, &resolved_args, auth_context)
+                    .await
+            }
+            SandboxMode::Docker => {
+                self.execute_docker(action_name, &resolved_args, auth_context)
+                    .await
+            }
         };
 
         // Handle transaction
@@ -6131,9 +7263,15 @@ impl ActionRuntime {
                         crate::core::TaskStatus::Failed { .. } => "Failed",
                         crate::core::TaskStatus::Cancelled => "Cancelled",
                     };
-                    output.push_str(&format!("- {} (status: {})\n", t.description, status_str));
+                    output.push_str(&format!(
+                        "- {} (id: {}, action: {}, status: {})\n",
+                        t.description, t.id, t.action, status_str
+                    ));
                     if let Some(ref cron) = t.cron {
                         output.push_str(&format!("  Schedule: {}\n", cron));
+                    }
+                    if let Some(scheduled_for) = t.scheduled_for {
+                        output.push_str(&format!("  Next run: {}\n", scheduled_for.to_rfc3339()));
                     }
                 }
                 Ok(output)
@@ -6186,8 +7324,23 @@ impl ActionRuntime {
                 Ok(format!("Watch created: {}", desc))
             }
             "manage_actions" => self.execute_manage_actions(arguments).await,
+            "list_integrations" => self.execute_list_integrations(arguments).await,
             "capability_acquire" => self.execute_capability_acquire(arguments).await,
+            "capability_resolve" => self.execute_capability_resolve(arguments).await,
             "connector_request" => self.execute_connector_request(arguments).await,
+            "lan_discover" => crate::actions::lan::lan_discover(arguments).await,
+            "extension_pack_list" => self.execute_extension_pack_list(arguments).await,
+            "extension_pack_search" => self.execute_extension_pack_search(arguments).await,
+            "extension_pack_install" => self.execute_extension_pack_install(arguments).await,
+            "extension_pack_scaffold" => self.execute_extension_pack_scaffold(arguments).await,
+            "extension_pack_connect" => self.execute_extension_pack_connect(arguments).await,
+            "extension_pack_test_connection" => {
+                self.execute_extension_pack_test_connection(arguments).await
+            }
+            "extension_pack_list_events" => {
+                self.execute_extension_pack_list_events(arguments).await
+            }
+            "extension_pack_invoke" => self.execute_extension_pack_invoke(arguments).await,
             "pipeline_compile" => self.execute_pipeline_compile(arguments).await,
             "pipeline_run" => self.execute_pipeline_run(arguments).await,
             "signal_consensus" => self.execute_signal_consensus(arguments).await,
@@ -6227,7 +7380,7 @@ impl ActionRuntime {
                     serde_json::from_value(arguments.clone())
                         .map_err(|e| anyhow::anyhow!("Invalid search arguments: {}", e))?;
 
-                let config = build_search_config(&self.config_dir).await;
+                let config = build_search_config(&self.config_dir, self.storage.as_ref()).await;
                 crate::actions::search::execute_search(&args, &config).await
             }
             "research" => {
@@ -6235,7 +7388,7 @@ impl ActionRuntime {
                     serde_json::from_value(arguments.clone())
                         .map_err(|e| anyhow::anyhow!("Invalid research arguments: {}", e))?;
 
-                let config = build_search_config(&self.config_dir).await;
+                let config = build_search_config(&self.config_dir, self.storage.as_ref()).await;
                 crate::actions::research::execute_research(&args, &config).await
             }
             "code_execute" => {
@@ -6990,6 +8143,366 @@ print(result["text"])
         }
     }
 
+    async fn execute_list_integrations(&self, arguments: &serde_json::Value) -> Result<String> {
+        let query = arguments.get("query").and_then(|value| value.as_str());
+        let kind = arguments.get("kind").and_then(|value| value.as_str());
+        let packs = if let Some(registry) = self.extension_pack_registry.clone() {
+            let guard = registry.read().await;
+            Some(guard.search_packs(query, kind).await?)
+        } else {
+            None
+        };
+        let plugins = if let Some(registry) = self.plugin_registry.clone() {
+            let guard = registry.read().await;
+            Some(guard.list_plugins().await?)
+        } else {
+            None
+        };
+        let mcp_servers = if let Some(registry) = self.mcp_registry.clone() {
+            let guard = registry.read().await;
+            Some(guard.list_servers(false).await?)
+        } else {
+            None
+        };
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "extension_packs": packs,
+            "plugins": plugins,
+            "mcp_servers": mcp_servers,
+        }))?)
+    }
+
+    async fn execute_extension_pack_list(&self, arguments: &serde_json::Value) -> Result<String> {
+        let registry = self
+            .extension_pack_registry
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Extension-pack registry not available"))?;
+        let query = arguments.get("query").and_then(|value| value.as_str());
+        let kind = arguments.get("kind").and_then(|value| value.as_str());
+        let guard = registry.read().await;
+        Ok(serde_json::to_string_pretty(
+            &guard.search_packs(query, kind).await?,
+        )?)
+    }
+
+    async fn execute_extension_pack_search(&self, arguments: &serde_json::Value) -> Result<String> {
+        self.execute_extension_pack_list(arguments).await
+    }
+
+    async fn execute_extension_pack_install(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
+        let request: crate::extension_packs::ExtensionPackInstallRequest =
+            serde_json::from_value(arguments.clone()).map_err(|error| {
+                anyhow::anyhow!("Invalid extension pack install arguments: {}", error)
+            })?;
+        let registry = self
+            .extension_pack_registry
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Extension-pack registry not available"))?;
+        let mut guard = registry.write().await;
+        Ok(serde_json::to_string_pretty(
+            &guard.install(request).await?,
+        )?)
+    }
+
+    async fn execute_extension_pack_scaffold(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
+        let request: crate::extension_packs::ExtensionPackScaffoldRequest =
+            serde_json::from_value(arguments.clone()).map_err(|error| {
+                anyhow::anyhow!("Invalid extension pack scaffold arguments: {}", error)
+            })?;
+        let registry = self
+            .extension_pack_registry
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Extension-pack registry not available"))?;
+        let mut guard = registry.write().await;
+        Ok(serde_json::to_string_pretty(
+            &guard.scaffold(request).await?,
+        )?)
+    }
+
+    async fn execute_extension_pack_connect(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
+        let pack_id = arguments
+            .get("pack_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Missing pack_id"))?;
+        let request: crate::extension_packs::ExtensionPackConnectionUpsertRequest =
+            serde_json::from_value(arguments.clone()).map_err(|error| {
+                anyhow::anyhow!("Invalid extension pack connect arguments: {}", error)
+            })?;
+        let registry = self
+            .extension_pack_registry
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Extension-pack registry not available"))?;
+        let mut guard = registry.write().await;
+        let connection = guard.upsert_connection(pack_id, request).await?;
+        let oauth_hint = guard.supports_connect_url(pack_id);
+        let redirect_uri = arguments
+            .get("redirect_uri")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let connect_path = if oauth_hint {
+            let mut path = format!(
+                "/extension-packs/{}/connect-url",
+                urlencoding::encode(pack_id)
+            );
+            if let Some(redirect_uri) = redirect_uri {
+                let suffix = format!("redirect_uri={}", urlencoding::encode(redirect_uri));
+                path.push('?');
+                path.push_str(&suffix);
+            }
+            Some(path)
+        } else {
+            None
+        };
+        let connect_url = connect_path
+            .as_deref()
+            .map(|path| format!("{}{}", crate::core::net::internal_api_base_url(), path));
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "connection": connection,
+            "oauth_connect_in_ui": oauth_hint,
+            "connect_url_endpoint": connect_path,
+            "connect_url": connect_url,
+            "message": if oauth_hint {
+                "Connection record saved. Complete OAuth by opening the returned connect_url in a browser."
+            } else {
+                "Connection saved."
+            }
+        }))?)
+    }
+
+    async fn execute_extension_pack_test_connection(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
+        let pack_id = arguments
+            .get("pack_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Missing pack_id"))?;
+        let connection_id = arguments
+            .get("connection_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Missing connection_id"))?;
+        let registry = self
+            .extension_pack_registry
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Extension-pack registry not available"))?;
+        let mut guard = registry.write().await;
+        Ok(serde_json::to_string_pretty(
+            &guard
+                .test_connection(
+                    pack_id,
+                    connection_id,
+                    self.mcp_registry.clone(),
+                    self.plugin_registry.clone(),
+                )
+                .await?,
+        )?)
+    }
+
+    async fn execute_extension_pack_list_events(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
+        let pack_id = arguments
+            .get("pack_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Missing pack_id"))?;
+        let limit = arguments
+            .get("limit")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(25) as usize;
+        let registry = self
+            .extension_pack_registry
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Extension-pack registry not available"))?;
+        let guard = registry.read().await;
+        Ok(serde_json::to_string_pretty(
+            &guard.list_events(pack_id, limit).await?,
+        )?)
+    }
+
+    async fn execute_extension_pack_invoke(&self, arguments: &serde_json::Value) -> Result<String> {
+        let request: crate::extension_packs::ExtensionPackInvokeRequest =
+            serde_json::from_value(arguments.clone()).map_err(|error| {
+                anyhow::anyhow!("Invalid extension pack invoke arguments: {}", error)
+            })?;
+        let registry = self
+            .extension_pack_registry
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Extension-pack registry not available"))?;
+        let mut guard = registry.write().await;
+        let result = guard
+            .invoke_feature(
+                request,
+                self.mcp_registry.clone(),
+                self.plugin_registry.clone(),
+            )
+            .await?;
+        Ok(serde_json::to_string_pretty(&result)?)
+    }
+
+    async fn execute_capability_resolve(&self, arguments: &serde_json::Value) -> Result<String> {
+        let goal = arguments
+            .get("goal")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'goal' for capability resolution"))?;
+        let requested_capability = arguments
+            .get("requested_capability")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let selected_action = arguments
+            .get("selected_action")
+            .or_else(|| arguments.get("requested_action"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let failure_output = arguments
+            .get("failure_output")
+            .and_then(|value| value.as_str())
+            .or_else(|| arguments.get("error").and_then(|value| value.as_str()))
+            .unwrap_or("");
+        let files = self.collect_code_execute_files(arguments).await?;
+        let detected_inputs = files
+            .iter()
+            .map(|file| {
+                Self::upload_signature(&file.filename, file.content_type.as_deref(), &file.bytes)
+            })
+            .collect::<Vec<_>>();
+
+        let requested_capability_key =
+            requested_capability.map(|value| value.to_ascii_lowercase().replace([' ', '-'], "_"));
+        let selected_action_key = selected_action.map(str::to_ascii_lowercase);
+        let has_audio_like_file = detected_inputs.iter().any(|input| {
+            matches!(
+                input.get("input_type").and_then(|value| value.as_str()),
+                Some("audio") | Some("audio_video")
+            )
+        });
+        let missing_binary = Self::detect_missing_binary_from_output(failure_output);
+
+        let mut missing_capabilities = Vec::new();
+        let mut routes = Vec::new();
+        let mut next_actions = Vec::new();
+        let mut notes = Vec::new();
+
+        if let Some(binary) = missing_binary.as_deref() {
+            missing_capabilities.push(serde_json::json!({
+                "kind": "binary",
+                "name": binary,
+                "approval_required": true,
+                "reason": "The previous execution failed because this executable is not present in the sandbox/runtime environment.",
+            }));
+            routes.push(serde_json::json!({
+                "route": "host_install_approval",
+                "approval_required": true,
+                "auto_allowed": false,
+                "reason": "Sandbox-local pip/npm installs are allowed, but OS/host binary installation is approval-gated.",
+            }));
+        }
+
+        if selected_action_key.as_deref() == Some("transcribe_audio") && has_audio_like_file {
+            next_actions.push(serde_json::json!({
+                "name": "code_execute",
+                "arguments": {
+                    "language": "python",
+                    "code": Self::build_sandbox_transcription_code(),
+                    "files": arguments.get("files").cloned().unwrap_or_else(|| serde_json::json!([])),
+                    "file_payloads": arguments.get("file_payloads").cloned().unwrap_or_else(|| serde_json::json!([])),
+                    "network_access": true,
+                    "timeout_secs": 600,
+                    "execution_contract": {
+                        "phase": "validate",
+                        "target_validated_when_successful": true
+                    }
+                },
+                "why": "Run the catalog-selected transcription action inside the code sandbox after byte-level media detection. The script checks for ffmpeg and emits a structured missing-binary marker instead of installing OS packages."
+            }));
+            routes.push(serde_json::json!({
+                "route": "sandbox_code_execute",
+                "approval_required": false,
+                "auto_allowed": true,
+                "reason": "Use sandbox-local Python packages first; do not run host installers unless the sandbox reports a missing binary.",
+            }));
+            notes.push("Audio-like upload detected by bytes; prefer the selected sandbox action path before any host install.".to_string());
+        }
+
+        if let Some(requested) = requested_capability_key.as_deref() {
+            notes.push(format!("Requested capability hint: {}.", requested));
+        }
+        if let Some(action) = selected_action_key.as_deref() {
+            notes.push(format!("Selected catalog action: {}.", action));
+        }
+        if detected_inputs.is_empty() {
+            notes.push("No upload files were provided for byte-level inspection.".to_string());
+        }
+        if routes.is_empty() {
+            routes.push(serde_json::json!({
+                "route": "inspect_then_choose",
+                "approval_required": false,
+                "auto_allowed": true,
+                "reason": "No concrete missing capability was detected yet. Inspect with the nearest read-only/workspace tool, then retry capability_resolve with any failure output.",
+            }));
+        }
+
+        let approval_required = missing_capabilities.iter().any(|capability| {
+            capability
+                .get("approval_required")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+        });
+        let mut result = serde_json::json!({
+            "resolver": "capability_resolve",
+            "status": if approval_required { "needs_approval" } else { "ready" },
+            "policy": "sandbox_first",
+            "goal": goal,
+            "detected_inputs": detected_inputs,
+            "missing_capabilities": missing_capabilities,
+            "acquisition_routes": routes,
+            "next_actions": next_actions,
+            "verification": {
+                "required": true,
+                "evidence": "The next action should produce successful tool output, app health/log evidence, or a concrete approval blocker."
+            },
+            "notes": notes,
+        });
+
+        if approval_required {
+            result["approval_request"] = serde_json::json!({
+                "title": "Capability approval required",
+                "summary": "AgentArk detected a missing host/system capability that is not safe to install automatically.",
+                "reason": missing_binary
+                    .as_ref()
+                    .map(|binary| format!("Missing binary: {}.", binary))
+                    .unwrap_or_else(|| "A host-level capability is required.".to_string()),
+                "risk_level": "environment_change",
+                "risk_score": 72,
+                "source": "capability_resolve",
+                "comment_supported": true
+            });
+        }
+
+        Ok(serde_json::to_string_pretty(&result)?)
+    }
+
     async fn execute_capability_acquire(&self, arguments: &serde_json::Value) -> Result<String> {
         let arguments = Self::enrich_capability_acquisition_arguments(arguments).await;
         let raw_name = arguments
@@ -7701,27 +9214,260 @@ print(result["text"])
         has_dangerous_cap || (source != ActionSource::System && capabilities.is_empty())
     }
 
-    fn builtin_integrations_for_action(action_name: &str) -> &'static [&'static str] {
-        match action_name {
-            "gmail_scan" | "gmail_reply" => &["gmail", "google_workspace"],
-            "calendar_today" | "calendar_list" | "calendar_create" | "calendar_free" => {
-                &["google_calendar", "google_workspace"]
-            }
-            "google_drive_search"
-            | "google_docs_read"
-            | "google_sheets_read"
-            | "google_chat_list_spaces"
-            | "google_admin_list_users"
-            | "google_workspace_gws_help"
-            | "google_workspace_gws_schema"
-            | "google_workspace_gws_skills"
-            | "google_workspace_gws_command" => &["google_workspace"],
-            _ => &[],
+    fn action_scope_hint_for_loaded_action(
+        _action_name: &str,
+        loaded: &LoadedAction,
+    ) -> ActionScopeHint {
+        ActionScopeHint {
+            mcp_server_id: loaded
+                .mcp_binding
+                .as_ref()
+                .map(|binding| binding.server_id.clone()),
+            custom_api_id: loaded
+                .custom_api_binding
+                .as_ref()
+                .map(|binding| binding.api_id.clone()),
+            integration_ids: loaded.info.authorization.access.integration_ids.clone(),
+            requires_ssh_connection: loaded.info.authorization.access.requires_ssh_connection,
+            channel_targets: loaded.info.authorization.access.channel_targets.clone(),
         }
     }
 
-    fn is_builtin_integration_action_enabled(&self, action_name: &str) -> bool {
-        let integration_ids = Self::builtin_integrations_for_action(action_name);
+    fn fallback_action_scope_hint(_action_name: &str) -> ActionScopeHint {
+        ActionScopeHint::default()
+    }
+
+    fn normalize_scope_channel_target(value: Option<&str>, default_target: &str) -> String {
+        match value
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+            .map(|raw| raw.to_ascii_lowercase())
+        {
+            Some(channel) if matches!(channel.as_str(), "push" | "auto" | "default") => {
+                "preferred".to_string()
+            }
+            Some(channel)
+                if matches!(
+                    channel.as_str(),
+                    "app" | "app_notification" | "app_notifications" | "in_app"
+                ) =>
+            {
+                String::new()
+            }
+            Some(channel) if channel == "http" => "web".to_string(),
+            Some(channel) => channel,
+            None => default_target.to_string(),
+        }
+    }
+
+    fn scoped_channel_target_for_hint(
+        hint: &ActionScopeHint,
+        arguments: &serde_json::Value,
+    ) -> Option<String> {
+        let target = hint.channel_targets.first()?;
+        Some(Self::normalize_scope_channel_target(
+            arguments
+                .get(target.argument_key.as_str())
+                .and_then(|value| value.as_str()),
+            target.default_target.as_str(),
+        ))
+    }
+
+    fn uses_broad_network(action: &ActionDef) -> bool {
+        let outbound = &action.authorization.outbound;
+        outbound.outbound_write || outbound.public_publish
+    }
+
+    fn builtin_dangerous_permissions(
+        action: &ActionDef,
+    ) -> Vec<crate::security::action_guard::Permission> {
+        crate::security::action_guard::ActionGuard::permissions_from_capabilities(
+            &action.capabilities,
+        )
+        .into_iter()
+        .filter(|permission| {
+            !matches!(
+                permission,
+                crate::security::action_guard::Permission::Custom(_)
+            ) && Self::permission_needs_agent_approval(permission)
+        })
+        .collect()
+    }
+
+    fn permission_needs_agent_approval(
+        permission: &crate::security::action_guard::Permission,
+    ) -> bool {
+        crate::security::action_guard::ActionGuard::permission_risk(permission)
+            == crate::security::action_guard::PermissionRisk::Dangerous
+    }
+
+    pub fn action_permission_ids(action: &ActionDef) -> Vec<String> {
+        let mut permission_ids = action.authorization.access.permission_ids.clone();
+        permission_ids.extend(
+            Self::builtin_dangerous_permissions(action)
+                .into_iter()
+                .map(|permission| permission.to_string()),
+        );
+        if !action.authorization.access.channel_targets.is_empty() {
+            permission_ids.push("messaging_send".to_string());
+        }
+        permission_ids
+            .into_iter()
+            .map(|permission| permission.trim().to_ascii_lowercase())
+            .filter(|permission| !permission.is_empty())
+            .collect()
+    }
+
+    fn action_demands_broad_network_consent(action: &ActionDef) -> bool {
+        Self::uses_broad_network(action)
+            && !action
+                .authorization
+                .access
+                .permission_ids
+                .iter()
+                .any(|permission| permission.trim().eq_ignore_ascii_case("broad_network"))
+    }
+
+    pub fn action_required_agent_permission_ids(action: &ActionDef) -> Vec<String> {
+        let mut permission_ids = Self::action_permission_ids(action);
+        if Self::action_demands_broad_network_consent(action) {
+            permission_ids.push("broad_network".to_string());
+        }
+        permission_ids.sort();
+        permission_ids.dedup();
+        permission_ids
+    }
+
+    fn scope_contains_exact_value(allowed: &[String], candidate: &str) -> bool {
+        let candidate = candidate.trim();
+        allowed.iter().any(|value| value.trim() == candidate)
+    }
+
+    fn scope_contains_case_insensitive_value(allowed: &[String], candidate: &str) -> bool {
+        let candidate = candidate.trim();
+        allowed
+            .iter()
+            .any(|value| value.trim().eq_ignore_ascii_case(candidate))
+    }
+
+    fn scope_contains_channel_target(allowed: &[String], candidate: &str) -> bool {
+        let candidate = candidate.trim().to_ascii_lowercase();
+        allowed.iter().any(|value| {
+            Self::normalize_scope_channel_target(Some(value.as_str()), "")
+                .trim()
+                .eq_ignore_ascii_case(candidate.as_str())
+        })
+    }
+
+    fn scoped_actor_label(auth_context: &ActionAuthorizationContext) -> String {
+        auth_context
+            .agent_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| format!("Agent '{}'", value))
+            .unwrap_or_else(|| "This agent".to_string())
+    }
+
+    async fn authorize_action_scope(
+        &self,
+        action_name: &str,
+        arguments: &serde_json::Value,
+        auth_context: &ActionAuthorizationContext,
+    ) -> Option<ActionAuthorizationDecision> {
+        let scope = auth_context.agent_access_scope.as_ref()?;
+        let hint = {
+            let actions = self.actions.read().await;
+            actions
+                .get(action_name)
+                .map(|loaded| Self::action_scope_hint_for_loaded_action(action_name, loaded))
+        }
+        .unwrap_or_else(|| Self::fallback_action_scope_hint(action_name));
+        let actor = Self::scoped_actor_label(auth_context);
+
+        if let Some(server_id) = hint.mcp_server_id.as_deref() {
+            if !Self::scope_contains_exact_value(&scope.mcp_server_ids, server_id) {
+                return Some(ActionAuthorizationDecision::deny(format!(
+                    "{} is not allowed to use MCP server '{}'.",
+                    actor, server_id
+                )));
+            }
+        }
+
+        if let Some(api_id) = hint.custom_api_id.as_deref() {
+            if !Self::scope_contains_exact_value(&scope.custom_api_ids, api_id) {
+                return Some(ActionAuthorizationDecision::deny(format!(
+                    "{} is not allowed to use custom API '{}'.",
+                    actor, api_id
+                )));
+            }
+        }
+
+        if !hint.integration_ids.is_empty()
+            && !hint.integration_ids.iter().any(|integration_id| {
+                Self::scope_contains_case_insensitive_value(&scope.integration_ids, integration_id)
+            })
+        {
+            return Some(ActionAuthorizationDecision::deny(format!(
+                "{} is not allowed to use integration(s): {}.",
+                actor,
+                hint.integration_ids.join(", ")
+            )));
+        }
+
+        if hint.requires_ssh_connection {
+            if scope.ssh_connection_names.is_empty() {
+                return Some(ActionAuthorizationDecision::deny(format!(
+                    "{} is not allowed to use SSH because no SSH connections are attached.",
+                    actor
+                )));
+            }
+            if action_name == "ssh" {
+                if let Some(connection_name) = arguments
+                    .get("connection")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    if !Self::scope_contains_exact_value(
+                        &scope.ssh_connection_names,
+                        connection_name,
+                    ) {
+                        return Some(ActionAuthorizationDecision::deny(format!(
+                            "{} is not allowed to use SSH connection '{}'.",
+                            actor, connection_name
+                        )));
+                    }
+                }
+            }
+        }
+
+        if !hint.channel_targets.is_empty() {
+            let channel_target = Self::scoped_channel_target_for_hint(&hint, arguments)
+                .unwrap_or_else(|| "preferred".to_string());
+            if !channel_target.is_empty() {
+                if channel_target == "preferred" {
+                    if scope.channel_ids.is_empty() {
+                        return Some(ActionAuthorizationDecision::deny(format!(
+                            "{} is not allowed to use preferred-channel delivery because no messaging channels are attached.",
+                            actor
+                        )));
+                    }
+                } else if !Self::scope_contains_channel_target(&scope.channel_ids, &channel_target)
+                {
+                    return Some(ActionAuthorizationDecision::deny(format!(
+                        "{} is not allowed to use messaging channel '{}'.",
+                        actor, channel_target
+                    )));
+                }
+            }
+        }
+
+        None
+    }
+
+    fn is_action_integration_enabled(&self, action: &ActionDef) -> bool {
+        let integration_ids = &action.authorization.access.integration_ids;
         if integration_ids.is_empty() {
             return true;
         }
@@ -8019,6 +9765,7 @@ print(result["text"])
         &self,
         action_name: &str,
         arguments: &serde_json::Value,
+        auth_context: &ActionAuthorizationContext,
     ) -> Result<String> {
         // For built-in actions, fall back to native with some wrapping
         match action_name {
@@ -8026,7 +9773,10 @@ print(result["text"])
                 let url = arguments["url"]
                     .as_str()
                     .ok_or_else(|| anyhow::anyhow!("Missing url"))?;
-                let parsed_url = self.validate_http_get_url(url).await?;
+                let parsed_url = self
+                    .resolve_http_get_url_for_context(url, auth_context)
+                    .await?;
+                let chat_override = Self::direct_trusted_chat_tool_override(auth_context);
 
                 // Fast-path: try Lightpanda for external URLs (returns clean markdown)
                 let has_custom_headers = arguments
@@ -8034,11 +9784,7 @@ print(result["text"])
                     .and_then(|v| v.as_object())
                     .map(|h| !h.is_empty())
                     .unwrap_or(false);
-                let is_loopback = parsed_url
-                    .host_str()
-                    .map(|h| h == "localhost" || h == "127.0.0.1" || h == "::1")
-                    .unwrap_or(true);
-                if !is_loopback && !has_custom_headers {
+                if !Self::http_get_url_is_privateish(&parsed_url) && !has_custom_headers {
                     match crate::integrations::lightpanda::fetch_markdown(parsed_url.as_str()).await
                     {
                         Ok(markdown) => return Ok(markdown),
@@ -8066,7 +9812,7 @@ print(result["text"])
                                 | "x-forwarded-host"
                                 | "x-real-ip"
                         );
-                        if blocked {
+                        if blocked && !chat_override {
                             anyhow::bail!("Header '{}' is not allowed for http_get", k);
                         }
                         if let Some(s) = v.as_str() {
@@ -8284,16 +10030,67 @@ print(result["text"])
         }
     }
 
-    /// Connect to Docker, preferring DOCKER_HOST env var (for socket proxy) over local defaults
+    #[cfg(feature = "docker")]
+    fn docker_host_uses_socket_transport(host: &str) -> bool {
+        let trimmed = host.trim();
+        trimmed.starts_with("unix://") || trimmed.starts_with("npipe://")
+    }
+
+    /// Connect to Docker, honoring DOCKER_HOST transport instead of forcing HTTP.
     #[cfg(feature = "docker")]
     fn connect_docker() -> Result<bollard::Docker> {
         if let Ok(host) = std::env::var("DOCKER_HOST") {
-            tracing::debug!("Connecting to Docker via DOCKER_HOST={}", host);
-            bollard::Docker::connect_with_http_defaults()
-                .map_err(|e| anyhow::anyhow!("Failed to connect to Docker at {}: {}", host, e))
+            let trimmed = host.trim();
+            if !trimmed.is_empty() {
+                let transport = if Self::docker_host_uses_socket_transport(trimmed) {
+                    "socket"
+                } else {
+                    "network"
+                };
+                tracing::debug!(
+                    "Connecting to Docker via DOCKER_HOST={} ({})",
+                    trimmed,
+                    transport
+                );
+                return bollard::Docker::connect_with_defaults().map_err(|e| {
+                    anyhow::anyhow!("Failed to connect to Docker at {}: {}", trimmed, e)
+                });
+            }
+            bollard::Docker::connect_with_local_defaults()
+                .map_err(|e| anyhow::anyhow!("Failed to connect to Docker: {}", e))
         } else {
             bollard::Docker::connect_with_local_defaults()
                 .map_err(|e| anyhow::anyhow!("Failed to connect to Docker: {}", e))
+        }
+    }
+
+    fn should_manage_local_sandbox_containers_for(
+        role: Option<&str>,
+        has_local_docker_endpoint: bool,
+    ) -> bool {
+        let is_control_plane = role
+            .map(|value| value.trim().to_ascii_lowercase())
+            .is_some_and(|value| matches!(value.as_str(), "control-plane" | "control"));
+        !is_control_plane || has_local_docker_endpoint
+    }
+
+    pub(crate) fn should_manage_local_sandbox_containers() -> bool {
+        #[cfg(feature = "docker")]
+        {
+            let role = std::env::var("AGENTARK_STACK_ROLE").ok();
+            let has_local_docker_endpoint = std::env::var("DOCKER_HOST")
+                .ok()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+                || Path::new("/var/run/docker.sock").exists();
+            Self::should_manage_local_sandbox_containers_for(
+                role.as_deref(),
+                has_local_docker_endpoint,
+            )
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            false
         }
     }
 
@@ -8409,6 +10206,15 @@ print(result["text"])
     pub async fn reconcile_orphan_containers(&self) -> Result<u64> {
         #[cfg(feature = "docker")]
         {
+            if !Self::should_manage_local_sandbox_containers() {
+                tracing::debug!(
+                    "Skipping local sandbox container reconciliation on control plane without a local Docker endpoint"
+                );
+                self.update_container_reaper_status(0, None).await;
+                crate::metrics::record_container_sweeper_run("skipped", 0);
+                return Ok(0);
+            }
+
             let docker = match Self::connect_docker() {
                 Ok(docker) => docker,
                 Err(error) => {
@@ -8446,6 +10252,12 @@ print(result["text"])
                 Self::force_remove_container(&docker, id).await;
                 removed = removed.saturating_add(1);
             }
+            if let Err(error) = self.prune_stale_code_execute_artifacts().await {
+                tracing::warn!(
+                    "Failed to prune stale code execution artifacts during runtime reconciliation: {}",
+                    error
+                );
+            }
             self.update_container_reaper_status(removed, None).await;
             crate::metrics::record_container_sweeper_run("ok", removed);
             Ok(removed)
@@ -8454,6 +10266,97 @@ print(result["text"])
         {
             Ok(0)
         }
+    }
+
+    async fn prune_stale_path_entries(&self, root: &Path, max_age_secs: u64) -> Result<u64> {
+        let mut removed = 0u64;
+        let cutoff = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(max_age_secs))
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let mut entries = match tokio::fs::read_dir(root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error.into()),
+        };
+
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            let metadata = match entry.metadata().await {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let modified = match metadata.modified() {
+                Ok(modified) => modified,
+                Err(_) => continue,
+            };
+            if modified > cutoff {
+                continue;
+            }
+            if metadata.is_dir() {
+                tokio::fs::remove_dir_all(&path).await?;
+                removed = removed.saturating_add(1);
+            } else {
+                tokio::fs::remove_file(&path).await?;
+                removed = removed.saturating_add(1);
+            }
+        }
+
+        Ok(removed)
+    }
+
+    async fn prune_stale_native_code_execute_temp_dirs(&self) -> Result<u64> {
+        let temp_root = std::env::temp_dir();
+        let mut removed = 0u64;
+        let cutoff = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(
+                CODE_EXECUTE_NATIVE_TEMP_RETENTION_SECS,
+            ))
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let mut entries = match tokio::fs::read_dir(&temp_root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error.into()),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            let filename = entry.file_name();
+            let filename = filename.to_string_lossy();
+            if !filename.starts_with("agentark-exec-") {
+                continue;
+            }
+            let path = entry.path();
+            let metadata = match entry.metadata().await {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if !metadata.is_dir() {
+                continue;
+            }
+            let modified = match metadata.modified() {
+                Ok(modified) => modified,
+                Err(_) => continue,
+            };
+            if modified > cutoff {
+                continue;
+            }
+            tokio::fs::remove_dir_all(&path).await?;
+            removed = removed.saturating_add(1);
+        }
+        Ok(removed)
+    }
+
+    async fn prune_stale_code_execute_artifacts(&self) -> Result<u64> {
+        let mut removed = 0u64;
+        removed = removed.saturating_add(
+            self.prune_stale_path_entries(
+                &self.data_dir().join("outputs"),
+                CODE_EXECUTE_OUTPUT_RETENTION_SECS,
+            )
+            .await?,
+        );
+        removed = removed.saturating_add(self.prune_stale_native_code_execute_temp_dirs().await?);
+        Ok(removed)
     }
 
     fn docker_required_error(action_name: &str) -> anyhow::Error {
@@ -8468,10 +10371,28 @@ print(result["text"])
         &self,
         action_name: &str,
         arguments: &serde_json::Value,
+        auth_context: &ActionAuthorizationContext,
     ) -> Result<String> {
-        if action_name == "code_execute" {
-            if let Some(_executor) = Self::control_plane_executor_client() {
-                return self.execute_code_remote(arguments).await;
+        if let Some(_executor) = Self::control_plane_executor_client() {
+            if action_name == "code_execute" {
+                return self.execute_code_remote(arguments, auth_context).await;
+            }
+            if action_name == "shell" {
+                let command = arguments["command"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("Missing command"))?;
+                let shell_arguments = serde_json::json!({
+                    "language": "bash",
+                    "code": command,
+                    "timeout_secs": arguments
+                        .get("timeout_secs")
+                        .and_then(|value| value.as_i64())
+                        .unwrap_or(30),
+                    "network_access": false,
+                });
+                return self
+                    .execute_code_remote(&shell_arguments, auth_context)
+                    .await;
             }
         }
         #[cfg(feature = "docker")]
@@ -8507,7 +10428,7 @@ print(result["text"])
                     )
                     .await
                 }
-                "code_execute" => self.execute_code_docker(arguments).await,
+                "code_execute" => self.execute_code_docker(arguments, auth_context).await,
                 _ => Err(anyhow::anyhow!("Unknown docker action: {}", action_name)),
             }
         }
@@ -8626,10 +10547,6 @@ print(result["text"])
                 cpu_quota: Some(50_000),
                 pids_limit: Some(128),
                 network_mode: Some("none".to_string()),
-                tmpfs: Some(HashMap::from([(
-                    "/tmp".to_string(),
-                    "size=128M".to_string(),
-                )])),
                 cap_drop: Some(vec!["ALL".to_string()]),
                 security_opt: Some(security_opt.clone()),
                 auto_remove: Some(false),
@@ -8641,10 +10558,6 @@ print(result["text"])
                 cpu_period: Some(100_000),
                 cpu_quota: Some(50_000),
                 pids_limit: Some(128),
-                tmpfs: Some(HashMap::from([(
-                    "/tmp".to_string(),
-                    "size=128M".to_string(),
-                )])),
                 cap_drop: Some(vec!["ALL".to_string()]),
                 security_opt: Some(security_opt),
                 auto_remove: Some(false),
@@ -8661,7 +10574,17 @@ print(result["text"])
             labels: Some(Self::sandbox_container_labels(action_name, isolation)),
             host_config: Some(host_config),
             network_disabled: Some(network_disabled),
-            working_dir: Some("/tmp".to_string()),
+            working_dir: Some(
+                if matches!(
+                    isolation,
+                    ContainerIsolation::Standard | ContainerIsolation::StandardWithNetwork
+                ) {
+                    CODE_EXECUTE_SANDBOX_DIR
+                } else {
+                    "/tmp"
+                }
+                .to_string(),
+            ),
             ..Default::default()
         };
 
@@ -8936,7 +10859,8 @@ print(result["text"])
         &'static str,
     )> {
         // (image, extension, optional_build_cmd, run_cmd)
-        // {file} is replaced with /tmp/code.{ext} at runtime
+        // {file} is replaced with the sandbox source path at runtime.
+        // {sandbox_dir} is replaced with the writable execution workspace.
         match lang {
             // Interpreted
             "python" | "python3" | "py"
@@ -8960,33 +10884,245 @@ print(result["text"])
 
             // Compiled
             "java"
-                => Some(("eclipse-temurin:21-jdk", "java", Some("javac {file}"), "java -cp /tmp Main")),
+                => Some(("eclipse-temurin:21-jdk", "java", Some("javac {file}"), "java -cp {sandbox_dir} Main")),
             "c"
-                => Some(("gcc:latest", "c", Some("gcc {file} -o /tmp/a.out -lm"), "/tmp/a.out")),
+                => Some(("gcc:latest", "c", Some("gcc {file} -o {sandbox_dir}/a.out -lm"), "{sandbox_dir}/a.out")),
             "cpp" | "c++"
-                => Some(("gcc:latest", "cpp", Some("g++ {file} -o /tmp/a.out -lm"), "/tmp/a.out")),
+                => Some(("gcc:latest", "cpp", Some("g++ {file} -o {sandbox_dir}/a.out -lm"), "{sandbox_dir}/a.out")),
             "go" | "golang"
                 => Some(("golang:1-bookworm", "go", None, "go run {file}")),
             "rust" | "rs"
-                => Some(("rust:1-slim-bookworm", "rs", Some("rustc {file} -o /tmp/a.out"), "/tmp/a.out")),
+                => Some(("rust:1-slim-bookworm", "rs", Some("rustc {file} -o {sandbox_dir}/a.out"), "{sandbox_dir}/a.out")),
             "swift"
                 => Some(("swift:latest", "swift", None, "swift {file}")),
             "kotlin" | "kt"
-                => Some(("zenika/kotlin:latest", "kt", Some("kotlinc {file} -include-runtime -d /tmp/out.jar 2>/dev/null"), "java -jar /tmp/out.jar")),
+                => Some(("zenika/kotlin:latest", "kt", Some("kotlinc {file} -include-runtime -d {sandbox_dir}/out.jar 2>/dev/null"), "java -jar {sandbox_dir}/out.jar")),
 
             // Jupyter notebook â€” execute in-place and output results
             "jupyter" | "notebook" | "ipynb"
                 => Some(("python:3-slim", "ipynb",
-                    Some("PIP_ROOT_USER_ACTION=ignore PIP_DISABLE_PIP_VERSION_CHECK=1 pip install -q jupyter nbconvert nbformat matplotlib pandas numpy scikit-learn seaborn 2>/dev/null"),
+                    Some("PIP_ROOT_USER_ACTION=ignore PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --no-cache-dir -q jupyter nbconvert nbformat matplotlib pandas numpy scikit-learn seaborn 2>/dev/null"),
                     "jupyter nbconvert --to notebook --execute --inplace {file} 2>&1 && python3 -c \"import json; nb=json.load(open('{file}')); [print(o.get('text','')) for c in nb['cells'] for o in c.get('outputs',[]) if o.get('output_type')=='stream']\" ")),
 
             _ => None,
         }
     }
 
+    fn code_execute_contract_phase(arguments: &serde_json::Value) -> Option<&'static str> {
+        let phase = arguments
+            .get("execution_contract")
+            .and_then(|value| value.get("phase"))
+            .and_then(|value| value.as_str())?
+            .trim()
+            .to_ascii_lowercase();
+        match phase.as_str() {
+            "bootstrap" => Some("bootstrap"),
+            "validate" => Some("validate"),
+            "poll" => Some("poll"),
+            _ => None,
+        }
+    }
+
+    fn code_execute_contract_flag(arguments: &serde_json::Value, key: &str) -> bool {
+        arguments
+            .get("execution_contract")
+            .and_then(|value| value.get(key))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+    }
+
+    fn text_contains_network_endpoint(text: &str) -> bool {
+        let lower = text.to_ascii_lowercase();
+        if lower.contains("://") || lower.contains("localhost") || lower.contains("::1") {
+            return true;
+        }
+
+        for candidate in lower.split(|c: char| !(c.is_ascii_digit() || c == '.')) {
+            let octets: Vec<&str> = candidate.split('.').collect();
+            if octets.len() == 4
+                && octets
+                    .iter()
+                    .all(|part| !part.is_empty() && part.len() <= 3 && part.parse::<u8>().is_ok())
+            {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn json_value_contains_network_endpoint(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::String(text) => Self::text_contains_network_endpoint(text),
+            serde_json::Value::Array(values) => values
+                .iter()
+                .any(Self::json_value_contains_network_endpoint),
+            serde_json::Value::Object(values) => values
+                .values()
+                .any(Self::json_value_contains_network_endpoint),
+            _ => false,
+        }
+    }
+
+    fn code_execute_effective_network_access(arguments: &serde_json::Value) -> bool {
+        arguments
+            .get("network_access")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+            || Self::code_execute_contract_flag(arguments, "target_connectivity_required")
+            || Self::json_value_contains_network_endpoint(arguments)
+    }
+
+    fn build_code_execute_execution_metadata(
+        arguments: &serde_json::Value,
+        success: bool,
+        output_file_count: usize,
+    ) -> serde_json::Value {
+        let phase = Self::code_execute_contract_phase(arguments);
+        let target_validated = success
+            && Self::code_execute_contract_flag(arguments, "target_validated_when_successful");
+        let explicit_ready_for_watch = success
+            && Self::code_execute_contract_flag(arguments, "ready_for_watch_when_successful");
+        let ready_for_watch = explicit_ready_for_watch
+            || (success && phase == Some("poll"))
+            || (success && phase == Some("validate") && target_validated);
+        let setup_only = success && phase == Some("bootstrap") && !ready_for_watch;
+
+        serde_json::json!({
+            "phase": phase,
+            "setup_only": setup_only,
+            "target_validated": target_validated,
+            "ready_for_watch": ready_for_watch,
+            "target_connectivity_required": Self::code_execute_contract_flag(
+                arguments,
+                "target_connectivity_required",
+            ),
+            "network_access_requested": Self::code_execute_effective_network_access(arguments),
+            "output_file_count": output_file_count,
+        })
+    }
+
+    fn code_execute_high_risk_install_is_explicitly_approved(
+        auth_context: &ActionAuthorizationContext,
+    ) -> bool {
+        auth_context.current_turn_is_explicit_approval
+            && auth_context.direct_user_intent
+            && auth_context
+                .principal
+                .as_ref()
+                .is_some_and(|principal| principal.trusted)
+            && matches!(
+                auth_context.surface,
+                ActionExecutionSurface::Chat | ActionExecutionSurface::Api
+            )
+    }
+
+    fn detect_risky_code_execute_install_request(code: &str) -> Option<String> {
+        let lower = code.to_ascii_lowercase();
+        let patterns = [
+            ("apt-get ", "system package manager install (`apt-get`)"),
+            ("apt ", "system package manager install (`apt`)"),
+            ("yum ", "system package manager install (`yum`)"),
+            ("dnf ", "system package manager install (`dnf`)"),
+            ("apk add", "system package manager install (`apk add`)"),
+            ("pacman -s", "system package manager install (`pacman`)"),
+            (
+                "brew install",
+                "host package manager install (`brew install`)",
+            ),
+            (
+                "choco install",
+                "host package manager install (`choco install`)",
+            ),
+            (
+                "winget install",
+                "host package manager install (`winget install`)",
+            ),
+            ("| sh", "piped remote shell installer"),
+            ("| bash", "piped remote shell installer"),
+            ("| zsh", "piped remote shell installer"),
+            ("| iex", "piped remote PowerShell installer"),
+            ("git+", "non-registry package source (`git+`)"),
+            ("pip install http://", "direct URL package install"),
+            ("pip install https://", "direct URL package install"),
+            (
+                "python -m pip install http://",
+                "direct URL package install",
+            ),
+            (
+                "python -m pip install https://",
+                "direct URL package install",
+            ),
+            ("npm install http://", "direct URL package install"),
+            ("npm install https://", "direct URL package install"),
+            ("npm install git+", "git package install"),
+            ("npm install git@", "git package install"),
+            ("npm install github:", "GitHub package install"),
+        ];
+        for (needle, reason) in patterns {
+            if lower.contains(needle) {
+                return Some(reason.to_string());
+            }
+        }
+        if (lower.contains("curl ") || lower.contains("wget "))
+            && (lower.contains("| sh")
+                || lower.contains("| bash")
+                || lower.contains("| zsh")
+                || lower.contains("| iex"))
+        {
+            return Some("remote script installer".to_string());
+        }
+        None
+    }
+
+    fn build_code_execute_dependency_metadata(
+        python_packages: &[String],
+        node_packages: &[String],
+    ) -> serde_json::Value {
+        let mut installers = Vec::new();
+        if !python_packages.is_empty() {
+            installers.push(serde_json::json!({
+                "manager": "pip",
+                "sandbox_only": true,
+                "auto_allowed": true,
+                "packages": python_packages,
+            }));
+        }
+        if !node_packages.is_empty() {
+            installers.push(serde_json::json!({
+                "manager": "npm",
+                "sandbox_only": true,
+                "auto_allowed": true,
+                "packages": node_packages,
+            }));
+        }
+        serde_json::json!({ "installers": installers })
+    }
+
+    fn code_execute_dependency_summary(
+        python_packages: &[String],
+        node_packages: &[String],
+    ) -> Option<String> {
+        let mut sections = Vec::new();
+        if !python_packages.is_empty() {
+            sections.push(format!("pip: {}", python_packages.join(", ")));
+        }
+        if !node_packages.is_empty() {
+            sections.push(format!("npm: {}", node_packages.join(", ")));
+        }
+        if sections.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "AgentArk auto-installed sandbox dependencies: {}.",
+                sections.join("; ")
+            ))
+        }
+    }
+
     /// Detect non-stdlib Python imports and return a pip install command.
     /// Scans `import X` and `from X import` statements, filters out stdlib modules.
-    fn detect_python_deps(code: &str) -> String {
+    fn detect_python_dep_packages(code: &str) -> Vec<String> {
         // Python stdlib modules (comprehensive but not exhaustive â€” errs on side of not installing)
         const STDLIB: &[&str] = &[
             "abc",
@@ -9197,7 +11333,7 @@ print(result["text"])
         fn pip_name(module: &str) -> String {
             match module {
                 "PIL" | "Pillow" => "Pillow".to_string(),
-                "cv2" => "opencv-python".to_string(),
+                "cv2" => "opencv-python-headless".to_string(),
                 "sklearn" | "scikit_learn" => "scikit-learn".to_string(),
                 "bs4" => "beautifulsoup4".to_string(),
                 "yaml" => "pyyaml".to_string(),
@@ -9267,20 +11403,13 @@ print(result["text"])
             }
         }
 
-        if deps.is_empty() {
-            return String::new();
-        }
-
-        let dep_list: Vec<&str> = deps.iter().map(|s| s.as_str()).collect();
-        tracing::info!("Auto-detected Python deps: {:?}", dep_list);
-        format!(
-            "PIP_ROOT_USER_ACTION=ignore PIP_DISABLE_PIP_VERSION_CHECK=1 pip install -q {} && ",
-            dep_list.join(" ")
-        )
+        let mut dep_list: Vec<String> = deps.into_iter().collect();
+        dep_list.sort();
+        dep_list
     }
 
     /// Detect non-builtin Node.js requires/imports and return an npm install command.
-    fn detect_node_deps(code: &str) -> String {
+    fn detect_node_dep_packages(code: &str) -> Vec<String> {
         // Node.js built-in modules
         const BUILTINS: &[&str] = &[
             "assert",
@@ -9351,16 +11480,9 @@ print(result["text"])
             }
         }
 
-        if deps.is_empty() {
-            return String::new();
-        }
-
-        let dep_list: Vec<&str> = deps.iter().map(|s| s.as_str()).collect();
-        tracing::info!("Auto-detected Node.js deps: {:?}", dep_list);
-        format!(
-            "npm install --no-fund --no-audit -q {} 2>/dev/null && ",
-            dep_list.join(" ")
-        )
+        let mut dep_list: Vec<String> = deps.into_iter().collect();
+        dep_list.sort();
+        dep_list
     }
 
     /// Execute code in an isolated Docker container.
@@ -9368,7 +11490,17 @@ print(result["text"])
     /// Container is ephemeral â€” fully destroyed after execution.
     /// Output files (images, CSVs, etc.) are extracted before container cleanup.
     #[cfg(feature = "docker")]
-    async fn execute_code_docker(&self, arguments: &serde_json::Value) -> Result<String> {
+    async fn execute_code_docker(
+        &self,
+        arguments: &serde_json::Value,
+        auth_context: &ActionAuthorizationContext,
+    ) -> Result<String> {
+        if let Err(error) = self.prune_stale_code_execute_artifacts().await {
+            tracing::warn!(
+                "Failed to prune stale code execution artifacts before sandbox run: {}",
+                error
+            );
+        }
         let language = arguments["language"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'language' argument"))?
@@ -9376,6 +11508,19 @@ print(result["text"])
         let code_raw = arguments["code"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'code' argument"))?;
+        if let Some(reason) = Self::detect_risky_code_execute_install_request(code_raw) {
+            if Self::code_execute_high_risk_install_is_explicitly_approved(auth_context) {
+                tracing::info!(
+                    "Allowing high-risk code_execute installer after explicit approval turn: {}",
+                    reason
+                );
+            } else {
+                anyhow::bail!(
+                    "High-risk installer path detected inside `code_execute`: {}. Ordinary sandbox-local pip/npm installs from standard registries are auto-allowed. I did not run this installer automatically. Reply with approval in this chat if you want me to allow this exact installer path, or rewrite it to use standard registry packages inside the sandbox.",
+                    reason
+                );
+            }
+        }
 
         // Strip Jupyter magic commands (!pip, !apt, !conda, %pip, %conda, etc.)
         // LLMs often generate these in regular Python scripts â€” our auto-dependency
@@ -9408,10 +11553,10 @@ print(result["text"])
             ))?;
 
         let code_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, code);
-        let file_path = format!("/tmp/code.{}", ext);
+        let file_path = format!("{}/code.{}", CODE_EXECUTE_SANDBOX_DIR, ext);
         // Java needs the file named Main.java
         let file_path = if language == "java" {
-            "/tmp/Main.java".to_string()
+            format!("{}/Main.java", CODE_EXECUTE_SANDBOX_DIR)
         } else {
             file_path
         };
@@ -9440,29 +11585,65 @@ print(result["text"])
             }
         }
 
-        // Auto-detect dependencies for Python: scan imports, pip install non-stdlib packages
-        let auto_install_cmd = if matches!(language.as_str(), "python" | "python3" | "py") {
-            Self::detect_python_deps(code)
-        } else if matches!(
+        // Auto-detect dependencies for Python/Node and install them inside the sandbox only.
+        let python_packages = if matches!(language.as_str(), "python" | "python3" | "py") {
+            Self::detect_python_dep_packages(code)
+        } else {
+            Vec::new()
+        };
+        let node_packages = if matches!(
             language.as_str(),
             "javascript" | "js" | "node" | "typescript" | "ts"
         ) {
-            Self::detect_node_deps(code)
+            Self::detect_node_dep_packages(code)
+        } else {
+            Vec::new()
+        };
+        let auto_install_cmd = if !python_packages.is_empty() {
+            tracing::info!("Auto-detected Python deps: {:?}", python_packages);
+            format!(
+                "PIP_ROOT_USER_ACTION=ignore PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --no-cache-dir -q {} && ",
+                python_packages.join(" ")
+            )
+        } else if !node_packages.is_empty() {
+            tracing::info!("Auto-detected Node.js deps: {:?}", node_packages);
+            format!(
+                "npm install --no-fund --no-audit -q {} 2>/dev/null && ",
+                node_packages.join(" ")
+            )
         } else {
             String::new()
         };
 
-        let run = run_cmd.replace("{file}", &file_path);
+        let run = run_cmd
+            .replace("{file}", &file_path)
+            .replace("{sandbox_dir}", CODE_EXECUTE_SANDBOX_DIR);
+        let workspace_bootstrap = format!(
+            "mkdir -p '{sandbox}' '{home}' '{tmp}' '{cache}' '{pip_cache}' '{cache}/npm' /data && export HOME='{home}' TMPDIR='{tmp}' TMP='{tmp}' TEMP='{tmp}' XDG_CACHE_HOME='{cache}' PIP_CACHE_DIR='{pip_cache}' npm_config_cache='{cache}/npm' NPM_CONFIG_CACHE='{cache}/npm' && cd '{sandbox}' && ",
+            sandbox = CODE_EXECUTE_SANDBOX_DIR,
+            home = CODE_EXECUTE_HOME_DIR,
+            tmp = CODE_EXECUTE_TMP_DIR,
+            cache = CODE_EXECUTE_CACHE_DIR,
+            pip_cache = CODE_EXECUTE_PIP_CACHE_DIR,
+        );
         let main_cmd = if let Some(build) = build_cmd {
-            let build = build.replace("{file}", &file_path);
+            let build = build
+                .replace("{file}", &file_path)
+                .replace("{sandbox_dir}", CODE_EXECUTE_SANDBOX_DIR);
             format!(
-                "{}{}echo '{}' | base64 -d > {} && {} && {}",
-                file_inject_cmds, auto_install_cmd, code_b64, file_path, build, run
+                "{}{}{}echo '{}' | base64 -d > {} && {} && {}",
+                workspace_bootstrap,
+                file_inject_cmds,
+                auto_install_cmd,
+                code_b64,
+                file_path,
+                build,
+                run
             )
         } else {
             format!(
-                "{}{}echo '{}' | base64 -d > {} && {}",
-                file_inject_cmds, auto_install_cmd, code_b64, file_path, run
+                "{}{}{}echo '{}' | base64 -d > {} && {}",
+                workspace_bootstrap, file_inject_cmds, auto_install_cmd, code_b64, file_path, run
             )
         };
 
@@ -9481,19 +11662,36 @@ print(result["text"])
             String::new()
         };
         let shell_cmd = format!(
-            r#"{}; __AGENTARK_EXIT=$?; echo; echo '__AGENTARK_OUTPUT_FILES__';{} find /tmp -maxdepth 2 -type f ! -name 'code.*' ! -name 'a.out' ! -name 'Main.*' ! -name '*.class' ! -name 'out.jar' ! -name '*.ipynb' -newer {} 2>/dev/null | head -20 | while IFS= read -r __f; do __sz=$(stat -c%s "$__f" 2>/dev/null || echo 999999999); if [ "$__sz" -lt 5242880 ]; then echo "FILE:$(basename "$__f"):$(base64 "$__f" | tr -d '\n')"; fi; done; exit $__AGENTARK_EXIT"#,
-            main_cmd, notebook_extra, file_path
+            r#"{}; __AGENTARK_EXIT=$?; echo; echo '__AGENTARK_OUTPUT_FILES__';{} find {sandbox_dir} -maxdepth 3 -type f ! -name 'code.*' ! -name 'a.out' ! -name 'Main.*' ! -name '*.class' ! -name 'out.jar' ! -name '*.ipynb' -newer {} 2>/dev/null | head -20 | while IFS= read -r __f; do __sz=$(stat -c%s "$__f" 2>/dev/null || echo 999999999); if [ "$__sz" -lt 5242880 ]; then echo "FILE:$(basename "$__f"):$(base64 "$__f" | tr -d '\n')"; fi; done; exit $__AGENTARK_EXIT"#,
+            main_cmd,
+            notebook_extra,
+            file_path,
+            sandbox_dir = CODE_EXECUTE_SANDBOX_DIR
         );
 
-        // Notebooks get 10 min (install deps + execute all cells + ML training)
-        // Compiled languages get 120s (build + run), interpreted get 60s
-        let timeout = if is_notebook {
+        // Notebooks get 10 min (install deps + execute all cells + ML training).
+        // Compiled languages get 120s (build + run), interpreted get 60s. If
+        // runtime auto-installs dependencies, raise the default so the control
+        // plane does not time out ordinary sandbox package bootstrap.
+        let base_timeout = if is_notebook {
             600
         } else if build_cmd.is_some() {
             120
         } else {
             60
         };
+        let dependency_bootstrap = !python_packages.is_empty() || !node_packages.is_empty();
+        let default_timeout = if dependency_bootstrap {
+            base_timeout.max(180)
+        } else {
+            base_timeout
+        };
+        let timeout_limit = if is_notebook { 900 } else { 600 };
+        let timeout = arguments
+            .get("timeout_secs")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(default_timeout)
+            .clamp(1, timeout_limit);
 
         // Optional env vars for execution (resolved placeholders are already applied by the runtime).
         let env_vec: Option<Vec<String>> = arguments
@@ -9505,10 +11703,7 @@ print(result["text"])
                     .collect::<Vec<_>>()
             })
             .filter(|v| !v.is_empty());
-        let network_access = arguments
-            .get("network_access")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
+        let network_access = Self::code_execute_effective_network_access(arguments);
         let isolation = if network_access {
             ContainerIsolation::StandardWithNetwork
         } else {
@@ -9541,10 +11736,21 @@ print(result["text"])
                 )
             })?;
 
+        let install_summary =
+            Self::code_execute_dependency_summary(&python_packages, &node_packages);
+        let install_metadata =
+            Self::build_code_execute_dependency_metadata(&python_packages, &node_packages);
         let (user_output, saved_files) = if let Some(marker_pos) =
             output.find("__AGENTARK_OUTPUT_FILES__")
         {
-            let user_output = output[..marker_pos].trim_end().to_string();
+            let mut user_output = output[..marker_pos].trim_end().to_string();
+            if let Some(summary) = install_summary.as_deref() {
+                if user_output.is_empty() {
+                    user_output = summary.to_string();
+                } else if !user_output.contains(summary) {
+                    user_output = format!("{}\n{}", summary, user_output);
+                }
+            }
             let files_section = &output[marker_pos..];
 
             let mut saved = Vec::new();
@@ -9595,7 +11801,15 @@ print(result["text"])
                 format!("Failed to save code artifact '{}'", code_path.display())
             })?;
             saved.push(format!("/api/outputs/{}/{}", exec_id, code_filename));
-            (output.to_string(), saved)
+            let mut user_output = output.to_string();
+            if let Some(summary) = install_summary.as_deref() {
+                if user_output.trim().is_empty() {
+                    user_output = summary.to_string();
+                } else if !user_output.contains(summary) {
+                    user_output = format!("{}\n{}", summary, user_output);
+                }
+            }
+            (user_output, saved)
         };
 
         // Build final result with file paths
@@ -9603,7 +11817,44 @@ print(result["text"])
             "output": user_output,
             "error": parsed.get("error").cloned().unwrap_or(serde_json::Value::Null),
             "exit_code": parsed.get("exit_code").cloned().unwrap_or(serde_json::json!(-1)),
+            "dependency_installs": install_metadata,
+            "agentark_execution": Self::build_code_execute_execution_metadata(
+                arguments,
+                parsed
+                    .get("exit_code")
+                    .and_then(|value| value.as_i64())
+                    .unwrap_or(-1)
+                    == 0,
+                saved_files.len(),
+            ),
         });
+
+        let exit_code = parsed
+            .get("exit_code")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(-1);
+        if exit_code != 0 {
+            let combined_failure_text = format!(
+                "{}\n{}",
+                result
+                    .get("output")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(""),
+                result
+                    .get("error")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+            );
+            if let Some(binary) = Self::detect_missing_binary_from_output(&combined_failure_text) {
+                result["missing_capabilities"] = serde_json::json!([{
+                    "kind": "binary",
+                    "name": binary,
+                    "approval_required": true,
+                    "route": "host_install_approval",
+                    "reason": "The sandbox execution failed because this binary is not available. AgentArk will not install OS/host packages without explicit approval."
+                }]);
+            }
+        }
 
         if !saved_files.is_empty() {
             result["files"] = serde_json::json!(saved_files);
@@ -9614,6 +11865,12 @@ print(result["text"])
 
     /// Fallback: execute code natively in an isolated temp directory (no Docker)
     async fn execute_code_native(&self, arguments: &serde_json::Value) -> Result<String> {
+        if let Err(error) = self.prune_stale_code_execute_artifacts().await {
+            tracing::warn!(
+                "Failed to prune stale code execution artifacts before native sandbox run: {}",
+                error
+            );
+        }
         let language = arguments["language"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'language' argument"))?
@@ -9674,6 +11931,11 @@ print(result["text"])
             "output": stdout,
             "error": if stderr.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(stderr) },
             "exit_code": exit_code,
+            "agentark_execution": Self::build_code_execute_execution_metadata(
+                arguments,
+                exit_code == 0,
+                0,
+            ),
         });
 
         Ok(serde_json::to_string(&result)?)
@@ -9683,6 +11945,24 @@ print(result["text"])
     pub async fn list_actions(&self) -> Result<Vec<ActionDef>> {
         let actions = self.actions.read().await;
         Ok(actions.values().map(|s| s.info.clone()).collect())
+    }
+
+    pub async fn action_definition(&self, action_name: &str) -> Option<ActionDef> {
+        let actions = self.actions.read().await;
+        actions.get(action_name).map(|loaded| loaded.info.clone())
+    }
+
+    pub async fn list_action_scope_hints(&self) -> Result<HashMap<String, ActionScopeHint>> {
+        let actions = self.actions.read().await;
+        Ok(actions
+            .iter()
+            .map(|(name, loaded)| {
+                (
+                    name.clone(),
+                    Self::action_scope_hint_for_loaded_action(name, loaded),
+                )
+            })
+            .collect())
     }
 
     /// List only actions that are currently executable by the agent.
@@ -9700,8 +11980,7 @@ print(result["text"])
         drop(disabled);
         let mut enabled = Vec::new();
         for action in actions {
-            if action.source == ActionSource::System
-                && !self.is_builtin_integration_action_enabled(&action.name)
+            if action.source == ActionSource::System && !self.is_action_integration_enabled(&action)
             {
                 continue;
             }
@@ -9735,9 +12014,7 @@ print(result["text"])
         let Some(action) = action else {
             return false;
         };
-        if action.source == ActionSource::System
-            && !self.is_builtin_integration_action_enabled(name)
-        {
+        if action.source == ActionSource::System && !self.is_action_integration_enabled(&action) {
             return false;
         }
         if action.source != ActionSource::System {
@@ -11106,7 +13383,7 @@ required:{required_block}
 
         // Step 2: Perform web searches
         let mut search_results = Vec::new();
-        let search_config = build_search_config(&self.config_dir).await;
+        let search_config = build_search_config(&self.config_dir, self.storage.as_ref()).await;
 
         for query in &search_queries {
             tracing::debug!("Searching: {}", query);
@@ -11271,6 +13548,24 @@ required:{required_block}
         out
     }
 
+    fn slugify_name(value: &str) -> String {
+        let mut slug = String::new();
+        let mut last_was_separator = false;
+        for ch in value.trim().chars() {
+            if ch.is_ascii_alphanumeric() {
+                slug.push(ch.to_ascii_lowercase());
+                last_was_separator = false;
+            } else if !last_was_separator {
+                slug.push('-');
+                last_was_separator = true;
+            }
+        }
+        while slug.ends_with('-') {
+            slug.pop();
+        }
+        slug
+    }
+
     fn parse_required_fields_from_frontmatter(frontmatter: &str) -> Vec<String> {
         let mut required = Vec::new();
         let lines: Vec<&str> = frontmatter.lines().collect();
@@ -11279,9 +13574,15 @@ required:{required_block}
         while i < lines.len() {
             let raw = lines[i];
             let line = raw.trim();
-            let is_required_key = line.starts_with("required:")
-                || line.starts_with("required_inputs:")
-                || line.starts_with("requiredInputs:");
+            let is_required_key = line
+                .split_once(':')
+                .map(|(key, _)| Self::slugify_name(key).replace('-', "_"))
+                .is_some_and(|key| {
+                    matches!(
+                        key.as_str(),
+                        "required" | "required_inputs" | "requiredinputs" | "required_fields"
+                    )
+                });
             if is_required_key {
                 let rhs = line
                     .split_once(':')
@@ -11341,14 +13642,23 @@ required:{required_block}
             }
 
             if line.starts_with('#') {
-                let heading = line.trim_start_matches('#').trim().to_ascii_lowercase();
-                in_required_section = heading.contains("required input")
-                    || heading == "required"
-                    || heading == "input contract";
+                let heading = Self::slugify_name(line.trim_start_matches('#').trim());
+                in_required_section = matches!(
+                    heading.as_str(),
+                    "required-inputs"
+                        | "inputs-required"
+                        | "required-fields"
+                        | "required"
+                        | "input-contract"
+                );
                 continue;
             }
 
-            if line.to_ascii_lowercase().starts_with("required inputs:") {
+            if line
+                .split_once(':')
+                .map(|(key, _)| Self::slugify_name(key))
+                .is_some_and(|key| matches!(key.as_str(), "required-inputs" | "inputs-required"))
+            {
                 in_required_section = true;
                 continue;
             }
@@ -11723,15 +14033,58 @@ required:{required_block}
     }
 }
 
-/// Build search config: loads user settings from search.toml, injects API-backed
-/// secrets, auto-detects Playwright for explicit opt-in use, and applies the
-/// default Lightpanda -> DuckDuckGo -> none chain only when no chain is saved.
-async fn build_search_config(config_dir: &Path) -> crate::actions::SearchConfig {
-    // Load saved search config (from Settings UI)
-    let mut config = match std::fs::read_to_string(config_dir.join("search.toml")) {
-        Ok(content) => toml::from_str::<crate::actions::SearchConfig>(&content).unwrap_or_default(),
-        Err(_) => crate::actions::SearchConfig::default(),
-    };
+pub(crate) fn load_persisted_search_config(
+    config_dir: &Path,
+    data_dir: Option<&Path>,
+) -> crate::actions::SearchConfig {
+    if let Ok(manager) = SecureConfigManager::new_with_data_dir(config_dir, data_dir) {
+        if manager.uses_storage_backend() {
+            match manager.load_encrypted_json::<crate::actions::SearchConfig>(
+                crate::core::config::SETTINGS_SEARCH_KEY,
+            ) {
+                Ok(Some(config)) => return config,
+                Ok(None) => return crate::actions::SearchConfig::default(),
+                Err(error) => {
+                    tracing::warn!(
+                        "Failed to load search config from settings storage: {}",
+                        error
+                    )
+                }
+            }
+        }
+    }
+
+    std::fs::read_to_string(config_dir.join("search.toml"))
+        .ok()
+        .and_then(|content| toml::from_str::<crate::actions::SearchConfig>(&content).ok())
+        .unwrap_or_default()
+}
+
+pub(crate) fn save_persisted_search_config(
+    config_dir: &Path,
+    data_dir: Option<&Path>,
+    config: &crate::actions::SearchConfig,
+) -> Result<()> {
+    if let Ok(manager) = SecureConfigManager::new_with_data_dir(config_dir, data_dir) {
+        if manager.uses_storage_backend() {
+            return manager.save_encrypted_json(crate::core::config::SETTINGS_SEARCH_KEY, config);
+        }
+    }
+
+    let content = toml::to_string_pretty(config)?;
+    std::fs::write(config_dir.join("search.toml"), content)?;
+    Ok(())
+}
+
+/// Build search config: loads user settings from persistent settings storage,
+/// injects API-backed secrets, auto-detects Playwright for explicit opt-in use,
+/// and applies the default Lightpanda -> DuckDuckGo -> none chain only when no
+/// chain is saved.
+pub(crate) async fn build_search_config(
+    config_dir: &Path,
+    storage: Option<&crate::storage::Storage>,
+) -> crate::actions::SearchConfig {
+    let mut config = load_persisted_search_config(config_dir, None);
 
     if let Ok(manager) = crate::core::config::SecureConfigManager::new(config_dir) {
         if let Ok(secrets) = manager.load_secrets() {
@@ -11764,6 +14117,68 @@ async fn build_search_config(config_dir: &Path) -> crate::actions::SearchConfig 
             ) {
                 config.brave = None;
             }
+
+            if let Some(api_key) = secrets
+                .custom
+                .get("search_exa_key")
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+            {
+                config.exa = Some(crate::actions::search::SearchBackend::Exa { api_key });
+            } else if matches!(
+                &config.exa,
+                Some(crate::actions::search::SearchBackend::Exa { api_key })
+                    if api_key.trim().is_empty()
+            ) {
+                config.exa = None;
+            }
+
+            if let Some(api_key) = secrets
+                .custom
+                .get("search_tavily_key")
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+            {
+                config.tavily = Some(crate::actions::search::SearchBackend::Tavily { api_key });
+            } else if matches!(
+                &config.tavily,
+                Some(crate::actions::search::SearchBackend::Tavily { api_key })
+                    if api_key.trim().is_empty()
+            ) {
+                config.tavily = None;
+            }
+
+            if let Some(api_key) = secrets
+                .custom
+                .get("search_perplexity_key")
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+            {
+                config.perplexity =
+                    Some(crate::actions::search::SearchBackend::Perplexity { api_key });
+            } else if matches!(
+                &config.perplexity,
+                Some(crate::actions::search::SearchBackend::Perplexity { api_key })
+                    if api_key.trim().is_empty()
+            ) {
+                config.perplexity = None;
+            }
+
+            if let Some(api_key) = secrets
+                .custom
+                .get("search_firecrawl_key")
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+            {
+                config.firecrawl =
+                    Some(crate::actions::search::SearchBackend::Firecrawl { api_key });
+            } else if matches!(
+                &config.firecrawl,
+                Some(crate::actions::search::SearchBackend::Firecrawl { api_key })
+                    if api_key.trim().is_empty()
+            ) {
+                config.firecrawl = None;
+            }
         }
     }
 
@@ -11791,8 +14206,9 @@ async fn build_search_config(config_dir: &Path) -> crate::actions::SearchConfig 
     }
 
     config.ensure_default_chain();
+    let health = crate::actions::search::SearchBackendHealthState::load(storage).await;
 
-    config
+    config.with_health(health)
 }
 
 #[cfg(test)]
@@ -11855,6 +14271,262 @@ mod tests {
         assert_eq!(structured.status, "completed");
     }
 
+    #[test]
+    fn parse_tool_completion_accepts_raw_json_envelope() {
+        let structured = parse_schedule_task_completion(
+            &serde_json::json!({
+                "tool": "schedule_task",
+                "status": "completed",
+                "detail": "Task scheduled"
+            })
+            .to_string(),
+        )
+        .expect("raw JSON completion should parse");
+
+        assert_eq!(structured.tool, "schedule_task");
+        assert_eq!(structured.status, "completed");
+    }
+
+    #[test]
+    fn parse_workflow_inputs_accepts_structured_json_without_marker() {
+        let payload = serde_json::json!({
+            "action": "lookup_customer",
+            "missing": ["customer_id"],
+            "required": ["customer_id"],
+            "provided": [],
+            "query": "lookup customer"
+        })
+        .to_string();
+
+        let parsed = parse_workflow_missing_inputs_marker(&payload)
+            .expect("raw JSON missing-input payload should parse");
+
+        assert_eq!(parsed.action, "lookup_customer");
+        assert_eq!(parsed.missing, vec!["customer_id".to_string()]);
+    }
+
+    #[test]
+    fn required_input_parsing_accepts_canonicalized_metadata_keys_and_headings() {
+        let frontmatter = "Required Fields:\n  - customer_id\n  - account_id";
+        assert_eq!(
+            ActionRuntime::parse_required_fields_from_frontmatter(frontmatter),
+            vec!["customer_id".to_string(), "account_id".to_string()]
+        );
+
+        let workflow = "## Inputs Required\n- `customer_id`: stable customer id\n- account_id";
+        assert_eq!(
+            ActionRuntime::parse_required_fields_from_workflow(workflow),
+            vec!["customer_id".to_string(), "account_id".to_string()]
+        );
+    }
+
+    #[test]
+    fn docker_host_socket_transport_detection_handles_unix_and_tcp_hosts() {
+        assert!(ActionRuntime::docker_host_uses_socket_transport(
+            "unix:///var/run/docker.sock"
+        ));
+        assert!(ActionRuntime::docker_host_uses_socket_transport(
+            "npipe:////./pipe/docker_engine"
+        ));
+        assert!(!ActionRuntime::docker_host_uses_socket_transport(
+            "tcp://127.0.0.1:2375"
+        ));
+        assert!(!ActionRuntime::docker_host_uses_socket_transport(
+            "http://docker.internal:2375"
+        ));
+    }
+
+    #[test]
+    fn control_plane_without_local_docker_skips_local_docker_management() {
+        assert!(!ActionRuntime::should_manage_local_sandbox_containers_for(
+            Some("control"),
+            false,
+        ));
+        assert!(!ActionRuntime::should_manage_local_sandbox_containers_for(
+            Some("control-plane"),
+            false,
+        ));
+        assert!(ActionRuntime::should_manage_local_sandbox_containers_for(
+            Some("control"),
+            true,
+        ));
+        assert!(ActionRuntime::should_manage_local_sandbox_containers_for(
+            Some("executor"),
+            false,
+        ));
+        assert!(ActionRuntime::should_manage_local_sandbox_containers_for(
+            None, false,
+        ));
+    }
+
+    #[test]
+    fn code_execute_execution_metadata_marks_bootstrap_setup_only() {
+        let metadata = ActionRuntime::build_code_execute_execution_metadata(
+            &serde_json::json!({
+                "network_access": false,
+                "execution_contract": {
+                    "phase": "bootstrap"
+                }
+            }),
+            true,
+            0,
+        );
+
+        assert_eq!(
+            metadata.get("phase").and_then(|value| value.as_str()),
+            Some("bootstrap")
+        );
+        assert_eq!(
+            metadata.get("setup_only").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            metadata
+                .get("ready_for_watch")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn upload_signature_detects_opus_by_bytes_without_extension() {
+        let mut bytes = b"OggS".to_vec();
+        bytes.extend_from_slice(&[0; 24]);
+        bytes.extend_from_slice(b"OpusHead");
+        let detected = ActionRuntime::upload_signature("voice", None, &bytes);
+
+        assert_eq!(
+            detected.get("input_type").and_then(|value| value.as_str()),
+            Some("audio")
+        );
+        assert_eq!(
+            detected.get("extension").and_then(|value| value.as_str()),
+            Some("opus")
+        );
+    }
+
+    #[test]
+    fn upload_signature_keeps_unknown_unresolved_instead_of_guessing_text() {
+        let detected = ActionRuntime::upload_signature(
+            "payload",
+            Some("application/octet-stream"),
+            b"plain utf8 but no durable type evidence",
+        );
+
+        assert_eq!(
+            detected.get("input_type").and_then(|value| value.as_str()),
+            Some("unknown")
+        );
+        assert_eq!(
+            detected
+                .get("needs_deeper_inspection")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert!(detected.get("mime").is_some_and(|value| value.is_null()));
+    }
+
+    #[test]
+    fn missing_binary_detector_reads_structured_marker() {
+        assert_eq!(
+            ActionRuntime::detect_missing_binary_from_output("AGENTARK_MISSING_BINARY: ffmpeg\n"),
+            Some("ffmpeg".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_binary_detector_extracts_generic_shell_errors() {
+        assert_eq!(
+            ActionRuntime::detect_missing_binary_from_output(
+                "bash: custom-tool: command not found"
+            ),
+            Some("custom-tool".to_string())
+        );
+        assert_eq!(
+            ActionRuntime::detect_missing_binary_from_output(
+                "FileNotFoundError: [Errno 2] No such file or directory: 'media-helper'"
+            ),
+            Some("media-helper".to_string())
+        );
+    }
+
+    #[test]
+    fn code_execute_execution_metadata_marks_validated_poller_ready_for_watch() {
+        let metadata = ActionRuntime::build_code_execute_execution_metadata(
+            &serde_json::json!({
+                "network_access": true,
+                "execution_contract": {
+                    "phase": "validate",
+                    "target_validated_when_successful": true,
+                    "ready_for_watch_when_successful": true
+                }
+            }),
+            true,
+            1,
+        );
+
+        assert_eq!(
+            metadata.get("phase").and_then(|value| value.as_str()),
+            Some("validate")
+        );
+        assert_eq!(
+            metadata
+                .get("target_validated")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            metadata
+                .get("ready_for_watch")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn target_connectivity_contract_enables_effective_network_access() {
+        assert!(ActionRuntime::code_execute_effective_network_access(
+            &serde_json::json!({
+                "execution_contract": {
+                    "phase": "validate",
+                    "target_connectivity_required": true
+                }
+            })
+        ));
+        assert!(!ActionRuntime::code_execute_effective_network_access(
+            &serde_json::json!({
+                "execution_contract": {
+                    "phase": "bootstrap"
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn code_execute_infers_network_access_from_endpoint_values() {
+        assert!(ActionRuntime::code_execute_effective_network_access(
+            &serde_json::json!({
+                "language": "python",
+                "code": "print('polling a device')",
+                "env": {
+                    "TARGET_URL": "customproto://192.168.29.61:554/stream"
+                }
+            })
+        ));
+        assert!(ActionRuntime::code_execute_effective_network_access(
+            &serde_json::json!({
+                "language": "python",
+                "code": "open('output.txt', 'w').write('http://example.com')"
+            })
+        ));
+        assert!(!ActionRuntime::code_execute_effective_network_access(
+            &serde_json::json!({
+                "language": "python",
+                "code": "print('local-only calculation')"
+            })
+        ));
+    }
+
     #[tokio::test]
     async fn app_management_schemas_avoid_top_level_combinators() {
         let temp = tempfile::tempdir().unwrap();
@@ -11883,6 +14555,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn capability_resolve_is_builtin_and_file_read_scoped() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        runtime.load_builtin_actions().await.unwrap();
+        let action = action_def_by_name(&runtime, "capability_resolve").await;
+
+        assert_eq!(action.source, ActionSource::System);
+        assert_eq!(action.capabilities, vec!["file_read".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn capability_acquire_requires_agent_permission() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        runtime.load_builtin_actions().await.unwrap();
+        let action = action_def_by_name(&runtime, "capability_acquire").await;
+
+        assert_eq!(action.source, ActionSource::System);
+        assert!(ActionRuntime::action_required_agent_permission_ids(&action)
+            .iter()
+            .any(|permission| permission == "capability_acquire"));
     }
 
     #[tokio::test]
@@ -12020,6 +14716,7 @@ mod tests {
             storage: None,
             mcp_registry: None,
             plugin_registry: None,
+            extension_pack_registry: None,
             #[cfg(feature = "docker")]
             active_sandbox_containers: tokio::sync::RwLock::new(HashSet::new()),
             #[cfg(feature = "docker")]
@@ -12125,7 +14822,9 @@ version: "1.2.3"
             description: "Echo CLI".to_string(),
             version: "1.0.0".to_string(),
             executable_path: if cfg!(windows) {
-                "cmd".to_string()
+                std::env::var("ComSpec")
+                    .or_else(|_| std::env::var("COMSPEC"))
+                    .unwrap_or_else(|_| "C:\\WINDOWS\\system32\\cmd.exe".to_string())
             } else {
                 "sh".to_string()
             },
@@ -12135,7 +14834,7 @@ version: "1.2.3"
 
         runtime
             .install_cli_skill_action(
-                manifest,
+                manifest.clone(),
                 "---\nname: echo-cli\ndescription: Echo CLI\n---\n# echo-cli\n",
             )
             .await
@@ -12146,13 +14845,43 @@ version: "1.2.3"
         } else {
             serde_json::json!({ "args": ["-lc", "printf ready"] })
         };
-        let output = runtime.execute_action("echo-cli", &args).await.unwrap();
+        let output = runtime
+            .execute_cli_action(
+                "echo-cli",
+                CliToolBinding {
+                    executable_path: manifest.executable_path.clone(),
+                    verify_args: manifest.verify_args.clone(),
+                    auth_profile_id: None,
+                    auth_env_exports: BTreeMap::new(),
+                },
+                &args,
+            )
+            .await
+            .unwrap();
         assert!(output.contains("ready"));
     }
 
     async fn runtime_for_authorization_tests() -> ActionRuntime {
         let temp = tempfile::tempdir().unwrap();
-        ActionRuntime::new(temp.path(), temp.path()).await.unwrap()
+        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        runtime.load_builtin_actions().await.unwrap();
+        runtime
+    }
+
+    async fn runtime_for_permission_gate_tests() -> ActionRuntime {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        let guard = crate::security::ActionGuard::new(
+            &ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]),
+            "did:key:test",
+            temp.path(),
+            temp.path(),
+        )
+        .await
+        .unwrap();
+        runtime.set_action_guard(std::sync::Arc::new(guard));
+        runtime.load_builtin_actions().await.unwrap();
+        runtime
     }
 
     async fn action_def_by_name(runtime: &ActionRuntime, name: &str) -> ActionDef {
@@ -12178,6 +14907,63 @@ version: "1.2.3"
                     principal: Some(ActionCallerPrincipal::local_admin("test")),
                     surface: ActionExecutionSurface::Chat,
                     direct_user_intent: true,
+                    current_turn_is_explicit_approval: false,
+                    agent_name: None,
+                    agent_access_scope: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(decision.allowed);
+    }
+
+    #[tokio::test]
+    async fn lan_discover_requires_explicit_approval_for_trusted_chat() {
+        let runtime = runtime_for_authorization_tests().await;
+        let action = action_def_by_name(&runtime, "lan_discover").await;
+        assert!(action
+            .capabilities
+            .iter()
+            .any(|cap| cap == "local_network_discovery"));
+
+        let decision = runtime
+            .authorize_action_invocation(
+                "lan_discover",
+                Some(&action),
+                &serde_json::json!({ "target": "sonos" }),
+                &ActionAuthorizationContext {
+                    principal: Some(ActionCallerPrincipal::local_admin("test")),
+                    surface: ActionExecutionSurface::Chat,
+                    direct_user_intent: true,
+                    current_turn_is_explicit_approval: false,
+                    agent_name: None,
+                    agent_access_scope: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(!decision.allowed);
+        assert!(decision.reason.contains("explicit user approval"));
+    }
+
+    #[tokio::test]
+    async fn lan_discover_allows_explicit_approval_turn() {
+        let runtime = runtime_for_authorization_tests().await;
+        let action = action_def_by_name(&runtime, "lan_discover").await;
+        let decision = runtime
+            .authorize_action_invocation(
+                "lan_discover",
+                Some(&action),
+                &serde_json::json!({ "target": "sonos" }),
+                &ActionAuthorizationContext {
+                    principal: Some(ActionCallerPrincipal::local_admin("test")),
+                    surface: ActionExecutionSurface::Chat,
+                    direct_user_intent: true,
+                    current_turn_is_explicit_approval: true,
+                    agent_name: None,
+                    agent_access_scope: None,
                 },
             )
             .await
@@ -12199,6 +14985,9 @@ version: "1.2.3"
                     principal: Some(ActionCallerPrincipal::local_admin("test")),
                     surface: ActionExecutionSurface::Api,
                     direct_user_intent: true,
+                    current_turn_is_explicit_approval: false,
+                    agent_name: None,
+                    agent_access_scope: None,
                 },
             )
             .await
@@ -12220,6 +15009,9 @@ version: "1.2.3"
                     principal: None,
                     surface: ActionExecutionSurface::Background,
                     direct_user_intent: false,
+                    current_turn_is_explicit_approval: false,
+                    agent_name: None,
+                    agent_access_scope: None,
                 },
             )
             .await
@@ -12242,6 +15034,9 @@ version: "1.2.3"
                     principal: None,
                     surface: ActionExecutionSurface::Background,
                     direct_user_intent: false,
+                    current_turn_is_explicit_approval: false,
+                    agent_name: None,
+                    agent_access_scope: None,
                 },
             )
             .await
@@ -12263,6 +15058,9 @@ version: "1.2.3"
                     principal: None,
                     surface: ActionExecutionSurface::Api,
                     direct_user_intent: true,
+                    current_turn_is_explicit_approval: false,
+                    agent_name: None,
+                    agent_access_scope: None,
                 },
             )
             .await
@@ -12270,6 +15068,102 @@ version: "1.2.3"
 
         assert!(!decision.allowed);
         assert!(decision.reason.contains("trusted local session"));
+    }
+
+    #[tokio::test]
+    async fn trusted_chat_bypasses_permission_gate_for_code_execute() {
+        let runtime = runtime_for_permission_gate_tests().await;
+        let action = action_def_by_name(&runtime, "code_execute").await;
+        let unapproved = runtime
+            .unapproved_permissions_for_action(
+                &action,
+                &ActionAuthorizationContext {
+                    principal: Some(ActionCallerPrincipal::local_admin("test")),
+                    surface: ActionExecutionSurface::Chat,
+                    direct_user_intent: true,
+                    current_turn_is_explicit_approval: false,
+                    agent_name: None,
+                    agent_access_scope: None,
+                },
+            )
+            .await;
+
+        assert!(unapproved.is_empty());
+    }
+
+    #[tokio::test]
+    async fn anonymous_context_still_requires_code_execute_permission() {
+        let runtime = runtime_for_permission_gate_tests().await;
+        let action = action_def_by_name(&runtime, "code_execute").await;
+        let unapproved = runtime
+            .unapproved_permissions_for_action(&action, &ActionAuthorizationContext::default())
+            .await;
+
+        assert!(unapproved
+            .iter()
+            .any(|perm| matches!(perm, crate::security::action_guard::Permission::CodeExecute)));
+    }
+
+    #[tokio::test]
+    async fn scoped_agent_blocks_unattached_channel_targets() {
+        let runtime = runtime_for_authorization_tests().await;
+        let decision = runtime
+            .authorize_action_invocation(
+                "schedule_task",
+                None,
+                &serde_json::json!({
+                    "task": "Send me a daily summary",
+                    "cron": "0 9 * * *",
+                    "report_to": "slack"
+                }),
+                &ActionAuthorizationContext {
+                    principal: Some(ActionCallerPrincipal::local_admin("test")),
+                    surface: ActionExecutionSurface::Chat,
+                    direct_user_intent: true,
+                    current_turn_is_explicit_approval: false,
+                    agent_name: Some("Ops Bot".to_string()),
+                    agent_access_scope: Some(crate::core::swarm::AgentAccessScope {
+                        channel_ids: vec!["teams".to_string()],
+                        ..Default::default()
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(!decision.allowed);
+        assert!(decision.reason.contains("slack"));
+    }
+
+    #[cfg(feature = "ssh")]
+    #[tokio::test]
+    async fn scoped_agent_blocks_unattached_ssh_connection_names() {
+        let runtime = runtime_for_authorization_tests().await;
+        let decision = runtime
+            .authorize_action_invocation(
+                "ssh",
+                None,
+                &serde_json::json!({
+                    "connection": "staging-box",
+                    "command": "pwd"
+                }),
+                &ActionAuthorizationContext {
+                    principal: Some(ActionCallerPrincipal::local_admin("test")),
+                    surface: ActionExecutionSurface::Chat,
+                    direct_user_intent: true,
+                    current_turn_is_explicit_approval: false,
+                    agent_name: Some("Infra Bot".to_string()),
+                    agent_access_scope: Some(crate::core::swarm::AgentAccessScope {
+                        ssh_connection_names: vec!["prod-box".to_string()],
+                        ..Default::default()
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(!decision.allowed);
+        assert!(decision.reason.contains("staging-box"));
     }
 
     #[test]

@@ -16,7 +16,6 @@ use crate::core::prompt_policy::{
     chat_routing_classifier_system_prompt_v1, explicit_approval_classifier_system_prompt_v1,
     link_intent_classifier_system_prompt_v1, pending_action_classifier_system_prompt_v1,
     request_shape_classifier_system_prompt_v1, smalltalk_classifier_system_prompt_v1,
-    user_fact_fast_path_system_prompt_v1,
 };
 
 use super::prompt_evolution::PromptSurfaceProfile;
@@ -50,11 +49,6 @@ const ACTION_GROUNDING_MUTATION: &str = r#"
 - Prefer the smallest actionable interpretation that still matches the request.
 - Avoid background work or heavy execution shapes unless the request clearly calls for them."#;
 
-const FACT_CONSERVATISM_MUTATION: &str = r#"
-- Capture only durable, stable user facts.
-- Do not infer preferences or facts that are not directly supported by the message.
-- Prefer `none` over speculative fact extraction."#;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClassifierPromptBundleProfile {
     pub version: String,
@@ -68,7 +62,6 @@ pub struct ClassifierPromptBundleProfile {
     pub automation_intent: PromptSurfaceProfile,
     pub explicit_approval: PromptSurfaceProfile,
     pub pending_action: PromptSurfaceProfile,
-    pub user_fact_fast_path: PromptSurfaceProfile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -137,7 +130,6 @@ impl Default for ClassifierPromptBundleProfile {
             automation_intent: default_automation_intent_surface(),
             explicit_approval: default_explicit_approval_surface(),
             pending_action: default_pending_action_surface(),
-            user_fact_fast_path: default_user_fact_fast_path_surface(),
         };
         sanitize_classifier_prompt_bundle(&mut bundle);
         bundle
@@ -184,10 +176,6 @@ pub fn default_pending_action_surface() -> PromptSurfaceProfile {
     default_surface(pending_action_classifier_system_prompt_v1())
 }
 
-pub fn default_user_fact_fast_path_surface() -> PromptSurfaceProfile {
-    default_surface(user_fact_fast_path_system_prompt_v1())
-}
-
 pub fn parse_classifier_prompt_bundle_profile(raw: &[u8]) -> Option<ClassifierPromptBundleProfile> {
     let mut bundle = serde_json::from_slice::<ClassifierPromptBundleProfile>(raw).ok()?;
     sanitize_classifier_prompt_bundle(&mut bundle);
@@ -227,10 +215,6 @@ pub fn sanitize_classifier_prompt_bundle(bundle: &mut ClassifierPromptBundleProf
     sanitize_surface(
         &mut bundle.pending_action,
         &default_pending_action_surface(),
-    );
-    sanitize_surface(
-        &mut bundle.user_fact_fast_path,
-        &default_user_fact_fast_path_surface(),
     );
 }
 
@@ -276,10 +260,6 @@ pub fn render_pending_action_classifier_system_prompt(
     bundle: &ClassifierPromptBundleProfile,
 ) -> String {
     render_surface(&bundle.pending_action)
-}
-
-pub fn render_user_fact_fast_path_system_prompt(bundle: &ClassifierPromptBundleProfile) -> String {
-    render_surface(&bundle.user_fact_fast_path)
 }
 
 pub struct ClassifierPromptEvolutionEngine {
@@ -523,7 +503,6 @@ impl ClassifierPromptEvolutionEngine {
             &mut json_discipline.automation_intent,
             &mut json_discipline.explicit_approval,
             &mut json_discipline.pending_action,
-            &mut json_discipline.user_fact_fast_path,
         ] {
             surface.system_prompt =
                 append_unique_lines(&surface.system_prompt, JSON_DISCIPLINE_MUTATION);
@@ -546,16 +525,12 @@ impl ClassifierPromptEvolutionEngine {
         }
         sanitize_classifier_prompt_bundle(&mut action_grounding);
 
-        let mut fact_conservatism = baseline.clone();
-        fact_conservatism.user_fact_fast_path.system_prompt = append_unique_lines(
-            &fact_conservatism.user_fact_fast_path.system_prompt,
-            FACT_CONSERVATISM_MUTATION,
-        );
-        fact_conservatism.link_intent.system_prompt = append_unique_lines(
-            &fact_conservatism.link_intent.system_prompt,
+        let mut link_conservatism = baseline.clone();
+        link_conservatism.link_intent.system_prompt = append_unique_lines(
+            &link_conservatism.link_intent.system_prompt,
             "\n- Prefer SHARE_ONLY over IMPORT_SKILL unless import intent is explicit.",
         );
-        sanitize_classifier_prompt_bundle(&mut fact_conservatism);
+        sanitize_classifier_prompt_bundle(&mut link_conservatism);
 
         vec![
             CandidateClassifierBundle {
@@ -567,8 +542,8 @@ impl ClassifierPromptEvolutionEngine {
                 source: "deterministic_action_grounding".to_string(),
             },
             CandidateClassifierBundle {
-                bundle: fact_conservatism,
-                source: "deterministic_fact_conservatism".to_string(),
+                bundle: link_conservatism,
+                source: "deterministic_link_conservatism".to_string(),
             },
         ]
     }
@@ -716,9 +691,6 @@ Baseline bundle:\n{}",
             ClassifierSurfaceKind::PendingAction => {
                 render_pending_action_classifier_system_prompt(bundle)
             }
-            ClassifierSurfaceKind::UserFactFastPath => {
-                render_user_fact_fast_path_system_prompt(bundle)
-            }
         };
         let response = self
             .llm
@@ -829,7 +801,6 @@ enum ClassifierSurfaceKind {
     AutomationIntent,
     ExplicitApproval,
     PendingAction,
-    UserFactFastPath,
 }
 
 impl ClassifierSurfaceKind {
@@ -843,7 +814,6 @@ impl ClassifierSurfaceKind {
             Self::AutomationIntent => "automation_intent",
             Self::ExplicitApproval => "explicit_approval",
             Self::PendingAction => "pending_action",
-            Self::UserFactFastPath => "user_fact_fast_path",
         }
     }
 }
@@ -1133,11 +1103,6 @@ fn diff_summary(
             "pending_action",
             &baseline.pending_action,
             &candidate.pending_action,
-        ),
-        (
-            "user_fact_fast_path",
-            &baseline.user_fact_fast_path,
-            &candidate.user_fact_fast_path,
         ),
     ] {
         if before != after {

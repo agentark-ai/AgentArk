@@ -13,6 +13,8 @@ use anyhow::{anyhow, Result};
 use argon2::{Argon2, Params};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use rand::RngCore;
+use sha2::{Digest, Sha256};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 #[cfg(windows)]
@@ -47,42 +49,64 @@ impl KeyManager {
     /// If the keyfile doesn't exist, generates a new random key
     pub fn load_or_create(keyfile_path: &Path) -> Result<Self> {
         if keyfile_path.exists() {
-            let key_data = std::fs::read(keyfile_path)
-                .map_err(|e| anyhow!("Failed to read keyfile at {:?}: {}", keyfile_path, e))?;
-            if key_data.len() != KEY_LEN {
-                return Err(anyhow!(
-                    "Invalid keyfile length: expected {} bytes, got {} bytes at {:?}",
-                    KEY_LEN,
-                    key_data.len(),
-                    keyfile_path
-                ));
-            }
-            let mut key = [0u8; KEY_LEN];
-            key.copy_from_slice(&key_data);
-            Ok(Self {
-                key: Zeroizing::new(key),
-            })
-        } else {
-            // Generate a new random key
-            let mut key = [0u8; KEY_LEN];
-            OsRng.fill_bytes(&mut key);
-
-            // Save to keyfile with restricted permissions
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .mode(0o600)
-                    .open(keyfile_path)?;
-            }
-            std::fs::write(keyfile_path, key)?;
-
-            Ok(Self {
-                key: Zeroizing::new(key),
-            })
+            return Self::load_existing_keyfile(keyfile_path);
         }
+
+        // Generate a new random key and publish it atomically so concurrent
+        // split-service startups cannot observe a partially written keyfile or
+        // overwrite each other with different bootstrap material.
+        let mut generated = [0u8; KEY_LEN];
+        OsRng.fill_bytes(&mut generated);
+
+        match atomic_write_file_if_absent(keyfile_path, &generated)? {
+            true => Ok(Self {
+                key: Zeroizing::new(generated),
+            }),
+            false => Self::load_existing_keyfile(keyfile_path),
+        }
+    }
+
+    fn load_existing_keyfile(keyfile_path: &Path) -> Result<Self> {
+        for attempt in 0..20 {
+            match fs::read(keyfile_path) {
+                Ok(key_data) if key_data.len() == KEY_LEN => {
+                    let mut key = [0u8; KEY_LEN];
+                    key.copy_from_slice(&key_data);
+                    return Ok(Self {
+                        key: Zeroizing::new(key),
+                    });
+                }
+                Ok(key_data) if attempt < 19 && key_data.len() < KEY_LEN => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Ok(key_data) => {
+                    return Err(anyhow!(
+                        "Invalid keyfile length: expected {} bytes, got {} bytes at {:?}",
+                        KEY_LEN,
+                        key_data.len(),
+                        keyfile_path
+                    ));
+                }
+                Err(error) if attempt < 19 && error.kind() == std::io::ErrorKind::NotFound => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => {
+                    return Err(anyhow!(
+                        "Failed to read keyfile at {:?}: {}",
+                        keyfile_path,
+                        error
+                    ));
+                }
+            }
+        }
+        unreachable!("keyfile read loop should have returned or errored");
+    }
+
+    pub fn fingerprint(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"agentark-storage-key-fingerprint-v1");
+        hasher.update(&self.key[..]);
+        hex::encode(hasher.finalize())
     }
 
     /// Encrypt data using the master key
@@ -232,6 +256,34 @@ pub(crate) fn atomic_write_file(path: &Path, contents: &[u8]) -> Result<()> {
             .persist(path)
             .map_err(|err| anyhow!("Failed to atomically replace {:?}: {}", path, err.error))?;
         Ok(())
+    }
+}
+
+pub(crate) fn atomic_write_file_if_absent(path: &Path, contents: &[u8]) -> Result<bool> {
+    let _parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("Cannot determine parent directory for {:?}", path))?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    match options.open(path) {
+        Ok(mut file) => {
+            file.write_all(contents)?;
+            file.sync_all()?;
+            Ok(true)
+        }
+        Err(error)
+            if error.kind() == std::io::ErrorKind::AlreadyExists
+                || (path.exists() && error.kind() == std::io::ErrorKind::PermissionDenied) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(anyhow!("Failed to atomically create {:?}: {}", path, error)),
     }
 }
 

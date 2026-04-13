@@ -33,18 +33,53 @@ fn normalized_help_tokens(text: &str) -> BTreeSet<String> {
         .collect()
 }
 
+pub fn canonical_help_topic(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut last_was_separator = false;
+    for ch in value.trim().to_ascii_lowercase().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            last_was_separator = false;
+        } else if !out.is_empty() && !last_was_separator {
+            out.push('_');
+            last_was_separator = true;
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    out
+}
+
+pub fn known_help_topics() -> Vec<String> {
+    let mut topics = BTreeSet::new();
+    topics.insert("general".to_string());
+    topics.insert("overview".to_string());
+    topics.insert("features".to_string());
+    topics.insert("capabilities".to_string());
+    for doc in BUNDLED_HELP_DOCS {
+        for tag in doc.tags {
+            topics.insert(canonical_help_topic(tag));
+        }
+    }
+    topics.into_iter().collect()
+}
+
+#[cfg(test)]
 fn contains_help_phrase(haystack: &str, phrase: &str) -> bool {
     let haystack = format!(" {} ", normalize_help_text(haystack));
     let needle = format!(" {} ", normalize_help_text(phrase));
     !needle.trim().is_empty() && haystack.contains(&needle)
 }
 
+#[cfg(test)]
 fn contains_any_help_phrase(haystack: &str, phrases: &[&str]) -> bool {
     phrases
         .iter()
         .any(|phrase| contains_help_phrase(haystack, phrase))
 }
 
+#[cfg(test)]
 fn contains_any_help_token(haystack: &str, tokens: &[&str]) -> bool {
     let words = normalized_help_tokens(haystack);
     tokens.iter().any(|token| {
@@ -63,6 +98,7 @@ fn contains_any_help_token(haystack: &str, tokens: &[&str]) -> bool {
     })
 }
 
+#[cfg(test)]
 fn query_matches_help_intent(message: &str) -> bool {
     const INTENT_PHRASES: &[&str] = &[
         "how do i",
@@ -98,10 +134,11 @@ fn query_matches_help_intent(message: &str) -> bool {
         || contains_any_help_token(message, INTENT_TOKENS)
         || matches!(
             normalize_help_text(message).split_whitespace().next(),
-            Some("is" | "are" | "does" | "can")
+            Some("is" | "are" | "does" | "can" | "how" | "what" | "where" | "why")
         )
 }
 
+#[cfg(test)]
 fn topic_matches(message: &str, phrases: &[&str], tokens: &[&str]) -> bool {
     contains_any_help_phrase(message, phrases) || contains_any_help_token(message, tokens)
 }
@@ -123,10 +160,197 @@ impl ProductHelpMode {
     }
 }
 
-pub fn is_product_help_source(source: Option<&str>) -> bool {
-    matches!(source, Some(CURATED_SOURCE | RUNTIME_SOURCE))
+#[derive(Debug, Clone)]
+pub struct BundledHelpMatch {
+    pub title: String,
+    pub slug: String,
+    pub url: String,
+    pub tags: Vec<String>,
+    pub content: String,
+    pub score: usize,
 }
 
+fn branded_doc_title(doc: &crate::docs::product_help::BundledHelpDoc) -> String {
+    branded_product_text(doc.title)
+}
+
+fn branded_doc_summary(doc: &crate::docs::product_help::BundledHelpDoc) -> String {
+    branded_product_text(doc.summary)
+}
+
+fn branded_doc_content(doc: &crate::docs::product_help::BundledHelpDoc) -> String {
+    branded_product_text(&render_bundled_help_doc(doc))
+}
+
+fn decamelized_product_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    for (idx, ch) in name.chars().enumerate() {
+        if idx > 0 && ch.is_ascii_uppercase() {
+            out.push(' ');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn product_reference_aliases() -> Vec<String> {
+    let mut aliases = BTreeSet::new();
+    aliases.insert(crate::branding::PRODUCT_NAME.to_string());
+    aliases.insert(crate::branding::PRODUCT_SLUG.to_string());
+    aliases.insert(decamelized_product_name(crate::branding::PRODUCT_NAME));
+    if crate::branding::LEGACY_PRODUCT_NAME != crate::branding::PRODUCT_NAME {
+        aliases.insert(crate::branding::LEGACY_PRODUCT_NAME.to_string());
+        aliases.insert(decamelized_product_name(
+            crate::branding::LEGACY_PRODUCT_NAME,
+        ));
+    }
+    aliases.into_iter().collect()
+}
+
+fn is_low_signal_help_token(token: &str) -> bool {
+    matches!(
+        token,
+        "a" | "an"
+            | "and"
+            | "agent"
+            | "agents"
+            | "ai"
+            | "am"
+            | "are"
+            | "as"
+            | "assistant"
+            | "assistants"
+            | "be"
+            | "can"
+            | "does"
+            | "do"
+            | "for"
+            | "help"
+            | "how"
+            | "i"
+            | "in"
+            | "is"
+            | "it"
+            | "me"
+            | "my"
+            | "of"
+            | "on"
+            | "tell"
+            | "the"
+            | "this"
+            | "to"
+            | "use"
+            | "what"
+            | "whats"
+            | "with"
+    )
+}
+
+fn filtered_help_query_tokens(message: &str) -> BTreeSet<String> {
+    let product_tokens = product_reference_aliases()
+        .into_iter()
+        .flat_map(|alias| normalized_help_tokens(&alias).into_iter())
+        .collect::<BTreeSet<_>>();
+
+    normalized_help_tokens(message)
+        .into_iter()
+        .filter(|token| token.len() > 1)
+        .filter(|token| !product_tokens.contains(token))
+        .filter(|token| !is_low_signal_help_token(token))
+        .collect()
+}
+
+pub fn help_query_match_tokens(message: &str) -> Vec<String> {
+    filtered_help_query_tokens(message).into_iter().collect()
+}
+
+fn bundled_doc_tag_tokens(doc: &crate::docs::product_help::BundledHelpDoc) -> BTreeSet<String> {
+    doc.tags
+        .iter()
+        .flat_map(|tag| normalized_help_tokens(tag).into_iter())
+        .collect()
+}
+
+fn score_bundled_help_doc(
+    doc: &crate::docs::product_help::BundledHelpDoc,
+    query_tokens: &BTreeSet<String>,
+) -> usize {
+    if query_tokens.is_empty() {
+        return 0;
+    }
+
+    let title_tokens = normalized_help_tokens(&branded_doc_title(doc));
+    let summary_tokens = normalized_help_tokens(&branded_doc_summary(doc));
+    let content_tokens = normalized_help_tokens(&branded_doc_content(doc));
+    let tag_tokens = bundled_doc_tag_tokens(doc);
+
+    query_tokens.iter().fold(0usize, |score, token| {
+        score
+            + if tag_tokens.contains(token) { 8 } else { 0 }
+            + if title_tokens.contains(token) { 6 } else { 0 }
+            + if summary_tokens.contains(token) { 4 } else { 0 }
+            + if content_tokens.contains(token) { 2 } else { 0 }
+    })
+}
+
+pub fn match_bundled_help_docs(message: &str, limit: usize) -> Vec<BundledHelpMatch> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let query_tokens = filtered_help_query_tokens(message);
+    let mut scored = BUNDLED_HELP_DOCS
+        .iter()
+        .map(|doc| {
+            let score = score_bundled_help_doc(doc, &query_tokens);
+            (doc, score)
+        })
+        .collect::<Vec<_>>();
+
+    scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.slug.cmp(b.0.slug)));
+
+    let matches = scored
+        .iter()
+        .filter(|(_, score)| *score > 0)
+        .take(limit)
+        .map(|(doc, score)| BundledHelpMatch {
+            title: branded_doc_title(doc),
+            slug: doc.slug.to_string(),
+            url: crate::branding::help_uri(&format!("help/{}", doc.slug)),
+            tags: doc.tags.iter().map(|tag| tag.to_string()).collect(),
+            content: branded_doc_content(doc),
+            score: *score,
+        })
+        .collect::<Vec<_>>();
+
+    matches
+}
+
+pub fn bundled_help_doc_match_by_slug(slug: &str, score: usize) -> Option<BundledHelpMatch> {
+    BUNDLED_HELP_DOCS
+        .iter()
+        .find(|doc| doc.slug == slug)
+        .map(|doc| BundledHelpMatch {
+            title: branded_doc_title(doc),
+            slug: doc.slug.to_string(),
+            url: crate::branding::help_uri(&format!("help/{}", doc.slug)),
+            tags: doc.tags.iter().map(|tag| tag.to_string()).collect(),
+            content: branded_doc_content(doc),
+            score,
+        })
+}
+
+pub fn infer_help_topics_from_bundled_matches(matches: &[BundledHelpMatch]) -> Vec<String> {
+    let mut topics = BTreeSet::new();
+    for matched in matches {
+        for tag in &matched.tags {
+            topics.insert(tag.to_string());
+        }
+    }
+    topics.into_iter().collect()
+}
+
+#[cfg(test)]
 pub fn looks_like_agentark_help_query(message: &str) -> bool {
     let lc = message.trim().to_ascii_lowercase();
     if lc.is_empty() {
@@ -155,6 +379,7 @@ pub fn looks_like_agentark_help_query(message: &str) -> bool {
                 | "browser"
                 | "research"
                 | "security"
+                | "data_contract"
         )
     });
     let explicit_product_signal = contains_any_help_phrase(
@@ -176,7 +401,7 @@ pub fn looks_like_agentark_help_query(message: &str) -> bool {
             "local embeddings",
             "external embeddings",
             "input needed",
-            "set secret",
+            "/setsecret",
             "/delegate",
             "/rollback",
             "public apps",
@@ -190,6 +415,10 @@ pub fn looks_like_agentark_help_query(message: &str) -> bool {
             "action permissions",
             "approval grants",
             "sandbox mode",
+            "data contract",
+            "data ownership",
+            "user-owned",
+            "system-owned",
         ],
     ) || contains_any_help_token(
         message,
@@ -201,58 +430,13 @@ pub fn looks_like_agentark_help_query(message: &str) -> bool {
     help_intent && (high_signal_topic || explicit_product_signal)
 }
 
+#[cfg(test)]
 pub fn infer_help_mode(message: &str) -> ProductHelpMode {
-    let lc = message.trim().to_ascii_lowercase();
-    if lc.is_empty() {
-        return ProductHelpMode::Setup;
-    }
-
-    if contains_any_help_phrase(
-        message,
-        &[
-            "how do i",
-            "how to",
-            "where do i",
-            "set up",
-            "setup",
-            "configure",
-            "connect",
-            "add access",
-            "walk me through",
-            "steps to",
-            "new user",
-            "i am new",
-            "i'm new",
-        ],
-    ) {
-        return ProductHelpMode::Setup;
-    }
-
-    if contains_any_help_phrase(message, &["right now", "last run", "how many", "currently"])
-        || contains_any_help_token(
-            message,
-            &[
-                "status",
-                "state",
-                "enabled",
-                "disabled",
-                "connected",
-                "configured",
-                "current",
-                "queue",
-            ],
-        )
-        || matches!(
-            normalize_help_text(message).split_whitespace().next(),
-            Some("is" | "are" | "does")
-        )
-    {
-        return ProductHelpMode::Status;
-    }
-
+    let _ = message;
     ProductHelpMode::Explain
 }
 
+#[cfg(test)]
 pub fn infer_help_topics(message: &str) -> Vec<&'static str> {
     let mut topics = Vec::new();
     let explicit_environment_phrase = contains_any_help_phrase(
@@ -429,6 +613,21 @@ pub fn infer_help_topics(message: &str) -> Vec<&'static str> {
     ) {
         topics.push("memory");
     }
+    if topic_matches(
+        message,
+        &[
+            "data contract",
+            "data ownership",
+            "user-owned",
+            "system-owned",
+            "release updates",
+            "settings kv",
+            "settings:*",
+        ],
+        &["persistence", "persisted", "upgrade", "upgrades", "volumes"],
+    ) {
+        topics.push("data_contract");
+    }
     if contains_any_help_token(
         message,
         &[
@@ -498,11 +697,10 @@ pub fn infer_help_topics(message: &str) -> Vec<&'static str> {
         message,
         &[
             "chat shortcuts",
-            "set secret",
             "/setsecret",
-            "pause notifications",
-            "resume notifications",
-            "notification status",
+            "/notifications pause",
+            "/notifications resume",
+            "/notifications status",
             "/delegate",
             "/rollback",
         ],
@@ -729,11 +927,7 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
         ),
         (
             "Admin",
-            &[
-                "Settings > Data Lifecycle",
-                "Settings > Observability",
-                "Settings > Evolution",
-            ],
+            &["Settings > Data Lifecycle", "Settings > Observability"],
         ),
         ("Security", &["Settings > Security", "Settings > Advanced"]),
     ];
@@ -816,6 +1010,26 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
         ),
     });
 
+    let data_contract_content = format!(
+        "Data ownership contract for release updates in __PRODUCT_NAME__.\n\n\
+- User-owned | {}\n\
+- System-owned | {}\n\
+- Rule | {}",
+        crate::core::data_contract::USER_OWNED_SURFACES.join(", "),
+        crate::core::data_contract::SYSTEM_OWNED_SURFACES.join(", "),
+        crate::core::data_contract::RELEASE_UPDATE_RULE,
+    );
+    items.push(SeedKnowledgeItem {
+        title: "User/system data contract".to_string(),
+        content: branded_product_text(&data_contract_content),
+        source: RUNTIME_SOURCE,
+        url: Some(crate::branding::help_uri("help/runtime/data-contract")),
+        tags: Some(
+            "data_contract, data_ownership, docker, persistence, updates, upgrades, settings, memory, skills"
+                .to_string(),
+        ),
+    });
+
     let library_content = "Library and knowledge-related surfaces in the current UI.\n\n\
 - Library > Documents | Uploaded files and indexed document context.\n\
 - Settings > Knowledge > Memory | Structured memory and reusable knowledge-base items.\n\
@@ -855,10 +1069,13 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
     });
 
     let evolution_content = "Self-learning and evolution surfaces in the current UI.\n\n\
-- Settings > Admin > Evolution | Main self-learning and evolution control center.\n\
+- Evolution | Main self-learning page with What happened, What helped, Tests running, Review, and Controls tabs.\n\
 - Sentinel > Background learning | Live status for reflection pass, memory consolidation, experience consolidation, pattern induction, and candidate generation.\n\
-- Evolution Status | Self-evolve toggle, learning toggle, local-only mode, canary state, promotion mode, replay gate, queue metrics.\n\
-- Deploy Guard Default | Default access-guard behavior for app deployments.\n\
+- Evolution > What happened | Recent tested or promoted changes with lineage and plain-language summaries.\n\
+- Evolution > What helped | Measured impact from prompt, classifier, specialist, and routing changes.\n\
+- Evolution > Tests running | Canary rollout, baseline version, candidate version, and gate result for each evolvable surface.\n\
+- Evolution > Review | Draft workflow, strategy, and memory candidates waiting for review.\n\
+- Evolution > Controls | Self-evolve toggle, learning toggle, local-only mode, default app access guard, and developer-mode canary actions.\n\
 - Learned Memory | Durable facts, rules, lessons, and memory extracted from runs.\n\
 - Learned Procedures | Repeated successful workflows distilled into procedures.\n\
 - Recent Experience Runs | Recent evidence feeding the learning system.\n\
@@ -998,6 +1215,27 @@ mod tests {
     }
 
     #[test]
+    fn matches_capabilities_overview_for_general_product_queries() {
+        let matches = match_bundled_help_docs("What is AgentArk?", 3);
+        assert!(!matches.is_empty());
+        assert_eq!(matches[0].slug, "capabilities-overview");
+        assert!(matches[0].tags.iter().any(|tag| tag == "general"));
+    }
+
+    #[test]
+    fn does_not_force_agentark_overview_for_generic_agent_queries() {
+        let matches = match_bundled_help_docs("What is an agent?", 3);
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn derives_help_topics_from_matched_docs() {
+        let matches = match_bundled_help_docs("How do I configure models in AgentArk?", 3);
+        let topics = infer_help_topics_from_bundled_matches(&matches);
+        assert!(topics.iter().any(|topic| topic == "models"));
+    }
+
+    #[test]
     fn recognizes_google_calendar_help_queries() {
         assert!(looks_like_agentark_help_query(
             "How do I connect Google Calendar?"
@@ -1024,7 +1262,7 @@ mod tests {
         )));
         assert!(matches!(
             infer_help_mode("Is self-learning enabled right now?"),
-            ProductHelpMode::Status
+            ProductHelpMode::Explain
         ));
     }
 
@@ -1038,7 +1276,7 @@ mod tests {
         assert!(topics.contains(&"sentinel"));
         assert!(matches!(
             infer_help_mode("What is the current background learning status?"),
-            ProductHelpMode::Status
+            ProductHelpMode::Explain
         ));
     }
 
@@ -1062,7 +1300,7 @@ mod tests {
         assert!(topics.contains(&"environment"));
         assert!(matches!(
             infer_help_mode("What environment is AgentArk running in right now?"),
-            ProductHelpMode::Status
+            ProductHelpMode::Explain
         ));
     }
 
@@ -1079,7 +1317,7 @@ mod tests {
     #[test]
     fn detects_chat_shortcuts_help_queries() {
         assert!(looks_like_agentark_help_query(
-            "How do I use set secret in AgentArk?"
+            "How do I use /setsecret in AgentArk?"
         ));
         let topics = infer_help_topics("What does /rollback do?");
         assert!(topics.contains(&"chat_shortcuts"));

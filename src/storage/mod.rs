@@ -190,8 +190,10 @@ impl DatabaseConfig {
             .acquire_timeout(Duration::from_secs(self.connect_timeout_secs.max(1)))
             .sqlx_logging(false)
             .map_sqlx_postgres_opts(move |opts| {
-                opts.application_name("agentark")
-                    .options([("statement_timeout", statement_timeout_ms.as_str())])
+                opts.application_name("agentark").options([
+                    ("statement_timeout", statement_timeout_ms.as_str()),
+                    ("client_min_messages", "warning"),
+                ])
             });
         if let Some(schema) = self.schema.as_deref() {
             options.set_schema_search_path(schema);
@@ -678,13 +680,9 @@ impl Storage {
         Ok(())
     }
 
-    async fn ensure_kv_row_exists_txn(
-        &self,
-        txn: &DatabaseTransaction,
-        key: &str,
-    ) -> Result<()> {
+    async fn ensure_kv_row_exists_txn(&self, txn: &DatabaseTransaction, key: &str) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        kv_store::Entity::insert(kv_store::ActiveModel {
+        match kv_store::Entity::insert(kv_store::ActiveModel {
             key: Set(key.to_string()),
             value: Set(Vec::new()),
             created_at: Set(now.clone()),
@@ -696,7 +694,11 @@ impl Storage {
                 .to_owned(),
         )
         .exec(txn)
-        .await?;
+        .await
+        {
+            Ok(_) | Err(sea_orm::DbErr::RecordNotInserted) => {}
+            Err(error) => return Err(error.into()),
+        }
         Ok(())
     }
 
@@ -723,12 +725,7 @@ impl Storage {
         }))
     }
 
-    async fn set_kv_txn(
-        &self,
-        txn: &DatabaseTransaction,
-        key: &str,
-        value: &[u8],
-    ) -> Result<()> {
+    async fn set_kv_txn(&self, txn: &DatabaseTransaction, key: &str, value: &[u8]) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
         kv_store::Entity::insert(kv_store::ActiveModel {
             key: Set(key.to_string()),
@@ -764,7 +761,12 @@ impl Storage {
         }
     }
 
-    async fn set_kv_json_txn<T>(&self, txn: &DatabaseTransaction, key: &str, value: &T) -> Result<()>
+    async fn set_kv_json_txn<T>(
+        &self,
+        txn: &DatabaseTransaction,
+        key: &str,
+        value: &T,
+    ) -> Result<()>
     where
         T: serde::Serialize,
     {
@@ -912,40 +914,6 @@ impl Storage {
         Ok(true)
     }
 
-    pub async fn refresh_kv_lease(
-        &self,
-        key: &str,
-        owner_id: &str,
-        ttl_secs: i64,
-    ) -> Result<bool> {
-        let ttl_secs = ttl_secs.max(1);
-        let txn = self.db.begin().await?;
-        self.ensure_kv_row_exists_txn(&txn, key).await?;
-        let existing = self.get_kv_for_update_txn(&txn, key).await?;
-        let now = chrono::Utc::now();
-        let Some(lease) = existing
-            .as_ref()
-            .and_then(|row| serde_json::from_slice::<KvLeaseRecord>(&row.value).ok())
-        else {
-            txn.rollback().await?;
-            return Ok(false);
-        };
-        if lease.owner_id != owner_id || !lease_is_active(&lease, now) {
-            txn.rollback().await?;
-            return Ok(false);
-        }
-        let refreshed = KvLeaseRecord {
-            owner_id: owner_id.to_string(),
-            acquired_at: lease.acquired_at,
-            expires_at: (now + chrono::Duration::seconds(ttl_secs)).to_rfc3339(),
-            fence_token: lease.fence_token,
-        };
-        let raw = serde_json::to_vec(&refreshed)?;
-        self.set_kv_txn(&txn, key, &raw).await?;
-        txn.commit().await?;
-        Ok(true)
-    }
-
     pub async fn release_kv_lease(&self, key: &str, owner_id: &str) -> Result<()> {
         let txn = self.db.begin().await?;
         self.ensure_kv_row_exists_txn(&txn, key).await?;
@@ -1042,12 +1010,9 @@ impl Storage {
         let lease = existing
             .as_ref()
             .and_then(|row| serde_json::from_slice::<KvLeaseRecord>(&row.value).ok());
-        if lease
-            .as_ref()
-            .is_some_and(|record| {
-                record.owner_id == guard.owner_id && record.fence_token == guard.fence_token
-            })
-        {
+        if lease.as_ref().is_some_and(|record| {
+            record.owner_id == guard.owner_id && record.fence_token == guard.fence_token
+        }) {
             self.delete_kv_txn(&txn, key).await?;
         }
         txn.commit().await?;
@@ -1084,6 +1049,7 @@ impl Storage {
         old_key: &KeyManager,
         new_key: &KeyManager,
         encrypted_kv_keys: &[&str],
+        lineage_record: Option<(String, Vec<u8>)>,
     ) -> Result<()> {
         let txn = self.db.begin().await?;
 
@@ -1454,6 +1420,23 @@ impl Storage {
             }
         }
 
+        if let Some((lineage_key, lineage_value)) = lineage_record {
+            let now = chrono::Utc::now().to_rfc3339();
+            kv_store::Entity::insert(kv_store::ActiveModel {
+                key: Set(lineage_key),
+                value: Set(lineage_value),
+                created_at: Set(now.clone()),
+                updated_at: Set(now),
+            })
+            .on_conflict(
+                OnConflict::column(kv_store::Column::Key)
+                    .update_columns([kv_store::Column::Value, kv_store::Column::UpdatedAt])
+                    .to_owned(),
+            )
+            .exec(&txn)
+            .await?;
+        }
+
         txn.commit().await?;
         Ok(())
     }
@@ -1472,8 +1455,21 @@ impl Storage {
             return Ok(false);
         }
 
-        self.reencrypt_sensitive_payloads(key_manager, key_manager, encrypted_kv_keys)
-            .await?;
+        let lineage_record = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "fingerprint": key_manager.fingerprint(),
+            "recorded_at": chrono::Utc::now().to_rfc3339(),
+        }))?;
+        self.reencrypt_sensitive_payloads(
+            key_manager,
+            key_manager,
+            encrypted_kv_keys,
+            Some((
+                crate::core::config::SETTINGS_KEY_LINEAGE_KEY.to_string(),
+                lineage_record,
+            )),
+        )
+        .await?;
         self.set(Self::SENSITIVE_PAYLOAD_BACKFILL_MARKER_KEY, b"done")
             .await?;
         Ok(true)
@@ -1740,6 +1736,7 @@ impl Storage {
     // ==================== Semantic Facts ====================
 
     /// Insert a semantic fact
+    #[cfg(test)]
     pub async fn insert_fact(
         &self,
         id: &str,
@@ -2436,6 +2433,24 @@ impl Storage {
         model.updated_at = Set(chrono::Utc::now().to_rfc3339());
 
         model.update(&self.db).await?;
+        Ok(())
+    }
+
+    pub async fn replace_task_schedule(
+        &self,
+        id: &str,
+        cron: Option<String>,
+        scheduled_for: Option<String>,
+    ) -> Result<()> {
+        task::ActiveModel {
+            id: Set(id.to_string()),
+            cron: Set(cron),
+            scheduled_for: Set(scheduled_for),
+            updated_at: Set(chrono::Utc::now().to_rfc3339()),
+            ..Default::default()
+        }
+        .update(&self.db)
+        .await?;
         Ok(())
     }
 
@@ -3787,7 +3802,10 @@ impl Storage {
         candidate: &learning_candidate::Model,
     ) -> Result<bool> {
         let txn = self.db.begin().await?;
-        if !self.require_kv_lease_guard_txn(&txn, lease_key, guard).await? {
+        if !self
+            .require_kv_lease_guard_txn(&txn, lease_key, guard)
+            .await?
+        {
             txn.rollback().await?;
             return Ok(false);
         }
@@ -3892,7 +3910,10 @@ impl Storage {
         approved_ref: Option<&str>,
     ) -> Result<bool> {
         let txn = self.db.begin().await?;
-        if !self.require_kv_lease_guard_txn(&txn, lease_key, guard).await? {
+        if !self
+            .require_kv_lease_guard_txn(&txn, lease_key, guard)
+            .await?
+        {
             txn.rollback().await?;
             return Ok(false);
         }
@@ -3954,7 +3975,10 @@ impl Storage {
             .await?
             .ok_or_else(|| anyhow!("Learning candidate '{}' not found", candidate_id))?;
         if candidate.candidate_type != "strategy" {
-            anyhow::bail!("Learning candidate '{}' is not a strategy candidate", candidate_id);
+            anyhow::bail!(
+                "Learning candidate '{}' is not a strategy candidate",
+                candidate_id
+            );
         }
         let profile = parse_strategy_candidate_profile(&candidate)?;
         let baseline_version = self
@@ -4008,11 +4032,13 @@ impl Storage {
             .await?
             .ok_or_else(|| anyhow!("Learning candidate '{}' not found", candidate_id))?;
         if candidate.candidate_type != "strategy" {
-            anyhow::bail!("Learning candidate '{}' is not a strategy candidate", candidate_id);
+            anyhow::bail!(
+                "Learning candidate '{}' is not a strategy candidate",
+                candidate_id
+            );
         }
         let profile = parse_strategy_candidate_profile(&candidate)?;
-        let canary_key =
-            crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_CANARY_STATE_KEY;
+        let canary_key = crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_CANARY_STATE_KEY;
         if let Some(mut canary_state) = self
             .load_kv_json_txn::<crate::core::self_evolve::strategy_runtime::CanaryRolloutState>(
                 &txn, canary_key,
@@ -4021,7 +4047,8 @@ impl Storage {
         {
             if canary_state.candidate_version == profile.version {
                 canary_state.enabled = false;
-                self.set_kv_json_txn(&txn, canary_key, &canary_state).await?;
+                self.set_kv_json_txn(&txn, canary_key, &canary_state)
+                    .await?;
             }
         }
         self.update_learning_candidate_review_txn(
@@ -4046,7 +4073,10 @@ impl Storage {
             .await?
             .ok_or_else(|| anyhow!("Learning candidate '{}' not found", candidate_id))?;
         if candidate.candidate_type != "strategy" {
-            anyhow::bail!("Learning candidate '{}' is not a strategy candidate", candidate_id);
+            anyhow::bail!(
+                "Learning candidate '{}' is not a strategy candidate",
+                candidate_id
+            );
         }
         if !candidate.approval_status.eq_ignore_ascii_case("approved") {
             anyhow::bail!("Strategy candidate must be approved before promotion");
@@ -4063,8 +4093,7 @@ impl Storage {
         }
         self.set_kv_json_txn(&txn, profile_key, &profile).await?;
 
-        let canary_key =
-            crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_CANARY_STATE_KEY;
+        let canary_key = crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_CANARY_STATE_KEY;
         let mut canary_state = self
             .load_kv_json_txn::<crate::core::self_evolve::strategy_runtime::CanaryRolloutState>(
                 &txn, canary_key,
@@ -4074,7 +4103,8 @@ impl Storage {
         canary_state.enabled = false;
         canary_state.baseline_version = profile.version.clone();
         canary_state.candidate_version = profile.version.clone();
-        self.set_kv_json_txn(&txn, canary_key, &canary_state).await?;
+        self.set_kv_json_txn(&txn, canary_key, &canary_state)
+            .await?;
 
         txn.commit().await?;
         Ok(profile.version)
@@ -4103,8 +4133,7 @@ impl Storage {
         )
         .await?;
 
-        let canary_key =
-            crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_CANARY_STATE_KEY;
+        let canary_key = crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_CANARY_STATE_KEY;
         let mut canary_state = self
             .load_kv_json_txn::<crate::core::self_evolve::strategy_runtime::CanaryRolloutState>(
                 &txn, canary_key,
@@ -4114,7 +4143,8 @@ impl Storage {
         canary_state.enabled = false;
         canary_state.baseline_version = restored_profile.version.clone();
         canary_state.candidate_version = restored_profile.version.clone();
-        self.set_kv_json_txn(&txn, canary_key, &canary_state).await?;
+        self.set_kv_json_txn(&txn, canary_key, &canary_state)
+            .await?;
 
         txn.commit().await?;
         Ok(restored_profile.version)
@@ -4353,6 +4383,7 @@ impl Storage {
             llm_provider: Set(agent.llm_provider.clone()),
             capabilities: Set(agent.capabilities.clone()),
             system_prompt: Set(agent.system_prompt.clone()),
+            access_scope: Set(agent.access_scope.clone()),
             enabled: Set(agent.enabled),
             created_at: Set(agent.created_at.clone()),
         }
@@ -4376,6 +4407,7 @@ impl Storage {
             llm_provider: Set(agent.llm_provider.clone()),
             capabilities: Set(agent.capabilities.clone()),
             system_prompt: Set(agent.system_prompt.clone()),
+            access_scope: Set(agent.access_scope.clone()),
             enabled: Set(agent.enabled),
             created_at: Set(agent.created_at.clone()),
         }
@@ -4410,6 +4442,7 @@ impl Storage {
                 llm_provider: "{}".to_string(),
                 capabilities: r#"["deep research","web search","data analysis","fact checking","academic research"]"#.to_string(),
                 system_prompt: Some("You are a thorough research specialist. When given a topic, search the web, gather multiple sources, cross-reference facts, and present a well-structured summary with key findings, sources, and confidence levels. Be objective and cite your sources.".to_string()),
+                access_scope: "{}".to_string(),
                 enabled: 1,
                 created_at: now.clone(),
             },
@@ -4420,6 +4453,7 @@ impl Storage {
                 llm_provider: "{}".to_string(),
                 capabilities: r#"["code generation","debugging","code review","refactoring","architecture"]"#.to_string(),
                 system_prompt: Some("You are an expert software engineer. Write clean, efficient, well-documented code. When debugging, systematically identify root causes. When reviewing code, focus on correctness, performance, security, and maintainability. Support all major programming languages.".to_string()),
+                access_scope: "{}".to_string(),
                 enabled: 1,
                 created_at: now.clone(),
             },
@@ -4429,6 +4463,7 @@ impl Storage {
                 agent_type: "writer".to_string(),
                 llm_provider: "{}".to_string(),
                 capabilities: r#"["content writing","editing","summarization","translation","creative writing"]"#.to_string(),
+                access_scope: "{}".to_string(),
                 system_prompt: Some("You are a skilled writer and editor. Adapt your style to the requested format — professional emails, blog posts, reports, creative fiction, marketing copy, etc. Focus on clarity, engagement, and proper structure. When editing, preserve the author's voice while improving quality.".to_string()),
                 enabled: 1,
                 created_at: now.clone(),
@@ -4440,6 +4475,7 @@ impl Storage {
                 llm_provider: "{}".to_string(),
                 capabilities: r#"["data analysis","market research","financial analysis","trend analysis","reporting"]"#.to_string(),
                 system_prompt: Some("You are a sharp data and business analyst. Break down complex data, identify patterns and trends, provide actionable insights, and present findings clearly with charts and tables when appropriate. Always quantify your conclusions and flag uncertainties.".to_string()),
+                access_scope: "{}".to_string(),
                 enabled: 1,
                 created_at: now.clone(),
             },
@@ -4450,6 +4486,7 @@ impl Storage {
                 llm_provider: "{}".to_string(),
                 capabilities: r#"["project planning","task breakdown","scheduling","goal setting","strategy"]"#.to_string(),
                 system_prompt: Some("You are a strategic planner and project manager. Break down goals into actionable steps, estimate effort, identify dependencies and risks, and create clear timelines. Prioritize using impact vs effort. Always suggest concrete next actions.".to_string()),
+                access_scope: "{}".to_string(),
                 enabled: 1,
                 created_at: now.clone(),
             },
@@ -5323,8 +5360,7 @@ impl Storage {
             anyhow::bail!("storage backend is not Postgres");
         }
 
-        let sql =
-            "SELECT '[0,0]'::vector <=> '[0,0]'::vector AS cosine_distance".to_string();
+        let sql = "SELECT '[0,0]'::vector <=> '[0,0]'::vector AS cosine_distance".to_string();
         let row = self
             .db
             .query_one(Statement::from_string(DbBackend::Postgres, sql))

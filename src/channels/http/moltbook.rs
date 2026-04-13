@@ -393,13 +393,8 @@ fn format_moltbook_external_knowledge_title(insights: &MoltbookMemoryInsights) -
     format!("Moltbook: {}", moltbook_text_preview(seed, 96))
 }
 
-fn sanitize_moltbook_public_text(
-    text: &str,
-) -> crate::security::OutboundPrivacyTextResult {
-    crate::security::check_outbound_text(
-        text,
-        &crate::security::OutboundPrivacyPolicy::default(),
-    )
+fn sanitize_moltbook_public_text(text: &str) -> crate::security::OutboundPrivacyTextResult {
+    crate::security::check_outbound_text(text, &crate::security::OutboundPrivacyPolicy::default())
 }
 
 fn moltbook_privacy_details(
@@ -1701,9 +1696,8 @@ Rules:
                             }),
                         )
                         .await;
-                        engagement_failures.push(
-                            "post: blocked by outbound privacy gate".to_string(),
-                        );
+                        engagement_failures
+                            .push("post: blocked by outbound privacy gate".to_string());
                         continue;
                     }
                     remaining_posts -= 1;
@@ -1945,60 +1939,62 @@ Rules:
         Ok(Some(insights)) => {
             let (sanitized_insights, privacy) = sanitize_moltbook_memory_insights(&insights);
             match sanitized_insights {
-                Some(sanitized) => match persist_moltbook_external_knowledge(&storage, &sanitized).await {
-                    Ok(item) => {
-                        append_moltbook_activity(
-                            &storage,
-                            &run_id,
-                            "info",
-                            "external_memory_saved",
+                Some(sanitized) => {
+                    match persist_moltbook_external_knowledge(&storage, &sanitized).await {
+                        Ok(item) => {
+                            append_moltbook_activity(
+                                &storage,
+                                &run_id,
+                                "info",
+                                "external_memory_saved",
+                                serde_json::json!({
+                                    "knowledge_id": item.id.clone(),
+                                    "title": item.title.clone(),
+                                    "source": item.source.clone(),
+                                    "tags": item.tags.clone(),
+                                    "summary": sanitized.summary.clone(),
+                                    "insights": sanitized.insights.clone(),
+                                    "privacy": privacy.clone()
+                                }),
+                            )
+                            .await;
                             serde_json::json!({
-                                "knowledge_id": item.id.clone(),
-                                "title": item.title.clone(),
-                                "source": item.source.clone(),
-                                "tags": item.tags.clone(),
-                                "summary": sanitized.summary.clone(),
-                                "insights": sanitized.insights.clone(),
-                                "privacy": privacy.clone()
-                            }),
-                        )
-                        .await;
-                        serde_json::json!({
-                            "status": "saved",
-                            "store": "knowledge",
-                            "knowledge_id": item.id,
-                            "title": item.title,
-                            "source": item.source,
-                            "tags": item.tags,
-                            "summary": sanitized.summary,
-                            "insights": sanitized.insights,
-                            "privacy": privacy
-                        })
-                    }
-                    Err(error) => {
-                        append_moltbook_activity(
-                            &storage,
-                            &run_id,
-                            "warning",
-                            "external_memory_save_failed",
+                                "status": "saved",
+                                "store": "knowledge",
+                                "knowledge_id": item.id,
+                                "title": item.title,
+                                "source": item.source,
+                                "tags": item.tags,
+                                "summary": sanitized.summary,
+                                "insights": sanitized.insights,
+                                "privacy": privacy
+                            })
+                        }
+                        Err(error) => {
+                            append_moltbook_activity(
+                                &storage,
+                                &run_id,
+                                "warning",
+                                "external_memory_save_failed",
+                                serde_json::json!({
+                                    "summary": sanitized.summary.clone(),
+                                    "insights": sanitized.insights.clone(),
+                                    "privacy": privacy.clone(),
+                                    "error": error.clone()
+                                }),
+                            )
+                            .await;
                             serde_json::json!({
-                                "summary": sanitized.summary.clone(),
-                                "insights": sanitized.insights.clone(),
-                                "privacy": privacy.clone(),
-                                "error": error.clone()
-                            }),
-                        )
-                        .await;
-                        serde_json::json!({
-                            "status": "save_failed",
-                            "store": "knowledge",
-                            "summary": sanitized.summary,
-                            "insights": sanitized.insights,
-                            "privacy": privacy,
-                            "error": error
-                        })
+                                "status": "save_failed",
+                                "store": "knowledge",
+                                "summary": sanitized.summary,
+                                "insights": sanitized.insights,
+                                "privacy": privacy,
+                                "error": error
+                            })
+                        }
                     }
-                },
+                }
                 None => {
                     append_moltbook_activity(
                         &storage,

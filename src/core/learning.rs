@@ -158,23 +158,6 @@ fn suggested_steps_from_tools(tool_names: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn extract_operating_constraint(message: &str) -> Option<String> {
-    let lowered = message.trim().to_ascii_lowercase();
-    if lowered.is_empty() {
-        return None;
-    }
-    if lowered.contains("always ") || lowered.starts_with("always ") {
-        return Some(safe_truncate(message.trim(), 220));
-    }
-    if lowered.contains("never ") || lowered.starts_with("never ") {
-        return Some(safe_truncate(message.trim(), 220));
-    }
-    if lowered.contains("don't ") || lowered.contains("do not ") {
-        return Some(safe_truncate(message.trim(), 220));
-    }
-    None
-}
-
 fn bool_like(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "true" | "yes" | "on" | "1" => Some(true),
@@ -413,13 +396,17 @@ pub async fn record_execution_experience(
     if !load_learning_enabled(storage).await {
         return Ok(());
     }
-    let task_type = crate::core::self_evolve::strategy_runtime::infer_task_type(message);
-    let intent_key = derive_intent_key(message, &task_type);
-    let scope = scope_from_ids(project_id, conversation_id).to_string();
     let tool_attempts = storage
         .list_tool_attempts_for_run(&execution_run.id)
         .await
         .unwrap_or_default();
+    let task_type = crate::core::self_evolve::strategy_runtime::infer_task_type_from_action_names(
+        tool_attempts
+            .iter()
+            .map(|attempt| attempt.tool_name.as_str()),
+    );
+    let intent_key = derive_intent_key(message, &task_type);
+    let scope = scope_from_ids(project_id, conversation_id).to_string();
     let sequence_json = tool_sequence_json(&tool_attempts);
     let sequence_digest = tool_sequence_digest(&tool_attempts);
     let success_state = if matches!(
@@ -585,72 +572,6 @@ fn negative_lesson_summary(run: &experience_run::Model, tool_names: &[String]) -
     )
 }
 
-async fn upsert_constraint_from_message(
-    storage: &Storage,
-    message: &str,
-    project_id: Option<&str>,
-    conversation_id: Option<&str>,
-) -> Result<()> {
-    let Some(content) = extract_operating_constraint(message) else {
-        return Ok(());
-    };
-    let scope = scope_from_ids(project_id, conversation_id);
-    let normalized_key = format!(
-        "constraint::{}",
-        short_hash(&[
-            scope,
-            project_id.unwrap_or(""),
-            conversation_id.unwrap_or(""),
-            content.as_str()
-        ])
-    );
-    let id = build_item_id(
-        "constraint",
-        scope,
-        project_id,
-        conversation_id,
-        &normalized_key,
-    );
-    let existing = storage.get_experience_item(&id).await?;
-    let support_count = existing
-        .as_ref()
-        .map(|item| item.support_count.saturating_add(1))
-        .unwrap_or(1);
-    let confidence = existing
-        .as_ref()
-        .map(|item| (item.confidence + 0.06).min(0.98))
-        .unwrap_or(0.72);
-    let now = chrono::Utc::now().to_rfc3339();
-    storage
-        .upsert_experience_item(&experience_item::Model {
-            id,
-            kind: "constraint".to_string(),
-            scope: scope.to_string(),
-            project_id: project_id.map(|value| value.to_string()),
-            conversation_id: conversation_id.map(|value| value.to_string()),
-            title: "Learned operating constraint".to_string(),
-            content,
-            normalized_key,
-            confidence,
-            support_count,
-            contradiction_count: existing
-                .as_ref()
-                .map(|item| item.contradiction_count)
-                .unwrap_or_default(),
-            status: "active".to_string(),
-            metadata: json!({
-                "source": "experience_consolidation",
-                "constraint_type": "user_instruction",
-            }),
-            last_supported_at: Some(now.clone()),
-            last_contradicted_at: existing.and_then(|item| item.last_contradicted_at),
-            created_at: now.clone(),
-            updated_at: now,
-        })
-        .await?;
-    Ok(())
-}
-
 pub async fn sync_user_preference_to_experience_item(
     storage: &Storage,
     key: &str,
@@ -717,10 +638,6 @@ async fn consolidate_run(storage: &Storage, run: &experience_run::Model) -> Resu
     let project_id = run.project_id.as_deref();
     let conversation_id = run.conversation_id.as_deref();
     let now = chrono::Utc::now().to_rfc3339();
-
-    if let Some(request_text) = run.request_text.as_deref() {
-        upsert_constraint_from_message(storage, request_text, project_id, conversation_id).await?;
-    }
 
     let is_negative = run.correction_state == "corrected" || run.success_state == "failed";
     if is_negative {
@@ -1192,7 +1109,10 @@ fn learning_candidate_material_signature(candidate: &learning_candidate::Model) 
     ])
 }
 
-fn learning_candidate_revision_id(candidate: &learning_candidate::Model, signature: &str) -> String {
+fn learning_candidate_revision_id(
+    candidate: &learning_candidate::Model,
+    signature: &str,
+) -> String {
     stable_id(
         "candidate",
         &[
@@ -1213,7 +1133,8 @@ fn learning_candidate_needs_refresh(
         || existing.conversation_id != candidate.conversation_id
         || existing.pattern_id != candidate.pattern_id
         || existing.evidence_refs != candidate.evidence_refs
-        || semantic_candidate_proposed_content(existing) != semantic_candidate_proposed_content(candidate)
+        || semantic_candidate_proposed_content(existing)
+            != semantic_candidate_proposed_content(candidate)
         || (existing.confidence - candidate.confidence).abs() > f64::EPSILON
 }
 
@@ -1242,7 +1163,9 @@ async fn supersede_stale_draft_candidates(
     let mut updated = 0usize;
     for draft in existing_candidates.iter().filter(|candidate| {
         learning_candidate_is_draft(&candidate.approval_status)
-            && keep_id.map(|keep_id| candidate.id != keep_id).unwrap_or(true)
+            && keep_id
+                .map(|keep_id| candidate.id != keep_id)
+                .unwrap_or(true)
     }) {
         let note = format!(
             "Auto-superseded because generation returned to reviewed candidate `{}`.",
@@ -1280,13 +1203,10 @@ async fn upsert_generated_learning_candidate(
         .await?;
     let material_signature = learning_candidate_material_signature(&candidate);
 
-    if let Some(existing) = existing_candidates
-        .iter()
-        .find(|existing| {
-            learning_candidate_is_reviewed(&existing.approval_status)
-                && learning_candidate_material_signature(existing) == material_signature
-        })
-    {
+    if let Some(existing) = existing_candidates.iter().find(|existing| {
+        learning_candidate_is_reviewed(&existing.approval_status)
+            && learning_candidate_material_signature(existing) == material_signature
+    }) {
         let superseded = supersede_stale_draft_candidates(
             storage,
             lease_guard,
@@ -1298,13 +1218,10 @@ async fn upsert_generated_learning_candidate(
         return Ok(superseded);
     }
 
-    if let Some(existing) = existing_candidates
-        .iter()
-        .find(|existing| {
-            learning_candidate_is_draft(&existing.approval_status)
-                && learning_candidate_material_signature(existing) == material_signature
-        })
-    {
+    if let Some(existing) = existing_candidates.iter().find(|existing| {
+        learning_candidate_is_draft(&existing.approval_status)
+            && learning_candidate_material_signature(existing) == material_signature
+    }) {
         candidate.id = existing.id.clone();
         candidate.created_at = existing.created_at.clone();
         candidate.approval_status = existing.approval_status.clone();

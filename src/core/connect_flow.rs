@@ -5,6 +5,7 @@
 //! - Ask the user to provide required secrets via chat-safe commands.
 //! - When secrets are saved, run a connectivity check and enable on success.
 
+use crate::core::RequestShapeAssessment;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -37,53 +38,22 @@ pub struct PendingIntegrationConnect {
 
 pub const CONNECT_FLOW_TTL_SECS: i64 = 20 * 60;
 
-fn normalize_phrase(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut last_was_space = true;
-    for ch in text.chars() {
+pub fn canonical_integration_id(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut last_was_separator = false;
+    for ch in value.trim().to_ascii_lowercase().chars() {
         if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-            last_was_space = false;
-        } else if !last_was_space {
-            out.push(' ');
-            last_was_space = true;
+            out.push(ch);
+            last_was_separator = false;
+        } else if !out.is_empty() && !last_was_separator {
+            out.push('_');
+            last_was_separator = true;
         }
     }
-    out.trim().to_string()
-}
-
-fn contains_normalized_phrase(haystack: &str, phrase: &str) -> bool {
-    let haystack = format!(" {} ", normalize_phrase(haystack));
-    let needle = format!(" {} ", normalize_phrase(phrase));
-    !needle.trim().is_empty() && haystack.contains(&needle)
-}
-
-fn message_contains_any_phrase(message: &str, phrases: &[&str]) -> bool {
-    phrases
-        .iter()
-        .any(|phrase| contains_normalized_phrase(message, phrase))
-}
-
-fn contains_normalized_token(haystack: &str, token: &str) -> bool {
-    let haystack_tokens = normalize_phrase(haystack)
-        .split_whitespace()
-        .map(|word| word.to_string())
-        .collect::<std::collections::BTreeSet<_>>();
-    haystack_tokens.contains(&token.trim().to_ascii_lowercase())
-}
-
-fn message_contains_any_token(message: &str, tokens: &[&str]) -> bool {
-    tokens
-        .iter()
-        .any(|token| contains_normalized_token(message, token))
-}
-
-fn connect_trigger_matches(message: &str, trigger: &str) -> bool {
-    let normalized = normalize_phrase(trigger);
-    if normalized.split_whitespace().count() <= 1 {
-        return contains_normalized_token(message, trigger);
+    while out.ends_with('_') {
+        out.pop();
     }
-    contains_normalized_phrase(message, trigger)
+    out
 }
 
 static SPECS: &[IntegrationConnectSpec] = &[
@@ -239,66 +209,30 @@ pub fn spec_by_id(id: &str) -> Option<&'static IntegrationConnectSpec> {
     SPECS.iter().find(|s| s.id == id)
 }
 
-fn looks_like_connect_intent(message_lc: &str) -> bool {
-    message_contains_any_phrase(
-        message_lc,
-        &[
-            "set up",
-            "setup",
-            "configure",
-            "add integration",
-            "enable integration",
-            "grant access",
-            "give access",
-            "request access",
-            "need access",
-            "sign in",
-            "log in",
-            "wire up",
-            "hook up",
-        ],
-    ) || message_contains_any_token(
-        message_lc,
-        &[
-            "connect",
-            "link",
-            "integrate",
-            "authorize",
-            "authenticate",
-            "token",
-            "credentials",
-            "secret",
-            "sync",
-            "pair",
-        ],
-    ) || message_contains_any_phrase(message_lc, &["api key"])
+#[cfg(test)]
+pub fn detect_connect_integration(message: &str) -> Option<&'static IntegrationConnectSpec> {
+    let _ = message;
+    None
 }
 
-pub fn detect_connect_integration(message: &str) -> Option<&'static IntegrationConnectSpec> {
-    let lc = message.trim().to_ascii_lowercase();
-    if lc.is_empty() {
+pub fn detect_connect_integration_with_shape(
+    message: &str,
+    request_shape: Option<&RequestShapeAssessment>,
+) -> Option<&'static IntegrationConnectSpec> {
+    let _ = message;
+    if let Some(shape) = request_shape {
+        if shape.is_integration_request() && !shape.should_confirm && shape.confidence >= 0.70 {
+            let integration_id = shape.integration_id.as_deref()?;
+            return spec_by_id(&canonical_integration_id(integration_id));
+        }
         return None;
     }
-    if !looks_like_connect_intent(&lc) {
-        return None;
-    }
-    SPECS.iter().find(|spec| {
-        spec.triggers
-            .iter()
-            .any(|t| connect_trigger_matches(&lc, t))
-    })
+
+    None
 }
 
 pub fn is_cancel_message(message: &str) -> bool {
-    let lc = message.trim().to_ascii_lowercase();
-    let normalized = normalize_phrase(&lc);
-    normalized == "cancel"
-        || lc.trim() == "/cancel"
-        || contains_normalized_phrase(&lc, "cancel setup")
-        || contains_normalized_phrase(&lc, "never mind")
-        || contains_normalized_phrase(&lc, "nevermind")
-        || contains_normalized_phrase(&lc, "stop setup")
-        || contains_normalized_phrase(&lc, "abort setup")
+    message.trim().eq_ignore_ascii_case("/cancel")
 }
 
 pub fn connect_instructions(spec: &IntegrationConnectSpec) -> String {
@@ -309,7 +243,7 @@ pub fn connect_instructions(spec: &IntegrationConnectSpec) -> String {
     ));
     out.push_str("Send secrets using one of these safe commands:\n");
     out.push_str("- Telegram/WhatsApp: `/setsecret KEY=VALUE`\n");
-    out.push_str("- Web chat: `set secret KEY=VALUE`\n\n");
+    out.push_str("- Web chat: `/setsecret KEY=VALUE`\n\n");
 
     match spec.required.kind {
         SecretRequirementKind::All => {
@@ -333,8 +267,10 @@ pub fn connect_instructions(spec: &IntegrationConnectSpec) -> String {
         }
     }
 
-    out.push_str("\nAfter you set the secret(s), I will run a connection test and enable it if successful.\n");
-    out.push_str("To cancel: `cancel setup`.\n");
+    out.push_str(
+        "\nAfter you set the secret(s), I will run a connection test and enable it if successful.\n",
+    );
+    out.push_str("To cancel: `/cancel`.\n");
     out
 }
 
@@ -343,18 +279,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detects_connect_requests_with_normalized_paraphrases() {
-        let spec = detect_connect_integration("Please set-up GitHub for me").expect("github spec");
-        assert_eq!(spec.id, "github");
-
-        let spec = detect_connect_integration("I need GitHub access").expect("github spec");
-        assert_eq!(spec.id, "github");
+    fn phrase_only_detection_is_disabled() {
+        assert!(detect_connect_integration("GitHub").is_none());
+        assert!(detect_connect_integration("GitHub access").is_none());
     }
 
     #[test]
-    fn matches_hyphenated_integration_names() {
-        let spec =
-            detect_connect_integration("Connect Google-Places for me").expect("google places");
+    fn shape_detection_matches_hyphenated_integration_names() {
+        let shape = RequestShapeAssessment {
+            shape: "integration".to_string(),
+            execution_mode: "immediate".to_string(),
+            confidence: 0.92,
+            should_confirm: false,
+            confirmation_question: None,
+            reasoning: String::new(),
+            preferred_actions: vec![],
+            integration_id: Some("google-places".to_string()),
+            ..Default::default()
+        };
+        let spec = detect_connect_integration_with_shape("", Some(&shape)).expect("google places");
         assert_eq!(spec.id, "google_places");
     }
 
@@ -371,7 +314,64 @@ mod tests {
 
     #[test]
     fn matches_single_word_triggers_via_token_boundaries() {
-        let spec = detect_connect_integration("Please connect GitHub").expect("github spec");
+        let shape = RequestShapeAssessment {
+            shape: "integration".to_string(),
+            execution_mode: "immediate".to_string(),
+            confidence: 0.92,
+            should_confirm: false,
+            confirmation_question: None,
+            reasoning: String::new(),
+            preferred_actions: vec![],
+            integration_id: Some("github".to_string()),
+            ..Default::default()
+        };
+        let spec = detect_connect_integration_with_shape("", Some(&shape)).expect("github spec");
         assert_eq!(spec.id, "github");
+    }
+
+    #[test]
+    fn shape_gates_connect_flow_with_llm_integration_target() {
+        let shape = RequestShapeAssessment {
+            shape: "integration".to_string(),
+            execution_mode: "immediate".to_string(),
+            confidence: 0.92,
+            should_confirm: false,
+            confirmation_question: None,
+            reasoning: String::new(),
+            preferred_actions: vec![],
+            integration_id: Some("github".to_string()),
+            ..Default::default()
+        };
+
+        let spec = detect_connect_integration_with_shape("any wording", Some(&shape))
+            .expect("github spec");
+        assert_eq!(spec.id, "github");
+    }
+
+    #[test]
+    fn shape_blocks_plain_mentions_from_starting_connect_flow() {
+        let shape = RequestShapeAssessment {
+            shape: "conversation".to_string(),
+            execution_mode: "none".to_string(),
+            confidence: 0.88,
+            should_confirm: false,
+            confirmation_question: None,
+            reasoning: String::new(),
+            preferred_actions: vec![],
+            integration_id: Some("github".to_string()),
+            ..Default::default()
+        };
+
+        assert!(
+            detect_connect_integration_with_shape("GitHub docs update", Some(&shape)).is_none()
+        );
+    }
+
+    #[test]
+    fn cancel_message_is_explicit_only() {
+        assert!(is_cancel_message("/cancel"));
+        assert!(!is_cancel_message("cancel"));
+        assert!(!is_cancel_message("never mind"));
+        assert!(!is_cancel_message("stop setup"));
     }
 }

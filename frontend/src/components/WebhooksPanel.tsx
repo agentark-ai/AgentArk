@@ -27,6 +27,7 @@ import {
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
+import { formatUiDateTime } from "../lib/dateFormat";
 import type { IntegrationItem } from "../types";
 
 type JsonRecord = Record<string, unknown>;
@@ -59,9 +60,7 @@ function errMessage(error: unknown): string {
 }
 
 function humanTs(value: string): string {
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) return value || "-";
-  return parsed.toLocaleString();
+  return formatUiDateTime(value, { fallback: "-" });
 }
 
 function integrationLabel(id: string, integrations: IntegrationItem[]): string {

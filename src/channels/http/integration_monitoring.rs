@@ -181,7 +181,7 @@ pub(super) async fn apply_integration_monitoring_recommendation(
     let agent = state.agent.read().await;
     let (status, message) = match spec.blueprint {
         RecommendationBlueprint::Watcher(arguments) => match agent
-            .handle_watch(&arguments, "integrations", None, None)
+            .handle_watch(&arguments, "integrations", None, None, None)
             .await
         {
             Some(message) => {

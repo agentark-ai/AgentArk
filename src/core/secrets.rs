@@ -81,16 +81,32 @@ pub fn storage_keys_for_user_key(user_key: &str) -> Vec<String> {
     keys_to_write(user_key)
 }
 
-/// Parse `set secret` command syntax:
-/// - `set secret KEY=VALUE`
-/// - `set secret KEY VALUE`
+fn validate_secret_key(key: &str) -> Option<String> {
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    if key.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    if key.contains('\n') || key.contains('\r') {
+        return None;
+    }
+    Some(key.to_string())
+}
+
+/// Parse explicit secret command syntax across chat channels.
+///
+/// Accepted examples:
+/// - `/setsecret KEY=VALUE`
 pub fn parse_set_secret_command(message: &str) -> Option<(String, String)> {
     let trimmed = message.trim();
     let lower = trimmed.to_ascii_lowercase();
-    if !lower.starts_with("set secret ") {
+    let rest = if lower.starts_with("/setsecret ") {
+        trimmed[10..].trim()
+    } else {
         return None;
-    }
-    let rest = trimmed[10..].trim(); // len("set secret ") == 10
+    };
     if rest.is_empty() {
         return None;
     }
@@ -105,51 +121,30 @@ pub fn parse_set_secret_command(message: &str) -> Option<(String, String)> {
         (k, v)
     };
 
-    if key.is_empty() || value.is_empty() {
+    let key = validate_secret_key(key)?;
+    if value.is_empty() {
         return None;
     }
-    if key.chars().any(|c| c.is_whitespace()) {
-        return None;
-    }
-    if key.contains('\n') || key.contains('\r') {
-        return None;
-    }
-    Some((key.to_string(), value.to_string()))
+    Some((key, value.to_string()))
 }
 
 /// Parse a request to reuse the currently configured LLM credential for a target key.
 ///
 /// Supported forms:
-/// - `use current llm key for OPENAI_API_KEY`
-/// - `use current model key for OPENAI_API_KEY`
-/// - `use llm key OPENAI_API_KEY`
+/// - `/usecurrentkey OPENAI_API_KEY`
 pub fn parse_use_current_llm_key_command(message: &str) -> Option<String> {
     let trimmed = message.trim();
     let lower = trimmed.to_ascii_lowercase();
-    let prefixes = [
-        "use current llm key for ",
-        "use current model key for ",
-        "use llm key ",
-        "use model key ",
-    ];
-    let mut rest = None;
-    for prefix in prefixes {
-        if lower.starts_with(prefix) && trimmed.len() >= prefix.len() {
-            rest = Some(trimmed[prefix.len()..].trim());
-            break;
-        }
-    }
-    let key = rest?;
+    let rest = if lower.starts_with("/usecurrentkey ") {
+        trimmed[15..].trim()
+    } else {
+        return None;
+    };
+    let key = rest;
     if key.is_empty() {
         return None;
     }
-    if key.chars().any(|c| c.is_whitespace()) {
-        return None;
-    }
-    if key.contains('\n') || key.contains('\r') {
-        return None;
-    }
-    Some(key.to_string())
+    validate_secret_key(key)
 }
 
 pub fn store_user_secret(
@@ -196,17 +191,24 @@ mod tests {
     }
 
     #[test]
-    fn parse_set_secret_command_accepts_equals_form() {
+    fn parse_set_secret_command_accepts_slash_form() {
+        assert_eq!(parse_set_secret_command("GITHUB_TOKEN=abc123"), None);
+        assert_eq!(parse_set_secret_command("OPENAI_API_KEY=abc123"), None);
         assert_eq!(
-            parse_set_secret_command("set secret GITHUB_TOKEN=abc123"),
-            Some(("GITHUB_TOKEN".to_string(), "abc123".to_string()))
+            parse_set_secret_command("/setsecret OPENAI_API_KEY=abc123"),
+            Some(("OPENAI_API_KEY".to_string(), "abc123".to_string()))
         );
     }
 
     #[test]
-    fn parse_use_current_llm_key_command_accepts_full_phrase() {
+    fn parse_use_current_llm_key_command_accepts_slash_form() {
+        assert_eq!(parse_use_current_llm_key_command("OPENAI_API_KEY"), None);
         assert_eq!(
-            parse_use_current_llm_key_command("use current llm key for OPENAI_API_KEY"),
+            parse_use_current_llm_key_command("KEY OPENAI_API_KEY"),
+            None
+        );
+        assert_eq!(
+            parse_use_current_llm_key_command("/usecurrentkey OPENAI_API_KEY"),
             Some("OPENAI_API_KEY".to_string())
         );
     }
