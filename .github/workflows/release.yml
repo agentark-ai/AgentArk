@@ -57,7 +57,7 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
 
       - name: Cache cargo dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -181,7 +181,7 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
 
       - name: Cache cargo dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/bin
