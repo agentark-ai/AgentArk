@@ -50,7 +50,7 @@
 # Use Debian trixie here because fastembed -> ort-sys currently links against
 # ONNX Runtime binaries that require glibc 2.38 (__isoc23_* symbols). Bookworm
 # ships glibc 2.36, which causes the release link to fail in Docker builds.
-FROM rust:1.92-trixie AS builder
+FROM rust:1.94-trixie AS builder
 
 WORKDIR /app
 
@@ -90,9 +90,9 @@ RUN --mount=type=cache,id=agentark-cargo-target,target=/app/target \
     --mount=type=cache,id=agentark-cargo-registry,target=/usr/local/cargo/registry \
     rm -f target/release/agentark target/release/deps/agentark-* && \
     if [ "${AGENTARK_BUILD_JOBS}" = "0" ]; then \
-        cargo build --release --no-default-features --features "${AGENTARK_DOCKER_FEATURES}"; \
+        cargo build --release --no-default-features --features "${AGENTARK_DOCKER_FEATURES}" --bins; \
     else \
-        cargo build --release --no-default-features --features "${AGENTARK_DOCKER_FEATURES}" -j "${AGENTARK_BUILD_JOBS}"; \
+        cargo build --release --no-default-features --features "${AGENTARK_DOCKER_FEATURES}" --bins -j "${AGENTARK_BUILD_JOBS}"; \
     fi && \
     cp target/release/agentark /app/agentark-bin
 
@@ -101,14 +101,17 @@ RUN --mount=type=cache,id=agentark-cargo-target,target=/app/target \
 ARG AGENTARK_PREFETCH_LOCAL_EMBEDDINGS=true
 RUN --mount=type=cache,id=agentark-cargo-target,target=/app/target \
     --mount=type=cache,id=agentark-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=agentark-local-embeddings-cache,target=/tmp/agentark-embeddings-cache \
+    mkdir -p /app/prebuilt-embeddings-cache /tmp/agentark-embeddings-cache && \
     if [ "${AGENTARK_PREFETCH_LOCAL_EMBEDDINGS}" = "true" ]; then \
-        cargo run --release --no-default-features --features "${AGENTARK_DOCKER_FEATURES}" --bin prefetch_embeddings -- /app/prebuilt-embeddings-cache; \
+        target/release/prefetch_embeddings /tmp/agentark-embeddings-cache && \
+        cp -a /tmp/agentark-embeddings-cache/. /app/prebuilt-embeddings-cache/; \
     else \
         mkdir -p /app/prebuilt-embeddings-cache; \
     fi
 
 # -- Stage 2: Frontend build --
-FROM node:20-slim AS frontend-builder
+FROM node:25-slim AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN --mount=type=cache,id=agentark-frontend-npm,target=/root/.npm \
@@ -120,7 +123,7 @@ RUN npm run build
 
 # -- Stage 3: Node.js bridges build --
 # Build node_modules here (git available), then copy only the result to runtime
-FROM node:20-slim AS node-builder
+FROM node:25-slim AS node-builder
 
 ARG INSTALL_WHATSAPP_BRIDGE=true
 ARG INSTALL_PLAYWRIGHT_RUNTIME=false
@@ -152,7 +155,7 @@ COPY bridges/playwright-bridge/index.js ./
 # -- Stage 4: Minimal runtime --
 # Keep runtime on the same Debian family so the final binary sees the same
 # glibc generation it was linked against in the builder stage.
-FROM node:20-trixie-slim
+FROM node:25-trixie-slim
 
 ARG INSTALL_PLAYWRIGHT_RUNTIME=false
 ARG INSTALL_TAILSCALE=false
