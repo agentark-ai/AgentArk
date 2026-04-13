@@ -158,6 +158,83 @@ export const appTheme = createTheme({
             background: "rgba(10, 18, 31, 0.42)",
             boxShadow: "none",
           },
+          variants: [
+            {
+              props: { variant: "contained", color: "secondary" },
+              style: {
+                background: "var(--button-bg-subtle)",
+                color: "var(--button-text)",
+                borderColor: "var(--button-border)",
+                boxShadow: "var(--button-shadow)",
+                "&:hover": {
+                  background: "var(--button-bg-subtle-hover)",
+                  borderColor: "var(--button-border-strong)",
+                  boxShadow: "var(--button-shadow-hover)",
+                },
+              },
+            },
+            {
+              props: { variant: "contained", color: "success" },
+              style: { color: "#07131f" },
+            },
+            {
+              props: { variant: "contained", color: "warning" },
+              style: { color: "#07131f" },
+            },
+            {
+              props: { variant: "contained", color: "error" },
+              style: { color: "#f7fbff" },
+            },
+            {
+              props: { variant: "outlined", color: "primary" },
+              style: { color: "var(--button-text)" },
+            },
+            {
+              props: { variant: "outlined", color: "success" },
+              style: {
+                borderColor: "rgba(74, 210, 157, 0.28)",
+                color: "#79f0bb",
+                "&:hover": {
+                  borderColor: "rgba(74, 210, 157, 0.42)",
+                  background: "rgba(9, 37, 29, 0.82)",
+                },
+              },
+            },
+            {
+              props: { variant: "outlined", color: "warning" },
+              style: {
+                borderColor: "rgba(255, 159, 67, 0.3)",
+                color: "#ffbc7c",
+                "&:hover": {
+                  borderColor: "rgba(255, 159, 67, 0.44)",
+                  background: "rgba(47, 24, 8, 0.82)",
+                },
+              },
+            },
+            {
+              props: { variant: "outlined", color: "error" },
+              style: {
+                borderColor: "rgba(255, 107, 107, 0.3)",
+                color: "#ff9f9f",
+                "&:hover": {
+                  borderColor: "rgba(255, 107, 107, 0.44)",
+                  background: "rgba(46, 11, 18, 0.82)",
+                },
+              },
+            },
+            {
+              props: { variant: "text", color: "primary" },
+              style: { color: "var(--button-text)" },
+            },
+            {
+              props: { variant: "text", color: "error" },
+              style: { color: "#ffb0b0" },
+            },
+            {
+              props: { variant: "text", color: "warning" },
+              style: { color: "#ffc98e" },
+            },
+          ],
         },
         sizeSmall: {
           minHeight: "var(--button-height-sm)",
@@ -174,15 +251,6 @@ export const appTheme = createTheme({
           padding: "0 var(--button-pad-x-lg)",
           fontSize: "0.88rem",
         },
-        containedSizeMedium: {
-          minHeight: "var(--button-height-md)",
-        },
-        outlinedSizeMedium: {
-          minHeight: "var(--button-height-md)",
-        },
-        textSizeMedium: {
-          minHeight: "var(--button-height-md)",
-        },
         contained: {
           background: "var(--button-bg-primary)",
           color: "var(--button-text-strong)",
@@ -194,37 +262,6 @@ export const appTheme = createTheme({
             boxShadow: "var(--button-shadow-hover)",
           },
         },
-        containedPrimary: {
-          background: "var(--button-bg-primary)",
-          color: "var(--button-text-strong)",
-          borderColor: "rgba(158, 185, 212, 0.24)",
-          boxShadow: "var(--button-shadow-primary)",
-          "&:hover": {
-            background: "var(--button-bg-primary-hover)",
-            borderColor: "rgba(173, 199, 224, 0.3)",
-            boxShadow: "var(--button-shadow-hover)",
-          },
-        },
-        containedSecondary: {
-          background: "var(--button-bg-subtle)",
-          color: "var(--button-text)",
-          borderColor: "var(--button-border)",
-          boxShadow: "var(--button-shadow)",
-          "&:hover": {
-            background: "var(--button-bg-subtle-hover)",
-            borderColor: "var(--button-border-strong)",
-            boxShadow: "var(--button-shadow-hover)",
-          },
-        },
-        containedSuccess: {
-          color: "#07131f",
-        },
-        containedWarning: {
-          color: "#07131f",
-        },
-        containedError: {
-          color: "#f7fbff",
-        },
         outlined: {
           background: "rgba(22, 22, 26, 0.78)",
           borderColor: "var(--button-border)",
@@ -235,33 +272,6 @@ export const appTheme = createTheme({
             boxShadow: "none",
           },
         },
-        outlinedPrimary: {
-          color: "var(--button-text)",
-        },
-        outlinedSuccess: {
-          borderColor: "rgba(74, 210, 157, 0.28)",
-          color: "#79f0bb",
-          "&:hover": {
-            borderColor: "rgba(74, 210, 157, 0.42)",
-            background: "rgba(9, 37, 29, 0.82)",
-          },
-        },
-        outlinedWarning: {
-          borderColor: "rgba(255, 159, 67, 0.3)",
-          color: "#ffbc7c",
-          "&:hover": {
-            borderColor: "rgba(255, 159, 67, 0.44)",
-            background: "rgba(47, 24, 8, 0.82)",
-          },
-        },
-        outlinedError: {
-          borderColor: "rgba(255, 107, 107, 0.3)",
-          color: "#ff9f9f",
-          "&:hover": {
-            borderColor: "rgba(255, 107, 107, 0.44)",
-            background: "rgba(46, 11, 18, 0.82)",
-          },
-        },
         text: {
           color: "var(--button-text-muted)",
           borderColor: "transparent",
@@ -270,15 +280,6 @@ export const appTheme = createTheme({
             color: "var(--button-text)",
             background: "rgba(255, 255, 255, 0.05)",
           },
-        },
-        textPrimary: {
-          color: "var(--button-text)",
-        },
-        textError: {
-          color: "#ffb0b0",
-        },
-        textWarning: {
-          color: "#ffc98e",
         },
       },
     },
@@ -464,22 +465,36 @@ export const appTheme = createTheme({
         root: {
           borderRadius: 10,
           fontSize: "0.82rem",
-        },
-        standardInfo: {
-          background: "rgba(57, 208, 255, 0.06)",
-          border: "1px solid rgba(57, 208, 255, 0.15)",
-        },
-        standardSuccess: {
-          background: "rgba(74, 210, 157, 0.06)",
-          border: "1px solid rgba(74, 210, 157, 0.15)",
-        },
-        standardWarning: {
-          background: "rgba(255, 159, 67, 0.06)",
-          border: "1px solid rgba(255, 159, 67, 0.15)",
-        },
-        standardError: {
-          background: "rgba(255, 107, 107, 0.06)",
-          border: "1px solid rgba(255, 107, 107, 0.15)",
+          variants: [
+            {
+              props: { variant: "standard", color: "info" },
+              style: {
+                background: "rgba(57, 208, 255, 0.06)",
+                border: "1px solid rgba(57, 208, 255, 0.15)",
+              },
+            },
+            {
+              props: { variant: "standard", color: "success" },
+              style: {
+                background: "rgba(74, 210, 157, 0.06)",
+                border: "1px solid rgba(74, 210, 157, 0.15)",
+              },
+            },
+            {
+              props: { variant: "standard", color: "warning" },
+              style: {
+                background: "rgba(255, 159, 67, 0.06)",
+                border: "1px solid rgba(255, 159, 67, 0.15)",
+              },
+            },
+            {
+              props: { variant: "standard", color: "error" },
+              style: {
+                background: "rgba(255, 107, 107, 0.06)",
+                border: "1px solid rgba(255, 107, 107, 0.15)",
+              },
+            },
+          ],
         },
       },
     },

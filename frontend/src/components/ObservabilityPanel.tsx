@@ -81,7 +81,14 @@ export function ObservabilityPanel({
     <Stack spacing={1.5}>
       {!embedded ? (
         <>
-          <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+          <Stack
+            direction="row"
+            spacing={1}
+            useFlexGap
+            sx={{
+              alignItems: "center",
+              flexWrap: "wrap"
+            }}>
             <Typography variant="h6">Observability Export</Typography>
             <Chip size="small" label={statusChip.label} color={statusChip.color} />
             {values.authTokenConfigured ? (
@@ -89,19 +96,27 @@ export function ObservabilityPanel({
             ) : null}
           </Stack>
 
-          <Typography variant="caption" color="text.secondary">
+          <Typography variant="caption" sx={{
+            color: "text.secondary"
+          }}>
             Optional. When enabled and configured, AgentArk exports completed run traces to Langtrace, LangSmith, or any OTLP-compatible backend.
           </Typography>
         </>
       ) : (
-        <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+        <Stack
+          direction="row"
+          spacing={1}
+          useFlexGap
+          sx={{
+            alignItems: "center",
+            flexWrap: "wrap"
+          }}>
           <Chip size="small" label={statusChip.label} color={statusChip.color} />
           {values.authTokenConfigured ? (
             <Chip size="small" variant="outlined" label="Token saved" color="success" />
           ) : null}
         </Stack>
       )}
-
       <FormControlLabel
         control={
           <Switch
@@ -111,7 +126,6 @@ export function ObservabilityPanel({
         }
         label={values.enabled ? "Observability export is enabled" : "Enable observability export"}
       />
-
       <Stack direction={{ xs: "column", md: "row" }} spacing={1.5}>
         <TextField
           select
@@ -149,7 +163,6 @@ export function ObservabilityPanel({
           helperText={provider === "langsmith" ? "Maps to LANGSMITH_PROJECT. Traces go to this project in LangSmith." : undefined}
         />
       </Stack>
-
       <TextField
         label={endpointLabel}
         size="small"
@@ -159,7 +172,6 @@ export function ObservabilityPanel({
         placeholder={provider === "langtrace" ? "https://app.langtrace.ai" : provider === "langsmith" ? "https://eu.api.smith.langchain.com" : "https://collector.example.com"}
         helperText={endpointHelper}
       />
-
       <Stack direction={{ xs: "column", md: "row" }} spacing={1.5}>
         <TextField
           label="Auth Header Name"
@@ -179,8 +191,9 @@ export function ObservabilityPanel({
           helperText="Stored encrypted. Enter a blank value and save only if you want to keep the existing token unchanged."
         />
       </Stack>
-
-      <Stack direction={{ xs: "column", md: "row" }} spacing={1.5} alignItems={{ md: "center" }}>
+      <Stack direction={{ xs: "column", md: "row" }} spacing={1.5} sx={{
+        alignItems: { md: "center" }
+      }}>
         <TextField
           select
           label="Privacy Level"
@@ -202,23 +215,21 @@ export function ObservabilityPanel({
           {testing ? "Sending test..." : "Send Test Trace"}
         </Button>
       </Stack>
-
       <Alert severity={values.enabled ? "info" : "warning"}>
         {values.enabled
           ? "Exports only happen when observability is enabled and fully configured. If the endpoint or token is missing, AgentArk keeps tracing locally only."
           : "Observability export is off. AgentArk continues storing local traces in Trace."}
       </Alert>
-
       {issues.length > 0 ? (
         <Alert severity="error">
           {issues[0]}
           {issues.length > 1 ? ` (+${issues.length - 1} more recent export issue${issues.length === 2 ? "" : "s"})` : ""}
         </Alert>
       ) : null}
-
       <Divider />
-
-      <Typography variant="caption" color="text.secondary">
+      <Typography variant="caption" sx={{
+        color: "text.secondary"
+      }}>
         Export delivery logs are shown on the Trace page.
       </Typography>
     </Stack>

@@ -184,7 +184,13 @@ export function NeedsAttentionInbox({
       <CardContent sx={{ p: 1.3, display: "flex", flexDirection: "column" }}>
         <Stack spacing={1.15} className="mission-panel-content">
           <Box>
-            <Stack direction="row" alignItems="center" spacing={1} mb={0.45}>
+            <Stack
+              direction="row"
+              spacing={1}
+              sx={{
+                alignItems: "center",
+                mb: 0.45
+              }}>
               <WarningAmberRoundedIcon
                 sx={{ color: count > 0 ? "rgba(255, 167, 38, 0.9)" : "rgba(155, 180, 214, 0.4)", fontSize: 20 }}
               />
@@ -193,12 +199,16 @@ export function NeedsAttentionInbox({
               </Typography>
               {count > 0 ? <Badge badgeContent={count} color="warning" /> : null}
             </Stack>
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>
               One queue for approvals, pauses, failures, urgent alerts, and setup gaps that require an operator.
             </Typography>
           </Box>
 
-          <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+          <Stack direction="row" spacing={0.75} useFlexGap sx={{
+            flexWrap: "wrap"
+          }}>
             <Chip size="small" color={waitingCount > 0 ? "warning" : "default"} label={`${waitingCount} waiting`} />
             <Chip size="small" color={failedCount > 0 ? "error" : "default"} label={`${failedCount} failed`} />
             <Chip size="small" color={unreadAlerts > 0 ? "warning" : "default"} label={`${unreadAlerts} unread alerts`} />
@@ -207,7 +217,12 @@ export function NeedsAttentionInbox({
           {count === 0 ? (
             <Box className="empty-state mission-empty-copy" sx={{ py: 3 }}>
               <CheckCircleOutlineRoundedIcon sx={{ fontSize: 36, color: "rgba(20, 241, 149, 0.6)" }} />
-              <Typography variant="body2" color="text.secondary" sx={{ fontWeight: 600 }}>
+              <Typography
+                variant="body2"
+                sx={{
+                  color: "text.secondary",
+                  fontWeight: 600
+                }}>
                 Operator queue is clear.
               </Typography>
             </Box>
@@ -228,11 +243,20 @@ export function NeedsAttentionInbox({
                     <Stack
                       direction={{ xs: "column", sm: "row" }}
                       spacing={1}
-                      justifyContent="space-between"
-                      alignItems={{ xs: "flex-start", sm: "flex-start" }}
-                    >
+                      sx={{
+                        justifyContent: "space-between",
+                        alignItems: { xs: "flex-start", sm: "flex-start" }
+                      }}>
                       <Box sx={{ flex: 1, minWidth: 0 }}>
-                        <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" alignItems="center" sx={{ mb: 0.35 }}>
+                        <Stack
+                          direction="row"
+                          spacing={0.75}
+                          useFlexGap
+                          sx={{
+                            flexWrap: "wrap",
+                            alignItems: "center",
+                            mb: 0.35
+                          }}>
                           <Box
                             sx={{
                               px: 0.8,
@@ -248,16 +272,30 @@ export function NeedsAttentionInbox({
                           >
                             {meta.label}
                           </Box>
-                          <Typography variant="body2" fontWeight={700} title={item.title} className="mission-title-clamp">
+                          <Typography variant="body2" title={item.title} className="mission-title-clamp" sx={{
+                            fontWeight: 700
+                          }}>
                             {item.title}
                           </Typography>
                         </Stack>
-                        <Typography variant="caption" color="text.secondary" sx={{ display: "block", lineHeight: 1.45 }}>
+                        <Typography
+                          variant="caption"
+                          sx={{
+                            color: "text.secondary",
+                            display: "block",
+                            lineHeight: 1.45
+                          }}>
                           {item.detail || meta.defaultDetail}
                         </Typography>
                       </Box>
 
-                      <Stack direction="row" spacing={0.6} flexShrink={0} sx={{ pt: { sm: 0.2 } }}>
+                      <Stack
+                        direction="row"
+                        spacing={0.6}
+                        sx={{
+                          flexShrink: 0,
+                          pt: { sm: 0.2 }
+                        }}>
                         {item.kind === "approval" ? (
                           <>
                             <Button
@@ -318,7 +356,9 @@ export function NeedsAttentionInbox({
             </Stack>
           )}
 
-          <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" className="mission-panel-footer">
+          <Stack direction="row" spacing={0.75} useFlexGap className="mission-panel-footer" sx={{
+            flexWrap: "wrap"
+          }}>
             <Button variant="contained" size="small" onClick={() => onNavigate("tasks")} sx={{ textTransform: "none" }}>
               Open task queue
             </Button>

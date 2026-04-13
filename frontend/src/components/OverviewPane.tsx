@@ -808,7 +808,6 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
           {dataSourceErrorSummary}
         </Alert>
       ) : null}
-
       <Box className="overview-command-grid">
         <Box className="overview-main-column">
           <Box data-tour-target="welcome-hero">
@@ -844,7 +843,13 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
             />
           ) : (
             <Box className="overview-inline-note">
-              <Stack direction={{ xs: "column", sm: "row" }} spacing={1} alignItems={{ xs: "flex-start", sm: "center" }} justifyContent="space-between">
+              <Stack
+                direction={{ xs: "column", sm: "row" }}
+                spacing={1}
+                sx={{
+                  alignItems: { xs: "flex-start", sm: "center" },
+                  justifyContent: "space-between"
+                }}>
                 <Box>
                   <Typography variant="overline" className="overview-inline-note__kicker">
                     Operator Queue
@@ -863,7 +868,13 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
           {showActiveSessionsPanel ? (
             <Box className="overview-inline-note overview-inline-note--sessions">
               <Stack spacing={1}>
-                <Stack direction={{ xs: "column", sm: "row" }} spacing={1} alignItems={{ xs: "flex-start", sm: "center" }} justifyContent="space-between">
+                <Stack
+                  direction={{ xs: "column", sm: "row" }}
+                  spacing={1}
+                  sx={{
+                    alignItems: { xs: "flex-start", sm: "center" },
+                    justifyContent: "space-between"
+                  }}>
                   <Box>
                   <Typography variant="overline" className="overview-inline-note__kicker">
                     Active Sessions
@@ -882,21 +893,22 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
                       key={session.id}
                       direction="row"
                       spacing={0.75}
-                      alignItems="center"
                       sx={{
+                        alignItems: "center",
                         px: 0.9,
                         py: 0.75,
                         borderRadius: 2,
                         background: "rgba(255, 255, 255, 0.03)",
-                        border: "1px solid rgba(255, 255, 255, 0.08)",
-                      }}
-                    >
+                        border: "1px solid rgba(255, 255, 255, 0.08)"
+                      }}>
                       <Chip size="small" label={session.status.replace(/_/g, " ")} color={automationStatusColor(session.status)} />
                       <Box sx={{ minWidth: 0, flex: 1 }}>
                         <Typography variant="body2" noWrap sx={{ fontWeight: 600 }} title={session.title}>
                           {session.title}
                         </Typography>
-                        <Typography variant="caption" color="text.secondary" noWrap title={session.live_summary}>
+                        <Typography variant="caption" noWrap title={session.live_summary} sx={{
+                          color: "text.secondary"
+                        }}>
                           {session.live_summary}
                         </Typography>
                       </Box>
@@ -927,7 +939,9 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
                       <Typography variant="h6" sx={{ fontWeight: 700, mb: 0.45 }}>
                         Live surfaces and system drift.
                       </Typography>
-                      <Typography variant="body2" color="text.secondary">
+                      <Typography variant="body2" sx={{
+                        color: "text.secondary"
+                      }}>
                         {automationHeadline}
                       </Typography>
                     </Box>
@@ -974,15 +988,14 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
                             key={`${item.kind}-${item.id}`}
                             direction="row"
                             spacing={0.75}
-                            alignItems="center"
                             sx={{
+                              alignItems: "center",
                               px: 0.9,
                               py: 0.7,
                               borderRadius: 2,
                               background: "rgba(255, 255, 255, 0.03)",
-                              border: "1px solid rgba(255, 255, 255, 0.08)",
-                            }}
-                          >
+                              border: "1px solid rgba(255, 255, 255, 0.08)"
+                            }}>
                             <Chip size="small" label={automationKindLabel(item.kind)} />
                             <Typography variant="body2" noWrap sx={{ minWidth: 0, flex: 1 }} title={item.title}>
                               {item.title}
@@ -991,7 +1004,9 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
                         ))}
                       </Stack>
                     ) : (
-                      <Typography variant="body2" color="text.secondary">
+                      <Typography variant="body2" sx={{
+                        color: "text.secondary"
+                      }}>
                         Runtime inventory is quiet. The system is standing by for a new surface or trigger.
                       </Typography>
                     )}
@@ -1045,25 +1060,28 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
           />
         </Box>
       </Box>
-
       {/* Automation Inventory Dialog */}
       <Dialog
         open={inventoryOpen}
         onClose={() => setInventoryOpen(false)}
         maxWidth="md"
         fullWidth
-        PaperProps={{
-          sx: {
-            background: "rgba(22, 22, 26, 0.98)",
-            border: "1px solid rgba(255, 255, 255, 0.08)",
-            backdropFilter: "blur(20px)",
-          },
+        slotProps={{
+          paper: {
+            sx: {
+              background: "rgba(22, 22, 26, 0.98)",
+              border: "1px solid rgba(255, 255, 255, 0.08)",
+              backdropFilter: "blur(20px)",
+            },
+          }
         }}
       >
         <DialogTitle sx={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <Box>
             <Typography variant="h6">Automation Inventory</Typography>
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>
               Unified runtime view of active tasks, watchers, deployed apps, and integrations.
             </Typography>
           </Box>
@@ -1072,7 +1090,14 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
           </IconButton>
         </DialogTitle>
         <DialogContent dividers>
-          <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" mb={2}>
+          <Stack
+            direction="row"
+            spacing={0.75}
+            useFlexGap
+            sx={{
+              flexWrap: "wrap",
+              mb: 2
+            }}>
             <Chip size="small" label={`${automationCounts.tasks} tasks`} />
             <Chip size="small" label={`${automationCounts.watchers} watchers`} />
             <Chip size="small" label={`${automationCounts.apps} apps`} />
@@ -1082,38 +1107,67 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
           {automationQ.error ? (
             <Alert severity="error">{errMessage(automationQ.error)}</Alert>
           ) : automationPreview.length === 0 ? (
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>
               No active automation objects yet.
             </Typography>
           ) : (
-            <Stack spacing={1} mb={3}>
+            <Stack spacing={1} sx={{
+              mb: 3
+            }}>
               {automationPreview.map((item) => (
                 <Box key={`${item.kind}-${item.id}`} className="action-row">
-                  <Stack direction="row" justifyContent="space-between" alignItems="flex-start" spacing={1.25}>
+                  <Stack
+                    direction="row"
+                    spacing={1.25}
+                    sx={{
+                      justifyContent: "space-between",
+                      alignItems: "flex-start"
+                    }}>
                     <Stack spacing={0.35} sx={{ minWidth: 0 }}>
-                      <Stack direction="row" spacing={0.75} alignItems="center" useFlexGap flexWrap="wrap">
+                      <Stack
+                        direction="row"
+                        spacing={0.75}
+                        useFlexGap
+                        sx={{
+                          alignItems: "center",
+                          flexWrap: "wrap"
+                        }}>
                         <Chip size="small" label={automationKindLabel(item.kind)} />
                         <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap title={item.title}>
                           {item.title}
                         </Typography>
                       </Stack>
                       {item.subtitle ? (
-                        <Typography variant="caption" color="text.secondary" noWrap title={item.subtitle}>
+                        <Typography variant="caption" noWrap title={item.subtitle} sx={{
+                          color: "text.secondary"
+                        }}>
                           {item.subtitle}
                         </Typography>
                       ) : null}
                       {item.detail ? (
-                        <Typography variant="caption" color="text.secondary" noWrap title={item.detail}>
+                        <Typography variant="caption" noWrap title={item.detail} sx={{
+                          color: "text.secondary"
+                        }}>
                           {item.detail}
                         </Typography>
                       ) : null}
                       {item.next_run_at ? (
-                        <Typography variant="caption" color="text.secondary">
+                        <Typography variant="caption" sx={{
+                          color: "text.secondary"
+                        }}>
                           Next run: {formatAutomationTime(item.next_run_at)}
                         </Typography>
                       ) : null}
                     </Stack>
-                    <Stack direction="row" spacing={1} alignItems="center" sx={{ flexShrink: 0 }}>
+                    <Stack
+                      direction="row"
+                      spacing={1}
+                      sx={{
+                        alignItems: "center",
+                        flexShrink: 0
+                      }}>
                       <Chip size="small" label={item.status || "-"} color={automationStatusColor(item.status || "")} />
                       {item.url ? (
                         <Button
@@ -1137,39 +1191,71 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
           )}
 
           {/* Recent Automation Runs subsection */}
-          <Typography variant="h6" mb={0.5}>Recent Automation Runs</Typography>
-          <Typography variant="body2" color="text.secondary" mb={1.5}>
+          <Typography variant="h6" sx={{
+            mb: 0.5
+          }}>Recent Automation Runs</Typography>
+          <Typography
+            variant="body2"
+            sx={{
+              color: "text.secondary",
+              mb: 1.5
+            }}>
             Supervisor history for background tasks and watchers, including retries and validation summaries.
           </Typography>
 
           {automationRunsQ.error ? (
             <Alert severity="error">{errMessage(automationRunsQ.error)}</Alert>
           ) : automationRunsPreview.length === 0 ? (
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>
               No automation runs recorded yet.
             </Typography>
           ) : (
             <Stack spacing={1}>
               {automationRunsPreview.map((item) => (
                 <Box key={item.id} className="action-row">
-                  <Stack direction="row" justifyContent="space-between" alignItems="flex-start" spacing={1.25}>
+                  <Stack
+                    direction="row"
+                    spacing={1.25}
+                    sx={{
+                      justifyContent: "space-between",
+                      alignItems: "flex-start"
+                    }}>
                     <Stack spacing={0.35} sx={{ minWidth: 0 }}>
-                      <Stack direction="row" spacing={0.75} alignItems="center" useFlexGap flexWrap="wrap">
+                      <Stack
+                        direction="row"
+                        spacing={0.75}
+                        useFlexGap
+                        sx={{
+                          alignItems: "center",
+                          flexWrap: "wrap"
+                        }}>
                         <Chip size="small" label={automationKindLabel(item.kind)} />
                         <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap title={item.title}>
                           {item.title}
                         </Typography>
                         <Chip size="small" label={`Attempt ${item.attempt}`} />
                       </Stack>
-                      <Typography variant="caption" color="text.secondary" noWrap title={item.summary}>
+                      <Typography variant="caption" noWrap title={item.summary} sx={{
+                        color: "text.secondary"
+                      }}>
                         {item.summary}
                       </Typography>
-                      <Typography variant="caption" color="text.secondary">
+                      <Typography variant="caption" sx={{
+                        color: "text.secondary"
+                      }}>
                         Started: {formatAutomationTime(item.started_at)}
                         {item.next_retry_at ? ` | Next retry: ${formatAutomationTime(item.next_retry_at)}` : ""}
                       </Typography>
                     </Stack>
-                    <Stack direction="row" spacing={1} alignItems="center" sx={{ flexShrink: 0 }}>
+                    <Stack
+                      direction="row"
+                      spacing={1}
+                      sx={{
+                        alignItems: "center",
+                        flexShrink: 0
+                      }}>
                       <Chip
                         size="small"
                         label={item.current_status || item.status || "-"}
@@ -1192,19 +1278,20 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
           <Button onClick={() => setInventoryOpen(false)}>Close</Button>
         </DialogActions>
       </Dialog>
-
       {/* Recent Activity Dialog */}
       <Dialog
         open={activityOpen}
         onClose={() => setActivityOpen(false)}
         maxWidth="md"
         fullWidth
-        PaperProps={{
-          sx: {
-            background: "rgba(22, 22, 26, 0.98)",
-            border: "1px solid rgba(255, 255, 255, 0.08)",
-            backdropFilter: "blur(20px)",
-          },
+        slotProps={{
+          paper: {
+            sx: {
+              background: "rgba(22, 22, 26, 0.98)",
+              border: "1px solid rgba(255, 255, 255, 0.08)",
+              backdropFilter: "blur(20px)",
+            },
+          }
         }}
       >
         <DialogTitle sx={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -1229,24 +1316,27 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
           <Button onClick={() => setActivityOpen(false)}>Close</Button>
         </DialogActions>
       </Dialog>
-
       <Dialog
         open={dailyBriefDialogOpen}
         onClose={() => setDailyBriefDialogOpen(false)}
         maxWidth="md"
         fullWidth
-        PaperProps={{
-          sx: {
-            background: "rgba(22, 22, 26, 0.98)",
-            border: "1px solid rgba(255, 255, 255, 0.08)",
-            backdropFilter: "blur(20px)",
-          },
+        slotProps={{
+          paper: {
+            sx: {
+              background: "rgba(22, 22, 26, 0.98)",
+              border: "1px solid rgba(255, 255, 255, 0.08)",
+              backdropFilter: "blur(20px)",
+            },
+          }
         }}
       >
         <DialogTitle sx={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <Box>
             <Typography variant="h6">{dailyBriefRun?.title || "Daily Brief"}</Typography>
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>
               See what AgentArk generated, what it attempted, and the nearest runtime evidence.
             </Typography>
           </Box>
@@ -1269,13 +1359,17 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
                 {dailyBriefRun.detail}
               </Alert>
               {dailyBriefRun.outcome === "running" ? (
-                <Stack direction="row" spacing={1} alignItems="center">
+                <Stack direction="row" spacing={1} sx={{
+                  alignItems: "center"
+                }}>
                   <CircularProgress size={18} />
                   <Typography variant="body2">Running daily brief now...</Typography>
                 </Stack>
               ) : null}
 
-              <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+              <Stack direction="row" spacing={0.75} useFlexGap sx={{
+                flexWrap: "wrap"
+              }}>
                 <Chip
                   size="small"
                   label={
@@ -1340,7 +1434,12 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
                       <Typography variant="body2" sx={{ fontWeight: 600 }}>
                         In-app notification
                       </Typography>
-                      <Typography variant="caption" color="text.secondary" display="block">
+                      <Typography
+                        variant="caption"
+                        sx={{
+                          color: "text.secondary",
+                          display: "block"
+                        }}>
                         {formatAutomationTime(latestDailyBriefNotification.created_at)}
                       </Typography>
                       <Typography variant="body2" sx={{ mt: 0.35 }}>
@@ -1351,7 +1450,14 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
 
                   {latestDailyBriefTrace ? (
                     <Box className="action-row">
-                      <Stack direction="row" spacing={0.75} alignItems="center" useFlexGap flexWrap="wrap">
+                      <Stack
+                        direction="row"
+                        spacing={0.75}
+                        useFlexGap
+                        sx={{
+                          alignItems: "center",
+                          flexWrap: "wrap"
+                        }}>
                         <Typography variant="body2" sx={{ fontWeight: 600 }}>
                           Latest related trace
                         </Typography>
@@ -1361,7 +1467,12 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
                           color={automationStatusColor(latestDailyBriefTrace.status || "")}
                         />
                       </Stack>
-                      <Typography variant="caption" color="text.secondary" display="block">
+                      <Typography
+                        variant="caption"
+                        sx={{
+                          color: "text.secondary",
+                          display: "block"
+                        }}>
                         Started: {formatAutomationTime(latestDailyBriefTrace.started_at)}
                         {typeof latestDailyBriefTrace.duration_ms === "number" ? ` | ${latestDailyBriefTrace.duration_ms}ms` : ""}
                         {typeof latestDailyBriefTrace.step_count === "number" ? ` | ${latestDailyBriefTrace.step_count} step${latestDailyBriefTrace.step_count === 1 ? "" : "s"}` : ""}
@@ -1374,7 +1485,14 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
 
                   {latestDailyBriefAutomationRun ? (
                     <Box className="action-row">
-                      <Stack direction="row" spacing={0.75} alignItems="center" useFlexGap flexWrap="wrap">
+                      <Stack
+                        direction="row"
+                        spacing={0.75}
+                        useFlexGap
+                        sx={{
+                          alignItems: "center",
+                          flexWrap: "wrap"
+                        }}>
                         <Typography variant="body2" sx={{ fontWeight: 600 }}>
                           Related automation run
                         </Typography>
@@ -1384,7 +1502,12 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
                           color={automationStatusColor(latestDailyBriefAutomationRun.current_status || latestDailyBriefAutomationRun.status || "")}
                         />
                       </Stack>
-                      <Typography variant="caption" color="text.secondary" display="block">
+                      <Typography
+                        variant="caption"
+                        sx={{
+                          color: "text.secondary",
+                          display: "block"
+                        }}>
                         Started: {formatAutomationTime(latestDailyBriefAutomationRun.started_at)}
                       </Typography>
                       <Typography variant="body2" sx={{ mt: 0.35 }}>
@@ -1394,7 +1517,9 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
                   ) : null}
 
                   {!latestDailyBriefNotification && !latestDailyBriefTrace && !latestDailyBriefAutomationRun ? (
-                    <Typography variant="body2" color="text.secondary">
+                    <Typography variant="body2" sx={{
+                      color: "text.secondary"
+                    }}>
                       No related runtime evidence has landed yet. If a delivery channel is configured, it may still arrive shortly.
                     </Typography>
                   ) : null}
@@ -1402,7 +1527,9 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
               </Box>
 
               {briefingQ.data ? (
-                <Typography variant="caption" color="text.secondary">
+                <Typography variant="caption" sx={{
+                  color: "text.secondary"
+                }}>
                   Current briefing snapshot timestamp: {formatAutomationTime((briefingQ.data as { generated_at?: string }).generated_at)}
                 </Typography>
               ) : null}
@@ -1415,7 +1542,6 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
         <Button onClick={() => setDailyBriefDialogOpen(false)}>Close</Button>
       </DialogActions>
       </Dialog>
-
       <SuggestionRunDialog
         run={suggestionRun}
         open={suggestionRunOpen}
@@ -1435,7 +1561,6 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
         humanTs={humanTs}
         errMessage={errMessage}
       />
-
       <Dialog
         open={pauseDialogOpen}
         onClose={() => {
@@ -1458,7 +1583,9 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
         <DialogContent dividers>
           <Stack spacing={1.25}>
             {pausePhase === "stopping" || pausePhase === "resuming" ? (
-              <Stack direction="row" spacing={1} alignItems="center">
+              <Stack direction="row" spacing={1} sx={{
+                alignItems: "center"
+              }}>
                 <CircularProgress size={18} />
                 <Typography variant="body2">
                   {pausePhase === "stopping"
@@ -1477,7 +1604,9 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
               />
             ) : null}
 
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>
               {pauseTarget === "pause"
                 ? "When paused, these systems are suspended:"
                 : "On resume, these systems are active again:"}

@@ -74,7 +74,9 @@ const GuidedTour = lazy(() =>
 function WorkspacePaneFallback() {
   return (
     <Box className="list-shell" sx={{ minHeight: 180, p: 1.5 }}>
-      <Typography variant="body2" color="text.secondary">
+      <Typography variant="body2" sx={{
+        color: "text.secondary"
+      }}>
         Loading workspace...
       </Typography>
     </Box>
@@ -935,10 +937,12 @@ export default function App() {
     <Box className={`side-nav${collapsed ? " collapsed" : ""}${mobile ? " side-nav-mobile" : ""}`}>
       <Stack
         direction="row"
-        alignItems="center"
-        justifyContent={collapsed ? "center" : "space-between"}
-        sx={{ px: collapsed ? 0 : 0.5, mb: collapsed ? 0.4 : 1 }}
-      >
+        sx={{
+          alignItems: "center",
+          justifyContent: collapsed ? "center" : "space-between",
+          px: collapsed ? 0 : 0.5,
+          mb: collapsed ? 0.4 : 1
+        }}>
         {!collapsed ? (
           <Typography variant="caption" className="nav-label">
             {mobile ? "Navigation" : "Navigate"}
@@ -962,7 +966,12 @@ export default function App() {
         {NAV_GROUPS.map((group, groupIdx) => (
           <Box key={group.id} className="nav-group">
             {!collapsed ? (
-              <Stack direction="row" alignItems="center" justifyContent="space-between">
+              <Stack
+                direction="row"
+                sx={{
+                  alignItems: "center",
+                  justifyContent: "space-between"
+                }}>
                 <Typography variant="overline" className="nav-group-label">
                   {group.label}
                 </Typography>
@@ -985,7 +994,9 @@ export default function App() {
                   <ListItemText
                     className={`nav-item-text${collapsed ? " collapsed" : ""}`}
                     primary={item.label}
-                    primaryTypographyProps={{ noWrap: true }}
+                    slotProps={{
+                      primary: { noWrap: true }
+                    }}
                   />
                 </ListItemButton>
               </Tooltip>
@@ -1009,7 +1020,14 @@ export default function App() {
             className="shell-toolbar"
             sx={{ minHeight: "var(--appbar-height)", px: { xs: 1.25, md: 1.5 } }}
           >
-            <Stack direction="row" alignItems="center" spacing={1} sx={{ flexGrow: 1, minWidth: 0 }}>
+            <Stack
+              direction="row"
+              spacing={1}
+              sx={{
+                alignItems: "center",
+                flexGrow: 1,
+                minWidth: 0
+              }}>
               {isMobileShell ? (
                 <Tooltip title="Open navigation">
                   <IconButton
@@ -1053,7 +1071,9 @@ export default function App() {
                 />
               </Tooltip>
             </Stack>
-            <Stack direction="row" spacing={0.5} alignItems="center" className="shell-actions">
+            <Stack direction="row" spacing={0.5} className="shell-actions" sx={{
+              alignItems: "center"
+            }}>
               <Tooltip title="Notifications">
                 <IconButton
                   color="primary"
@@ -1118,12 +1138,13 @@ export default function App() {
           open={isMobileShell && mobileNavOpen}
           onClose={() => setMobileNavOpen(false)}
           ModalProps={{ keepMounted: true }}
-          PaperProps={{ className: "side-nav-mobile-paper" }}
+          slotProps={{
+            paper: { className: "side-nav-mobile-paper" }
+          }}
         >
           {renderSideNav({ collapsed: false, mobile: true })}
         </Drawer>
       </Box>
-
       <Suspense fallback={null}>
         <ApprovalPromptOverlay
           tasks={approvalTasks}
@@ -1134,24 +1155,25 @@ export default function App() {
           onOpenTasks={() => navigateToView("tasks")}
         />
       </Suspense>
-
       <Dialog
         open={settingsModalOpen}
         onClose={closeSettingsModal}
         fullWidth
         maxWidth={false}
-        PaperProps={{
-          sx: {
-            width: { xs: "96vw", md: "82vw", lg: 1120 },
-            maxWidth: 1120,
-            height: { xs: "92vh", md: "84vh" },
-            maxHeight: "92vh",
-            borderRadius: 2.25,
-            border: "1px solid rgba(255, 255, 255, 0.08)",
-            background: "linear-gradient(160deg, rgba(24, 24, 28, 0.98), rgba(15, 15, 18, 0.95))",
-            backdropFilter: "blur(18px)",
-            WebkitBackdropFilter: "blur(18px)",
-            overflow: "hidden"
+        slotProps={{
+          paper: {
+            sx: {
+              width: { xs: "96vw", md: "82vw", lg: 1120 },
+              maxWidth: 1120,
+              height: { xs: "92vh", md: "84vh" },
+              maxHeight: "92vh",
+              borderRadius: 2.25,
+              border: "1px solid rgba(255, 255, 255, 0.08)",
+              background: "linear-gradient(160deg, rgba(24, 24, 28, 0.98), rgba(15, 15, 18, 0.95))",
+              backdropFilter: "blur(18px)",
+              WebkitBackdropFilter: "blur(18px)",
+              overflow: "hidden"
+            }
           }
         }}
       >
@@ -1182,7 +1204,6 @@ export default function App() {
           </Suspense>
         </DialogContent>
       </Dialog>
-
       <Popover
         open={notifListOpen}
         anchorEl={notifAnchorEl}
@@ -1206,8 +1227,18 @@ export default function App() {
         }}
       >
         <Box sx={{ px: 1.5, pt: 1.25, pb: 1, borderBottom: "1px solid rgba(255, 255, 255, 0.08)" }}>
-          <Stack direction="row" justifyContent="space-between" alignItems="center">
-            <Typography variant="subtitle1" fontWeight={600} sx={{ color: "rgba(244, 245, 247, 0.94)" }}>Notifications</Typography>
+          <Stack
+            direction="row"
+            sx={{
+              justifyContent: "space-between",
+              alignItems: "center"
+            }}>
+            <Typography
+              variant="subtitle1"
+              sx={{
+                fontWeight: 600,
+                color: "rgba(244, 245, 247, 0.94)"
+              }}>Notifications</Typography>
             <Button
               size="small"
               onClick={() => markAllMutation.mutate()}
@@ -1267,7 +1298,9 @@ export default function App() {
           {notificationsQ.error ? <Alert severity="error">Failed to load notifications</Alert> : null}
           {filteredNotifications.length === 0 ? (
             <Box sx={{ p: 1.25 }}>
-              <Typography variant="body2" color="text.secondary">
+              <Typography variant="body2" sx={{
+                color: "text.secondary"
+              }}>
                 {visibleNotifications.length === 0 ? "No notifications yet." : "No notifications match this filter."}
               </Typography>
             </Box>
@@ -1325,14 +1358,23 @@ export default function App() {
                     <ListItemText
                       sx={{ my: 0, minWidth: 0 }}
                       primary={
-                        <Stack direction="row" justifyContent="space-between" spacing={2} sx={{ minWidth: 0 }}>
+                        <Stack
+                          direction="row"
+                          spacing={2}
+                          sx={{
+                            justifyContent: "space-between",
+                            minWidth: 0
+                          }}>
                           <Typography
                             variant="body2"
-                            fontWeight={n.read ? 400 : 600}
                             noWrap
-                            sx={{ minWidth: 0, flex: 1, color: n.read ? "rgba(177, 181, 189, 0.68)" : "rgba(244, 245, 247, 0.94)" }}
                             title={n.title || displayTitle}
-                          >
+                            sx={{
+                              fontWeight: n.read ? 400 : 600,
+                              minWidth: 0,
+                              flex: 1,
+                              color: n.read ? "rgba(177, 181, 189, 0.68)" : "rgba(244, 245, 247, 0.94)"
+                            }}>
                             {displayTitle}
                           </Typography>
                           <Typography
@@ -1359,7 +1401,9 @@ export default function App() {
                           >
                             {displaySummary}
                           </Typography>
-                          <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap>
+                          <Stack direction="row" spacing={0.5} useFlexGap sx={{
+                            flexWrap: "wrap"
+                          }}>
                             {inputNeeded ? (
                               <Chip size="small" label="Waiting on you" color="warning" variant="outlined" sx={{ height: 22 }} />
                             ) : null}
@@ -1385,23 +1429,36 @@ export default function App() {
           )}
         </Box>
       </Popover>
-
       <Drawer
         anchor="right"
         open={!!selectedNotification}
         onClose={closeNotification}
-        PaperProps={{
-          sx: {
-            width: 520,
-            maxWidth: "calc(100vw - 24px)",
-            borderLeft: "1px solid rgba(255, 255, 255, 0.08)",
-            background: "linear-gradient(160deg, rgba(24, 24, 28, 0.98), rgba(15, 15, 18, 0.95))"
+        slotProps={{
+          paper: {
+            sx: {
+              width: 520,
+              maxWidth: "calc(100vw - 24px)",
+              borderLeft: "1px solid rgba(255, 255, 255, 0.08)",
+              background: "linear-gradient(160deg, rgba(24, 24, 28, 0.98), rgba(15, 15, 18, 0.95))"
+            }
           }
         }}
       >
         <Box sx={{ p: 2, height: "100%", display: "flex", flexDirection: "column", gap: 1.25 }}>
-          <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between">
-            <Stack direction="row" spacing={1} alignItems="center" sx={{ minWidth: 0 }}>
+          <Stack
+            direction="row"
+            spacing={1}
+            sx={{
+              alignItems: "center",
+              justifyContent: "space-between"
+            }}>
+            <Stack
+              direction="row"
+              spacing={1}
+              sx={{
+                alignItems: "center",
+                minWidth: 0
+              }}>
               <NotificationsActiveRoundedIcon color="warning" />
               <Typography variant="h6" noWrap title={selectedNotification?.title || "Notification detail"}>
                 {notificationDisplayTitle(selectedNotification || {})}
@@ -1420,7 +1477,9 @@ export default function App() {
               </Button>
             ) : null}
           </Stack>
-          <Typography variant="caption" color="text.secondary" title={notifTimeAgo(selectedNotification?.created_at).tip}>
+          <Typography variant="caption" title={notifTimeAgo(selectedNotification?.created_at).tip} sx={{
+            color: "text.secondary"
+          }}>
             {notifTimeAgo(selectedNotification?.created_at).label}
           </Typography>
           <Divider />
@@ -1442,19 +1501,25 @@ export default function App() {
                         return (
                           <Stack spacing={0.65}>
                             {shown.length === 0 ? (
-                              <Typography variant="body2" color="text.secondary">
+                              <Typography variant="body2" sx={{
+                                color: "text.secondary"
+                              }}>
                                 (No top-level metadata fields)
                               </Typography>
                             ) : (
                               shown.map(([k, v]) => {
                                 const out = formatMetaValue(v);
                                 return (
-                                  <Stack key={k} direction="row" spacing={1} alignItems="baseline">
+                                  <Stack key={k} direction="row" spacing={1} sx={{
+                                    alignItems: "baseline"
+                                  }}>
                                     <Typography
                                       variant="caption"
-                                      color="text.secondary"
-                                      sx={{ width: 140, flex: "0 0 auto" }}
-                                    >
+                                      sx={{
+                                        color: "text.secondary",
+                                        width: 140,
+                                        flex: "0 0 auto"
+                                      }}>
                                       {k}
                                     </Typography>
                                     {out.href ? (
@@ -1481,7 +1546,9 @@ export default function App() {
                               })
                             )}
                             {entries.length > shown.length ? (
-                              <Typography variant="caption" color="text.secondary">
+                              <Typography variant="caption" sx={{
+                                color: "text.secondary"
+                              }}>
                                 {entries.length - shown.length} more field(s) not shown.
                               </Typography>
                             ) : null}

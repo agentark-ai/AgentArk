@@ -356,15 +356,21 @@ export function WebhooksPanel({ autoRefresh }: WebhooksPanelProps) {
       <Alert severity="info">
         Add inbound webhook sources here. Secrets are stored encrypted, never echoed back in normal UI responses, and not passed to the LLM. Matched events create autonomous work without waiting for chat, can notify on queued/succeeded/failed states, and can push completion output to the preferred or source-specific channel.
       </Alert>
-
       {error ? <Alert severity="error">{error}</Alert> : null}
       {success ? <Alert severity="success">{success}</Alert> : null}
-
       <Box className="list-shell">
-        <Stack direction={{ xs: "column", sm: "row" }} justifyContent="space-between" alignItems={{ xs: "flex-start", sm: "center" }} spacing={1}>
+        <Stack
+          direction={{ xs: "column", sm: "row" }}
+          spacing={1}
+          sx={{
+            justifyContent: "space-between",
+            alignItems: { xs: "flex-start", sm: "center" }
+          }}>
           <Box>
             <Typography variant="h6">Webhook Sources</Typography>
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>
               Create inbound webhook sources in a guided popup, then run a synthetic test without leaving the editor.
             </Typography>
           </Box>
@@ -373,7 +379,6 @@ export function WebhooksPanel({ autoRefresh }: WebhooksPanelProps) {
           </Button>
         </Stack>
       </Box>
-
       <Dialog open={dialogOpen} onClose={busy ? undefined : closeDialog} fullWidth maxWidth="md">
         <DialogTitle>{editingId ? "Edit Webhook Source" : "New Webhook Source"}</DialogTitle>
         <DialogContent dividers>
@@ -458,7 +463,15 @@ export function WebhooksPanel({ autoRefresh }: WebhooksPanelProps) {
             value={form.dedupe_window_secs}
             onChange={(e) => setField("dedupe_window_secs", Number(e.target.value) || 900)}
           />
-          <Stack direction="row" spacing={1.5} alignItems="center" flexWrap="wrap" useFlexGap sx={{ minHeight: 40 }}>
+          <Stack
+            direction="row"
+            spacing={1.5}
+            useFlexGap
+            sx={{
+              alignItems: "center",
+              flexWrap: "wrap",
+              minHeight: 40
+            }}>
             <FormControlLabel control={<Switch checked={form.enabled} onChange={(e) => setField("enabled", e.target.checked)} />} label="Enabled" />
             <FormControlLabel control={<Switch checked={form.require_approval} onChange={(e) => setField("require_approval", e.target.checked)} />} label="Require approval" />
             <FormControlLabel control={<Switch checked={form.allow_duplicate} onChange={(e) => setField("allow_duplicate", e.target.checked)} />} label="Allow duplicates" />
@@ -499,7 +512,15 @@ export function WebhooksPanel({ autoRefresh }: WebhooksPanelProps) {
             ))}
           </TextField>
         </Stack>
-            <Stack direction="row" spacing={1.5} alignItems="center" flexWrap="wrap" useFlexGap sx={{ minHeight: 40 }}>
+            <Stack
+              direction="row"
+              spacing={1.5}
+              useFlexGap
+              sx={{
+                alignItems: "center",
+                flexWrap: "wrap",
+                minHeight: 40
+              }}>
           <FormControlLabel control={<Switch checked={form.notify_on_queued} onChange={(e) => setField("notify_on_queued", e.target.checked)} />} label="Notify on queued" />
           <FormControlLabel control={<Switch checked={form.notify_on_success} onChange={(e) => setField("notify_on_success", e.target.checked)} />} label="Notify on success" />
           <FormControlLabel control={<Switch checked={form.notify_on_failure} onChange={(e) => setField("notify_on_failure", e.target.checked)} />} label="Notify on failure" />
@@ -514,7 +535,9 @@ export function WebhooksPanel({ autoRefresh }: WebhooksPanelProps) {
           helperText="This is what the agent sees after the webhook is normalized. Put operator intent here, not secrets."
         />
             {!editingId ? (
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: "text.secondary"
+              }}>
                 Save once to enable synthetic test runs for this source.
               </Typography>
             ) : null}
@@ -548,7 +571,6 @@ export function WebhooksPanel({ autoRefresh }: WebhooksPanelProps) {
           </Button>
         </DialogActions>
       </Dialog>
-
       <Stack spacing={1.5}>
         <Typography variant="h6">Configured Sources</Typography>
         {sourcesQ.error ? <Alert severity="error">{errMessage(sourcesQ.error)}</Alert> : null}
@@ -559,25 +581,47 @@ export function WebhooksPanel({ autoRefresh }: WebhooksPanelProps) {
             const ingestUrl = typeof window === "undefined" ? ingestPath : `${window.location.origin}${ingestPath}`;
             return (
               <Box key={sourceId} sx={{ p: 1.5, borderRadius: 2, border: "1px solid rgba(120,180,255,0.18)", background: "rgba(8,20,38,0.6)" }}>
-                <Stack direction={{ xs: "column", md: "row" }} justifyContent="space-between" spacing={1.5}>
+                <Stack direction={{ xs: "column", md: "row" }} spacing={1.5} sx={{
+                  justifyContent: "space-between"
+                }}>
                   <Stack spacing={0.6}>
-                    <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+                    <Stack
+                      direction="row"
+                      spacing={1}
+                      useFlexGap
+                      sx={{
+                        alignItems: "center",
+                        flexWrap: "wrap"
+                      }}>
                       <Typography variant="subtitle1">{str(source.name)}</Typography>
                       <Chip size="small" label={toBool(source.enabled) ? "Enabled" : "Disabled"} color={toBool(source.enabled) ? "success" : "default"} />
                       <Chip size="small" variant="outlined" label={str(source.provider, "generic")} />
                       <Chip size="small" variant="outlined" color={toBool(source.secret_configured) ? "success" : "warning"} label={toBool(source.secret_configured) ? "Secret saved" : "No secret"} />
                     </Stack>
-                    <Typography variant="caption" color="text.secondary">
+                    <Typography variant="caption" sx={{
+                      color: "text.secondary"
+                    }}>
                       {ingestPath}
                     </Typography>
-                    <Typography variant="caption" color="text.secondary">
+                    <Typography variant="caption" sx={{
+                      color: "text.secondary"
+                    }}>
                       Last activity: {str(source.last_received_at) ? `${humanTs(str(source.last_received_at))} (${str(source.last_outcome, "unknown")})` : "No deliveries yet"}
                     </Typography>
-                    <Typography variant="caption" color="text.secondary">
+                    <Typography variant="caption" sx={{
+                      color: "text.secondary"
+                    }}>
                       Notifications: {notificationSummary(source)} | Completion: {completionTargetSummary(source, integrations)}
                     </Typography>
                   </Stack>
-                  <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+                  <Stack
+                    direction="row"
+                    spacing={1}
+                    useFlexGap
+                    sx={{
+                      alignItems: "center",
+                      flexWrap: "wrap"
+                    }}>
                     <Tooltip title="Copy webhook URL">
                       <IconButton size="small" onClick={async () => { await navigator.clipboard.writeText(ingestUrl); setSuccess("Webhook URL copied."); }}>
                         <ContentCopyRoundedIcon fontSize="small" />
@@ -593,12 +637,12 @@ export function WebhooksPanel({ autoRefresh }: WebhooksPanelProps) {
           })
         ) : null}
       </Stack>
-
       <Divider />
-
       <Stack spacing={1}>
         <Typography variant="h6">Recent Event Deliveries</Typography>
-        <Typography variant="caption" color="text.secondary">
+        <Typography variant="caption" sx={{
+          color: "text.secondary"
+        }}>
           This is the ingress view. Tasks and Trace show what the agent actually executed after a webhook matched.
         </Typography>
         {eventsQ.error ? <Alert severity="error">{errMessage(eventsQ.error)}</Alert> : null}
@@ -617,7 +661,9 @@ export function WebhooksPanel({ autoRefresh }: WebhooksPanelProps) {
             {events.length === 0 ? (
               <TableRow>
                 <TableCell colSpan={5}>
-                  <Typography variant="body2" color="text.secondary">No webhook deliveries yet.</Typography>
+                  <Typography variant="body2" sx={{
+                    color: "text.secondary"
+                  }}>No webhook deliveries yet.</Typography>
                 </TableCell>
               </TableRow>
             ) : (
@@ -628,7 +674,9 @@ export function WebhooksPanel({ autoRefresh }: WebhooksPanelProps) {
                   <TableCell>
                     <Stack spacing={0.2}>
                       <Typography variant="body2">{str(event.event_type, "webhook")}</Typography>
-                      <Typography variant="caption" color="text.secondary">{str(event.subject)}</Typography>
+                      <Typography variant="caption" sx={{
+                        color: "text.secondary"
+                      }}>{str(event.subject)}</Typography>
                     </Stack>
                   </TableCell>
                   <TableCell>
@@ -636,8 +684,12 @@ export function WebhooksPanel({ autoRefresh }: WebhooksPanelProps) {
                   </TableCell>
                   <TableCell>
                     <Stack spacing={0.2}>
-                      <Typography variant="caption" color="text.secondary">{str(event.message)}</Typography>
-                      {str(event.task_id) ? <Typography variant="caption" color="text.secondary">Task: {str(event.task_id)}</Typography> : null}
+                      <Typography variant="caption" sx={{
+                        color: "text.secondary"
+                      }}>{str(event.message)}</Typography>
+                      {str(event.task_id) ? <Typography variant="caption" sx={{
+                        color: "text.secondary"
+                      }}>Task: {str(event.task_id)}</Typography> : null}
                       {str(event.payload_excerpt) ? <Typography variant="caption" sx={{ whiteSpace: "pre-wrap", color: "text.secondary" }}>{str(event.payload_excerpt)}</Typography> : null}
                     </Stack>
                   </TableCell>

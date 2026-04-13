@@ -49,11 +49,12 @@ export function WorkspacePageHeader({
     >
       <Stack
         direction={{ xs: "column", md: "row" }}
-        justifyContent="space-between"
-        alignItems={{ xs: "stretch", md: "flex-start" }}
         spacing={1}
         className="workspace-page-header"
-      >
+        sx={{
+          justifyContent: "space-between",
+          alignItems: { xs: "stretch", md: "flex-start" }
+        }}>
         <Box className="workspace-page-header-copy">
           <Typography className="workspace-page-kicker">{eyebrow}</Typography>
           <Typography className="workspace-page-title">{title}</Typography>

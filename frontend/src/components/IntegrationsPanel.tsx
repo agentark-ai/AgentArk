@@ -13,7 +13,7 @@ import {
   DialogTitle,
   Divider,
   FormControlLabel,
-  Grid2,
+  Grid as Grid2,
   IconButton,
   Menu,
   MenuItem,
@@ -2349,7 +2349,9 @@ export function IntegrationsPanel({
         <Stack spacing={1.25}>
           <Box>
             <Typography variant="subtitle2">Sender Trust</Typography>
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: "text.secondary"
+            }}>
               Use pairing when unknown {channelName} senders should wait for operator approval before AgentArk acts.
             </Typography>
           </Box>
@@ -2381,16 +2383,26 @@ export function IntegrationsPanel({
               Could not load sender approval state right now: {asErrorMessage(senderVerificationQ.error)}
             </Alert>
           ) : null}
-          <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+          <Stack direction="row" spacing={1} useFlexGap sx={{
+            flexWrap: "wrap"
+          }}>
             <Chip size="small" variant="outlined" label={`${pending.length} pending`} />
             <Chip size="small" variant="outlined" label={`${approved.length} approved`} />
           </Stack>
           <Box>
-            <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 0.75 }}>
+            <Typography
+              variant="caption"
+              sx={{
+                color: "text.secondary",
+                display: "block",
+                mb: 0.75
+              }}>
               Pending approvals
             </Typography>
             {pending.length === 0 ? (
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: "text.secondary"
+              }}>
                 No pending {channelName} senders.
               </Typography>
             ) : (
@@ -2405,14 +2417,23 @@ export function IntegrationsPanel({
                       py: 0.9
                     }}
                   >
-                    <Stack direction={{ xs: "column", sm: "row" }} spacing={1} justifyContent="space-between">
+                    <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{
+                      justifyContent: "space-between"
+                    }}>
                       <Box sx={{ minWidth: 0 }}>
                         <Typography variant="body2">{senderLabel(row)}</Typography>
-                        <Typography variant="caption" color="text.secondary">
+                        <Typography variant="caption" sx={{
+                          color: "text.secondary"
+                        }}>
                           {str(row.sender_id, "-")}
                           {str(row.scope_id) ? ` | ${scopeLabel(row)}` : ""}
                         </Typography>
-                        <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
+                        <Typography
+                          variant="caption"
+                          sx={{
+                            color: "text.secondary",
+                            display: "block"
+                          }}>
                           Last seen {formatSeen(str(row.last_seen_at))}
                         </Typography>
                       </Box>
@@ -2447,11 +2468,19 @@ export function IntegrationsPanel({
             )}
           </Box>
           <Box>
-            <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 0.75 }}>
+            <Typography
+              variant="caption"
+              sx={{
+                color: "text.secondary",
+                display: "block",
+                mb: 0.75
+              }}>
               Approved senders
             </Typography>
             {approved.length === 0 ? (
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: "text.secondary"
+              }}>
                 No approved {channelName} senders yet.
               </Typography>
             ) : (
@@ -2466,10 +2495,14 @@ export function IntegrationsPanel({
                       py: 0.9
                     }}
                   >
-                    <Stack direction={{ xs: "column", sm: "row" }} spacing={1} justifyContent="space-between">
+                    <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{
+                      justifyContent: "space-between"
+                    }}>
                       <Box sx={{ minWidth: 0 }}>
                         <Typography variant="body2">{senderLabel(row)}</Typography>
-                        <Typography variant="caption" color="text.secondary">
+                        <Typography variant="caption" sx={{
+                          color: "text.secondary"
+                        }}>
                           {str(row.sender_id, "-")}
                           {str(row.scope_id) ? ` | ${scopeLabel(row)}` : ""}
                         </Typography>
@@ -3045,7 +3078,9 @@ export function IntegrationsPanel({
       return (
         <Stack key={field.key} spacing={1}>
           <Typography variant="subtitle2">{field.label}</Typography>
-          <Typography variant="caption" color="text.secondary">
+          <Typography variant="caption" sx={{
+            color: "text.secondary"
+          }}>
             Choose the Workspace services AgentArk should be allowed to use from this single Google consent flow.
           </Typography>
           <Grid2 container spacing={0.75}>
@@ -3090,7 +3125,9 @@ export function IntegrationsPanel({
               );
             })}
           </Grid2>
-          <Typography variant="caption" color="text.secondary">
+          <Typography variant="caption" sx={{
+            color: "text.secondary"
+          }}>
             Checked bundles will be requested during Google consent. You can reconnect later to grant more.
           </Typography>
         </Stack>
@@ -3160,7 +3197,12 @@ export function IntegrationsPanel({
     >
       {!embedded ? (
         <>
-          <Stack direction="row" alignItems="center" justifyContent="space-between">
+          <Stack
+            direction="row"
+            sx={{
+              alignItems: "center",
+              justifyContent: "space-between"
+            }}>
             <Typography variant="h6">
               {mode === "mcp"
                 ? "MCP Servers"
@@ -3175,11 +3217,15 @@ export function IntegrationsPanel({
             <Stack direction="row" spacing={1} />
           </Stack>
           {mode === "channels" ? (
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: "text.secondary"
+            }}>
               Configure delivery transports and review live channel health. If something looks off, run ArkPulse for diagnostics.
             </Typography>
           ) : mode === "connectors" ? (
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: "text.secondary"
+            }}>
               OAuth-based integrations for Google Workspace, GitHub, Jira, and more. Connect once, then the agent can use them in any conversation.
             </Typography>
           ) : mode === "messaging" ? (
@@ -3193,7 +3239,9 @@ export function IntegrationsPanel({
               >
                 Finish channel onboarding here. If you need a health check later, run ArkPulse.
               </Typography>
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: "text.secondary"
+              }}>
                 This page is intentionally focused on messaging only: Telegram, WhatsApp, Slack, Discord, Matrix, and Teams.
               </Typography>
             </>
@@ -3208,29 +3256,30 @@ export function IntegrationsPanel({
               >
                 These are pre-built integrations. You can always chat with the agent to build any custom integration on your own.
               </Typography>
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: "text.secondary"
+              }}>
                 Integrations are long-lived connectors (auth + config). To import skills from a URL, use the Skills tab.
               </Typography>
             </>
           ) : (
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: "text.secondary"
+            }}>
               Configure external MCP servers (HTTP or stdio), auth, allowlists, and refresh tools/resources.
             </Typography>
           )}
         </>
       ) : null}
-
       {showIntegrations && notice?.kind === "error" ? <Alert severity={notice.kind}>{notice.text}</Alert> : null}
       {showMcp && mcpNotice ? <Alert severity={mcpNotice.kind}>{mcpNotice.text}</Alert> : null}
       {showMcp && sshNotice ? <Alert severity={sshNotice.kind}>{sshNotice.text}</Alert> : null}
-
       {shouldLoadConnectorCatalog && integrationsQ.error ? (
         <Alert severity="error">
           Failed to load integrations:{" "}
           {integrationsQ.error instanceof Error ? integrationsQ.error.message : "Unknown error"}
         </Alert>
       ) : null}
-
       {showIntegrations && !showChannelsPage && !showConnectorsPage ? (
         <ExtensionPacksPanel
           mode={
@@ -3240,7 +3289,6 @@ export function IntegrationsPanel({
           }
         />
       ) : null}
-
       {showConnectorsPage ? (
         <>
           {readyList.length > 0 ? (
@@ -3248,13 +3296,16 @@ export function IntegrationsPanel({
               <Stack
                 direction={{ xs: "column", sm: "row" }}
                 spacing={1}
-                justifyContent="space-between"
-                alignItems={{ xs: "flex-start", sm: "center" }}
-                sx={{ mb: 1.25 }}
-              >
+                sx={{
+                  justifyContent: "space-between",
+                  alignItems: { xs: "flex-start", sm: "center" },
+                  mb: 1.25
+                }}>
                 <Box>
                   <Typography variant="subtitle2">Connected</Typography>
-                  <Typography variant="caption" color="text.secondary">
+                  <Typography variant="caption" sx={{
+                    color: "text.secondary"
+                  }}>
                     These integrations are live and available to the agent.
                   </Typography>
                 </Box>
@@ -3297,8 +3348,16 @@ export function IntegrationsPanel({
                         }}
                       >
                         <Stack spacing={0.75}>
-                          <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={1}>
-                            <Stack direction="row" alignItems="center" spacing={0.75}>
+                          <Stack
+                            direction="row"
+                            spacing={1}
+                            sx={{
+                              alignItems: "center",
+                              justifyContent: "space-between"
+                            }}>
+                            <Stack direction="row" spacing={0.75} sx={{
+                              alignItems: "center"
+                            }}>
                               <ConnectorIcon id={integration.id} name={integration.name} />
                               <Typography variant="subtitle2" noWrap sx={{ fontWeight: 700 }}>
                                 {integration.name}
@@ -3316,18 +3375,23 @@ export function IntegrationsPanel({
                           </Stack>
                           <Typography
                             variant="caption"
-                            color="text.secondary"
                             sx={{
+                              color: "text.secondary",
                               lineHeight: 1.45,
                               display: "-webkit-box",
                               WebkitLineClamp: 2,
                               WebkitBoxOrient: "vertical",
                               overflow: "hidden"
-                            }}
-                          >
+                            }}>
                             {integrationCardCopy(integration)}
                           </Typography>
-                          <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
+                          <Stack
+                            direction="row"
+                            spacing={1}
+                            sx={{
+                              justifyContent: "space-between",
+                              alignItems: "center"
+                            }}>
                             <Chip
                               size="small"
                               label={integrationCardLabel(cardState)}
@@ -3365,19 +3429,21 @@ export function IntegrationsPanel({
           />
         </>
       ) : null}
-
       {showCatalog ? (
         <Box className="list-shell">
           <Stack spacing={1.1}>
             <Stack
               direction={{ xs: "column", sm: "row" }}
               spacing={1}
-              justifyContent="space-between"
-              alignItems={{ xs: "flex-start", sm: "center" }}
-            >
+              sx={{
+                justifyContent: "space-between",
+                alignItems: { xs: "flex-start", sm: "center" }
+              }}>
               <Box>
                 <Typography variant="subtitle2">Live Summary</Typography>
-                <Typography variant="caption" color="text.secondary">
+                <Typography variant="caption" sx={{
+                  color: "text.secondary"
+                }}>
                   Current connected apps and active integration surfaces.
                 </Typography>
               </Box>
@@ -3401,8 +3467,16 @@ export function IntegrationsPanel({
                       }}
                     >
                       <Stack spacing={0.65} sx={{ height: "100%" }}>
-                        <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={1}>
-                          <Stack direction="row" alignItems="center" spacing={0.8}>
+                        <Stack
+                          direction="row"
+                          spacing={1}
+                          sx={{
+                            alignItems: "center",
+                            justifyContent: "space-between"
+                          }}>
+                          <Stack direction="row" spacing={0.8} sx={{
+                            alignItems: "center"
+                          }}>
                             <Box
                               sx={{
                                 width: 8,
@@ -3420,15 +3494,14 @@ export function IntegrationsPanel({
                         </Stack>
                         <Typography
                           variant="caption"
-                          color="text.secondary"
                           sx={{
+                            color: "text.secondary",
                             lineHeight: 1.45,
                             display: "-webkit-box",
                             WebkitLineClamp: 2,
                             WebkitBoxOrient: "vertical",
                             overflow: "hidden"
-                          }}
-                        >
+                          }}>
                           {item.detail}
                         </Typography>
                       </Stack>
@@ -3437,14 +3510,15 @@ export function IntegrationsPanel({
                 ))}
               </Grid2>
             ) : (
-              <Typography variant="body2" color="text.secondary">
+              <Typography variant="body2" sx={{
+                color: "text.secondary"
+              }}>
                 No live integrations or automations are active yet.
               </Typography>
             )}
           </Stack>
         </Box>
       ) : null}
-
       {false && showCatalog ? (
         <Accordion
           disableGutters
@@ -3456,13 +3530,16 @@ export function IntegrationsPanel({
             <Stack
               direction={{ xs: "column", sm: "row" }}
               spacing={1}
-              justifyContent="space-between"
-              alignItems={{ xs: "flex-start", sm: "center" }}
-              sx={{ width: "100%" }}
-            >
+              sx={{
+                justifyContent: "space-between",
+                alignItems: { xs: "flex-start", sm: "center" },
+                width: "100%"
+              }}>
               <Box>
                 <Typography variant="subtitle2">Active Connections</Typography>
-                <Typography variant="caption" color="text.secondary">
+                <Typography variant="caption" sx={{
+                  color: "text.secondary"
+                }}>
                   Live integrations are shown here first. Expand this to manage every connected service.
                 </Typography>
               </Box>
@@ -3474,13 +3551,16 @@ export function IntegrationsPanel({
           <Stack
             direction={{ xs: "column", sm: "row" }}
             spacing={1}
-            justifyContent="space-between"
-            alignItems={{ xs: "flex-start", sm: "center" }}
-            sx={{ mb: 1.25 }}
-          >
+            sx={{
+              justifyContent: "space-between",
+              alignItems: { xs: "flex-start", sm: "center" },
+              mb: 1.25
+            }}>
             <Box>
               <Typography variant="subtitle2">Connected Apps</Typography>
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: "text.secondary"
+              }}>
                 Live integrations are shown here first. Setup-heavy sections stay collapsed until you need them.
               </Typography>
             </Box>
@@ -3524,7 +3604,13 @@ export function IntegrationsPanel({
                       }}
                     >
                       <Stack spacing={0.75}>
-                        <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={1}>
+                        <Stack
+                          direction="row"
+                          spacing={1}
+                          sx={{
+                            alignItems: "center",
+                            justifyContent: "space-between"
+                          }}>
                           <Typography variant="subtitle2" noWrap sx={{ fontWeight: 700 }}>
                             {integration.name}
                           </Typography>
@@ -3540,18 +3626,23 @@ export function IntegrationsPanel({
                         </Stack>
                         <Typography
                           variant="caption"
-                          color="text.secondary"
                           sx={{
+                            color: "text.secondary",
                             lineHeight: 1.45,
                             display: "-webkit-box",
                             WebkitLineClamp: 2,
                             WebkitBoxOrient: "vertical",
                             overflow: "hidden"
-                          }}
-                        >
+                          }}>
                           {integrationCardCopy(integration)}
                         </Typography>
-                        <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
+                        <Stack
+                          direction="row"
+                          spacing={1}
+                          sx={{
+                            justifyContent: "space-between",
+                            alignItems: "center"
+                          }}>
                           <Chip
                             size="small"
                             label="Connected"
@@ -3578,7 +3669,9 @@ export function IntegrationsPanel({
               })}
             </Grid2>
           ) : (
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>
               No integrations are connected yet.
             </Typography>
           )}
@@ -3586,7 +3679,6 @@ export function IntegrationsPanel({
           </AccordionDetails>
         </Accordion>
       ) : null}
-
       {false && showCatalog ? (
         <Accordion
           disableGutters
@@ -3598,13 +3690,16 @@ export function IntegrationsPanel({
             <Stack
               direction={{ xs: "column", sm: "row" }}
               spacing={1}
-              justifyContent="space-between"
-              alignItems={{ xs: "flex-start", sm: "center" }}
-              sx={{ width: "100%" }}
-            >
+              sx={{
+                justifyContent: "space-between",
+                alignItems: { xs: "flex-start", sm: "center" },
+                width: "100%"
+              }}>
               <Box>
                 <Typography variant="subtitle2">Plugin SDK</Typography>
-                <Typography variant="caption" color="text.secondary">
+                <Typography variant="caption" sx={{
+                  color: "text.secondary"
+                }}>
                   Manage installed external plugins and their event subscriptions here.
                 </Typography>
               </Box>
@@ -3615,7 +3710,6 @@ export function IntegrationsPanel({
           </AccordionDetails>
         </Accordion>
       ) : null}
-
       {false && showCatalog ? (
         <Accordion
           disableGutters
@@ -3627,13 +3721,16 @@ export function IntegrationsPanel({
             <Stack
               direction={{ xs: "column", sm: "row" }}
               spacing={1}
-              justifyContent="space-between"
-              alignItems={{ xs: "flex-start", sm: "center" }}
-              sx={{ width: "100%" }}
-            >
+              sx={{
+                justifyContent: "space-between",
+                alignItems: { xs: "flex-start", sm: "center" },
+                width: "100%"
+              }}>
               <Box>
                 <Typography variant="subtitle2">Recent Activity</Typography>
-                <Typography variant="caption" color="text.secondary">
+                <Typography variant="caption" sx={{
+                  color: "text.secondary"
+                }}>
                   Background sync highlights important changes here when attention is needed.
                 </Typography>
               </Box>
@@ -3664,13 +3761,20 @@ export function IntegrationsPanel({
                     <TableRow key={item.id}>
                       <TableCell>
                         <Typography variant="body2">{item.integration_name}</Typography>
-                        <Typography variant="caption" color="text.secondary" sx={{ textTransform: "capitalize" }}>
+                        <Typography
+                          variant="caption"
+                          sx={{
+                            color: "text.secondary",
+                            textTransform: "capitalize"
+                          }}>
                           {item.kind.replace(/_/g, " ")}
                         </Typography>
                       </TableCell>
                       <TableCell>
                         <Typography variant="body2">{item.title}</Typography>
-                        <Typography variant="caption" color="text.secondary">
+                        <Typography variant="caption" sx={{
+                          color: "text.secondary"
+                        }}>
                           {item.summary}
                         </Typography>
                       </TableCell>
@@ -3684,7 +3788,12 @@ export function IntegrationsPanel({
                       </TableCell>
                       <TableCell>
                         <Typography variant="body2">{formatDateTime(item.detected_at)}</Typography>
-                        <Typography variant="caption" color="text.secondary" sx={{ textTransform: "capitalize" }}>
+                        <Typography
+                          variant="caption"
+                          sx={{
+                            color: "text.secondary",
+                            textTransform: "capitalize"
+                          }}>
                           {item.outcome.replace(/_/g, " ")}
                         </Typography>
                       </TableCell>
@@ -3693,14 +3802,15 @@ export function IntegrationsPanel({
                 </TableBody>
               </Table>
             ) : (
-              <Typography variant="body2" color="text.secondary">
+              <Typography variant="body2" sx={{
+                color: "text.secondary"
+              }}>
                 No recent integration activity yet.
               </Typography>
             )}
           </AccordionDetails>
         </Accordion>
       ) : null}
-
       {showChannelsPage ? (
         <Box className="list-shell">
           <Typography variant="subtitle2" sx={{ mb: 1 }}>
@@ -3740,7 +3850,9 @@ export function IntegrationsPanel({
                   .map((ch) => (
                   <TableRow key={ch.name}>
                     <TableCell>
-                      <Stack direction="row" alignItems="center" spacing={1}>
+                      <Stack direction="row" spacing={1} sx={{
+                        alignItems: "center"
+                      }}>
                         <ChannelIcon name={ch.name} />
                         <Typography variant="body2">{ch.name}</Typography>
                       </Stack>
@@ -3748,11 +3860,15 @@ export function IntegrationsPanel({
                     <TableCell>
                       <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.75 }}>
                         <Box component="span" sx={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, bgcolor: ch.ready ? "rgba(74,210,157,0.85)" : ch.enabled ? "rgba(255,180,50,0.85)" : "rgba(180,200,220,0.5)" }} />
-                        <Typography variant="body2" color="text.secondary" noWrap>{channelStatusLabel(ch.statusRaw, ch.enabled)}</Typography>
+                        <Typography variant="body2" noWrap sx={{
+                          color: "text.secondary"
+                        }}>{channelStatusLabel(ch.statusRaw, ch.enabled)}</Typography>
                       </Box>
                     </TableCell>
                     <TableCell>
-                      <Typography variant="body2" color="text.secondary" noWrap>{ch.detail}</Typography>
+                      <Typography variant="body2" noWrap sx={{
+                        color: "text.secondary"
+                      }}>{ch.detail}</Typography>
                     </TableCell>
                     <TableCell align="right">
                       <Button size="small" variant="text" onClick={ch.onSetup} sx={{ minWidth: 0 }}>{ch.actionLabel || "Setup"}</Button>
@@ -3766,7 +3882,9 @@ export function IntegrationsPanel({
           <Stack spacing={1.25}>
             <Box>
               <Typography variant="subtitle2">Setup Wizards</Typography>
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: "text.secondary"
+              }}>
                 Connect each messaging channel here. Every inbound DM, group, room, or space becomes its own AgentArk conversation thread, while still sharing your global docs, memories, apps, tasks, and watchers.
               </Typography>
             </Box>
@@ -3775,7 +3893,9 @@ export function IntegrationsPanel({
                 Failed to load gateway channel health: {(channelsQ.error as Error)?.message || "Unknown error"}
               </Alert>
             ) : null}
-            <Grid2 container spacing={1.25} alignItems="stretch">
+            <Grid2 container spacing={1.25} sx={{
+              alignItems: "stretch"
+            }}>
               {messagingSetups.map((setup) => {
                 const displayState = messagingDisplayState(setup.status, setup.enabled);
                 const statusLabel = channelStatusLabel(setup.status, setup.enabled);
@@ -3805,7 +3925,13 @@ export function IntegrationsPanel({
                     >
                       <Stack spacing={1.1} sx={{ height: "100%", justifyContent: "space-between" }}>
                         <Box>
-                          <Stack direction="row" alignItems="center" spacing={0.9} sx={{ mb: 0.75 }}>
+                          <Stack
+                            direction="row"
+                            spacing={0.9}
+                            sx={{
+                              alignItems: "center",
+                              mb: 0.75
+                            }}>
                             <ChannelIcon name={setup.name} size={20} />
                             <Typography variant="subtitle2" noWrap>
                               {setup.name}
@@ -3813,19 +3939,26 @@ export function IntegrationsPanel({
                           </Stack>
                           <Typography
                             variant="body2"
-                            color="text.secondary"
                             sx={{
+                              color: "text.secondary",
                               display: "-webkit-box",
                               WebkitLineClamp: 3,
                               WebkitBoxOrient: "vertical",
                               overflow: "hidden"
-                            }}
-                          >
+                            }}>
                             {setup.detail}
                           </Typography>
                         </Box>
-                        <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
-                          <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap>
+                        <Stack
+                          direction="row"
+                          spacing={1}
+                          sx={{
+                            justifyContent: "space-between",
+                            alignItems: "center"
+                          }}>
+                          <Stack direction="row" spacing={0.5} useFlexGap sx={{
+                            flexWrap: "wrap"
+                          }}>
                             <Chip size="small" label="Channel" sx={sectionTagChipSx} />
                             {statusLabel ? <Chip size="small" label={statusLabel} sx={sectionCountChipSx} /> : null}
                           </Stack>
@@ -3847,7 +3980,6 @@ export function IntegrationsPanel({
           </Stack>
         </Box>
       ) : null}
-
       {/* Messaging Channels accordion removed - dedicated "Messaging Channels" tab exists in sidebar */}
       {false ? (<Box>
         <Box className="list-shell">
@@ -3874,11 +4006,15 @@ export function IntegrationsPanel({
                   <TableCell>
                     <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.75 }}>
                       <Box component="span" sx={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, bgcolor: telegramEnabledSaved ? "rgba(74,210,157,0.85)" : "rgba(180,200,220,0.5)" }} />
-                      <Typography variant="body2" color="text.secondary" noWrap>{channelStatusLabel(telegramConnectionStatusRaw, telegramEnabledSaved)}</Typography>
+                      <Typography variant="body2" noWrap sx={{
+                        color: "text.secondary"
+                      }}>{channelStatusLabel(telegramConnectionStatusRaw, telegramEnabledSaved)}</Typography>
                     </Box>
                   </TableCell>
                   <TableCell>
-                    <Typography variant="body2" color="text.secondary" noWrap>
+                    <Typography variant="body2" noWrap sx={{
+                      color: "text.secondary"
+                    }}>
                       {telegramConnectionDetail || (telegramTokenConfigured ? "Token set" : "Not configured")}
                     </Typography>
                   </TableCell>
@@ -3907,11 +4043,15 @@ export function IntegrationsPanel({
                                 : "rgba(180,200,220,0.5)"
                         }}
                       />
-                      <Typography variant="body2" color="text.secondary" noWrap>{channelStatusLabel(whatsappConnectionStatusRaw, channelForm.whatsapp_enabled)}</Typography>
+                      <Typography variant="body2" noWrap sx={{
+                        color: "text.secondary"
+                      }}>{channelStatusLabel(whatsappConnectionStatusRaw, channelForm.whatsapp_enabled)}</Typography>
                     </Box>
                   </TableCell>
                   <TableCell>
-                    <Typography variant="body2" color="text.secondary" noWrap>
+                    <Typography variant="body2" noWrap sx={{
+                      color: "text.secondary"
+                    }}>
                       {whatsappConnectionDetail || whatsappModeSummary}
                     </Typography>
                   </TableCell>
@@ -3928,7 +4068,9 @@ export function IntegrationsPanel({
           <Stack spacing={1.25}>
             <Box>
               <Typography variant="subtitle2">Setup Wizards</Typography>
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: "text.secondary"
+              }}>
                 Onboard Slack, Discord, Matrix, and Teams here. If something looks off later, run ArkPulse for diagnostics.
               </Typography>
             </Box>
@@ -3937,7 +4079,9 @@ export function IntegrationsPanel({
                 Failed to load gateway channel health: {(channelsQ.error as Error)?.message || "Unknown error"}
               </Alert>
             ) : null}
-            <Grid2 container spacing={1} alignItems="stretch">
+            <Grid2 container spacing={1} sx={{
+              alignItems: "stretch"
+            }}>
               {messagingSetups.map((setup) => {
                 const displayState = messagingDisplayState(setup.status, setup.enabled);
                 const accent = integrationCardAccent(
@@ -3970,8 +4114,16 @@ export function IntegrationsPanel({
                       }}
                     >
                       <Stack spacing={0.75}>
-                        <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={1}>
-                          <Stack direction="row" alignItems="center" spacing={0.75}>
+                        <Stack
+                          direction="row"
+                          spacing={1}
+                          sx={{
+                            alignItems: "center",
+                            justifyContent: "space-between"
+                          }}>
+                          <Stack direction="row" spacing={0.75} sx={{
+                            alignItems: "center"
+                          }}>
                             <ChannelIcon name={setup.name} size={22} />
                             <Typography variant="subtitle2" noWrap sx={{ fontWeight: 700 }}>
                               {setup.name}
@@ -3981,18 +4133,23 @@ export function IntegrationsPanel({
                         </Stack>
                         <Typography
                           variant="caption"
-                          color="text.secondary"
                           sx={{
+                            color: "text.secondary",
                             lineHeight: 1.45,
                             display: "-webkit-box",
                             WebkitLineClamp: 2,
                             WebkitBoxOrient: "vertical",
                             overflow: "hidden"
-                          }}
-                        >
+                          }}>
                           {setup.detail}
                         </Typography>
-                        <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
+                        <Stack
+                          direction="row"
+                          spacing={1}
+                          sx={{
+                            justifyContent: "space-between",
+                            alignItems: "center"
+                          }}>
                           {channelStatusLabel(setup.status, setup.enabled) ? (
                             <Chip
                               size="small"
@@ -4014,7 +4171,6 @@ export function IntegrationsPanel({
           </Stack>
         </Box>
       </Box>) : null}
-
       {showCatalog ? (
         <Accordion
           disableGutters
@@ -4026,13 +4182,16 @@ export function IntegrationsPanel({
             <Stack
               direction={{ xs: "column", sm: "row" }}
               spacing={1}
-              justifyContent="space-between"
-              alignItems={{ xs: "flex-start", sm: "center" }}
-              sx={{ width: "100%" }}
-            >
+              sx={{
+                justifyContent: "space-between",
+                alignItems: { xs: "flex-start", sm: "center" },
+                width: "100%"
+              }}>
               <Box>
                 <Typography variant="subtitle2">Prebuilt Connectors</Typography>
-                <Typography variant="caption" color="text.secondary">
+                <Typography variant="caption" sx={{
+                  color: "text.secondary"
+                }}>
                   Connect Google Workspace, GitHub, Jira, Sentry, and other built-in integrations here. Use the dedicated Webhooks & APIs page for custom sources.
                 </Typography>
               </Box>
@@ -4050,7 +4209,6 @@ export function IntegrationsPanel({
           </AccordionDetails>
         </Accordion>
       ) : null}
-
       {showCatalog ? (
         <Accordion
           disableGutters
@@ -4062,13 +4220,16 @@ export function IntegrationsPanel({
             <Stack
               direction={{ xs: "column", sm: "row" }}
               spacing={1}
-              justifyContent="space-between"
-              alignItems={{ xs: "flex-start", sm: "center" }}
-              sx={{ width: "100%" }}
-            >
+              sx={{
+                justifyContent: "space-between",
+                alignItems: { xs: "flex-start", sm: "center" },
+                width: "100%"
+              }}>
               <Box>
                 <Typography variant="subtitle2">Plugin SDK</Typography>
-                <Typography variant="caption" color="text.secondary">
+                <Typography variant="caption" sx={{
+                  color: "text.secondary"
+                }}>
                   Manage installed external plugins and their event subscriptions here.
                 </Typography>
               </Box>
@@ -4079,7 +4240,6 @@ export function IntegrationsPanel({
           </AccordionDetails>
         </Accordion>
       ) : null}
-
       {showCatalog ? (
         <Accordion
           disableGutters
@@ -4091,13 +4251,16 @@ export function IntegrationsPanel({
             <Stack
               direction={{ xs: "column", sm: "row" }}
               spacing={1}
-              justifyContent="space-between"
-              alignItems={{ xs: "flex-start", sm: "center" }}
-              sx={{ width: "100%" }}
-            >
+              sx={{
+                justifyContent: "space-between",
+                alignItems: { xs: "flex-start", sm: "center" },
+                width: "100%"
+              }}>
               <Box>
                 <Typography variant="subtitle2">Conversation Routing</Typography>
-                <Typography variant="caption" color="text.secondary">
+                <Typography variant="caption" sx={{
+                  color: "text.secondary"
+                }}>
                   Keep channel-specific traffic pinned to the right agent only when you explicitly need it.
                 </Typography>
               </Box>
@@ -4108,9 +4271,7 @@ export function IntegrationsPanel({
           </AccordionDetails>
         </Accordion>
       ) : null}
-
       {/* Messaging onboarding section removed - duplicates Setup Wizards above */}
-
       {false && showCatalog ? (
         <Accordion
           disableGutters
@@ -4122,17 +4283,22 @@ export function IntegrationsPanel({
             <Stack
               direction={{ xs: "column", sm: "row" }}
               spacing={1}
-              justifyContent="space-between"
-              alignItems={{ xs: "flex-start", sm: "center" }}
-              sx={{ width: "100%" }}
-            >
+              sx={{
+                justifyContent: "space-between",
+                alignItems: { xs: "flex-start", sm: "center" },
+                width: "100%"
+              }}>
               <Box>
                 <Typography variant="subtitle2">Integration Catalog</Typography>
-                <Typography variant="caption" color="text.secondary">
+                <Typography variant="caption" sx={{
+                  color: "text.secondary"
+                }}>
                   Review everything available, including connectors that still need setup or attention.
                 </Typography>
               </Box>
-              <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+              <Stack direction="row" spacing={0.75} useFlexGap sx={{
+                flexWrap: "wrap"
+              }}>
                 <Chip size="small" variant="outlined" label={`${readyList.length} ready`} />
                 <Chip size="small" variant="outlined" label={`${notReadyList.length} need attention`} />
               </Stack>
@@ -4140,7 +4306,13 @@ export function IntegrationsPanel({
           </AccordionSummary>
           <AccordionDetails>
         <Box className="list-shell">
-          <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1.5 }}>
+          <Stack
+            direction="row"
+            sx={{
+              justifyContent: "space-between",
+              alignItems: "center",
+              mb: 1.5
+            }}>
             <Typography variant="subtitle2">
               Available Integrations
             </Typography>
@@ -4203,7 +4375,13 @@ export function IntegrationsPanel({
                     }}
                   >
                     <Stack spacing={0.5} sx={{ minHeight: 56 }}>
-                      <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={0.5}>
+                      <Stack
+                        direction="row"
+                        spacing={0.5}
+                        sx={{
+                          alignItems: "center",
+                          justifyContent: "space-between"
+                        }}>
                         <Typography variant="subtitle2" noWrap sx={{ fontWeight: 700, fontSize: "0.82rem" }}>
                           {integration.name}
                         </Typography>
@@ -4217,7 +4395,16 @@ export function IntegrationsPanel({
                           }}
                         />
                       </Stack>
-                      <Typography variant="caption" color="text.secondary" sx={{ lineHeight: 1.3, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>
+                      <Typography
+                        variant="caption"
+                        sx={{
+                          color: "text.secondary",
+                          lineHeight: 1.3,
+                          display: "-webkit-box",
+                          WebkitLineClamp: 2,
+                          WebkitBoxOrient: "vertical",
+                          overflow: "hidden"
+                        }}>
                         {integrationCardCopy(integration)}
                       </Typography>
                     </Stack>
@@ -4243,16 +4430,23 @@ export function IntegrationsPanel({
           </AccordionDetails>
         </Accordion>
       ) : null}
-
       {showMcp ? (
         <Box className="list-shell">
-        <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ mb: 1 }}>
+        <Stack
+          direction="row"
+          sx={{
+            alignItems: "center",
+            justifyContent: "space-between",
+            mb: 1
+          }}>
           <Typography variant="subtitle2">MCP Servers ({mcpSorted.length})</Typography>
           <Button size="small" variant="contained" onClick={openCreateMcp}>
             Add MCP Server
           </Button>
         </Stack>
-        <Typography variant="caption" color="text.secondary">
+        <Typography variant="caption" sx={{
+          color: "text.secondary"
+        }}>
           Manage external MCP servers (HTTP or stdio). Tools/resources hot-reload after create/update.
         </Typography>
         {mcpNotice ? <Alert sx={{ mt: 1 }} severity={mcpNotice.kind}>{mcpNotice.text}</Alert> : null}
@@ -4261,7 +4455,12 @@ export function IntegrationsPanel({
             Failed to load MCP servers: {mcpQ.error instanceof Error ? mcpQ.error.message : "Unknown error"}
           </Alert>
         ) : mcpSorted.length === 0 ? (
-          <Typography sx={{ mt: 1 }} variant="body2" color="text.secondary">
+          <Typography
+            variant="body2"
+            sx={{
+              color: "text.secondary",
+              mt: 1
+            }}>
             No MCP servers configured.
           </Typography>
         ) : (
@@ -4274,8 +4473,15 @@ export function IntegrationsPanel({
                 <Grid2 key={id || str(server.name, Math.random().toString())} size={{ xs: 12, md: 6 }}>
                   <Box className="list-shell" sx={{ minHeight: 0 }}>
                     <Stack spacing={1}>
-                      <Stack direction="row" alignItems="center" justifyContent="space-between">
-                        <Typography variant="subtitle1" fontWeight={700}>
+                      <Stack
+                        direction="row"
+                        sx={{
+                          alignItems: "center",
+                          justifyContent: "space-between"
+                        }}>
+                        <Typography variant="subtitle1" sx={{
+                          fontWeight: 700
+                        }}>
                           {str(server.name, "(unnamed)")}
                         </Typography>
                         <Stack direction="row" spacing={0.5}>
@@ -4291,20 +4497,28 @@ export function IntegrationsPanel({
                           />
                         </Stack>
                       </Stack>
-                      <Typography variant="body2" color="text.secondary">
+                      <Typography variant="body2" sx={{
+                        color: "text.secondary"
+                      }}>
                         {str(server.description, "No description")}
                       </Typography>
-                      <Typography variant="caption" color="text.secondary">
+                      <Typography variant="caption" sx={{
+                        color: "text.secondary"
+                      }}>
                         {transportSummary(server)}
                       </Typography>
-                      <Typography variant="caption" color="text.secondary">
+                      <Typography variant="caption" sx={{
+                        color: "text.secondary"
+                      }}>
                         Auth: {authSummary(server)} | Tools: {str(server.tool_count, "0")} | Resources: {str(server.resource_count, "0")}
                       </Typography>
                       {lastError ? <Alert severity="error">{lastError}</Alert> : null}
                       {warnings.length > 0 ? (
                         <Alert severity="warning">{warnings.slice(0, 2).join(" ")}</Alert>
                       ) : null}
-                      <Stack direction="row" justifyContent="flex-end">
+                      <Stack direction="row" sx={{
+                        justifyContent: "flex-end"
+                      }}>
                         <CardActionsMenu
                           ariaLabel={`${str(server.name, "MCP server")} options`}
                           actions={[
@@ -4340,10 +4554,15 @@ export function IntegrationsPanel({
         )}
       </Box>
       ) : null}
-
       {showMcp ? (
         <Box className="list-shell">
-          <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ mb: 1 }}>
+          <Stack
+            direction="row"
+            sx={{
+              alignItems: "center",
+              justifyContent: "space-between",
+              mb: 1
+            }}>
             <Typography variant="subtitle2">SSH Access ({sshKeyNames.length} keys, {sshConnectionNames.length} connections)</Typography>
             <Stack direction="row" spacing={1}>
               <Button size="small" variant="outlined" onClick={openSshTestDialog} disabled={sshConnectionNames.length === 0}>
@@ -4357,7 +4576,9 @@ export function IntegrationsPanel({
               </Button>
             </Stack>
           </Stack>
-          <Typography variant="caption" color="text.secondary">
+          <Typography variant="caption" sx={{
+            color: "text.secondary"
+          }}>
             Upload private keys, create named connection profiles, and run connectivity tests.
           </Typography>
           {sshNotice ? <Alert sx={{ mt: 1 }} severity={sshNotice.kind}>{sshNotice.text}</Alert> : null}
@@ -4373,7 +4594,12 @@ export function IntegrationsPanel({
           ) : null}
 
           {sshKeyNames.length === 0 && sshConnectionNames.length === 0 ? (
-            <Typography sx={{ mt: 1 }} variant="body2" color="text.secondary">
+            <Typography
+              variant="body2"
+              sx={{
+                color: "text.secondary",
+                mt: 1
+              }}>
               No SSH keys or connections configured.
             </Typography>
           ) : (
@@ -4382,12 +4608,23 @@ export function IntegrationsPanel({
                 <Grid2 key={`key-${name}`} size={{ xs: 12, md: 6 }}>
                   <Box className="list-shell" sx={{ minHeight: 0 }}>
                     <Stack spacing={0.5}>
-                      <Stack direction="row" alignItems="center" justifyContent="space-between">
-                        <Typography variant="subtitle1" fontWeight={700}>{name}</Typography>
+                      <Stack
+                        direction="row"
+                        sx={{
+                          alignItems: "center",
+                          justifyContent: "space-between"
+                        }}>
+                        <Typography variant="subtitle1" sx={{
+                          fontWeight: 700
+                        }}>{name}</Typography>
                         <Chip size="small" label="key" color="default" />
                       </Stack>
-                      <Typography variant="caption" color="text.secondary">SSH private key</Typography>
-                      <Stack direction="row" justifyContent="flex-end">
+                      <Typography variant="caption" sx={{
+                        color: "text.secondary"
+                      }}>SSH private key</Typography>
+                      <Stack direction="row" sx={{
+                        justifyContent: "flex-end"
+                      }}>
                         <CardActionsMenu
                           ariaLabel={`${name} options`}
                           actions={[
@@ -4412,12 +4649,23 @@ export function IntegrationsPanel({
                 <Grid2 key={`conn-${name}`} size={{ xs: 12, md: 6 }}>
                   <Box className="list-shell" sx={{ minHeight: 0 }}>
                     <Stack spacing={0.5}>
-                      <Stack direction="row" alignItems="center" justifyContent="space-between">
-                        <Typography variant="subtitle1" fontWeight={700}>{name}</Typography>
+                      <Stack
+                        direction="row"
+                        sx={{
+                          alignItems: "center",
+                          justifyContent: "space-between"
+                        }}>
+                        <Typography variant="subtitle1" sx={{
+                          fontWeight: 700
+                        }}>{name}</Typography>
                         <Chip size="small" label="connection" color="success" />
                       </Stack>
-                      <Typography variant="caption" color="text.secondary">SSH connection profile</Typography>
-                      <Stack direction="row" justifyContent="flex-end">
+                      <Typography variant="caption" sx={{
+                        color: "text.secondary"
+                      }}>SSH connection profile</Typography>
+                      <Stack direction="row" sx={{
+                        justifyContent: "flex-end"
+                      }}>
                         <CardActionsMenu
                           ariaLabel={`${name} options`}
                           actions={[
@@ -4451,17 +4699,20 @@ export function IntegrationsPanel({
           )}
         </Box>
       ) : null}
-
       {showIntegrations ? (
       <Dialog open={telegramSetupOpen} onClose={() => setTelegramSetupOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>Telegram Setup</DialogTitle>
         <DialogContent dividers>
           <Stack spacing={1.5}>
             {notice?.kind === "error" ? <Alert severity="error">{notice.text}</Alert> : null}
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>
               Add your Telegram bot token and optional allowed user IDs. This controls who can use your bot.
             </Typography>
-            <Stack direction="row" spacing={1} alignItems="center">
+            <Stack direction="row" spacing={1} sx={{
+              alignItems: "center"
+            }}>
               <Chip
                 size="small"
                 label={channelStatusLabel(telegramConnectionStatusRaw, telegramEnabledSaved)}
@@ -4473,7 +4724,9 @@ export function IntegrationsPanel({
               </Button>
             </Stack>
             {telegramConnectionDetail ? (
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: "text.secondary"
+              }}>
                 {telegramConnectionDetail}
               </Typography>
             ) : null}
@@ -4519,16 +4772,19 @@ export function IntegrationsPanel({
         })}
       </Dialog>
       ) : null}
-
       {showIntegrations ? (
       <Dialog open={slackSetupOpen} onClose={() => setSlackSetupOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>Slack Setup</DialogTitle>
         <DialogContent dividers>
           <Stack spacing={1.5}>
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>
               Save the bot token and signing secret, then point Slack Events API at `/webhook/slack`. Reply routing and channel runtime health will show up in Channels after the first live event.
             </Typography>
-            <Stack direction="row" spacing={1} alignItems="center">
+            <Stack direction="row" spacing={1} sx={{
+              alignItems: "center"
+            }}>
               <Chip
                 size="small"
                 label={channelStatusLabel(slackConnectionStatusRaw, channelForm.slack_enabled)}
@@ -4539,7 +4795,9 @@ export function IntegrationsPanel({
                 {channelsQ.isFetching ? "Refreshing..." : "Refresh Status"}
               </Button>
             </Stack>
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: "text.secondary"
+            }}>
               {slackConnectionDetail}
             </Typography>
             <FormControlLabel
@@ -4591,16 +4849,19 @@ export function IntegrationsPanel({
         })}
       </Dialog>
       ) : null}
-
       {showIntegrations ? (
       <Dialog open={discordSetupOpen} onClose={() => setDiscordSetupOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>Discord Setup</DialogTitle>
         <DialogContent dividers>
           <Stack spacing={1.5}>
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>
               Discord now requires a live bot token plus at least one guild, channel, or thread scope for inbound handling. The webhook URL is optional and only helps with outbound thread posting.
             </Typography>
-            <Stack direction="row" spacing={1} alignItems="center">
+            <Stack direction="row" spacing={1} sx={{
+              alignItems: "center"
+            }}>
               <Chip
                 size="small"
                 label={channelStatusLabel(discordConnectionStatusRaw, channelForm.discord_enabled)}
@@ -4611,7 +4872,9 @@ export function IntegrationsPanel({
                 {channelsQ.isFetching ? "Refreshing..." : "Refresh Status"}
               </Button>
             </Stack>
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: "text.secondary"
+            }}>
               {discordConnectionDetail}
             </Typography>
             <FormControlLabel
@@ -4644,16 +4907,19 @@ export function IntegrationsPanel({
         })}
       </Dialog>
       ) : null}
-
       {showIntegrations ? (
       <Dialog open={matrixSetupOpen} onClose={() => setMatrixSetupOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>Matrix Setup</DialogTitle>
         <DialogContent dividers>
           <Stack spacing={1.5}>
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>
               Configure a Matrix homeserver identity that the sync loop can poll continuously. After the first room event, AgentArk will remember the active reply destination automatically.
             </Typography>
-            <Stack direction="row" spacing={1} alignItems="center">
+            <Stack direction="row" spacing={1} sx={{
+              alignItems: "center"
+            }}>
               <Chip
                 size="small"
                 label={channelStatusLabel(matrixConnectionStatusRaw, channelForm.matrix_enabled)}
@@ -4664,7 +4930,9 @@ export function IntegrationsPanel({
                 {channelsQ.isFetching ? "Refreshing..." : "Refresh Status"}
               </Button>
             </Stack>
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: "text.secondary"
+            }}>
               {matrixConnectionDetail}
             </Typography>
             <FormControlLabel
@@ -4700,16 +4968,19 @@ export function IntegrationsPanel({
         })}
       </Dialog>
       ) : null}
-
       {showIntegrations ? (
       <Dialog open={teamsSetupOpen} onClose={() => setTeamsSetupOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>Teams Setup</DialogTitle>
         <DialogContent dividers>
           <Stack spacing={1.5}>
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>
               Configure the Bot Framework endpoint and credentials, including the bot app ID used for JWT verification. The runtime will only accept signed inbound activities and only reply to trusted service URLs.
             </Typography>
-            <Stack direction="row" spacing={1} alignItems="center">
+            <Stack direction="row" spacing={1} sx={{
+              alignItems: "center"
+            }}>
               <Chip
                 size="small"
                 label={channelStatusLabel(teamsConnectionStatusRaw, channelForm.teams_enabled)}
@@ -4720,7 +4991,9 @@ export function IntegrationsPanel({
                 {channelsQ.isFetching ? "Refreshing..." : "Refresh Status"}
               </Button>
             </Stack>
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: "text.secondary"
+            }}>
               {teamsConnectionDetail}
             </Typography>
             <FormControlLabel
@@ -4776,16 +5049,19 @@ export function IntegrationsPanel({
         })}
       </Dialog>
       ) : null}
-
       {showIntegrations ? (
       <Dialog open={googleChatSetupOpen} onClose={() => setGoogleChatSetupOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>Google Chat Setup</DialogTitle>
         <DialogContent dividers>
           <Stack spacing={1.5}>
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>
               Use this when you want AgentArk to send and receive messages inside Google Chat. This is separate from Google Workspace data access. Each space or DM becomes its own AgentArk conversation thread, while still sharing your global docs, memories, apps, tasks, and watchers.
             </Typography>
-            <Stack direction="row" spacing={1} alignItems="center">
+            <Stack direction="row" spacing={1} sx={{
+              alignItems: "center"
+            }}>
               <Chip
                 size="small"
                 label={channelStatusLabel(googleChatConnectionStatusRaw, channelForm.google_chat_enabled)}
@@ -4796,7 +5072,9 @@ export function IntegrationsPanel({
                 {channelsQ.isFetching ? "Refreshing..." : "Refresh Status"}
               </Button>
             </Stack>
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: "text.secondary"
+            }}>
               {googleChatConnectionDetail}
             </Typography>
             <FormControlLabel
@@ -4851,16 +5129,19 @@ export function IntegrationsPanel({
         })}
       </Dialog>
       ) : null}
-
       {showIntegrations ? (
       <Dialog open={signalSetupOpen} onClose={() => setSignalSetupOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>Signal Setup</DialogTitle>
         <DialogContent dividers>
           <Stack spacing={1.5}>
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>
               Signal uses a companion bridge. Each Signal DM or group becomes its own AgentArk conversation thread, while AgentArk still keeps access to your shared docs, memories, apps, tasks, and watchers.
             </Typography>
-            <Stack direction="row" spacing={1} alignItems="center">
+            <Stack direction="row" spacing={1} sx={{
+              alignItems: "center"
+            }}>
               <Chip
                 size="small"
                 label={channelStatusLabel(signalConnectionStatusRaw, channelForm.signal_enabled)}
@@ -4871,7 +5152,9 @@ export function IntegrationsPanel({
                 {channelsQ.isFetching ? "Refreshing..." : "Refresh Status"}
               </Button>
             </Stack>
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: "text.secondary"
+            }}>
               {signalConnectionDetail}
             </Typography>
             <FormControlLabel
@@ -4914,16 +5197,19 @@ export function IntegrationsPanel({
         })}
       </Dialog>
       ) : null}
-
       {showIntegrations ? (
       <Dialog open={imessageSetupOpen} onClose={() => setImessageSetupOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>iMessage Setup</DialogTitle>
         <DialogContent dividers>
           <Stack spacing={1.5}>
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>
               iMessage requires a companion bridge backed by an Apple device. Each chat becomes its own AgentArk conversation thread, while AgentArk still shares your global docs, memories, apps, tasks, and watchers across all channels.
             </Typography>
-            <Stack direction="row" spacing={1} alignItems="center">
+            <Stack direction="row" spacing={1} sx={{
+              alignItems: "center"
+            }}>
               <Chip
                 size="small"
                 label={channelStatusLabel(imessageConnectionStatusRaw, channelForm.imessage_enabled)}
@@ -4934,7 +5220,9 @@ export function IntegrationsPanel({
                 {channelsQ.isFetching ? "Refreshing..." : "Refresh Status"}
               </Button>
             </Stack>
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: "text.secondary"
+            }}>
               {imessageConnectionDetail}
             </Typography>
             <FormControlLabel
@@ -4977,16 +5265,19 @@ export function IntegrationsPanel({
         })}
       </Dialog>
       ) : null}
-
       {showIntegrations ? (
       <Dialog open={lineSetupOpen} onClose={() => setLineSetupOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>LINE Setup</DialogTitle>
         <DialogContent dividers>
           <Stack spacing={1.5}>
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>
               LINE is a first-class messaging channel for AgentArk. Each DM, room, or group becomes its own AgentArk conversation thread, while still sharing your global docs, memories, apps, tasks, and watchers.
             </Typography>
-            <Stack direction="row" spacing={1} alignItems="center">
+            <Stack direction="row" spacing={1} sx={{
+              alignItems: "center"
+            }}>
               <Chip
                 size="small"
                 label={channelStatusLabel(lineConnectionStatusRaw, channelForm.line_enabled)}
@@ -4997,7 +5288,9 @@ export function IntegrationsPanel({
                 {channelsQ.isFetching ? "Refreshing..." : "Refresh Status"}
               </Button>
             </Stack>
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: "text.secondary"
+            }}>
               {lineConnectionDetail}
             </Typography>
             <FormControlLabel
@@ -5049,16 +5342,19 @@ export function IntegrationsPanel({
         })}
       </Dialog>
       ) : null}
-
       {showIntegrations ? (
       <Dialog open={wechatSetupOpen} onClose={() => setWechatSetupOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>WeChat Setup</DialogTitle>
         <DialogContent dividers>
           <Stack spacing={1.5}>
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>
               WeChat uses a bridge so each WeChat chat can stay in its own AgentArk conversation thread, while AgentArk still shares your global docs, memories, apps, tasks, and watchers across channels.
             </Typography>
-            <Stack direction="row" spacing={1} alignItems="center">
+            <Stack direction="row" spacing={1} sx={{
+              alignItems: "center"
+            }}>
               <Chip
                 size="small"
                 label={channelStatusLabel(wechatConnectionStatusRaw, channelForm.wechat_enabled)}
@@ -5069,7 +5365,9 @@ export function IntegrationsPanel({
                 {channelsQ.isFetching ? "Refreshing..." : "Refresh Status"}
               </Button>
             </Stack>
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: "text.secondary"
+            }}>
               {wechatConnectionDetail}
             </Typography>
             <FormControlLabel
@@ -5109,16 +5407,19 @@ export function IntegrationsPanel({
         })}
       </Dialog>
       ) : null}
-
       {showIntegrations ? (
       <Dialog open={qqSetupOpen} onClose={() => setQqSetupOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>QQ Setup</DialogTitle>
         <DialogContent dividers>
           <Stack spacing={1.5}>
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>
               QQ uses a bridge so each QQ chat can stay in its own AgentArk conversation thread, while AgentArk still shares your global docs, memories, apps, tasks, and watchers across channels.
             </Typography>
-            <Stack direction="row" spacing={1} alignItems="center">
+            <Stack direction="row" spacing={1} sx={{
+              alignItems: "center"
+            }}>
               <Chip
                 size="small"
                 label={channelStatusLabel(qqConnectionStatusRaw, channelForm.qq_enabled)}
@@ -5129,7 +5430,9 @@ export function IntegrationsPanel({
                 {channelsQ.isFetching ? "Refreshing..." : "Refresh Status"}
               </Button>
             </Stack>
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: "text.secondary"
+            }}>
               {qqConnectionDetail}
             </Typography>
             <FormControlLabel
@@ -5168,13 +5471,14 @@ export function IntegrationsPanel({
         })}
       </Dialog>
       ) : null}
-
       {showIntegrations ? (
       <Dialog open={whatsAppSetupOpen} onClose={() => setWhatsAppSetupOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>WhatsApp Setup</DialogTitle>
         <DialogContent dividers>
           <Stack spacing={1.5}>
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>
               Choose how you want to connect WhatsApp: quick QR pairing or Enterprise Cloud API.
             </Typography>
             <FormControlLabel
@@ -5225,8 +5529,12 @@ export function IntegrationsPanel({
                 {whatsappEmbeddedBridgeSelected ? (
                   <Box className="metadata-box" sx={{ maxHeight: "none", p: 1.5 }}>
                     <Stack spacing={1}>
-                      <Stack direction="row" spacing={1} alignItems="center">
-                        <Typography variant="body2" fontWeight={700}>
+                      <Stack direction="row" spacing={1} sx={{
+                        alignItems: "center"
+                      }}>
+                        <Typography variant="body2" sx={{
+                          fontWeight: 700
+                        }}>
                           Bundled bridge status
                         </Typography>
                         <Chip
@@ -5236,7 +5544,9 @@ export function IntegrationsPanel({
                           variant="outlined"
                         />
                       </Stack>
-                      <Typography variant="caption" color="text.secondary">
+                      <Typography variant="caption" sx={{
+                        color: "text.secondary"
+                      }}>
                         {whatsappConnectionDetail}
                       </Typography>
                       {!whatsappBridgeInstalled ? (
@@ -5346,14 +5656,18 @@ export function IntegrationsPanel({
 
             {channelForm.whatsapp_enabled && channelForm.whatsapp_mode === "cloud_api" ? (
               <>
-                <Stack direction="row" spacing={1} alignItems="center">
+                <Stack direction="row" spacing={1} sx={{
+                  alignItems: "center"
+                }}>
                   <Chip
                     size="small"
                     label={channelStatusLabel(whatsappConnectionStatusRaw, channelForm.whatsapp_enabled)}
                     color={channelStatusColor(whatsappConnectionStatusRaw, channelForm.whatsapp_enabled)}
                     variant="outlined"
                   />
-                  <Typography variant="caption" color="text.secondary">
+                  <Typography variant="caption" sx={{
+                    color: "text.secondary"
+                  }}>
                     {whatsappConnectionDetail}
                   </Typography>
                 </Stack>
@@ -5415,16 +5729,19 @@ export function IntegrationsPanel({
         })}
       </Dialog>
       ) : null}
-
       {showIntegrations ? (
         <Dialog open={!!active} onClose={closeConfig} maxWidth="md" fullWidth>
           <DialogTitle sx={{ textTransform: "none" }}>{active?.name || "Configure integration"}</DialogTitle>
           <DialogContent sx={{ px: { xs: 2, md: 3 }, py: { xs: 1.5, md: 2.5 } }}>
             <Stack spacing={1.5} sx={{ pt: 0.5 }}>
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>
               {active?.description}
             </Typography>
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: "text.secondary"
+            }}>
               {integrationDialogStatusLabel(active)}
             </Typography>
             {activeHasSavedConfig && !editingConnected ? (
@@ -5436,7 +5753,9 @@ export function IntegrationsPanel({
                       : "This integration is connected, but currently disabled for agent use."
                     : "Credentials are saved, but this integration remains disabled until a live connection is confirmed."}
                 </Alert>
-                <Stack direction="row" spacing={1} alignItems="center">
+                <Stack direction="row" spacing={1} sx={{
+                  alignItems: "center"
+                }}>
                   <FormControlLabel
                     control={
                       <Switch
@@ -5497,10 +5816,18 @@ export function IntegrationsPanel({
                   background: "rgba(8, 18, 32, 0.46)"
                 }}
               >
-                <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between">
+                <Stack
+                  direction="row"
+                  spacing={1}
+                  sx={{
+                    alignItems: "center",
+                    justifyContent: "space-between"
+                  }}>
                   <Box>
                     <Typography variant="subtitle2">Google OAuth setup</Typography>
-                    <Typography variant="caption" color="text.secondary">
+                    <Typography variant="caption" sx={{
+                      color: "text.secondary"
+                    }}>
                       Add the Google OAuth client here, then AgentArk will open the Google consent screen in your browser.
                     </Typography>
                   </Box>
@@ -5523,7 +5850,9 @@ export function IntegrationsPanel({
               ? (active?.config_fields || []).map(renderField)
               : null}
             {active?.config_help ? (
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: "text.secondary"
+              }}>
                 {active.config_help}
               </Typography>
             ) : null}
@@ -5542,7 +5871,9 @@ export function IntegrationsPanel({
                       ? "Browser Sign-In"
                       : "Finish Browser Sign-In"}
                   </Typography>
-                  <Typography variant="caption" color="text.secondary">
+                  <Typography variant="caption" sx={{
+                    color: "text.secondary"
+                  }}>
                     {active?.id === "google_workspace"
                       ? "AgentArk will save the client ID, optional secret update, and selected bundles first, then open the Google consent screen."
                       : "AgentArk will save these credentials first, then open the provider sign-in flow."}
@@ -5576,13 +5907,17 @@ export function IntegrationsPanel({
                     <Stack
                       direction={{ xs: "column", sm: "row" }}
                       spacing={1}
-                      alignItems={{ xs: "flex-start", sm: "center" }}
-                      justifyContent="space-between"
-                      sx={{ width: "100%", pr: 1 }}
-                    >
+                      sx={{
+                        alignItems: { xs: "flex-start", sm: "center" },
+                        justifyContent: "space-between",
+                        width: "100%",
+                        pr: 1
+                      }}>
                       <Box>
                         <Typography variant="subtitle2">Background Sync</Typography>
-                        <Typography variant="caption" color="text.secondary">
+                        <Typography variant="caption" sx={{
+                          color: "text.secondary"
+                        }}>
                           Defaults to ArkPulse cadence: every 30 minutes. Use a shorter interval only when this integration needs closer polling.
                         </Typography>
                       </Box>
@@ -5635,7 +5970,9 @@ export function IntegrationsPanel({
                               type="number"
                               value={syncForm.poll_interval_minutes}
                               onChange={(e) => setSyncField("poll_interval_minutes", e.target.value)}
-                              inputProps={{ min: 1, max: 1440 }}
+                              slotProps={{
+                                htmlInput: { min: 1, max: 1440 }
+                              }}
                             />
                           </Grid2>
                           <Grid2 size={{ xs: 12, sm: 6 }}>
@@ -5648,7 +5985,9 @@ export function IntegrationsPanel({
                               onChange={(e) =>
                                 setSyncField("importance_threshold_percent", e.target.value)
                               }
-                              inputProps={{ min: 10, max: 100 }}
+                              slotProps={{
+                                htmlInput: { min: 10, max: 100 }
+                              }}
                             />
                           </Grid2>
                         </Grid2>
@@ -5677,7 +6016,9 @@ export function IntegrationsPanel({
                         {activeSyncStatus ? (
                           <Grid2 container spacing={1}>
                             <Grid2 size={{ xs: 12, sm: 6 }}>
-                              <Typography variant="caption" color="text.secondary">
+                              <Typography variant="caption" sx={{
+                                color: "text.secondary"
+                              }}>
                                 Last sync
                               </Typography>
                               <Typography variant="body2">
@@ -5685,7 +6026,9 @@ export function IntegrationsPanel({
                               </Typography>
                             </Grid2>
                             <Grid2 size={{ xs: 12, sm: 6 }}>
-                              <Typography variant="caption" color="text.secondary">
+                              <Typography variant="caption" sx={{
+                                color: "text.secondary"
+                              }}>
                                 Last detected item
                               </Typography>
                               <Typography variant="body2">
@@ -5693,13 +6036,17 @@ export function IntegrationsPanel({
                               </Typography>
                             </Grid2>
                             <Grid2 size={{ xs: 12, sm: 6 }}>
-                              <Typography variant="caption" color="text.secondary">
+                              <Typography variant="caption" sx={{
+                                color: "text.secondary"
+                              }}>
                                 Recent captured items
                               </Typography>
                               <Typography variant="body2">{activeSyncStatus.recent_item_count}</Typography>
                             </Grid2>
                             <Grid2 size={{ xs: 12, sm: 6 }}>
-                              <Typography variant="caption" color="text.secondary">
+                              <Typography variant="caption" sx={{
+                                color: "text.secondary"
+                              }}>
                                 Feed type
                               </Typography>
                               <Typography variant="body2" sx={{ textTransform: "capitalize" }}>
@@ -5806,7 +6153,6 @@ export function IntegrationsPanel({
           </DialogActions>
         </Dialog>
       ) : null}
-
       {showMcp ? (
       <Dialog open={sshKeyDialogOpen} onClose={closeSshKeyDialog} maxWidth="sm" fullWidth>
         <DialogTitle>Add SSH Key</DialogTitle>
@@ -5848,7 +6194,6 @@ export function IntegrationsPanel({
         </DialogActions>
       </Dialog>
       ) : null}
-
       {showMcp ? (
       <Dialog open={sshConnDialogOpen} onClose={closeSshConnDialog} maxWidth="sm" fullWidth>
         <DialogTitle>Add SSH Connection</DialogTitle>
@@ -5928,7 +6273,6 @@ export function IntegrationsPanel({
         </DialogActions>
       </Dialog>
       ) : null}
-
       {showMcp ? (
       <Dialog open={sshTestDialogOpen} onClose={closeSshTestDialog} maxWidth="sm" fullWidth>
         <DialogTitle>Test SSH Connection</DialogTitle>
@@ -5954,7 +6298,9 @@ export function IntegrationsPanel({
                 size="small"
                 label="Test output"
                 value={sshTestOutput}
-                InputProps={{ readOnly: true }}
+                slotProps={{
+                  input: { readOnly: true }
+                }}
               />
             ) : null}
           </Stack>
@@ -5975,7 +6321,6 @@ export function IntegrationsPanel({
         </DialogActions>
       </Dialog>
       ) : null}
-
       {showMcp ? (
       <Dialog open={mcpDialogOpen} onClose={closeMcpDialog} maxWidth="md" fullWidth>
         <DialogTitle>{mcpEditingId ? "Edit MCP Server" : "Add MCP Server"}</DialogTitle>

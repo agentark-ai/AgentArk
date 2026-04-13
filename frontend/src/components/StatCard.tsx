@@ -81,16 +81,28 @@ export function StatCard({
   return (
     <Card className={className} sx={compact ? { height: "100%" } : undefined}>
       <CardContent sx={compact ? { p: 1.25 } : undefined}>
-        <Stack direction="row" alignItems="center" justifyContent="space-between" mb={1}>
-          <Typography variant="body2" color="text.secondary">
+        <Stack
+          direction="row"
+          sx={{
+            alignItems: "center",
+            justifyContent: "space-between",
+            mb: 1
+          }}>
+          <Typography variant="body2" sx={{
+            color: "text.secondary"
+          }}>
             {label}
           </Typography>
           {icon}
         </Stack>
-        <Typography variant={compact ? "h6" : "h5"} fontWeight={700}>
+        <Typography variant={compact ? "h6" : "h5"} sx={{
+          fontWeight: 700
+        }}>
           {value}
         </Typography>
-        <Typography variant="caption" color="text.secondary">
+        <Typography variant="caption" sx={{
+          color: "text.secondary"
+        }}>
           {hint || "Live"}
         </Typography>
         {sparkline && sparkline.length >= 2 ? (

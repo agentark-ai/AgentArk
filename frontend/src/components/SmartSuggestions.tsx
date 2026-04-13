@@ -57,13 +57,17 @@ export function SmartSuggestions({
     <Card className="mission-panel mission-panel--adaptive mission-side-panel mission-side-panel--suggestions">
       <CardContent sx={{ p: 1.2, display: "flex", flexDirection: "column" }}>
         <Stack spacing={1.15} className="mission-panel-content">
-          <Stack direction="row" alignItems="center" spacing={0.75}>
+          <Stack direction="row" spacing={0.75} sx={{
+            alignItems: "center"
+          }}>
             <AutoAwesomeRoundedIcon sx={{ fontSize: 18, color: "rgba(244, 245, 247, 0.82)" }} />
             <Box sx={{ flex: 1 }}>
               <Typography variant="body1" sx={{ fontWeight: 700 }}>
                 Recommended Skills
               </Typography>
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: "text.secondary"
+              }}>
                 Available next actions from the current brief and active runtime context.
               </Typography>
             </Box>
@@ -84,10 +88,11 @@ export function SmartSuggestions({
                   <Stack
                     direction="row"
                     spacing={0.75}
-                    alignItems="center"
                     useFlexGap
-                    flexWrap="wrap"
-                  >
+                    sx={{
+                      alignItems: "center",
+                      flexWrap: "wrap"
+                    }}>
                     <Box
                       sx={{
                         width: 22,
@@ -107,8 +112,10 @@ export function SmartSuggestions({
                     </Box>
                     <Typography
                       variant="body2"
-                      fontWeight={700}
                       className="mission-title-clamp"
+                      sx={{
+                        fontWeight: 700
+                      }}
                     >
                       {suggestion.title}
                     </Typography>
@@ -125,14 +132,22 @@ export function SmartSuggestions({
                   </Stack>
                   <Typography
                     variant="caption"
-                    color="text.secondary"
-                    sx={{ lineHeight: 1.45 }}
                     className="mission-detail-clamp"
-                  >
+                    sx={{
+                      color: "text.secondary",
+                      lineHeight: 1.45
+                    }}>
                     {suggestion.detail}
                   </Typography>
 
-                  <Stack direction="row" spacing={0.6} mt={0.35} useFlexGap flexWrap="wrap">
+                  <Stack
+                    direction="row"
+                    spacing={0.6}
+                    useFlexGap
+                    sx={{
+                      mt: 0.35,
+                      flexWrap: "wrap"
+                    }}>
                     <Button
                       variant="contained"
                       size="small"

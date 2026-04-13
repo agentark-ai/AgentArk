@@ -144,7 +144,13 @@ export function WelcomeHero({
           <Stack spacing={1} className="mission-panel-section">
             <Box className="welcome-hero-header">
               <Stack spacing={0.8} sx={{ minWidth: 0, flex: 1 }} className="welcome-hero-copy">
-                <Stack direction="row" spacing={1} alignItems="center" sx={{ minWidth: 0 }}>
+                <Stack
+                  direction="row"
+                  spacing={1}
+                  sx={{
+                    alignItems: "center",
+                    minWidth: 0
+                  }}>
                   <Box
                     component="img"
                     src="/logo.svg"
@@ -178,15 +184,19 @@ export function WelcomeHero({
                 </Stack>
                 <Typography
                   variant="body2"
-                  color="text.secondary"
                   className="mission-card-copy"
                   title="Private by default, useful every day: memory, daily briefings, safe actions, and deeper automation when you want it."
+                  sx={{
+                    color: "text.secondary"
+                  }}
                 >
                   Private by default, useful every day: memory, daily briefings, safe actions, and deeper automation when you want it.
                 </Typography>
               </Stack>
 
-              <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" className="welcome-hero-status-row">
+              <Stack direction="row" spacing={0.75} useFlexGap className="welcome-hero-status-row" sx={{
+                flexWrap: "wrap"
+              }}>
                 <Chip
                   size="small"
                   color={agentPaused ? "warning" : "success"}

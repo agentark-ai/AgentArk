@@ -235,15 +235,21 @@ export function SenderVerificationPanel({ autoRefresh }: SenderVerificationPanel
         Transport signatures confirm Slack, Teams, and WhatsApp webhooks came from the platform. This
         page decides which human senders are trusted to trigger AgentArk work.
       </Alert>
-
       {error ? <Alert severity="error">{error}</Alert> : null}
       {success ? <Alert severity="success">{success}</Alert> : null}
-
       <Box className="list-shell">
-        <Stack direction="row" justifyContent="space-between" alignItems="center" mb={1.5}>
+        <Stack
+          direction="row"
+          sx={{
+            justifyContent: "space-between",
+            alignItems: "center",
+            mb: 1.5
+          }}>
           <Box>
             <Typography variant="h6">Sender Trust Policies</Typography>
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>
               Use `pairing` when a channel should stop unknown senders until an operator approves them.
             </Typography>
           </Box>
@@ -283,13 +289,16 @@ export function SenderVerificationPanel({ autoRefresh }: SenderVerificationPanel
               <Stack
                 direction={{ xs: "column", md: "row" }}
                 spacing={1.5}
-                justifyContent="space-between"
-                alignItems={{ xs: "flex-start", md: "center" }}
-                mb={1.5}
-              >
+                sx={{
+                  justifyContent: "space-between",
+                  alignItems: { xs: "flex-start", md: "center" },
+                  mb: 1.5
+                }}>
                 <Box>
                   <Typography variant="subtitle1">{item.title}</Typography>
-                  <Typography variant="body2" color="text.secondary">
+                  <Typography variant="body2" sx={{
+                    color: "text.secondary"
+                  }}>
                     {item.helper}
                   </Typography>
                 </Box>
@@ -326,19 +335,28 @@ export function SenderVerificationPanel({ autoRefresh }: SenderVerificationPanel
           ))}
         </Stack>
       </Box>
-
       <Box className="list-shell">
-        <Stack direction="row" justifyContent="space-between" alignItems="center" mb={1}>
+        <Stack
+          direction="row"
+          sx={{
+            justifyContent: "space-between",
+            alignItems: "center",
+            mb: 1
+          }}>
           <Box>
             <Typography variant="h6">Pending Sender Approvals</Typography>
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>
               New senders that hit a paired channel stop here until an operator approves them.
             </Typography>
           </Box>
           <Chip size="small" label={`${pending.length} pending`} />
         </Stack>
         {pending.length === 0 ? (
-          <Typography variant="body2" color="text.secondary">
+          <Typography variant="body2" sx={{
+            color: "text.secondary"
+          }}>
             No pending senders.
           </Typography>
         ) : (
@@ -361,7 +379,9 @@ export function SenderVerificationPanel({ autoRefresh }: SenderVerificationPanel
                   <TableCell>
                     <Stack spacing={0.2}>
                       <span>{senderDisplay(row)}</span>
-                      <Typography variant="caption" color="text.secondary">
+                      <Typography variant="caption" sx={{
+                        color: "text.secondary"
+                      }}>
                         {str(row.sender_id, "-")}
                       </Typography>
                     </Stack>
@@ -370,7 +390,9 @@ export function SenderVerificationPanel({ autoRefresh }: SenderVerificationPanel
                   <TableCell>
                     <Stack spacing={0.2}>
                       <span>{humanTs(str(row.last_seen_at))}</span>
-                      <Typography variant="caption" color="text.secondary">
+                      <Typography variant="caption" sx={{
+                        color: "text.secondary"
+                      }}>
                         First seen {humanTs(str(row.first_seen_at))}
                       </Typography>
                     </Stack>
@@ -392,19 +414,28 @@ export function SenderVerificationPanel({ autoRefresh }: SenderVerificationPanel
           </Table>
         )}
       </Box>
-
       <Box className="list-shell">
-        <Stack direction="row" justifyContent="space-between" alignItems="center" mb={1}>
+        <Stack
+          direction="row"
+          sx={{
+            justifyContent: "space-between",
+            alignItems: "center",
+            mb: 1
+          }}>
           <Box>
             <Typography variant="h6">Approved Senders</Typography>
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>
               These senders can trigger AgentArk on paired channels until they are revoked.
             </Typography>
           </Box>
           <Chip size="small" label={`${approved.length} approved`} />
         </Stack>
         {approved.length === 0 ? (
-          <Typography variant="body2" color="text.secondary">
+          <Typography variant="body2" sx={{
+            color: "text.secondary"
+          }}>
             No approved senders yet.
           </Typography>
         ) : (
@@ -426,7 +457,9 @@ export function SenderVerificationPanel({ autoRefresh }: SenderVerificationPanel
                   <TableCell>
                     <Stack spacing={0.2}>
                       <span>{senderDisplay(row)}</span>
-                      <Typography variant="caption" color="text.secondary">
+                      <Typography variant="caption" sx={{
+                        color: "text.secondary"
+                      }}>
                         {str(row.sender_id, "-")}
                       </Typography>
                     </Stack>

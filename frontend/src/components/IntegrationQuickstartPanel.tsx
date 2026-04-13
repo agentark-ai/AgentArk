@@ -11,7 +11,7 @@ import {
   DialogContent,
   DialogTitle,
   FormControlLabel,
-  Grid2,
+  Grid as Grid2,
   MenuItem,
   Stack,
   Switch,
@@ -363,14 +363,15 @@ export function IntegrationQuickstartPanel({
   return (
     <Stack spacing={2}>
       {notice ? <Alert severity={notice.kind}>{notice.text}</Alert> : null}
-
       {!showCustomApisOnly ? (
       <Box className="list-shell">
         <Stack spacing={1.5}>
           {!embedded ? (
             <Box>
               <Typography variant="subtitle2">Prebuilt Connectors</Typography>
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: "text.secondary"
+              }}>
                 Connect Google Workspace, GitHub, Jira, Sentry, Notion, and other first-party integrations directly here.
               </Typography>
             </Box>
@@ -378,12 +379,15 @@ export function IntegrationQuickstartPanel({
           <Stack
             direction={{ xs: "column", sm: "row" }}
             spacing={1}
-            justifyContent="space-between"
-            alignItems={{ xs: "flex-start", sm: "center" }}
-          >
+            sx={{
+              justifyContent: "space-between",
+              alignItems: { xs: "flex-start", sm: "center" }
+            }}>
             <Box>
               <Typography variant="subtitle2">Available Connectors</Typography>
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: "text.secondary"
+              }}>
                 Use the dedicated Webhooks & APIs page for incoming event sources and imported custom tools.
               </Typography>
             </Box>
@@ -392,9 +396,16 @@ export function IntegrationQuickstartPanel({
           {loadError && sortedIntegrations.length === 0 ? (
             <Alert severity="error">Failed to load available integrations: {loadError}</Alert>
           ) : loading && sortedIntegrations.length === 0 ? (
-            <Stack spacing={1.25} alignItems="center" sx={{ py: 4 }}>
+            <Stack
+              spacing={1.25}
+              sx={{
+                alignItems: "center",
+                py: 4
+              }}>
               <CircularProgress size={22} />
-              <Typography variant="body2" color="text.secondary">
+              <Typography variant="body2" sx={{
+                color: "text.secondary"
+              }}>
                 Loading available integrations...
               </Typography>
             </Stack>
@@ -411,16 +422,32 @@ export function IntegrationQuickstartPanel({
                     <Box sx={{ p: 1.5, borderRadius: 1.5, border: isConfigured ? "1px solid rgba(64,196,255,0.24)" : "1px solid rgba(112,153,201,0.16)", background: isConfigured ? "rgba(8,24,42,0.56)" : "rgba(7,17,32,0.6)", height: "100%" }}>
                       <Stack spacing={1.1} sx={{ height: "100%", justifyContent: "space-between" }}>
                         <Box>
-                          <Stack direction="row" spacing={0.9} alignItems="center" sx={{ mb: 0.75 }}>
+                          <Stack
+                            direction="row"
+                            spacing={0.9}
+                            sx={{
+                              alignItems: "center",
+                              mb: 0.75
+                            }}>
                             <ChannelIcon name={integration.id || integration.name} size={20} />
                             <Typography variant="subtitle2">{integration.name}</Typography>
                           </Stack>
-                          <Typography variant="body2" color="text.secondary">
+                          <Typography variant="body2" sx={{
+                            color: "text.secondary"
+                          }}>
                             {integration.description}
                           </Typography>
                         </Box>
-                        <Stack direction="row" spacing={0.75} alignItems="center" justifyContent="space-between">
-                          <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap>
+                        <Stack
+                          direction="row"
+                          spacing={0.75}
+                          sx={{
+                            alignItems: "center",
+                            justifyContent: "space-between"
+                          }}>
+                          <Stack direction="row" spacing={0.5} useFlexGap sx={{
+                            flexWrap: "wrap"
+                          }}>
                             <Chip size="small" label="Connector" sx={tagChipSx} />
                             {connectorStatusLabel(integration) ? (
                               <Chip size="small" label={connectorStatusLabel(integration)} sx={countChipSx} />
@@ -447,10 +474,17 @@ export function IntegrationQuickstartPanel({
       ) : (
         <Box className="list-shell">
           <Stack spacing={1.5}>
-            <Stack direction="row" alignItems="center" justifyContent="space-between">
+            <Stack
+              direction="row"
+              sx={{
+                alignItems: "center",
+                justifyContent: "space-between"
+              }}>
               <Box>
                 <Typography variant="subtitle2">Custom APIs</Typography>
-                <Typography variant="caption" color="text.secondary">
+                <Typography variant="caption" sx={{
+                  color: "text.secondary"
+                }}>
                   Import approved API endpoints as tools the agent can use safely. Secrets stay encrypted.
                 </Typography>
               </Box>
@@ -464,7 +498,6 @@ export function IntegrationQuickstartPanel({
           </Stack>
         </Box>
       )}
-
       {showCustomApisOnly && customApis.length > 0 ? (
         <Box className="list-shell">
           <Stack spacing={1}>
@@ -491,7 +524,9 @@ export function IntegrationQuickstartPanel({
                       <TableCell>{String(Number(config.action_count) || 0)}</TableCell>
                       <TableCell>{str(config.last_test_outcome, "-")}</TableCell>
                       <TableCell align="right">
-                        <Stack direction="row" spacing={0.5} justifyContent="flex-end">
+                        <Stack direction="row" spacing={0.5} sx={{
+                          justifyContent: "flex-end"
+                        }}>
                           <Button
                             size="small"
                             variant="text"
@@ -514,12 +549,13 @@ export function IntegrationQuickstartPanel({
           </Stack>
         </Box>
       ) : null}
-
       <Dialog open={customApiOpen} onClose={() => setCustomApiOpen(false)} fullWidth maxWidth="lg">
         <DialogTitle>Import Custom API</DialogTitle>
         <DialogContent dividers>
           <Stack spacing={1.5}>
-            <Stack direction="row" spacing={0.75} flexWrap="wrap" useFlexGap>
+            <Stack direction="row" spacing={0.75} useFlexGap sx={{
+              flexWrap: "wrap"
+            }}>
               <Chip label="OpenAPI text" color={customApiForm.source_mode === "openapi_text" ? "primary" : "default"} variant={customApiForm.source_mode === "openapi_text" ? "filled" : "outlined"} onClick={() => setCustomApiForm((current) => ({ ...current, source_mode: "openapi_text" }))} />
               <Chip label="OpenAPI URL" color={customApiForm.source_mode === "openapi_url" ? "primary" : "default"} variant={customApiForm.source_mode === "openapi_url" ? "filled" : "outlined"} onClick={() => setCustomApiForm((current) => ({ ...current, source_mode: "openapi_url" }))} />
               <Chip label="Sample curl" color={customApiForm.source_mode === "curl" ? "primary" : "default"} variant={customApiForm.source_mode === "curl" ? "filled" : "outlined"} onClick={() => setCustomApiForm((current) => ({ ...current, source_mode: "curl" }))} />
@@ -587,7 +623,9 @@ export function IntegrationQuickstartPanel({
                         </TableCell>
                         <TableCell>
                           <Typography variant="body2">{operation.name || `${operation.method} ${operation.path}`}</Typography>
-                          <Typography variant="caption" color="text.secondary">
+                          <Typography variant="caption" sx={{
+                            color: "text.secondary"
+                          }}>
                             {operation.method} {operation.path}
                           </Typography>
                         </TableCell>
@@ -606,7 +644,9 @@ export function IntegrationQuickstartPanel({
                           </TextField>
                         </TableCell>
                         <TableCell>
-                          <Typography variant="caption" color="text.secondary">
+                          <Typography variant="caption" sx={{
+                            color: "text.secondary"
+                          }}>
                             {operation.body_required ? "Requires request body." : "No request body required."}
                           </Typography>
                         </TableCell>

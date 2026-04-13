@@ -11,7 +11,7 @@ import {
   DialogTitle,
   Divider,
   FormControlLabel,
-  Grid2,
+  Grid as Grid2,
   IconButton,
   Menu,
   MenuItem,
@@ -398,7 +398,6 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
     <WorkspacePageShell spacing={1.5}>
       {notice ? <Alert severity={notice.kind}>{notice.text}</Alert> : null}
       {sessionsQ.error ? <Alert severity="error">{errMessage(sessionsQ.error)}</Alert> : null}
-
       <WorkspacePageHeader
         eyebrow="Operations"
         title="Sessions"
@@ -409,7 +408,6 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
           </Button>
         }
       />
-
       {/* Compact stat strip */}
       <Box className="list-shell stat-strip">
         {[
@@ -424,10 +422,11 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
           </div>
         ))}
       </Box>
-
       {/* Sessions table — same pattern as Tasks page */}
       <Box className="list-shell">
-        <Typography variant="h6" mb={1}>
+        <Typography variant="h6" sx={{
+          mb: 1
+        }}>
           Session List
         </Typography>
         {sessionsQ.isLoading ? (
@@ -436,7 +435,12 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
           </Box>
         ) : sessions.length === 0 ? (
           <Box sx={{ py: 5, textAlign: "center" }}>
-            <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            <Typography
+              variant="body2"
+              sx={{
+                color: "text.secondary",
+                mb: 2
+              }}>
               No background sessions yet. Create a session when work should persist beyond one chat turn.
             </Typography>
             <Button variant="outlined" onClick={openCreateDialog}>
@@ -538,7 +542,6 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
           </TableContainer>
         )}
       </Box>
-
       {/* Session detail dialog — opened via "View" in ops menu */}
       <Dialog open={selectedId != null} onClose={() => setSelectedId(null)} maxWidth="md" fullWidth>
         <DialogTitle sx={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={selectedSession?.title || "Session"}>{selectedSession?.title || "Session"}</DialogTitle>
@@ -551,7 +554,13 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
             <Alert severity="error">{errMessage(detailQ.error)}</Alert>
           ) : (
             <Stack spacing={1}>
-              <Stack direction="row" spacing={1} flexWrap="wrap" alignItems="center">
+              <Stack
+                direction="row"
+                spacing={1}
+                sx={{
+                  flexWrap: "wrap",
+                  alignItems: "center"
+                }}>
                 <Chip
                   size="small"
                   label={statusLabel(selectedSession.status)}
@@ -562,7 +571,9 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                 <Chip size="small" variant="outlined" label={`${sessionCount(selectedSession)} linked`} />
               </Stack>
 
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: "text.secondary"
+              }}>
                 Updated: {formatTimestamp(selectedSession.updated_at)}
               </Typography>
 
@@ -576,14 +587,18 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
               {detailTab === "overview" ? (
                 <Stack spacing={1.5}>
                   <Box className="metadata-box">
-                    <Typography variant="caption" color="text.secondary">Objective</Typography>
+                    <Typography variant="caption" sx={{
+                      color: "text.secondary"
+                    }}>Objective</Typography>
                     <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
                       {selectedSession.objective}
                     </Typography>
                   </Box>
                   {selectedSession.summary ? (
                     <Box className="metadata-box">
-                      <Typography variant="caption" color="text.secondary">Summary</Typography>
+                      <Typography variant="caption" sx={{
+                        color: "text.secondary"
+                      }}>Summary</Typography>
                       <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
                         {selectedSession.summary}
                       </Typography>
@@ -601,7 +616,9 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                     ].map((item) => (
                       <Grid2 key={item.label} size={{ xs: 12, md: 4 }}>
                         <Box className="metadata-box" sx={{ height: "100%" }}>
-                          <Typography variant="caption" color="text.secondary">{item.label}</Typography>
+                          <Typography variant="caption" sx={{
+                            color: "text.secondary"
+                          }}>{item.label}</Typography>
                           <Typography variant="body2">{item.value}</Typography>
                         </Box>
                       </Grid2>
@@ -610,7 +627,9 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
 
                   {detailQ.data?.session_detail.working_memory ? (
                     <Box className="metadata-box">
-                      <Typography variant="caption" color="text.secondary">Working memory</Typography>
+                      <Typography variant="caption" sx={{
+                        color: "text.secondary"
+                      }}>Working memory</Typography>
                       <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
                         {detailQ.data.session_detail.working_memory}
                       </Typography>
@@ -638,20 +657,30 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                         <Stack spacing={0.9}>
                           {detailQ.data.linked_tasks.map((task) => (
                             <Box key={task.id} className="micro-surface-list-item">
-                              <Stack direction="row" spacing={1} justifyContent="space-between" alignItems="center">
+                              <Stack
+                                direction="row"
+                                spacing={1}
+                                sx={{
+                                  justifyContent: "space-between",
+                                  alignItems: "center"
+                                }}>
                                 <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap title={task.description}>
                                   {task.description}
                                 </Typography>
                                 <Chip size="small" label={statusLabel(task.status)} color={chipColor(task.status)} />
                               </Stack>
-                              <Typography variant="caption" color="text.secondary">
+                              <Typography variant="caption" sx={{
+                                color: "text.secondary"
+                              }}>
                                 {task.action || "task"} | {formatTimestamp(task.created_at)}
                               </Typography>
                             </Box>
                           ))}
                         </Stack>
                       ) : (
-                        <Typography variant="body2" color="text.secondary">
+                        <Typography variant="body2" sx={{
+                          color: "text.secondary"
+                        }}>
                           No tasks linked to this session.
                         </Typography>
                       )}
@@ -665,20 +694,30 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                         <Stack spacing={0.9}>
                           {detailQ.data.linked_watchers.map((watcher) => (
                             <Box key={watcher.id} className="micro-surface-list-item">
-                              <Stack direction="row" spacing={1} justifyContent="space-between" alignItems="center">
+                              <Stack
+                                direction="row"
+                                spacing={1}
+                                sx={{
+                                  justifyContent: "space-between",
+                                  alignItems: "center"
+                                }}>
                                 <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap title={watcher.description}>
                                   {watcher.description}
                                 </Typography>
                                 <Chip size="small" label={statusLabel(watcher.status)} color={chipColor(watcher.status)} />
                               </Stack>
-                              <Typography variant="caption" color="text.secondary">
+                              <Typography variant="caption" sx={{
+                                color: "text.secondary"
+                              }}>
                                 {watcher.poll_action || "watcher"} | {formatTimestamp(watcher.created_at)}
                               </Typography>
                             </Box>
                           ))}
                         </Stack>
                       ) : (
-                        <Typography variant="body2" color="text.secondary">
+                        <Typography variant="body2" sx={{
+                          color: "text.secondary"
+                        }}>
                           No watchers linked to this session.
                         </Typography>
                       )}
@@ -696,23 +735,39 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                         <Stack spacing={0.9}>
                           {detailQ.data.recent_runs.map((run) => (
                             <Box key={run.id} className="micro-surface-list-item">
-                              <Stack direction="row" spacing={1} justifyContent="space-between" alignItems="center">
+                              <Stack
+                                direction="row"
+                                spacing={1}
+                                sx={{
+                                  justifyContent: "space-between",
+                                  alignItems: "center"
+                                }}>
                                 <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap title={run.title}>
                                   {run.title}
                                 </Typography>
                                 <Chip size="small" label={statusLabel(run.status)} color={chipColor(run.status)} />
                               </Stack>
-                              <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.5 }}>
+                              <Typography
+                                variant="caption"
+                                sx={{
+                                  color: "text.secondary",
+                                  display: "block",
+                                  mt: 0.5
+                                }}>
                                 {run.summary}
                               </Typography>
-                              <Typography variant="caption" color="text.secondary">
+                              <Typography variant="caption" sx={{
+                                color: "text.secondary"
+                              }}>
                                 {formatTimestamp(run.started_at)}
                               </Typography>
                             </Box>
                           ))}
                         </Stack>
                       ) : (
-                        <Typography variant="body2" color="text.secondary">
+                        <Typography variant="body2" sx={{
+                          color: "text.secondary"
+                        }}>
                           No recorded runs for this session yet.
                         </Typography>
                       )}
@@ -733,18 +788,28 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                                   {event.summary}
                                 </Typography>
                                 {event.detail ? (
-                                  <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.35 }}>
+                                  <Typography
+                                    variant="caption"
+                                    sx={{
+                                      color: "text.secondary",
+                                      display: "block",
+                                      mt: 0.35
+                                    }}>
                                     {event.detail}
                                   </Typography>
                                 ) : null}
-                                <Typography variant="caption" color="text.secondary">
+                                <Typography variant="caption" sx={{
+                                  color: "text.secondary"
+                                }}>
                                   {formatTimestamp(event.at)}
                                 </Typography>
                               </Box>
                             ))}
                         </Stack>
                       ) : (
-                        <Typography variant="body2" color="text.secondary">
+                        <Typography variant="body2" sx={{
+                          color: "text.secondary"
+                        }}>
                           No session events yet.
                         </Typography>
                       )}
@@ -756,7 +821,6 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
           )}
         </DialogContent>
       </Dialog>
-
       {/* Create/Edit form dialog */}
       <Dialog open={dialogOpen} onClose={() => setDialogOpen(false)} maxWidth="md" fullWidth>
         <DialogTitle>{editingSessionId ? "Edit Background Session" : "Create Background Session"}</DialogTitle>
@@ -892,14 +956,18 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                             <Typography variant="body2" noWrap title={task.description}>
                               {task.description}
                             </Typography>
-                            <Typography variant="caption" color="text.secondary">
+                            <Typography variant="caption" sx={{
+                              color: "text.secondary"
+                            }}>
                               {task.action || "task"} | {statusLabel(task.status)}
                             </Typography>
                           </Box>
                         }
                       />
                     ))}
-                    {!availableTasks.length ? <Typography variant="body2" color="text.secondary">No live tasks available.</Typography> : null}
+                    {!availableTasks.length ? <Typography variant="body2" sx={{
+                      color: "text.secondary"
+                    }}>No live tasks available.</Typography> : null}
                   </Stack>
                 </Box>
               </Grid2>
@@ -930,14 +998,18 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                             <Typography variant="body2" noWrap title={watcher.description}>
                               {watcher.description}
                             </Typography>
-                            <Typography variant="caption" color="text.secondary">
+                            <Typography variant="caption" sx={{
+                              color: "text.secondary"
+                            }}>
                               {watcher.poll_action || "watcher"} | {statusLabel(watcher.status)}
                             </Typography>
                           </Box>
                         }
                       />
                     ))}
-                    {!availableWatchers.length ? <Typography variant="body2" color="text.secondary">No live watchers available.</Typography> : null}
+                    {!availableWatchers.length ? <Typography variant="body2" sx={{
+                      color: "text.secondary"
+                    }}>No live watchers available.</Typography> : null}
                   </Stack>
                 </Box>
               </Grid2>

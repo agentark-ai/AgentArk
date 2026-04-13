@@ -3346,7 +3346,7 @@ body {
 }
 
 .chat-plan-confirmation-card .MuiInputBase-input,
-.chat-plan-confirmation-card .MuiInputBase-inputMultiline {
+.chat-plan-confirmation-card.MuiInputBase-multiline > .MuiInputBase-input {
   color: rgba(248, 248, 250, 0.96);
 }
 
@@ -4131,17 +4131,17 @@ body {
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.03);
 }
 
-.settings-main .MuiAlert-standardInfo,
+.settings-main .MuiAlert-standard.MuiAlert-colorInfo,
 .settings-page-shell .MuiAlert-standardInfo {
   background: rgba(24, 24, 28, 0.88) !important;
 }
 
-.settings-main .MuiAlert-standardWarning,
+.settings-main .MuiAlert-standard.MuiAlert-colorWarning,
 .settings-page-shell .MuiAlert-standardWarning {
   background: rgba(43, 28, 10, 0.72) !important;
 }
 
-.settings-main .MuiAlert-standardError,
+.settings-main .MuiAlert-standard.MuiAlert-colorError,
 .settings-page-shell .MuiAlert-standardError {
   background: rgba(45, 16, 20, 0.74) !important;
 }
@@ -6447,16 +6447,16 @@ body {
 }
 
 /* Alert subtle glow matching severity */
-.MuiAlert-standardInfo {
+.MuiAlert-standard.MuiAlert-colorInfo {
   border: 1px solid rgba(57, 208, 255, 0.15) !important;
 }
-.MuiAlert-standardSuccess {
+.MuiAlert-standard.MuiAlert-colorSuccess {
   border: 1px solid rgba(74, 210, 157, 0.15) !important;
 }
-.MuiAlert-standardWarning {
+.MuiAlert-standard.MuiAlert-colorWarning {
   border: 1px solid rgba(255, 159, 67, 0.15) !important;
 }
-.MuiAlert-standardError {
+.MuiAlert-standard.MuiAlert-colorError {
   border: 1px solid rgba(255, 107, 107, 0.15) !important;
 }
 

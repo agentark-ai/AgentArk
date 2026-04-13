@@ -151,8 +151,20 @@ export function ApprovalPromptOverlay({
       }}
     >
       <Stack spacing={1.25} sx={{ p: 1.5 }}>
-        <Stack direction="row" alignItems="flex-start" justifyContent="space-between" spacing={1}>
-          <Stack direction="row" spacing={1.1} alignItems="center" sx={{ minWidth: 0 }}>
+        <Stack
+          direction="row"
+          spacing={1}
+          sx={{
+            alignItems: "flex-start",
+            justifyContent: "space-between"
+          }}>
+          <Stack
+            direction="row"
+            spacing={1.1}
+            sx={{
+              alignItems: "center",
+              minWidth: 0
+            }}>
             <Box
               sx={{
                 width: 34,
@@ -189,7 +201,9 @@ export function ApprovalPromptOverlay({
           </IconButton>
         </Stack>
 
-        <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+        <Stack direction="row" spacing={0.75} useFlexGap sx={{
+          flexWrap: "wrap"
+        }}>
           {activeApproval.riskLevel ? (
             <Chip
               size="small"
@@ -294,7 +308,13 @@ export function ApprovalPromptOverlay({
           </Button>
         </Stack>
 
-        <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
+        <Stack
+          direction="row"
+          spacing={1}
+          sx={{
+            justifyContent: "space-between",
+            alignItems: "center"
+          }}>
           <Button
             size="small"
             onClick={onOpenTasks}

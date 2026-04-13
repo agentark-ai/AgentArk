@@ -12,7 +12,7 @@ import {
   CardContent,
   Chip,
   Divider,
-  Grid2,
+  Grid as Grid2,
   MenuItem,
   Stack,
   TextField,
@@ -144,7 +144,12 @@ export function DevicesControlPanel({
           <Typography variant="h5" sx={{ fontWeight: 700, letterSpacing: 0 }}>
             Companion nodes and capability grants
           </Typography>
-          <Typography variant="body2" color="text.secondary" sx={{ maxWidth: 840 }}>
+          <Typography
+            variant="body2"
+            sx={{
+              color: "text.secondary",
+              maxWidth: 840
+            }}>
             Use this panel for paired devices, capability scope, and the operational state of each node.
           </Typography>
         </Box>
@@ -153,9 +158,16 @@ export function DevicesControlPanel({
           <Grid2 size={{ xs: 12, sm: 4 }}>
             <Card className="workspace-side-card">
               <CardContent sx={{ p: 1.5 }}>
-                <Stack direction="row" justifyContent="space-between" alignItems="center">
+                <Stack
+                  direction="row"
+                  sx={{
+                    justifyContent: "space-between",
+                    alignItems: "center"
+                  }}>
                   <Box>
-                    <Typography variant="body2" color="text.secondary">
+                    <Typography variant="body2" sx={{
+                      color: "text.secondary"
+                    }}>
                       Online
                     </Typography>
                     <Typography variant="h5" sx={{ fontWeight: 700 }}>
@@ -170,9 +182,16 @@ export function DevicesControlPanel({
           <Grid2 size={{ xs: 12, sm: 4 }}>
             <Card className="workspace-side-card">
               <CardContent sx={{ p: 1.5 }}>
-                <Stack direction="row" justifyContent="space-between" alignItems="center">
+                <Stack
+                  direction="row"
+                  sx={{
+                    justifyContent: "space-between",
+                    alignItems: "center"
+                  }}>
                   <Box>
-                    <Typography variant="body2" color="text.secondary">
+                    <Typography variant="body2" sx={{
+                      color: "text.secondary"
+                    }}>
                       Pairing
                     </Typography>
                     <Typography variant="h5" sx={{ fontWeight: 700 }}>
@@ -187,9 +206,16 @@ export function DevicesControlPanel({
           <Grid2 size={{ xs: 12, sm: 4 }}>
             <Card className="workspace-side-card">
               <CardContent sx={{ p: 1.5 }}>
-                <Stack direction="row" justifyContent="space-between" alignItems="center">
+                <Stack
+                  direction="row"
+                  sx={{
+                    justifyContent: "space-between",
+                    alignItems: "center"
+                  }}>
                   <Box>
-                    <Typography variant="body2" color="text.secondary">
+                    <Typography variant="body2" sx={{
+                      color: "text.secondary"
+                    }}>
                       Capability-ready
                     </Typography>
                     <Typography variant="h5" sx={{ fontWeight: 700 }}>
@@ -208,12 +234,20 @@ export function DevicesControlPanel({
             <Card className="workspace-side-card">
               <CardContent sx={{ p: 1.5 }}>
                 <Stack spacing={1.2}>
-                  <Stack direction="row" justifyContent="space-between" alignItems="center" gap={1}>
+                  <Stack
+                    direction="row"
+                    sx={{
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      gap: 1
+                    }}>
                     <Box>
                       <Typography variant="h6" sx={{ fontWeight: 650 }}>
                         Node inventory
                       </Typography>
-                      <Typography variant="body2" color="text.secondary">
+                      <Typography variant="body2" sx={{
+                        color: "text.secondary"
+                      }}>
                         Operational state for paired companion devices.
                       </Typography>
                     </Box>
@@ -226,7 +260,12 @@ export function DevicesControlPanel({
                       <Typography variant="subtitle1" sx={{ fontWeight: 650, mb: 0.5 }}>
                         No devices paired yet
                       </Typography>
-                      <Typography variant="body2" color="text.secondary" sx={{ maxWidth: 560 }}>
+                      <Typography
+                        variant="body2"
+                        sx={{
+                          color: "text.secondary",
+                          maxWidth: 560
+                        }}>
                         Pair a node to expose camera, screen, location, SMS, notifications, or remote run capabilities.
                       </Typography>
                     </Box>
@@ -248,21 +287,33 @@ export function DevicesControlPanel({
                             }}
                           >
                             <Stack spacing={0.75} sx={{ width: "100%" }}>
-                              <Stack direction="row" justifyContent="space-between" alignItems="center" gap={1}>
+                              <Stack
+                                direction="row"
+                                sx={{
+                                  justifyContent: "space-between",
+                                  alignItems: "center",
+                                  gap: 1
+                                }}>
                                 <Box sx={{ minWidth: 0 }}>
                                   <Typography variant="subtitle2" sx={{ fontWeight: 650 }} noWrap>
                                     {node.name}
                                   </Typography>
-                                  <Typography variant="caption" color="text.secondary" noWrap>
+                                  <Typography variant="caption" noWrap sx={{
+                                    color: "text.secondary"
+                                  }}>
                                     {node.platform} {node.model ? `| ${node.model}` : ""}
                                   </Typography>
                                 </Box>
                                 <Chip size="small" color={statusTone(node.status)} label={statusLabel(node.status)} />
                               </Stack>
-                              <Typography variant="body2" color="text.secondary">
+                              <Typography variant="body2" sx={{
+                                color: "text.secondary"
+                              }}>
                                 {node.detail || node.location || "No node detail supplied yet."}
                               </Typography>
-                              <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                              <Stack direction="row" spacing={0.75} useFlexGap sx={{
+                                flexWrap: "wrap"
+                              }}>
                                 {(node.capabilities || []).slice(0, 4).map((capability) => (
                                   <Chip
                                     key={capability}
@@ -293,22 +344,30 @@ export function DevicesControlPanel({
                       <Typography variant="h6" sx={{ fontWeight: 650 }}>
                         Node details
                       </Typography>
-                      <Typography variant="body2" color="text.secondary">
+                      <Typography variant="body2" sx={{
+                        color: "text.secondary"
+                      }}>
                         Manage pairing and command execution for the selected node.
                       </Typography>
                     </Box>
 
-                    <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                    <Stack direction="row" spacing={0.75} useFlexGap sx={{
+                      flexWrap: "wrap"
+                    }}>
                       <Chip size="small" variant="outlined" label={selected.platform} />
                       <Chip size="small" color={statusTone(selected.status)} label={statusLabel(selected.status)} />
                       {selected.owner ? <Chip size="small" variant="outlined" label={selected.owner} /> : null}
                     </Stack>
 
-                    <Typography variant="body2" color="text.secondary">
+                    <Typography variant="body2" sx={{
+                      color: "text.secondary"
+                    }}>
                       Last seen {formatDate(selected.last_seen_at)}
                     </Typography>
 
-                    <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                    <Stack direction="row" spacing={0.75} useFlexGap sx={{
+                      flexWrap: "wrap"
+                    }}>
                       <Button variant="contained" size="small" onClick={() => onRefreshNode?.(selected.id)}>
                         Refresh
                       </Button>
@@ -349,7 +408,9 @@ export function DevicesControlPanel({
                     <Typography variant="subtitle1" sx={{ fontWeight: 650, mb: 0.5 }}>
                       No node selected
                     </Typography>
-                    <Typography variant="body2" color="text.secondary">
+                    <Typography variant="body2" sx={{
+                      color: "text.secondary"
+                    }}>
                       Select a device to inspect its capabilities and operational state.
                     </Typography>
                   </Box>
@@ -363,7 +424,9 @@ export function DevicesControlPanel({
                   <Typography variant="h6" sx={{ fontWeight: 650 }}>
                     Pair node
                   </Typography>
-                  <Typography variant="body2" color="text.secondary">
+                  <Typography variant="body2" sx={{
+                    color: "text.secondary"
+                  }}>
                     This currently registers a device record in AgentArk. A real iPhone/macOS pairing
                     handshake is not implemented yet.
                   </Typography>
@@ -397,15 +460,17 @@ export function DevicesControlPanel({
                       )
                     }
                     helperText="Choose the capabilities this companion device would expose."
-                    SelectProps={{
-                      multiple: true,
-                      renderValue: (selected) => (
-                        <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5 }}>
-                          {(selected as string[]).map((value) => (
-                            <Chip key={value} size="small" label={capabilityLabel(value)} />
-                          ))}
-                        </Box>
-                      )
+                    slotProps={{
+                      select: {
+                        multiple: true,
+                        renderValue: (selected) => (
+                          <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5 }}>
+                            {(selected as string[]).map((value) => (
+                              <Chip key={value} size="small" label={capabilityLabel(value)} />
+                            ))}
+                          </Box>
+                        )
+                      }
                     }}
                   >
                     {DEVICE_CAPABILITY_OPTIONS.map((option) => (
@@ -414,7 +479,9 @@ export function DevicesControlPanel({
                       </MenuItem>
                     ))}
                   </TextField>
-                  <Typography variant="caption" color="text.secondary">
+                  <Typography variant="caption" sx={{
+                    color: "text.secondary"
+                  }}>
                     Capabilities are metadata right now. They do not activate real camera, SMS, or remote-run access by
                     themselves.
                   </Typography>

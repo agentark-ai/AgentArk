@@ -6,7 +6,7 @@ import {
   CardContent,
   Chip,
   Divider,
-  Grid2,
+  Grid as Grid2,
   Stack,
   Typography,
 } from "@mui/material";
@@ -97,7 +97,11 @@ export function BriefingPanel({ briefing, compact = false }: Props) {
       <Card sx={compact ? { minHeight: 0 } : undefined}>
         <CardContent sx={compact ? { p: 1.25 } : undefined}>
           <Typography variant="h6">Daily Command Brief</Typography>
-          <Typography color="text.secondary" mt={1}>
+          <Typography
+            sx={{
+              color: "text.secondary",
+              mt: 1
+            }}>
             Waiting for briefing data...
           </Typography>
         </CardContent>
@@ -119,10 +123,11 @@ export function BriefingPanel({ briefing, compact = false }: Props) {
       >
         <Stack
           direction="row"
-          justifyContent="space-between"
-          alignItems="center"
-          mb={1.5}
-        >
+          sx={{
+            justifyContent: "space-between",
+            alignItems: "center",
+            mb: 1.5
+          }}>
           <Typography variant="h6">Daily Command Brief</Typography>
           <Chip size="small" label={briefing.scope.toUpperCase()} />
         </Stack>
@@ -132,7 +137,12 @@ export function BriefingPanel({ briefing, compact = false }: Props) {
               <Grid2
                 size={{ xs: 12, md: visibleOpportunities.length > 0 ? 6 : 12 }}
               >
-                <Typography variant="subtitle2" color="warning.main" mb={1}>
+                <Typography
+                  variant="subtitle2"
+                  sx={{
+                    color: "warning.main",
+                    mb: 1
+                  }}>
                   Top Risks
                 </Typography>
                 <Stack spacing={1}>
@@ -149,7 +159,12 @@ export function BriefingPanel({ briefing, compact = false }: Props) {
               <Grid2
                 size={{ xs: 12, md: actionableRisks.length > 0 ? 6 : 12 }}
               >
-                <Typography variant="subtitle2" color="success.main" mb={1}>
+                <Typography
+                  variant="subtitle2"
+                  sx={{
+                    color: "success.main",
+                    mb: 1
+                  }}>
                   Top Opportunities
                 </Typography>
                 <Stack spacing={1}>
@@ -170,7 +185,9 @@ export function BriefingPanel({ briefing, compact = false }: Props) {
         {showSignalRow ? <Divider sx={{ my: 2 }} /> : null}
 
         {visibleSkills.length > 0 ? (
-          <Typography variant="subtitle2" mb={1}>
+          <Typography variant="subtitle2" sx={{
+            mb: 1
+          }}>
             Recommended Skills
           </Typography>
         ) : null}
@@ -184,19 +201,26 @@ export function BriefingPanel({ briefing, compact = false }: Props) {
                 key={skill.id}
                 direction={{ xs: "column", md: "row" }}
                 spacing={1}
-                justifyContent="space-between"
-                alignItems={{ xs: "flex-start", md: "center" }}
                 className="action-row"
-              >
+                sx={{
+                  justifyContent: "space-between",
+                  alignItems: { xs: "flex-start", md: "center" }
+                }}>
                 <Stack spacing={0.3} sx={{ flex: 1, minWidth: 0 }}>
-                  <Typography variant="body2" fontWeight={700}>
+                  <Typography variant="body2" sx={{
+                    fontWeight: 700
+                  }}>
                     {skill.title}
                   </Typography>
-                  <Typography variant="caption" color="text.secondary">
+                  <Typography variant="caption" sx={{
+                    color: "text.secondary"
+                  }}>
                     {skill.summary || skill.description || "No description"}
                   </Typography>
                 </Stack>
-                <Stack direction="row" spacing={0.5} alignItems="center">
+                <Stack direction="row" spacing={0.5} sx={{
+                  alignItems: "center"
+                }}>
                   <Button
                     variant="contained"
                     size="small"

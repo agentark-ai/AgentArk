@@ -10,7 +10,7 @@ import {
   CardContent,
   Chip,
   Divider,
-  Grid2,
+  Grid as Grid2,
   Stack,
   TextField,
   Typography
@@ -130,7 +130,12 @@ export function ChannelsControlPanel({
           <Typography variant="h5" sx={{ fontWeight: 700, letterSpacing: 0 }}>
             Gateway surface and delivery readiness
           </Typography>
-          <Typography variant="body2" color="text.secondary" sx={{ maxWidth: 780 }}>
+          <Typography
+            variant="body2"
+            sx={{
+              color: "text.secondary",
+              maxWidth: 780
+            }}>
             Keep channel connections visible, route-specific, and recoverable. This panel is meant to show the live
             channel fabric without forcing the user into Settings.
           </Typography>
@@ -140,9 +145,16 @@ export function ChannelsControlPanel({
           <Grid2 size={{ xs: 12, sm: 4 }}>
             <Card className="workspace-side-card">
               <CardContent sx={{ p: 1.5 }}>
-                <Stack direction="row" justifyContent="space-between" alignItems="center">
+                <Stack
+                  direction="row"
+                  sx={{
+                    justifyContent: "space-between",
+                    alignItems: "center"
+                  }}>
                   <Box>
-                    <Typography variant="body2" color="text.secondary">
+                    <Typography variant="body2" sx={{
+                      color: "text.secondary"
+                    }}>
                       Connected
                     </Typography>
                     <Typography variant="h5" sx={{ fontWeight: 700 }}>
@@ -157,9 +169,16 @@ export function ChannelsControlPanel({
           <Grid2 size={{ xs: 12, sm: 4 }}>
             <Card className="workspace-side-card">
               <CardContent sx={{ p: 1.5 }}>
-                <Stack direction="row" justifyContent="space-between" alignItems="center">
+                <Stack
+                  direction="row"
+                  sx={{
+                    justifyContent: "space-between",
+                    alignItems: "center"
+                  }}>
                   <Box>
-                    <Typography variant="body2" color="text.secondary">
+                    <Typography variant="body2" sx={{
+                      color: "text.secondary"
+                    }}>
                       Need setup
                     </Typography>
                     <Typography variant="h5" sx={{ fontWeight: 700 }}>
@@ -174,9 +193,16 @@ export function ChannelsControlPanel({
           <Grid2 size={{ xs: 12, sm: 4 }}>
             <Card className="workspace-side-card">
               <CardContent sx={{ p: 1.5 }}>
-                <Stack direction="row" justifyContent="space-between" alignItems="center">
+                <Stack
+                  direction="row"
+                  sx={{
+                    justifyContent: "space-between",
+                    alignItems: "center"
+                  }}>
                   <Box>
-                    <Typography variant="body2" color="text.secondary">
+                    <Typography variant="body2" sx={{
+                      color: "text.secondary"
+                    }}>
                       Disabled
                     </Typography>
                     <Typography variant="h5" sx={{ fontWeight: 700 }}>
@@ -195,12 +221,20 @@ export function ChannelsControlPanel({
             <Card className="workspace-side-card">
               <CardContent sx={{ p: 1.5 }}>
                 <Stack spacing={1.2}>
-                  <Stack direction="row" justifyContent="space-between" alignItems="center" gap={1}>
+                  <Stack
+                    direction="row"
+                    sx={{
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      gap: 1
+                    }}>
                     <Box>
                       <Typography variant="h6" sx={{ fontWeight: 650 }}>
                         Channel inventory
                       </Typography>
-                      <Typography variant="body2" color="text.secondary">
+                      <Typography variant="body2" sx={{
+                        color: "text.secondary"
+                      }}>
                         Select a channel to inspect connection state, routing scope, and actions.
                       </Typography>
                     </Box>
@@ -214,7 +248,13 @@ export function ChannelsControlPanel({
                       <Typography variant="subtitle1" sx={{ fontWeight: 650, mb: 0.5 }}>
                         No channels configured yet
                       </Typography>
-                      <Typography variant="body2" color="text.secondary" sx={{ maxWidth: 560, mb: 1.5 }}>
+                      <Typography
+                        variant="body2"
+                        sx={{
+                          color: "text.secondary",
+                          maxWidth: 560,
+                          mb: 1.5
+                        }}>
                         Add a channel to begin routing inbound messages and outbound delivery through the gateway.
                       </Typography>
                       <Button variant="contained" startIcon={<LinkRoundedIcon />} onClick={() => onOpenWizard?.("")}>
@@ -239,23 +279,40 @@ export function ChannelsControlPanel({
                             }}
                           >
                             <Stack spacing={0.75} sx={{ width: "100%" }}>
-                              <Stack direction="row" justifyContent="space-between" alignItems="center" gap={1}>
+                              <Stack
+                                direction="row"
+                                sx={{
+                                  justifyContent: "space-between",
+                                  alignItems: "center",
+                                  gap: 1
+                                }}>
                                 <Box sx={{ minWidth: 0 }}>
                                   <Typography variant="subtitle2" sx={{ fontWeight: 650 }} noWrap>
                                     {channel.name}
                                   </Typography>
-                                  <Typography variant="caption" color="text.secondary" noWrap>
+                                  <Typography variant="caption" noWrap sx={{
+                                    color: "text.secondary"
+                                  }}>
                                     {channel.kind} {channel.route_scope ? `| ${channel.route_scope}` : ""}
                                   </Typography>
                                 </Box>
-                                <Stack direction="row" spacing={0.75} alignItems="center" useFlexGap flexWrap="wrap">
+                                <Stack
+                                  direction="row"
+                                  spacing={0.75}
+                                  useFlexGap
+                                  sx={{
+                                    alignItems: "center",
+                                    flexWrap: "wrap"
+                                  }}>
                                   {typeof channel.unread_count === "number" && channel.unread_count > 0 ? (
                                     <Chip size="small" color="info" label={`${channel.unread_count} unread`} />
                                   ) : null}
                                   <Chip size="small" color={statusTone(channel.status)} label={statusLabel(channel.status)} />
                                 </Stack>
                               </Stack>
-                              <Typography variant="body2" color="text.secondary">
+                              <Typography variant="body2" sx={{
+                                color: "text.secondary"
+                              }}>
                                 {statusHint(channel)}
                               </Typography>
                             </Stack>
@@ -278,27 +335,37 @@ export function ChannelsControlPanel({
                       <Typography variant="h6" sx={{ fontWeight: 650 }}>
                         Channel details
                       </Typography>
-                      <Typography variant="body2" color="text.secondary">
+                      <Typography variant="body2" sx={{
+                        color: "text.secondary"
+                      }}>
                         Quick actions for the selected channel.
                       </Typography>
                     </Box>
 
-                    <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                    <Stack direction="row" spacing={0.75} useFlexGap sx={{
+                      flexWrap: "wrap"
+                    }}>
                       <Chip size="small" variant="outlined" label={selected.kind} />
                       <Chip size="small" color={statusTone(selected.status)} label={statusLabel(selected.status)} />
                       {selected.route_scope ? <Chip size="small" variant="outlined" label={selected.route_scope} /> : null}
                     </Stack>
 
                     <Box>
-                      <Typography variant="body2" color="text.secondary">
+                      <Typography variant="body2" sx={{
+                        color: "text.secondary"
+                      }}>
                         {statusHint(selected)}
                       </Typography>
-                      <Typography variant="caption" color="text.secondary">
+                      <Typography variant="caption" sx={{
+                        color: "text.secondary"
+                      }}>
                         Last activity {formatDate(selected.last_activity_at)}
                       </Typography>
                     </Box>
 
-                    <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                    <Stack direction="row" spacing={0.75} useFlexGap sx={{
+                      flexWrap: "wrap"
+                    }}>
                       <Button variant="contained" size="small" onClick={() => onConnectChannel?.(selected.id)}>
                         Connect
                       </Button>
@@ -317,7 +384,9 @@ export function ChannelsControlPanel({
                         Capability hints
                       </Typography>
                       {capabilities.length === 0 ? (
-                        <Typography variant="body2" color="text.secondary">
+                        <Typography variant="body2" sx={{
+                          color: "text.secondary"
+                        }}>
                           No channel capabilities supplied yet.
                         </Typography>
                       ) : (
@@ -328,7 +397,9 @@ export function ChannelsControlPanel({
                                 {capability.label}
                               </Typography>
                               {capability.detail ? (
-                                <Typography variant="caption" color="text.secondary">
+                                <Typography variant="caption" sx={{
+                                  color: "text.secondary"
+                                }}>
                                   {capability.detail}
                                 </Typography>
                               ) : null}
@@ -355,7 +426,9 @@ export function ChannelsControlPanel({
                           target.value = "";
                         }}
                       />
-                      <Typography variant="caption" color="text.secondary">
+                      <Typography variant="caption" sx={{
+                        color: "text.secondary"
+                      }}>
                         Press Enter to submit a note for the selected channel.
                       </Typography>
                     </Stack>
@@ -364,7 +437,9 @@ export function ChannelsControlPanel({
                       <Typography variant="subtitle2" sx={{ fontWeight: 650, mb: 0.5 }}>
                         Delivery posture
                       </Typography>
-                      <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                      <Stack direction="row" spacing={0.75} useFlexGap sx={{
+                        flexWrap: "wrap"
+                      }}>
                         <Chip size="small" icon={<HubRoundedIcon />} label={selected.enabled ? "Enabled" : "Disabled"} />
                         {selected.paired_with ? <Chip size="small" label={`Paired with ${selected.paired_with}`} /> : null}
                       </Stack>
@@ -375,7 +450,9 @@ export function ChannelsControlPanel({
                     <Typography variant="subtitle1" sx={{ fontWeight: 650, mb: 0.5 }}>
                       No channel selected
                     </Typography>
-                    <Typography variant="body2" color="text.secondary">
+                    <Typography variant="body2" sx={{
+                      color: "text.secondary"
+                    }}>
                       Select a channel from the list to inspect connection state and actions.
                     </Typography>
                   </Box>

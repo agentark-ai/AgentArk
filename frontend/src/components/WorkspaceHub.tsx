@@ -183,9 +183,10 @@ export function WorkspaceHub({
         <Stack
           direction={{ xs: "column", lg: "row" }}
           spacing={1.5}
-          justifyContent="space-between"
-          alignItems={{ xs: "flex-start", lg: "center" }}
-        >
+          sx={{
+            justifyContent: "space-between",
+            alignItems: { xs: "flex-start", lg: "center" }
+          }}>
           <Box sx={{ minWidth: 0 }}>
             <Typography variant="overline" className="workspace-shell-kicker">
               Active Workspace
@@ -193,12 +194,19 @@ export function WorkspaceHub({
             <Typography variant="h5" sx={{ fontWeight: 700, letterSpacing: 0, mb: 0.35 }}>
               Ask naturally. Deeper work stays one click away.
             </Typography>
-            <Typography variant="body2" color="text.secondary" sx={{ maxWidth: 860 }}>
+            <Typography
+              variant="body2"
+              sx={{
+                color: "text.secondary",
+                maxWidth: 860
+              }}>
               Ask quick questions directly. When the work needs files, tools, approvals, apps, or repeatability, the run
               stays visible as a task without sending you to a different product surface.
             </Typography>
           </Box>
-          <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+          <Stack direction="row" spacing={0.75} useFlexGap sx={{
+            flexWrap: "wrap"
+          }}>
             {DRAWER_VIEWS.slice(0, 6).map((entry) => (
               <Button
                 key={entry.view}
@@ -219,7 +227,6 @@ export function WorkspaceHub({
           </Stack>
         </Stack>
       </Box>
-
       <Box className="workspace-hub-grid">
         <Box className="workspace-chat-stage">
           <NativeWorkspace
@@ -242,13 +249,17 @@ export function WorkspaceHub({
                     Live execution stays visible.
                   </Typography>
                 </Box>
-                <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                <Stack direction="row" spacing={0.75} useFlexGap sx={{
+                  flexWrap: "wrap"
+                }}>
                   <Chip size="small" color="info" label={`${runningTasks.length} running`} />
                   <Chip size="small" color="warning" label={`${waitingTasks.length} waiting`} />
                   <Chip size="small" color={failedTasks.length > 0 ? "error" : "default"} label={`${failedTasks.length} failed`} />
                 </Stack>
                 {liveTaskPreview.length === 0 ? (
-                  <Typography variant="body2" color="text.secondary">
+                  <Typography variant="body2" sx={{
+                    color: "text.secondary"
+                  }}>
                     No active or blocked tasks right now. The thread is clear for quick asks.
                   </Typography>
                 ) : (
@@ -256,13 +267,22 @@ export function WorkspaceHub({
                     {liveTaskPreview.map((task) => (
                       <Box key={task.id} className="action-row">
                         <Stack spacing={0.45}>
-                          <Stack direction="row" spacing={0.75} alignItems="center" useFlexGap flexWrap="wrap">
+                          <Stack
+                            direction="row"
+                            spacing={0.75}
+                            useFlexGap
+                            sx={{
+                              alignItems: "center",
+                              flexWrap: "wrap"
+                            }}>
                             <Chip size="small" variant="outlined" label={formatTaskStatus(task)} />
                             <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap title={task.description}>
                               {task.description || "Task"}
                             </Typography>
                           </Stack>
-                          <Typography variant="caption" color="text.secondary">
+                          <Typography variant="caption" sx={{
+                            color: "text.secondary"
+                          }}>
                             Created {formatWhen(task.created_at)}
                           </Typography>
                         </Stack>
@@ -293,7 +313,9 @@ export function WorkspaceHub({
                     Projects, artifacts, and recent runs.
                   </Typography>
                 </Box>
-                <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                <Stack direction="row" spacing={0.75} useFlexGap sx={{
+                  flexWrap: "wrap"
+                }}>
                   <Chip size="small" label={`${projects.length} projects`} />
                   <Chip size="small" label={`${activeApps.length} live apps`} />
                   {restoringApps.length > 0 ? (
@@ -307,19 +329,25 @@ export function WorkspaceHub({
                 </Stack>
                 <Divider sx={{ borderColor: "rgba(108, 156, 212, 0.12)" }} />
                 <Stack spacing={0.65}>
-                  <Typography variant="caption" color="text.secondary">
+                  <Typography variant="caption" sx={{
+                    color: "text.secondary"
+                  }}>
                     Latest run
                   </Typography>
                   <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap title={latestTrace?.message_preview || ""}>
                     {latestTrace?.message_preview || "No recent traces yet."}
                   </Typography>
                   {latestTrace ? (
-                    <Typography variant="caption" color="text.secondary">
+                    <Typography variant="caption" sx={{
+                      color: "text.secondary"
+                    }}>
                       {latestTrace.status || "unknown"} • {latestTrace.step_count} step{latestTrace.step_count === 1 ? "" : "s"} • {formatWhen(latestTrace.started_at)}
                     </Typography>
                   ) : null}
                 </Stack>
-                <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+                <Stack direction="row" spacing={1} useFlexGap sx={{
+                  flexWrap: "wrap"
+                }}>
                   <Button size="small" variant="outlined" onClick={() => onNavigateToView("projects")} sx={{ textTransform: "none" }}>
                     Open Projects
                   </Button>
@@ -345,7 +373,9 @@ export function WorkspaceHub({
                     Open deeper tools only when needed.
                   </Typography>
                 </Box>
-                <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                <Stack direction="row" spacing={0.75} useFlexGap sx={{
+                  flexWrap: "wrap"
+                }}>
                   {DRAWER_VIEWS.map((entry) => (
                     <Chip
                       key={entry.view}
@@ -357,7 +387,9 @@ export function WorkspaceHub({
                     />
                   ))}
                 </Stack>
-                <Typography variant="body2" color="text.secondary">
+                <Typography variant="body2" sx={{
+                  color: "text.secondary"
+                }}>
                   This keeps the first screen focused while still exposing the full assistant workspace behind one action.
                 </Typography>
                 <Stack direction="row" spacing={1}>
@@ -373,33 +405,39 @@ export function WorkspaceHub({
           </Card>
         </Stack>
       </Box>
-
       <Drawer
         anchor="right"
         open={drawerView !== null}
         onClose={() => setDrawerView(null)}
-        PaperProps={{
-          sx: {
-            width: { xs: "100%", md: 640 },
-            maxWidth: "100vw",
-            borderLeft: "1px solid rgba(108, 156, 212, 0.18)",
-            background: "linear-gradient(160deg, rgba(9, 21, 39, 0.97), rgba(7, 16, 30, 0.9))",
-          },
+        slotProps={{
+          paper: {
+            sx: {
+              width: { xs: "100%", md: 640 },
+              maxWidth: "100vw",
+              borderLeft: "1px solid rgba(108, 156, 212, 0.18)",
+              background: "linear-gradient(160deg, rgba(9, 21, 39, 0.97), rgba(7, 16, 30, 0.9))",
+            },
+          }
         }}
       >
         <Box className="workspace-side-drawer">
           <Stack
             direction="row"
-            alignItems="center"
-            justifyContent="space-between"
             spacing={1}
-            sx={{ px: 1.5, py: 1.2, borderBottom: "1px solid rgba(108, 156, 212, 0.14)" }}
-          >
+            sx={{
+              alignItems: "center",
+              justifyContent: "space-between",
+              px: 1.5,
+              py: 1.2,
+              borderBottom: "1px solid rgba(108, 156, 212, 0.14)"
+            }}>
             <Box sx={{ minWidth: 0 }}>
               <Typography variant="subtitle1" sx={{ fontWeight: 650 }} noWrap>
                 {drawerMeta?.label || "Workspace panel"}
               </Typography>
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: "text.secondary"
+              }}>
                 {drawerMeta?.detail || "Assistant workspace"}
               </Typography>
             </Box>

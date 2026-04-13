@@ -114,7 +114,9 @@ export function SuggestionRunDialog({
         <DialogTitle sx={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 2 }}>
           <Box>
             <Typography variant="h6">{run?.title || "Suggestion Run"}</Typography>
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: "text.secondary"
+            }}>
               Live execution trace for this run
             </Typography>
           </Box>
@@ -134,7 +136,9 @@ export function SuggestionRunDialog({
         </DialogTitle>
         <DialogContent dividers>
           <Stack spacing={2}>
-            <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+            <Stack direction="row" spacing={1} useFlexGap sx={{
+              flexWrap: "wrap"
+            }}>
               <Chip
                 size="small"
                 color={run?.status === "completed" ? "success" : run?.status === "error" ? "error" : "warning"}
@@ -151,7 +155,9 @@ export function SuggestionRunDialog({
             {detailError ? <Alert severity="error">{errMessage(detailError)}</Alert> : null}
             {acceptedOutcomes.length > 0 ? (
               <Box className="list-shell">
-                <Typography variant="subtitle2" mb={1}>Saved Outcome</Typography>
+                <Typography variant="subtitle2" sx={{
+                  mb: 1
+                }}>Saved Outcome</Typography>
                 <Stack spacing={1}>
                   {acceptedOutcomes.map((outcome, idx) => {
                     const kind = str(outcome.kind, "artifact");
@@ -164,8 +170,21 @@ export function SuggestionRunDialog({
                     return (
                       <Box key={`${str(outcome.id, `outcome-${idx}`)}-${kind}`} className="action-row">
                         <Stack spacing={0.9}>
-                          <Stack direction={{ xs: "column", sm: "row" }} spacing={1} justifyContent="space-between" alignItems={{ xs: "flex-start", sm: "center" }}>
-                            <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap" alignItems="center">
+                          <Stack
+                            direction={{ xs: "column", sm: "row" }}
+                            spacing={1}
+                            sx={{
+                              justifyContent: "space-between",
+                              alignItems: { xs: "flex-start", sm: "center" }
+                            }}>
+                            <Stack
+                              direction="row"
+                              spacing={1}
+                              useFlexGap
+                              sx={{
+                                flexWrap: "wrap",
+                                alignItems: "center"
+                              }}>
                               <Chip size="small" color={suggestionKindColor(kind)} label={kind} />
                               {status ? <Chip size="small" variant="outlined" color={suggestionOutcomeStatusColor(status)} label={status} /> : null}
                               {toBool(outcome.primary) ? <Chip size="small" variant="outlined" label="primary" /> : null}
@@ -187,11 +206,15 @@ export function SuggestionRunDialog({
                             {title}
                           </Typography>
                           {detail ? (
-                            <Typography variant="caption" color="text.secondary">
+                            <Typography variant="caption" sx={{
+                              color: "text.secondary"
+                            }}>
                               {detail}
                             </Typography>
                           ) : null}
-                          <Typography variant="caption" color="text.secondary">
+                          <Typography variant="caption" sx={{
+                            color: "text.secondary"
+                          }}>
                             ID: {str(outcome.id, "-")}
                             {createdAt ? ` | Created ${humanTs(createdAt).label}` : ""}
                           </Typography>
@@ -210,9 +233,13 @@ export function SuggestionRunDialog({
               </Box>
               <Box className="metadata-box micro-surface" sx={{ maxHeight: 360 }}>
                 {traceLoading && !traceSteps.length ? (
-                  <Typography variant="body2" color="text.secondary">Waiting for trace...</Typography>
+                  <Typography variant="body2" sx={{
+                    color: "text.secondary"
+                  }}>Waiting for trace...</Typography>
                 ) : traceSteps.length === 0 ? (
-                  <Typography variant="body2" color="text.secondary">Trace initialized. Waiting for the first execution step...</Typography>
+                  <Typography variant="body2" sx={{
+                    color: "text.secondary"
+                  }}>Trace initialized. Waiting for the first execution step...</Typography>
                 ) : (
                   <Stack spacing={1}>
                     {traceSteps.map((step, idx) => {
@@ -221,12 +248,28 @@ export function SuggestionRunDialog({
                       return (
                         <Box key={`${str(stepRecord.time, "step")}-${idx}`} className="console-line">
                           <Stack spacing={0.75}>
-                            <Stack direction="row" alignItems="center" spacing={1} useFlexGap flexWrap="wrap">
+                            <Stack
+                              direction="row"
+                              spacing={1}
+                              useFlexGap
+                              sx={{
+                                alignItems: "center",
+                                flexWrap: "wrap"
+                              }}>
                               <Chip size="small" color={getTraceStepColor(str(stepRecord.type || stepRecord.step_type, "step"))} label={str(stepRecord.type || stepRecord.step_type, "step")} />
-                              <Typography variant="caption" color="text.secondary">{str(stepRecord.time)}</Typography>
+                              <Typography variant="caption" sx={{
+                                color: "text.secondary"
+                              }}>{str(stepRecord.time)}</Typography>
                             </Stack>
-                            <Typography variant="body2" fontWeight={600}>{str(stepRecord.title)}</Typography>
-                            <Typography variant="caption" color="text.secondary" sx={{ whiteSpace: "pre-wrap" }}>
+                            <Typography variant="body2" sx={{
+                              fontWeight: 600
+                            }}>{str(stepRecord.title)}</Typography>
+                            <Typography
+                              variant="caption"
+                              sx={{
+                                color: "text.secondary",
+                                whiteSpace: "pre-wrap"
+                              }}>
                               {consoleView.detail}
                             </Typography>
                             {consoleView.dataText ? (
@@ -281,7 +324,6 @@ export function SuggestionRunDialog({
           <Button onClick={onClose}>Close</Button>
         </DialogActions>
       </Dialog>
-
       {open && minimized && run ? (
         <Box
           sx={{
@@ -298,7 +340,12 @@ export function SuggestionRunDialog({
           }}
         >
           <Stack spacing={1}>
-            <Stack direction="row" justifyContent="space-between" alignItems="center">
+            <Stack
+              direction="row"
+              sx={{
+                justifyContent: "space-between",
+                alignItems: "center"
+              }}>
               <Typography variant="subtitle2" noWrap title={run.title}>
                 {run.title}
               </Typography>
@@ -311,7 +358,9 @@ export function SuggestionRunDialog({
                 </IconButton>
               </Stack>
             </Stack>
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: "text.secondary"
+            }}>
               {run.summary}
             </Typography>
           </Stack>

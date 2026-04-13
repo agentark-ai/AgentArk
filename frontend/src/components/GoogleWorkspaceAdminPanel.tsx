@@ -81,25 +81,32 @@ export function GoogleWorkspaceAdminPanel() {
       ) : null}
       {notice ? <Alert severity={notice.kind}>{notice.text}</Alert> : null}
       {settingsQ.error ? <Alert severity="error">{asErrorMessage(settingsQ.error)}</Alert> : null}
-
       <Box className="list-shell" sx={{ minHeight: 0 }}>
         <Stack spacing={1.5}>
           <Box>
             <Typography variant="h6">Google OAuth</Typography>
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: "text.secondary"
+            }}>
               Redirect URI: {String(settings?.redirect_uri || "http://localhost:8990/oauth/callback")}
             </Typography>
           </Box>
-          <Stack direction={{ xs: "column", sm: "row" }} spacing={1} useFlexGap flexWrap="wrap">
+          <Stack direction={{ xs: "column", sm: "row" }} spacing={1} useFlexGap sx={{
+            flexWrap: "wrap"
+          }}>
             <Typography variant="body2">
               Status:{" "}
               <strong>{settings?.configured ? "Configured" : "Not configured"}</strong>
             </Typography>
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>
               Source: {String(settings?.source_label || "Not configured")}
             </Typography>
             {settings?.client_id_hint ? (
-              <Typography variant="body2" color="text.secondary">
+              <Typography variant="body2" sx={{
+                color: "text.secondary"
+              }}>
                 Client ID: {String(settings.client_id_hint)}
               </Typography>
             ) : null}
@@ -115,7 +122,9 @@ export function GoogleWorkspaceAdminPanel() {
             onChange={(event) => setCredentialsJson(event.target.value)}
             size="small"
           />
-          <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+          <Stack direction="row" spacing={1} useFlexGap sx={{
+            flexWrap: "wrap"
+          }}>
             <Button component="label" variant="outlined" size="small">
               Upload Credentials JSON
               <input
@@ -135,12 +144,19 @@ export function GoogleWorkspaceAdminPanel() {
                 }}
               />
             </Button>
-            <Typography variant="caption" color="text.secondary" sx={{ alignSelf: "center" }}>
+            <Typography
+              variant="caption"
+              sx={{
+                color: "text.secondary",
+                alignSelf: "center"
+              }}>
               Desktop or web OAuth client JSON from Google Cloud both work.
             </Typography>
           </Stack>
 
-          <Typography variant="caption" color="text.secondary">
+          <Typography variant="caption" sx={{
+            color: "text.secondary"
+          }}>
             Or enter the values directly if you do not want to paste the full JSON.
           </Typography>
           <TextField
@@ -161,7 +177,9 @@ export function GoogleWorkspaceAdminPanel() {
             placeholder={settings?.secret_configured ? "Leave blank unless replacing it" : "GOCSPX-..."}
           />
 
-          <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+          <Stack direction="row" spacing={1} useFlexGap sx={{
+            flexWrap: "wrap"
+          }}>
             <Button
               variant="contained"
               size="small"

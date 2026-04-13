@@ -261,7 +261,6 @@ export function GuidedTour({ openTourStep, currentView }: Props) {
           />
         </svg>
       </Box>
-
       {targetRect ? (
         <Box
           key={renderKey}
@@ -282,7 +281,6 @@ export function GuidedTour({ openTourStep, currentView }: Props) {
           }}
         />
       ) : null}
-
       <Box
         key={`${stepDef.id}-${renderKey}`}
         className="tour-tooltip"
@@ -307,7 +305,13 @@ export function GuidedTour({ openTourStep, currentView }: Props) {
           animation: "tour-tooltip-enter 180ms ease",
         }}
       >
-        <Stack direction="row" justifyContent="space-between" alignItems="flex-start" spacing={1}>
+        <Stack
+          direction="row"
+          spacing={1}
+          sx={{
+            justifyContent: "space-between",
+            alignItems: "flex-start"
+          }}>
           <Box>
             <Typography
               variant="overline"
@@ -324,14 +328,28 @@ export function GuidedTour({ openTourStep, currentView }: Props) {
           </IconButton>
         </Stack>
 
-        <Typography variant="body2" color="text.secondary" sx={{ mt: 1.3, lineHeight: 1.6 }}>
+        <Typography
+          variant="body2"
+          sx={{
+            color: "text.secondary",
+            mt: 1.3,
+            lineHeight: 1.6
+          }}>
           {stepDef.body}
         </Typography>
 
         <Box sx={{ flex: 1 }} />
 
-        <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mt: 2 }}>
-          <Typography variant="caption" color="text.secondary">
+        <Stack
+          direction="row"
+          sx={{
+            justifyContent: "space-between",
+            alignItems: "center",
+            mt: 2
+          }}>
+          <Typography variant="caption" sx={{
+            color: "text.secondary"
+          }}>
             Step {tourStep + 1} of {TOUR_STEPS.length}
           </Typography>
           <Stack direction="row" spacing={1}>

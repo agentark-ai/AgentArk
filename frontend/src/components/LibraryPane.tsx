@@ -50,11 +50,23 @@ export function LibraryPane({ autoRefresh, showAdvanced, onNavigateToView }: Pro
         <Typography variant="h4" sx={{ fontWeight: 700, letterSpacing: 0, mb: 0.45 }}>
           Reusable knowledge, capabilities, and artifacts.
         </Typography>
-        <Typography variant="body2" color="text.secondary" sx={{ maxWidth: 860 }}>
+        <Typography
+          variant="body2"
+          sx={{
+            color: "text.secondary",
+            maxWidth: 860
+          }}>
           Keep imported skills, indexed documents, and built apps together. This is the reusable substrate the workspace can
           draw from while tasks are running.
         </Typography>
-        <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" sx={{ mt: 1.2 }}>
+        <Stack
+          direction="row"
+          spacing={0.75}
+          useFlexGap
+          sx={{
+            flexWrap: "wrap",
+            mt: 1.2
+          }}>
           {LIBRARY_VIEWS.map((entry) => (
             <Button
               key={entry.view}
@@ -73,12 +85,18 @@ export function LibraryPane({ autoRefresh, showAdvanced, onNavigateToView }: Pro
             Projects
           </Button>
         </Stack>
-        <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" sx={{ mt: 1 }}>
+        <Stack
+          direction="row"
+          spacing={0.75}
+          useFlexGap
+          sx={{
+            flexWrap: "wrap",
+            mt: 1
+          }}>
           <Chip size="small" label={activeMeta.label} color="primary" />
           <Chip size="small" label={activeMeta.detail} />
         </Stack>
       </Box>
-
       <Box className="library-stage">
         <NativeWorkspace
           view={activeView}

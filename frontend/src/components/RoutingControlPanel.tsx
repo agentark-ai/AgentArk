@@ -8,7 +8,7 @@ import {
   CardContent,
   Chip,
   Divider,
-  Grid2,
+  Grid as Grid2,
   MenuItem,
   Stack,
   TextField,
@@ -106,7 +106,12 @@ export function RoutingControlPanel({
           <Typography variant="h5" sx={{ fontWeight: 700, letterSpacing: 0 }}>
             Keep the right channel tied to the right agent
           </Typography>
-          <Typography variant="body2" color="text.secondary" sx={{ maxWidth: 840 }}>
+          <Typography
+            variant="body2"
+            sx={{
+              color: "text.secondary",
+              maxWidth: 840
+            }}>
             Use this only when messages from a specific channel, account, or thread should always go to the same agent
             or broadcast target. Most users can leave this empty.
           </Typography>
@@ -116,9 +121,16 @@ export function RoutingControlPanel({
           <Grid2 size={{ xs: 12, sm: 4 }}>
             <Card className="workspace-side-card">
               <CardContent sx={{ p: 1.5 }}>
-                <Stack direction="row" justifyContent="space-between" alignItems="center">
+                <Stack
+                  direction="row"
+                  sx={{
+                    justifyContent: "space-between",
+                    alignItems: "center"
+                  }}>
                   <Box>
-                    <Typography variant="body2" color="text.secondary">
+                    <Typography variant="body2" sx={{
+                      color: "text.secondary"
+                    }}>
                       Active routes
                     </Typography>
                     <Typography variant="h5" sx={{ fontWeight: 700 }}>
@@ -133,9 +145,16 @@ export function RoutingControlPanel({
           <Grid2 size={{ xs: 12, sm: 4 }}>
             <Card className="workspace-side-card">
               <CardContent sx={{ p: 1.5 }}>
-                <Stack direction="row" justifyContent="space-between" alignItems="center">
+                <Stack
+                  direction="row"
+                  sx={{
+                    justifyContent: "space-between",
+                    alignItems: "center"
+                  }}>
                   <Box>
-                    <Typography variant="body2" color="text.secondary">
+                    <Typography variant="body2" sx={{
+                      color: "text.secondary"
+                    }}>
                       Channel scoped
                     </Typography>
                     <Typography variant="h5" sx={{ fontWeight: 700 }}>
@@ -150,9 +169,16 @@ export function RoutingControlPanel({
           <Grid2 size={{ xs: 12, sm: 4 }}>
             <Card className="workspace-side-card">
               <CardContent sx={{ p: 1.5 }}>
-                <Stack direction="row" justifyContent="space-between" alignItems="center">
+                <Stack
+                  direction="row"
+                  sx={{
+                    justifyContent: "space-between",
+                    alignItems: "center"
+                  }}>
                   <Box>
-                    <Typography variant="body2" color="text.secondary">
+                    <Typography variant="body2" sx={{
+                      color: "text.secondary"
+                    }}>
                       Global routes
                     </Typography>
                     <Typography variant="h5" sx={{ fontWeight: 700 }}>
@@ -171,12 +197,20 @@ export function RoutingControlPanel({
             <Card className="workspace-side-card">
               <CardContent sx={{ p: 1.5 }}>
                 <Stack spacing={1.2}>
-                  <Stack direction="row" justifyContent="space-between" alignItems="center" gap={1}>
+                  <Stack
+                    direction="row"
+                    sx={{
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      gap: 1
+                    }}>
                     <Box>
                       <Typography variant="h6" sx={{ fontWeight: 650 }}>
                         Routing rules
                       </Typography>
-                      <Typography variant="body2" color="text.secondary">
+                      <Typography variant="body2" sx={{
+                        color: "text.secondary"
+                      }}>
                         Visible rules with explicit targets and scope.
                       </Typography>
                     </Box>
@@ -189,7 +223,13 @@ export function RoutingControlPanel({
                       <Typography variant="subtitle1" sx={{ fontWeight: 650, mb: 0.5 }}>
                         No routes defined
                       </Typography>
-                      <Typography variant="body2" color="text.secondary" sx={{ maxWidth: 560, mb: 1.5 }}>
+                      <Typography
+                        variant="body2"
+                        sx={{
+                          color: "text.secondary",
+                          maxWidth: 560,
+                          mb: 1.5
+                        }}>
                         Add a rule only if you need a channel, account, or broadcast group to always use the same agent.
                       </Typography>
                     </Box>
@@ -211,16 +251,31 @@ export function RoutingControlPanel({
                             }}
                           >
                             <Stack spacing={0.75} sx={{ width: "100%" }}>
-                              <Stack direction="row" justifyContent="space-between" alignItems="center" gap={1}>
+                              <Stack
+                                direction="row"
+                                sx={{
+                                  justifyContent: "space-between",
+                                  alignItems: "center",
+                                  gap: 1
+                                }}>
                                 <Box sx={{ minWidth: 0 }}>
                                   <Typography variant="subtitle2" sx={{ fontWeight: 650 }} noWrap>
                                     {route.name}
                                   </Typography>
-                                  <Typography variant="caption" color="text.secondary" noWrap>
+                                  <Typography variant="caption" noWrap sx={{
+                                    color: "text.secondary"
+                                  }}>
                                     {route.match}
                                   </Typography>
                                 </Box>
-                                <Stack direction="row" spacing={0.75} alignItems="center" useFlexGap flexWrap="wrap">
+                                <Stack
+                                  direction="row"
+                                  spacing={0.75}
+                                  useFlexGap
+                                  sx={{
+                                    alignItems: "center",
+                                    flexWrap: "wrap"
+                                  }}>
                                   <Chip
                                     size="small"
                                     color={route.enabled ? "success" : "default"}
@@ -229,10 +284,14 @@ export function RoutingControlPanel({
                                   <Chip size="small" variant="outlined" label={scopeLabel(route.scope)} />
                                 </Stack>
                               </Stack>
-                              <Typography variant="body2" color="text.secondary">
+                              <Typography variant="body2" sx={{
+                                color: "text.secondary"
+                              }}>
                                 {route.description || "No description provided."}
                               </Typography>
-                              <Typography variant="caption" color="text.secondary">
+                              <Typography variant="caption" sx={{
+                                color: "text.secondary"
+                              }}>
                                 Target {route.route_to || route.agent || route.broadcast_group || route.channel || "unset"} | Last
                                 matched {formatDate(route.last_matched_at)}
                               </Typography>
@@ -256,23 +315,33 @@ export function RoutingControlPanel({
                       <Typography variant="h6" sx={{ fontWeight: 650 }}>
                         When you actually need this
                       </Typography>
-                      <Typography variant="body2" color="text.secondary">
+                      <Typography variant="body2" sx={{
+                        color: "text.secondary"
+                      }}>
                         Leave routing empty unless a specific channel, account, or thread must always use the same
                         agent.
                       </Typography>
                     </Box>
                     <Stack spacing={0.75}>
-                      <Typography variant="body2" color="text.secondary">
+                      <Typography variant="body2" sx={{
+                        color: "text.secondary"
+                      }}>
                         Example: send Slack support messages to a Support Agent.
                       </Typography>
-                      <Typography variant="body2" color="text.secondary">
+                      <Typography variant="body2" sx={{
+                        color: "text.secondary"
+                      }}>
                         Example: keep Discord moderation traffic with a Moderation Agent.
                       </Typography>
-                      <Typography variant="body2" color="text.secondary">
+                      <Typography variant="body2" sx={{
+                        color: "text.secondary"
+                      }}>
                         Example: fan out urgent alerts to more than one agent with a broadcast group.
                       </Typography>
                     </Stack>
-                    <Typography variant="caption" color="text.secondary">
+                    <Typography variant="caption" sx={{
+                      color: "text.secondary"
+                    }}>
                       This is an expert/admin tool. Most workspaces do not need any rules here.
                     </Typography>
                     <Button variant="outlined" onClick={() => setAdvancedOpen(true)}>
@@ -281,12 +350,20 @@ export function RoutingControlPanel({
                   </Stack>
                 ) : (
                   <Stack spacing={1.2}>
-                    <Stack direction="row" justifyContent="space-between" alignItems="center" gap={1}>
+                    <Stack
+                      direction="row"
+                      sx={{
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        gap: 1
+                      }}>
                       <Box>
                         <Typography variant="h6" sx={{ fontWeight: 650 }}>
                           Advanced routing tools
                         </Typography>
-                        <Typography variant="body2" color="text.secondary">
+                        <Typography variant="body2" sx={{
+                          color: "text.secondary"
+                        }}>
                           Build a rule or edit the selected one.
                         </Typography>
                       </Box>
@@ -327,7 +404,9 @@ export function RoutingControlPanel({
                           onChange={(event) => onSaveRoute?.({ id: selected.id, route_to: event.target.value })}
                           helperText="Channel, agent, or broadcast-group target"
                         />
-                        <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                        <Stack direction="row" spacing={0.75} useFlexGap sx={{
+                          flexWrap: "wrap"
+                        }}>
                           <Button
                             variant="contained"
                             size="small"
@@ -403,7 +482,9 @@ export function RoutingControlPanel({
                         Broadcast groups
                       </Typography>
                       {broadcastGroups.length === 0 ? (
-                        <Typography variant="body2" color="text.secondary">
+                        <Typography variant="body2" sx={{
+                          color: "text.secondary"
+                        }}>
                           No groups yet. Use a group only when one event needs to go to multiple agents or devices.
                         </Typography>
                       ) : (
@@ -414,7 +495,9 @@ export function RoutingControlPanel({
                                 <Typography variant="body2" sx={{ fontWeight: 600 }}>
                                   {group.name}
                                 </Typography>
-                                <Typography variant="caption" color="text.secondary">
+                                <Typography variant="caption" sx={{
+                                  color: "text.secondary"
+                                }}>
                                   {group.members.length} members{group.description ? ` | ${group.description}` : ""}
                                 </Typography>
                               </Stack>

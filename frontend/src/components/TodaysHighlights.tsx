@@ -144,22 +144,35 @@ export function TodaysHighlights({ tasks, traces }: Props) {
             <Typography variant="body1" sx={{ fontWeight: 700 }}>
               Operational Summary
             </Typography>
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>
               Compact view of today's completion pace, runtime activity, and usage footprint.
             </Typography>
           </Box>
 
           {noTodayData ? (
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>
               No meaningful activity yet today. Falling back to the trailing 30-day baseline.
             </Typography>
           ) : (
-            <Stack direction="row" alignItems="center" spacing={0.55} useFlexGap flexWrap="wrap">
+            <Stack
+              direction="row"
+              spacing={0.55}
+              useFlexGap
+              sx={{
+                alignItems: "center",
+                flexWrap: "wrap"
+              }}>
               <Typography variant="body2" sx={{ color: "text.primary", fontWeight: 600 }}>
                 {completedToday > 0 ? `${completedToday} completions` : "No completions yet"}
               </Typography>
               {trendPct !== 0 ? (
-                <Stack direction="row" alignItems="center" spacing={0.25}>
+                <Stack direction="row" spacing={0.25} sx={{
+                  alignItems: "center"
+                }}>
                   {trendPct > 0 ? (
                     <TrendingUpRoundedIcon sx={{ fontSize: 15, color: "#82f7c1" }} />
                   ) : (
@@ -167,9 +180,10 @@ export function TodaysHighlights({ tasks, traces }: Props) {
                   )}
                   <Typography
                     variant="caption"
-                    fontWeight={700}
-                    sx={{ color: trendPct > 0 ? "#82f7c1" : "#ff9800" }}
-                  >
+                    sx={{
+                      fontWeight: 700,
+                      color: trendPct > 0 ? "#82f7c1" : "#ff9800"
+                    }}>
                     {trendPct > 0 ? "+" : ""}
                     {trendPct}% vs avg
                   </Typography>
@@ -208,7 +222,9 @@ export function TodaysHighlights({ tasks, traces }: Props) {
           {completedList.length > 0 ? (
             <Stack spacing={0.55} className="mission-panel-section">
               {completedList.map((task, index) => (
-                <Stack key={task.id || index} direction="row" spacing={0.75} alignItems="center">
+                <Stack key={task.id || index} direction="row" spacing={0.75} sx={{
+                  alignItems: "center"
+                }}>
                   <CheckCircleRoundedIcon sx={{ fontSize: 14, color: "#82f7c1", flexShrink: 0 }} />
                   <Typography variant="body2" noWrap sx={{ minWidth: 0 }} title={String(task.description || "")}>
                     {String(task.description || "Task completed")}
@@ -218,16 +234,22 @@ export function TodaysHighlights({ tasks, traces }: Props) {
             </Stack>
           ) : (
             <Box className="mission-empty-copy" sx={{ justifyContent: "flex-start", py: 0.35 }}>
-              <Typography variant="body2" color="text.secondary">
+              <Typography variant="body2" sx={{
+                color: "text.secondary"
+              }}>
                 No completed tasks have landed yet today.
               </Typography>
             </Box>
           )}
 
           {todayUsagePresent ? (
-            <Stack direction={{ xs: "column", sm: "row" }} spacing={0.85} useFlexGap flexWrap="wrap">
+            <Stack direction={{ xs: "column", sm: "row" }} spacing={0.85} useFlexGap sx={{
+              flexWrap: "wrap"
+            }}>
               {todayUsageRows.map((row) => (
-                <Typography key={row.label} variant="caption" color="text.secondary">
+                <Typography key={row.label} variant="caption" sx={{
+                  color: "text.secondary"
+                }}>
                   {row.label}: <span style={{ color: "rgba(244, 245, 247, 0.92)" }}>{row.value}</span>
                 </Typography>
               ))}
@@ -235,9 +257,13 @@ export function TodaysHighlights({ tasks, traces }: Props) {
           ) : null}
 
           {nextScheduled ? (
-            <Stack direction="row" spacing={0.75} alignItems="center">
+            <Stack direction="row" spacing={0.75} sx={{
+              alignItems: "center"
+            }}>
               <ScheduleRoundedIcon sx={{ fontSize: 14, color: "rgba(244, 245, 247, 0.78)", flexShrink: 0 }} />
-              <Typography variant="body2" color="text.secondary">
+              <Typography variant="body2" sx={{
+                color: "text.secondary"
+              }}>
                 Next scheduled: {String(nextScheduled.description || "Scheduled task").slice(0, 56)}
               </Typography>
             </Stack>
@@ -247,7 +273,12 @@ export function TodaysHighlights({ tasks, traces }: Props) {
             <Sparkline values={weekCounts} />
           </Box>
 
-          <Typography variant="caption" color="text.secondary" display="block">
+          <Typography
+            variant="caption"
+            sx={{
+              color: "text.secondary",
+              display: "block"
+            }}>
             {activitySummary}
           </Typography>
         </Stack>

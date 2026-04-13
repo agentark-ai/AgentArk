@@ -139,7 +139,9 @@ export function ApplicationRegistryPanel({ autoRefresh }: { autoRefresh: boolean
       <Stack spacing={1.25}>
         <Box>
           <Typography variant="h6">External Launchers</Typography>
-          <Typography variant="caption" color="text.secondary">
+          <Typography variant="caption" sx={{
+            color: "text.secondary"
+          }}>
             AgentArk-managed launchers for optional external terminal tools through Ollama Launch. These are companion tools, not AgentArk modes.
           </Typography>
         </Box>
@@ -150,11 +152,15 @@ export function ApplicationRegistryPanel({ autoRefresh }: { autoRefresh: boolean
 
         <Alert severity={ollamaReady ? "success" : "warning"}>
           <Stack spacing={0.5}>
-            <Typography variant="body2" fontWeight={700}>
+            <Typography variant="body2" sx={{
+              fontWeight: 700
+            }}>
               {ollamaReady ? "Ollama launch runtime is ready." : "Ollama launch runtime needs attention."}
             </Typography>
             <Typography variant="body2">{runtimeDetail || "No Ollama runtime details available yet."}</Typography>
-            <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+            <Stack direction="row" spacing={1} useFlexGap sx={{
+              flexWrap: "wrap"
+            }}>
               <Chip size="small" label={bool(runtime.ollama_cli_available) ? "CLI installed" : "CLI missing"} color={bool(runtime.ollama_cli_available) ? "success" : "warning"} />
               <Chip size="small" label={bool(runtime.ollama_reachable) ? "Runtime reachable" : "Runtime unreachable"} color={bool(runtime.ollama_reachable) ? "success" : "warning"} />
               {runtimeVersion ? <Chip size="small" label={runtimeVersion} variant="outlined" /> : null}
@@ -166,7 +172,9 @@ export function ApplicationRegistryPanel({ autoRefresh }: { autoRefresh: boolean
         </Alert>
 
         {sortedApplications.length === 0 ? (
-          <Typography variant="body2" color="text.secondary">
+          <Typography variant="body2" sx={{
+            color: "text.secondary"
+          }}>
             No built-in application launchers are registered.
           </Typography>
         ) : (
@@ -216,10 +224,21 @@ export function ApplicationRegistryPanel({ autoRefresh }: { autoRefresh: boolean
               return (
                 <Box key={id} className="action-row" sx={{ p: 1.25, borderRadius: 2, border: "1px solid rgba(108, 156, 212, 0.12)" }}>
                   <Stack spacing={1}>
-                    <Stack direction={{ xs: "column", md: "row" }} justifyContent="space-between" spacing={1}>
+                    <Stack direction={{ xs: "column", md: "row" }} spacing={1} sx={{
+                      justifyContent: "space-between"
+                    }}>
                       <Box sx={{ minWidth: 0 }}>
-                        <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
-                        <Typography variant="subtitle1" fontWeight={700}>
+                        <Stack
+                          direction="row"
+                          spacing={1}
+                          useFlexGap
+                          sx={{
+                            alignItems: "center",
+                            flexWrap: "wrap"
+                          }}>
+                        <Typography variant="subtitle1" sx={{
+                          fontWeight: 700
+                        }}>
                             {label}
                           </Typography>
                           <Chip size="small" label="External" variant="outlined" />
@@ -227,14 +246,25 @@ export function ApplicationRegistryPanel({ autoRefresh }: { autoRefresh: boolean
                           {currentMode ? <Chip size="small" label={currentMode} variant="outlined" /> : null}
                           {currentModel ? <Chip size="small" label={currentModel} variant="outlined" /> : null}
                         </Stack>
-                        <Typography variant="body2" color="text.secondary">
+                        <Typography variant="body2" sx={{
+                          color: "text.secondary"
+                        }}>
                           {str(app.tagline)}
                         </Typography>
-                        <Typography variant="caption" color="text.secondary">
+                        <Typography variant="caption" sx={{
+                          color: "text.secondary"
+                        }}>
                           {str(app.description)}
                         </Typography>
                       </Box>
-                      <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+                      <Stack
+                        direction="row"
+                        spacing={1}
+                        useFlexGap
+                        sx={{
+                          alignItems: "center",
+                          flexWrap: "wrap"
+                        }}>
                         <Link href={str(app.docs_url)} target="_blank" rel="noreferrer" underline="hover">
                           Docs
                         </Link>
@@ -245,12 +275,16 @@ export function ApplicationRegistryPanel({ autoRefresh }: { autoRefresh: boolean
                     </Stack>
 
                     {aliases.length > 0 ? (
-                      <Typography variant="caption" color="text.secondary">
+                      <Typography variant="caption" sx={{
+                        color: "text.secondary"
+                      }}>
                         Aliases: {aliases.join(", ")}
                       </Typography>
                     ) : null}
 
-                    <Stack direction={{ xs: "column", md: "row" }} spacing={1} alignItems={{ xs: "stretch", md: "center" }}>
+                    <Stack direction={{ xs: "column", md: "row" }} spacing={1} sx={{
+                      alignItems: { xs: "stretch", md: "center" }
+                    }}>
                       <TextField
                         fullWidth
                         size="small"
@@ -264,7 +298,9 @@ export function ApplicationRegistryPanel({ autoRefresh }: { autoRefresh: boolean
                           }))
                         }
                       />
-                      <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+                      <Stack direction="row" spacing={1} useFlexGap sx={{
+                        flexWrap: "wrap"
+                      }}>
                         <Button
                           size="small"
                           variant="outlined"
@@ -366,7 +402,9 @@ export function ApplicationRegistryPanel({ autoRefresh }: { autoRefresh: boolean
                     </Stack>
 
                     {recommendedModels.length > 0 ? (
-                      <Stack direction="row" spacing={0.75} flexWrap="wrap" useFlexGap>
+                      <Stack direction="row" spacing={0.75} useFlexGap sx={{
+                        flexWrap: "wrap"
+                      }}>
                         {recommendedModels.map((model) => (
                           <Chip
                             key={`${id}-${model}`}
@@ -389,7 +427,13 @@ export function ApplicationRegistryPanel({ autoRefresh }: { autoRefresh: boolean
                       <Typography className="micro-surface-title">
                         {runtimeInDocker ? "Launch commands" : "Launch command"}
                       </Typography>
-                      <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.75 }}>
+                      <Typography
+                        variant="caption"
+                        sx={{
+                          color: "text.secondary",
+                          display: "block",
+                          mt: 0.75
+                        }}>
                         {runtimeInDocker ? "Docker host command" : "Launch command"}
                       </Typography>
                       <Typography variant="body2" sx={{ wordBreak: "break-all" }}>
@@ -398,7 +442,9 @@ export function ApplicationRegistryPanel({ autoRefresh }: { autoRefresh: boolean
                       {supportsConfig ? (
                         <>
                           <Divider sx={{ my: 0.75 }} />
-                          <Typography variant="caption" color="text.secondary">
+                          <Typography variant="caption" sx={{
+                            color: "text.secondary"
+                          }}>
                             {runtimeInDocker ? "Docker host config command" : "Config command"}
                           </Typography>
                           <Typography variant="body2" sx={{ wordBreak: "break-all" }}>
@@ -409,7 +455,9 @@ export function ApplicationRegistryPanel({ autoRefresh }: { autoRefresh: boolean
                       {runtimeInDocker ? (
                         <>
                           <Divider sx={{ my: 0.75 }} />
-                          <Typography variant="caption" color="text.secondary">
+                          <Typography variant="caption" sx={{
+                            color: "text.secondary"
+                          }}>
                             In-container command
                           </Typography>
                           <Typography variant="body2" sx={{ wordBreak: "break-all" }}>
@@ -418,7 +466,9 @@ export function ApplicationRegistryPanel({ autoRefresh }: { autoRefresh: boolean
                           {supportsConfig ? (
                             <>
                               <Divider sx={{ my: 0.75 }} />
-                              <Typography variant="caption" color="text.secondary">
+                              <Typography variant="caption" sx={{
+                                color: "text.secondary"
+                              }}>
                                 In-container config command
                               </Typography>
                               <Typography variant="body2" sx={{ wordBreak: "break-all" }}>

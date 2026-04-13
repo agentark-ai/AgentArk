@@ -313,21 +313,22 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
           sent to the model.
         </Alert>
       ) : null}
-
       {error ? <Alert severity="error">{error}</Alert> : null}
       {success ? <Alert severity="success">{success}</Alert> : null}
-
       <Box className="list-shell">
         <Stack
           direction={{ xs: "column", sm: "row" }}
-          justifyContent="space-between"
-          alignItems={{ xs: "flex-start", sm: "center" }}
           spacing={1}
-        >
+          sx={{
+            justifyContent: "space-between",
+            alignItems: { xs: "flex-start", sm: "center" }
+          }}>
           {!embedded ? (
             <Box>
               <Typography variant="h6">Plugin SDK</Typography>
-              <Typography variant="body2" color="text.secondary">
+              <Typography variant="body2" sx={{
+                color: "text.secondary"
+              }}>
                 Install third-party plugins and subscribe them to platform events like webhooks,
                 approvals, and task outcomes.
               </Typography>
@@ -342,7 +343,6 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
           </Button>
         </Stack>
       </Box>
-
       <Dialog open={dialogOpen} onClose={busy ? undefined : closeDialog} fullWidth maxWidth="md">
         <DialogTitle>{editingId ? "Edit Plugin" : "Install Plugin"}</DialogTitle>
         <DialogContent dividers>
@@ -406,7 +406,9 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
                   label="Clear saved token on next save"
                 />
               ) : null}
-              <Stack direction="row" spacing={2} flexWrap="wrap">
+              <Stack direction="row" spacing={2} sx={{
+                flexWrap: "wrap"
+              }}>
                 <FormControlLabel
                   control={
                     <Switch
@@ -421,7 +423,9 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
 
             <Stack spacing={1.25} sx={{ flex: 1 }}>
               <Typography variant="subtitle2">Subscribed Events</Typography>
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: "text.secondary"
+              }}>
                 Plugins only receive the events you enable here.
               </Typography>
               <Box
@@ -447,7 +451,9 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
                       />
                     ))
                   ) : (
-                    <Typography variant="body2" color="text.secondary">
+                    <Typography variant="body2" sx={{
+                      color: "text.secondary"
+                    }}>
                       Platform events will appear after the plugin settings payload loads.
                     </Typography>
                   )}
@@ -456,7 +462,13 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
             </Stack>
           </Stack>
           {!editingId ? (
-            <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 1.5 }}>
+            <Typography
+              variant="caption"
+              sx={{
+                color: "text.secondary",
+                display: "block",
+                mt: 1.5
+              }}>
               Save once to enable the plugin test button.
             </Typography>
           ) : null}
@@ -484,10 +496,14 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
           </Button>
         </DialogActions>
       </Dialog>
-
       <Box className="list-shell">
         <Stack spacing={1.5}>
-          <Stack direction="row" justifyContent="space-between" alignItems="center">
+          <Stack
+            direction="row"
+            sx={{
+              justifyContent: "space-between",
+              alignItems: "center"
+            }}>
             <Typography variant="h6">Installed Plugins</Typography>
             <Chip
               label={`${plugins.length} installed`}
@@ -513,9 +529,17 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
                       p: 1.5
                     }}
                   >
-                    <Stack direction={{ xs: "column", lg: "row" }} spacing={2} justifyContent="space-between">
+                    <Stack direction={{ xs: "column", lg: "row" }} spacing={2} sx={{
+                      justifyContent: "space-between"
+                    }}>
                       <Stack spacing={0.8} sx={{ minWidth: 0 }}>
-                        <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
+                        <Stack
+                          direction="row"
+                          spacing={1}
+                          sx={{
+                            alignItems: "center",
+                            flexWrap: "wrap"
+                          }}>
                           <Typography variant="subtitle1">{str(plugin.name, pluginId)}</Typography>
                           <Chip
                             size="small"
@@ -531,13 +555,19 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
                             <Chip size="small" label="Token saved" variant="outlined" />
                           ) : null}
                         </Stack>
-                        <Typography variant="body2" color="text.secondary">
+                        <Typography variant="body2" sx={{
+                          color: "text.secondary"
+                        }}>
                           {str(plugin.description, str(manifest.description, "No description provided."))}
                         </Typography>
-                        <Typography variant="caption" color="text.secondary">
+                        <Typography variant="caption" sx={{
+                          color: "text.secondary"
+                        }}>
                           Base URL: {str(plugin.base_url)}
                         </Typography>
-                        <Typography variant="caption" color="text.secondary">
+                        <Typography variant="caption" sx={{
+                          color: "text.secondary"
+                        }}>
                           Last synced: {humanTs(str(plugin.last_synced_at || plugin.updated_at))}
                         </Typography>
                         {str(plugin.last_error) ? (
@@ -545,13 +575,17 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
                             {str(plugin.last_error)}
                           </Alert>
                         ) : null}
-                        <Stack direction="row" spacing={0.75} flexWrap="wrap" useFlexGap>
+                        <Stack direction="row" spacing={0.75} useFlexGap sx={{
+                          flexWrap: "wrap"
+                        }}>
                           {actions.map((actionName) => (
                             <Chip key={actionName} size="small" label={actionName} />
                           ))}
                           {!actions.length ? <Chip size="small" label="No actions" variant="outlined" /> : null}
                         </Stack>
-                        <Stack direction="row" spacing={0.75} flexWrap="wrap" useFlexGap>
+                        <Stack direction="row" spacing={0.75} useFlexGap sx={{
+                          flexWrap: "wrap"
+                        }}>
                           {subscribed.map((eventName) => (
                             <Chip key={`sub-${pluginId}-${eventName}`} size="small" label={`Subscribed: ${eventName}`} variant="outlined" />
                           ))}
@@ -559,14 +593,22 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
                             <Chip size="small" label="No subscribed events" variant="outlined" />
                           ) : null}
                         </Stack>
-                        <Stack direction="row" spacing={0.75} flexWrap="wrap" useFlexGap>
+                        <Stack direction="row" spacing={0.75} useFlexGap sx={{
+                          flexWrap: "wrap"
+                        }}>
                           {availableEvents.map((eventName) => (
                             <Chip key={`avail-${pluginId}-${eventName}`} size="small" label={`Supports: ${eventName}`} variant="outlined" />
                           ))}
                         </Stack>
                       </Stack>
 
-                      <Stack direction="row" spacing={1} alignItems="flex-start" flexWrap="wrap">
+                      <Stack
+                        direction="row"
+                        spacing={1}
+                        sx={{
+                          alignItems: "flex-start",
+                          flexWrap: "wrap"
+                        }}>
                         <Button
                           variant="outlined"
                           onClick={() => {
@@ -625,7 +667,6 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
           ) : null}
         </Stack>
       </Box>
-
       <Box className="list-shell">
         <Stack spacing={1.5}>
           <Typography variant="h6">Plugin Activity</Typography>
@@ -651,7 +692,9 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
                     <TableCell>{str(entry.subject, "-")}</TableCell>
                     <TableCell>{str(entry.outcome, "-")}</TableCell>
                     <TableCell sx={{ maxWidth: 420 }}>
-                      <Typography variant="body2" color="text.secondary">
+                      <Typography variant="body2" sx={{
+                        color: "text.secondary"
+                      }}>
                         {str(entry.message, "-")}
                       </Typography>
                     </TableCell>
@@ -660,7 +703,9 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
               ) : (
                 <TableRow>
                   <TableCell colSpan={6}>
-                    <Typography variant="body2" color="text.secondary">
+                    <Typography variant="body2" sx={{
+                      color: "text.secondary"
+                    }}>
                       No plugin activity yet.
                     </Typography>
                   </TableCell>

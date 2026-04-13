@@ -122,10 +122,17 @@ export function MetricBarCard({
                 key={`${title}-${row.label}-${index}`}
                 className="metric-bar-card-row"
                 direction="row"
-                justifyContent="space-between"
-                alignItems="center"
-              >
-                <Stack direction="row" spacing={0.8} alignItems="center" sx={{ minWidth: 0 }}>
+                sx={{
+                  justifyContent: "space-between",
+                  alignItems: "center"
+                }}>
+                <Stack
+                  direction="row"
+                  spacing={0.8}
+                  sx={{
+                    alignItems: "center",
+                    minWidth: 0
+                  }}>
                   <Box
                     sx={{
                       width: 8,

@@ -8,7 +8,7 @@ import {
   CardContent,
   Chip,
   Divider,
-  Grid2,
+  Grid as Grid2,
   MenuItem,
   Stack,
   TextField,
@@ -108,7 +108,12 @@ export function BrowserProfilesPanel({
           <Typography variant="h5" sx={{ fontWeight: 700, letterSpacing: 0 }}>
             Managed browser profiles and handoff state
           </Typography>
-          <Typography variant="body2" color="text.secondary" sx={{ maxWidth: 840 }}>
+          <Typography
+            variant="body2"
+            sx={{
+              color: "text.secondary",
+              maxWidth: 840
+            }}>
             Use this shell to surface named browser profiles, active sessions, and manual-login workflows.
           </Typography>
         </Box>
@@ -117,9 +122,16 @@ export function BrowserProfilesPanel({
           <Grid2 size={{ xs: 12, sm: 4 }}>
             <Card className="workspace-side-card">
               <CardContent sx={{ p: 1.5 }}>
-                <Stack direction="row" justifyContent="space-between" alignItems="center">
+                <Stack
+                  direction="row"
+                  sx={{
+                    justifyContent: "space-between",
+                    alignItems: "center"
+                  }}>
                   <Box>
-                    <Typography variant="body2" color="text.secondary">
+                    <Typography variant="body2" sx={{
+                      color: "text.secondary"
+                    }}>
                       Running
                     </Typography>
                     <Typography variant="h5" sx={{ fontWeight: 700 }}>
@@ -134,9 +146,16 @@ export function BrowserProfilesPanel({
           <Grid2 size={{ xs: 12, sm: 4 }}>
             <Card className="workspace-side-card">
               <CardContent sx={{ p: 1.5 }}>
-                <Stack direction="row" justifyContent="space-between" alignItems="center">
+                <Stack
+                  direction="row"
+                  sx={{
+                    justifyContent: "space-between",
+                    alignItems: "center"
+                  }}>
                   <Box>
-                    <Typography variant="body2" color="text.secondary">
+                    <Typography variant="body2" sx={{
+                      color: "text.secondary"
+                    }}>
                       Locked
                     </Typography>
                     <Typography variant="h5" sx={{ fontWeight: 700 }}>
@@ -151,9 +170,16 @@ export function BrowserProfilesPanel({
           <Grid2 size={{ xs: 12, sm: 4 }}>
             <Card className="workspace-side-card">
               <CardContent sx={{ p: 1.5 }}>
-                <Stack direction="row" justifyContent="space-between" alignItems="center">
+                <Stack
+                  direction="row"
+                  sx={{
+                    justifyContent: "space-between",
+                    alignItems: "center"
+                  }}>
                   <Box>
-                    <Typography variant="body2" color="text.secondary">
+                    <Typography variant="body2" sx={{
+                      color: "text.secondary"
+                    }}>
                       Managed
                     </Typography>
                     <Typography variant="h5" sx={{ fontWeight: 700 }}>
@@ -172,12 +198,20 @@ export function BrowserProfilesPanel({
             <Card className="workspace-side-card">
               <CardContent sx={{ p: 1.5 }}>
                 <Stack spacing={1.2}>
-                  <Stack direction="row" justifyContent="space-between" alignItems="center" gap={1}>
+                  <Stack
+                    direction="row"
+                    sx={{
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      gap: 1
+                    }}>
                     <Box>
                       <Typography variant="h6" sx={{ fontWeight: 650 }}>
                         Profile inventory
                       </Typography>
-                      <Typography variant="body2" color="text.secondary">
+                      <Typography variant="body2" sx={{
+                        color: "text.secondary"
+                      }}>
                         Managed and manual profiles in one list.
                       </Typography>
                     </Box>
@@ -190,7 +224,9 @@ export function BrowserProfilesPanel({
                       <Typography variant="subtitle1" sx={{ fontWeight: 650, mb: 0.5 }}>
                         No browser profiles yet
                       </Typography>
-                      <Typography variant="body2" color="text.secondary">
+                      <Typography variant="body2" sx={{
+                        color: "text.secondary"
+                      }}>
                         Create a profile to isolate logins, cookies, and manual-login handoffs.
                       </Typography>
                     </Box>
@@ -212,21 +248,33 @@ export function BrowserProfilesPanel({
                             }}
                           >
                             <Stack spacing={0.75} sx={{ width: "100%" }}>
-                              <Stack direction="row" justifyContent="space-between" alignItems="center" gap={1}>
+                              <Stack
+                                direction="row"
+                                sx={{
+                                  justifyContent: "space-between",
+                                  alignItems: "center",
+                                  gap: 1
+                                }}>
                                 <Box sx={{ minWidth: 0 }}>
                                   <Typography variant="subtitle2" sx={{ fontWeight: 650 }} noWrap>
                                     {profile.name}
                                   </Typography>
-                                  <Typography variant="caption" color="text.secondary" noWrap>
+                                  <Typography variant="caption" noWrap sx={{
+                                    color: "text.secondary"
+                                  }}>
                                     {profile.browser} {profile.target ? `| ${profile.target}` : ""}
                                   </Typography>
                                 </Box>
-                                <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                                <Stack direction="row" spacing={0.75} useFlexGap sx={{
+                                  flexWrap: "wrap"
+                                }}>
                                   {profile.default ? <Chip size="small" label="Default" color="info" /> : null}
                                   <Chip size="small" color={statusTone(profile.status)} label={statusLabel(profile.status)} />
                                 </Stack>
                               </Stack>
-                              <Typography variant="body2" color="text.secondary">
+                              <Typography variant="body2" sx={{
+                                color: "text.secondary"
+                              }}>
                                 {profile.detail || "No profile detail supplied yet."}
                               </Typography>
                             </Stack>
@@ -249,25 +297,35 @@ export function BrowserProfilesPanel({
                       <Typography variant="h6" sx={{ fontWeight: 650 }}>
                         Profile details
                       </Typography>
-                      <Typography variant="body2" color="text.secondary">
+                      <Typography variant="body2" sx={{
+                        color: "text.secondary"
+                      }}>
                         Launch, stop, or hand off manual login for the selected profile.
                       </Typography>
                     </Box>
 
-                    <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                    <Stack direction="row" spacing={0.75} useFlexGap sx={{
+                      flexWrap: "wrap"
+                    }}>
                       <Chip size="small" variant="outlined" label={selected.browser} />
                       <Chip size="small" color={statusTone(selected.status)} label={statusLabel(selected.status)} />
                       {selected.managed ? <Chip size="small" variant="outlined" label="Managed" /> : null}
                     </Stack>
 
-                    <Typography variant="body2" color="text.secondary">
+                    <Typography variant="body2" sx={{
+                      color: "text.secondary"
+                    }}>
                       Last launch {formatDate(selected.last_launch_at)}.
                     </Typography>
-                    <Typography variant="body2" color="text.secondary">
+                    <Typography variant="body2" sx={{
+                      color: "text.secondary"
+                    }}>
                       Active sessions: {selected.session_count || 0}
                     </Typography>
 
-                    <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                    <Stack direction="row" spacing={0.75} useFlexGap sx={{
+                      flexWrap: "wrap"
+                    }}>
                       <Button variant="contained" size="small" onClick={() => onLaunchProfile?.(selected.id)}>
                         Launch
                       </Button>
@@ -288,7 +346,9 @@ export function BrowserProfilesPanel({
                     <Typography variant="subtitle1" sx={{ fontWeight: 650, mb: 0.5 }}>
                       No profile selected
                     </Typography>
-                    <Typography variant="body2" color="text.secondary">
+                    <Typography variant="body2" sx={{
+                      color: "text.secondary"
+                    }}>
                       Select a browser profile to manage launch and login flow.
                     </Typography>
                   </Box>
@@ -347,7 +407,9 @@ export function BrowserProfilesPanel({
                     Active sessions
                   </Typography>
                   {sessions.length === 0 ? (
-                    <Typography variant="body2" color="text.secondary">
+                    <Typography variant="body2" sx={{
+                      color: "text.secondary"
+                    }}>
                       No browser sessions are active right now.
                     </Typography>
                   ) : (
@@ -358,7 +420,9 @@ export function BrowserProfilesPanel({
                             <Typography variant="body2" sx={{ fontWeight: 600 }}>
                               {session.title || session.id}
                             </Typography>
-                            <Typography variant="caption" color="text.secondary">
+                            <Typography variant="caption" sx={{
+                              color: "text.secondary"
+                            }}>
                               {session.status} {session.url ? `| ${session.url}` : ""}
                             </Typography>
                           </Stack>

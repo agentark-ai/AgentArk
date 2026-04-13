@@ -103,7 +103,13 @@ export function AgentStatusBar({
         py: { xs: 1.0, md: 1.1 },
       }}
     >
-      <Stack direction="row" justifyContent="space-between" spacing={1} alignItems="flex-start">
+      <Stack
+        direction="row"
+        spacing={1}
+        sx={{
+          justifyContent: "space-between",
+          alignItems: "flex-start"
+        }}>
         <Stack spacing={0.45} sx={{ minWidth: 0, flex: 1 }}>
           <Typography
             variant="overline"
@@ -111,7 +117,9 @@ export function AgentStatusBar({
           >
             System Posture
           </Typography>
-          <Stack direction="row" alignItems="center" spacing={1}>
+          <Stack direction="row" spacing={1} sx={{
+            alignItems: "center"
+          }}>
             <Box
               sx={{
                 width: 10,
@@ -131,7 +139,12 @@ export function AgentStatusBar({
               {label}
             </Typography>
           </Stack>
-          <Typography variant="caption" color="text.secondary" sx={{ lineHeight: 1.45 }}>
+          <Typography
+            variant="caption"
+            sx={{
+              color: "text.secondary",
+              lineHeight: 1.45
+            }}>
             Live reasoning posture, queue pressure, model readiness, and runtime health.
           </Typography>
         </Stack>
@@ -153,21 +166,19 @@ export function AgentStatusBar({
           {agentPaused ? "Paused" : "Ready"}
         </Box>
       </Stack>
-
       <Stack spacing={0.75}>
         {postureItems.map((item) => (
           <Stack
             key={item.label}
             direction="row"
             spacing={1}
-            justifyContent="space-between"
-            alignItems="center"
             className="mission-metric-card mission-metric-card--rail"
             sx={{
+              justifyContent: "space-between",
+              alignItems: "center",
               px: 1.1,
-              py: 0.75,
-            }}
-          >
+              py: 0.75
+            }}>
             <Box sx={{ minWidth: 0, flex: 1 }}>
               <Typography
                 variant="caption"
@@ -189,18 +200,25 @@ export function AgentStatusBar({
           </Stack>
         ))}
       </Stack>
-
       <Stack spacing={0.7} sx={{ pt: 0.2 }}>
-        <Stack direction="row" spacing={1.2} useFlexGap flexWrap="wrap">
+        <Stack direction="row" spacing={1.2} useFlexGap sx={{
+          flexWrap: "wrap"
+        }}>
           {status ? (
             <>
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: "text.secondary"
+              }}>
                 {status.memory_entries} memories
               </Typography>
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: "text.secondary"
+              }}>
                 {status.skills_loaded ?? status.actions_loaded ?? 0} skills
               </Typography>
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: "text.secondary"
+              }}>
                 RTT {serverStatus?.rtt_ms ?? "-"}ms
               </Typography>
             </>

@@ -328,13 +328,27 @@ export function LiveEventConsole({ history, events = [], compact = false, onHide
           overflow: "hidden",
         }}
       >
-        <Stack direction={{ xs: "column", sm: "row" }} justifyContent="space-between" alignItems={{ xs: "flex-start", sm: "flex-start" }} spacing={1.25} className="live-console-header">
+        <Stack
+          direction={{ xs: "column", sm: "row" }}
+          spacing={1.25}
+          className="live-console-header"
+          sx={{
+            justifyContent: "space-between",
+            alignItems: { xs: "flex-start", sm: "flex-start" }
+          }}>
           <Stack spacing={0.7} sx={{ minWidth: 0 }}>
             <Typography className="live-console-eyebrow">AgentArk</Typography>
             <Typography className="live-console-title">Execution Console</Typography>
             <Typography className="live-console-copy">{stageDetail}</Typography>
           </Stack>
-          <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+          <Stack
+            direction="row"
+            spacing={1}
+            useFlexGap
+            sx={{
+              alignItems: "center",
+              flexWrap: "wrap"
+            }}>
             {onHideAdvanced ? (
               <Button
                 size="small"
@@ -389,18 +403,21 @@ export function LiveEventConsole({ history, events = [], compact = false, onHide
                 key={entry.id}
                 direction="row"
                 spacing={1.25}
-                alignItems="stretch"
                 className={`live-console-entry tone-${entry.tone}`}
+                sx={{
+                  alignItems: "stretch"
+                }}
               >
                 <Box className="live-console-entry-rail" />
                 <Stack spacing={0.45} sx={{ flex: 1, minWidth: 0 }} className="live-console-entry-main">
                   <Stack
                     direction={{ xs: "column", sm: "row" }}
                     spacing={0.75}
-                    justifyContent="space-between"
-                    alignItems={{ xs: "flex-start", sm: "center" }}
                     className="live-console-entry-head"
-                  >
+                    sx={{
+                      justifyContent: "space-between",
+                      alignItems: { xs: "flex-start", sm: "center" }
+                    }}>
                     <Typography className="live-console-entry-title">{entry.title}</Typography>
                     <Typography className="live-console-entry-time">{entry.timestamp}</Typography>
                   </Stack>

@@ -285,12 +285,20 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
         }}
       >
         <Stack spacing={1}>
-          <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={1}>
+          <Stack
+            direction="row"
+            spacing={1}
+            sx={{
+              alignItems: "center",
+              justifyContent: "space-between"
+            }}>
             <Box sx={{ minWidth: 0 }}>
               <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
                 {pack.manifest.name}
               </Typography>
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: "text.secondary"
+              }}>
                 {pack.manifest.kind.replace(/_/g, " ")}
               </Typography>
             </Box>
@@ -301,10 +309,17 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
               sx={{ color: accent.chip, borderColor: accent.chip }}
             />
           </Stack>
-          <Typography variant="caption" color="text.secondary" sx={{ lineHeight: 1.5 }}>
+          <Typography
+            variant="caption"
+            sx={{
+              color: "text.secondary",
+              lineHeight: 1.5
+            }}>
             {pack.manifest.description || "No description provided."}
           </Typography>
-          <Stack direction="row" spacing={0.75} flexWrap="wrap" useFlexGap>
+          <Stack direction="row" spacing={0.75} useFlexGap sx={{
+            flexWrap: "wrap"
+          }}>
             <Chip size="small" label={`${pack.feature_summaries.length} features`} variant="outlined" />
             <Chip size="small" label={pack.trust_level.replace(/_/g, " ")} variant="outlined" />
             <Chip size="small" label={pack.verification_status.replace(/_/g, " ")} variant="outlined" />
@@ -312,21 +327,32 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
             {pack.manifest.draft ? <Chip size="small" label="draft" variant="outlined" /> : null}
           </Stack>
           {pack.verification_detail ? (
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: "text.secondary"
+            }}>
               {pack.verification_detail}
             </Typography>
           ) : null}
           {pack.status_detail ? (
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: "text.secondary"
+            }}>
               {pack.status_detail}
             </Typography>
           ) : null}
           {installedPack && pack.supports_webhook && pack.webhook_path ? (
-            <Typography variant="caption" color="text.secondary" sx={{ wordBreak: "break-all" }}>
+            <Typography
+              variant="caption"
+              sx={{
+                color: "text.secondary",
+                wordBreak: "break-all"
+              }}>
               Webhook: {`${window.location.origin}${pack.webhook_path}`}
             </Typography>
           ) : null}
-          <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+          <Stack direction="row" spacing={1} useFlexGap sx={{
+            flexWrap: "wrap"
+          }}>
             {!installedPack ? (
               <Button
                 size="small"
@@ -386,7 +412,9 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
               </>
             )}
           </Stack>
-          <Stack direction="row" spacing={0.75} flexWrap="wrap" useFlexGap>
+          <Stack direction="row" spacing={0.75} useFlexGap sx={{
+            flexWrap: "wrap"
+          }}>
             {pack.feature_summaries.slice(0, 4).map((feature) => (
               <Chip
                 key={`${pack.manifest.id}-${feature.id}`}
@@ -408,12 +436,15 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
           <Stack
             direction={{ xs: "column", sm: "row" }}
             spacing={1}
-            justifyContent="space-between"
-            alignItems={{ xs: "stretch", sm: "center" }}
-          >
+            sx={{
+              justifyContent: "space-between",
+              alignItems: { xs: "stretch", sm: "center" }
+            }}>
             <Box>
               <Typography variant="subtitle2">{sectionTitle}</Typography>
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: "text.secondary"
+              }}>
                 {sectionSubtitle}
               </Typography>
             </Box>
@@ -450,7 +481,9 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
           {packsQ.data?.not_found ? (
             <Stack spacing={0.75}>
               {packsQ.data.next_steps.map((step) => (
-                <Typography key={step} variant="caption" color="text.secondary">
+                <Typography key={step} variant="caption" sx={{
+                  color: "text.secondary"
+                }}>
                   {step}
                 </Typography>
               ))}
@@ -458,7 +491,9 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
           ) : null}
           {installed.length > 0 ? (
             <Stack spacing={1}>
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: "text.secondary"
+              }}>
                 Installed
               </Typography>
               <Stack spacing={1}>{installed.map((pack) => renderPackCard(pack, true))}</Stack>
@@ -466,7 +501,9 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
           ) : null}
           {catalog.length > 0 ? (
             <Stack spacing={1}>
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: "text.secondary"
+              }}>
                 Catalog
               </Typography>
               <Stack spacing={1}>{catalog.map((pack) => renderPackCard(pack, false))}</Stack>
@@ -474,12 +511,13 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
           ) : null}
         </Stack>
       </Box>
-
       <Dialog open={linkDialogOpen} onClose={() => setLinkDialogOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>Install pack from link or local path</DialogTitle>
         <DialogContent sx={{ pt: 1 }}>
           <Stack spacing={1.5}>
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: "text.secondary"
+            }}>
               Use this when you already have a manifest URL, raw manifest path, or local bundle path. Non-bundled sources install as unverified packs unless publisher verification succeeds.
             </Typography>
             <TextField
@@ -526,12 +564,13 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
           </Button>
         </DialogActions>
       </Dialog>
-
       <Dialog open={uploadDialogOpen} onClose={() => setUploadDialogOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>Upload manifest or bundle</DialogTitle>
         <DialogContent sx={{ pt: 1 }}>
           <Stack spacing={1.5}>
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: "text.secondary"
+            }}>
               Upload a manifest JSON/YAML file or a zip bundle containing one of the expected manifest names.
             </Typography>
             <Button variant="outlined" component="label">
@@ -562,7 +601,6 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
           </Button>
         </DialogActions>
       </Dialog>
-
       <Dialog
         open={scaffoldDialogOpen}
         onClose={() => setScaffoldDialogOpen(false)}
@@ -572,7 +610,9 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
         <DialogTitle>Scaffold draft pack</DialogTitle>
         <DialogContent sx={{ pt: 1 }}>
           <Stack spacing={1.5}>
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: "text.secondary"
+            }}>
               Draft packs are local and unverified by default. Start read-only when possible, then replace placeholder bindings after review.
             </Typography>
             <TextField
@@ -608,7 +648,9 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
               onChange={(event) => setScaffoldDocsUrl(event.target.value)}
             />
             <Divider flexItem />
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: "text.secondary"
+            }}>
               Optional import source. If you provide an OpenAPI URL, OpenAPI text, or a sample curl command, the draft pack will be generated with executable HTTP bindings instead of placeholder bindings.
             </Typography>
             <TextField
@@ -666,7 +708,6 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
           </Button>
         </DialogActions>
       </Dialog>
-
       <Dialog open={!!connectPack} onClose={() => setConnectPack(null)} maxWidth="sm" fullWidth>
         <DialogTitle>{connectPack ? `Connect ${connectPack.manifest.name}` : "Connect pack"}</DialogTitle>
         <DialogContent sx={{ pt: 1 }}>
@@ -674,10 +715,14 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
             {connectError ? <Alert severity="error">{connectError}</Alert> : null}
             {connectDetailQ.data?.connections?.length ? (
               <Stack spacing={1}>
-                <Typography variant="caption" color="text.secondary">
+                <Typography variant="caption" sx={{
+                  color: "text.secondary"
+                }}>
                   Existing connections
                 </Typography>
-                <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+                <Stack direction="row" spacing={1} useFlexGap sx={{
+                  flexWrap: "wrap"
+                }}>
                   {connectDetailQ.data.connections.map((item) => (
                     <Button
                       key={item.connection.id}
@@ -705,7 +750,9 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
                 </Stack>
               </Stack>
             ) : null}
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: "text.secondary"
+            }}>
               {
                 "Save a connection secret as JSON. Examples: {\"api_key\":\"...\"} for API-key packs or {\"username\":\"...\",\"password\":\"...\"} for basic-auth packs."
               }
@@ -754,13 +801,17 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
           </Button>
         </DialogActions>
       </Dialog>
-
       <Dialog open={!!eventsPack} onClose={() => setEventsPack(null)} maxWidth="md" fullWidth>
         <DialogTitle>{eventsPack ? `${eventsPack.manifest.name} inbound events` : "Inbound events"}</DialogTitle>
         <DialogContent sx={{ pt: 1 }}>
           <Stack spacing={1.25}>
             {eventsPack?.webhook_path ? (
-              <Typography variant="caption" color="text.secondary" sx={{ wordBreak: "break-all" }}>
+              <Typography
+                variant="caption"
+                sx={{
+                  color: "text.secondary",
+                  wordBreak: "break-all"
+                }}>
                 {`${window.location.origin}${eventsPack.webhook_path}`}
               </Typography>
             ) : null}
@@ -783,21 +834,29 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
                 }}
               >
                 <Stack spacing={0.75}>
-                  <Stack direction="row" spacing={0.75} flexWrap="wrap" useFlexGap>
+                  <Stack direction="row" spacing={0.75} useFlexGap sx={{
+                    flexWrap: "wrap"
+                  }}>
                     <Chip size="small" label={event.event_type} variant="outlined" />
                     <Chip size="small" label={event.status} variant="outlined" />
                     <Chip size="small" label={event.transport} variant="outlined" />
                   </Stack>
-                  <Typography variant="caption" color="text.secondary">
+                  <Typography variant="caption" sx={{
+                    color: "text.secondary"
+                  }}>
                     {new Date(event.received_at).toLocaleString()}
                   </Typography>
                   {event.outcome ? (
-                    <Typography variant="caption" color="text.secondary">
+                    <Typography variant="caption" sx={{
+                      color: "text.secondary"
+                    }}>
                       {event.outcome}
                     </Typography>
                   ) : null}
                   {event.response_preview ? (
-                    <Typography variant="caption" color="text.secondary">
+                    <Typography variant="caption" sx={{
+                      color: "text.secondary"
+                    }}>
                       {event.response_preview}
                     </Typography>
                   ) : null}

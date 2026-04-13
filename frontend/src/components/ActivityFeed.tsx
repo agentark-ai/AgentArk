@@ -62,12 +62,19 @@ export function ActivityFeed({ traces, onViewAll }: Props) {
     <Card className="mission-panel mission-panel--lower mission-panel--adaptive">
       <CardContent sx={{ p: 1.55, display: "flex", flexDirection: "column" }}>
         <Stack spacing={1} className="mission-panel-content">
-          <Stack direction="row" justifyContent="space-between" alignItems="center">
+          <Stack
+            direction="row"
+            sx={{
+              justifyContent: "space-between",
+              alignItems: "center"
+            }}>
             <Box>
               <Typography variant="h6" sx={{ fontWeight: 700 }}>
                 Runtime Activity
               </Typography>
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: "text.secondary"
+              }}>
                 Recent supervised runs and operator-visible outcomes.
               </Typography>
             </Box>
@@ -80,7 +87,9 @@ export function ActivityFeed({ traces, onViewAll }: Props) {
 
           {items.length === 0 ? (
             <Box className="mission-empty-copy">
-              <Typography variant="body2" color="text.secondary">
+              <Typography variant="body2" sx={{
+                color: "text.secondary"
+              }}>
                 No recent activity.
               </Typography>
             </Box>
@@ -97,12 +106,21 @@ export function ActivityFeed({ traces, onViewAll }: Props) {
                     background: "linear-gradient(180deg, rgba(24, 24, 28, 0.92), rgba(15, 15, 18, 0.88))",
                   }}
                 >
-                  <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between">
+                  <Stack
+                    direction="row"
+                    spacing={1}
+                    sx={{
+                      alignItems: "center",
+                      justifyContent: "space-between"
+                    }}>
                     <Typography
                       variant="caption"
-                      color="text.secondary"
-                      sx={{ flexShrink: 0, minWidth: 62, fontFamily: "JetBrains Mono, monospace" }}
-                    >
+                      sx={{
+                        color: "text.secondary",
+                        flexShrink: 0,
+                        minWidth: 62,
+                        fontFamily: "JetBrains Mono, monospace"
+                      }}>
                       {relativeTime(trace.started_at)}
                     </Typography>
                     <Typography
@@ -125,19 +143,40 @@ export function ActivityFeed({ traces, onViewAll }: Props) {
                   <Collapse in={expandedId === trace.id}>
                     <Box sx={{ mt: 0.75, pl: 1, borderLeft: "2px solid rgba(255, 255, 255, 0.12)" }}>
                       {trace.duration_ms != null ? (
-                        <Typography variant="caption" color="text.secondary" display="block">
+                        <Typography
+                          variant="caption"
+                          sx={{
+                            color: "text.secondary",
+                            display: "block"
+                          }}>
                           Completed in {trace.duration_ms}ms
                         </Typography>
                       ) : null}
-                      <Typography variant="caption" color="text.secondary" display="block">
+                      <Typography
+                        variant="caption"
+                        sx={{
+                          color: "text.secondary",
+                          display: "block"
+                        }}>
                         {trace.step_count} step{trace.step_count !== 1 ? "s" : ""} executed
                       </Typography>
                       {trace.channel ? (
-                        <Typography variant="caption" color="text.secondary" display="block">
+                        <Typography
+                          variant="caption"
+                          sx={{
+                            color: "text.secondary",
+                            display: "block"
+                          }}>
                           Channel: {trace.channel}
                         </Typography>
                       ) : null}
-                      <Typography variant="caption" color="text.secondary" display="block" mt={0.25}>
+                      <Typography
+                        variant="caption"
+                        sx={{
+                          color: "text.secondary",
+                          display: "block",
+                          mt: 0.25
+                        }}>
                         {trace.message_preview}
                       </Typography>
                     </Box>

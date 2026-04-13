@@ -85,18 +85,29 @@ export function InboxPane({ tasks, notifications, onNavigateToView }: Props) {
         <Typography variant="h4" sx={{ fontWeight: 700, letterSpacing: 0, mb: 0.45 }}>
           Human input, blocked work, and alerts.
         </Typography>
-        <Typography variant="body2" color="text.secondary" sx={{ maxWidth: 860 }}>
+        <Typography
+          variant="body2"
+          sx={{
+            color: "text.secondary",
+            maxWidth: 860
+          }}>
           Keep approvals, failures, pauses, and unread alerts together. The agent can keep running in chat while
           the inbox stays focused on what needs your attention.
         </Typography>
-        <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" sx={{ mt: 1.2 }}>
+        <Stack
+          direction="row"
+          spacing={0.75}
+          useFlexGap
+          sx={{
+            flexWrap: "wrap",
+            mt: 1.2
+          }}>
           <Chip size="small" color="warning" label={`${waitingTasks.length} waiting`} />
           <Chip size="small" color="info" label={`${runningTasks.length} running`} />
           <Chip size="small" color={failedTasks.length > 0 ? "error" : "default"} label={`${failedTasks.length} failed`} />
           <Chip size="small" color={unreadNotifications.length > 0 ? "warning" : "default"} label={`${unreadNotifications.length} unread alerts`} />
         </Stack>
       </Box>
-
       <Box className="inbox-grid">
         <Card className="workspace-side-card">
           <CardContent sx={{ p: 1.5 }}>
@@ -105,20 +116,31 @@ export function InboxPane({ tasks, notifications, onNavigateToView }: Props) {
                 Waiting for you
               </Typography>
               {waitingTasks.length === 0 ? (
-                <Typography variant="body2" color="text.secondary">
+                <Typography variant="body2" sx={{
+                  color: "text.secondary"
+                }}>
                   No paused or approval-gated tasks right now.
                 </Typography>
               ) : (
                 waitingTasks.slice(0, 6).map((task) => (
                   <Box key={task.id} className="action-row">
                     <Stack spacing={0.5}>
-                      <Stack direction="row" spacing={0.75} alignItems="center" useFlexGap flexWrap="wrap">
+                      <Stack
+                        direction="row"
+                        spacing={0.75}
+                        useFlexGap
+                        sx={{
+                          alignItems: "center",
+                          flexWrap: "wrap"
+                        }}>
                         <Chip size="small" variant="outlined" color="warning" label={formatStatus(task)} />
                         <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap title={task.description}>
                           {task.description || "Task"}
                         </Typography>
                       </Stack>
-                      <Typography variant="caption" color="text.secondary">
+                      <Typography variant="caption" sx={{
+                        color: "text.secondary"
+                      }}>
                         Created {formatWhen(task.created_at)}
                       </Typography>
                     </Stack>
@@ -139,14 +161,23 @@ export function InboxPane({ tasks, notifications, onNavigateToView }: Props) {
                 Runs to watch
               </Typography>
               {runningTasks.length === 0 && failedTasks.length === 0 ? (
-                <Typography variant="body2" color="text.secondary">
+                <Typography variant="body2" sx={{
+                  color: "text.secondary"
+                }}>
                   Nothing urgent in the run queue.
                 </Typography>
               ) : (
                 [...runningTasks, ...failedTasks].slice(0, 8).map((task) => (
                   <Box key={task.id} className="action-row">
                     <Stack spacing={0.5}>
-                      <Stack direction="row" spacing={0.75} alignItems="center" useFlexGap flexWrap="wrap">
+                      <Stack
+                        direction="row"
+                        spacing={0.75}
+                        useFlexGap
+                        sx={{
+                          alignItems: "center",
+                          flexWrap: "wrap"
+                        }}>
                         <Chip
                           size="small"
                           variant="outlined"
@@ -157,7 +188,9 @@ export function InboxPane({ tasks, notifications, onNavigateToView }: Props) {
                           {task.description || "Task"}
                         </Typography>
                       </Stack>
-                      <Typography variant="caption" color="text.secondary">
+                      <Typography variant="caption" sx={{
+                        color: "text.secondary"
+                      }}>
                         Created {formatWhen(task.created_at)}
                       </Typography>
                     </Stack>
@@ -183,14 +216,23 @@ export function InboxPane({ tasks, notifications, onNavigateToView }: Props) {
                 Unread alerts
               </Typography>
               {unreadNotifications.length === 0 ? (
-                <Typography variant="body2" color="text.secondary">
+                <Typography variant="body2" sx={{
+                  color: "text.secondary"
+                }}>
                   Inbox is clear.
                 </Typography>
               ) : (
                 unreadNotifications.map((notification) => (
                   <Box key={notification.id} className="action-row">
                     <Stack spacing={0.5}>
-                      <Stack direction="row" spacing={0.75} alignItems="center" useFlexGap flexWrap="wrap">
+                      <Stack
+                        direction="row"
+                        spacing={0.75}
+                        useFlexGap
+                        sx={{
+                          alignItems: "center",
+                          flexWrap: "wrap"
+                        }}>
                         <Chip
                           size="small"
                           color={
@@ -205,11 +247,23 @@ export function InboxPane({ tasks, notifications, onNavigateToView }: Props) {
                           {notification.title || "Notification"}
                         </Typography>
                       </Stack>
-                      <Typography variant="caption" color="text.secondary" sx={{ display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>
+                      <Typography
+                        variant="caption"
+                        sx={{
+                          color: "text.secondary",
+                          display: "-webkit-box",
+                          WebkitLineClamp: 2,
+                          WebkitBoxOrient: "vertical",
+                          overflow: "hidden"
+                        }}>
                         {notification.body}
                       </Typography>
-                      <Stack direction="row" spacing={1} alignItems="center">
-                        <Typography variant="caption" color="text.secondary">
+                      <Stack direction="row" spacing={1} sx={{
+                        alignItems: "center"
+                      }}>
+                        <Typography variant="caption" sx={{
+                          color: "text.secondary"
+                        }}>
                           {formatWhen(notification.created_at)}
                         </Typography>
                         <Button

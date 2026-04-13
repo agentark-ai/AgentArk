@@ -9,7 +9,7 @@ import {
   DialogActions,
   DialogContent,
   DialogTitle,
-  Grid2,
+  Grid as Grid2,
   MenuItem,
   Stack,
   TextField,
@@ -887,7 +887,13 @@ function SectionShell({
           <Typography variant="h6" sx={{ fontWeight: 800 }}>
             {title}
           </Typography>
-          <Typography variant="body2" color="text.secondary" sx={{ mt: 0.35, maxWidth: 860 }}>
+          <Typography
+            variant="body2"
+            sx={{
+              color: "text.secondary",
+              mt: 0.35,
+              maxWidth: 860
+            }}>
             {detail}
           </Typography>
         </Box>
@@ -915,19 +921,28 @@ function RunCard({ run, live = false }: { run: SwarmRun; live?: boolean }) {
       <Stack spacing={1.2}>
         <Stack
           direction={{ xs: "column", md: "row" }}
-          alignItems={{ xs: "flex-start", md: "center" }}
-          justifyContent="space-between"
-          gap={1}
-        >
+          sx={{
+            alignItems: { xs: "flex-start", md: "center" },
+            justifyContent: "space-between",
+            gap: 1
+          }}>
           <Box sx={{ minWidth: 0 }}>
             <Typography variant="body1" sx={{ fontWeight: 700 }}>
               {run.request}
             </Typography>
-            <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.35 }}>
+            <Typography
+              variant="caption"
+              sx={{
+                color: "text.secondary",
+                display: "block",
+                mt: 0.35
+              }}>
               {run.summary || "Delegated run details available below."}
             </Typography>
           </Box>
-          <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+          <Stack direction="row" spacing={0.75} useFlexGap sx={{
+            flexWrap: "wrap"
+          }}>
             <Chip size="small" color={statusChipColor(run.status)} label={statusChipLabel(run.status)} />
             <Chip
               size="small"
@@ -938,7 +953,9 @@ function RunCard({ run, live = false }: { run: SwarmRun; live?: boolean }) {
           </Stack>
         </Stack>
 
-        <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+        <Stack direction="row" spacing={0.75} useFlexGap sx={{
+          flexWrap: "wrap"
+        }}>
           {run.startedAt ? (
             <Chip size="small" variant="outlined" label={`Started ${formatTimestamp(run.startedAt)}`} />
           ) : null}
@@ -965,21 +982,26 @@ function RunCard({ run, live = false }: { run: SwarmRun; live?: boolean }) {
                 <Stack spacing={0.75}>
                   <Stack
                     direction={{ xs: "column", sm: "row" }}
-                    alignItems={{ xs: "flex-start", sm: "center" }}
-                    justifyContent="space-between"
-                    gap={0.75}
-                  >
+                    sx={{
+                      alignItems: { xs: "flex-start", sm: "center" },
+                      justifyContent: "space-between",
+                      gap: 0.75
+                    }}>
                     <Box sx={{ minWidth: 0 }}>
                       <Typography variant="body2" sx={{ fontWeight: 700 }}>
                         {agent.agentRole
                           ? `${agent.agentName} · ${agent.agentRole}`
                           : agent.agentName}
                       </Typography>
-                      <Typography variant="caption" color="text.secondary">
+                      <Typography variant="caption" sx={{
+                        color: "text.secondary"
+                      }}>
                         {agent.modelName || (agent.isSpecialist ? "Specialist model" : "Auto agent")}
                       </Typography>
                     </Box>
-                    <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                    <Stack direction="row" spacing={0.75} useFlexGap sx={{
+                      flexWrap: "wrap"
+                    }}>
                       <Chip
                         size="small"
                         color={statusChipColor(agent.status)}
@@ -1001,7 +1023,9 @@ function RunCard({ run, live = false }: { run: SwarmRun; live?: boolean }) {
                       {agent.task}
                     </Typography>
                   ) : null}
-                  <Typography variant="caption" color="text.secondary">
+                  <Typography variant="caption" sx={{
+                    color: "text.secondary"
+                  }}>
                     {agent.latestUpdate || agent.summary || "No extra detail recorded."}
                   </Typography>
                 </Stack>
@@ -1122,7 +1146,13 @@ function AccessScopeSelect({
                 {option.label}
               </Typography>
               {option.helper ? (
-                <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.2 }}>
+                <Typography
+                  variant="caption"
+                  sx={{
+                    color: "text.secondary",
+                    display: "block",
+                    mt: 0.2
+                  }}>
                   {option.helper}
                 </Typography>
               ) : null}
@@ -1138,10 +1168,10 @@ function AccessScopeSelect({
           </Box>
         );
       }}
-      renderTags={(value, getTagProps) =>
+      renderValue={(value, getItemProps) =>
         value.map((option, index) => (
           <Chip
-            {...getTagProps({ index })}
+            {...getItemProps({ index })}
             key={option.id}
             size="small"
             variant="outlined"
@@ -1520,16 +1550,15 @@ export function SwarmManager({ autoRefresh }: Props) {
             direction="row"
             spacing={0.75}
             useFlexGap
-            flexWrap="wrap"
-            alignItems="center"
             sx={{
+              flexWrap: "wrap",
+              alignItems: "center",
               p: 0.45,
               borderRadius: "8px",
               border: "1px solid rgba(108, 156, 212, 0.12)",
               background: "linear-gradient(180deg, rgba(9, 19, 35, 0.72), rgba(7, 15, 28, 0.62))",
               boxShadow: "inset 0 1px 0 rgba(148, 199, 245, 0.04)"
-            }}
-          >
+            }}>
             <Button
               size="small"
               variant="contained"
@@ -1581,7 +1610,6 @@ export function SwarmManager({ autoRefresh }: Props) {
           </Stack>
         }
       />
-
       <Box className="list-shell stat-strip">
         {[
           { label: "Active agents", value: activeAgentCount },
@@ -1595,9 +1623,7 @@ export function SwarmManager({ autoRefresh }: Props) {
           </div>
         ))}
       </Box>
-
       {queryError ? <Alert severity="error">{errMessage(queryError)}</Alert> : null}
-
       {activeRuns.length > 0 ? (
         <SectionShell
           eyebrow="Live now"
@@ -1611,7 +1637,6 @@ export function SwarmManager({ autoRefresh }: Props) {
           </Stack>
         </SectionShell>
       ) : null}
-
       {customAgents.length > 0 ? (
       <SectionShell
         eyebrow="Roster"
@@ -1621,10 +1646,13 @@ export function SwarmManager({ autoRefresh }: Props) {
         <Stack spacing={1.2}>
           <Stack
             direction={{ xs: "column", md: "row" }}
-            alignItems={{ xs: "flex-start", md: "center" }}
-            gap={1}
-          >
-            <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+            sx={{
+              alignItems: { xs: "flex-start", md: "center" },
+              gap: 1
+            }}>
+            <Stack direction="row" spacing={0.75} useFlexGap sx={{
+              flexWrap: "wrap"
+            }}>
               <Chip size="small" variant="outlined" label={`${customAgents.length} custom`} />
               {hiddenSystemCount > 0 ? (
                 <Chip size="small" variant="outlined" label={`${hiddenSystemCount} system hidden`} />
@@ -1648,21 +1676,26 @@ export function SwarmManager({ autoRefresh }: Props) {
                   <Stack spacing={1}>
                     <Stack
                       direction={{ xs: "column", sm: "row" }}
-                      alignItems={{ xs: "flex-start", sm: "center" }}
-                      justifyContent="space-between"
-                      gap={0.9}
-                    >
+                      sx={{
+                        alignItems: { xs: "flex-start", sm: "center" },
+                        justifyContent: "space-between",
+                        gap: 0.9
+                      }}>
                       <Box sx={{ minWidth: 0 }}>
                         <Typography variant="body1" sx={{ fontWeight: 700 }}>
                           {agent.agentType
                             ? `${agent.displayName} · ${agent.agentType}`
                             : agent.displayName}
                         </Typography>
-                        <Typography variant="caption" color="text.secondary">
+                        <Typography variant="caption" sx={{
+                          color: "text.secondary"
+                        }}>
                           {agent.provider} / {agent.model}
                         </Typography>
                       </Box>
-                      <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                      <Stack direction="row" spacing={0.75} useFlexGap sx={{
+                        flexWrap: "wrap"
+                      }}>
                         <Chip
                           size="small"
                           color={statusChipColor(agent.enabled ? agent.status : "disabled")}
@@ -1687,7 +1720,9 @@ export function SwarmManager({ autoRefresh }: Props) {
                       </Stack>
                     </Stack>
 
-                    <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                    <Stack direction="row" spacing={0.75} useFlexGap sx={{
+                      flexWrap: "wrap"
+                    }}>
                       {agent.capabilities.slice(0, 5).map((capability) => (
                         <Chip
                           key={`${agent.id}-${capability}`}
@@ -1710,10 +1745,19 @@ export function SwarmManager({ autoRefresh }: Props) {
                         border: "1px solid rgba(255,255,255,0.05)"
                       }}
                     >
-                      <Typography variant="caption" color="text.secondary">
+                      <Typography variant="caption" sx={{
+                        color: "text.secondary"
+                      }}>
                         Access
                       </Typography>
-                      <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" sx={{ mt: 0.75 }}>
+                      <Stack
+                        direction="row"
+                        spacing={0.75}
+                        useFlexGap
+                        sx={{
+                          flexWrap: "wrap",
+                          mt: 0.75
+                        }}>
                         {accessScopeSummary(agent.accessScope).length > 0 ? (
                           accessScopeSummary(agent.accessScope).map((summary) => (
                             <Chip key={`${agent.id}-${summary}`} size="small" variant="filled" label={summary} sx={{ height: 22 }} />
@@ -1723,7 +1767,14 @@ export function SwarmManager({ autoRefresh }: Props) {
                         )}
                       </Stack>
                       {accessScopeLabels(agent.accessScope, optionMaps).length > 0 ? (
-                        <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" sx={{ mt: 0.75 }}>
+                        <Stack
+                          direction="row"
+                          spacing={0.75}
+                          useFlexGap
+                          sx={{
+                            flexWrap: "wrap",
+                            mt: 0.75
+                          }}>
                           {accessScopeLabels(agent.accessScope, optionMaps)
                             .slice(0, 4)
                             .map((label) => (
@@ -1749,18 +1800,28 @@ export function SwarmManager({ autoRefresh }: Props) {
                         border: "1px solid rgba(255,255,255,0.05)"
                       }}
                     >
-                      <Typography variant="caption" color="text.secondary">
+                      <Typography variant="caption" sx={{
+                        color: "text.secondary"
+                      }}>
                         Latest task
                       </Typography>
                       <Typography variant="body2" sx={{ mt: 0.25, color: "rgba(231, 239, 251, 0.94)" }}>
                         {agent.lastTask || "No delegated task recorded yet."}
                       </Typography>
-                      <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.45 }}>
+                      <Typography
+                        variant="caption"
+                        sx={{
+                          color: "text.secondary",
+                          display: "block",
+                          mt: 0.45
+                        }}>
                         {agent.lastUpdate || agent.lastSummary || "This specialist is ready for new work."}
                       </Typography>
                     </Box>
 
-                    <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                    <Stack direction="row" spacing={0.75} useFlexGap sx={{
+                      flexWrap: "wrap"
+                    }}>
                       {agent.lastActivityAt ? (
                         <Chip size="small" variant="outlined" label={`Last active ${formatTimestamp(agent.lastActivityAt)}`} />
                       ) : null}
@@ -1775,7 +1836,6 @@ export function SwarmManager({ autoRefresh }: Props) {
         </Stack>
       </SectionShell>
       ) : null}
-
       {recentRuns.length > 0 ? (
         <SectionShell
           eyebrow="History"
@@ -1789,7 +1849,6 @@ export function SwarmManager({ autoRefresh }: Props) {
           </Stack>
         </SectionShell>
       ) : null}
-
       <Dialog open={createOpen} onClose={closeAgentDialog} maxWidth="md" fullWidth>
         <DialogTitle>{editingAgent ? "Edit custom agent" : "Add custom agent"}</DialogTitle>
         <DialogContent dividers>
@@ -1810,8 +1869,16 @@ export function SwarmManager({ autoRefresh }: Props) {
                 placeholder="Example: Handles Slack follow-ups, summarizes urgent threads, drafts replies, and can query our Google Workspace docs."
                 helperText="Optional for manual setup. Required only if you want AI to draft the name, role, capabilities, and system prompt."
               />
-              <Stack direction={{ xs: "column", sm: "row" }} spacing={1} justifyContent="space-between" alignItems={{ xs: "stretch", sm: "center" }}>
-                <Typography variant="caption" color="text.secondary">
+              <Stack
+                direction={{ xs: "column", sm: "row" }}
+                spacing={1}
+                sx={{
+                  justifyContent: "space-between",
+                  alignItems: { xs: "stretch", sm: "center" }
+                }}>
+                <Typography variant="caption" sx={{
+                  color: "text.secondary"
+                }}>
                   AI drafting never auto-saves. It only fills the editable fields below.
                 </Typography>
                 <Button
@@ -1889,12 +1956,21 @@ export function SwarmManager({ autoRefresh }: Props) {
                     background: "linear-gradient(180deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.02) 100%)"
                   }}
                 >
-                  <Stack direction={{ xs: "column", sm: "row" }} spacing={0.75} useFlexGap flexWrap="wrap" alignItems={{ xs: "flex-start", sm: "center" }}>
+                  <Stack
+                    direction={{ xs: "column", sm: "row" }}
+                    spacing={0.75}
+                    useFlexGap
+                    sx={{
+                      flexWrap: "wrap",
+                      alignItems: { xs: "flex-start", sm: "center" }
+                    }}>
                     <Typography variant="body2" sx={{ fontWeight: 700 }}>
                       {selectedModelProfile.label || `${formatProfileRole(selectedModelProfile.role)} profile`}
                     </Typography>
                     <Chip size="small" variant="outlined" label={formatProfileRole(selectedModelProfile.role)} />
-                    <Typography variant="caption" color="text.secondary">
+                    <Typography variant="caption" sx={{
+                      color: "text.secondary"
+                    }}>
                       Reuses your saved model setup automatically.
                     </Typography>
                   </Stack>

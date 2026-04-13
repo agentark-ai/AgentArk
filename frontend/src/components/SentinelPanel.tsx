@@ -436,7 +436,14 @@ export function SentinelPanel({
           title="Sentinel"
           description="Sentinel watches activity in the background, suggests helpful next steps, and can handle lightweight routine help automatically when you choose Auto."
           actions={
-            <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap" alignItems="flex-start">
+            <Stack
+              direction="row"
+              spacing={1}
+              useFlexGap
+              sx={{
+                flexWrap: "wrap",
+                alignItems: "flex-start"
+              }}>
               <Chip label={`${stats?.open_proposals ?? 0} open proposals`} />
               <Chip label={`${stats?.connected_services ?? 0} connected services`} />
               <Chip label={`${stats?.recent_runs ?? 0} recent runs`} />
@@ -453,11 +460,20 @@ export function SentinelPanel({
           <Alert severity="error">{errMessage(settingsQ.error || feedQ.error || traceQ.error)}</Alert>
         ) : null}
 
-        <Stack direction={{ xs: "column", xl: "row" }} spacing={1.5} alignItems="stretch">
+        <Stack direction={{ xs: "column", xl: "row" }} spacing={1.5} sx={{
+          alignItems: "stretch"
+        }}>
           <Stack spacing={1.5} sx={{ flex: 1.1 }}>
             <Box className="list-shell">
               <Stack spacing={1.25}>
-                <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap" alignItems="center">
+                <Stack
+                  direction="row"
+                  spacing={1}
+                  useFlexGap
+                  sx={{
+                    flexWrap: "wrap",
+                    alignItems: "center"
+                  }}>
                   <Typography variant="h6">How Sentinel should help</Typography>
                   <Chip
                     size="small"
@@ -466,10 +482,14 @@ export function SentinelPanel({
                   />
                   {settingsQ.data?.agent_paused ? <Chip size="small" color="warning" label="Agent paused" /> : null}
                 </Stack>
-                <Typography variant="body2" color="text.secondary">
+                <Typography variant="body2" sx={{
+                  color: "text.secondary"
+                }}>
                   {modeSummary(form.autonomy_mode)}
                 </Typography>
-                <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+                <Stack direction="row" spacing={1} useFlexGap sx={{
+                  flexWrap: "wrap"
+                }}>
                   {(["off", "assist", "auto"] as const).map((mode) => (
                     <Button
                       key={mode}
@@ -504,7 +524,9 @@ export function SentinelPanel({
                     <Alert severity="info">
                       Advanced scoring and proposal limits use the built-in defaults. This page keeps the main setup simple.
                     </Alert>
-                    <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+                    <Stack direction="row" spacing={1} useFlexGap sx={{
+                      flexWrap: "wrap"
+                    }}>
                       <Chip size="small" variant="outlined" label={`Daily run limit ${settingsQ.data?.daily_run_limit ?? 40}`} />
                       <Chip size="small" variant="outlined" label={`${stats?.connected_services ?? 0} connected services`} />
                       {settingsQ.data?.quiet_hours_start || settingsQ.data?.quiet_hours_end ? (
@@ -546,12 +568,16 @@ export function SentinelPanel({
             <Box className="list-shell">
               <Stack spacing={1}>
                 <Typography variant="h6">Current status</Typography>
-                <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+                <Stack direction="row" spacing={1} useFlexGap sx={{
+                  flexWrap: "wrap"
+                }}>
                   <Chip size="small" label={`${scan?.open_proposals ?? 0} open`} />
                   <Chip size="small" label={`${scan?.last_auto_executed ?? 0} auto-ran`} />
                   <Chip size="small" label={str(scan?.last_status, "idle")} />
                 </Stack>
-                <Typography variant="body2" color="text.secondary">
+                <Typography variant="body2" sx={{
+                  color: "text.secondary"
+                }}>
                   Last background pass: {scan?.last_completed_at ? humanTs(scan.last_completed_at).label : "waiting for the first run"}
                 </Typography>
                 {str(scan?.last_error, "").trim() ? (
@@ -562,9 +588,22 @@ export function SentinelPanel({
 
             <Box className="list-shell">
               <Stack spacing={1}>
-                <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
+                <Stack
+                  direction="row"
+                  spacing={1}
+                  sx={{
+                    justifyContent: "space-between",
+                    alignItems: "center"
+                  }}>
                   <Typography variant="h6">Background learning</Typography>
-                  <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" justifyContent="flex-end">
+                  <Stack
+                    direction="row"
+                    spacing={0.75}
+                    useFlexGap
+                    sx={{
+                      flexWrap: "wrap",
+                      justifyContent: "flex-end"
+                    }}>
                     <Chip
                       size="small"
                       color={backgroundTone(str(backgroundLearning?.status, autonomyDisabled ? "disabled" : "idle"))}
@@ -579,14 +618,18 @@ export function SentinelPanel({
                     ) : null}
                   </Stack>
                 </Stack>
-                <Typography variant="body2" color="text.secondary">
+                <Typography variant="body2" sx={{
+                  color: "text.secondary"
+                }}>
                   {str(backgroundLearning?.summary, "").trim()
                     ? str(backgroundLearning?.summary, "")
                     : autonomyDisabled
                       ? "Background learning is paused until autonomy is re-enabled."
                       : "Sentinel quietly reviews recent activity and improves memory and reuse in the background."}
                 </Typography>
-                <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+                <Stack direction="row" spacing={1} useFlexGap sx={{
+                  flexWrap: "wrap"
+                }}>
                   <Chip
                     size="small"
                     variant="outlined"
@@ -619,8 +662,17 @@ export function SentinelPanel({
                     return (
                       <Box key={key} className="action-row">
                         <Stack spacing={0.85}>
-                          <Stack direction={{ xs: "column", sm: "row" }} spacing={1} justifyContent="space-between">
-                            <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap" alignItems="center">
+                          <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{
+                            justifyContent: "space-between"
+                          }}>
+                            <Stack
+                              direction="row"
+                              spacing={1}
+                              useFlexGap
+                              sx={{
+                                flexWrap: "wrap",
+                                alignItems: "center"
+                              }}>
                               <Typography variant="subtitle2">{label}</Typography>
                               <Chip size="small" color={backgroundTone(status)} label={status} />
                               {typeof job?.changed === "boolean" ? (
@@ -632,14 +684,18 @@ export function SentinelPanel({
                             </Stack>
                           </Stack>
                           <Typography variant="body2">{formatBackgroundSummary(job)}</Typography>
-                          <Typography variant="caption" color="text.secondary">
+                          <Typography variant="caption" sx={{
+                            color: "text.secondary"
+                          }}>
                             {job?.last_started_at ? `Started ${humanTs(job.last_started_at).label}` : "Started -"}
                             {" | "}
                             {job?.last_completed_at ? `Completed ${humanTs(job.last_completed_at).label}` : "Completed -"}
                             {job?.last_error ? ` | Error: ${job.last_error}` : ""}
                           </Typography>
                           {statsEntries.length > 0 ? (
-                            <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                            <Stack direction="row" spacing={0.75} useFlexGap sx={{
+                              flexWrap: "wrap"
+                            }}>
                               {statsEntries.map(([statKey, statValue]) => (
                                 <Chip
                                   key={`${key}-${statKey}`}
@@ -655,7 +711,9 @@ export function SentinelPanel({
                     );
                   })}
                 </Stack>
-                <Typography variant="caption" color="text.secondary">
+                <Typography variant="caption" sx={{
+                  color: "text.secondary"
+                }}>
                   Reflection, memory cleanup, and pattern learning continue automatically in the background. Detailed internals are hidden here to keep this page simple.
                 </Typography>
               </Stack>
@@ -665,12 +723,19 @@ export function SentinelPanel({
           <Stack spacing={1.5} sx={{ flex: 1.4 }}>
             <Box className="list-shell">
               <Stack spacing={1}>
-                <Stack direction="row" justifyContent="space-between" alignItems="center">
+                <Stack
+                  direction="row"
+                  sx={{
+                    justifyContent: "space-between",
+                    alignItems: "center"
+                  }}>
                   <Typography variant="h6">Open proposals</Typography>
                   {feedQ.isLoading ? <CircularProgress size={18} /> : null}
                 </Stack>
                 {openProposals.length === 0 ? (
-                  <Typography variant="body2" color="text.secondary">
+                  <Typography variant="body2" sx={{
+                    color: "text.secondary"
+                  }}>
                     Nothing needs your attention right now.
                   </Typography>
                 ) : (
@@ -678,8 +743,17 @@ export function SentinelPanel({
                     {openProposals.map((proposal) => (
                       <Box key={proposal.id} className="action-row">
                         <Stack spacing={0.9}>
-                          <Stack direction={{ xs: "column", sm: "row" }} spacing={1} justifyContent="space-between">
-                            <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap" alignItems="center">
+                          <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{
+                            justifyContent: "space-between"
+                          }}>
+                            <Stack
+                              direction="row"
+                              spacing={1}
+                              useFlexGap
+                              sx={{
+                                flexWrap: "wrap",
+                                alignItems: "center"
+                              }}>
                               <Typography variant="subtitle2">{proposal.title}</Typography>
                               <Chip size="small" color={proposalTone(proposal.status)} label={proposal.status} />
                               <Chip size="small" variant="outlined" label={proposal.source_kind} />
@@ -702,10 +776,14 @@ export function SentinelPanel({
                             </Stack>
                           </Stack>
                           <Typography variant="body2">{proposal.detail}</Typography>
-                          <Typography variant="caption" color="text.secondary">
+                          <Typography variant="caption" sx={{
+                            color: "text.secondary"
+                          }}>
                             {proposal.rationale}
                           </Typography>
-                          <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+                          <Stack direction="row" spacing={1} useFlexGap sx={{
+                            flexWrap: "wrap"
+                          }}>
                             {proposal.source_label ? <Chip size="small" variant="outlined" label={proposal.source_label} /> : null}
                             {proposal.trace_id ? <Chip size="small" variant="outlined" label={`Trace ${proposal.trace_id}`} /> : null}
                             {proposal.snoozed_until ? (
@@ -724,7 +802,9 @@ export function SentinelPanel({
               <Stack spacing={1}>
                 <Typography variant="h6">Recent observations</Typography>
                 {recentObservations.length === 0 ? (
-                  <Typography variant="body2" color="text.secondary">
+                  <Typography variant="body2" sx={{
+                    color: "text.secondary"
+                  }}>
                     No recent background signals were worth surfacing.
                   </Typography>
                 ) : (
@@ -732,14 +812,23 @@ export function SentinelPanel({
                     {recentObservations.map((observation: SentinelObservation) => (
                       <Box key={observation.id} className="action-row">
                         <Stack spacing={0.75}>
-                          <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap" alignItems="center">
+                          <Stack
+                            direction="row"
+                            spacing={1}
+                            useFlexGap
+                            sx={{
+                              flexWrap: "wrap",
+                              alignItems: "center"
+                            }}>
                             <Typography variant="subtitle2">{observation.title}</Typography>
                             <Chip size="small" variant="outlined" label={observation.kind} />
                             <Chip size="small" variant="outlined" label={observation.source_kind} />
                             <Chip size="small" variant="outlined" label={`P${observation.priority}`} />
                           </Stack>
                           <Typography variant="body2">{observation.detail}</Typography>
-                          <Typography variant="caption" color="text.secondary">
+                          <Typography variant="caption" sx={{
+                            color: "text.secondary"
+                          }}>
                             {observation.source_label || "Internal signal"} | {humanTs(observation.updated_at).label}
                           </Typography>
                         </Stack>
@@ -752,14 +841,21 @@ export function SentinelPanel({
 
             <Box className="list-shell">
               <Stack spacing={1}>
-                <Stack direction="row" justifyContent="space-between" alignItems="center">
+                <Stack
+                  direction="row"
+                  sx={{
+                    justifyContent: "space-between",
+                    alignItems: "center"
+                  }}>
                   <Typography variant="h6">Recent runs</Typography>
                   <Button size="small" onClick={() => navigateToView("trace")}>
                     Open Trace
                   </Button>
                 </Stack>
                 {recentSentinelRuns.length === 0 ? (
-                  <Typography variant="body2" color="text.secondary">
+                  <Typography variant="body2" sx={{
+                    color: "text.secondary"
+                  }}>
                     No Sentinel-related traces recorded yet.
                   </Typography>
                 ) : (
@@ -767,12 +863,21 @@ export function SentinelPanel({
                     {recentSentinelRuns.slice(0, 8).map((trace) => (
                       <Box key={trace.id} className="action-row">
                         <Stack spacing={0.6}>
-                          <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap" alignItems="center">
+                          <Stack
+                            direction="row"
+                            spacing={1}
+                            useFlexGap
+                            sx={{
+                              flexWrap: "wrap",
+                              alignItems: "center"
+                            }}>
                             <Typography variant="subtitle2">{trace.message_preview}</Typography>
                             <Chip size="small" color={proposalTone(trace.status)} label={trace.status} />
                             <Chip size="small" variant="outlined" label={trace.channel} />
                           </Stack>
-                          <Typography variant="caption" color="text.secondary">
+                          <Typography variant="caption" sx={{
+                            color: "text.secondary"
+                          }}>
                             {humanTs(trace.started_at).label} | {trace.step_count} steps
                           </Typography>
                         </Stack>
@@ -785,7 +890,6 @@ export function SentinelPanel({
           </Stack>
         </Stack>
       </WorkspacePageShell>
-
       <SuggestionRunDialog
         run={run}
         open={runOpen}
