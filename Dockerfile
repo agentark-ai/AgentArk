@@ -50,7 +50,7 @@
 # Use Debian trixie here because fastembed -> ort-sys currently links against
 # ONNX Runtime binaries that require glibc 2.38 (__isoc23_* symbols). Bookworm
 # ships glibc 2.36, which causes the release link to fail in Docker builds.
-FROM rust:1.92-trixie AS builder
+FROM rust:1.94-trixie AS builder
 
 WORKDIR /app
 
