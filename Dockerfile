@@ -108,7 +108,7 @@ RUN --mount=type=cache,id=agentark-cargo-target,target=/app/target \
     fi
 
 # -- Stage 2: Frontend build --
-FROM node:20-slim AS frontend-builder
+FROM node:25-slim AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN --mount=type=cache,id=agentark-frontend-npm,target=/root/.npm \
@@ -120,7 +120,7 @@ RUN npm run build
 
 # -- Stage 3: Node.js bridges build --
 # Build node_modules here (git available), then copy only the result to runtime
-FROM node:20-slim AS node-builder
+FROM node:25-slim AS node-builder
 
 ARG INSTALL_WHATSAPP_BRIDGE=true
 ARG INSTALL_PLAYWRIGHT_RUNTIME=false
@@ -152,7 +152,7 @@ COPY bridges/playwright-bridge/index.js ./
 # -- Stage 4: Minimal runtime --
 # Keep runtime on the same Debian family so the final binary sees the same
 # glibc generation it was linked against in the builder stage.
-FROM node:20-trixie-slim
+FROM node:25-trixie-slim
 
 ARG INSTALL_PLAYWRIGHT_RUNTIME=false
 ARG INSTALL_TAILSCALE=false
