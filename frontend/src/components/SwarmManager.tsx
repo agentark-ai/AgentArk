@@ -1582,75 +1582,37 @@ export function SwarmManager({ autoRefresh }: Props) {
         }
       />
 
-      <Grid2 container spacing={1.5}>
+      <Box className="list-shell stat-strip">
         {[
-          {
-            label: "Active agents",
-            value: String(activeAgentCount),
-            tone: activeAgentCount > 0 ? "warning.main" : "text.primary"
-          },
-          {
-            label: "Custom agents",
-            value: String(totalAgentCount),
-            tone: "text.primary"
-          },
-          {
-            label: "Interrupted runs",
-            value: String(interruptedRuns),
-            tone: interruptedRuns > 0 ? "warning.light" : "text.primary"
-          },
-          {
-            label: "Failed runs",
-            value: String(failedRuns),
-            tone: failedRuns > 0 ? "error.light" : "text.primary"
-          }
-        ].map((item) => (
-          <Grid2 key={item.label} size={{ xs: 6, lg: 3 }}>
-            <Box className="list-shell" sx={{ minHeight: 110, height: "100%" }}>
-              <Typography variant="caption" color="text.secondary">
-                {item.label}
-              </Typography>
-              <Typography variant="h5" sx={{ fontWeight: 800, color: item.tone }}>
-                {item.value}
-              </Typography>
-            </Box>
-          </Grid2>
+          { label: "Active agents", value: activeAgentCount },
+          { label: "Custom agents", value: totalAgentCount },
+          { label: "Interrupted runs", value: interruptedRuns },
+          { label: "Failed runs", value: failedRuns },
+        ].map((s) => (
+          <div key={s.label} className="stat-strip-item">
+            <span className="stat-strip-label">{s.label}</span>
+            <span className="stat-strip-value">{s.value}</span>
+          </div>
         ))}
-      </Grid2>
+      </Box>
 
       {queryError ? <Alert severity="error">{errMessage(queryError)}</Alert> : null}
 
-      <SectionShell
-        eyebrow="Live now"
-        title="Delegated runs in progress"
-        detail="Every active multi-agent run appears here with the same per-agent state shown in chat."
-      >
-        {activeRuns.length === 0 ? (
-          <Box
-            sx={{
-              p: 1.5,
-              borderRadius: "8px",
-              border: "1px dashed rgba(255,255,255,0.12)",
-              background: "rgba(255,255,255,0.02)"
-            }}
-          >
-            <Typography variant="body2" sx={{ fontWeight: 700 }}>
-              No live delegated runs
-            </Typography>
-            <Typography variant="body2" color="text.secondary" sx={{ mt: 0.45 }}>
-              Ask for swarm explicitly in chat or let the router delegate a genuinely parallel task.
-              Live runs will appear here immediately and update as agents work.
-            </Typography>
-          </Box>
-        ) : (
+      {activeRuns.length > 0 ? (
+        <SectionShell
+          eyebrow="Live now"
+          title="Delegated runs in progress"
+          detail="Every active multi-agent run appears here with the same per-agent state shown in chat."
+        >
           <Stack spacing={1.2}>
             {activeRuns.map((run) => (
               <RunCard key={run.id} run={run} live />
             ))}
           </Stack>
-        )}
-      </SectionShell>
+        </SectionShell>
+      ) : null}
 
+      {customAgents.length > 0 ? (
       <SectionShell
         eyebrow="Roster"
         title="Custom agents"
@@ -1670,24 +1632,7 @@ export function SwarmManager({ autoRefresh }: Props) {
             </Stack>
           </Stack>
 
-        {customAgents.length === 0 ? (
-          <Box
-            sx={{
-              p: 1.5,
-              borderRadius: "8px",
-              border: "1px dashed rgba(255,255,255,0.12)",
-              background: "rgba(255,255,255,0.02)"
-            }}
-          >
-            <Typography variant="body2" sx={{ fontWeight: 700 }}>
-              No custom agents yet
-            </Typography>
-            <Typography variant="body2" color="text.secondary" sx={{ mt: 0.45 }}>
-              Add user-managed agents when you want fixed specialists with your own model, prompt,
-              or capability mix. Built-in system specialists stay hidden from this list.
-            </Typography>
-          </Box>
-        ) : (
+        {customAgents.length > 0 ? (
           <Grid2 container spacing={1.15}>
             {customAgents.map((agent) => (
               <Grid2 key={agent.id} size={{ xs: 12, md: 6, xl: 4 }}>
@@ -1826,27 +1771,24 @@ export function SwarmManager({ autoRefresh }: Props) {
               </Grid2>
             ))}
           </Grid2>
-        )}
+        ) : null}
         </Stack>
       </SectionShell>
+      ) : null}
 
-      <SectionShell
-        eyebrow="History"
-        title="Recent swarm runs"
-        detail="Completed, interrupted, and failed runs stay here so you can review exactly which agents worked on each request."
-      >
-        {recentRuns.length === 0 ? (
-          <Typography variant="body2" color="text.secondary">
-            No completed swarm history has been recorded yet.
-          </Typography>
-        ) : (
+      {recentRuns.length > 0 ? (
+        <SectionShell
+          eyebrow="History"
+          title="Recent swarm runs"
+          detail="Completed, interrupted, and failed runs stay here so you can review exactly which agents worked on each request."
+        >
           <Stack spacing={1.2}>
             {recentRuns.slice(0, 18).map((run) => (
               <RunCard key={run.id} run={run} />
             ))}
           </Stack>
-        )}
-      </SectionShell>
+        </SectionShell>
+      ) : null}
 
       <Dialog open={createOpen} onClose={closeAgentDialog} maxWidth="md" fullWidth>
         <DialogTitle>{editingAgent ? "Edit custom agent" : "Add custom agent"}</DialogTitle>

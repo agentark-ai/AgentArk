@@ -9,8 +9,8 @@ use tokio::sync::mpsc::Sender;
 
 use crate::core::agent::{ConversationMessage, StreamEvent};
 use crate::core::llm_provider::{
-    display_openai_base_url, force_refresh_codex_cli_api_key, openai_provider_label,
-    resolve_openai_request_config,
+    display_openai_base_url, force_refresh_codex_cli_api_key, is_codex_cli_base_url,
+    openai_provider_label, resolve_openai_request_config, ResolvedOpenAiRequestConfig,
 };
 
 // OpenRouter enforces request affordability against the declared output budget.
@@ -617,6 +617,260 @@ fn extract_openai_delta_text(value: &serde_json::Value) -> Option<String> {
     extract_openai_text_from_value(value, false)
 }
 
+fn openai_responses_endpoint(config: &ResolvedOpenAiRequestConfig) -> String {
+    format!("{}/responses", config.base_url.trim_end_matches('/'))
+}
+
+fn openai_responses_message(role: &str, content: &str) -> serde_json::Value {
+    let normalized_role = match role {
+        "assistant" => "assistant",
+        "developer" => "developer",
+        "system" => "developer",
+        _ => "user",
+    };
+    let content_type = if normalized_role == "assistant" {
+        "output_text"
+    } else {
+        "input_text"
+    };
+    serde_json::json!({
+        "type": "message",
+        "role": normalized_role,
+        "content": [{
+            "type": content_type,
+            "text": content,
+        }],
+    })
+}
+
+fn build_openai_responses_input(
+    user_message: &str,
+    history: &[ConversationMessage],
+) -> Vec<serde_json::Value> {
+    let mut input = Vec::new();
+    for message in history
+        .iter()
+        .filter(|message| !(message.role == "user" && message.content == user_message))
+    {
+        let content = message.content.trim();
+        if content.is_empty() {
+            continue;
+        }
+        input.push(openai_responses_message(message.role.as_str(), content));
+    }
+    input.push(openai_responses_message("user", user_message));
+    input
+}
+
+fn build_openai_responses_tools(actions: &[crate::actions::ActionDef]) -> Vec<serde_json::Value> {
+    actions
+        .iter()
+        .map(|action| {
+            serde_json::json!({
+                "type": "function",
+                "name": action.name,
+                "description": action.description,
+                "strict": false,
+                "parameters": normalize_openai_tool_schema(&action.input_schema),
+            })
+        })
+        .collect()
+}
+
+fn build_openai_responses_request(
+    model: &str,
+    system_prompt: &str,
+    user_message: &str,
+    history: &[ConversationMessage],
+    actions: &[crate::actions::ActionDef],
+    stream: bool,
+) -> serde_json::Value {
+    let tools = build_openai_responses_tools(actions);
+    let mut request = serde_json::json!({
+        "model": model,
+        "instructions": system_prompt,
+        "input": build_openai_responses_input(user_message, history),
+        "stream": stream,
+        "store": false,
+    });
+    if !tools.is_empty() {
+        request["tools"] = serde_json::Value::Array(tools);
+        request["tool_choice"] = serde_json::Value::String("auto".to_string());
+        request["parallel_tool_calls"] = serde_json::Value::Bool(true);
+    }
+    request
+}
+
+fn openai_responses_tool_arguments(value: Option<&serde_json::Value>) -> serde_json::Value {
+    match value {
+        Some(serde_json::Value::String(raw)) => serde_json::from_str(raw)
+            .unwrap_or_else(|_| serde_json::json!({ "_raw": raw })),
+        Some(value) if value.is_object() || value.is_array() => value.clone(),
+        Some(value) if value.is_null() => serde_json::json!({}),
+        Some(value) => serde_json::json!({ "_raw": value }),
+        None => serde_json::json!({}),
+    }
+}
+
+fn openai_responses_usage(
+    payload: &serde_json::Value,
+    prompt_chars: usize,
+    completion_chars: usize,
+) -> Option<LlmTokenUsage> {
+    let usage = payload.get("usage")?;
+    let input_tokens = usage
+        .get("input_tokens")
+        .or_else(|| usage.get("prompt_tokens"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or_else(|| estimate_tokens_from_chars(prompt_chars));
+    let output_tokens = usage
+        .get("output_tokens")
+        .or_else(|| usage.get("completion_tokens"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or_else(|| estimate_tokens_from_chars(completion_chars));
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(|value| value.as_u64())
+        .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
+    Some(LlmTokenUsage {
+        prompt_tokens: input_tokens,
+        completion_tokens: output_tokens,
+        total_tokens,
+        estimated: false,
+    })
+}
+
+fn collect_openai_responses_text_from_content(content: &serde_json::Value) -> String {
+    let Some(blocks) = content.as_array() else {
+        return extract_openai_message_text(content).unwrap_or_default();
+    };
+    let mut text = String::new();
+    for block in blocks {
+        let block_type = block.get("type").and_then(|value| value.as_str()).unwrap_or("");
+        if matches!(block_type, "output_text" | "input_text" | "text")
+            || block.get("text").is_some()
+        {
+            if let Some(chunk) = block.get("text").and_then(|value| value.as_str()) {
+                text.push_str(chunk);
+            }
+        }
+    }
+    text
+}
+
+fn parse_openai_responses_payload(
+    payload: &serde_json::Value,
+    prompt_chars: usize,
+    fallback_content: &str,
+    provider: &str,
+    model: &str,
+) -> Result<LlmResponse> {
+    if let Some(error) = payload.get("error").filter(|value| !value.is_null()) {
+        return Err(anyhow!("OpenAI Subscription returned an error payload: {}", error));
+    }
+
+    let mut content = payload
+        .get("output_text")
+        .and_then(extract_openai_message_text)
+        .unwrap_or_default();
+    let response_level_text_present = !content.is_empty();
+    let mut reasoning: Option<String> = None;
+    let mut tool_calls = Vec::new();
+
+    if let Some(output) = payload.get("output").and_then(|value| value.as_array()) {
+        for item in output {
+            match item.get("type").and_then(|value| value.as_str()).unwrap_or("") {
+                "message" => {
+                    let item_text = item
+                        .get("content")
+                        .map(collect_openai_responses_text_from_content)
+                        .unwrap_or_default();
+                    if !response_level_text_present && !item_text.is_empty() {
+                        content.push_str(&item_text);
+                    }
+                }
+                "function_call" => {
+                    let name = item
+                        .get("name")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let fallback_id = format!("call_{}", tool_calls.len() + 1);
+                    let id = item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .and_then(|value| value.as_str())
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or(fallback_id.as_str())
+                        .to_string();
+                    tool_calls.push(ToolCall {
+                        id,
+                        name: name.to_string(),
+                        arguments: openai_responses_tool_arguments(item.get("arguments")),
+                    });
+                }
+                "reasoning" => {
+                    if let Some(summary) = item.get("summary").and_then(|value| value.as_array()) {
+                        let mut text = String::new();
+                        for chunk in summary {
+                            if let Some(value) = chunk.get("text").and_then(|value| value.as_str())
+                            {
+                                text.push_str(value);
+                            }
+                        }
+                        if !text.trim().is_empty() {
+                            reasoning.get_or_insert_with(String::new).push_str(&text);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if content.is_empty() && !fallback_content.is_empty() {
+        content = fallback_content.to_string();
+    }
+    if content.is_empty() && tool_calls.is_empty() {
+        if let Some(text) = extract_text_from_any_json(payload) {
+            content = text;
+        }
+    }
+    if content.is_empty() && tool_calls.is_empty() {
+        return Err(anyhow!(
+            "OpenAI Subscription response did not contain assistant text or tool calls"
+        ));
+    }
+
+    let completion_chars = content.len()
+        + tool_calls
+            .iter()
+            .map(|call| call.name.len() + call.arguments.to_string().len())
+            .sum::<usize>();
+    let usage = openai_responses_usage(payload, prompt_chars, completion_chars).or_else(|| {
+        let prompt_tokens = estimate_tokens_from_chars(prompt_chars);
+        let completion_tokens = estimate_tokens_from_chars(completion_chars);
+        Some(LlmTokenUsage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+            estimated: true,
+        })
+    });
+
+    Ok(LlmResponse {
+        content,
+        tool_calls,
+        reasoning,
+        usage,
+        provider: provider.to_string(),
+        model: model.to_string(),
+    })
+}
+
 /// Normalize tool JSON Schema for OpenAI-compatible function calling.
 /// OpenAI requires `items` to be present for every array schema.
 fn normalize_openai_tool_schema(schema: &serde_json::Value) -> serde_json::Value {
@@ -955,7 +1209,7 @@ mod tests {
     use super::{
         extract_partial_draft_files, json_contains_tool_call_indicators,
         normalize_openai_tool_schema, openai_stream_data_has_terminal_finish_reason,
-        parse_partial_tool_arguments,
+        parse_openai_responses_payload, parse_partial_tool_arguments,
     };
 
     #[test]
@@ -1064,6 +1318,28 @@ mod tests {
         });
 
         assert!(json_contains_tool_call_indicators(&payload));
+    }
+
+    #[test]
+    fn openai_responses_parser_ignores_null_error_field() {
+        let payload = serde_json::json!({
+            "error": null,
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "I'm AgentArk." }]
+            }],
+            "usage": { "input_tokens": 1, "output_tokens": 2, "total_tokens": 3 }
+        });
+
+        let response = parse_openai_responses_payload(
+            &payload,
+            1,
+            "",
+            "openai-subscription",
+            "gpt-5.4",
+        )
+        .expect("null error is not an error payload");
+        assert_eq!(response.content, "I'm AgentArk.");
     }
 
     #[test]
@@ -1429,6 +1705,16 @@ impl LlmClient {
             LlmProvider::OpenAI { model, .. } => model,
             LlmProvider::Ollama { model, .. } => model,
         }
+    }
+
+    pub fn requires_streaming_responses_api(&self) -> bool {
+        matches!(
+            &self.provider,
+            LlmProvider::OpenAI {
+                base_url: Some(base_url),
+                ..
+            } if is_codex_cli_base_url(base_url)
+        )
     }
 
     pub fn provider_name(&self) -> &'static str {
@@ -1855,6 +2141,34 @@ impl LlmClient {
         })
     }
 
+    async fn chat_openai_codex_responses(
+        &self,
+        model: &str,
+        system_prompt: &str,
+        user_message: &str,
+        history: &[ConversationMessage],
+        actions: &[crate::actions::ActionDef],
+        request_config: ResolvedOpenAiRequestConfig,
+    ) -> Result<LlmResponse> {
+        let (token_tx, mut token_rx) = tokio::sync::mpsc::channel(64);
+        let drain_handle = tokio::spawn(async move {
+            while token_rx.recv().await.is_some() {}
+        });
+        let result = self
+            .chat_openai_codex_responses_stream(
+                model,
+                system_prompt,
+                user_message,
+                history,
+                actions,
+                token_tx,
+                request_config,
+            )
+            .await;
+        drain_handle.abort();
+        result
+    }
+
     async fn chat_openai_with_history(&self, params: OpenAiChatParams<'_>) -> Result<LlmResponse> {
         let api_key = params.api_key;
         let model = params.model;
@@ -1987,6 +2301,18 @@ impl LlmClient {
 
         let mut request_config =
             resolve_openai_request_config(&self.client, api_key, base_url).await?;
+        if request_config.uses_codex_cli_oauth {
+            return self
+                .chat_openai_codex_responses(
+                    model,
+                    system_prompt,
+                    user_message,
+                    history,
+                    actions,
+                    request_config,
+                )
+                .await;
+        }
         let endpoint = format!("{}/chat/completions", request_config.base_url);
         let request = OpenAIRequest {
             model: model.to_string(),
@@ -2728,6 +3054,195 @@ impl LlmClient {
         })
     }
 
+    async fn chat_openai_codex_responses_stream(
+        &self,
+        model: &str,
+        system_prompt: &str,
+        user_message: &str,
+        history: &[ConversationMessage],
+        actions: &[crate::actions::ActionDef],
+        token_tx: Sender<StreamEvent>,
+        mut request_config: ResolvedOpenAiRequestConfig,
+    ) -> Result<LlmResponse> {
+        let endpoint = openai_responses_endpoint(&request_config);
+        let request =
+            build_openai_responses_request(model, system_prompt, user_message, history, actions, true);
+        let prompt_chars = system_prompt.len()
+            + user_message.len()
+            + history.iter().map(|message| message.content.len()).sum::<usize>();
+        let send_start = std::time::Instant::now();
+        let mut forced_oauth_refresh = false;
+
+        let response = loop {
+            let response = self
+                .client
+                .post(&endpoint)
+                .timeout(std::time::Duration::from_secs(600))
+                .header("Content-Type", "application/json")
+                .header("Accept", "text/event-stream")
+                .bearer_auth(&request_config.api_key)
+                .json(&request)
+                .send()
+                .await?;
+            let status = response.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED && !forced_oauth_refresh {
+                let refreshed_api_key = force_refresh_codex_cli_api_key(&self.client)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "OpenAI Subscription OAuth refresh did not return a usable access token"
+                        )
+                    })?;
+                request_config.api_key = refreshed_api_key;
+                forced_oauth_refresh = true;
+                continue;
+            }
+            break response;
+        };
+
+        let status = response.status();
+        if !status.is_success() {
+            let error = match read_response_bytes_limited(response, "OpenAI Subscription").await {
+                Ok(bytes) => {
+                    let body = String::from_utf8_lossy(&bytes).trim().to_string();
+                    if body.is_empty() {
+                        "<empty body>".to_string()
+                    } else {
+                        body
+                    }
+                }
+                Err(read_err) => format!("<failed to read error body: {}>", read_err),
+            };
+            return Err(anyhow!("OpenAI Subscription error ({}): {}", status, error));
+        }
+
+        let mut content = String::new();
+        let mut reasoning: Option<String> = None;
+        let mut completed_response: Option<serde_json::Value> = None;
+        let mut first_token = true;
+        let inter_chunk_timeout_secs = llm_stream_inter_chunk_timeout_secs();
+        let first_token_timeout_secs = llm_stream_first_token_timeout_secs();
+        let total_timeout_secs = llm_stream_total_timeout_secs();
+
+        let heartbeat_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hb_done_clone = heartbeat_done.clone();
+        let hb_tx = token_tx.clone();
+        let hb_model = model.to_string();
+        let hb_start = std::time::Instant::now();
+        let heartbeat_handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                if hb_done_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let elapsed = hb_start.elapsed().as_secs();
+                queue_stream_event(
+                    &hb_tx,
+                    StreamEvent::Thinking(format!(
+                        "Waiting for {} to respond ({}s)...",
+                        hb_model, elapsed
+                    )),
+                );
+            }
+        });
+
+        let mut buffer = String::new();
+        let mut stream = response.bytes_stream();
+        loop {
+            if send_start.elapsed().as_secs() >= total_timeout_secs {
+                break;
+            }
+            let timeout_secs = if first_token {
+                first_token_timeout_secs
+            } else {
+                inter_chunk_timeout_secs
+            };
+            let chunk = match tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                stream.next(),
+            )
+            .await
+            {
+                Ok(Some(Ok(chunk))) => chunk,
+                Ok(Some(Err(error))) => return Err(error.into()),
+                Ok(None) => break,
+                Err(_) => break,
+            };
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            let lines: Vec<&str> = buffer.split('\n').collect();
+            let last = lines.last().copied().unwrap_or("").to_string();
+
+            for line in lines.iter().take(lines.len().saturating_sub(1)) {
+                let line = line.trim_end_matches('\r').trim();
+                if !line.starts_with("data:") {
+                    continue;
+                }
+                let data = line.trim_start_matches("data:").trim();
+                if data == "[DONE]" {
+                    break;
+                }
+                let parsed: serde_json::Value = match serde_json::from_str(data) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                match parsed.get("type").and_then(|value| value.as_str()).unwrap_or("") {
+                    "response.output_text.delta" => {
+                        if let Some(delta) = parsed.get("delta").and_then(|value| value.as_str()) {
+                            if first_token {
+                                first_token = false;
+                                heartbeat_done.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            content.push_str(delta);
+                            queue_stream_event(&token_tx, StreamEvent::Token(delta.to_string()));
+                        }
+                    }
+                    "response.reasoning_summary_text.delta" => {
+                        if let Some(delta) = parsed.get("delta").and_then(|value| value.as_str()) {
+                            reasoning.get_or_insert_with(String::new).push_str(delta);
+                        }
+                    }
+                    "response.completed" => {
+                        completed_response = parsed.get("response").cloned();
+                    }
+                    _ => {}
+                }
+            }
+            buffer = last;
+        }
+        heartbeat_done.store(true, std::sync::atomic::Ordering::Relaxed);
+        heartbeat_handle.abort();
+
+        if let Some(response_json) = completed_response {
+            let mut parsed = parse_openai_responses_payload(
+                &response_json,
+                prompt_chars,
+                &content,
+                request_config.provider_label,
+                model,
+            )?;
+            if parsed.reasoning.is_none() {
+                parsed.reasoning = reasoning;
+            }
+            return Ok(parsed);
+        }
+
+        let prompt_tokens = estimate_tokens_from_chars(prompt_chars);
+        let completion_tokens = estimate_tokens_from_chars(content.len());
+        Ok(LlmResponse {
+            content,
+            tool_calls: vec![],
+            reasoning,
+            usage: Some(LlmTokenUsage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
+                estimated: true,
+            }),
+            provider: request_config.provider_label.to_string(),
+            model: model.to_string(),
+        })
+    }
+
     async fn chat_openai_with_history_stream(
         &self,
         params: OpenAiStreamParams<'_>,
@@ -2869,6 +3384,19 @@ impl LlmClient {
 
         let mut request_config =
             resolve_openai_request_config(&self.client, api_key, base_url).await?;
+        if request_config.uses_codex_cli_oauth {
+            return self
+                .chat_openai_codex_responses_stream(
+                    model,
+                    system_prompt,
+                    user_message,
+                    history,
+                    actions,
+                    token_tx,
+                    request_config,
+                )
+                .await;
+        }
         let url = request_config.base_url.clone();
         tracing::info!(
             "LLM stream → {} model={} msgs={} tools={}",

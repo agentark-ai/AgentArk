@@ -92,9 +92,9 @@ use crate::core::llm_provider::{
     canonical_provider_id, display_openai_base_url, force_refresh_codex_cli_api_key,
     is_openrouter_base_url, normalize_openai_base_url, openai_provider_label,
     persist_codex_cli_oauth_tokens, provider_allows_model_discovery, resolve_codex_cli_api_key,
-    resolve_openai_request_config, CODEX_CLI_BASE_URL, OPENAI_DEVICE_AUTH_CLIENT_ID,
-    OPENAI_DEVICE_REDIRECT_URI, OPENAI_DEVICE_TOKEN_URL, OPENAI_DEVICE_USERCODE_URL,
-    OPENAI_DEVICE_VERIFY_URL, OPENAI_OAUTH_TOKEN_URL, OPENROUTER_API_BASE_URL,
+    resolve_openai_request_config, OPENAI_DEVICE_AUTH_CLIENT_ID, OPENAI_DEVICE_REDIRECT_URI,
+    OPENAI_DEVICE_TOKEN_URL, OPENAI_DEVICE_USERCODE_URL, OPENAI_DEVICE_VERIFY_URL,
+    OPENAI_OAUTH_TOKEN_URL, OPENROUTER_API_BASE_URL, HUGGINGFACE_API_BASE_URL,
 };
 use crate::core::{
     score_action_risk, Agent, AutonomySettings, AutopilotMode, ConversationScope, ExecutionTrace,
@@ -853,6 +853,17 @@ async fn open_url_in_default_browser(url: &str) -> std::result::Result<(), Strin
     }
 }
 
+fn server_can_launch_local_browser() -> bool {
+    if cfg!(target_os = "linux") {
+        let display_available = std::env::var_os("DISPLAY").is_some()
+            || std::env::var_os("WAYLAND_DISPLAY").is_some();
+        if !display_available || std::path::Path::new("/.dockerenv").exists() {
+            return false;
+        }
+    }
+    true
+}
+
 fn normalize_model_credential_base_url(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
@@ -905,7 +916,7 @@ fn model_slot_request_credential_scope(
                 normalize_model_credential_base_url(base_url.as_deref()),
             ))
         }
-        "openai" | "openai-compatible" | "openrouter" | "openai-subscription" => {
+        "openai" | "openai-compatible" | "openrouter" | "openai-subscription" | "huggingface" => {
             let compat_base_url = normalize_openai_base_url(provider_id, base_url)?;
             Ok((
                 openai_provider_label(compat_base_url.as_deref()).to_string(),
@@ -934,7 +945,7 @@ fn can_reuse_model_slot_api_key(
 fn llm_provider_requires_api_key(provider_id: &str) -> bool {
     matches!(
         provider_id,
-        "anthropic" | "openai" | "openrouter" | "openai-subscription"
+        "anthropic" | "openai" | "openrouter" | "openai-subscription" | "huggingface"
     )
 }
 
@@ -997,7 +1008,7 @@ async fn provider_from_model_slot_request(
             model: request.model.clone(),
             base_url: None,
         },
-        "openai-compatible" | "openrouter" => LlmProvider::OpenAI {
+        "openai-compatible" | "openrouter" | "huggingface" => LlmProvider::OpenAI {
             api_key: api_key.clone(),
             model: request.model.clone(),
             base_url: compat_base_url,
@@ -2133,7 +2144,6 @@ pub struct SettingsResponse {
     pub memory_retention_run_interval_days: u64,
     pub memory_retention_idle_threshold_secs: u64,
     pub memory_retention_max_delete_per_run: u64,
-    pub memory_retention_protect_fact_sources: bool,
     pub data_lifecycle: DataLifecycleSettings,
     pub observability: observability::ObservabilitySettingsResponse,
 }
@@ -2405,8 +2415,6 @@ pub struct SettingsUpdate {
     pub memory_retention_idle_threshold_secs: Option<u64>,
     #[serde(default)]
     pub memory_retention_max_delete_per_run: Option<u64>,
-    #[serde(default)]
-    pub memory_retention_protect_fact_sources: Option<bool>,
     #[serde(default)]
     pub data_lifecycle: Option<DataLifecycleSettingsUpdate>,
     #[serde(default)]
@@ -4159,8 +4167,7 @@ pub async fn serve(
             axum::routing::delete(delete_document_endpoint),
         )
         .route("/documents/{id}/search", get(search_document_endpoint))
-        // Memory consolidation
-        .route("/memory/consolidate", post(trigger_consolidation))
+        // Memory
         .route("/memory/stats", get(memory_stats))
         .route("/memory/maintenance/review", get(memory_maintenance_review))
         .route("/memory/maintenance/run", post(run_memory_maintenance))
@@ -5573,14 +5580,8 @@ fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value> {
         "Memory statistics by domain",
         "Memory",
     );
-    add(
-        "/memory/consolidate",
-        "POST",
-        "Run memory consolidation",
-        "Memory",
-    );
     add("/memory/episodes", "GET", "List episodic memory", "Memory");
-    add("/memory/facts", "GET", "List semantic facts", "Memory");
+    add("/memory/facts", "GET", "List learned facts", "Memory");
     add(
         "/memory/preferences",
         "GET",
@@ -9647,12 +9648,6 @@ async fn build_runtime_health_payload(
         .ok()
         .flatten()
         .and_then(|raw| String::from_utf8(raw).ok());
-    let consolidation_heartbeat = storage
-        .get(crate::sentinel::SENTINEL_CONSOLIDATION_HEARTBEAT_KEY)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|raw| String::from_utf8(raw).ok());
     let approval_expiry_heartbeat = storage
         .get(crate::sentinel::SENTINEL_APPROVAL_EXPIRY_HEARTBEAT_KEY)
         .await
@@ -9695,14 +9690,6 @@ async fn build_runtime_health_payload(
         heartbeat_recent_with_threshold(
             integration_sync_heartbeat.as_deref(),
             (sentinel_config.integration_sync_interval as i64 * 3).max(8 * 60),
-        )
-    } else {
-        true
-    };
-    let consolidation_loop_ok = if state.server_role == HttpServerRole::ControlPlane {
-        heartbeat_recent_with_threshold(
-            consolidation_heartbeat.as_deref(),
-            (sentinel_config.consolidation_interval as i64 * 3).max(20 * 60),
         )
     } else {
         true
@@ -9784,7 +9771,7 @@ async fn build_runtime_health_payload(
         let embeddings_ok = if let Some(client) = embedding_client.as_ref() {
             client.health_check().await.is_ok()
         } else {
-            true
+            false
         };
         pgvector_ok && embeddings_ok
     } else {
@@ -9831,7 +9818,6 @@ async fn build_runtime_health_payload(
         && watcher_loop_ok;
     let ready = healthy
         && integration_sync_loop_ok
-        && consolidation_loop_ok
         && approval_expiry_loop_ok
         && arkpulse_loop_ok
         && auto_analysis_loop_ok
@@ -9900,7 +9886,6 @@ async fn build_runtime_health_payload(
                 "scheduler_loop": scheduler_loop_ok,
                 "watcher_loop": watcher_loop_ok,
                 "integration_sync_loop": integration_sync_loop_ok,
-                "consolidation_loop": consolidation_loop_ok,
                 "approval_expiry_loop": approval_expiry_loop_ok,
                 "arkpulse_loop": arkpulse_loop_ok,
                 "auto_analysis_loop": auto_analysis_loop_ok,
@@ -9911,7 +9896,6 @@ async fn build_runtime_health_payload(
                 "scheduler": scheduler_heartbeat,
                 "watcher": watcher_heartbeat,
                 "integration_sync": integration_sync_heartbeat,
-                "consolidation": consolidation_heartbeat,
                 "approval_expiry": approval_expiry_heartbeat,
                 "arkpulse": arkpulse_heartbeat,
                 "auto_analysis": auto_analysis_heartbeat,
@@ -18628,7 +18612,7 @@ async fn start_codex_cli_oauth() -> Response {
                 "OAuth flow started. Waiting for device code...".to_string()
             };
 
-            let opened_browser = if !auth_url.is_empty() {
+            let opened_browser = if !auth_url.is_empty() && server_can_launch_local_browser() {
                 open_url_in_default_browser(&auth_url).await.is_ok()
             } else {
                 false
@@ -22799,7 +22783,6 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
         memory_retention_run_interval_days: config.memory.retention_run_interval_days,
         memory_retention_idle_threshold_secs: config.memory.retention_idle_threshold_secs,
         memory_retention_max_delete_per_run: config.memory.retention_max_delete_per_run,
-        memory_retention_protect_fact_sources: config.memory.retention_protect_fact_sources,
         data_lifecycle,
         observability: observability::build_observability_settings_response(
             &config.observability,
@@ -23400,7 +23383,6 @@ async fn update_settings(
             || settings.memory_retention_run_interval_days.is_some()
             || settings.memory_retention_idle_threshold_secs.is_some()
             || settings.memory_retention_max_delete_per_run.is_some()
-            || settings.memory_retention_protect_fact_sources.is_some()
         {
             if let Some(v) = settings.memory_retention_enabled {
                 agent_guard.config.memory.retention_enabled = v;
@@ -23432,9 +23414,6 @@ async fn update_settings(
             }
             if let Some(v) = settings.memory_retention_max_delete_per_run {
                 agent_guard.config.memory.retention_max_delete_per_run = v.clamp(10, 20_000);
-            }
-            if let Some(v) = settings.memory_retention_protect_fact_sources {
-                agent_guard.config.memory.retention_protect_fact_sources = v;
             }
         }
 
@@ -23901,7 +23880,7 @@ async fn update_settings(
                     model: settings.llm_model,
                     base_url: None,
                 },
-                "openai-compatible" | "openrouter" => LlmProvider::OpenAI {
+                "openai-compatible" | "openrouter" | "huggingface" => LlmProvider::OpenAI {
                     api_key: api_key_for_provider.clone(),
                     model: settings.llm_model,
                     base_url: compat_base_url,
@@ -24012,7 +23991,7 @@ async fn update_settings(
                         model: fb_model,
                         base_url: None,
                     }),
-                    "openai-compatible" | "openrouter" | "openai-subscription" => {
+                    "openai-compatible" | "openrouter" | "openai-subscription" | "huggingface" => {
                         Some(LlmProvider::OpenAI {
                             api_key: resolved_fallback_api_key.clone(),
                             model: fb_model,
@@ -25960,12 +25939,64 @@ async fn test_llm_connection(provider: &LlmProvider) -> Result<(), String> {
             }
         }
         LlmProvider::OpenAI {
-            api_key, base_url, ..
+            api_key,
+            base_url,
+            model,
         } => {
             let mut request_config =
                 resolve_openai_request_config(&client, api_key, base_url.as_deref())
                     .await
                     .map_err(|e| e.to_string())?;
+            if request_config.uses_codex_cli_oauth {
+                let endpoint = format!("{}/responses", request_config.base_url.trim_end_matches('/'));
+                let payload = serde_json::json!({
+                    "model": model,
+                    "instructions": "You are checking whether this model endpoint is reachable. Reply with OK.",
+                    "input": [{
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "Connection check" }]
+                    }],
+                    "stream": true,
+                    "store": false,
+                });
+                let mut resp = client
+                    .post(&endpoint)
+                    .bearer_auth(&request_config.api_key)
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "text/event-stream")
+                    .json(&payload)
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+                    let refreshed = force_refresh_codex_cli_api_key(&client)
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .unwrap_or_default();
+                    request_config.api_key = refreshed;
+                    resp = client
+                        .post(&endpoint)
+                        .bearer_auth(&request_config.api_key)
+                        .header("Content-Type", "application/json")
+                        .header("Accept", "text/event-stream")
+                        .json(&payload)
+                        .send()
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                if resp.status().is_success() {
+                    return Ok(());
+                }
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(format!(
+                    "{} returned {}: {}",
+                    request_config.provider_label,
+                    status,
+                    body.trim()
+                ));
+            }
             let base = request_config.base_url.trim_end_matches('/');
             let url = format!("{}/models", base);
             let mut request = client.get(url);
@@ -26707,6 +26738,13 @@ fn filter_openai_chat_model_ids(ids: &mut Vec<String>) {
     ids.dedup();
 }
 
+fn openai_subscription_catalog_models() -> Vec<serde_json::Value> {
+    ["gpt-5.4", "gpt-5.3-codex", "gpt-5.3-codex-spark"]
+        .into_iter()
+        .map(|id| serde_json::json!({ "id": id }))
+        .collect()
+}
+
 async fn fetch_openai_catalog_models(
     client: &reqwest::Client,
     provider_id: &str,
@@ -26805,6 +26843,64 @@ async fn fetch_openai_catalog_models(
         .collect())
 }
 
+async fn fetch_huggingface_catalog_models(
+    client: &reqwest::Client,
+    api_key: &str,
+) -> std::result::Result<Vec<serde_json::Value>, String> {
+    let mut request = client
+        .get("https://huggingface.co/api/models")
+        .query(&[
+            ("pipeline_tag", "text-generation"),
+            ("sort", "trending"),
+            ("limit", "80"),
+        ]);
+    if !api_key.trim().is_empty() {
+        request = request.bearer_auth(api_key.trim());
+    }
+
+    let response = request.send().await.map_err(|e| e.to_string())?;
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap_or_default();
+        return Err(format!("Hugging Face returned {}: {}", status, text.trim()));
+    }
+
+    let body: serde_json::Value = response.json().await.unwrap_or_default();
+    let rows = body
+        .as_array()
+        .cloned()
+        .or_else(|| body.get("models").and_then(|value| value.as_array()).cloned())
+        .unwrap_or_default();
+    let mut models: Vec<(String, Option<String>)> = rows
+        .into_iter()
+        .filter_map(|row| {
+            let id = row
+                .get("id")
+                .or_else(|| row.get("modelId"))
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?
+                .to_string();
+            let name = row
+                .get("name")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_string());
+            Some((id, name))
+        })
+        .collect();
+    models.sort_by(|(left_id, _), (right_id, _)| left_id.cmp(right_id));
+    models.dedup_by(|left, right| left.0 == right.0);
+    Ok(models
+        .into_iter()
+        .map(|(id, name)| match name {
+            Some(name) => serde_json::json!({ "id": id, "name": name }),
+            None => serde_json::json!({ "id": id }),
+        })
+        .collect())
+}
+
 /// Discover available models from a provider API
 async fn discover_provider_models(
     Path(provider): Path<String>,
@@ -26869,18 +26965,7 @@ async fn discover_provider_models(
                 )
                     .into_response();
             }
-            match fetch_openai_catalog_models(&client, provider_id, Some(CODEX_CLI_BASE_URL), "")
-                .await
-            {
-                Ok(models) => models,
-                Err(error) => {
-                    return (
-                        StatusCode::BAD_GATEWAY,
-                        Json(serde_json::json!({ "error": error })),
-                    )
-                        .into_response();
-                }
-            }
+            openai_subscription_catalog_models()
         }
         "openai-compatible" => {
             let Some(base_url) = params
@@ -26998,6 +27083,29 @@ async fn discover_provider_models(
                         .unwrap_or_default()
                 }
                 _ => vec![],
+            }
+        }
+        "huggingface" => {
+            let api_key = params
+                .get("api_key")
+                .map(String::as_str)
+                .unwrap_or_default();
+            let base_url = params
+                .get("base_url")
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(HUGGINGFACE_API_BASE_URL);
+            match fetch_huggingface_catalog_models(&client, api_key).await {
+                Ok(models) if !models.is_empty() => models,
+                _ => fetch_openai_catalog_models(
+                    &client,
+                    provider_id,
+                    Some(base_url),
+                    api_key,
+                )
+                .await
+                .unwrap_or_default(),
             }
         }
         _ => {
@@ -27896,7 +28004,7 @@ fn build_swarm_agent_spec(
             api_key: effective_api_key,
             model: request.llm_model.clone(),
         },
-        "openai" | "openai-compatible" | "openrouter" | "openai-subscription" => {
+        "openai" | "openai-compatible" | "openrouter" | "openai-subscription" | "huggingface" => {
             LlmProvider::OpenAI {
                 api_key: effective_api_key,
                 model: request.llm_model.clone(),
@@ -32753,43 +32861,6 @@ async fn search_document_endpoint(
 
 // ==================== Memory Endpoints ====================
 
-async fn trigger_consolidation(State(state): State<AppState>) -> Response {
-    let agent = state.agent.read().await;
-    let llm = agent.llm.clone();
-    match agent.memory.run_llm_consolidation(&llm).await {
-        Ok(summary) => {
-            let event_id = uuid::Uuid::new_v4().to_string();
-            agent
-                .hooks
-                .fire(
-                    hooks::HookTrigger::OnConsolidate,
-                    hooks::HookContext {
-                        event_id: Some(event_id),
-                        trigger: "on_consolidate".to_string(),
-                        channel: "system".to_string(),
-                        message: Some("memory consolidation completed".to_string()),
-                        response: Some(summary.clone()),
-                        action: None,
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                    },
-                )
-                .await;
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({"status": "ok", "summary": summary})),
-            )
-                .into_response()
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
-    }
-}
-
 async fn memory_stats(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -32893,7 +32964,7 @@ async fn list_episodes(
     }
 }
 
-/// List semantic facts
+/// List learned facts from the current memory store.
 async fn list_facts(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -32993,13 +33064,12 @@ struct MemoryMaintenanceKnowledgeCounts {
 struct MemoryMaintenancePolicy {
     data_cleanup_enabled: bool,
     episode_retention_enabled: bool,
-    protect_fact_sources: bool,
 }
 
 #[derive(Debug, Serialize)]
 struct MemoryMaintenanceDurablePolicy {
     documents: String,
-    semantic_facts: String,
+    learned_facts: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -33012,7 +33082,6 @@ struct MemoryMaintenanceEpisodeCleanupReview {
     raw_candidate_count: u64,
     estimated_remaining_episodes: u64,
     protected_recent_count: u64,
-    protected_fact_source_count: u64,
     cutoff_days: u64,
     keep_last: u64,
     require_consolidated: bool,
@@ -33044,22 +33113,6 @@ struct EpisodeCleanupPlan {
     review: MemoryMaintenanceEpisodeCleanupReview,
 }
 
-fn collect_protected_episode_ids_for_maintenance(sources: &[String]) -> HashSet<String> {
-    let mut protected = HashSet::new();
-    for blob in sources {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(blob) {
-            if let Some(entries) = value.as_array() {
-                for entry in entries {
-                    if let Some(id) = entry.as_str() {
-                        protected.insert(id.to_string());
-                    }
-                }
-            }
-        }
-    }
-    protected
-}
-
 fn build_episode_cleanup_preview_signature(
     current_episode_count: u64,
     delete_ids: &[String],
@@ -33074,7 +33127,6 @@ fn build_episode_cleanup_preview_signature(
     mem_cfg.retention_require_consolidated.hash(&mut hasher);
     mem_cfg.retention_max_access_count.hash(&mut hasher);
     mem_cfg.retention_max_importance.to_bits().hash(&mut hasher);
-    mem_cfg.retention_protect_fact_sources.hash(&mut hasher);
     for id in delete_ids {
         id.hash(&mut hasher);
     }
@@ -33091,7 +33143,7 @@ async fn get_memory_maintenance_counts(
     let facts = storage
         .count_facts(None)
         .await
-        .map_err(|e| format!("Failed to count semantic facts: {}", e))?;
+        .map_err(|e| format!("Failed to count learned facts: {}", e))?;
     let documents = storage
         .count_documents(None)
         .await
@@ -33130,19 +33182,6 @@ async fn build_episode_cleanup_plan(
         .await
         .map_err(|e| format!("Failed to load protected recent episodes: {}", e))?;
     let keep_newest_protected: HashSet<String> = keep_newest_ids.into_iter().collect();
-    let mut protected = keep_newest_protected.clone();
-
-    let fact_protected = if mem_cfg.retention_protect_fact_sources {
-        let sources = storage
-            .list_all_semantic_fact_sources()
-            .await
-            .map_err(|e| format!("Failed to inspect semantic fact sources: {}", e))?;
-        let ids = collect_protected_episode_ids_for_maintenance(&sources);
-        protected.extend(ids.iter().cloned());
-        ids
-    } else {
-        HashSet::new()
-    };
 
     let target = if current_episode_count > max_episodes {
         ((current_episode_count - max_episodes) + 100)
@@ -33168,7 +33207,7 @@ async fn build_episode_cleanup_plan(
 
     let delete_ids: Vec<String> = raw_candidates
         .iter()
-        .filter(|id| !protected.contains(*id))
+        .filter(|id| !keep_newest_protected.contains(*id))
         .cloned()
         .collect();
     let available = !delete_ids.is_empty();
@@ -33182,12 +33221,12 @@ async fn build_episode_cleanup_plan(
     } else if raw_candidates.is_empty() {
         "No episodes met the current retention safety thresholds, so nothing is eligible for reviewed cleanup.".to_string()
     } else if delete_ids.is_empty() {
-        "Episodes matched age/importance rules, but they are still protected by the keep-last window or semantic-fact source protection.".to_string()
+        "Episodes matched age/importance rules, but they are still protected by the keep-last window.".to_string()
     } else if !lifecycle.cleanup_enabled || !mem_cfg.retention_enabled {
         "Automatic cleanup is disabled, but this reviewed flow can still run a one-time cleanup with the same safety thresholds.".to_string()
     } else {
         format!(
-            "{} low-risk episodic memories can be removed while leaving documents and semantic facts untouched.",
+            "{} low-risk episodic memories can be removed while leaving documents and learned facts untouched.",
             delete_ids.len()
         )
     };
@@ -33210,7 +33249,6 @@ async fn build_episode_cleanup_plan(
         raw_candidate_count: raw_candidates.len() as u64,
         estimated_remaining_episodes: current_episode_count.saturating_sub(delete_ids.len() as u64),
         protected_recent_count: keep_newest_protected.len() as u64,
-        protected_fact_source_count: fact_protected.len() as u64,
         cutoff_days: safe_cutoff_days,
         keep_last,
         require_consolidated: mem_cfg.retention_require_consolidated,
@@ -33274,11 +33312,10 @@ async fn memory_maintenance_review(State(state): State<AppState>) -> Response {
         policy: MemoryMaintenancePolicy {
             data_cleanup_enabled: lifecycle.cleanup_enabled,
             episode_retention_enabled: mem_cfg.retention_enabled,
-            protect_fact_sources: mem_cfg.retention_protect_fact_sources,
         },
         durable_policy: MemoryMaintenanceDurablePolicy {
             documents: "Documents and document chunks are durable. This review screen reports their size but never deletes them.".to_string(),
-            semantic_facts: "Semantic facts are durable. Episode cleanup keeps fact rows intact and protects source-linked episodes when that safety rule is enabled.".to_string(),
+            learned_facts: "Learned facts and operating constraints live in the experience-item memory store. Episode cleanup leaves them intact.".to_string(),
         },
         episode_cleanup: plan.review,
     };
@@ -33382,7 +33419,7 @@ async fn run_memory_maintenance(
             "action": MEMORY_MAINTENANCE_EPISODE_RETENTION_ACTION,
             "deleted": deleted,
             "summary": format!(
-                "Deleted {} episodic memories using the reviewed retention policy. Documents and semantic facts were left intact.",
+                "Deleted {} episodic memories using the reviewed retention policy. Documents and learned facts were left intact.",
                 deleted
             ),
         })),

@@ -142,7 +142,6 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
             arkpulse_event::Entity,
             browser_session::Entity,
             episode::Entity,
-            semantic_fact::Entity,
             action::Entity,
             execution_proof::Entity,
             execution_trace::Entity,
@@ -574,28 +573,6 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
             .col(watcher::Column::LeaseExpiresAt)
             .if_not_exists()
             .to_owned(),
-    )
-    .await?;
-    ensure_index(
-        db,
-        backend,
-        Index::create()
-            .name("idx_facts_project_id")
-            .table(semantic_fact::Entity)
-            .col(semantic_fact::Column::ProjectId)
-            .if_not_exists()
-            .to_owned(),
-    )
-    .await?;
-    ensure_pgvector_hnsw_index(
-        db,
-        backend,
-        "semantic_facts",
-        "embedding",
-        "CREATE INDEX IF NOT EXISTS idx_semantic_facts_embedding_hnsw \
-         ON semantic_facts USING hnsw (embedding vector_cosine_ops) \
-         WHERE embedding IS NOT NULL",
-        "semantic fact pgvector HNSW index",
     )
     .await?;
     ensure_index(

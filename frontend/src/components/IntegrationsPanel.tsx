@@ -372,8 +372,8 @@ type IntegrationSyncFormState = {
 
 function defaultIntegrationSyncForm(): IntegrationSyncFormState {
   return {
-    enabled: false,
-    poll_interval_minutes: "5",
+    enabled: true,
+    poll_interval_minutes: "30",
     importance_threshold_percent: "70",
     notify_on_important: true,
     push_to_preferred_channel: false
@@ -501,11 +501,11 @@ function channelStatusColor(
 
 function channelStatusLabel(status: string, enabled: boolean): string {
   const display = messagingDisplayState(status, enabled);
-  if (display === "ready") return "Ready";
-  if (display === "error") return "Error";
+  if (display === "ready") return "Channel ready";
+  if (display === "error") return "Channel error";
   if (display === "checking") return "Checking";
-  if (display === "needs_setup") return "Needs setup";
-  return "Off";
+  if (display === "needs_setup") return "Setup needed";
+  return "";
 }
 
 function messagingWizardHint(status: string, enabled: boolean): string {
@@ -784,6 +784,7 @@ export function IntegrationsPanel({
   const [editingConnected, setEditingConnected] = useState(false);
   const [syncForm, setSyncForm] = useState<IntegrationSyncFormState>(defaultIntegrationSyncForm());
   const [syncDirty, setSyncDirty] = useState(false);
+  const [syncExpanded, setSyncExpanded] = useState(false);
   const [syncNotice, setSyncNotice] = useState<{ kind: "success" | "error"; text: string } | null>(null);
   const [saving, setSaving] = useState(false);
   const [configSuccess, setConfigSuccess] = useState(false);
@@ -1410,6 +1411,12 @@ export function IntegrationsPanel({
     [integrations]
   );
   const activeSyncStatus = active ? integrationSyncStatusById[active.id] || null : null;
+  const syncSummaryLabel =
+    activeSyncStatus && !activeSyncStatus.supported
+      ? "Not available"
+      : syncForm.enabled
+        ? "Enabled"
+        : "Disabled";
   const readyList = sorted.filter((i) => integrationCardState(i) === "enabled");
   const notReadyList = sorted.filter((i) => integrationCardState(i) !== "enabled");
   const webhookSources = useMemo(
@@ -1506,6 +1513,32 @@ export function IntegrationsPanel({
       letterSpacing: 0,
       textTransform: "uppercase"
     }
+  } as const;
+  const sectionTagChipSx = {
+    height: 22,
+    borderRadius: 1,
+    background: "rgba(14, 25, 43, 0.95)",
+    border: "1px solid rgba(112,153,201,0.18)",
+    color: "rgba(198,214,235,0.82)",
+    "& .MuiChip-label": {
+      px: 1,
+      fontSize: "0.63rem",
+      fontWeight: 700,
+      letterSpacing: 0,
+      textTransform: "uppercase"
+    }
+  } as const;
+  const connectorCardActionButtonSx = {
+    minWidth: 0,
+    width: "auto",
+    maxWidth: "fit-content",
+    alignSelf: "flex-start",
+    flex: "0 0 auto",
+    whiteSpace: "nowrap",
+    borderRadius: 1.5,
+    textTransform: "none",
+    fontWeight: 700,
+    boxShadow: "none"
   } as const;
   const dialogActionButtonSx = {
     minHeight: 32,
@@ -2531,6 +2564,7 @@ export function IntegrationsPanel({
     setConfigSuccess(false);
     setSyncForm(integrationSyncFormFromStatus(integrationSyncStatusById[integration.id] || null));
     setSyncDirty(false);
+    setSyncExpanded(false);
     setSyncNotice(null);
     setGoogleWorkspaceHelpOpen(false);
   };
@@ -2544,6 +2578,7 @@ export function IntegrationsPanel({
     setEditingConnected(false);
     setSyncForm(defaultIntegrationSyncForm());
     setSyncDirty(false);
+    setSyncExpanded(false);
     setSyncNotice(null);
     setGoogleWorkspaceHelpOpen(false);
   };
@@ -3196,16 +3231,12 @@ export function IntegrationsPanel({
         </Alert>
       ) : null}
 
-      {showIntegrations ? (
+      {showIntegrations && !showChannelsPage && !showConnectorsPage ? (
         <ExtensionPacksPanel
           mode={
-            showChannelsPage
-              ? "channels"
-              : showMessagingOnly
-                ? "messaging"
-                : showConnectorsPage
-                  ? "connectors"
-                  : "all"
+            showMessagingOnly
+              ? "messaging"
+              : "all"
           }
         />
       ) : null}
@@ -3744,73 +3775,69 @@ export function IntegrationsPanel({
                 Failed to load gateway channel health: {(channelsQ.error as Error)?.message || "Unknown error"}
               </Alert>
             ) : null}
-            <Grid2 container spacing={1} alignItems="stretch">
+            <Grid2 container spacing={1.25} alignItems="stretch">
               {messagingSetups.map((setup) => {
                 const displayState = messagingDisplayState(setup.status, setup.enabled);
-                const accent = integrationCardAccent(
-                  displayState === "ready" ? "enabled" : "disabled"
-                );
+                const statusLabel = channelStatusLabel(setup.status, setup.enabled);
+                const isConfigured = displayState !== "off";
                 return (
-                  <Grid2 key={setup.id} size={{ xs: 12, sm: 6, lg: 3 }} sx={{ display: "flex" }}>
+                  <Grid2 key={setup.id} size={{ xs: 12, md: 6, xl: 4 }} sx={{ display: "flex" }}>
                     <Box
+                      role="button"
+                      tabIndex={0}
+                      onClick={setup.open}
+                      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setup.open(); } }}
                       sx={{
                         height: "100%",
-                        border: `1px solid ${accent.border}`,
-                        background: accent.background,
-                        borderRadius: 1.5,
+                        width: "100%",
                         p: 1.5,
-                        minHeight: 196,
-                        display: "flex",
-                        flexDirection: "column",
-                        justifyContent: "space-between"
+                        borderRadius: 1.5,
+                        border: isConfigured ? "1px solid rgba(64,196,255,0.24)" : "1px solid rgba(112,153,201,0.16)",
+                        background: isConfigured ? "rgba(8,24,42,0.56)" : "rgba(7,17,32,0.6)",
+                        cursor: "pointer",
+                        transition: "border-color 0.15s, background 0.15s, box-shadow 0.15s",
+                        "&:hover": {
+                          borderColor: isConfigured ? "rgba(64,196,255,0.36)" : "rgba(112,153,201,0.26)",
+                          background: isConfigured ? "rgba(8,28,48,0.66)" : "rgba(9,22,40,0.72)",
+                          boxShadow: "0 8px 24px rgba(0,0,0,0.18)"
+                        }
                       }}
                     >
-                      <Stack spacing={1}>
-                        <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
-                          <Stack direction="row" alignItems="center" spacing={0.75}>
-                            <ChannelIcon name={setup.name} size={22} />
-                            <Typography variant="subtitle2">{setup.name}</Typography>
+                      <Stack spacing={1.1} sx={{ height: "100%", justifyContent: "space-between" }}>
+                        <Box>
+                          <Stack direction="row" alignItems="center" spacing={0.9} sx={{ mb: 0.75 }}>
+                            <ChannelIcon name={setup.name} size={20} />
+                            <Typography variant="subtitle2" noWrap>
+                              {setup.name}
+                            </Typography>
                           </Stack>
-                          <Chip
+                          <Typography
+                            variant="body2"
+                            color="text.secondary"
+                            sx={{
+                              display: "-webkit-box",
+                              WebkitLineClamp: 3,
+                              WebkitBoxOrient: "vertical",
+                              overflow: "hidden"
+                            }}
+                          >
+                            {setup.detail}
+                          </Typography>
+                        </Box>
+                        <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
+                          <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap>
+                            <Chip size="small" label="Channel" sx={sectionTagChipSx} />
+                            {statusLabel ? <Chip size="small" label={statusLabel} sx={sectionCountChipSx} /> : null}
+                          </Stack>
+                          <Button
                             size="small"
-                            label={channelStatusLabel(setup.status, setup.enabled)}
-                            color={channelStatusColor(setup.status, setup.enabled)}
-                            variant="outlined"
-                          />
+                            variant={displayState === "off" ? "contained" : "outlined"}
+                            sx={connectorCardActionButtonSx}
+                            onClick={(e) => { e.stopPropagation(); setup.open(); }}
+                          >
+                            {setup.actionLabel}
+                          </Button>
                         </Stack>
-                        <Typography
-                          variant="body2"
-                          color="text.secondary"
-                          sx={{
-                            lineHeight: 1.45,
-                            display: "-webkit-box",
-                            WebkitLineClamp: 3,
-                            WebkitBoxOrient: "vertical",
-                            overflow: "hidden",
-                            minHeight: "4.35em"
-                          }}
-                        >
-                          {setup.detail}
-                        </Typography>
-                        <Typography
-                          variant="caption"
-                          color="text.secondary"
-                          sx={{
-                            lineHeight: 1.4,
-                            display: "-webkit-box",
-                            WebkitLineClamp: 2,
-                            WebkitBoxOrient: "vertical",
-                            overflow: "hidden",
-                            minHeight: "2.8em"
-                          }}
-                        >
-                          {messagingWizardHint(setup.status, setup.enabled)}
-                        </Typography>
-                      </Stack>
-                      <Stack direction="row" spacing={1} sx={{ mt: 1.25 }}>
-                        <Button size="small" variant="contained" onClick={setup.open}>
-                          {setup.actionLabel}
-                        </Button>
                       </Stack>
                     </Box>
                   </Grid2>
@@ -3916,67 +3943,68 @@ export function IntegrationsPanel({
                 const accent = integrationCardAccent(
                   displayState === "ready" ? "enabled" : "disabled"
                 );
+                const dotColor = integrationCardDotColor(
+                  displayState === "ready" ? "enabled" : "disabled"
+                );
                 return (
-                  <Grid2 key={setup.id} size={{ xs: 12, sm: 6, lg: 3 }} sx={{ display: "flex" }}>
+                  <Grid2 key={setup.id} size={{ xs: 12, sm: 6, md: 4, lg: 3 }} sx={{ display: "flex" }}>
                     <Box
+                      role="button"
+                      tabIndex={0}
+                      onClick={setup.open}
+                      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setup.open(); } }}
                       sx={{
                         height: "100%",
+                        width: "100%",
+                        p: 1.35,
+                        borderRadius: "8px",
                         border: `1px solid ${accent.border}`,
                         background: accent.background,
-                        borderRadius: 1.5,
-                        p: 1.5,
-                        minHeight: 196,
-                        display: "flex",
-                        flexDirection: "column",
-                        justifyContent: "space-between"
+                        cursor: "pointer",
+                        transition: "border-color 0.15s, background 0.15s, box-shadow 0.15s",
+                        "&:hover": {
+                          borderColor: accent.hoverBorder,
+                          background: accent.hoverBackground,
+                          boxShadow: "0 8px 24px rgba(0,0,0,0.18)"
+                        }
                       }}
                     >
-                      <Stack spacing={1}>
-                        <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
+                      <Stack spacing={0.75}>
+                        <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={1}>
                           <Stack direction="row" alignItems="center" spacing={0.75}>
                             <ChannelIcon name={setup.name} size={22} />
-                            <Typography variant="subtitle2">{setup.name}</Typography>
+                            <Typography variant="subtitle2" noWrap sx={{ fontWeight: 700 }}>
+                              {setup.name}
+                            </Typography>
                           </Stack>
-                          <Chip
-                            size="small"
-                            label={channelStatusLabel(setup.status, setup.enabled)}
-                            color={channelStatusColor(setup.status, setup.enabled)}
-                            variant="outlined"
-                          />
+                          <Box sx={{ width: 8, height: 8, borderRadius: "50%", background: dotColor, flex: "0 0 auto" }} />
                         </Stack>
-                        <Typography
-                          variant="body2"
-                          color="text.secondary"
-                          sx={{
-                            lineHeight: 1.45,
-                            display: "-webkit-box",
-                            WebkitLineClamp: 3,
-                            WebkitBoxOrient: "vertical",
-                            overflow: "hidden",
-                            minHeight: "4.35em"
-                          }}
-                        >
-                          {setup.detail}
-                        </Typography>
                         <Typography
                           variant="caption"
                           color="text.secondary"
                           sx={{
-                            lineHeight: 1.4,
+                            lineHeight: 1.45,
                             display: "-webkit-box",
                             WebkitLineClamp: 2,
                             WebkitBoxOrient: "vertical",
-                            overflow: "hidden",
-                            minHeight: "2.8em"
+                            overflow: "hidden"
                           }}
                         >
-                          {messagingWizardHint(setup.status, setup.enabled)}
+                          {setup.detail}
                         </Typography>
-                      </Stack>
-                      <Stack direction="row" spacing={1} sx={{ mt: 1.25 }}>
-                        <Button size="small" variant="contained" onClick={setup.open}>
-                          {setup.actionLabel}
-                        </Button>
+                        <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
+                          {channelStatusLabel(setup.status, setup.enabled) ? (
+                            <Chip
+                              size="small"
+                              label={channelStatusLabel(setup.status, setup.enabled)}
+                              sx={{ height: 20, fontSize: "0.68rem", fontWeight: 700, borderColor: accent.chipBorder, color: accent.chipColor }}
+                              variant="outlined"
+                            />
+                          ) : <Box sx={{ flex: 1 }} />}
+                          <Button size="small" variant="text" sx={{ minWidth: 0 }} onClick={(e) => { e.stopPropagation(); setup.open(); }}>
+                            {setup.actionLabel}
+                          </Button>
+                        </Stack>
                       </Stack>
                     </Box>
                   </Grid2>
@@ -5416,7 +5444,10 @@ export function IntegrationsPanel({
                         onChange={async () => {
                           try {
                             await api.rawPost(`/integrations/${active!.id}/${active!.enabled ? "disable" : "enable"}`, {});
-                            await queryClient.invalidateQueries({ queryKey: ["integrations"] });
+                            await Promise.allSettled([
+                              queryClient.invalidateQueries({ queryKey: ["integrations"] }),
+                              queryClient.invalidateQueries({ queryKey: ["integration-sync-status"] })
+                            ]);
                             setActive((prev) => prev ? { ...prev, enabled: !prev.enabled } : prev);
                           } catch (e) {
                             setFormError(asErrorMessage(e));
@@ -5519,24 +5550,52 @@ export function IntegrationsPanel({
                 </Box>
               </Box>
             ) : null}
-            {active?.id !== "google_workspace" ? (
+            {active ? (
               <>
                 <Divider sx={{ borderColor: "rgba(112,153,201,0.12)" }} />
-                <Box
+                <Accordion
+                  expanded={syncExpanded}
+                  onChange={(_, expanded) => setSyncExpanded(expanded)}
+                  disableGutters
                   sx={{
                     border: "1px solid rgba(110, 160, 255, 0.18)",
                     borderRadius: 2,
-                    p: 1.5,
-                    background: "rgba(10, 18, 32, 0.5)"
+                    background: "rgba(10, 18, 32, 0.5)",
+                    "&:before": { display: "none" }
                   }}
                 >
+                  <AccordionSummary
+                    expandIcon={<ExpandMoreRoundedIcon />}
+                    sx={{
+                      px: 1.5,
+                      py: 1,
+                      minHeight: 0,
+                      "& .MuiAccordionSummary-content": { my: 0 }
+                    }}
+                  >
+                    <Stack
+                      direction={{ xs: "column", sm: "row" }}
+                      spacing={1}
+                      alignItems={{ xs: "flex-start", sm: "center" }}
+                      justifyContent="space-between"
+                      sx={{ width: "100%", pr: 1 }}
+                    >
+                      <Box>
+                        <Typography variant="subtitle2">Background Sync</Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          Defaults to ArkPulse cadence: every 30 minutes. Use a shorter interval only when this integration needs closer polling.
+                        </Typography>
+                      </Box>
+                      <Chip
+                        size="small"
+                        variant="outlined"
+                        color={syncSummaryLabel === "Enabled" ? "success" : "default"}
+                        label={syncSummaryLabel}
+                      />
+                    </Stack>
+                  </AccordionSummary>
+                  <AccordionDetails sx={{ px: 1.5, pt: 0, pb: 1.5 }}>
                   <Stack spacing={1.25}>
-                    <Box>
-                      <Typography variant="subtitle2">Background Sync</Typography>
-                      <Typography variant="caption" color="text.secondary">
-                        Poll this integration in the background so AgentArk can spot important updates without waiting for chat.
-                      </Typography>
-                    </Box>
                     {integrationSyncStatusQ.error ? (
                       <Alert severity="warning">
                         Could not load background sync state right now: {asErrorMessage(integrationSyncStatusQ.error)}
@@ -5550,12 +5609,12 @@ export function IntegrationsPanel({
                       <>
                         {activeSyncStatus && !activeSyncStatus.integration_enabled ? (
                           <Alert severity="info">
-                            This integration is disabled. Background sync will stay paused until the connector is enabled again.
+                            This integration is disabled. Background sync is saved, but polling stays paused until the connector is enabled again.
                           </Alert>
                         ) : null}
                         {activeSyncStatus && !activeSyncStatus.connected ? (
                           <Alert severity="info">
-                            Connect this integration first. AgentArk can save sync preferences now, but it cannot poll until credentials work.
+                            Connect this integration first. Sync preferences can be saved now, but polling starts only after credentials work.
                           </Alert>
                         ) : null}
                         <FormControlLabel
@@ -5672,7 +5731,8 @@ export function IntegrationsPanel({
                       </>
                     )}
                   </Stack>
-                </Box>
+                  </AccordionDetails>
+                </Accordion>
               </>
             ) : null}
             {formError ? <Alert severity="error">{formError}</Alert> : null}

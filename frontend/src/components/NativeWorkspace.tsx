@@ -62,7 +62,7 @@ import FilterListRoundedIcon from "@mui/icons-material/FilterListRounded";
 import SettingsRoundedIcon from "@mui/icons-material/SettingsRounded";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { UserRound } from "lucide-react";
-import { Fragment, Suspense, isValidElement, lazy, useEffect, useLayoutEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent, type MouseEvent, type ReactNode } from "react";
+import { Fragment, Suspense, isValidElement, lazy, useEffect, useLayoutEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent, type JSX, type MouseEvent, type ReactNode } from "react";
 import ReactECharts from "echarts-for-react";
 import { api, apiUrl } from "../api/client";
 import AgentLogo from "../assets/logo.svg";
@@ -369,12 +369,20 @@ type ResearchReportDialogState = {
 
 const MODEL_FALLBACKS_BY_PROVIDER: Record<string, string[]> = {
   openai: ["gpt-5", "gpt-5-mini", "gpt-4.1", "o4-mini", "o3"],
-  "openai-subscription": ["gpt-5", "gpt-5-mini", "gpt-4.1", "o4-mini", "o3"],
   anthropic: ["claude-opus-4-20250514", "claude-sonnet-4-20250514", "claude-3-7-sonnet-latest", "claude-3-5-haiku-latest"],
   openrouter: ["openai/gpt-5", "anthropic/claude-sonnet-4", "google/gemini-2.5-pro"],
   "openai-compatible": [],
   ollama: [],
 };
+
+const MODEL_PROVIDER_OPTIONS = [
+  { value: "ollama", label: "ollama" },
+  { value: "anthropic", label: "anthropic" },
+  { value: "openai", label: "openai" },
+  { value: "openrouter", label: "openrouter" },
+  { value: "huggingface", label: "huggingface inference" },
+  { value: "openai-compatible", label: "openai-compatible" },
+];
 
 function getDeveloperModeEnabled(): boolean {
   if (typeof window === "undefined") return false;
@@ -10717,16 +10725,16 @@ function ChatManager({
     ));
   const starterPrompts = [
     {
-      label: "Review recent changes",
-      prompt: "Review recent changes and list only the critical risks."
+      label: "Send me a daily brief",
+      prompt: "Every weekday at 9am, send me a daily brief with weather, calendar, urgent email, and overdue tasks."
     },
     {
-      label: "Plan a UI cleanup",
-      prompt: "Plan and implement a cleaner UI that fits the viewport better."
+      label: "Watch something for me",
+      prompt: "Watch my inbox for urgent client messages and alert me if I don't reply within 2 hours."
     },
     {
-      label: "Summarize the project",
-      prompt: "Summarize the current project architecture and suggest the next steps."
+      label: "Deploy an app from chat",
+      prompt: "Build me a simple landing page and deploy it with a public URL."
     }
   ];
   const origin = typeof window !== "undefined" ? window.location.origin : "";
@@ -11953,6 +11961,166 @@ function ChatManager({
             )}
           </Box>
         </Box>
+        {workspaceSnippetFiles.length > 0 ? (
+          <Accordion className="chat-workspace-section" disableGutters>
+            <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ minHeight: 34 }}>
+              <Typography variant="subtitle2">Snippets ({workspaceSnippetFiles.length})</Typography>
+            </AccordionSummary>
+            <AccordionDetails sx={{ p: "4px 8px 8px" }}>
+              <Stack spacing={0.5}>
+                {workspaceSnippetFiles.map((snippet) => (
+                  <Box
+                    key={snippet.id}
+                    className={`deployed-file-row${activeSnippetFile?.id === snippet.id ? " is-selected" : ""}`}
+                    onClick={() => {
+                      setWorkspaceOpen(true);
+                      setSelectedSnippetId(snippet.id);
+                    }}
+                  >
+                    <span className="deployed-file-icon">&lt;/&gt;</span>
+                    <span className="deployed-file-name" title={snippet.displayName}>{snippet.displayName}</span>
+                    <span className="deployed-file-size">{snippet.sourceLabel}</span>
+                  </Box>
+                ))}
+              </Stack>
+            </AccordionDetails>
+          </Accordion>
+        ) : null}
+
+        {isShowingSnippetPreview && activeWorkspaceCodeEntry ? (
+          <Accordion className="chat-workspace-section" disableGutters defaultExpanded>
+            <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ minHeight: 34 }}>
+              <Stack direction="row" spacing={1} alignItems="center" className="chat-workspace-code-summary">
+                <Stack direction="row" spacing={1} alignItems="center" className="chat-workspace-code-heading">
+                  <Typography variant="subtitle2">Snippet preview</Typography>
+                  <Typography
+                    variant="caption"
+                    className="chat-workspace-code-path"
+                    title={activeWorkspaceCodePath}
+                  >
+                    {activeWorkspaceCodePath}
+                  </Typography>
+                </Stack>
+                <Box sx={{ flex: 1, minWidth: 0 }} />
+                <Stack direction="row" spacing={1} alignItems="center" className="chat-workspace-code-actions">
+                  <Typography
+                    variant="caption"
+                    color="text.secondary"
+                    className="chat-workspace-code-meta"
+                    title={activeWorkspaceCodeSourceLabel}
+                  >
+                    {activeWorkspaceCodeSourceLabel}
+                  </Typography>
+                  <Button
+                    size="small"
+                    variant="text"
+                    className="chat-workspace-code-open"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setCodeViewerOpen(true);
+                    }}
+                  >
+                    Open full screen
+                  </Button>
+                </Stack>
+              </Stack>
+            </AccordionSummary>
+            <AccordionDetails>
+              {workspaceSnippetFiles.length > 1 ? (
+                <Box className="code-file-tabs chat-workspace-file-tabs">
+                  {workspaceSnippetFiles.map((snippet) => (
+                    <button
+                      key={snippet.id}
+                      className={`code-file-tab${activeSnippetFile?.id === snippet.id ? " code-file-tab-active" : ""}`}
+                      onClick={() => setSelectedSnippetId(snippet.id)}
+                    >
+                      {snippet.displayName}
+                    </button>
+                  ))}
+                </Box>
+              ) : null}
+              <pre className="code-viewer-pre chat-workspace-code-inline">
+                <code>{renderCodeBlockLines(activeWorkspaceCodeContent || "", {
+                  fileName: activeWorkspaceCodePath
+                })}</code>
+              </pre>
+              <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.75 }}>
+                Referenced from {activeWorkspaceCodeSourceLabel}.
+              </Typography>
+            </AccordionDetails>
+          </Accordion>
+        ) : codeSnapshot ? (
+          <Accordion className="chat-workspace-section" disableGutters>
+            <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ minHeight: 34 }}>
+              <Typography variant="subtitle2">Code</Typography>
+            </AccordionSummary>
+            <AccordionDetails>
+              <pre className="code-viewer-pre chat-workspace-pre">
+                <code>{renderCodeBlockLines(codeSnapshot)}</code>
+              </pre>
+            </AccordionDetails>
+          </Accordion>
+        ) : null}
+
+        {previewUrl ? (
+          <Accordion className="chat-workspace-section chat-workspace-section-preview" disableGutters>
+            <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ minHeight: 34 }}>
+              <Typography variant="subtitle2">Preview</Typography>
+            </AccordionSummary>
+            <AccordionDetails>
+              <Box className="chat-workspace-preview">
+                <Typography
+                  variant="caption"
+                  color="text.secondary"
+                  sx={{ display: "block", mb: 0.7 }}
+                  noWrap
+                  title={previewUrl}
+                >
+                  Local:{" "}
+                  <Link href={previewUrl} target="_blank" rel="noopener noreferrer" underline="hover">
+                    {previewUrl}
+                  </Link>
+                </Typography>
+                {publicPreviewUrl ? (
+                  <Typography
+                    variant="caption"
+                    color="info.main"
+                    sx={{ display: "block", mb: 0.7 }}
+                    noWrap
+                    title={publicPreviewUrl}
+                  >
+                    {workspaceTunnelMeta.isPrivate ? "Private access:" : "Public:"}{" "}
+                    <Link href={publicPreviewUrl} target="_blank" rel="noopener noreferrer" underline="hover">
+                      {publicPreviewUrl}
+                    </Link>
+                  </Typography>
+                ) : null}
+                <Stack direction="row" spacing={0.8} sx={{ mt: 0.7 }}>
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    onClick={() => window.open(previewUrl, "_blank", "noopener,noreferrer")}
+                  >
+                    Open live app
+                  </Button>
+                  <Button
+                    size="small"
+                    variant="contained"
+                    onClick={() => setPreviewDialogOpen(true)}
+                    disabled={!previewImageUrl}
+                  >
+                    Open preview popup
+                  </Button>
+                </Stack>
+                {!previewImageUrl ? (
+                  <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.7 }}>
+                    Screenshot preview will appear after deployment validation captures it.
+                  </Typography>
+                ) : null}
+              </Box>
+            </AccordionDetails>
+          </Accordion>
+        ) : null}
       </Box>
     </Box>
   );
@@ -12800,166 +12968,6 @@ function ChatManager({
       {showWorkspacePanelInline ? (
         <Box sx={{ minHeight: 0, display: { xs: "none", lg: "contents" } }}>
           {renderActivityPanelContent()}
-          {workspaceSnippetFiles.length > 0 ? (
-              <Accordion className="chat-workspace-section" disableGutters>
-                <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ minHeight: 34 }}>
-                  <Typography variant="subtitle2">Snippets ({workspaceSnippetFiles.length})</Typography>
-                </AccordionSummary>
-                <AccordionDetails sx={{ p: "4px 8px 8px" }}>
-                  <Stack spacing={0.5}>
-                    {workspaceSnippetFiles.map((snippet) => (
-                      <Box
-                        key={snippet.id}
-                        className={`deployed-file-row${activeSnippetFile?.id === snippet.id ? " is-selected" : ""}`}
-                        onClick={() => {
-                          setWorkspaceOpen(true);
-                          setSelectedSnippetId(snippet.id);
-                        }}
-                      >
-                        <span className="deployed-file-icon">&lt;/&gt;</span>
-                        <span className="deployed-file-name" title={snippet.displayName}>{snippet.displayName}</span>
-                        <span className="deployed-file-size">{snippet.sourceLabel}</span>
-                      </Box>
-                    ))}
-                  </Stack>
-                </AccordionDetails>
-              </Accordion>
-            ) : null}
-
-            {isShowingSnippetPreview && activeWorkspaceCodeEntry ? (
-              <Accordion className="chat-workspace-section" disableGutters defaultExpanded>
-                <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ minHeight: 34 }}>
-                  <Stack direction="row" spacing={1} alignItems="center" className="chat-workspace-code-summary">
-                    <Stack direction="row" spacing={1} alignItems="center" className="chat-workspace-code-heading">
-                      <Typography variant="subtitle2">Snippet preview</Typography>
-                      <Typography
-                        variant="caption"
-                        className="chat-workspace-code-path"
-                        title={activeWorkspaceCodePath}
-                      >
-                        {activeWorkspaceCodePath}
-                      </Typography>
-                    </Stack>
-                    <Box sx={{ flex: 1, minWidth: 0 }} />
-                    <Stack direction="row" spacing={1} alignItems="center" className="chat-workspace-code-actions">
-                      <Typography
-                        variant="caption"
-                        color="text.secondary"
-                        className="chat-workspace-code-meta"
-                        title={activeWorkspaceCodeSourceLabel}
-                      >
-                        {activeWorkspaceCodeSourceLabel}
-                      </Typography>
-                      <Button
-                        size="small"
-                        variant="text"
-                        className="chat-workspace-code-open"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          setCodeViewerOpen(true);
-                        }}
-                      >
-                        Open full screen
-                      </Button>
-                    </Stack>
-                  </Stack>
-                </AccordionSummary>
-                <AccordionDetails>
-                  {workspaceSnippetFiles.length > 1 ? (
-                    <Box className="code-file-tabs chat-workspace-file-tabs">
-                      {workspaceSnippetFiles.map((snippet) => (
-                        <button
-                          key={snippet.id}
-                          className={`code-file-tab${activeSnippetFile?.id === snippet.id ? " code-file-tab-active" : ""}`}
-                          onClick={() => setSelectedSnippetId(snippet.id)}
-                        >
-                          {snippet.displayName}
-                        </button>
-                      ))}
-                    </Box>
-                  ) : null}
-                  <pre className="code-viewer-pre chat-workspace-code-inline">
-                    <code>{renderCodeBlockLines(activeWorkspaceCodeContent || "", {
-                      fileName: activeWorkspaceCodePath
-                    })}</code>
-                  </pre>
-                  <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.75 }}>
-                    Referenced from {activeWorkspaceCodeSourceLabel}.
-                  </Typography>
-                </AccordionDetails>
-              </Accordion>
-            ) : codeSnapshot ? (
-              <Accordion className="chat-workspace-section" disableGutters>
-                <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ minHeight: 34 }}>
-                  <Typography variant="subtitle2">Code</Typography>
-                </AccordionSummary>
-                <AccordionDetails>
-                  <pre className="code-viewer-pre chat-workspace-pre">
-                    <code>{renderCodeBlockLines(codeSnapshot)}</code>
-                  </pre>
-                </AccordionDetails>
-              </Accordion>
-            ) : null}
-
-            {previewUrl ? (
-              <Accordion className="chat-workspace-section chat-workspace-section-preview" disableGutters>
-                <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ minHeight: 34 }}>
-                  <Typography variant="subtitle2">Preview</Typography>
-                </AccordionSummary>
-                <AccordionDetails>
-                  <Box className="chat-workspace-preview">
-                    <Typography
-                      variant="caption"
-                      color="text.secondary"
-                      sx={{ display: "block", mb: 0.7 }}
-                      noWrap
-                      title={previewUrl}
-                    >
-                      Local:{" "}
-                      <Link href={previewUrl} target="_blank" rel="noopener noreferrer" underline="hover">
-                        {previewUrl}
-                      </Link>
-                    </Typography>
-                    {publicPreviewUrl ? (
-                      <Typography
-                        variant="caption"
-                        color="info.main"
-                        sx={{ display: "block", mb: 0.7 }}
-                        noWrap
-                        title={publicPreviewUrl}
-                      >
-                        {workspaceTunnelMeta.isPrivate ? "Private access:" : "Public:"}{" "}
-                        <Link href={publicPreviewUrl} target="_blank" rel="noopener noreferrer" underline="hover">
-                        {publicPreviewUrl}
-                      </Link>
-                    </Typography>
-                    ) : null}
-                    <Stack direction="row" spacing={0.8} sx={{ mt: 0.7 }}>
-                      <Button
-                        size="small"
-                        variant="outlined"
-                        onClick={() => window.open(previewUrl, "_blank", "noopener,noreferrer")}
-                      >
-                        Open live app
-                      </Button>
-                      <Button
-                        size="small"
-                        variant="contained"
-                        onClick={() => setPreviewDialogOpen(true)}
-                        disabled={!previewImageUrl}
-                      >
-                        Open preview popup
-                      </Button>
-                    </Stack>
-                    {!previewImageUrl ? (
-                      <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.7 }}>
-                        Screenshot preview will appear after deployment validation captures it.
-                      </Typography>
-                    ) : null}
-                  </Box>
-                </AccordionDetails>
-              </Accordion>
-            ) : null}
         </Box>
       ) : null}
 
@@ -19859,7 +19867,7 @@ function ProjectsManager({
         <DialogContent>
           <Stack spacing={1}>
             <Alert severity="warning">
-              This permanently deletes the project and ALL associated data: conversations, messages, documents, document chunks, episodic memories, and semantic facts.
+              This permanently deletes the project and ALL associated data: conversations, messages, documents, document chunks, episodic memories, and learned facts.
             </Alert>
             <Typography variant="body2">
               Type the project name to confirm deletion: <b>{str(deleteProject?.name, "")}</b>
@@ -23053,7 +23061,6 @@ function SettingsManager({
     memory_retention_run_interval_days: "7",
     memory_retention_idle_threshold_secs: "600",
     memory_retention_max_delete_per_run: "500",
-    memory_retention_protect_fact_sources: true,
 
     data_lifecycle_cleanup_enabled: true,
     data_lifecycle_notifications_cleanup_enabled: true,
@@ -23451,11 +23458,6 @@ function SettingsManager({
       memory_retention_run_interval_days: str(settings.memory_retention_run_interval_days, "7"),
       memory_retention_idle_threshold_secs: str(settings.memory_retention_idle_threshold_secs, "600"),
       memory_retention_max_delete_per_run: str(settings.memory_retention_max_delete_per_run, "500"),
-      memory_retention_protect_fact_sources:
-        settings.memory_retention_protect_fact_sources == null
-          ? true
-          : toBool(settings.memory_retention_protect_fact_sources),
-
       data_lifecycle_cleanup_enabled:
         dataLifecycleSettings.cleanup_enabled == null
           ? true
@@ -23823,7 +23825,6 @@ function SettingsManager({
         memory_retention_run_interval_days: memoryRetentionRunIntervalDays,
         memory_retention_idle_threshold_secs: memoryRetentionIdleThresholdSecs,
         memory_retention_max_delete_per_run: memoryRetentionMaxDeletePerRun,
-        memory_retention_protect_fact_sources: form.memory_retention_protect_fact_sources,
         data_lifecycle: dataLifecycle,
 
         observability: {
@@ -24169,6 +24170,7 @@ function SettingsManager({
     setModelForm((p) => {
       const current = p.base_url.trim();
       let next = p.base_url;
+      let nextModel = p.model;
       if (p.provider === "openrouter") {
         if (current === OLLAMA_DEFAULT_BASE_URL) next = "";
       } else if (p.provider === "ollama") {
@@ -24181,7 +24183,15 @@ function SettingsManager({
       ) {
         next = "";
       }
-      return next === p.base_url ? p : { ...p, base_url: next };
+      const providerFallback = MODEL_FALLBACKS_BY_PROVIDER[p.provider]?.[0] || "";
+      const previousProviderFallbacks = MODEL_FALLBACKS_BY_PROVIDER[prevProvider] || [];
+      const providerChanged = !!prevProvider && prevProvider !== p.provider;
+      if (providerFallback && (!p.model.trim() || providerChanged || previousProviderFallbacks.includes(p.model.trim()))) {
+        nextModel = providerFallback;
+      } else if (providerChanged) {
+        nextModel = "";
+      }
+      return next === p.base_url && nextModel === p.model ? p : { ...p, base_url: next, model: nextModel };
     });
   }, [modelForm.provider]);
 
@@ -24224,10 +24234,28 @@ function SettingsManager({
     }
     return names;
   }, [discoverModelsQ.data]);
+  const discoveredModelIds = useMemo(
+    () => (discoverModelsQ.data || []).map((model) => model.id).filter(Boolean),
+    [discoverModelsQ.data]
+  );
+  useEffect(() => {
+    if (!modelDialogOpen || discoverModelsQ.isFetching) return;
+    const firstDiscoveredModel = discoveredModelIds[0];
+    if (!firstDiscoveredModel) return;
+    setModelForm((p) => {
+      if (p.provider !== modelForm.provider) return p;
+      const currentModel = p.model.trim();
+      const fallbackModels = MODEL_FALLBACKS_BY_PROVIDER[p.provider] || [];
+      if (currentModel && !fallbackModels.includes(currentModel)) return p;
+      return currentModel === firstDiscoveredModel
+        ? p
+        : { ...p, model: firstDiscoveredModel };
+    });
+  }, [discoveredModelIds, discoverModelsQ.isFetching, modelDialogOpen, modelForm.provider]);
   const modelOptions = useMemo(() => {
     const merged: string[] = [];
     for (const candidate of [
-      ...(discoverModelsQ.data || []).map((model) => model.id),
+      ...discoveredModelIds,
       ...(MODEL_FALLBACKS_BY_PROVIDER[modelForm.provider] || []),
       modelForm.model.trim()
     ]) {
@@ -24236,7 +24264,7 @@ function SettingsManager({
       merged.push(value);
     }
     return merged;
-  }, [discoverModelsQ.data, modelForm.model, modelForm.provider]);
+  }, [discoveredModelIds, modelForm.model, modelForm.provider]);
 
   function openAddModel() {
     setModelEditingId(null);
@@ -24246,6 +24274,7 @@ function SettingsManager({
     setModelEditingOriginalScope({ provider: "", base_url: "" });
     setModelClearApiKey(false);
     setOpenaiSubAuth(null);
+    previousModelProviderRef.current = "";
     setModelForm({
       label: "",
       role: "primary",
@@ -24259,22 +24288,25 @@ function SettingsManager({
   }
 
   function openEditModel(slot: JsonRecord) {
+    const provider = str(slot.provider, "");
+    const baseUrl = str(slot.base_url, "");
     setModelEditingId(str(slot.id, ""));
     setModelAdvancedOpen(false);
     setModelConnectivityWarning(null);
     setModelEditingHasApiKey(toBool(slot.has_api_key));
     setModelEditingOriginalScope({
-      provider: str(slot.provider, ""),
-      base_url: str(slot.base_url, "")
+      provider,
+      base_url: baseUrl
     });
     setModelClearApiKey(false);
     setOpenaiSubAuth(null);
+    previousModelProviderRef.current = provider;
     setModelForm({
       label: str(slot.label, ""),
       role: str(slot.role, "primary"),
-      provider: str(slot.provider, ""),
+      provider,
       model: str(slot.model, ""),
-      base_url: str(slot.base_url, ""),
+      base_url: baseUrl,
       api_key: "",
       enabled: toBool(slot.enabled)
     });
@@ -24481,9 +24513,10 @@ function SettingsManager({
   const telegramAllowedUsers = parseTelegramUsers(form.telegram_allowed_users_csv);
   const whatsappAllowedNumbers = parseCsvList(form.whatsapp_allowed_numbers_csv);
   const whatsappConfigReady =
-    form.whatsapp_mode === "cloud_api"
+    form.whatsapp_enabled &&
+    (form.whatsapp_mode === "cloud_api"
       ? hasWhatsAppToken && !!form.whatsapp_phone_number_id.trim()
-      : !!form.whatsapp_bridge_url.trim();
+      : !!form.whatsapp_bridge_url.trim());
   const embeddingsIsLocal = embeddingsProvider === "local-hf";
   const embeddingsIsOllama = embeddingsProvider === "ollama";
   const embeddingsIsExternal = embeddingsProvider === "openai-compatible" || embeddingsIsOllama;
@@ -27175,12 +27208,16 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                   fullWidth
                 >
                   <MenuItem value="">Select provider</MenuItem>
-                  <MenuItem value="ollama">ollama</MenuItem>
-                  <MenuItem value="anthropic">anthropic</MenuItem>
-                  <MenuItem value="openai">openai</MenuItem>
-                  <MenuItem value="openai-subscription">openai-subscription (OAuth)</MenuItem>
-                  <MenuItem value="openrouter">openrouter</MenuItem>
-                  <MenuItem value="openai-compatible">openai-compatible</MenuItem>
+                  {modelForm.provider === "openai-subscription" ? (
+                    <MenuItem value="openai-subscription" sx={{ display: "none" }}>
+                      openai-subscription
+                    </MenuItem>
+                  ) : null}
+                  {MODEL_PROVIDER_OPTIONS.map((provider) => (
+                    <MenuItem key={provider.value} value={provider.value}>
+                      {provider.label}
+                    </MenuItem>
+                  ))}
                 </TextField>
                 <Autocomplete
                   freeSolo
@@ -27398,7 +27435,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                     <Typography variant="body2">Advanced</Typography>
                   </AccordionSummary>
                   <AccordionDetails>
-                    {["ollama", "openrouter", "openai-compatible"].includes(modelForm.provider) ? (
+                    {["ollama", "openrouter", "openai-compatible", "huggingface"].includes(modelForm.provider) ? (
                       <TextField
                         label={modelForm.provider === "openai-compatible" ? "Base URL" : "Base URL (optional)"}
                         value={modelForm.base_url}
@@ -27409,7 +27446,9 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                             ? `Example: ${OPENROUTER_DEFAULT_BASE_URL}`
                             : modelForm.provider === "ollama"
                               ? `Example: ${OLLAMA_DEFAULT_BASE_URL}`
-                              : "Required for OpenAI-compatible providers."
+                              : modelForm.provider === "huggingface"
+                                ? "Default: https://api-inference.huggingface.co/v1 — use your HF token as the API key"
+                                : "Required for OpenAI-compatible providers."
                         }
                       />
                     ) : (
@@ -27514,30 +27553,27 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
               {renderSettingsSectionIntro({
                 eyebrow: "Search",
                 title: "Provider Credentials",
-                description: "Configured providers are used automatically in a fixed order. Leave API key fields blank to keep any existing saved key. SearXNG uses its base URL instead of an API key.",
+                description: "Configured providers are used automatically in a fixed order. Leave API key fields blank to keep any existing saved key.",
               })}
               <Stack spacing={1.2} sx={{ mt: 1 }}>
                 <Alert severity="info">
-                  Configured provider order: {SEARCH_PROVIDER_OPTIONS.map((provider) => provider.label).join(" -> ")}.
-                </Alert>
-                <Alert severity="info">
-                  {"Free fallback order: Bing RSS -> Lightpanda -> DuckDuckGo. Browser-backed search is reserved for explicit page-reading and browser tasks."}
+                  Provider order: {SEARCH_PROVIDER_OPTIONS.map((provider) => provider.label).join(" → ")} — free fallback: Bing RSS → Lightpanda → DuckDuckGo.
                 </Alert>
                 <Typography variant="caption" color="text.secondary">
                   Anonymous HTML backends that return challenge pages are cooled down for {str(settings.search_builtin_cooldown_hours, "24")} hours. Configured API providers and SearXNG are never auto-cooled down.
                 </Typography>
+                {SEARCH_API_PROVIDER_OPTIONS.map((provider) =>
+                  renderSearchProviderCredentialField(provider)
+                )}
                 <TextField
-                  label="SearXNG Base URL"
+                  label="SearXNG Base URL (self-hosted)"
                   value={form.search_searxng_base_url}
                   onChange={(e) => setField("search_searxng_base_url", e.target.value)}
                   fullWidth
                   size="small"
                   placeholder="https://search.example.com"
-                  helperText="Optional self-hosted search endpoint. AgentArk will call /search?format=json against this base URL."
+                  helperText="Optional — requires your own SearXNG instance. AgentArk will call /search?format=json against this URL."
                 />
-                {SEARCH_API_PROVIDER_OPTIONS.map((provider) =>
-                  renderSearchProviderCredentialField(provider)
-                )}
               </Stack>
             </Box>
           </Grid2>
@@ -28526,7 +28562,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                 <Chip
                   size="small"
                   variant="outlined"
-                  label={form.memory_retention_require_consolidated ? "Only consolidated episodes" : "Consolidation guard off"}
+                  label={form.memory_retention_require_consolidated ? "Only finalized episodes" : "Finalized-only guard off"}
                 />
               </Stack>
               <FormControlLabel
@@ -28641,20 +28677,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                         }
                       />
                     }
-                    label="Require consolidation"
-                  />
-                </Grid2>
-                <Grid2 size={{ xs: 12, md: 4 }}>
-                  <FormControlLabel
-                    control={
-                      <Switch
-                        checked={form.memory_retention_protect_fact_sources}
-                        onChange={(e) =>
-                          setField("memory_retention_protect_fact_sources", e.target.checked)
-                        }
-                      />
-                    }
-                    label="Protect fact-linked episodes"
+                    label="Only prune finalized episodes"
                   />
                 </Grid2>
               </Grid2>
@@ -29925,19 +29948,13 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                   color={toBool(storageMaintenancePolicy.episode_retention_enabled) ? "success" : "default"}
                   variant={toBool(storageMaintenancePolicy.episode_retention_enabled) ? "filled" : "outlined"}
                 />
-                <Chip
-                  size="small"
-                  label={toBool(storageMaintenancePolicy.protect_fact_sources) ? "Fact source protection on" : "Fact source protection off"}
-                  color={toBool(storageMaintenancePolicy.protect_fact_sources) ? "info" : "default"}
-                  variant="outlined"
-                />
               </Stack>
 
               <Alert severity="info" variant="outlined">
                 {str(storageMaintenanceDurablePolicy.documents, "Documents stay durable.")}
               </Alert>
               <Alert severity="info" variant="outlined">
-                {str(storageMaintenanceDurablePolicy.semantic_facts, "Semantic facts stay durable.")}
+                {str(storageMaintenanceDurablePolicy.learned_facts, "Learned facts stay durable.")}
               </Alert>
 
               <Box className="metadata-box">
@@ -29953,10 +29970,10 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                     Safeguards: keep last {num(storageMaintenanceEpisode.keep_last, 0)} | min age {num(storageMaintenanceEpisode.cutoff_days, 0)} days | max importance {num(storageMaintenanceEpisode.max_importance, 0).toFixed(2)} | max access count {num(storageMaintenanceEpisode.max_access_count, 0)}
                   </Typography>
                   <Typography variant="body2" color="text.secondary">
-                    Protected rows: {num(storageMaintenanceEpisode.protected_recent_count, 0)} recent episodes | {num(storageMaintenanceEpisode.protected_fact_source_count, 0)} fact-linked episodes
+                    Protected rows: {num(storageMaintenanceEpisode.protected_recent_count, 0)} recent episodes
                   </Typography>
                   <Typography variant="body2" color="text.secondary">
-                    Consolidated-only requirement: {toBool(storageMaintenanceEpisode.require_consolidated) ? "on" : "off"}
+                    Finalized-only requirement: {toBool(storageMaintenanceEpisode.require_consolidated) ? "on" : "off"}
                   </Typography>
                 </Stack>
               </Box>

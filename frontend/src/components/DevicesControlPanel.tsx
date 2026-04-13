@@ -18,7 +18,7 @@ import {
   TextField,
   Typography
 } from "@mui/material";
-import { useMemo, useState } from "react";
+import { useMemo, useState, type JSX } from "react";
 import { formatUiDateTime } from "../lib/dateFormat";
 
 export type DeviceCapability =

@@ -21,7 +21,7 @@ pub enum HookTrigger {
     PreAction,
     /// After executing an action
     PostAction,
-    /// On memory consolidation
+    /// On learning consolidation
     OnConsolidate,
     /// On error
     OnError,

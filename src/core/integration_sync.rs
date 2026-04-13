@@ -18,6 +18,7 @@ const MAX_RECENT_SOURCE_IDS: usize = 400;
 const MAX_BASELINE_ITEMS: usize = 8;
 const INTEGRATION_SYNC_BUSY_MESSAGE: &str =
     "Another integration sync run is already in progress. Try again in a moment.";
+const DEFAULT_INTEGRATION_SYNC_POLL_SECS: u64 = 30 * 60;
 static INTEGRATION_SYNC_MUTATION_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 #[derive(Clone)]
@@ -209,72 +210,72 @@ fn adapter_for(integration_id: &str) -> Option<IntegrationSyncAdapter> {
     match integration_id {
         "google_workspace" => Some(IntegrationSyncAdapter {
             sync_kind: "activity",
-            default_poll_interval_secs: 300,
+            default_poll_interval_secs: DEFAULT_INTEGRATION_SYNC_POLL_SECS,
             default_importance_threshold: 0.72,
         }),
         "gmail" => Some(IntegrationSyncAdapter {
             sync_kind: "activity",
-            default_poll_interval_secs: 300,
+            default_poll_interval_secs: DEFAULT_INTEGRATION_SYNC_POLL_SECS,
             default_importance_threshold: 0.72,
         }),
         "google_calendar" => Some(IntegrationSyncAdapter {
             sync_kind: "activity",
-            default_poll_interval_secs: 600,
+            default_poll_interval_secs: DEFAULT_INTEGRATION_SYNC_POLL_SECS,
             default_importance_threshold: 0.68,
         }),
         "github" => Some(IntegrationSyncAdapter {
             sync_kind: "activity",
-            default_poll_interval_secs: 300,
+            default_poll_interval_secs: DEFAULT_INTEGRATION_SYNC_POLL_SECS,
             default_importance_threshold: 0.74,
         }),
         "notion" => Some(IntegrationSyncAdapter {
             sync_kind: "activity",
-            default_poll_interval_secs: 900,
+            default_poll_interval_secs: DEFAULT_INTEGRATION_SYNC_POLL_SECS,
             default_importance_threshold: 0.66,
         }),
         "twitter" => Some(IntegrationSyncAdapter {
             sync_kind: "activity",
-            default_poll_interval_secs: 900,
+            default_poll_interval_secs: DEFAULT_INTEGRATION_SYNC_POLL_SECS,
             default_importance_threshold: 0.7,
         }),
         "onepassword" => Some(IntegrationSyncAdapter {
             sync_kind: "inventory",
-            default_poll_interval_secs: 3600,
+            default_poll_interval_secs: DEFAULT_INTEGRATION_SYNC_POLL_SECS,
             default_importance_threshold: 0.8,
         }),
         "twilio" => Some(IntegrationSyncAdapter {
             sync_kind: "activity",
-            default_poll_interval_secs: 300,
+            default_poll_interval_secs: DEFAULT_INTEGRATION_SYNC_POLL_SECS,
             default_importance_threshold: 0.72,
         }),
         "ordering" => Some(IntegrationSyncAdapter {
             sync_kind: "activity",
-            default_poll_interval_secs: 300,
+            default_poll_interval_secs: DEFAULT_INTEGRATION_SYNC_POLL_SECS,
             default_importance_threshold: 0.7,
         }),
         "garmin" => Some(IntegrationSyncAdapter {
             sync_kind: "activity",
-            default_poll_interval_secs: 1800,
+            default_poll_interval_secs: DEFAULT_INTEGRATION_SYNC_POLL_SECS,
             default_importance_threshold: 0.76,
         }),
         "whoop" => Some(IntegrationSyncAdapter {
             sync_kind: "activity",
-            default_poll_interval_secs: 1800,
+            default_poll_interval_secs: DEFAULT_INTEGRATION_SYNC_POLL_SECS,
             default_importance_threshold: 0.76,
         }),
         "ga4" => Some(IntegrationSyncAdapter {
             sync_kind: "analytics",
-            default_poll_interval_secs: 3600,
+            default_poll_interval_secs: DEFAULT_INTEGRATION_SYNC_POLL_SECS,
             default_importance_threshold: 0.7,
         }),
         "gsc" => Some(IntegrationSyncAdapter {
             sync_kind: "analytics",
-            default_poll_interval_secs: 3600,
+            default_poll_interval_secs: DEFAULT_INTEGRATION_SYNC_POLL_SECS,
             default_importance_threshold: 0.7,
         }),
         "social_analytics" => Some(IntegrationSyncAdapter {
             sync_kind: "analytics",
-            default_poll_interval_secs: 3600,
+            default_poll_interval_secs: DEFAULT_INTEGRATION_SYNC_POLL_SECS,
             default_importance_threshold: 0.72,
         }),
         _ => None,
@@ -285,7 +286,7 @@ fn default_config_for(integration_id: &str) -> Option<IntegrationSyncConfig> {
     let adapter = adapter_for(integration_id)?;
     Some(IntegrationSyncConfig {
         integration_id: integration_id.to_string(),
-        enabled: false,
+        enabled: true,
         poll_interval_secs: adapter.default_poll_interval_secs,
         importance_threshold: adapter.default_importance_threshold,
         notify_on_important: true,
@@ -316,6 +317,18 @@ async fn save_state_store(
     ctx.encrypted_storage
         .set_encrypted(INTEGRATION_SYNC_STATE_KEY, &bytes)
         .await
+}
+
+pub async fn ensure_default_enabled(ctx: &IntegrationSyncContext, integration_id: &str) -> Result<()> {
+    let Some(config) = default_config_for(integration_id) else {
+        return Ok(());
+    };
+    let mut store = load_state_store(ctx).await;
+    if store.configs.contains_key(integration_id) {
+        return Ok(());
+    }
+    store.configs.insert(integration_id.to_string(), config);
+    save_state_store(ctx, &store).await
 }
 
 async fn load_feed(ctx: &IntegrationSyncContext) -> Vec<IntegrationSyncFeedItem> {
@@ -945,12 +958,36 @@ pub async fn run_due_syncs(ctx: &IntegrationSyncContext) -> Result<()> {
     let mut runs = load_runs(ctx).await;
     let manager = integration_manager(ctx);
 
-    let due_configs = store
-        .configs
-        .values()
-        .filter(|cfg| cfg.enabled)
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut supported_ids = manager.ids();
+    supported_ids.extend(
+        ["google_workspace", "gmail"]
+            .iter()
+            .map(|id| (*id).to_string()),
+    );
+    supported_ids.sort();
+    supported_ids.dedup();
+
+    let mut due_configs = Vec::new();
+    for integration_id in supported_ids {
+        let Some(config) = store
+            .configs
+            .get(&integration_id)
+            .cloned()
+            .or_else(|| default_config_for(&integration_id))
+        else {
+            continue;
+        };
+        if !config.enabled {
+            continue;
+        }
+        if !integration_connected(ctx, &manager, &integration_id).await {
+            continue;
+        }
+        if !integration_dispatch_enabled(ctx, &manager, &integration_id).await {
+            continue;
+        }
+        due_configs.push(config);
+    }
 
     for config in due_configs {
         let cursor = store

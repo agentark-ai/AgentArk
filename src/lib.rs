@@ -1671,7 +1671,7 @@ async fn run_headless(agent: core::Agent) -> Result<()> {
         })
     };
 
-    // Start ArkSentinel — unified background engine (scheduler, watchers, consolidation, ArkPulse)
+    // Start ArkSentinel — unified background engine (scheduler, watchers, experience learning, ArkPulse)
     let sentinel_handles = sentinel::start(
         agent.clone(),
         sentinel::SentinelConfig::default(),

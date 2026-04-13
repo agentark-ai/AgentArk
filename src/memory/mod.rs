@@ -1,4 +1,4 @@
-//! Cognitive Memory System - Episodic, Semantic, and Procedural Memory
+//! Cognitive memory retrieval for episodic entries and learned experience items.
 //!
 //! Inspired by human memory systems and recent research:
 //! - arXiv:2512.13564 "Memory in the Age of AI Agents"
@@ -7,7 +7,6 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use sea_orm::entity::prelude::PgVector;
 use serde::{Deserialize, Serialize};
@@ -15,7 +14,6 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::core::embeddings::EmbeddingClient;
@@ -121,9 +119,6 @@ const MEMORY_VECTOR_SHORTLIST_MAX: usize = 384;
 const MEMORY_RECENT_SHORTLIST_MULTIPLIER: usize = 4;
 const MEMORY_RECENT_SHORTLIST_MIN: usize = 32;
 const MEMORY_RECENT_SHORTLIST_MAX: usize = 128;
-const MEMORY_CONSOLIDATION_LEASE_KEY: &str = "memory_llm_consolidation_lease_v1";
-const MEMORY_CONSOLIDATION_LEASE_TTL_SECS: i64 = 30 * 60;
-static MEMORY_CONSOLIDATION_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 fn shortlist_limit(multiplier: usize, min: usize, max: usize, limit: usize) -> u64 {
     let bounded = limit.max(1).saturating_mul(multiplier).clamp(min, max);
@@ -230,7 +225,7 @@ impl CognitiveMemory {
             + normalized_importance * importance
     }
 
-    /// Calculate simple relevance score based on word overlap
+    /// Calculate simple fallback relevance score based on word overlap.
     fn calculate_relevance(&self, query: &str, content: &str) -> f32 {
         let query_lower = query.to_lowercase();
         let content_lower = content.to_lowercase();
@@ -252,7 +247,6 @@ impl CognitiveMemory {
         let intersection = query_words.intersection(&content_words).count();
         let query_coverage = intersection as f32 / query_words.len() as f32;
 
-        // Boost for exact phrase matches
         let phrase_boost = if content_lower.contains(&query_lower) {
             0.3
         } else {
@@ -263,9 +257,22 @@ impl CognitiveMemory {
     }
 
     async fn embed_text(&self, text: &str) -> Option<PgVector> {
-        let client = self.embedding_client.read().clone()?;
-        let values = client.embed_texts(&[text.to_string()]).await.ok()?;
-        values.into_iter().next()
+        let Some(client) = self.embedding_client.read().clone() else {
+            tracing::warn!(
+                "Memory embedding skipped because no embedding client is configured; using lexical memory fallback"
+            );
+            return None;
+        };
+        match client.embed_texts(&[text.to_string()]).await {
+            Ok(values) => values.into_iter().next(),
+            Err(error) => {
+                tracing::warn!(
+                    "Memory embedding failed; using lexical memory fallback until the embedding backend recovers: {}",
+                    error
+                );
+                None
+            }
+        }
     }
 
     fn dense_similarity(
@@ -307,76 +314,6 @@ impl CognitiveMemory {
         Ok(id)
     }
 
-    async fn load_semantic_facts_for_scope(
-        &self,
-        project_id: Option<&str>,
-    ) -> Vec<crate::storage::entities::semantic_fact::Model> {
-        if let Some(project_id) = project_id {
-            let scoped_count = match self.encrypted_storage.count_facts(Some(project_id)).await {
-                Ok(count) => count,
-                Err(error) => {
-                    tracing::warn!(
-                        project_id = project_id,
-                        "Scoped fact count failed: {}",
-                        error
-                    );
-                    0
-                }
-            };
-            let mut merged = match self
-                .encrypted_storage
-                .get_facts_by_project_decrypted(scoped_count, 0, Some(project_id))
-                .await
-            {
-                Ok(rows) => rows,
-                Err(error) => {
-                    tracing::warn!(
-                        project_id = project_id,
-                        "Scoped fact fallback load failed: {}",
-                        error
-                    );
-                    Vec::new()
-                }
-            };
-            let global_count = match self.encrypted_storage.count_global_facts().await {
-                Ok(count) => count,
-                Err(error) => {
-                    tracing::warn!("Global fact count failed: {}", error);
-                    0
-                }
-            };
-            let global = match self
-                .encrypted_storage
-                .get_global_facts_decrypted(global_count, 0)
-                .await
-            {
-                Ok(rows) => rows,
-                Err(error) => {
-                    tracing::warn!("Global fact fallback load failed: {}", error);
-                    Vec::new()
-                }
-            };
-            let mut seen_ids = merged
-                .iter()
-                .map(|fact| fact.id.clone())
-                .collect::<std::collections::HashSet<_>>();
-            for fact in global {
-                if seen_ids.insert(fact.id.clone()) {
-                    merged.push(fact);
-                }
-            }
-            merged
-        } else {
-            match self.encrypted_storage.get_facts_decrypted().await {
-                Ok(rows) => rows,
-                Err(error) => {
-                    tracing::warn!("Fact fallback load failed: {}", error);
-                    Vec::new()
-                }
-            }
-        }
-    }
-
     async fn load_episode_candidates(
         &self,
         query_embedding: Option<&PgVector>,
@@ -394,7 +331,7 @@ impl CognitiveMemory {
                     Err(error) => {
                         tracing::warn!(
                             project_id = ?project_id,
-                            "Episode fallback load failed: {}",
+                            "Episode lexical fallback load failed: {}",
                             error
                         );
                         Vec::new()
@@ -408,7 +345,7 @@ impl CognitiveMemory {
                 {
                     Ok(rows) => rows,
                     Err(error) => {
-                        tracing::warn!("Episode fallback load failed: {}", error);
+                        tracing::warn!("Episode lexical fallback load failed: {}", error);
                         Vec::new()
                     }
                 }
@@ -416,6 +353,9 @@ impl CognitiveMemory {
         };
 
         let Some(query_embedding) = query_embedding else {
+            tracing::warn!(
+                "Dense memory query embedding unavailable; using lexical memory fallback"
+            );
             return load_fallback().await;
         };
 
@@ -469,6 +409,7 @@ impl CognitiveMemory {
         let candidate_ids = merge_candidate_ids(dense_ids, recent_ids);
 
         if candidate_ids.is_empty() {
+            tracing::warn!("Episode shortlist was empty; using lexical memory fallback");
             load_fallback().await
         } else {
             match self
@@ -481,96 +422,7 @@ impl CognitiveMemory {
                     tracing::warn!(
                         project_id = ?project_id,
                         ids = candidate_ids.len(),
-                        "Episode shortlist hydrate failed: {}",
-                        error
-                    );
-                    load_fallback().await
-                }
-            }
-        }
-    }
-
-    async fn load_semantic_fact_candidates(
-        &self,
-        query_embedding: Option<&PgVector>,
-        project_id: Option<&str>,
-        limit: usize,
-    ) -> Vec<crate::storage::entities::semantic_fact::Model> {
-        let load_fallback = || async {
-            let rows = self.load_semantic_facts_for_scope(project_id).await;
-            if rows.is_empty() {
-                tracing::debug!(project_id = ?project_id, "Semantic fact fallback returned no rows");
-            }
-            rows
-        };
-
-        let Some(query_embedding) = query_embedding else {
-            return load_fallback().await;
-        };
-
-        let dense_ids = match self
-            .storage
-            .nearest_semantic_fact_ids(
-                query_embedding,
-                project_id,
-                shortlist_limit(
-                    MEMORY_VECTOR_SHORTLIST_MULTIPLIER,
-                    MEMORY_VECTOR_SHORTLIST_MIN,
-                    MEMORY_VECTOR_SHORTLIST_MAX,
-                    limit,
-                ),
-            )
-            .await
-        {
-            Ok(ids) => ids,
-            Err(error) => {
-                tracing::warn!(
-                    project_id = ?project_id,
-                    "Semantic fact pgvector shortlist failed: {}",
-                    error
-                );
-                Vec::new()
-            }
-        };
-        let recent_ids = match self
-            .storage
-            .list_recent_fact_ids_for_scope(
-                project_id,
-                shortlist_limit(
-                    MEMORY_RECENT_SHORTLIST_MULTIPLIER,
-                    MEMORY_RECENT_SHORTLIST_MIN,
-                    MEMORY_RECENT_SHORTLIST_MAX,
-                    limit,
-                ),
-            )
-            .await
-        {
-            Ok(ids) => ids,
-            Err(error) => {
-                tracing::warn!(
-                    project_id = ?project_id,
-                    "Semantic fact recent shortlist failed: {}",
-                    error
-                );
-                Vec::new()
-            }
-        };
-        let candidate_ids = merge_candidate_ids(dense_ids, recent_ids);
-
-        if candidate_ids.is_empty() {
-            load_fallback().await
-        } else {
-            match self
-                .encrypted_storage
-                .get_facts_by_ids_decrypted(&candidate_ids)
-                .await
-            {
-                Ok(rows) => rows,
-                Err(error) => {
-                    tracing::warn!(
-                        project_id = ?project_id,
-                        ids = candidate_ids.len(),
-                        "Semantic fact shortlist hydrate failed: {}",
+                        "Episode shortlist hydrate failed; using lexical memory fallback: {}",
                         error
                     );
                     load_fallback().await
@@ -592,10 +444,6 @@ impl CognitiveMemory {
         let episodes = self
             .load_episode_candidates(query_embedding.as_ref(), project_id, limit)
             .await;
-        let facts = self
-            .load_semantic_fact_candidates(query_embedding.as_ref(), project_id, limit)
-            .await;
-
         let mut entries: Vec<MemoryEntry> = episodes
             .into_iter()
             .map(|e| {
@@ -618,7 +466,6 @@ impl CognitiveMemory {
                         .ok()
                 });
 
-                // Calculate scores
                 let lexical_relevance = self.calculate_relevance(query, &e.content);
                 let dense_relevance =
                     Self::dense_similarity(query_embedding.as_ref(), e.embedding.as_ref())
@@ -645,36 +492,6 @@ impl CognitiveMemory {
             })
             .collect();
 
-        entries.extend(facts.into_iter().map(|fact| {
-            let timestamp = chrono::DateTime::parse_from_rfc3339(&fact.created_at)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
-            let lexical_relevance = self.calculate_relevance(query, &fact.fact);
-            let dense_relevance =
-                Self::dense_similarity(query_embedding.as_ref(), fact.embedding.as_ref())
-                    .unwrap_or(0.0);
-            let relevance_score = lexical_relevance.max(dense_relevance);
-            let recency_score = self.calculate_recency_score(timestamp, None);
-            let importance = fact.confidence.clamp(0.0, 1.0);
-            let final_score =
-                self.calculate_final_score(relevance_score, recency_score, importance);
-
-            MemoryEntry {
-                id: Uuid::parse_str(&fact.id).unwrap_or_else(|_| Uuid::new_v4()),
-                content: fact.fact,
-                memory_type: MemoryType::Semantic {
-                    confidence: fact.confidence,
-                    sources: serde_json::from_str(&fact.sources).unwrap_or_default(),
-                },
-                timestamp,
-                relevance_score,
-                importance,
-                recency_score,
-                final_score,
-                access_count: 0,
-            }
-        }));
-
         // Sort by final score (highest first)
         entries.sort_by(|a, b| {
             b.final_score
@@ -682,7 +499,7 @@ impl CognitiveMemory {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // Keep only memories with at least minimal lexical relevance so pure recency
+        // Keep only memories with at least minimal relevance so pure recency
         // does not surface unrelated context.
         let top_entries: Vec<MemoryEntry> = entries
             .into_iter()
@@ -698,63 +515,6 @@ impl CognitiveMemory {
         Ok(top_entries)
     }
 
-    /// Legacy episode consolidation no longer writes semantic facts.
-    /// User memory is captured by the lifecycle-aware chat memory path.
-    pub async fn run_llm_consolidation(&self, _llm: &crate::core::LlmClient) -> Result<String> {
-        let Ok(_guard) = MEMORY_CONSOLIDATION_LOCK.try_lock() else {
-            return Ok("Memory consolidation already in progress.".to_string());
-        };
-        let lease_owner = Uuid::new_v4().to_string();
-        match self
-            .storage
-            .acquire_kv_lease(
-                MEMORY_CONSOLIDATION_LEASE_KEY,
-                &lease_owner,
-                MEMORY_CONSOLIDATION_LEASE_TTL_SECS,
-            )
-            .await?
-        {
-            true => {}
-            false => {
-                return Ok(
-                    "Memory consolidation already in progress on another worker.".to_string(),
-                )
-            }
-        }
-
-        let result = async {
-            let episodes = self
-                .encrypted_storage
-                .get_unconsolidated_episodes_decrypted(50)
-                .await?;
-            if episodes.is_empty() {
-                return Ok("No unconsolidated episodes found.".to_string());
-            }
-
-            let episode_ids = episodes
-                .iter()
-                .map(|episode| episode.id.clone())
-                .collect::<Vec<_>>();
-            self.storage.mark_episodes_consolidated(&episode_ids).await?;
-            let summary = format!(
-                "Skipped legacy semantic-fact consolidation for {} episodes; lifecycle-aware chat memory capture is the durable user-memory writer.",
-                episode_ids.len()
-            );
-            tracing::info!("Legacy memory consolidation disabled: {}", summary);
-            Ok(summary)
-        }
-        .await;
-
-        if let Err(error) = self
-            .storage
-            .release_kv_lease(MEMORY_CONSOLIDATION_LEASE_KEY, &lease_owner)
-            .await
-        {
-            tracing::warn!("Failed to release memory consolidation lease: {}", error);
-        }
-
-        result
-    }
     /// Get total entry count
     pub fn entry_count(&self) -> usize {
         self.episode_count.load(Ordering::Relaxed)

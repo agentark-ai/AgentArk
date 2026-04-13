@@ -519,7 +519,7 @@ fn verify_signature(
         .context("failed to decode Teams authorization signature")?;
     let signature = RsaPkcs1v15Signature::try_from(signature.as_slice())
         .context("invalid Teams authorization signature format")?;
-    let verifying_key = VerifyingKey::<sha2::Sha256>::new(key.public_key.clone());
+    let verifying_key = VerifyingKey::<rsa::sha2::Sha256>::new(key.public_key.clone());
     verifying_key
         .verify(signed_input.as_bytes(), &signature)
         .map_err(|_| anyhow!("Teams authorization signature verification failed"))

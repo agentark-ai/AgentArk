@@ -14,8 +14,7 @@ const MAX_SENTINEL_OBSERVATIONS: usize = 120;
 const MAX_SENTINEL_PROPOSALS: usize = 96;
 const SENTINEL_RETENTION_DAYS: i64 = 30;
 const SENTINEL_PROPOSAL_RECREATE_HOURS: i64 = 24;
-const BACKGROUND_LEARNING_JOB_KEYS: [(&str, &str); 4] = [
-    ("memory_consolidation", "Memory consolidation"),
+const BACKGROUND_LEARNING_JOB_KEYS: [(&str, &str); 3] = [
     ("experience_consolidation", "Experience consolidation"),
     ("pattern_induction", "Pattern induction"),
     ("candidate_generation", "Candidate generation"),
@@ -221,7 +220,6 @@ async fn save_daily_auto_runs(storage: &crate::storage::Storage, counter: &Senti
 fn background_learning_label(key: &str) -> String {
     match key {
         "reflection_pass" => "Reflection pass",
-        "memory_consolidation" => "Memory consolidation",
         "experience_consolidation" => "Experience consolidation",
         "pattern_induction" => "Pattern induction",
         "candidate_generation" => "Candidate generation",

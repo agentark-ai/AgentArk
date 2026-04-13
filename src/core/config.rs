@@ -2966,12 +2966,10 @@ impl Default for SandboxConfig {
 pub struct MemoryConfig {
     #[serde(default = "default_max_episodes")]
     pub max_episodes: usize,
-    #[serde(default = "default_consolidation_interval")]
-    pub consolidation_interval_hours: u64,
     #[serde(default)]
     pub embedding_model: String,
-    /// Optional retention pruning for episodic episodes (not semantic facts).
-    /// Fresh installs enable it conservatively; legacy configs without this field deserialize as false.
+    /// Optional retention pruning for episodic episodes.
+    /// Fresh installs enable it conservatively; configs without this field deserialize as false.
     #[serde(default = "default_false")]
     pub retention_enabled: bool,
     /// Minimum age (days) before an episode is eligible for pruning.
@@ -2986,7 +2984,7 @@ pub struct MemoryConfig {
     /// Only prune episodes with access_count <= this value.
     #[serde(default = "default_retention_max_access_count")]
     pub retention_max_access_count: i32,
-    /// Require consolidated=true for pruning (strongly recommended).
+    /// Require finalized episodes for pruning (strongly recommended).
     #[serde(default = "default_true")]
     pub retention_require_consolidated: bool,
     /// Minimum days between retention runs.
@@ -2998,17 +2996,10 @@ pub struct MemoryConfig {
     /// Maximum number of episodes to delete per run (rate limiter).
     #[serde(default = "default_retention_max_delete_per_run")]
     pub retention_max_delete_per_run: u64,
-    /// Protect episodes referenced in semantic fact sources.
-    #[serde(default = "default_true")]
-    pub retention_protect_fact_sources: bool,
 }
 
 fn default_max_episodes() -> usize {
     10000
-}
-
-fn default_consolidation_interval() -> u64 {
-    24
 }
 
 fn default_false() -> bool {
@@ -3047,7 +3038,6 @@ impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             max_episodes: default_max_episodes(),
-            consolidation_interval_hours: default_consolidation_interval(),
             embedding_model: String::new(),
             retention_enabled: default_false(),
             retention_min_age_days: default_retention_min_age_days(),
@@ -3058,7 +3048,6 @@ impl Default for MemoryConfig {
             retention_run_interval_days: default_retention_run_interval_days(),
             retention_idle_threshold_secs: default_retention_idle_threshold_secs(),
             retention_max_delete_per_run: default_retention_max_delete_per_run(),
-            retention_protect_fact_sources: default_true(),
         }
     }
 }

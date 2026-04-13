@@ -3460,7 +3460,7 @@ print(json.dumps({
                     "at": { "type": "string", "description": "ISO 8601 timestamp for one-time task. Example: '2026-02-06T09:00:00+05:30'" },
                     "action": { "type": "string", "description": "Optional explicit action name to run for each task occurrence" },
                     "action_arguments": { "type": "object", "description": "Optional explicit arguments for the selected action" },
-                    "report_to": { "type": "string", "description": "Preferred notification channel for results" },
+                    "report_to": { "type": "string", "description": "Notification route for results. Use 'preferred' unless the user explicitly requests a connected delivery channel; do not guess Telegram, WhatsApp, or another messenger." },
                     "allow_duplicate": { "type": "boolean", "description": "Create a separate task even if a matching one already exists. Default false: matching tasks are updated/reused." },
                     "validation": {
                         "type": "object",
@@ -3571,7 +3571,7 @@ print(json.dumps({
                     "timeout_hours": { "type": "integer", "description": "Convenience timeout override in hours. Supports very large values." },
                     "timeout_days": { "type": "integer", "description": "Convenience timeout override in days. Supports very large values." },
                     "until_stopped": { "type": "boolean", "description": "Keep watching until the user stops it. Internally stored as a very large timeout." },
-                    "notify_channel": { "type": "string", "description": "Channel to notify: 'telegram' or 'http' (default: 'telegram')" },
+                    "notify_channel": { "type": "string", "description": "Notification route. Use 'preferred' by default so AgentArk can use any connected messaging channel; use a named channel only when the user explicitly requested it and it is connected. Use 'in_app' for web-only notifications." },
                     "allow_duplicate": { "type": "boolean", "description": "Create a separate watcher even if a matching one already exists. Default false: matching watchers are updated/reused." },
                     "validation": {
                         "type": "object",
@@ -10234,9 +10234,9 @@ print(result["text"])
                 )],
             )]);
             let containers = docker
-                .list_containers(Some(bollard::container::ListContainersOptions::<String> {
+                .list_containers(Some(bollard::query_parameters::ListContainersOptions {
                     all: true,
-                    filters,
+                    filters: Some(filters),
                     ..Default::default()
                 }))
                 .await?;
@@ -10445,16 +10445,22 @@ print(result["text"])
     #[cfg(feature = "docker")]
     async fn force_remove_container(docker: &bollard::Docker, id: &str) {
         // Kill first (faster than stop for stuck containers)
-        let _ = docker.kill_container::<String>(id, None).await;
+        let _ = docker.kill_container(id, None).await;
         // Stop as fallback (handles already-stopped containers)
         let _ = docker
-            .stop_container(id, Some(bollard::container::StopContainerOptions { t: 0 }))
+            .stop_container(
+                id,
+                Some(bollard::query_parameters::StopContainerOptions {
+                    t: Some(0),
+                    ..Default::default()
+                }),
+            )
             .await;
         // Force remove â€” deletes container, volumes, and anonymous volumes
         let _ = docker
             .remove_container(
                 id,
-                Some(bollard::container::RemoveContainerOptions {
+                Some(bollard::query_parameters::RemoveContainerOptions {
                     force: true,
                     v: true, // Remove anonymous volumes attached to the container
                     ..Default::default()
@@ -10475,8 +10481,8 @@ print(result["text"])
         tracing::info!("Pulling Docker image '{}' (first-time download)...", image);
 
         let mut stream = docker.create_image(
-            Some(bollard::image::CreateImageOptions {
-                from_image: image,
+            Some(bollard::query_parameters::CreateImageOptions {
+                from_image: Some(image.to_string()),
                 ..Default::default()
             }),
             None,
@@ -10567,7 +10573,7 @@ print(result["text"])
 
         let network_disabled = !network_access;
 
-        let container_config = bollard::container::Config {
+        let container_config = bollard::models::ContainerCreateBody {
             image: Some(image.to_string()),
             cmd: Some(cmd),
             env,
@@ -10589,9 +10595,7 @@ print(result["text"])
         };
 
         let create_started = std::time::Instant::now();
-        let container = docker
-            .create_container::<String, String>(None, container_config)
-            .await;
+        let container = docker.create_container(None, container_config).await;
         let container = match container {
             Ok(container) => {
                 crate::metrics::observe_container_lifecycle(
@@ -10633,7 +10637,7 @@ print(result["text"])
 
         // Start container â€” if this fails, clean up immediately
         let start_started = std::time::Instant::now();
-        if let Err(e) = docker.start_container::<String>(&container_id, None).await {
+        if let Err(e) = docker.start_container(&container_id, None).await {
             crate::metrics::observe_container_lifecycle(
                 action_name,
                 "start",
@@ -10676,7 +10680,7 @@ print(result["text"])
             docker
                 .wait_container(
                     &container_id,
-                    None::<bollard::container::WaitContainerOptions<String>>,
+                    None::<bollard::query_parameters::WaitContainerOptions>,
                 )
                 .try_collect::<Vec<_>>(),
         )
@@ -10785,9 +10789,9 @@ print(result["text"])
         // Collect stdout and stderr before cleanup
         let logs_started = std::time::Instant::now();
         let logs = docker
-            .logs::<String>(
+            .logs(
                 &container_id,
-                Some(bollard::container::LogsOptions {
+                Some(bollard::query_parameters::LogsOptions {
                     stdout: true,
                     stderr: true,
                     ..Default::default()

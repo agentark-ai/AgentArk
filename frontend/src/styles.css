@@ -908,14 +908,14 @@ body {
 .nav-label {
   display: block;
   margin: 0;
-  font-size: 0.64rem;
+  font-size: 0.74rem;
   letter-spacing: 0;
 }
 
 .nav-group-label {
   display: block;
   margin: 3px 6px 5px;
-  font-size: 9px;
+  font-size: 10.5px;
   letter-spacing: 0;
   color: rgba(177, 181, 189, 0.58);
   text-transform: uppercase;
@@ -967,8 +967,8 @@ body {
 }
 
 .nav-item .MuiTypography-root {
-  font-size: 0.82rem !important;
-  line-height: 1.25 !important;
+  font-size: 0.88rem !important;
+  line-height: 1.3 !important;
 }
 
 .nav-item-text.collapsed {
@@ -3928,7 +3928,7 @@ body {
 }
 
 .settings-nav-group-label {
-  font-size: 0.66rem;
+  font-size: 0.74rem;
   text-transform: uppercase;
   letter-spacing: 0;
   color: rgba(173, 177, 186, 0.52);

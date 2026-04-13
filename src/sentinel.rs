@@ -5,7 +5,7 @@
 //! - **Process watchdog**: Monitors tunnel + WhatsApp bridge, auto-restarts on crash
 //! - **Task scheduler**: Fires cron tasks (daily brief, recurring jobs) at the right time
 //! - **Watcher poller**: Evaluates watch conditions and triggers on match
-//! - **Memory consolidation**: Periodically compresses episodic memory
+//! - **Experience learning**: Consolidates execution evidence into learned memory
 //! - **Approval expiry**: Cleans up stale approval requests
 //! - **ArkPulse**: Periodically wakes the agent to reflect and act proactively
 //!
@@ -273,7 +273,6 @@ const ARKPULSE_GROWTH_NOTIFY_COOLDOWN_SECS: i64 = 7 * 24 * 3600;
 pub const SENTINEL_SCHEDULER_HEARTBEAT_KEY: &str = "sentinel_scheduler_heartbeat_v1";
 pub const SENTINEL_WATCHER_HEARTBEAT_KEY: &str = "sentinel_watcher_heartbeat_v1";
 pub const SENTINEL_INTEGRATION_SYNC_HEARTBEAT_KEY: &str = "sentinel_integration_sync_heartbeat_v1";
-pub const SENTINEL_CONSOLIDATION_HEARTBEAT_KEY: &str = "sentinel_consolidation_heartbeat_v1";
 pub const SENTINEL_APPROVAL_EXPIRY_HEARTBEAT_KEY: &str = "sentinel_approval_expiry_heartbeat_v1";
 pub const SENTINEL_ARKPULSE_HEARTBEAT_KEY: &str = "sentinel_arkpulse_heartbeat_v1";
 pub const SENTINEL_AUTO_ANALYSIS_HEARTBEAT_KEY: &str = "sentinel_auto_analysis_heartbeat_v1";
@@ -2489,8 +2488,6 @@ pub struct SentinelConfig {
     pub watcher_interval: u64,
     /// How often to poll connected integrations for new activity (seconds)
     pub integration_sync_interval: u64,
-    /// How often to run memory consolidation (seconds)
-    pub consolidation_interval: u64,
     /// How often to consolidate execution experiences into learned memory (seconds)
     pub experience_consolidation_interval: u64,
     /// How often to induce procedural patterns from learned procedures (seconds)
@@ -2517,7 +2514,6 @@ impl Default for SentinelConfig {
             scheduler_interval: 30,
             watcher_interval: 1,
             integration_sync_interval: 120,
-            consolidation_interval: 600,
             experience_consolidation_interval: 600,
             pattern_induction_interval: 900,
             candidate_generation_interval: 1200,
@@ -2635,37 +2631,6 @@ pub fn start(
     }
 
     // ── Memory Consolidation ────────────────────────────────────────────
-    handles.push({
-        let agent = agent.clone();
-        let mut shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-                config.consolidation_interval,
-            ));
-            interval.tick().await; // Skip first immediate tick
-            loop {
-                if !tick_or_shutdown(&mut interval, &mut shutdown).await {
-                    break;
-                }
-                record_loop_heartbeat(&agent, SENTINEL_CONSOLIDATION_HEARTBEAT_KEY).await;
-                if is_agent_autonomy_paused(&agent).await {
-                    continue;
-                }
-                run_with_busy_deferral(
-                    &agent,
-                    "consolidation",
-                    MAINTENANCE_DEFER_MINUTES,
-                    MAINTENANCE_MAX_DEFERS,
-                    || {
-                        let agent = agent.clone();
-                        async move { run_consolidation(&agent).await }
-                    },
-                )
-                .await;
-            }
-        })
-    });
-
     handles.push({
         let agent = agent.clone();
         let mut shutdown = shutdown_rx.clone();
@@ -2981,7 +2946,7 @@ pub fn start(
     });
 
     tracing::info!(
-        "ArkSentinel started: scheduler={}s, watchers={}s, integration_sync={}s, consolidation={}s, experience_learning={}s, pattern_induction={}s, candidate_generation={}s, pulse={}s, auto_analysis={}s, container_reaper={}s",
+        "ArkSentinel started: scheduler={}s, watchers={}s, integration_sync={}s, experience_learning={}s, pattern_induction={}s, candidate_generation={}s, pulse={}s, auto_analysis={}s, container_reaper={}s",
         config.scheduler_interval,
         config.watcher_interval,
         if config.integration_sync_interval > 0 {
@@ -2989,7 +2954,6 @@ pub fn start(
         } else {
             "off".to_string()
         },
-        config.consolidation_interval,
         config.experience_consolidation_interval,
         config.pattern_induction_interval,
         config.candidate_generation_interval,
@@ -3297,15 +3261,8 @@ async fn run_watchers(agent: &SharedAgent) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Memory Consolidation
+// Background Learning
 // ═══════════════════════════════════════════════════════════════════════════
-
-static BACKGROUND_LEARNING_LLM_CONSOLIDATION_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(
-        r"^Consolidated (?P<episodes>\d+) episodes into (?P<facts>\d+) facts \(skipped (?P<dupes>\d+) dupes, (?P<quality>\d+) low-quality\)\.?(?: (?P<rest>.*))?$",
-    )
-    .expect("valid background learning summary regex")
-});
 
 async fn persist_background_learning_job_result(
     storage: &crate::storage::Storage,
@@ -3334,37 +3291,6 @@ fn background_learning_job_update(
     }
 }
 
-fn parse_background_learning_memory_stats(summary: &str) -> serde_json::Value {
-    if let Some(caps) = BACKGROUND_LEARNING_LLM_CONSOLIDATION_RE.captures(summary) {
-        let episodes = caps
-            .name("episodes")
-            .and_then(|value| value.as_str().parse::<usize>().ok())
-            .unwrap_or(0);
-        let facts = caps
-            .name("facts")
-            .and_then(|value| value.as_str().parse::<usize>().ok())
-            .unwrap_or(0);
-        let dupes = caps
-            .name("dupes")
-            .and_then(|value| value.as_str().parse::<usize>().ok())
-            .unwrap_or(0);
-        let quality = caps
-            .name("quality")
-            .and_then(|value| value.as_str().parse::<usize>().ok())
-            .unwrap_or(0);
-        return serde_json::json!({
-            "episodes_processed": episodes,
-            "facts_created": facts,
-            "duplicates_skipped": dupes,
-            "low_quality_skipped": quality,
-        });
-    }
-
-    serde_json::json!({
-        "summary": summary,
-    })
-}
-
 async fn run_integration_sync(agent: &SharedAgent) {
     let shared_agent = agent.clone();
     let ctx = {
@@ -3373,58 +3299,6 @@ async fn run_integration_sync(agent: &SharedAgent) {
     };
     if let Err(error) = crate::core::integration_sync::run_due_syncs(&ctx).await {
         tracing::warn!("ArkSentinel: integration sync failed: {}", error);
-    }
-}
-
-async fn run_consolidation(agent: &SharedAgent) {
-    let started_at = chrono::Utc::now();
-    let (storage, result) = {
-        let agent = agent.read().await;
-        let llm = agent.llm.clone();
-        let storage = agent.storage.clone();
-        let result = agent.memory.run_llm_consolidation(&llm).await;
-        (storage, result)
-    };
-    let completed_at = chrono::Utc::now();
-    match result {
-        Ok(summary) => {
-            let changed = !summary.contains("No unconsolidated");
-            if changed {
-                tracing::info!("ArkSentinel: auto-consolidation: {}", summary);
-            }
-            persist_background_learning_job_result(
-                &storage,
-                background_learning_job_update(
-                    "memory_consolidation",
-                    "completed",
-                    started_at,
-                    completed_at,
-                    summary.clone(),
-                    changed,
-                    parse_background_learning_memory_stats(&summary),
-                ),
-            )
-            .await;
-        }
-        Err(e) => {
-            let summary = format!("Memory consolidation skipped: {}", e);
-            tracing::debug!("ArkSentinel: consolidation skipped: {}", e);
-            persist_background_learning_job_result(
-                &storage,
-                background_learning_job_update(
-                    "memory_consolidation",
-                    "failed",
-                    started_at,
-                    completed_at,
-                    summary,
-                    false,
-                    serde_json::json!({
-                        "error": e.to_string(),
-                    }),
-                ),
-            )
-            .await;
-        }
     }
 }
 
@@ -4089,7 +3963,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
         let fact_count = match pulse_ctx.storage.count_facts(None).await {
             Ok(count) => count as usize,
             Err(error) => {
-                tracing::warn!("ArkPulse failed to count semantic facts: {}", error);
+                tracing::warn!("ArkPulse failed to count learned facts: {}", error);
                 0
             }
         };
@@ -4123,7 +3997,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
                             service: "Postgres pgvector retrieval".to_string(),
                             status: "ok".to_string(),
                             message: format!(
-                                "pgvector ready, embeddings healthy ({}) | {} episodes, {} facts",
+                                "pgvector ready, embeddings healthy ({}) | {} episodes, {} learned facts",
                                 message, episode_count, fact_count
                             ),
                         },
@@ -4131,7 +4005,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
                             service: "Postgres pgvector retrieval".to_string(),
                             status: "warn".to_string(),
                             message: format!(
-                                "pgvector ready, embeddings unavailable: {} | {} episodes, {} facts",
+                                "pgvector ready, embeddings unavailable: {} | {} episodes, {} learned facts",
                                 error, episode_count, fact_count
                             ),
                         },
@@ -4141,7 +4015,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
                         service: "Postgres pgvector retrieval".to_string(),
                         status: "warn".to_string(),
                         message: format!(
-                            "pgvector ready, but retrieval is lexical-only until embeddings are configured | {} episodes, {} facts",
+                            "pgvector ready, but retrieval is lexical-only until embeddings are configured | {} episodes, {} learned facts",
                             episode_count, fact_count
                         ),
                     }
@@ -4151,7 +4025,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
                 service: "Postgres pgvector retrieval".to_string(),
                 status: "warn".to_string(),
                 message: format!(
-                    "pgvector unavailable: {} | {} episodes, {} facts",
+                    "pgvector unavailable: {} | {} episodes, {} learned facts",
                     error, episode_count, fact_count
                 ),
             },
@@ -4763,8 +4637,8 @@ async fn run_unused_app_check(agent: &SharedAgent) {
 // - Fresh installs enable normal retention by default; users can disable it.
 // - Only runs when episode count exceeds memory.max_episodes
 // - Only deletes low-importance, low-access episodes
-// - Strongly prefers deleting only consolidated episodes
-// - Protects newest N episodes and episodes referenced by semantic-fact sources
+// - Strongly prefers deleting only finalized episodes
+// - Protects newest N episodes
 // =====================================================================
 
 const EPISODE_RETENTION_CLEANUP_KEY: &str = "episode_retention_last_cleanup";
@@ -4822,24 +4696,6 @@ fn available_disk_bytes(path: &Path) -> Option<u64> {
 
     #[allow(unreachable_code)]
     None
-}
-
-fn collect_protected_episode_ids_from_fact_sources(
-    sources: &[String],
-) -> std::collections::HashSet<String> {
-    let mut protected = std::collections::HashSet::new();
-    for blob in sources {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(blob) {
-            if let Some(arr) = v.as_array() {
-                for item in arr {
-                    if let Some(id) = item.as_str() {
-                        protected.insert(id.to_string());
-                    }
-                }
-            }
-        }
-    }
-    protected
 }
 
 async fn run_episode_retention_cleanup(agent: &SharedAgent) {
@@ -4920,18 +4776,7 @@ async fn run_episode_retention_cleanup(agent: &SharedAgent) {
         .unwrap_or_default();
     let keep_newest_protected: std::collections::HashSet<String> =
         keep_newest.into_iter().collect();
-    let mut protected = keep_newest_protected.clone();
-
-    // Protect episode ids referenced as sources by semantic facts (optional, default true).
-    let mut fact_protected: std::collections::HashSet<String> = std::collections::HashSet::new();
-    if mem_cfg.retention_protect_fact_sources {
-        let sources = storage
-            .list_all_semantic_fact_sources()
-            .await
-            .unwrap_or_default();
-        fact_protected = collect_protected_episode_ids_from_fact_sources(&sources);
-        protected.extend(fact_protected.clone());
-    }
+    let protected = keep_newest_protected.clone();
 
     // Delete in bounded batches.
     let target = if emergency_mode {
@@ -4972,23 +4817,10 @@ async fn run_episode_retention_cleanup(agent: &SharedAgent) {
         .await
         .unwrap_or_default();
 
-    let mut delete_ids: Vec<String> = candidates
+    let delete_ids: Vec<String> = candidates
         .into_iter()
         .filter(|id| !protected.contains(id))
         .collect();
-
-    // Emergency fallback: if fact-source protection blocks all candidates under disk pressure,
-    // relax only that protection (still preserves newest N) to free space.
-    if emergency_mode && delete_ids.is_empty() && !fact_protected.is_empty() {
-        let relaxed_candidates = storage
-            .list_episode_prune_candidates(&cutoff_rfc3339, false, 1.0, i32::MAX, target)
-            .await
-            .unwrap_or_default();
-        delete_ids = relaxed_candidates
-            .into_iter()
-            .filter(|id| !keep_newest_protected.contains(id))
-            .collect();
-    }
 
     if delete_ids.is_empty() {
         // Record attempts so we don't spin aggressively.
@@ -5014,7 +4846,7 @@ async fn run_episode_retention_cleanup(agent: &SharedAgent) {
                 );
             } else {
                 tracing::info!(
-                    "Episode retention cleanup: deleted={} (count={}, max_episodes={}, cutoff_days={}, consolidated_required={})",
+                    "Episode retention cleanup: deleted={} (count={}, max_episodes={}, cutoff_days={}, finalized_required={})",
                     deleted,
                     count,
                     mem_cfg.max_episodes,

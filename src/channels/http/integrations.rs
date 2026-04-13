@@ -2199,6 +2199,22 @@ pub(super) async fn configure_integration(
                                 Some("false".to_string()),
                             );
                         }
+                        if !config_only {
+                            let sync_ctx = crate::core::integration_sync::context_from_agent(
+                                &agent,
+                                Some(state.agent.clone()),
+                            );
+                            if let Err(error) =
+                                crate::core::integration_sync::ensure_default_enabled(&sync_ctx, &id)
+                                    .await
+                            {
+                                tracing::warn!(
+                                    "Failed to enable default background sync for {}: {}",
+                                    id,
+                                    error
+                                );
+                            }
+                        }
                         (
                             StatusCode::OK,
                             Json(serde_json::json!({
@@ -2350,6 +2366,22 @@ pub(super) async fn enable_integration(
                 &integration_user_disabled_key(&id),
                 Some("false".to_string()),
             );
+            {
+                let agent = state.agent.read().await;
+                let sync_ctx = crate::core::integration_sync::context_from_agent(
+                    &agent,
+                    Some(state.agent.clone()),
+                );
+                if let Err(error) =
+                    crate::core::integration_sync::ensure_default_enabled(&sync_ctx, &id).await
+                {
+                    tracing::warn!(
+                        "Failed to enable default background sync for {}: {}",
+                        id,
+                        error
+                    );
+                }
+            }
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({"status":"ok","enabled":true,"connected":true})),
@@ -2399,6 +2431,19 @@ pub(super) async fn enable_integration(
                 let _ = manager.set_custom_secret(
                     &integration_user_disabled_key(&id),
                     Some("false".to_string()),
+                );
+            }
+            let sync_ctx = crate::core::integration_sync::context_from_agent(
+                &agent,
+                Some(state.agent.clone()),
+            );
+            if let Err(error) =
+                crate::core::integration_sync::ensure_default_enabled(&sync_ctx, &id).await
+            {
+                tracing::warn!(
+                    "Failed to enable default background sync for {}: {}",
+                    id,
+                    error
                 );
             }
             (

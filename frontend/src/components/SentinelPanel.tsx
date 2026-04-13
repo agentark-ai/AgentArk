@@ -122,7 +122,6 @@ function blankForm(): SentinelFormState {
 
 const BACKGROUND_LEARNING_JOB_ORDER = [
   { key: "reflection_pass", label: "Reflection pass" },
-  { key: "memory_consolidation", label: "Memory consolidation" },
   { key: "experience_consolidation", label: "Experience consolidation" },
   { key: "pattern_induction", label: "Pattern induction" },
   { key: "candidate_generation", label: "Candidate generation" },

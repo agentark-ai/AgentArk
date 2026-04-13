@@ -5,7 +5,7 @@
 //! are encrypted with AES-256-GCM before storage and decrypted on retrieval.
 //! Non-content fields (timestamps, IDs, metadata) remain in plaintext for querying.
 
-use super::entities::{approval_log, episode, execution_trace, message, semantic_fact};
+use super::entities::{approval_log, episode, execution_trace, message};
 use super::Storage;
 use crate::crypto::KeyManager;
 use anyhow::Result;
@@ -93,11 +93,11 @@ impl EncryptedStorage {
         episodes
     }
 
-    /// Decrypt the fact field of semantic facts, falling back to plaintext for legacy data
+    /// Decrypt learned fact text when the caller hands us encrypted compatibility rows.
     fn decrypt_fact_content(
         &self,
-        mut facts: Vec<semantic_fact::Model>,
-    ) -> Vec<semantic_fact::Model> {
+        mut facts: Vec<super::LearnedFactRecord>,
+    ) -> Vec<super::LearnedFactRecord> {
         let key_manager = self.current_key_manager();
         for f in &mut facts {
             if let Ok(decrypted) = key_manager.decrypt_string(&f.fact) {
@@ -158,15 +158,6 @@ impl EncryptedStorage {
         Ok(self.decrypt_episode_content(episodes))
     }
 
-    /// Get unconsolidated episodes and decrypt content
-    pub async fn get_unconsolidated_episodes_decrypted(
-        &self,
-        limit: u64,
-    ) -> Result<Vec<episode::Model>> {
-        let episodes = self.storage.get_unconsolidated_episodes(limit).await?;
-        Ok(self.decrypt_episode_content(episodes))
-    }
-
     /// Get episodes by project and decrypt content
     pub async fn get_episodes_by_project_decrypted(
         &self,
@@ -181,9 +172,9 @@ impl EncryptedStorage {
         Ok(self.decrypt_episode_content(episodes))
     }
 
-    // ==================== Encrypted Semantic Facts ====================
+    // ==================== Learned Facts ====================
 
-    /// Insert a semantic fact with encrypted content
+    /// Insert a learned fact with encrypted content in tests.
     #[cfg(test)]
     pub async fn insert_fact_encrypted(
         &self,
@@ -207,19 +198,19 @@ impl EncryptedStorage {
             .await
     }
 
-    /// Get facts and decrypt their content
-    pub async fn get_facts_decrypted(&self) -> Result<Vec<semantic_fact::Model>> {
+    /// Get learned facts and decrypt their content when needed.
+    pub async fn get_facts_decrypted(&self) -> Result<Vec<super::LearnedFactRecord>> {
         let facts = self.storage.get_facts().await?;
         Ok(self.decrypt_fact_content(facts))
     }
 
-    /// Get facts by project and decrypt their content (paginated)
+    /// Get learned facts by project and decrypt their content when needed.
     pub async fn get_facts_by_project_decrypted(
         &self,
         limit: u64,
         offset: u64,
         project_id: Option<&str>,
-    ) -> Result<Vec<semantic_fact::Model>> {
+    ) -> Result<Vec<super::LearnedFactRecord>> {
         let facts = self
             .storage
             .get_facts_by_project(limit, offset, project_id)
@@ -232,25 +223,9 @@ impl EncryptedStorage {
         &self,
         limit: u64,
         offset: u64,
-    ) -> Result<Vec<semantic_fact::Model>> {
+    ) -> Result<Vec<super::LearnedFactRecord>> {
         let facts = self.storage.get_global_facts(limit, offset).await?;
         Ok(self.decrypt_fact_content(facts))
-    }
-
-    pub async fn get_facts_by_ids_decrypted(
-        &self,
-        ids: &[String],
-    ) -> Result<Vec<semantic_fact::Model>> {
-        let facts = self.storage.get_facts_by_ids(ids).await?;
-        Ok(self.decrypt_fact_content(facts))
-    }
-
-    pub async fn count_facts(&self, project_id: Option<&str>) -> Result<u64> {
-        self.storage.count_facts(project_id).await
-    }
-
-    pub async fn count_global_facts(&self) -> Result<u64> {
-        self.storage.count_global_facts().await
     }
 
     // ==================== Encrypted KV Store ====================

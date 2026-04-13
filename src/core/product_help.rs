@@ -516,7 +516,6 @@ pub fn infer_help_topics(message: &str) -> Vec<&'static str> {
             "self-learning",
             "background learning",
             "reflection pass",
-            "memory consolidation",
             "experience consolidation",
             "pattern induction",
             "candidate generation",
@@ -1033,7 +1032,7 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
     let library_content = "Library and knowledge-related surfaces in the current UI.\n\n\
 - Library > Documents | Uploaded files and indexed document context.\n\
 - Settings > Knowledge > Memory | Structured memory and reusable knowledge-base items.\n\
-- Settings > Knowledge > Memory > Facts | Semantic facts extracted or stored by the system.\n\
+- Settings > Knowledge > Memory > Facts | Learned facts and operating constraints captured by the memory system.\n\
 - Settings > Knowledge > Memory > Preferences | Durable user preferences and rules.\n\
 - Settings > Knowledge > Memory > User Data | Notes, links, and captured user data.\n\
 - Settings > Knowledge > Memory > Knowledge | Reusable knowledge-base items, including bundled product docs after sync.\n\
@@ -1070,7 +1069,7 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
 
     let evolution_content = "Self-learning and evolution surfaces in the current UI.\n\n\
 - Evolution | Main self-learning page with What happened, What helped, Tests running, Review, and Controls tabs.\n\
-- Sentinel > Background learning | Live status for reflection pass, memory consolidation, experience consolidation, pattern induction, and candidate generation.\n\
+- Sentinel > Background learning | Live status for reflection pass, experience consolidation, pattern induction, and candidate generation.\n\
 - Evolution > What happened | Recent tested or promoted changes with lineage and plain-language summaries.\n\
 - Evolution > What helped | Measured impact from prompt, classifier, specialist, and routing changes.\n\
 - Evolution > Tests running | Canary rollout, baseline version, candidate version, and gate result for each evolvable surface.\n\

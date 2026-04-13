@@ -33,6 +33,16 @@ pub struct HousekeepingStatus {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LearnedFactRecord {
+    pub id: String,
+    pub fact: String,
+    pub confidence: f32,
+    pub sources: String,
+    pub created_at: String,
+    pub project_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct KvLeaseRecord {
     owner_id: String,
     acquired_at: String,
@@ -469,6 +479,27 @@ fn experience_item_kind_rank(kind: &str) -> i32 {
         "lesson" => 2,
         "procedure" => 3,
         _ => 4,
+    }
+}
+
+fn learned_fact_from_experience_item(item: experience_item::Model) -> LearnedFactRecord {
+    let sources = item
+        .metadata
+        .get("sources")
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| value.to_string())
+        })
+        .unwrap_or_else(|| "[]".to_string());
+    LearnedFactRecord {
+        id: item.id,
+        fact: item.content,
+        confidence: item.confidence.clamp(0.0, 1.0) as f32,
+        sources,
+        created_at: item.created_at,
+        project_id: item.project_id,
     }
 }
 
@@ -1068,21 +1099,6 @@ impl Storage {
             .await?;
         }
 
-        let facts = semantic_fact::Entity::find().all(&txn).await?;
-        for row in facts {
-            let plaintext = old_key
-                .decrypt_string(&row.fact)
-                .unwrap_or_else(|_| row.fact.clone());
-            let encrypted = new_key.encrypt_string(&plaintext)?;
-            semantic_fact::ActiveModel {
-                id: Unchanged(row.id),
-                fact: Set(encrypted),
-                ..Default::default()
-            }
-            .update(&txn)
-            .await?;
-        }
-
         let messages = message::Entity::find().all(&txn).await?;
         for row in messages {
             let plaintext = old_key
@@ -1534,7 +1550,7 @@ impl Storage {
             context: Set(context.to_string()),
             embedding: Set(embedding),
             timestamp: Set(now),
-            consolidated: Set(false),
+            consolidated: Set(true),
             importance: Set(bounded_importance),
             last_accessed: Set(None),
             access_count: Set(0),
@@ -1710,17 +1726,6 @@ impl Storage {
         Ok(ids)
     }
 
-    /// List all semantic fact source blobs (JSON arrays of episode UUIDs).
-    pub async fn list_all_semantic_fact_sources(&self) -> Result<Vec<String>> {
-        let rows = semantic_fact::Entity::find()
-            .select_only()
-            .column(semantic_fact::Column::Sources)
-            .into_tuple::<String>()
-            .all(&self.db)
-            .await?;
-        Ok(rows)
-    }
-
     /// Delete episodes by id. Returns rows affected.
     pub async fn delete_episodes_by_ids(&self, ids: &[String]) -> Result<u64> {
         if ids.is_empty() {
@@ -1733,9 +1738,9 @@ impl Storage {
         Ok(res.rows_affected)
     }
 
-    // ==================== Semantic Facts ====================
+    // ==================== Learned Facts ====================
 
-    /// Insert a semantic fact
+    /// Insert a learned fact into the current experience-item memory store.
     #[cfg(test)]
     pub async fn insert_fact(
         &self,
@@ -1747,30 +1752,50 @@ impl Storage {
         project_id: Option<&str>,
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
+        let _ = embedding;
+        let scope = if project_id.is_some() {
+            "project"
+        } else {
+            "global"
+        };
 
-        semantic_fact::ActiveModel {
-            id: Set(id.to_string()),
-            fact: Set(fact.to_string()),
-            confidence: Set(confidence),
-            sources: Set(sources.to_string()),
-            embedding: Set(embedding),
-            created_at: Set(now),
-            project_id: Set(project_id.map(|s| s.to_string())),
-        }
-        .insert(&self.db)
+        self.upsert_experience_item(&experience_item::Model {
+            id: id.to_string(),
+            kind: "personal_fact".to_string(),
+            scope: scope.to_string(),
+            project_id: project_id.map(str::to_string),
+            conversation_id: None,
+            title: "Learned fact".to_string(),
+            content: fact.to_string(),
+            normalized_key: format!("fact::{}", id),
+            confidence: confidence.clamp(0.0, 1.0) as f64,
+            support_count: 1,
+            contradiction_count: 0,
+            status: "active".to_string(),
+            metadata: serde_json::json!({ "sources": sources }),
+            last_supported_at: Some(now.clone()),
+            last_contradicted_at: None,
+            created_at: now.clone(),
+            updated_at: now,
+        })
         .await?;
 
         Ok(())
     }
 
-    /// Get all semantic facts
-    pub async fn get_facts(&self) -> Result<Vec<semantic_fact::Model>> {
-        let facts = semantic_fact::Entity::find()
-            .order_by_desc(semantic_fact::Column::CreatedAt)
+    /// Get learned facts from the current experience-item memory store.
+    pub async fn get_facts(&self) -> Result<Vec<LearnedFactRecord>> {
+        let facts = experience_item::Entity::find()
+            .filter(experience_item::Column::Status.eq("active"))
+            .filter(experience_item::Column::Kind.is_in(["personal_fact", "constraint"]))
+            .order_by_desc(experience_item::Column::UpdatedAt)
             .limit(Self::MAX_FACT_ROWS_PER_QUERY)
             .all(&self.db)
             .await?;
-        Ok(facts)
+        Ok(facts
+            .into_iter()
+            .map(learned_fact_from_experience_item)
+            .collect())
     }
 
     /// Get episodes filtered by project
@@ -1802,143 +1827,62 @@ impl Storage {
         Ok(count)
     }
 
-    /// Get facts filtered by project (paginated)
+    /// Get learned facts filtered by project (paginated).
     pub async fn get_facts_by_project(
         &self,
         limit: u64,
         offset: u64,
         project_id: Option<&str>,
-    ) -> Result<Vec<semantic_fact::Model>> {
-        let mut query = semantic_fact::Entity::find();
+    ) -> Result<Vec<LearnedFactRecord>> {
+        let mut query = experience_item::Entity::find()
+            .filter(experience_item::Column::Status.eq("active"))
+            .filter(experience_item::Column::Kind.is_in(["personal_fact", "constraint"]))
+            .order_by_desc(experience_item::Column::UpdatedAt);
         if let Some(pid) = project_id {
-            query = query.filter(semantic_fact::Column::ProjectId.eq(pid));
+            query = query.filter(experience_item::Column::ProjectId.eq(pid));
         }
         let facts = query
             .limit(Self::db_limit(limit))
             .offset(Self::db_offset(offset))
             .all(&self.db)
             .await?;
-        Ok(facts)
-    }
-
-    pub async fn get_facts_by_ids(&self, ids: &[String]) -> Result<Vec<semantic_fact::Model>> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let models = semantic_fact::Entity::find()
-            .filter(semantic_fact::Column::Id.is_in(ids.iter().cloned()))
-            .all(&self.db)
-            .await?;
-        let mut by_id = models
+        Ok(facts
             .into_iter()
-            .map(|model| (model.id.clone(), model))
-            .collect::<std::collections::HashMap<_, _>>();
-
-        Ok(ids
-            .iter()
-            .filter_map(|id| by_id.remove(id))
-            .collect::<Vec<_>>())
+            .map(learned_fact_from_experience_item)
+            .collect())
     }
 
-    /// Get only global-scope semantic facts.
+    /// Get only global-scope learned facts.
     pub async fn get_global_facts(
         &self,
         limit: u64,
         offset: u64,
-    ) -> Result<Vec<semantic_fact::Model>> {
-        let facts = semantic_fact::Entity::find()
-            .filter(semantic_fact::Column::ProjectId.is_null())
-            .order_by_desc(semantic_fact::Column::CreatedAt)
+    ) -> Result<Vec<LearnedFactRecord>> {
+        let facts = experience_item::Entity::find()
+            .filter(experience_item::Column::Status.eq("active"))
+            .filter(experience_item::Column::Kind.is_in(["personal_fact", "constraint"]))
+            .filter(experience_item::Column::ProjectId.is_null())
+            .filter(experience_item::Column::ConversationId.is_null())
+            .order_by_desc(experience_item::Column::UpdatedAt)
             .limit(Self::db_limit(limit))
             .offset(Self::db_offset(offset))
             .all(&self.db)
             .await?;
-        Ok(facts)
+        Ok(facts
+            .into_iter()
+            .map(learned_fact_from_experience_item)
+            .collect())
     }
 
-    /// Count facts
+    /// Count learned facts in the current memory store.
     pub async fn count_facts(&self, project_id: Option<&str>) -> Result<u64> {
-        let mut query = semantic_fact::Entity::find();
+        let mut query = experience_item::Entity::find()
+            .filter(experience_item::Column::Status.eq("active"))
+            .filter(experience_item::Column::Kind.is_in(["personal_fact", "constraint"]));
         if let Some(pid) = project_id {
-            query = query.filter(semantic_fact::Column::ProjectId.eq(pid));
+            query = query.filter(experience_item::Column::ProjectId.eq(pid));
         }
         Ok(query.count(&self.db).await?)
-    }
-
-    /// Count only global-scope semantic facts.
-    pub async fn count_global_facts(&self) -> Result<u64> {
-        Ok(semantic_fact::Entity::find()
-            .filter(semantic_fact::Column::ProjectId.is_null())
-            .count(&self.db)
-            .await?)
-    }
-
-    pub async fn list_recent_fact_ids_for_scope(
-        &self,
-        project_id: Option<&str>,
-        limit: u64,
-    ) -> Result<Vec<String>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-
-        let mut query = semantic_fact::Entity::find()
-            .select_only()
-            .column(semantic_fact::Column::Id)
-            .order_by_desc(semantic_fact::Column::CreatedAt);
-        if let Some(pid) = project_id {
-            query = query.filter(
-                Condition::any()
-                    .add(semantic_fact::Column::ProjectId.eq(pid))
-                    .add(semantic_fact::Column::ProjectId.is_null()),
-            );
-        }
-
-        query
-            .limit(Self::db_limit(limit))
-            .into_tuple::<String>()
-            .all(&self.db)
-            .await
-            .map_err(Into::into)
-    }
-
-    pub async fn nearest_semantic_fact_ids(
-        &self,
-        query_embedding: &PgVector,
-        project_id: Option<&str>,
-        limit: u64,
-    ) -> Result<Vec<String>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-
-        let embedding_sql = pgvector_sql_literal(query_embedding);
-        let scope_filter = if let Some(pid) = project_id {
-            format!(
-                " AND (project_id = '{}' OR project_id IS NULL)",
-                pid.replace('\'', "''")
-            )
-        } else {
-            String::new()
-        };
-        let sql = format!(
-            "SELECT id \
-             FROM semantic_facts \
-             WHERE embedding IS NOT NULL{scope_filter} \
-             ORDER BY embedding <=> {embedding_sql} ASC, created_at DESC \
-             LIMIT {}",
-            Self::db_limit(limit)
-        );
-
-        let rows = self
-            .db
-            .query_all(Statement::from_string(DbBackend::Postgres, sql))
-            .await?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|row| row.try_get::<String>("", "id").ok())
-            .collect())
     }
 
     /// Get episodes for scoring, scoped to project (includes global episodes too)
@@ -3419,6 +3363,7 @@ impl Storage {
         }
         let capped_limit = limit.min(Self::MAX_EXPERIENCE_ITEM_ROWS_PER_QUERY);
         let mut items = query
+            .order_by_desc(experience_item::Column::UpdatedAt)
             .limit(Self::db_limit(capped_limit))
             .all(&self.db)
             .await?;
@@ -5099,10 +5044,6 @@ impl Storage {
             .filter(episode::Column::ProjectId.eq(id))
             .exec(&txn)
             .await?;
-        semantic_fact::Entity::delete_many()
-            .filter(semantic_fact::Column::ProjectId.eq(id))
-            .exec(&txn)
-            .await?;
         user_preference::Entity::delete_many()
             .filter(user_preference::Column::ProjectId.eq(id))
             .exec(&txn)
@@ -5738,30 +5679,6 @@ impl Storage {
             .count(&self.db)
             .await
             .map_err(Into::into)
-    }
-
-    /// Mark episodes as consolidated
-    pub async fn mark_episodes_consolidated(&self, ids: &[String]) -> Result<()> {
-        if ids.is_empty() {
-            return Ok(());
-        }
-        episode::Entity::update_many()
-            .col_expr(episode::Column::Consolidated, Expr::value(true))
-            .filter(episode::Column::Id.is_in(ids.to_vec()))
-            .exec(&self.db)
-            .await?;
-        Ok(())
-    }
-
-    /// Get unconsolidated episodes for LLM consolidation
-    pub async fn get_unconsolidated_episodes(&self, limit: u64) -> Result<Vec<episode::Model>> {
-        let episodes = episode::Entity::find()
-            .filter(episode::Column::Consolidated.eq(false))
-            .order_by_asc(episode::Column::Timestamp)
-            .limit(Self::db_limit(limit))
-            .all(&self.db)
-            .await?;
-        Ok(episodes)
     }
 
     // ==================== Approval Log ====================
@@ -6575,8 +6492,12 @@ impl Storage {
             let experience_item_cutoff = (now
                 - chrono::Duration::days(lifecycle.experience_item_retention_days as i64))
             .to_rfc3339();
+            let active_user_memory_protection = Condition::any()
+                .add(experience_item::Column::Status.ne("active"))
+                .add(experience_item::Column::Kind.is_not_in(["personal_fact", "constraint"]));
             experience_item::Entity::delete_many()
                 .filter(experience_item::Column::UpdatedAt.lt(experience_item_cutoff))
+                .filter(active_user_memory_protection)
                 .exec(&txn)
                 .await?;
         }

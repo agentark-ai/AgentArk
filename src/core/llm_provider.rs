@@ -9,9 +9,12 @@ pub const OPENAI_COMPATIBLE_PROVIDER_ID: &str = "openai-compatible";
 pub const OPENROUTER_PROVIDER_ID: &str = "openrouter";
 pub const ANTHROPIC_PROVIDER_ID: &str = "anthropic";
 pub const OLLAMA_PROVIDER_ID: &str = "ollama";
+pub const HUGGINGFACE_PROVIDER_ID: &str = "huggingface";
 pub const CODEX_CLI_BASE_URL: &str = "codex://cli";
 pub const OPENAI_API_BASE_URL: &str = "https://api.openai.com/v1";
+pub const OPENAI_CODEX_API_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub const OPENROUTER_API_BASE_URL: &str = "https://openrouter.ai/api/v1";
+pub const HUGGINGFACE_API_BASE_URL: &str = "https://api-inference.huggingface.co/v1";
 
 pub const OPENAI_DEVICE_AUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const OPENAI_DEVICE_USERCODE_URL: &str =
@@ -81,6 +84,12 @@ const OLLAMA_CAPABILITIES: ProviderCapabilities = ProviderCapabilities {
     default_base_url: None,
 };
 
+const HUGGINGFACE_CAPABILITIES: ProviderCapabilities = ProviderCapabilities {
+    discovery: ProviderDiscoveryKind::OpenAiCompatible,
+    requires_base_url: false,
+    default_base_url: Some(HUGGINGFACE_API_BASE_URL),
+};
+
 pub fn provider_descriptor(provider: &str) -> Option<ProviderDescriptor> {
     match provider.trim().to_ascii_lowercase().as_str() {
         OPENAI_PROVIDER_ID => Some(ProviderDescriptor {
@@ -109,6 +118,12 @@ pub fn provider_descriptor(provider: &str) -> Option<ProviderDescriptor> {
             canonical_id: OLLAMA_PROVIDER_ID,
             capabilities: OLLAMA_CAPABILITIES,
         }),
+        HUGGINGFACE_PROVIDER_ID | "hf" | "hugging_face" | "hugging-face" => {
+            Some(ProviderDescriptor {
+                canonical_id: HUGGINGFACE_PROVIDER_ID,
+                capabilities: HUGGINGFACE_CAPABILITIES,
+            })
+        }
         _ => None,
     }
 }
@@ -130,13 +145,22 @@ pub fn is_openrouter_base_url(url: &str) -> bool {
         .is_some_and(|host| host == "openrouter.ai" || host.ends_with(".openrouter.ai"))
 }
 
+pub fn is_huggingface_base_url(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(|host| host.to_ascii_lowercase()))
+        .is_some_and(|host| {
+            host == "api-inference.huggingface.co" || host.ends_with(".huggingface.co")
+        })
+}
+
 pub fn is_codex_cli_base_url(url: &str) -> bool {
     url.trim().eq_ignore_ascii_case(CODEX_CLI_BASE_URL)
 }
 
 pub fn effective_openai_base_url(base_url: Option<&str>) -> &str {
     match base_url {
-        Some(url) if is_codex_cli_base_url(url) => OPENAI_API_BASE_URL,
+        Some(url) if is_codex_cli_base_url(url) => OPENAI_CODEX_API_BASE_URL,
         Some(url) => url,
         None => OPENAI_API_BASE_URL,
     }
@@ -146,6 +170,7 @@ pub fn openai_provider_label(base_url: Option<&str>) -> &'static str {
     match base_url {
         Some(url) if is_codex_cli_base_url(url) => OPENAI_SUBSCRIPTION_PROVIDER_ID,
         Some(url) if is_openrouter_base_url(url) => OPENROUTER_PROVIDER_ID,
+        Some(url) if is_huggingface_base_url(url) => HUGGINGFACE_PROVIDER_ID,
         Some(_) => OPENAI_COMPATIBLE_PROVIDER_ID,
         None => OPENAI_PROVIDER_ID,
     }
@@ -468,7 +493,7 @@ pub async fn resolve_openai_request_config(
 mod tests {
     use super::{
         normalize_openai_base_url, openai_provider_label, CODEX_CLI_BASE_URL,
-        OPENROUTER_API_BASE_URL,
+        HUGGINGFACE_API_BASE_URL, OPENROUTER_API_BASE_URL,
     };
 
     #[test]
@@ -484,6 +509,18 @@ mod tests {
         assert_eq!(
             normalize_openai_base_url("openrouter", None).unwrap(),
             Some(OPENROUTER_API_BASE_URL.to_string())
+        );
+    }
+
+    #[test]
+    fn huggingface_label_detects_default_base_url() {
+        assert_eq!(
+            openai_provider_label(Some(HUGGINGFACE_API_BASE_URL)),
+            "huggingface"
+        );
+        assert_eq!(
+            normalize_openai_base_url("huggingface", None).unwrap(),
+            Some(HUGGINGFACE_API_BASE_URL.to_string())
         );
     }
 }

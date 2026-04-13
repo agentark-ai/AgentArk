@@ -7,6 +7,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
+use std::time::{Duration, Instant};
 
 #[cfg(not(test))]
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
@@ -19,13 +20,17 @@ use super::llm_provider::effective_openai_base_url;
 const MAX_EMBED_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_LOCAL_EMBEDDING_MODEL: &str = "BAAI/bge-small-en-v1.5";
 const DEFAULT_OPENAI_EMBEDDINGS_BASE_URL: &str = "https://api.openai.com/v1";
+const LOCAL_EMBEDDING_RETRY_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, Debug)]
 enum LocalEmbeddingStatus {
     Idle,
     Preparing,
     Ready,
-    Failed(String),
+    Failed {
+        error: String,
+        retry_after: Instant,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -302,6 +307,17 @@ impl EmbeddingProvider {
     }
 }
 
+fn local_embeddings_cache_dir(data_dir: &Path) -> PathBuf {
+    std::env::var_os("AGENTARK_LOCAL_EMBEDDINGS_CACHE_DIR")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| {
+            let bundled = PathBuf::from("/app/prebuilt-embeddings-cache");
+            bundled.exists().then_some(bundled)
+        })
+        .unwrap_or_else(|| data_dir.join("embeddings-cache"))
+}
+
 impl EmbeddingClient {
     pub fn from_config(config: &AgentConfig, data_dir: &Path) -> Result<Option<Self>> {
         let embeddings = config.embeddings_config();
@@ -313,7 +329,7 @@ impl EmbeddingClient {
 
         let provider = match embeddings.provider {
             EmbeddingsProviderKind::LocalHf => EmbeddingProvider::LocalHf {
-                cache_dir: data_dir.join("embeddings-cache"),
+                cache_dir: local_embeddings_cache_dir(data_dir),
                 runtime: Arc::new(Mutex::new(None)),
                 status: Arc::new(Mutex::new(LocalEmbeddingStatus::Idle)),
             },
@@ -414,10 +430,27 @@ impl EmbeddingClient {
                 Ok(())
             }
             Err(error) => {
-                Self::set_local_status(&status, LocalEmbeddingStatus::Failed(error.to_string()));
+                Self::set_local_status(
+                    &status,
+                    LocalEmbeddingStatus::Failed {
+                        error: error.to_string(),
+                        retry_after: Instant::now() + LOCAL_EMBEDDING_RETRY_INTERVAL,
+                    },
+                );
                 Err(error)
             }
         }
+    }
+
+    fn local_retry_delay(status: &Arc<Mutex<LocalEmbeddingStatus>>) -> Result<Option<Duration>> {
+        let status = status
+            .lock()
+            .map_err(|_| anyhow!("local embeddings status lock poisoned"))?
+            .clone();
+        let LocalEmbeddingStatus::Failed { retry_after, .. } = status else {
+            return Ok(None);
+        };
+        Ok(Some(retry_after.saturating_duration_since(Instant::now())))
     }
 
     pub async fn prepare(&self) -> Result<()> {
@@ -436,6 +469,15 @@ impl EmbeddingClient {
                 runtime,
                 status,
             } => {
+                if let Some(delay) = Self::local_retry_delay(status)? {
+                    if delay > Duration::ZERO {
+                        return Err(anyhow!(
+                            "local embeddings are unavailable; next download retry in about {} minute(s)",
+                            delay.as_secs().div_ceil(60)
+                        ));
+                    }
+                    Self::set_local_status(status, LocalEmbeddingStatus::Idle);
+                }
                 self.prepare_local_model(
                     cache_dir.clone(),
                     Arc::clone(runtime),
@@ -469,9 +511,14 @@ impl EmbeddingClient {
                     LocalEmbeddingStatus::Ready => {
                         Ok(format!("Local embeddings ready ({})", self.model))
                     }
-                    LocalEmbeddingStatus::Failed(error) => {
-                        Err(anyhow!("Local embeddings unavailable: {}", error))
-                    }
+                    LocalEmbeddingStatus::Failed { error, retry_after } => Err(anyhow!(
+                        "Local embeddings unavailable: {}; next download retry in about {} minute(s)",
+                        error,
+                        retry_after
+                            .saturating_duration_since(Instant::now())
+                            .as_secs()
+                            .div_ceil(60)
+                    )),
                 }
             }
             EmbeddingProvider::OpenAICompatible { base_url, .. } => Ok(format!(

@@ -172,11 +172,10 @@ export type MemoryMaintenanceReviewResponse = {
   policy: {
     data_cleanup_enabled: boolean;
     episode_retention_enabled: boolean;
-    protect_fact_sources: boolean;
   };
   durable_policy: {
     documents: string;
-    semantic_facts: string;
+    learned_facts: string;
   };
   episode_cleanup: {
     available: boolean;
@@ -187,7 +186,6 @@ export type MemoryMaintenanceReviewResponse = {
     raw_candidate_count: number;
     estimated_remaining_episodes: number;
     protected_recent_count: number;
-    protected_fact_source_count: number;
     cutoff_days: number;
     keep_last: number;
     require_consolidated: boolean;
@@ -330,7 +328,7 @@ export type SentinelBackgroundLearning = {
   changed?: boolean;
   jobs?: Partial<
     Record<
-      "reflection_pass" | "memory_consolidation" | "experience_consolidation" | "pattern_induction" | "candidate_generation",
+      "reflection_pass" | "experience_consolidation" | "pattern_induction" | "candidate_generation",
       SentinelBackgroundLearningJob
     >
   > & Record<string, SentinelBackgroundLearningJob>;

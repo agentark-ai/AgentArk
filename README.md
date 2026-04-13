@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <em>Personal AI Assistant — Self-hosted, private, always learning</em>
+  <em>Personal AI Assistant - Self-hosted, private, always learning</em>
 </p>
 
 <p align="center">
@@ -109,9 +109,9 @@ Your data stays with you. Your secrets are encrypted. You keep the final say on 
  └──────────────────────────────────┘
 ```
 
-**Agent Engine** — LLM routing, multi-provider support, sub-agent orchestration, self-evolve pipeline  
-**Sentinel & Cron** — Background watchers, scheduled tasks, learning loops, health monitoring  
-**Executor Sandbox** — WASM (Wasmtime) + Docker isolation for code execution, browser automation, app deployment
+**Agent Engine** - LLM routing, multi-provider support, sub-agent orchestration, self-evolve pipeline
+**Sentinel & Cron** - Background watchers, scheduled tasks, learning loops, health monitoring
+**Executor Sandbox** - WASM (Wasmtime) + Docker isolation for code execution, browser automation, app deployment
 
 ---
 
@@ -180,7 +180,7 @@ agentark ➜ I can help with...
 | Autocomplete slash commands | `Tab` |
 | Exit | `Ctrl+D` or `/exit` |
 
-All capabilities available in the Web UI work in CLI mode — same tools, memory, and integrations.
+All capabilities available in the Web UI work in CLI mode - same tools, memory, and integrations.
 
 ### Build from source
 
@@ -229,23 +229,23 @@ In short: choose OpenClaw for a lightweight runtime, PicoClaw for the smallest f
 
 ### Performance snapshot
 
-|                    | AgentArk | NanoBot | PicoClaw | ZeroClaw |
-|:-------------------|:---------|:--------|:---------|:---------|
-| **Cold start**     | **48ms** | 800ms   | 90ms     | 60ms     |
-| **Idle RAM**       | **34MB** | 85MB    | 18MB     | 12MB     |
-| **Binary**         | 38MB     | 45MB    | 12MB     | 8MB      |
-| **Language**       | Rust     | Python  | Go       | Rust     |
-| **Memory system**  | 3-tier   | Basic   | None     | None     |
-| **WASM sandbox**   | Yes      | No      | No       | No       |
-| **Self-evolution** | Yes      | No      | No       | No       |
+|                    | AgentArk   | OpenClaw       | PicoClaw    | NanoClaw      |
+|:-------------------|:-----------|:---------------|:------------|:--------------|
+| **Cold start**     | **48ms**   | ~800ms         | <1s         | ~500ms        |
+| **Idle RAM**       | **34MB**   | ~80MB          | <10MB       | ~60MB         |
+| **Binary**         | 38MB       | npm package    | ~12MB       | npm package   |
+| **Language**       | Rust       | TypeScript     | Go          | TypeScript    |
+| **Memory system**  | 3-tier     | Session-based  | JSONL basic | SQLite basic  |
+| **WASM sandbox**   | Yes        | No             | No          | Container     |
+| **Self-evolution** | Yes        | No             | No          | No            |
 
 > AgentArk is heavier than minimal agents because it bundles a full web UI, WASM sandbox, Playwright browser automation, and a 3-tier memory system. The others are lighter because they do less.
 
 ### Monthly cost comparison
 
-All platforms are free/open-source — the real cost is **AI tokens + hosting**.
+All platforms are free/open-source - the real cost is **AI tokens + hosting**.
 
-|                    | NanoClaw      | TinyClaw                | **AgentArk**           |
+|                    | OpenClaw      | PicoClaw                | **AgentArk**           |
 |:--|:--|:--|:--|
 | Software           | Free          | Free (or $30/mo hosted) | Free                   |
 | Avg personal use   | $5 - $50/mo   | $10 - $40/mo            | **$2 - $10/mo**        |
@@ -263,11 +263,11 @@ AgentArk's edge: route to DeepSeek, GLM, Mistral, or local Ollama for $0.10-$0.5
 
 | | |
 |:--|:--|
-| **Sub-Agent Orchestration** | Researcher, Coder, Analyst, Writer, Validator — auto-selected per task |
+| **Sub-Agent Orchestration** | Researcher, Coder, Analyst, Writer, Validator - auto-selected per task |
 | **Self-Evolve Engine** | Prompt evolution, policy tuning, strategy learning, and routing benchmarks |
 | **Self-Tune** | Learns your style from local history, tracks tool success rates, adjusts autonomy |
 | **Cognitive Memory** | Three-tier: Episodic (conversations), Semantic (facts), Procedural (actions) with decay scoring |
-| **Live App Deployment** | Deploy static or dynamic apps from chat — Node, Python, HTML, and more |
+| **Live App Deployment** | Deploy static or dynamic apps from chat - Node, Python, HTML, and more |
 | **Goal Autopilot** | Goal → plan → scheduled execution → recurring progress reports |
 | **Predictive Nudges** | Early warnings for missed deadlines, overdue pressure, recommended next actions |
 | **Background Learning** | Periodic reflection, memory consolidation, and pattern induction |
@@ -296,18 +296,18 @@ AgentArk's edge: route to DeepSeek, GLM, Mistral, or local Ollama for $0.10-$0.5
 
 ### Autonomy Control Plane
 
-- **Daily Command Brief** — risks, opportunities, and 3 executable recommendations at login
-- **Autopilot Modes** — `Focus`, `Ops`, `Travel`, `Finance` — declarative routines + watchers
-- **Smart Inbox Triage** — auto-clusters messages: Act now / Delegate / Ignore
-- **Live Incident Copilot** — executable containment/recovery playbooks
-- **Cross-Channel Continuity** — configurable `per_channel` or `global` context scope
-- **Outcome Timeline + Rollback** — replayable event timeline with safe rollback
-- **Trust Layer** — risk scoring, policy-based blocking, approval escalation
-- **One-Click Delegation Swarm** — delegate strategic tasks to specialist sub-agents
+- **Daily Command Brief** - risks, opportunities, and 3 executable recommendations at login
+- **Autopilot Modes** - `Focus`, `Ops`, `Travel`, `Finance` - declarative routines + watchers
+- **Smart Inbox Triage** - auto-clusters messages: Act now / Delegate / Ignore
+- **Live Incident Copilot** - executable containment/recovery playbooks
+- **Cross-Channel Continuity** - configurable `per_channel` or `global` context scope
+- **Outcome Timeline + Rollback** - replayable event timeline with safe rollback
+- **Trust Layer** - risk scoring, policy-based blocking, approval escalation
+- **One-Click Delegation Swarm** - delegate strategic tasks to specialist sub-agents
 
 ### External launchers (optional)
 
-AgentArk can manage optional external launchers through the Apps view: **Claude Code**, **Codex**, and **OpenCode**. These are companion tools AgentArk can prepare or invoke — not AgentArk modes or rebrands.
+AgentArk can manage optional external launchers through the Apps view: **Claude Code**, **Codex**, and **OpenCode**. These are companion tools AgentArk can prepare or invoke - not AgentArk modes or rebrands.
 
 ```bash
 # Docker-hosted
@@ -344,6 +344,7 @@ ollama launch opencode
 | **OpenRouter** | `https://openrouter.ai/api/v1` | `glm-4`, `qwen/qwen-2.5-72b-instruct` |
 | **Anthropic** | built-in | `claude-sonnet-4-20250514` |
 | **OpenAI** | built-in | `gpt-4o`, `gpt-4-turbo` |
+| **Hugging Face Inference** | `https://api-inference.huggingface.co/v1` | `meta-llama/Llama-3.1-8B-Instruct`, `Qwen/Qwen2.5-72B-Instruct` |
 | **OpenAI-compatible** | your URL | any compatible model |
 
 ### Telegram bot (optional)
@@ -369,7 +370,7 @@ ollama launch opencode
 - Docker Compose starts Postgres and all internal services automatically
 - Local embeddings use `BAAI/bge-small-en-v1.5` by default; external OpenAI-compatible endpoints supported
 - Bundled skills live under `/app/skills`; user data under `/app/data`
-- Keep Docker volumes attached when updating — `docker compose down -v` is a full reset
+- Keep Docker volumes attached when updating - `docker compose down -v` is a full reset
 
 ---
 
@@ -399,14 +400,14 @@ Full details: [SECURITY.md](SECURITY.md) and [VERIFY.md](VERIFY.md)
 
 ## Design Principles
 
-- **Secure first** — encrypted secrets, approvals, sandboxing, and verifiable records
-- **Daily by default** — briefs, reminders, follow-up, and messaging delivery are first-class
-- **Memory that compounds** — each useful interaction builds on previous preferences and facts
-- **Self-evolving** — corrections, tool outcomes, and benchmarks improve local memory, prompts, and routing
-- **Chat-first** — talk to it naturally, not through config files or flowcharts
-- **Power when needed** — tasks, watchers, apps, integrations, and swarm agents for deeper work
-- **Model-agnostic** — OpenAI, Anthropic, Google, Ollama, or any OpenAI-compatible endpoint
-- **Self-hosted** — your hardware, your data, your rules
+- **Secure first** - encrypted secrets, approvals, sandboxing, and verifiable records
+- **Daily by default** - briefs, reminders, follow-up, and messaging delivery are first-class
+- **Memory that compounds** - each useful interaction builds on previous preferences and facts
+- **Self-evolving** - corrections, tool outcomes, and benchmarks improve local memory, prompts, and routing
+- **Chat-first** - talk to it naturally, not through config files or flowcharts
+- **Power when needed** - tasks, watchers, apps, integrations, and swarm agents for deeper work
+- **Model-agnostic** - OpenAI, Anthropic, Google, Ollama, or any OpenAI-compatible endpoint
+- **Self-hosted** - your hardware, your data, your rules
 
 ---
 
@@ -414,10 +415,10 @@ Full details: [SECURITY.md](SECURITY.md) and [VERIFY.md](VERIFY.md)
 
 | | |
 |:--|:--|
-| **Performance** | Tokio async runtime, `Arc<RwLock<T>>` concurrency — no GIL bottleneck |
+| **Performance** | Tokio async runtime, `Arc<RwLock<T>>` concurrency - no GIL bottleneck |
 | **Security** | `Zeroizing` auto-clears secrets from memory; zero `unsafe` blocks in the codebase |
 | **Type Safety** | Enums, traits, and compile-time guarantees catch bugs before production |
-| **Single Binary** | One compiled binary + Docker — no dependency hell |
+| **Single Binary** | One compiled binary + Docker - no dependency hell |
 | **WASM Sandboxing** | Wasmtime integration is natural in Rust |
 
 ---
@@ -448,7 +449,7 @@ Full interactive API docs available at **http://localhost:8990/docs#/** after st
 <details>
 <summary>Data lost after restart</summary>
 
-- Always use Docker volumes — `docker compose` handles this automatically
+- Always use Docker volumes - `docker compose` handles this automatically
 - If using `docker run`, add `-v agentark-data:/app/data -v agentark-config:/app/config`
 </details>
 
@@ -501,11 +502,11 @@ skills/             # Built-in skill definitions
 
 ### Guidelines
 
-- **PRs over issues** — code speaks louder than feature requests
-- **One concern per PR** — keep changes focused and reviewable
-- **Tests for new features** — add to `tests/` when adding functionality
-- **No secrets in code** — use `SecureConfigManager` for anything sensitive
-- **Format before push** — `cargo fmt` and `cd frontend && npx prettier --write src/`
+- **PRs over issues** - code speaks louder than feature requests
+- **One concern per PR** - keep changes focused and reviewable
+- **Tests for new features** - add to `tests/` when adding functionality
+- **No secrets in code** - use `SecureConfigManager` for anything sensitive
+- **Format before push** - `cargo fmt` and `cd frontend && npx prettier --write src/`
 
 ---
 
@@ -515,7 +516,7 @@ AgentArk is built on outstanding open-source projects:
 
 | Project | Used for |
 |:--|:--|
-| [Rust](https://www.rust-lang.org/) | Core runtime — memory safety, performance, fearless concurrency |
+| [Rust](https://www.rust-lang.org/) | Core runtime - memory safety, performance, fearless concurrency |
 | [Tokio](https://tokio.rs/) | Async runtime powering all concurrent operations |
 | [Axum](https://github.com/tokio-rs/axum) | HTTP server and API framework |
 | [SeaORM](https://www.sea-ql.org/SeaORM/) | Database ORM over PostgreSQL |

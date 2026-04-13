@@ -96,6 +96,17 @@ RUN --mount=type=cache,id=agentark-cargo-target,target=/app/target \
     fi && \
     cp target/release/agentark /app/agentark-bin
 
+# Preload the default local embedding model for published/prebuilt images.
+# Runtime still falls back to /app/data/embeddings-cache when this cache is not present.
+ARG AGENTARK_PREFETCH_LOCAL_EMBEDDINGS=true
+RUN --mount=type=cache,id=agentark-cargo-target,target=/app/target \
+    --mount=type=cache,id=agentark-cargo-registry,target=/usr/local/cargo/registry \
+    if [ "${AGENTARK_PREFETCH_LOCAL_EMBEDDINGS}" = "true" ]; then \
+        cargo run --release --no-default-features --features "${AGENTARK_DOCKER_FEATURES}" --bin prefetch_embeddings -- /app/prebuilt-embeddings-cache; \
+    else \
+        mkdir -p /app/prebuilt-embeddings-cache; \
+    fi
+
 # -- Stage 2: Frontend build --
 FROM node:20-slim AS frontend-builder
 WORKDIR /app/frontend
@@ -248,6 +259,7 @@ COPY --from=node-builder --chown=agent:agent /bridges/playwright-bridge /app/bri
 
 # Copy AgentArk binary from builder
 COPY --from=builder --chown=agent:agent /app/agentark-bin /app/agentark
+COPY --from=builder --chown=agent:agent /app/prebuilt-embeddings-cache /app/prebuilt-embeddings-cache
 
 # Copy assets directly from build context (not part of Rust compilation)
 COPY --chown=agent:agent config /app/config
@@ -268,6 +280,7 @@ RUN sed -i 's/\r$//' /app/docker-entrypoint.sh && chmod +x /app/docker-entrypoin
 # Environment
 ENV AGENTARK_CONFIG=/app/config
 ENV AGENTARK_DATA=/app/data
+ENV AGENTARK_LOCAL_EMBEDDINGS_CACHE_DIR=/app/prebuilt-embeddings-cache
 ENV TS_STATE_DIR=/app/data/tailscale
 ENV TS_SOCKET=/app/data/tailscale/tailscaled.sock
 ENV TS_USERSPACE=true

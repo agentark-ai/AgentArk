@@ -128,7 +128,9 @@ impl Agent {
 ## Action Selection
 - The action catalog appears later in this prompt and is the source of truth for available capabilities.
 - Use action names, descriptions, capabilities, and input schemas semantically. Do not rely on brittle keyword matching.
-- If multiple actions look plausible, prefer the clearest semantic match with the smallest missing-input surface.
+- If several actions are complementary steps in one chain, use them together.
+- If several actions are competing alternatives for the same role and none is clearly the best semantic match, ask one short clarification instead of guessing.
+- If no action is a close semantic match, ask what skill/action or target the user wants rather than forcing an unrelated tool.
 - For workspace/self-modification requests, prefer local code, file, and shell actions over spinning up new external artifacts unless the user clearly asked for a separate app/service.
 - When you emit a tool call, provide complete arguments that satisfy the action schema as far as the user request allows.
 

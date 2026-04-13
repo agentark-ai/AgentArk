@@ -382,6 +382,8 @@ impl SearchClient {
         struct SerperRequest {
             q: String,
             num: usize,
+            gl: String,
+            hl: String,
         }
 
         #[derive(Deserialize)]
@@ -406,6 +408,8 @@ impl SearchClient {
         let request = SerperRequest {
             q: query.to_string(),
             num: num_results,
+            gl: "us".to_string(),
+            hl: "en".to_string(),
         };
 
         let response: SerperResponse = self
@@ -470,7 +474,7 @@ impl SearchClient {
         }
 
         let url = format!(
-            "https://api.search.brave.com/res/v1/web/search?q={}&count={}",
+            "https://api.search.brave.com/res/v1/web/search?q={}&count={}&country=US&search_lang=en&ui_lang=en-US",
             urlencoding::encode(query),
             num_results
         );
@@ -890,7 +894,7 @@ impl SearchClient {
         }
 
         let url = format!(
-            "{}/search?q={}&format=json",
+            "{}/search?q={}&format=json&language=en-US",
             base_url.trim_end_matches('/'),
             urlencoding::encode(query)
         );
@@ -1030,7 +1034,7 @@ impl SearchClient {
 
         // Navigate to Brave Search (reliable from VPS IPs, no captcha)
         let search_url = format!(
-            "https://search.brave.com/search?q={}&count={}",
+            "https://search.brave.com/search?q={}&count={}&country=us&search_lang=en&ui_lang=en-US",
             urlencoding::encode(query),
             num_results + 5
         );
@@ -1214,7 +1218,7 @@ impl SearchClient {
         backend: &str,
     ) -> Result<SearchResponse> {
         let url = format!(
-            "https://www.bing.com/search?format=rss&q={}",
+            "https://www.bing.com/search?format=rss&cc=US&setlang=en-US&mkt=en-US&q={}",
             urlencoding::encode(query)
         );
         let xml = self.get_text_with_retry(&url, SEARCH_XML_ACCEPT).await?;
@@ -1525,8 +1529,8 @@ fn should_retry_search_request(err: Option<&reqwest::Error>) -> bool {
 fn duckduckgo_search_urls(query: &str) -> Vec<String> {
     let encoded = urlencoding::encode(query);
     vec![
-        format!("https://html.duckduckgo.com/html/?q={}", encoded),
-        format!("https://lite.duckduckgo.com/lite/?q={}", encoded),
+        format!("https://html.duckduckgo.com/html/?kl=us-en&q={}", encoded),
+        format!("https://lite.duckduckgo.com/lite/?kl=us-en&q={}", encoded),
     ]
 }
 

@@ -248,12 +248,19 @@ Return ONLY valid JSON. Do not include any extra text.
 
 Output schema:
 {
-  "needed_actions": ["action_name", "action_name"]
+  "needed_actions": ["action_name", "action_name"],
+  "should_clarify": false,
+  "clarification_question": null,
+  "reasoning": "brief explanation"
 }
 
 Rules:
 - Use only the provided actions.
 - Keep the list minimal.
+- Use exact action names from the catalog. User-added and bundled skills are normal actions: select them by their name, description, capabilities, planner metadata, and schema even when the user does not name the skill.
+- For purely conversational requests with no execution needed, return an empty `needed_actions` list and set `should_clarify=false`.
+- If execution is requested but no catalog action is a close semantic match, or if multiple actions are competing alternatives for the same role and none is clearly best, return an empty `needed_actions` list and set `should_clarify=true` with one short question.
+- If multiple actions are complementary steps in one execution chain, include them together.
 - Treat `planner_metadata` as a hard planning signal for role, integration class, auth, cost, and side effects.
 - Use any request-shape assessment as a semantic hint, but override it when the action catalog or recent artifact context makes a better match.
 - Prefer actions that directly inspect, operate on, modify, or validate the user's target.

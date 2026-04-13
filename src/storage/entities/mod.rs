@@ -28,7 +28,6 @@ pub mod procedural_pattern;
 pub mod project;
 pub mod run_checkpoint;
 pub mod security_log;
-pub mod semantic_fact;
 pub mod swarm_agent;
 pub mod swarm_delegation;
 pub mod task;
