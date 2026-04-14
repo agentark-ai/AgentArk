@@ -10,8 +10,9 @@ pub use executor_client::{
     ExecutorClient, ExecutorClientConfig,
 };
 pub(crate) use internal_auth::{
-    load_internal_service_token_from_default_config_dir, load_or_create_internal_service_token,
-    InternalServiceKind,
+    describe_internal_service_tokens, load_internal_service_token_from_default_config_dir,
+    load_or_create_internal_service_token, read_persisted_internal_service_token,
+    restore_internal_service_token, rotate_internal_service_token, InternalServiceKind,
 };
 pub use workspace_client::{WorkspaceClient, WorkspaceClientConfig};
 

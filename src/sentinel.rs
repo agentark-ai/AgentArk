@@ -59,6 +59,29 @@ static WATCHER_POLL_TIMEOUT_SECS: Lazy<u64> = Lazy::new(|| {
         .filter(|value| *value > 0)
         .unwrap_or(30)
 });
+// Supervision budget for ArkSentinel's internal maintenance jobs only.
+// This does not apply to foreground chat requests or long-running user work.
+static SENTINEL_JOB_TIMEOUT_SECS: Lazy<u64> = Lazy::new(|| {
+    std::env::var("AGENTARK_SENTINEL_JOB_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(90)
+});
+static SENTINEL_NOTIFY_TIMEOUT_SECS: Lazy<u64> = Lazy::new(|| {
+    std::env::var("AGENTARK_SENTINEL_NOTIFY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(8)
+});
+static WATCHER_TRIGGER_TIMEOUT_SECS: Lazy<u64> = Lazy::new(|| {
+    std::env::var("AGENTARK_WATCHER_TRIGGER_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(45)
+});
 
 struct PulseRunGuard;
 
@@ -127,7 +150,20 @@ async fn run_with_busy_deferral<F, Fut>(
     let mut defers = 0u32;
     loop {
         if !sentinel_under_load(agent).await {
-            job().await;
+            tracing::debug!("ArkSentinel: {} started", label);
+            match tokio::time::timeout(Duration::from_secs(*SENTINEL_JOB_TIMEOUT_SECS), job()).await
+            {
+                Ok(()) => {
+                    tracing::debug!("ArkSentinel: {} completed", label);
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "ArkSentinel: {} timed out after {}s",
+                        label,
+                        *SENTINEL_JOB_TIMEOUT_SECS
+                    );
+                }
+            }
             return;
         }
 
@@ -172,6 +208,16 @@ pub struct PulseEvent {
 /// Detailed system snapshot captured by each pulse check
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PulseDetails {
+    #[serde(default)]
+    pub scan_started_at: String,
+    #[serde(default)]
+    pub scan_finished_at: String,
+    #[serde(default)]
+    pub scan_duration_ms: u64,
+    #[serde(default)]
+    pub notification_outcome: String,
+    #[serde(default)]
+    pub scan_log: Vec<PulseScanSection>,
     pub pending_tasks: usize,
     pub running_tasks: usize,
     pub completed_tasks: usize,
@@ -196,6 +242,27 @@ pub struct PulseDetails {
     /// 0..100 score where 100 means healthier posture
     #[serde(default)]
     pub doctor_score: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PulseScanMetric {
+    pub label: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PulseScanSection {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub detail: String,
+    #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub metrics: Vec<PulseScanMetric>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -558,18 +625,18 @@ fn public_base_url_is_local(base_url: &str) -> bool {
 }
 
 /// Append a pulse event to the persistent log (capped at MAX_PULSE_EVENTS)
-async fn log_pulse_event(agent: &Agent, event: PulseEvent) {
-    migrate_legacy_pulse_log(agent).await;
+async fn log_pulse_event(storage: &crate::storage::Storage, event: PulseEvent) {
+    migrate_legacy_pulse_log_storage(storage).await;
 
     let Some(row) = pulse_event_to_row(&event) else {
         tracing::warn!("ArkPulse event could not be serialized for persistent storage");
         return;
     };
-    if let Err(error) = agent.storage.insert_arkpulse_event(&row).await {
+    if let Err(error) = storage.insert_arkpulse_event(&row).await {
         tracing::warn!("Failed to persist ArkPulse event row: {}", error);
         return;
     }
-    prune_pulse_event_rows(&agent.storage).await;
+    prune_pulse_event_rows(storage).await;
 }
 
 /// Get the ArkPulse log from storage
@@ -694,8 +761,8 @@ async fn prune_pulse_event_rows(storage: &crate::storage::Storage) {
     }
 }
 
-async fn migrate_legacy_pulse_log(agent: &Agent) {
-    let existing_rows = match agent.storage.count_arkpulse_events().await {
+async fn migrate_legacy_pulse_log_storage(storage: &crate::storage::Storage) {
+    let existing_rows = match storage.count_arkpulse_events().await {
         Ok(count) => count,
         Err(error) => {
             tracing::warn!("Failed to count ArkPulse history rows: {}", error);
@@ -706,13 +773,7 @@ async fn migrate_legacy_pulse_log(agent: &Agent) {
         return;
     }
 
-    let Some(bytes) = agent
-        .storage
-        .get_encrypted(PULSE_LOG_KEY)
-        .await
-        .ok()
-        .flatten()
-    else {
+    let Some(bytes) = storage.get_encrypted(PULSE_LOG_KEY).await.ok().flatten() else {
         return;
     };
     let Ok(raw_events) = serde_json::from_slice::<Vec<PulseEvent>>(&bytes) else {
@@ -720,7 +781,7 @@ async fn migrate_legacy_pulse_log(agent: &Agent) {
     };
     let events = prune_pulse_events(raw_events);
     if events.is_empty() {
-        let _ = agent.storage.delete(PULSE_LOG_KEY).await;
+        let _ = storage.delete(PULSE_LOG_KEY).await;
         return;
     }
 
@@ -729,13 +790,17 @@ async fn migrate_legacy_pulse_log(agent: &Agent) {
             tracing::warn!("Skipping legacy ArkPulse event migration due to serialization failure");
             return;
         };
-        if let Err(error) = agent.storage.insert_arkpulse_event(&row).await {
+        if let Err(error) = storage.insert_arkpulse_event(&row).await {
             tracing::warn!("Failed to migrate legacy ArkPulse event row: {}", error);
             return;
         }
     }
-    prune_pulse_event_rows(&agent.storage).await;
-    let _ = agent.storage.delete(PULSE_LOG_KEY).await;
+    prune_pulse_event_rows(storage).await;
+    let _ = storage.delete(PULSE_LOG_KEY).await;
+}
+
+async fn migrate_legacy_pulse_log(agent: &Agent) {
+    migrate_legacy_pulse_log_storage(&agent.storage).await;
 }
 
 static RE_AWS_ACCESS_KEY: Lazy<Regex> =
@@ -769,6 +834,134 @@ fn compute_doctor_score(findings: &[DoctorFinding]) -> u32 {
         .map(|f| severity_weight(&f.severity))
         .sum();
     100u32.saturating_sub(penalty.min(100))
+}
+
+#[derive(Debug, Default)]
+struct PulseDoctorReport {
+    findings: Vec<DoctorFinding>,
+    sections: Vec<PulseScanSection>,
+}
+
+fn pulse_metric(label: impl Into<String>, value: impl Into<String>) -> PulseScanMetric {
+    PulseScanMetric {
+        label: label.into(),
+        value: value.into(),
+    }
+}
+
+fn pulse_section_status_from_findings(findings: &[DoctorFinding]) -> &'static str {
+    if findings.iter().any(|finding| {
+        finding.user_actionable && matches!(finding.severity.as_str(), "critical" | "high")
+    }) {
+        "error"
+    } else if findings.is_empty() {
+        "ok"
+    } else {
+        "warning"
+    }
+}
+
+fn highest_finding_severity(findings: &[DoctorFinding]) -> &'static str {
+    match findings
+        .iter()
+        .max_by_key(|finding| severity_weight(&finding.severity))
+        .map(|finding| finding.severity.as_str())
+    {
+        Some("critical") => "critical",
+        Some("high") => "high",
+        Some("medium") => "medium",
+        Some("low") => "low",
+        Some("warning") => "warning",
+        Some("info") => "info",
+        Some("none") | None => "none",
+        Some(_) => "warning",
+    }
+}
+
+fn build_scan_section(
+    id: &str,
+    title: &str,
+    duration: Duration,
+    findings: &[DoctorFinding],
+    ok_summary: impl Into<String>,
+    detail: impl Into<String>,
+    mut metrics: Vec<PulseScanMetric>,
+) -> PulseScanSection {
+    let actionable = findings
+        .iter()
+        .filter(|finding| finding.user_actionable)
+        .count();
+    let status = pulse_section_status_from_findings(findings).to_string();
+    let summary = if findings.is_empty() {
+        ok_summary.into()
+    } else {
+        let preview = findings
+            .iter()
+            .take(3)
+            .map(|finding| finding.title.clone())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        format!(
+            "{} finding{}: {}",
+            findings.len(),
+            if findings.len() == 1 { "" } else { "s" },
+            preview
+        )
+    };
+    let detail = if findings.is_empty() {
+        detail.into()
+    } else {
+        let categories = findings
+            .iter()
+            .map(|finding| finding.category.as_str())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .take(6)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let targets = findings
+            .iter()
+            .map(|finding| finding.target.as_str())
+            .filter(|target| !target.trim().is_empty())
+            .take(4)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        format!(
+            "Highest severity: {}. Categories: {}. Targets: {}.",
+            highest_finding_severity(findings),
+            if categories.is_empty() {
+                "none".to_string()
+            } else {
+                categories
+            },
+            if targets.is_empty() {
+                "not provided".to_string()
+            } else {
+                targets
+            }
+        )
+    };
+    metrics.push(pulse_metric(
+        "Duration",
+        format!("{} ms", duration.as_millis()),
+    ));
+    metrics.push(pulse_metric("Findings", findings.len().to_string()));
+    if !findings.is_empty() {
+        metrics.push(pulse_metric("Actionable", actionable.to_string()));
+        metrics.push(pulse_metric(
+            "Highest severity",
+            highest_finding_severity(findings),
+        ));
+    }
+    PulseScanSection {
+        id: id.to_string(),
+        title: title.to_string(),
+        status,
+        summary,
+        detail,
+        duration_ms: duration.as_millis() as u64,
+        metrics,
+    }
 }
 
 macro_rules! push_finding {
@@ -912,6 +1105,33 @@ fn is_scan_text_file(path: &Path) -> bool {
     )
 }
 
+fn should_descend_app_scan_entry(entry: &walkdir::DirEntry) -> bool {
+    if !entry.file_type().is_dir() {
+        return true;
+    }
+    let name = entry
+        .file_name()
+        .to_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    !matches!(
+        name.as_str(),
+        ".git"
+            | ".hg"
+            | ".svn"
+            | ".next"
+            | ".cache"
+            | "node_modules"
+            | "dist"
+            | "build"
+            | "target"
+            | "vendor"
+            | ".venv"
+            | "venv"
+            | "__pycache__"
+    )
+}
+
 fn read_text_limited(path: &Path, max_bytes: usize) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
     let clipped = if bytes.len() > max_bytes {
@@ -965,6 +1185,7 @@ fn detect_ws_hint(app_dir: &Path) -> bool {
     let mut scanned = 0usize;
     for entry in walkdir::WalkDir::new(app_dir)
         .into_iter()
+        .filter_entry(should_descend_app_scan_entry)
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
     {
@@ -987,6 +1208,25 @@ fn detect_ws_hint(app_dir: &Path) -> bool {
         }
     }
     false
+}
+
+async fn detect_ws_hint_async(app_dir: PathBuf) -> bool {
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || detect_ws_hint(&app_dir)),
+    )
+    .await
+    {
+        Ok(Ok(has_hint)) => has_hint,
+        Ok(Err(error)) => {
+            tracing::warn!("ArkPulse WS hint worker failed: {}", error);
+            false
+        }
+        Err(_) => {
+            tracing::warn!("ArkPulse WS hint worker timed out after 5s");
+            false
+        }
+    }
 }
 
 fn run_dependency_and_supply_checks_for_app(app: &AppEndpoint, findings: &mut Vec<DoctorFinding>) {
@@ -1237,6 +1477,7 @@ fn run_secret_scan_for_app(app: &AppEndpoint, findings: &mut Vec<DoctorFinding>)
     let mut hit_count = 0usize;
     for entry in walkdir::WalkDir::new(&app.app_dir)
         .into_iter()
+        .filter_entry(should_descend_app_scan_entry)
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
     {
@@ -1905,7 +2146,7 @@ async fn run_data_safety_checks(
     findings: &mut Vec<DoctorFinding>,
 ) {
     let backup_dir = data_dir.join("backups");
-    if !backup_dir.exists() {
+    if tokio::fs::metadata(&backup_dir).await.is_err() {
         push_internal_finding!(
             findings,
             "medium",
@@ -1918,11 +2159,12 @@ async fn run_data_safety_checks(
         );
     } else {
         let mut latest: Option<SystemTime> = None;
-        if let Ok(entries) = std::fs::read_dir(&backup_dir) {
-            for entry in entries.flatten() {
-                if let Ok(meta) = entry.metadata() {
-                    if let Ok(m) = meta.modified() {
-                        latest = Some(latest.map_or(m, |x| x.max(m)));
+        if let Ok(mut entries) = tokio::fs::read_dir(&backup_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if let Ok(meta) = entry.metadata().await {
+                    if let Ok(modified_at) = meta.modified() {
+                        latest =
+                            Some(latest.map_or(modified_at, |current| current.max(modified_at)));
                     }
                 }
             }
@@ -2039,12 +2281,12 @@ async fn run_data_safety_checks(
     }
 }
 
-fn run_policy_compliance_checks(findings: &mut Vec<DoctorFinding>) {
+async fn run_policy_compliance_checks(findings: &mut Vec<DoctorFinding>) {
     let agent_path = Path::new("src").join("core").join("agent.rs");
     let task_router_path = Path::new("src").join("core").join("task_router.rs");
     let parallel_path = Path::new("src").join("core").join("parallel.rs");
 
-    if let Ok(agent_src) = std::fs::read_to_string(&agent_path) {
+    if let Ok(agent_src) = tokio::fs::read_to_string(&agent_path).await {
         if !has_bounded_app_validation_retry(&agent_src) {
             push_finding!(
                 findings,
@@ -2084,7 +2326,7 @@ fn run_policy_compliance_checks(findings: &mut Vec<DoctorFinding>) {
         }
     }
 
-    if let Ok(router_src) = std::fs::read_to_string(&task_router_path) {
+    if let Ok(router_src) = tokio::fs::read_to_string(&task_router_path).await {
         if !has_retry_cap_prompt_policy(&router_src) {
             push_finding!(
                 findings,
@@ -2099,7 +2341,7 @@ fn run_policy_compliance_checks(findings: &mut Vec<DoctorFinding>) {
         }
     }
 
-    if let Ok(parallel_src) = std::fs::read_to_string(&parallel_path) {
+    if let Ok(parallel_src) = tokio::fs::read_to_string(&parallel_path).await {
         if !has_parallel_app_deploy_recovery(&parallel_src) {
             push_finding!(
                 findings,
@@ -2346,7 +2588,12 @@ async fn run_app_health_checks(
                 }
             }
 
-            if !app.is_static && detect_ws_hint(&app.app_dir) {
+            let has_ws_hint = if app.is_static {
+                false
+            } else {
+                detect_ws_hint_async(app.app_dir.clone()).await
+            };
+            if has_ws_hint {
                 let ws_url = format!("{}/apps/{}/ws", effective_ws_base, app.id);
                 let ws_request = match tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
                     ws_url.clone(),
@@ -2411,8 +2658,9 @@ async fn run_doctor_checks(
     deployed_apps: &[AppPulseInfo],
     security: Option<&crate::core::SecuritySnapshot>,
     security_thresholds: ArkPulseSecurityThresholds,
-) -> Vec<DoctorFinding> {
+) -> PulseDoctorReport {
     let mut findings: Vec<DoctorFinding> = Vec::new();
+    let mut sections: Vec<PulseScanSection> = Vec::new();
     let data_dir = ctx.data_dir.clone();
     let app_rows = ctx.app_registry.list().await;
     let app_endpoints = parse_app_endpoints(&app_rows, &data_dir);
@@ -2435,6 +2683,8 @@ async fn run_doctor_checks(
     });
     let api_key = ctx.api_key.as_deref();
 
+    let attack_surface_started = Instant::now();
+    let findings_before = findings.len();
     run_attack_surface_checks(
         http_client,
         &http_base,
@@ -2444,7 +2694,42 @@ async fn run_doctor_checks(
         &mut findings,
     )
     .await;
+    sections.push(build_scan_section(
+        "attack_surface",
+        "Attack surface probes",
+        attack_surface_started.elapsed(),
+        &findings[findings_before..],
+        "Probed externally reachable surfaces for unsafe exposure or traversal behavior.",
+        "Checked tunnel/app exposure and file-serving surfaces.",
+        vec![
+            pulse_metric("Managed apps", app_endpoints.len().to_string()),
+            pulse_metric(
+                "Public base URL",
+                configured_public_base_url
+                    .clone()
+                    .unwrap_or_else(|| "not configured".to_string()),
+            ),
+        ],
+    ));
+
+    let runtime_hardening_started = Instant::now();
+    let findings_before = findings.len();
     run_runtime_hardening_checks(http_client, &http_base, &app_endpoints, &mut findings).await;
+    sections.push(build_scan_section(
+        "runtime_hardening",
+        "Runtime hardening",
+        runtime_hardening_started.elapsed(),
+        &findings[findings_before..],
+        "Validated managed runtime surfaces and gateway protections.",
+        "Checked runtime-facing routes and hardening expectations.",
+        vec![pulse_metric(
+            "Managed apps",
+            app_endpoints.len().to_string(),
+        )],
+    ));
+
+    let resource_checks_started = Instant::now();
+    let findings_before = findings.len();
     run_resource_checks(
         ctx,
         deployed_apps,
@@ -2453,13 +2738,93 @@ async fn run_doctor_checks(
         &mut findings,
     )
     .await;
-    run_data_safety_checks(&ctx.storage, &data_dir, &mut findings).await;
-    run_policy_compliance_checks(&mut findings);
+    sections.push(build_scan_section(
+        "resource_posture",
+        "Resource posture",
+        resource_checks_started.elapsed(),
+        &findings[findings_before..],
+        "Reviewed database size, durable knowledge growth, traffic spikes, and security counters.",
+        "Checked capacity pressure and burst behavior across storage and runtime counters.",
+        vec![
+            pulse_metric("Deployed apps", deployed_apps.len().to_string()),
+            pulse_metric(
+                "Security snapshot",
+                if security.is_some() {
+                    "present"
+                } else {
+                    "none"
+                },
+            ),
+        ],
+    ));
 
-    for app in &app_endpoints {
-        run_dependency_and_supply_checks_for_app(app, &mut findings);
-        run_secret_scan_for_app(app, &mut findings);
+    let data_safety_started = Instant::now();
+    let findings_before = findings.len();
+    run_data_safety_checks(&ctx.storage, &data_dir, &mut findings).await;
+    sections.push(build_scan_section(
+        "data_safety",
+        "Data safety",
+        data_safety_started.elapsed(),
+        &findings[findings_before..],
+        "Checked backup posture and durable schema readiness.",
+        "Verified backup directory presence and expected storage tables.",
+        vec![pulse_metric("Data dir", data_dir.display().to_string())],
+    ));
+
+    let policy_started = Instant::now();
+    let findings_before = findings.len();
+    run_policy_compliance_checks(&mut findings).await;
+    sections.push(build_scan_section(
+        "policy_compliance",
+        "Policy compliance",
+        policy_started.elapsed(),
+        &findings[findings_before..],
+        "Read policy-critical source files for bounded retry and recovery safeguards.",
+        "Validated code paths that can create loops, duplicate tool calls, or miss recovery behavior.",
+        vec![
+            pulse_metric("Files", "3"),
+            pulse_metric("Source", "agent/task_router/parallel"),
+        ],
+    ));
+
+    let app_scan_started = Instant::now();
+    let findings_before = findings.len();
+    let mut app_scan_tasks = Vec::new();
+    for app in app_endpoints.iter().cloned() {
+        app_scan_tasks.push(tokio::task::spawn_blocking(move || {
+            let mut findings = Vec::new();
+            run_dependency_and_supply_checks_for_app(&app, &mut findings);
+            run_secret_scan_for_app(&app, &mut findings);
+            findings
+        }));
     }
+    for task in app_scan_tasks {
+        match tokio::time::timeout(Duration::from_secs(20), task).await {
+            Ok(Ok(app_findings)) => findings.extend(app_findings),
+            Ok(Err(error)) => {
+                tracing::warn!("ArkPulse app scan worker failed: {}", error);
+            }
+            Err(_) => {
+                tracing::warn!("ArkPulse app scan worker timed out after 20s");
+            }
+        }
+    }
+    sections.push(build_scan_section(
+        "app_code_scan",
+        "Managed app code scan",
+        app_scan_started.elapsed(),
+        &findings[findings_before..],
+        if app_endpoints.is_empty() {
+            "No managed apps were available for dependency or secret scanning.".to_string()
+        } else {
+            "Scanned managed app directories for dependency drift, risky install hooks, and secret exposure.".to_string()
+        },
+        "Reviewed app manifests and a bounded subset of source files for code-level risk indicators.",
+        vec![pulse_metric("Apps scanned", app_endpoints.len().to_string())],
+    ));
+
+    let app_health_started = Instant::now();
+    let findings_before = findings.len();
     run_app_health_checks(
         http_client,
         &http_base,
@@ -2470,12 +2835,29 @@ async fn run_doctor_checks(
         &mut findings,
     )
     .await;
+    sections.push(build_scan_section(
+        "app_runtime_health",
+        "Managed app runtime health",
+        app_health_started.elapsed(),
+        &findings[findings_before..],
+        if app_endpoints.is_empty() {
+            "No managed apps were available for health probes.".to_string()
+        } else {
+            "Probed app entrypoints, guarded health routes, and WebSocket paths where expected."
+                .to_string()
+        },
+        "Validated deployed app reachability and latency from the control plane.",
+        vec![
+            pulse_metric("Apps probed", app_endpoints.len().to_string()),
+            pulse_metric("Runtime app rows", deployed_apps.len().to_string()),
+        ],
+    ));
 
     findings.sort_by(|a, b| severity_weight(&b.severity).cmp(&severity_weight(&a.severity)));
     if findings.len() > 40 {
         findings.truncate(40);
     }
-    findings
+    PulseDoctorReport { findings, sections }
 }
 
 /// ArkSentinel configuration (loaded from settings, with sensible defaults)
@@ -2735,7 +3117,19 @@ pub fn start(
                     break;
                 }
                 record_loop_heartbeat(&agent, SENTINEL_APPROVAL_EXPIRY_HEARTBEAT_KEY).await;
-                run_approval_expiry(&agent).await;
+                tracing::debug!("ArkSentinel: approval_expiry started");
+                match tokio::time::timeout(
+                    Duration::from_secs(*SENTINEL_JOB_TIMEOUT_SECS),
+                    run_approval_expiry(&agent),
+                )
+                .await
+                {
+                    Ok(()) => tracing::debug!("ArkSentinel: approval_expiry completed"),
+                    Err(_) => tracing::warn!(
+                        "ArkSentinel: approval_expiry timed out after {}s",
+                        *SENTINEL_JOB_TIMEOUT_SECS
+                    ),
+                }
             }
         })
     });
@@ -2903,12 +3297,28 @@ pub fn start(
                     if !tick_or_shutdown(&mut interval, &mut shutdown).await {
                         break;
                     }
-                    let agent_guard = agent.read().await;
-                    if let Err(error) = agent_guard.runtime.reconcile_orphan_containers().await {
-                        tracing::warn!(
-                            "ArkSentinel: sandbox container reconciliation failed: {}",
-                            error
-                        );
+                    let runtime = {
+                        let agent_guard = agent.read().await;
+                        agent_guard.runtime.clone()
+                    };
+                    tracing::debug!("ArkSentinel: container_reaper started");
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(*SENTINEL_JOB_TIMEOUT_SECS),
+                        async move { runtime.reconcile_orphan_containers().await },
+                    )
+                    .await;
+                    match result {
+                        Ok(Ok(_)) => tracing::debug!("ArkSentinel: container_reaper completed"),
+                        Ok(Err(error)) => {
+                            tracing::warn!(
+                                "ArkSentinel: sandbox container reconciliation failed: {}",
+                                error
+                            );
+                        }
+                        Err(_) => tracing::warn!(
+                            "ArkSentinel: container_reaper timed out after {}s",
+                            *SENTINEL_JOB_TIMEOUT_SECS
+                        ),
                     }
                 }
             })
@@ -3025,16 +3435,39 @@ async fn record_loop_heartbeat(agent: &SharedAgent, key: &str) {
     }
 }
 
+async fn notify_preferred_channel_bounded(
+    agent: &SharedAgent,
+    message: &str,
+    context: &'static str,
+) {
+    let message = message.to_string();
+    match tokio::time::timeout(
+        Duration::from_secs(*SENTINEL_NOTIFY_TIMEOUT_SECS),
+        async move {
+            let agent_guard = agent.read().await;
+            agent_guard.notify_preferred_channel(&message).await;
+        },
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(_) => tracing::warn!(
+            "ArkSentinel: {} preferred-channel notification timed out after {}s",
+            context,
+            *SENTINEL_NOTIFY_TIMEOUT_SECS
+        ),
+    }
+}
+
 async fn persist_watcher_notification_attempt(
-    agent: &crate::core::Agent,
+    watcher_manager: &crate::core::watcher::WatcherManager,
     watcher_id: uuid::Uuid,
     channel: String,
     success: bool,
     message: &str,
     error: Option<String>,
 ) {
-    agent
-        .watcher_manager
+    watcher_manager
         .push_notification_attempt(
             watcher_id,
             crate::core::watcher::WatcherNotificationAttempt {
@@ -3053,23 +3486,31 @@ async fn run_watchers(agent: &SharedAgent) {
         tracing::debug!("ArkSentinel: watchers skipped (agent paused)");
         return;
     }
+    let (watcher_manager, background_sessions, runtime, notification_store) = {
+        let agent_guard = agent.read().await;
+        (
+            agent_guard.watcher_manager.clone(),
+            agent_guard.background_sessions.clone(),
+            agent_guard.runtime.clone(),
+            agent_guard.notification_store(),
+        )
+    };
 
     // Expire timed-out watchers
-    let expired = {
-        let agent = agent.read().await;
-        agent.watcher_manager.expire_watchers().await
-    };
+    let expired = watcher_manager.expire_watchers().await;
     for w in &expired {
-        let agent = agent.read().await;
         let msg = format!(
             "Watcher timed out: **{}**\n\nPolled `{}` {} times over {} minutes without finding a match.",
-            w.description, w.poll_action, w.poll_count, w.timeout_secs / 60
+            w.description,
+            w.poll_action,
+            w.poll_count,
+            w.timeout_secs / 60
         );
-        let web_outcome = agent
+        let web_outcome = notification_store
             .emit_notification_with_status("Watcher Timed Out", &msg, "warning", "watcher")
             .await;
         persist_watcher_notification_attempt(
-            &agent,
+            &watcher_manager,
             w.id,
             web_outcome.channel,
             web_outcome.success,
@@ -3079,11 +3520,12 @@ async fn run_watchers(agent: &SharedAgent) {
         .await;
         if !w.notify_channel.is_empty() {
             if !w.notify_channel.eq_ignore_ascii_case("web") {
+                let agent = agent.read().await;
                 let outcome = agent
                     .try_send_notification_reported(&w.notify_channel, &msg)
                     .await;
                 persist_watcher_notification_attempt(
-                    &agent,
+                    &watcher_manager,
                     w.id,
                     outcome.channel,
                     outcome.success,
@@ -3093,12 +3535,13 @@ async fn run_watchers(agent: &SharedAgent) {
                 .await;
             }
         } else {
+            let agent = agent.read().await;
             for outcome in agent.notify_preferred_channel_reported(&msg).await {
                 if outcome.channel.eq_ignore_ascii_case("web") {
                     continue;
                 }
                 persist_watcher_notification_attempt(
-                    &agent,
+                    &watcher_manager,
                     w.id,
                     outcome.channel,
                     outcome.success,
@@ -3108,40 +3551,48 @@ async fn run_watchers(agent: &SharedAgent) {
                 .await;
             }
         }
+        let agent = agent.read().await;
         agent
             .sync_watcher_supervisor_state(w, Some("timed_out"), None)
             .await;
     }
 
     // Poll due watchers
-    let due_watchers = {
-        let agent = agent.read().await;
-        agent.watcher_manager.get_due_watchers().await
-    };
+    let due_watchers = watcher_manager.get_due_watchers().await;
 
     for watcher in due_watchers {
         let poll_result = {
-            let agent = agent.read().await;
             let authorization =
                 crate::core::automation::runtime_authorization_context_from_arguments(
                     &watcher.poll_arguments,
                     crate::actions::ActionExecutionSurface::Background,
                 );
-            match tokio::time::timeout(
-                Duration::from_secs(*WATCHER_POLL_TIMEOUT_SECS),
-                agent.runtime.execute_action_with_context(
-                    &watcher.poll_action,
-                    &watcher.poll_arguments,
-                    &authorization,
-                ),
+            if let Err(error) = Agent::enforce_background_session_policy_for_action_shared(
+                &background_sessions,
+                runtime.as_ref(),
+                &watcher.poll_action,
+                &watcher.poll_arguments,
             )
             .await
             {
-                Ok(result) => result,
-                Err(_) => Err(anyhow::anyhow!(
-                    "Watcher poll timed out after {} seconds",
-                    *WATCHER_POLL_TIMEOUT_SECS
-                )),
+                Err(anyhow::anyhow!(error))
+            } else {
+                match tokio::time::timeout(
+                    Duration::from_secs(*WATCHER_POLL_TIMEOUT_SECS),
+                    runtime.execute_action_with_context(
+                        &watcher.poll_action,
+                        &watcher.poll_arguments,
+                        &authorization,
+                    ),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(anyhow::anyhow!(
+                        "Watcher poll timed out after {} seconds",
+                        *WATCHER_POLL_TIMEOUT_SECS
+                    )),
+                }
             }
         };
 
@@ -3160,13 +3611,9 @@ async fn run_watchers(agent: &SharedAgent) {
                 );
                 if !critique.validation_passed {
                     let error_text = critique.summary.clone();
-                    {
-                        let agent = agent.read().await;
-                        agent
-                            .watcher_manager
-                            .record_poll_error(watcher.id, new_count, error_text.clone())
-                            .await;
-                    }
+                    watcher_manager
+                        .record_poll_error(watcher.id, new_count, error_text.clone())
+                        .await;
                     tracing::warn!(
                         "Watcher '{}' poll #{} failed validation: {}",
                         watcher.description,
@@ -3175,7 +3622,25 @@ async fn run_watchers(agent: &SharedAgent) {
                     );
                     continue;
                 }
-                let matched = {
+                let matched = if let Some(outcome) =
+                    Agent::evaluate_watch_condition_without_llm(&watcher.condition, &result)
+                {
+                    match outcome {
+                        Ok(matched) => matched,
+                        Err(error_text) => {
+                            watcher_manager
+                                .record_poll_error(watcher.id, new_count, error_text.clone())
+                                .await;
+                            tracing::warn!(
+                                "Watcher '{}' poll #{} failed condition evaluation: {}",
+                                watcher.description,
+                                new_count,
+                                error_text
+                            );
+                            continue;
+                        }
+                    }
+                } else {
                     let agent = agent.read().await;
                     match agent
                         .evaluate_watcher_condition(
@@ -3187,8 +3652,7 @@ async fn run_watchers(agent: &SharedAgent) {
                     {
                         Ok(matched) => matched,
                         Err(error_text) => {
-                            agent
-                                .watcher_manager
+                            watcher_manager
                                 .record_poll_error(watcher.id, new_count, error_text.clone())
                                 .await;
                             tracing::warn!(
@@ -3201,13 +3665,9 @@ async fn run_watchers(agent: &SharedAgent) {
                         }
                     }
                 };
-                {
-                    let agent = agent.read().await;
-                    agent
-                        .watcher_manager
-                        .record_poll_success(watcher.id, new_count, result.clone(), matched)
-                        .await;
-                }
+                watcher_manager
+                    .record_poll_success(watcher.id, new_count, result.clone(), matched)
+                    .await;
                 tracing::info!(
                     "Watcher '{}' poll #{}: action={}, result_len={}, condition_matched={}",
                     watcher.description,
@@ -3218,46 +3678,58 @@ async fn run_watchers(agent: &SharedAgent) {
                 );
                 if matched {
                     let trigger_result = result.clone();
-                    {
-                        let agent = agent.read().await;
-                        agent
-                            .watcher_manager
-                            .mark_triggered(watcher.id, trigger_result.clone())
-                            .await;
-                    }
+                    watcher_manager
+                        .mark_triggered(watcher.id, trigger_result.clone())
+                        .await;
 
+                    let followup_worker = {
+                        let agent_guard = agent.read().await;
+                        agent_guard.watcher_followup_worker()
+                    };
                     let agent = Arc::clone(agent);
                     let permits = Arc::clone(&WATCHER_TRIGGER_PERMITS);
                     tokio::spawn(async move {
                         let Ok(_permit) = permits.acquire_owned().await else {
                             return;
                         };
-                        let agent_guard = agent.read().await;
-                        agent_guard
-                            .handle_watcher_trigger_supervised(watcher, trigger_result)
-                            .await;
+                        let result = tokio::time::timeout(
+                            Duration::from_secs(*WATCHER_TRIGGER_TIMEOUT_SECS),
+                            async move {
+                                let prepared = followup_worker
+                                    .prepare_watcher_followup(&watcher, &trigger_result)
+                                    .await;
+                                let agent_guard = agent.read().await;
+                                agent_guard
+                                    .handle_watcher_trigger_supervised(
+                                        watcher,
+                                        trigger_result,
+                                        prepared,
+                                    )
+                                    .await;
+                            },
+                        )
+                        .await;
+                        if result.is_err() {
+                            tracing::warn!(
+                                "ArkSentinel: watcher trigger follow-up timed out after {}s",
+                                *WATCHER_TRIGGER_TIMEOUT_SECS
+                            );
+                        }
                     });
                 }
             }
             Err(e) => {
                 let error_text = e.to_string();
-                {
-                    let agent = agent.read().await;
-                    agent
-                        .watcher_manager
-                        .record_poll_error(watcher.id, new_count, error_text.clone())
-                        .await;
-                }
+                watcher_manager
+                    .record_poll_error(watcher.id, new_count, error_text.clone())
+                    .await;
                 tracing::debug!("ArkSentinel: watcher {} poll error: {}", watcher.id, e);
             }
         }
     }
 
     // Cleanup old watchers
-    {
-        let agent = agent.read().await;
-        agent.watcher_manager.cleanup().await;
-    }
+    watcher_manager.cleanup().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3445,11 +3917,11 @@ async fn run_pattern_induction_job(agent: &SharedAgent) {
 
 async fn run_candidate_generation_job(agent: &SharedAgent) {
     let started_at = chrono::Utc::now();
-    let storage = {
+    let (storage, data_dir) = {
         let agent = agent.read().await;
-        agent.storage.clone()
+        (agent.storage.clone(), agent.data_dir.clone())
     };
-    match crate::core::learning::run_candidate_generation(&storage).await {
+    match crate::core::learning::run_candidate_generation(&storage, &data_dir).await {
         Ok(processed) if processed > 0 => {
             let completed_at = chrono::Utc::now();
             tracing::info!(
@@ -3517,22 +3989,23 @@ async fn run_candidate_generation_job(agent: &SharedAgent) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 async fn run_approval_expiry(agent: &SharedAgent) {
-    let agent = agent.read().await;
     const APPROVAL_EXPIRY_SECS: i64 = 7 * 24 * 60 * 60;
-    if let Err(e) = agent
-        .storage
-        .expire_old_approvals(APPROVAL_EXPIRY_SECS)
-        .await
-    {
+    let (storage, tasks) = {
+        let agent_guard = agent.read().await;
+        (agent_guard.storage.clone(), agent_guard.tasks.clone())
+    };
+    if let Err(e) = storage.expire_old_approvals(APPROVAL_EXPIRY_SECS).await {
         tracing::debug!("ArkSentinel: approval expiry check: {}", e);
     }
-    if let Err(e) = agent
-        .expire_stale_approval_tasks(APPROVAL_EXPIRY_SECS)
-        .await
+    if let Err(e) =
+        Agent::expire_stale_approval_tasks_shared(&storage, &tasks, APPROVAL_EXPIRY_SECS).await
     {
         tracing::debug!("ArkSentinel: stale approval task expiry check: {}", e);
     }
-    agent.safety.clear_expired_approvals();
+    {
+        let agent_guard = agent.read().await;
+        agent_guard.safety.clear_expired_approvals();
+    }
 }
 
 fn build_pulse_log_summary(
@@ -3822,15 +4295,47 @@ pub async fn run_pulse(agent: &SharedAgent) {
         return;
     }
     let _pulse_guard = PulseRunGuard;
+    let pulse_started_at = chrono::Utc::now();
+    let pulse_started = Instant::now();
+    let mut pulse_scan_log = Vec::new();
 
     {
+        let integration_started = Instant::now();
         let shared_agent = agent.clone();
         let ctx = {
             let guard = shared_agent.read().await;
             crate::core::integration_sync::context_from_agent(&guard, Some(shared_agent.clone()))
         };
-        if let Err(error) = crate::core::integration_sync::run_due_syncs(&ctx).await {
-            tracing::debug!("ArkPulse integration probe skipped: {}", error);
+        match crate::core::integration_sync::run_due_syncs(&ctx).await {
+            Ok(()) => pulse_scan_log.push(PulseScanSection {
+                id: "integration_sync".to_string(),
+                title: "Integration sync".to_string(),
+                status: "ok".to_string(),
+                summary: "Checked due integration syncs before diagnostics.".to_string(),
+                detail:
+                    "Ran the connector scheduler first so ArkPulse used the freshest integration state."
+                        .to_string(),
+                duration_ms: integration_started.elapsed().as_millis() as u64,
+                metrics: vec![pulse_metric(
+                    "Duration",
+                    format!("{} ms", integration_started.elapsed().as_millis()),
+                )],
+            }),
+            Err(error) => {
+                tracing::debug!("ArkPulse integration probe skipped: {}", error);
+                pulse_scan_log.push(PulseScanSection {
+                    id: "integration_sync".to_string(),
+                    title: "Integration sync".to_string(),
+                    status: "warning".to_string(),
+                    summary: "Integration sync probe was skipped for this run.".to_string(),
+                    detail: error.to_string(),
+                    duration_ms: integration_started.elapsed().as_millis() as u64,
+                    metrics: vec![pulse_metric(
+                        "Duration",
+                        format!("{} ms", integration_started.elapsed().as_millis()),
+                    )],
+                });
+            }
         }
     }
 
@@ -3842,7 +4347,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
         .build()
         .unwrap_or_default();
 
-    let (pulse_ctx, tasks, watcher_manager, security_events) = {
+    let (pulse_ctx, tasks, watcher_manager, security_events, notification_store) = {
         let agent_guard = agent.read().await;
         (
             PulseDoctorContext {
@@ -3859,6 +4364,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
             agent_guard.tasks.clone(),
             agent_guard.watcher_manager.clone(),
             agent_guard.security_events.clone(),
+            agent_guard.notification_store(),
         )
     };
     let storage = pulse_ctx.storage.clone();
@@ -3868,12 +4374,14 @@ pub async fn run_pulse(agent: &SharedAgent) {
         .await;
     let security_thresholds = load_arkpulse_security_thresholds(&storage).await;
 
-    let (overdue_tasks, failed_tasks, approaching_goals, brief_channel, details, deployed_apps) = {
+    let (overdue_tasks, failed_tasks, approaching_goals, brief_channel, mut details, deployed_apps) = {
         let now = chrono::Utc::now();
         let all_tasks = {
             let tasks = tasks.read().await;
             tasks.all().to_vec()
         };
+        let mut run_sections = Vec::new();
+        let task_snapshot_started = Instant::now();
 
         // Task counts
         let pending = all_tasks
@@ -3948,9 +4456,46 @@ pub async fn run_pulse(agent: &SharedAgent) {
 
         // Watcher count
         let active_watchers = watcher_manager.list().await.len();
+        run_sections.push(PulseScanSection {
+            id: "task_snapshot".to_string(),
+            title: "Task and watcher snapshot".to_string(),
+            status: if overdue.is_empty() && failed.is_empty() {
+                "ok".to_string()
+            } else {
+                "warning".to_string()
+            },
+            summary: if overdue.is_empty() && failed.is_empty() {
+                "Captured task, goal, and watcher counts with no overdue or failed work."
+                    .to_string()
+            } else {
+                format!(
+                    "Captured runtime workload with {} overdue item(s) and {} failed task(s).",
+                    overdue.len(),
+                    failed.len()
+                )
+            },
+            detail: format!(
+                "Pending: {} | Running: {} | Completed: {} | Goal deadlines close: {} | Active watchers: {}",
+                pending,
+                running,
+                completed,
+                approaching_goals.len(),
+                active_watchers
+            ),
+            duration_ms: task_snapshot_started.elapsed().as_millis() as u64,
+            metrics: vec![
+                pulse_metric("Pending", pending.to_string()),
+                pulse_metric("Running", running.to_string()),
+                pulse_metric("Completed", completed.to_string()),
+                pulse_metric("Overdue", overdue.len().to_string()),
+                pulse_metric("Failed", failed.len().to_string()),
+                pulse_metric("Watchers", active_watchers.to_string()),
+            ],
+        });
 
         // ── Health checks ────────────────────────────────────────────────
         let mut health_checks = Vec::new();
+        let health_snapshot_started = Instant::now();
 
         // Postgres-backed pgvector retrieval
         let episode_count = match pulse_ctx.storage.count_episodes().await {
@@ -4145,9 +4690,45 @@ pub async fn run_pulse(agent: &SharedAgent) {
             }
         };
         health_checks.push(llm_check);
+        run_sections.push(PulseScanSection {
+            id: "health_snapshot".to_string(),
+            title: "Runtime health snapshot".to_string(),
+            status: if health_checks
+                .iter()
+                .any(|check| check.status.eq_ignore_ascii_case("error"))
+            {
+                "error".to_string()
+            } else if health_checks
+                .iter()
+                .any(|check| check.status.eq_ignore_ascii_case("warn"))
+            {
+                "warning".to_string()
+            } else {
+                "ok".to_string()
+            },
+            summary: format!(
+                "Collected {} health checks across memory retrieval, browser tooling, and model connectivity.",
+                health_checks.len()
+            ),
+            detail: health_checks
+                .iter()
+                .map(|check| format!("{}: {} ({})", check.service, check.message, check.status))
+                .take(6)
+                .collect::<Vec<_>>()
+                .join(" | "),
+            duration_ms: health_snapshot_started.elapsed().as_millis() as u64,
+            metrics: vec![
+                pulse_metric("Checks", health_checks.len().to_string()),
+                pulse_metric("Memories", total_memories.to_string()),
+                pulse_metric("Documents", document_count.to_string()),
+                pulse_metric("Chunks", document_chunk_count.to_string()),
+            ],
+        });
 
         // ── Security snapshot ────────────────────────────────────────────
+        let security_snapshot_started = Instant::now();
         let sec_snapshot = security_events.snapshot();
+        let mut security_persisted = false;
 
         // Persist security events to DB if any occurred
         if sec_snapshot.has_events() {
@@ -4195,6 +4776,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
                 .collect();
             match pulse_ctx.storage.insert_security_logs(&logs).await {
                 Ok(()) => {
+                    security_persisted = true;
                     security_events.commit_snapshot(&sec_snapshot);
                     tracing::info!(
                         "ArkPulse security: injections={}, auth_fail={}, rate_limit={}, unauth={}",
@@ -4212,6 +4794,46 @@ pub async fn run_pulse(agent: &SharedAgent) {
                 }
             }
         }
+        run_sections.push(PulseScanSection {
+            id: "security_snapshot".to_string(),
+            title: "Security snapshot".to_string(),
+            status: if sec_snapshot.injection_attempts > 0 {
+                "error".to_string()
+            } else if sec_snapshot.has_events() {
+                "warning".to_string()
+            } else {
+                "ok".to_string()
+            },
+            summary: if sec_snapshot.has_events() {
+                "Recorded security counters observed since the previous pulse.".to_string()
+            } else {
+                "No new security events were recorded since the previous pulse.".to_string()
+            },
+            detail: format!(
+                "Injections: {} | Auth failures: {} | Rate-limit hits: {} | Unauthorized channel attempts: {} | Persisted: {}",
+                sec_snapshot.injection_attempts,
+                sec_snapshot.auth_failures,
+                sec_snapshot.rate_limit_hits,
+                sec_snapshot.unauthorized_channel_attempts,
+                if security_persisted {
+                    "yes"
+                } else if sec_snapshot.has_events() {
+                    "no"
+                } else {
+                    "not needed"
+                }
+            ),
+            duration_ms: security_snapshot_started.elapsed().as_millis() as u64,
+            metrics: vec![
+                pulse_metric("Injections", sec_snapshot.injection_attempts.to_string()),
+                pulse_metric("Auth failures", sec_snapshot.auth_failures.to_string()),
+                pulse_metric("Rate limits", sec_snapshot.rate_limit_hits.to_string()),
+                pulse_metric(
+                    "Unauthorized channels",
+                    sec_snapshot.unauthorized_channel_attempts.to_string(),
+                ),
+            ],
+        });
 
         let channel = pulse_ctx
             .storage
@@ -4236,13 +4858,71 @@ pub async fn run_pulse(agent: &SharedAgent) {
                 idle_hours: (now_ts - s.last_accessed).num_hours(),
             })
             .collect();
+        run_sections.push(PulseScanSection {
+            id: "app_inventory".to_string(),
+            title: "Managed app inventory".to_string(),
+            status: if deployed_apps
+                .iter()
+                .any(|app| !app.is_static && !app.process_alive)
+            {
+                "warning".to_string()
+            } else {
+                "ok".to_string()
+            },
+            summary: if deployed_apps.is_empty() {
+                "No managed apps are currently deployed.".to_string()
+            } else {
+                format!(
+                    "Captured runtime inventory for {} managed app(s).",
+                    deployed_apps.len()
+                )
+            },
+            detail: deployed_apps
+                .iter()
+                .take(6)
+                .map(|app| {
+                    format!(
+                        "{}: {} | {} | idle {}h",
+                        app.title,
+                        if app.process_alive || app.is_static {
+                            "reachable"
+                        } else {
+                            "process down"
+                        },
+                        if app.is_static { "static" } else { "runtime" },
+                        app.idle_hours
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | "),
+            duration_ms: 0,
+            metrics: vec![
+                pulse_metric("Apps", deployed_apps.len().to_string()),
+                pulse_metric(
+                    "Managed runtimes",
+                    deployed_apps
+                        .iter()
+                        .filter(|app| !app.is_static)
+                        .count()
+                        .to_string(),
+                ),
+                pulse_metric(
+                    "Down",
+                    deployed_apps
+                        .iter()
+                        .filter(|app| !app.is_static && !app.process_alive)
+                        .count()
+                        .to_string(),
+                ),
+            ],
+        });
 
         let security_snapshot = if sec_snapshot.has_events() {
             Some(sec_snapshot.clone())
         } else {
             None
         };
-        let doctor_findings = run_doctor_checks(
+        let doctor_report = run_doctor_checks(
             &pulse_ctx,
             &http_client,
             &deployed_apps,
@@ -4250,9 +4930,16 @@ pub async fn run_pulse(agent: &SharedAgent) {
             security_thresholds,
         )
         .await;
+        run_sections.extend(doctor_report.sections.clone());
+        let doctor_findings = doctor_report.findings;
         let doctor_score = compute_doctor_score(&doctor_findings);
 
         let details = PulseDetails {
+            scan_started_at: pulse_started_at.to_rfc3339(),
+            scan_finished_at: String::new(),
+            scan_duration_ms: 0,
+            notification_outcome: String::new(),
+            scan_log: run_sections,
             pending_tasks: pending,
             running_tasks: running,
             completed_tasks: completed,
@@ -4278,6 +4965,8 @@ pub async fn run_pulse(agent: &SharedAgent) {
             deployed_apps,
         )
     };
+    pulse_scan_log.extend(details.scan_log.clone());
+    details.scan_log = pulse_scan_log;
 
     // Deterministic pulse classification: notify only on critical breakage or security spikes.
     let has_overdue = !overdue_tasks.is_empty();
@@ -4348,6 +5037,18 @@ pub async fn run_pulse(agent: &SharedAgent) {
     if !has_any_signal {
         tracing::debug!("ArkPulse: all clear");
         let summary = "All clear, no issues detected".to_string();
+        details.scan_finished_at = chrono::Utc::now().to_rfc3339();
+        details.scan_duration_ms = pulse_started.elapsed().as_millis() as u64;
+        details.notification_outcome = "none".to_string();
+        details.scan_log.push(PulseScanSection {
+            id: "notification_outcome".to_string(),
+            title: "Notification outcome".to_string(),
+            status: "ok".to_string(),
+            summary: "No user notification was sent because the run was clear.".to_string(),
+            detail: "ArkPulse logged the run silently for operator review.".to_string(),
+            duration_ms: 0,
+            metrics: vec![pulse_metric("Outcome", "none")],
+        });
         let event = PulseEvent {
             timestamp: chrono::Utc::now().to_rfc3339(),
             status: "ok".to_string(),
@@ -4358,8 +5059,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
             failed_tasks: 0,
             details,
         };
-        let agent_guard = agent.read().await;
-        log_pulse_event(&agent_guard, event).await;
+        log_pulse_event(&storage, event).await;
         return;
     }
 
@@ -4372,6 +5072,39 @@ pub async fn run_pulse(agent: &SharedAgent) {
             doctor_low_count,
             health_warn_count,
         );
+        details.scan_finished_at = chrono::Utc::now().to_rfc3339();
+        details.scan_duration_ms = pulse_started.elapsed().as_millis() as u64;
+        details.notification_outcome = if growth_notification.is_some() {
+            "in_app_growth_warning".to_string()
+        } else {
+            "none".to_string()
+        };
+        details.scan_log.push(PulseScanSection {
+            id: "notification_outcome".to_string(),
+            title: "Notification outcome".to_string(),
+            status: if growth_notification.is_some() {
+                "warning".to_string()
+            } else {
+                "ok".to_string()
+            },
+            summary: if growth_notification.is_some() {
+                "ArkPulse emitted a throttled growth warning without escalating a critical alert."
+                    .to_string()
+            } else {
+                "ArkPulse recorded non-critical context without sending a user-facing alert."
+                    .to_string()
+            },
+            detail: "Run history was saved so you can review the context later.".to_string(),
+            duration_ms: 0,
+            metrics: vec![pulse_metric(
+                "Outcome",
+                if growth_notification.is_some() {
+                    "growth warning"
+                } else {
+                    "logged only"
+                },
+            )],
+        });
         let event = PulseEvent {
             timestamp: chrono::Utc::now().to_rfc3339(),
             status: "ok".to_string(),
@@ -4382,8 +5115,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
             failed_tasks: failed_tasks.len(),
             details,
         };
-        let agent_guard = agent.read().await;
-        log_pulse_event(&agent_guard, event).await;
+        log_pulse_event(&storage, event).await;
         tracing::debug!("ArkPulse: non-critical signals recorded, no user notification sent");
         return;
     }
@@ -4412,9 +5144,44 @@ pub async fn run_pulse(agent: &SharedAgent) {
     } else {
         false
     };
-    let agent_guard = agent.read().await;
+    details.scan_finished_at = chrono::Utc::now().to_rfc3339();
+    details.scan_duration_ms = pulse_started.elapsed().as_millis() as u64;
+    details.notification_outcome = if should_emit_alert {
+        "in_app_and_preferred_channel".to_string()
+    } else if should_notify_user {
+        "suppressed_duplicate".to_string()
+    } else if growth_notification.is_some() {
+        "in_app_growth_warning".to_string()
+    } else {
+        "logged_only".to_string()
+    };
+    details.scan_log.push(PulseScanSection {
+        id: "notification_outcome".to_string(),
+        title: "Notification outcome".to_string(),
+        status: if should_emit_alert {
+            "error".to_string()
+        } else {
+            "warning".to_string()
+        },
+        summary: if should_emit_alert {
+            "ArkPulse emitted a critical alert for this run.".to_string()
+        } else if should_notify_user {
+            "ArkPulse suppressed a duplicate alert inside the cooldown window.".to_string()
+        } else if growth_notification.is_some() {
+            "ArkPulse emitted a growth warning without escalating a critical alert.".to_string()
+        } else {
+            "ArkPulse recorded the issue in history without pushing a user-facing alert."
+                .to_string()
+        },
+        detail: format!("Preferred channel target: {}", brief_channel),
+        duration_ms: 0,
+        metrics: vec![pulse_metric(
+            "Outcome",
+            details.notification_outcome.clone(),
+        )],
+    });
     if should_emit_alert {
-        agent_guard
+        notification_store
             .emit_notification("ArkPulse Critical", &alert_text, "error", "arkpulse")
             .await;
     } else if should_notify_user {
@@ -4429,7 +5196,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
     }
     if let Some((signature, body)) = growth_notification {
         if should_emit_arkpulse_growth_notification(&storage, &signature).await {
-            agent_guard
+            notification_store
                 .emit_notification(
                     "Knowledge growth warning",
                     &body,
@@ -4458,9 +5225,9 @@ pub async fn run_pulse(agent: &SharedAgent) {
         failed_tasks: failed_tasks.len(),
         details: details.clone(),
     };
-    log_pulse_event(&agent_guard, event).await;
+    log_pulse_event(&storage, event).await;
     if should_emit_alert {
-        agent_guard.notify_preferred_channel(&alert_text).await;
+        notify_preferred_channel_bounded(agent, &alert_text, "arkpulse").await;
         tracing::info!(
             "ArkPulse: critical alert sent to preferred channel ({})",
             brief_channel
@@ -4491,14 +5258,14 @@ pub async fn run_pulse(agent: &SharedAgent) {
 const SECURITY_CLEANUP_KEY: &str = "security_log_last_cleanup";
 
 async fn run_security_log_cleanup(agent: &SharedAgent) {
-    let (storage, lifecycle, last_cleanup_bytes, last_activity) = {
+    let (storage, last_activity) = {
         let agent_guard = agent.read().await;
         let storage = agent_guard.storage.clone();
-        let lifecycle = load_data_lifecycle_settings(&storage).await;
-        let lc = storage.get(SECURITY_CLEANUP_KEY).await.unwrap_or(None);
         let la = agent_guard.last_activity_at();
-        (storage, lifecycle, lc, la)
+        (storage, la)
     };
+    let lifecycle = load_data_lifecycle_settings(&storage).await;
+    let last_cleanup_bytes = storage.get(SECURITY_CLEANUP_KEY).await.unwrap_or(None);
 
     if !lifecycle.cleanup_enabled
         || !lifecycle.logs_cleanup_enabled
@@ -4567,11 +5334,15 @@ async fn run_unused_app_check(agent: &SharedAgent) {
         return;
     }
 
-    let agent_guard = agent.read().await;
-    let unused_apps = agent_guard
-        .app_registry
-        .get_unused_apps(UNUSED_APP_IDLE_HOURS)
-        .await;
+    let (app_registry, storage, notification_store) = {
+        let agent_guard = agent.read().await;
+        (
+            agent_guard.app_registry.clone(),
+            agent_guard.storage.clone(),
+            agent_guard.notification_store(),
+        )
+    };
+    let unused_apps = app_registry.get_unused_apps(UNUSED_APP_IDLE_HOURS).await;
 
     if unused_apps.is_empty() {
         return;
@@ -4582,8 +5353,7 @@ async fn run_unused_app_check(agent: &SharedAgent) {
     for (app_id, title, last_accessed) in &unused_apps {
         // Check cooldown — don't spam the same app notification every hour
         let notify_key = format!("{}{}", UNUSED_APP_NOTIFY_PREFIX, app_id);
-        let last_notified = agent_guard
-            .storage
+        let last_notified = storage
             .get(&notify_key)
             .await
             .ok()
@@ -4611,18 +5381,15 @@ async fn run_unused_app_check(agent: &SharedAgent) {
         );
 
         // In-app notification
-        agent_guard
+        notification_store
             .emit_notification("Unused App", &message, "info", "app_cleanup")
             .await;
 
         // Push to preferred channel
-        agent_guard.notify_preferred_channel(&message).await;
+        notify_preferred_channel_bounded(agent, &message, "unused_app_check").await;
 
         // Record notification time
-        let _ = agent_guard
-            .storage
-            .set(&notify_key, now.to_rfc3339().as_bytes())
-            .await;
+        let _ = storage.set(&notify_key, now.to_rfc3339().as_bytes()).await;
 
         tracing::info!(
             "Sent unused app notification for '{}' (idle {})",
@@ -4699,17 +5466,17 @@ fn available_disk_bytes(path: &Path) -> Option<u64> {
 }
 
 async fn run_episode_retention_cleanup(agent: &SharedAgent) {
-    let (storage, mem_cfg, lifecycle, last_activity, data_dir) = {
+    let (storage, mem_cfg, last_activity, data_dir) = {
         let agent_guard = agent.read().await;
         let storage = agent_guard.storage.clone();
         (
             storage.clone(),
             agent_guard.config.memory.clone(),
-            load_data_lifecycle_settings(&storage).await,
             agent_guard.last_activity_at(),
             agent_guard.data_dir().to_path_buf(),
         )
     };
+    let lifecycle = load_data_lifecycle_settings(&storage).await;
     let now = chrono::Utc::now();
     let free_bytes = available_disk_bytes(&data_dir);
     let emergency_mode = free_bytes

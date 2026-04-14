@@ -3057,9 +3057,7 @@ Requirements:\n\
                                 Err(e) => {
                                     last_error = format!(
                                         "HTTP probe passed on attempt {} (status {}), but browser validation failed: {}",
-                                        attempt,
-                                        status,
-                                        e
+                                        attempt, status, e
                                     );
                                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                                     continue;
@@ -3663,7 +3661,8 @@ Requirements:\n\
             }
         }
 
-        let enabled_ids: HashSet<String> = self.integrations.enabled_ids().into_iter().collect();
+        let enabled_ids: HashSet<String> =
+            self.integrations.ready_ids().await.into_iter().collect();
         for integration_id in &enabled_ids {
             aliases
                 .entry(integration_id.clone())
@@ -3972,7 +3971,13 @@ Requirements:\n\
             sandbox_mode: None,
             source: crate::actions::ActionSource::System,
             file_path: None,
-            authorization: Default::default(),
+            authorization: crate::actions::ActionAuthorization {
+                access: crate::actions::ActionAccessMetadata {
+                    integration_ids: vec![integration_id.to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
         }
     }
 
@@ -3981,6 +3986,10 @@ Requirements:\n\
         actions: &mut Vec<crate::actions::ActionDef>,
     ) {
         let mut existing: HashSet<String> = actions.iter().map(|a| a.name.clone()).collect();
+        let mut covered_integration_ids: HashSet<String> = actions
+            .iter()
+            .flat_map(|action| action.authorization.access.integration_ids.clone())
+            .collect();
         let integration_aliases = self.load_tool_integration_aliases().await;
         let enabled_ids: HashSet<String> = integration_aliases.values().cloned().collect();
 
@@ -3988,12 +3997,16 @@ Requirements:\n\
             let Some(integration) = self.integrations.get(integration_id) else {
                 continue;
             };
+            if covered_integration_ids.contains(integration_id) {
+                continue;
+            }
             if existing.insert(integration_id.to_string()) {
                 actions.push(self.build_integration_action_def(
                     integration_id,
                     integration_id,
                     integration,
                 ));
+                covered_integration_ids.insert(integration_id.to_string());
             }
         }
 
@@ -7539,10 +7552,10 @@ Requirements:\n\
                             - Router invalid JSON rate changed from {:.1}% to {:.1}%\n\
                             - The improved prompt bundle has been {}\n\n\
                             {} is now testing a better routing, primary response, and delegated synthesis prompt set.",
-                              result.evaluated_candidates,
-                              result.baseline_score * 100.0,
-                              result.best_candidate_score * 100.0,
-                              result.wins,
+                            result.evaluated_candidates,
+                            result.baseline_score * 100.0,
+                            result.best_candidate_score * 100.0,
+                            result.wins,
                             result.losses,
                             result.baseline_router_invalid_json_rate * 100.0,
                             result.candidate_router_invalid_json_rate * 100.0,
@@ -9516,6 +9529,8 @@ Requirements:\n\
                     let agent_config = self.config.clone();
                     let storage_clone = self.storage.clone();
                     let encrypted_storage_clone = self.encrypted_storage.clone();
+                    let local_ui_base = Self::user_facing_local_base_url();
+                    let public_ui_base = self.load_public_base_url().await;
                     let notify_conversation_id = call
                         .arguments
                         .get("conversation_id")
@@ -9523,35 +9538,86 @@ Requirements:\n\
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .map(str::to_string);
-                    let notify_conversation_id_for_session = notify_conversation_id.clone();
-                    let notify_fn: std::sync::Arc<dyn Fn(String, Option<Vec<u8>>) + Send + Sync> =
-                        std::sync::Arc::new(move |msg: String, screenshot: Option<Vec<u8>>| {
-                            let config = agent_config.clone();
-                            let channel = notify_channel.clone();
-                            let chat_id = chat_id.clone();
-                            let storage = storage_clone.clone();
-                            let encrypted_storage = encrypted_storage_clone.clone();
-                            let conversation_id = notify_conversation_id.clone();
-                            let _screenshot = screenshot; // screenshots sent via channel-specific methods
-                            tokio::spawn(async move {
-                                // Store as notification in DB so it appears in web UI
+                    let notify_fn: std::sync::Arc<
+                        dyn Fn(crate::core::browser_session::BrowserSessionNotification)
+                            + Send
+                            + Sync,
+                    > = std::sync::Arc::new(move |notification| {
+                        let config = agent_config.clone();
+                        let channel = notify_channel.clone();
+                        let chat_id = chat_id.clone();
+                        let storage = storage_clone.clone();
+                        let encrypted_storage = encrypted_storage_clone.clone();
+                        let conversation_id = notify_conversation_id.clone();
+                        let local_ui_base = local_ui_base.clone();
+                        let public_ui_base = public_ui_base.clone();
+                        let session_id = notification.session_id.clone();
+                        let msg = notification.message.clone();
+                        let _screenshot = notification.screenshot.clone(); // screenshots sent via channel-specific methods
+                        tokio::spawn(async move {
+                            let handoff_relative = format!("/ui/browser-handoff/{}", session_id);
+                            let absolutize = |base: &str| -> String {
+                                if handoff_relative.starts_with('/') {
+                                    format!("{}{}", base.trim_end_matches('/'), handoff_relative)
+                                } else {
+                                    format!("{}/{}", base.trim_end_matches('/'), handoff_relative)
+                                }
+                            };
+                            let local_handoff_url = absolutize(&local_ui_base);
+                            let public_handoff_url =
+                                public_ui_base.as_ref().map(|base| absolutize(base));
+                            let delivery_message = match notification.kind {
+                                    crate::core::browser_session::BrowserSessionNotificationKind::NeedsInput => {
+                                        if let Some(public_url) = public_handoff_url.as_ref() {
+                                            if public_url != &local_handoff_url {
+                                                format!(
+                                                    "{}\nOpen live handoff: {}\nLocal fallback: {}",
+                                                    msg, public_url, local_handoff_url
+                                                )
+                                            } else {
+                                                format!("{}\nOpen live handoff: {}", msg, public_url)
+                                            }
+                                        } else {
+                                            format!(
+                                                "{}\nOpen live handoff: {}",
+                                                msg, local_handoff_url
+                                            )
+                                        }
+                                    }
+                                    _ => msg.clone(),
+                                };
+                            if matches!(
+                                notification.kind,
+                                crate::core::browser_session::BrowserSessionNotificationKind::Failed
+                            ) {
                                 let notif = crate::storage::entities::notification::Model {
                                     id: uuid::Uuid::new_v4().to_string(),
                                     title: "Browser Automation".to_string(),
-                                    body: msg.clone(),
-                                    level: "info".to_string(),
+                                    body: delivery_message.clone(),
+                                    level: "warning".to_string(),
                                     source: "browser".to_string(),
                                     read: false,
                                     created_at: chrono::Utc::now().to_rfc3339(),
                                 };
                                 let _ = storage.insert_notification(&notif).await;
+                            }
 
-                                // Also append to conversation so browser prompts are visible in chat thread.
-                                if let Some(cid) = conversation_id.as_deref() {
-                                    let body = format!(
-                                        "[Browser automation] {}\nReply here in chat to continue.",
-                                        msg
-                                    );
+                            // Also append to conversation so browser prompts are visible in chat thread.
+                            if let Some(cid) = conversation_id.as_deref() {
+                                let body = match notification.kind {
+                                        crate::core::browser_session::BrowserSessionNotificationKind::NeedsInput => Some(
+                                            format!(
+                                                "[Browser automation] {}",
+                                                delivery_message
+                                            ),
+                                        ),
+                                        crate::core::browser_session::BrowserSessionNotificationKind::Completed
+                                        | crate::core::browser_session::BrowserSessionNotificationKind::Failed => {
+                                            Some(format!("[Browser automation] {}", delivery_message))
+                                        }
+                                        crate::core::browser_session::BrowserSessionNotificationKind::Progress => None,
+                                    };
+                                if let Some(body) = body {
                                     let asst_msg = crate::storage::entities::message::Model {
                                         id: uuid::Uuid::new_v4().to_string(),
                                         conversation_id: cid.to_string(),
@@ -9564,10 +9630,16 @@ Requirements:\n\
                                     let _ =
                                         encrypted_storage.insert_message_encrypted(&asst_msg).await;
                                 }
+                            }
 
-                                // Send to Telegram if configured
-                                #[cfg(feature = "telegram")]
-                                if channel == "telegram" {
+                            // Send to Telegram if configured
+                            #[cfg(feature = "telegram")]
+                                if channel == "telegram"
+                                    && !matches!(
+                                        notification.kind,
+                                        crate::core::browser_session::BrowserSessionNotificationKind::Progress
+                                    )
+                                {
                                     if let Some(tg) = &config.telegram {
                                         if !tg.bot_token.is_empty() {
                                             let target = if !chat_id.is_empty() {
@@ -9583,27 +9655,21 @@ Requirements:\n\
                                                 let _ = bot
                                                     .send_message(
                                                         teloxide::types::ChatId(target),
-                                                        &msg,
+                                                        &delivery_message,
                                                     )
                                                     .await;
                                             }
                                         }
                                     }
                                 }
-                                let _ = channel; // suppress unused warning on non-telegram builds
-                            });
+                            let _ = channel; // suppress unused warning on non-telegram builds
                         });
+                    });
 
                     let llm_clone = self.llm.clone();
                     match self
                         .browser_sessions
-                        .start_session(
-                            task_desc,
-                            channel,
-                            notify_conversation_id_for_session.as_deref().unwrap_or(""),
-                            llm_clone,
-                            notify_fn,
-                        )
+                        .start_session(task_desc, channel, llm_clone, notify_fn)
                         .await
                     {
                         Ok(session_id) => {
@@ -10277,12 +10343,16 @@ Requirements:\n\
                                       Why I'm asking: credentials are stored encrypted and handled outside model generation to reduce leak risk.\n\
                                       For non-sensitive config values, redeploy/restart with config.{{KEY}}=value.\n\
                                       Then restart app '{}'.{}",
-                                     title,
-                                     if missing.is_empty() { "none" } else { &missing },
-                                     if missing_config.is_empty() { "".to_string() } else { format!("\nMissing config values: {}", missing_config) },
-                                     reuse_option,
-                                     app_id,
-                                     public_access_note
+                                    title,
+                                    if missing.is_empty() { "none" } else { &missing },
+                                    if missing_config.is_empty() {
+                                        "".to_string()
+                                    } else {
+                                        format!("\nMissing config values: {}", missing_config)
+                                    },
+                                    reuse_option,
+                                    app_id,
+                                    public_access_note
                                 );
                                 if let Some(cid) =
                                     conversation_id.filter(|value| !value.trim().is_empty())
@@ -10517,17 +10587,17 @@ Requirements:\n\
                                                 )
                                             } else if verified {
                                                 format!(
-                                                "App deployed + validated: {} ({}) [{} attempt{}]",
-                                                title,
-                                                app_type,
-                                                verify_attempts,
-                                                if verify_attempts == 1 { "" } else { "s" }
-                                            )
+                                                    "App deployed + validated: {} ({}) [{} attempt{}]",
+                                                    title,
+                                                    app_type,
+                                                    verify_attempts,
+                                                    if verify_attempts == 1 { "" } else { "s" }
+                                                )
                                             } else {
                                                 format!(
-                                                "App deployed, validation incomplete: {} ({}) - {}",
-                                                title, app_type, verify_detail
-                                            )
+                                                    "App deployed, validation incomplete: {} ({}) - {}",
+                                                    title, app_type, verify_detail
+                                                )
                                             },
                                         },
                                     );
@@ -10903,7 +10973,11 @@ Requirements:\n\
                             }
 
                             total_retries += 1;
-                            tracing::info!("Self-heal: code execution failed (attempt {}/{}), asking LLM to fix", total_retries, MAX_TOTAL_RETRIES);
+                            tracing::info!(
+                                "Self-heal: code execution failed (attempt {}/{}), asking LLM to fix",
+                                total_retries,
+                                MAX_TOTAL_RETRIES
+                            );
 
                             // Emit trace step
                             {
@@ -10931,7 +11005,11 @@ Requirements:\n\
                                 Code:\n```{}\n{}\n```\n\n\
                                 Error output:\n```\n{}\n{}\n```\n\n\
                                 Return only the fixed code, nothing else.",
-                                language, language, current_code.trim(), error_text, output_text
+                                language,
+                                language,
+                                current_code.trim(),
+                                error_text,
+                                output_text
                             );
 
                             let empty_actions: Vec<crate::actions::ActionDef> = Vec::new();

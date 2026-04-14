@@ -16,6 +16,7 @@ import CloseIcon from "@mui/icons-material/Close";
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
+import { isBackgroundSessionVisibleInUi } from "../lib/backgroundSessions";
 import { formatUiDateTime, formatUiRelativeDateTimeMeta } from "../lib/dateFormat";
 import { useUiStore } from "../store/uiStore";
 import { AgentStatusBar } from "./AgentStatusBar";
@@ -30,7 +31,7 @@ import type {
   AutonomyActionExecutionResponse,
   BackgroundSessionSummary,
   BriefingResponse,
-  RecommendedSkill,
+  RecommendedAction,
   Task,
   TraceSummary,
   Notification,
@@ -195,11 +196,11 @@ function buildSuggestionTraceConsoleView(step: JsonRecord): { detail: string; da
   return { detail, dataText: "" };
 }
 
-function summarizeSuggestedRun(skill: RecommendedSkill, out: AutonomyActionExecutionResponse): string {
+function summarizeSuggestedRun(action: RecommendedAction, out: AutonomyActionExecutionResponse): string {
   const result = asRecord(out.result);
   const resultStatus = str(result.status, out.status).trim().toLowerCase();
   if (resultStatus === "queued_for_approval") {
-    return `Queued "${skill.title}" for approval.`;
+    return `Queued "${action.title}" for approval.`;
   }
   const message = str(out.message, "").trim();
   if (message) return message;
@@ -211,7 +212,7 @@ function summarizeSuggestedRun(skill: RecommendedSkill, out: AutonomyActionExecu
   if (taskId) {
     return result.reused_existing === true ? `Reused existing task ${taskId}.` : `Created task ${taskId}.`;
   }
-  return `Ran "${skill.title}".`;
+  return `Ran "${action.title}".`;
 }
 
 function isDailyBriefSignal(value: unknown): boolean {
@@ -389,7 +390,7 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
   const automationRuns = useMemo(() => pickAutomationRuns(automationRunsQ.data), [automationRunsQ.data]);
   const automationRunsPreview = automationRuns.slice(0, 6);
   const backgroundSessions = useMemo<BackgroundSessionSummary[]>(
-    () => sessionsQ.data?.sessions || [],
+    () => (sessionsQ.data?.sessions || []).filter((session) => isBackgroundSessionVisibleInUi(session)),
     [sessionsQ.data]
   );
   const activeBackgroundSessions = useMemo(
@@ -472,21 +473,18 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
       return next.endsWith(".") ? next : `${next}.`;
     };
     const briefing = briefingQ.data as BriefingResponse | undefined;
-    const recommendedSkills =
-      briefing?.recommended_skills ||
-      (((briefing as unknown as { recommended_actions?: RecommendedSkill[] })?.recommended_actions ||
-        []) as RecommendedSkill[]);
+    const recommendedActions = briefing?.recommended_actions || briefing?.recommended_skills || [];
     const topOpportunity = briefing?.top_opportunities?.[0];
     const topRisk = briefing?.top_risks?.[0];
 
     if (hasLlmConfigured) {
       pushPrompt(
-        recommendedSkills[0]
+        recommendedActions[0]
           ? scifiLead(
               `Open the next operator lane: ${clean(
-                recommendedSkills[0].summary ||
-                  recommendedSkills[0].description ||
-                  recommendedSkills[0].title,
+                recommendedActions[0].summary ||
+                  recommendedActions[0].description ||
+                  recommendedActions[0].title,
                 92
               )}`
             )
@@ -605,8 +603,8 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
       await queryClient.invalidateQueries({ queryKey: ["trace"] });
     },
   });
-  const executeSkillMutation = useMutation({
-    mutationFn: api.executeRecommendedSkill,
+  const executeActionMutation = useMutation({
+    mutationFn: api.executeRecommendedAction,
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["briefing"] });
       await queryClient.invalidateQueries({ queryKey: ["tasks"] });
@@ -615,12 +613,12 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
   });
   const runBriefingMutation = useMutation({
     mutationFn: () =>
-      api.executeRecommendedSkill({
+      api.executeRecommendedAction({
         id: "daily_brief_now",
         title: "Generate Daily Brief",
-        skill_kind: "daily_brief_now",
+        action_kind: "daily_brief_now",
         payload: {},
-      } as RecommendedSkill),
+      } as RecommendedAction),
     onMutate: () => {
       const triggeredAt = new Date().toISOString();
       setDailyBriefRun({
@@ -684,26 +682,26 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
     }
   }
 
-  async function handleExecuteSuggestedSkill(skill: RecommendedSkill) {
+  async function handleExecuteSuggestedAction(action: RecommendedAction) {
     const startedAt = new Date().toISOString();
     setSuggestionRun({
-      title: skill.title || "Suggested run",
+      title: action.title || "Suggested run",
       status: "running",
-      summary: `Starting "${skill.title || "suggested run"}"...`,
+      summary: `Starting "${action.title || "suggested run"}"...`,
       startedAt,
     });
     setSuggestionRunOpen(true);
     setSuggestionRunMinimized(false);
 
     try {
-      const out = await executeSkillMutation.mutateAsync(skill);
+      const out = await executeActionMutation.mutateAsync(action);
       const traceId = str(out.trace_id, str(asRecord(out.result).trace_id, "")).trim();
-      const summary = summarizeSuggestedRun(skill, out);
+      const summary = summarizeSuggestedRun(action, out);
       const resultStatus = str(asRecord(out.result).status, out.status).trim().toLowerCase();
       const finalStatus: SuggestionRunState["status"] =
         resultStatus === "queued_for_approval" || !traceId ? "completed" : "running";
       setSuggestionRun({
-        title: skill.title || "Suggested run",
+        title: action.title || "Suggested run",
         status: finalStatus,
         summary,
         traceId: traceId || undefined,
@@ -712,7 +710,7 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
       });
     } catch (error) {
       setSuggestionRun({
-        title: skill.title || "Suggested run",
+        title: action.title || "Suggested run",
         status: "error",
         summary: errMessage(error),
         startedAt,
@@ -1055,8 +1053,8 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
           />
           <SmartSuggestions
             briefing={briefingQ.data}
-            onExecuteSkill={handleExecuteSuggestedSkill}
-            executing={executeSkillMutation.isPending}
+            onExecuteAction={handleExecuteSuggestedAction}
+            executing={executeActionMutation.isPending}
           />
         </Box>
       </Box>

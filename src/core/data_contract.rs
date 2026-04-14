@@ -18,7 +18,6 @@ pub(crate) const USER_OWNED_SURFACES: &[&str] = &[
 ];
 
 pub(crate) const SYSTEM_OWNED_SURFACES: &[&str] = &[
-    "/app/skills/**",
     "built-in prompt bundles",
     "frontend/runtime image files",
     "default extension packs",
@@ -37,7 +36,6 @@ mod tests {
         assert!(USER_OWNED_SURFACES.contains(&"encrypted settings:* KV"));
         assert!(USER_OWNED_SURFACES.contains(&"/app/data/skills/**"));
         assert!(USER_OWNED_SURFACES.contains(&"/app/data/cli_skills/**"));
-        assert!(SYSTEM_OWNED_SURFACES.contains(&"/app/skills/**"));
         assert!(RELEASE_UPDATE_RULE.contains("migrations with backups"));
     }
 }

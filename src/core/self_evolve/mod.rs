@@ -12,6 +12,7 @@ pub mod coding_guidelines;
 pub mod policy_evolution;
 pub mod prompt_evolution;
 pub mod security_review;
+pub mod skill_evolution;
 pub mod specialist_prompt_evolution;
 pub mod strategy_runtime;
 pub mod tools;

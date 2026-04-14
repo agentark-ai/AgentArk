@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::RngCore;
+use serde::Serialize;
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -12,7 +13,7 @@ pub(crate) enum InternalServiceKind {
 }
 
 impl InternalServiceKind {
-    fn env_var(self) -> &'static str {
+    pub(crate) fn env_var(self) -> &'static str {
         match self {
             Self::Executor => "AGENTARK_EXECUTOR_TOKEN",
             Self::Workspace => "AGENTARK_WORKSPACE_TOKEN",
@@ -33,12 +34,30 @@ impl InternalServiceKind {
         }
     }
 
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Executor => "executor",
             Self::Workspace => "workspace",
         }
     }
+
+    fn id(self) -> &'static str {
+        self.label()
+    }
+
+    fn token_path(self, config_dir: &Path) -> PathBuf {
+        config_dir.join(self.token_file_name())
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct InternalServiceTokenStatus {
+    pub id: String,
+    pub label: String,
+    pub env_var: String,
+    pub managed_by_env: bool,
+    pub configured: bool,
+    pub updated_at: Option<String>,
 }
 
 pub(crate) fn load_or_create_internal_service_token(
@@ -200,6 +219,85 @@ fn normalize_token(raw: &str) -> Option<String> {
     }
 }
 
+pub(crate) fn read_persisted_internal_service_token(
+    config_dir: &Path,
+    service: InternalServiceKind,
+) -> Result<Option<String>> {
+    read_token_file(&service.token_path(config_dir))
+}
+
+pub(crate) fn restore_internal_service_token(
+    config_dir: &Path,
+    service: InternalServiceKind,
+    previous: Option<&str>,
+) -> Result<()> {
+    let token_path = service.token_path(config_dir);
+    match previous {
+        Some(token) => persist_token_if_needed(config_dir, service, token),
+        None => {
+            if token_path.exists() {
+                std::fs::remove_file(&token_path).with_context(|| {
+                    format!(
+                        "Failed to remove {} internal auth token file {} during rollback",
+                        service.label(),
+                        token_path.display()
+                    )
+                })?;
+            }
+            Ok(())
+        }
+    }
+}
+
+pub(crate) fn rotate_internal_service_token(
+    config_dir: &Path,
+    service: InternalServiceKind,
+) -> Result<String> {
+    if read_env_token(service).is_some() {
+        anyhow::bail!(
+            "{} internal credential is managed by {}. Rotate it in the deployment environment instead.",
+            service.label(),
+            service.env_var()
+        );
+    }
+    let token = generate_internal_service_token(service);
+    persist_token_if_needed(config_dir, service, &token)?;
+    Ok(token)
+}
+
+pub(crate) fn describe_internal_service_tokens(
+    config_dir: &Path,
+) -> Result<Vec<InternalServiceTokenStatus>> {
+    [
+        InternalServiceKind::Executor,
+        InternalServiceKind::Workspace,
+    ]
+    .into_iter()
+    .map(|service| describe_internal_service_token(config_dir, service))
+    .collect()
+}
+
+fn describe_internal_service_token(
+    config_dir: &Path,
+    service: InternalServiceKind,
+) -> Result<InternalServiceTokenStatus> {
+    let token_path = service.token_path(config_dir);
+    let managed_by_env = read_env_token(service).is_some();
+    let configured = managed_by_env || read_token_file(&token_path)?.is_some();
+    let updated_at = std::fs::metadata(&token_path)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339());
+    Ok(InternalServiceTokenStatus {
+        id: service.id().to_string(),
+        label: service.label().to_string(),
+        env_var: service.env_var().to_string(),
+        managed_by_env,
+        configured,
+        updated_at,
+    })
+}
+
 fn generate_internal_service_token(service: InternalServiceKind) -> String {
     let mut bytes = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
@@ -212,7 +310,10 @@ fn generate_internal_service_token(service: InternalServiceKind) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_or_create_internal_service_token, InternalServiceKind};
+    use super::{
+        load_or_create_internal_service_token, read_persisted_internal_service_token,
+        rotate_internal_service_token, InternalServiceKind,
+    };
 
     #[test]
     fn creates_and_reuses_executor_token_file() {
@@ -225,5 +326,22 @@ mod tests {
                 .expect("second token");
         assert_eq!(first, second);
         assert!(first.starts_with("ak_int_exec_"));
+    }
+
+    #[test]
+    fn rotates_workspace_token_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first =
+            load_or_create_internal_service_token(dir.path(), InternalServiceKind::Workspace)
+                .expect("first token");
+        let rotated = rotate_internal_service_token(dir.path(), InternalServiceKind::Workspace)
+            .expect("rotated token");
+        let persisted =
+            read_persisted_internal_service_token(dir.path(), InternalServiceKind::Workspace)
+                .expect("persisted token")
+                .expect("token file present");
+        assert_ne!(first, rotated);
+        assert_eq!(rotated, persisted);
+        assert!(rotated.starts_with("ak_int_ws_"));
     }
 }

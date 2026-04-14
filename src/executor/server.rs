@@ -228,7 +228,9 @@ fn authorize_internal(headers: &HeaderMap, token: Option<&str>) -> Result<(), St
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::trim);
-    if provided == Some(expected) {
+    if provided.is_some_and(|value| {
+        crate::security::constant_time_eq(value.as_bytes(), expected.as_bytes())
+    }) {
         Ok(())
     } else {
         Err(StatusCode::UNAUTHORIZED)

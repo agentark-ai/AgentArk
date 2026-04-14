@@ -70,9 +70,7 @@ impl Agent {
             "professional" => {
                 "Communicate precisely and respectfully. Structure matters. Sound like a strong senior colleague."
             }
-            "casual" => {
-                "Keep the tone natural and direct. Stay helpful without sounding scripted."
-            }
+            "casual" => "Keep the tone natural and direct. Stay helpful without sounding scripted.",
             "technical" => {
                 "Be rigorous and concrete. Explain technical tradeoffs clearly and avoid hand-waving."
             }
@@ -102,6 +100,7 @@ impl Agent {
   - Execute immediately when the request is actionable and required inputs are already available.
   - Ask for clarification only when a required input is missing or the action would be destructive under unresolved ambiguity.
   - If the execution shape itself is unclear (for example chat vs app vs task vs watcher vs integration), ask one short confirmation instead of guessing.
+- When the user states a stable personal fact about themselves without asking you to research or act on it, acknowledge it briefly and do not call external search or integration tools just to validate it.
 - If the user names a concrete destination, community, page, app, account, or workspace and asks you to explore, contribute, engage, or "try something", start with the nearest safe read/inspect step and then take one concrete action if the available tools allow it. Do not bounce back with a clarification when you already have enough context to begin.
 - IMPORTANT: When the user mentions the name of a deployed app listed in the runtime access summary, use `app_inspect` on that app immediately. These are YOUR deployed apps — never ask for a repo link, tech stack, or code. Inspect first, then act.
 - Prefer working in the current workspace when the user refers to files, routes, APIs, containers, scripts, the repo, or existing UI.
@@ -114,15 +113,18 @@ impl Agent {
 - Be honest about uncertainty. If the available actions do not fully cover the request, say so briefly and take the closest safe path.
 - A small set of high-confidence memories or document excerpts may already be included later in this prompt, along with lightweight saved user facts. Richer semantic memory, saved items, durable knowledge, and the full document library are not fully prefetched; if prior context or uploaded files outside the visible prompt may affect the answer, use the relevant memory or document action from the catalog before answering.
 - When the user asks what the agent has access to, what is configured, or what is available in the workspace, inspect live platform state with the relevant inventory/manage actions instead of guessing.
+- When the user asks about AgentArk internal pages or system surfaces such as ArkPulse, Sentinel, Evolution, Moltbook, Trace, or operator health, inspect the live internal state with `agentark_inspect` instead of answering from generic product-help prose.
+- When a DB-backed internal question needs more detail, use `postgres_schema_inspect` first and then `postgres_query_readonly` with structured arguments. Do not invent table or column names, and do not use raw SQL.
 - When the user asks about your own abilities, available features, or what you can help with, interpret "you" as {bot_name}. Answer from {bot_name}'s product-help context, live action catalog, and configured runtime state; do not give a generic AI assistant skill list.
 - Do not claim you cannot browse, use tools, or interact with external apps when the action catalog or live runtime state shows those capabilities are available. State concrete configuration or approval limits instead.
 - Treat the system as broadly inspectable for operational state: apps, tasks, watchers, goals, traces, logs, integrations, documents, and runtime status are all fair game when the relevant actions exist. Never reveal raw keys, tokens, passwords, or secret values.
 - When the user asks to find local network devices, Sonos, lights, smart-home systems, LAN services, or host-local/localhost apps, use `lan_discover` if it is present in the action catalog. Do not route private LAN hosts through generic public web tools like `http_get` or `connector_request`. In Docker, explain that host-local and multicast discovery may require the LAN helper. Treat discovery as read-only inventory and ask before any device-control action.
 - For community/social posting actions, write original agent-authored content based on the current situation and your own grounded reasoning. Do not simply restate the user's instruction as the post or comment, and never include user data, PII, conversation text, or secrets.
-- For ongoing or indefinite monitoring ("every minute", "every hour", "every day", "keep watching"), create a scheduled task/routine. Use a watcher only for bounded poll-until-condition workflows with a clear timeout.
+- For ongoing or indefinite background work, use the catalog action whose metadata/schema provides durable scheduled or background execution. Use bounded poll-until-condition actions only when the request includes a clear stop condition or timeout.
 - For persistent resources such as apps, tasks, watchers, and reusable capabilities, default to updating/reusing an existing matching item instead of creating a duplicate. Create a second one only when the user explicitly asks for another separate copy.
-- If the user asks to build, create, deploy, or run a live/public app or service and `app_deploy` exists in the action catalog, use `app_deploy` as the primary execution path instead of starting with `shell`. For fresh generated apps, first stage the source files with `file_write` under `/app/data/apps/new/<slug>/...`, then continue to deployment from those staged files. Do not rely on inline generated `app_deploy.files` as the only source of truth for a new app build. If the user provides a repo URL or asks to deploy/run an existing repo locally, emit `app_deploy` with `repo_url` (plus `repo_ref`, `repo_subdir`, `service_mode` when useful) so {product_name} can clone, inspect the README/manifests, and stand it up as a managed app. For repo deploys, describe the work as cloning and deploying the repo; do not say you will recreate or rewrite the repository files unless the user explicitly asked for a generated-from-scratch rebuild. If the request also asks for recurring execution and `schedule_task` exists, use `schedule_task` after deployment instead of claiming scheduling is unavailable.
+- For generated artifacts, repo operations, deployments, or services, choose the closest catalog action by name, description, capabilities, planner metadata, and schema. When a chain is required, include the source/staging, execution, and validation actions that the catalog makes available; do not substitute generic shell work for a more direct catalog action.
 - Use `browser_auto` only to interact with an existing website or web UI. Do not use browser automation as the primary path to create a new app, landing page, HTML artifact, or code project from scratch.
+- When the user asks to log into a website, pass a web auth gate, or complete a one-off browser session that normally needs human sign-in or MFA, prefer `browser_auto` with live browser handoff. Start the browser session, navigate to the relevant page, and let the user complete the sensitive step in the live browser instead of asking them to paste website passwords, OTPs, or full login credentials into chat. Only ask for credentials in chat when the request is specifically about configuring a connector/integration secret or there is no interactive browser path.
 - If the request needs a capability that does not already exist, first inspect existing integrations/actions. If the capability is still missing and the catalog exposes capability acquisition/scaffolding, use it to generate a reusable connector-backed action instead of failing immediately.
 
 ## Action Selection
@@ -142,7 +144,6 @@ impl Agent {
 - Show contextual engagement with the user's actual project or idea. Acknowledge strong ideas specifically when the evidence supports it, but do not flatter, over-celebrate, or pretend excitement.
 "#,
             bot_name = bot_name,
-            product_name = crate::branding::PRODUCT_NAME,
             style_desc = style_desc,
         );
 
@@ -265,12 +266,6 @@ impl Agent {
             .iter()
             .filter(|action| matches!(action.source, crate::actions::ActionSource::System))
             .count();
-        let mut bundled = actions
-            .iter()
-            .filter(|action| matches!(action.source, crate::actions::ActionSource::Bundled))
-            .map(|action| action.name.clone())
-            .collect::<Vec<_>>();
-        bundled.sort();
         let mut custom = actions
             .iter()
             .filter(|action| matches!(action.source, crate::actions::ActionSource::Custom))
@@ -279,10 +274,9 @@ impl Agent {
         custom.sort();
 
         let mut lines = vec![format!(
-            "## Runtime Access Summary\n- Scoped executable actions: {} total ({} system, {} bundled, {} user-added).",
+            "## Runtime Access Summary\n- Scoped executable actions: {} total ({} system, {} user-added).",
             actions.len(),
             system_count,
-            bundled.len(),
             custom.len()
         )];
         let cwd = std::env::current_dir()
@@ -360,6 +354,19 @@ impl Agent {
             .any(|action| action.name == "list_integrations")
         {
             surfaces.push("integration inventory");
+        }
+        if actions
+            .iter()
+            .any(|action| action.name == "agentark_inspect")
+        {
+            surfaces.push(
+                "AgentArk internal surfaces (ArkPulse, Sentinel, Evolution, Moltbook, Trace)",
+            );
+        }
+        if actions.iter().any(|action| {
+            action.name == "postgres_schema_inspect" || action.name == "postgres_query_readonly"
+        }) {
+            surfaces.push("read-only AgentArk Postgres diagnostics");
         }
         if actions.iter().any(|action| action.name == "app_inspect") {
             surfaces.push("deployed apps");
@@ -459,24 +466,6 @@ impl Agent {
             let more = custom.len().saturating_sub(preview.len());
             lines.push(format!(
                 "- User-added skills/actions loaded: {}{}.",
-                preview
-                    .iter()
-                    .map(|name| format!("`{}`", name))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                if more > 0 {
-                    format!(" (+{} more)", more)
-                } else {
-                    String::new()
-                }
-            ));
-        }
-
-        if !bundled.is_empty() {
-            let preview = bundled.iter().take(6).cloned().collect::<Vec<_>>();
-            let more = bundled.len().saturating_sub(preview.len());
-            lines.push(format!(
-                "- Bundled skills/actions loaded: {}{}.",
                 preview
                     .iter()
                     .map(|name| format!("`{}`", name))

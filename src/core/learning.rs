@@ -1,7 +1,11 @@
+use std::collections::HashSet;
+use std::path::Path;
+
 use anyhow::Result;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::core::self_evolve::skill_evolution::{self, SkillMetricsSnapshot, SkillWindowDirection};
 use crate::core::{ExecutionRun, ExecutionRunStatus, ToolAttempt};
 use crate::storage::{
     experience_edge, experience_item, experience_run, learning_candidate, procedural_pattern,
@@ -58,36 +62,18 @@ fn normalize_token(token: &str) -> Option<String> {
     let trimmed = token
         .trim_matches(|ch: char| !ch.is_ascii_alphanumeric())
         .to_ascii_lowercase();
-    if trimmed.len() < 3 {
-        return None;
-    }
-    if matches!(
-        trimmed.as_str(),
-        "that"
-            | "this"
-            | "with"
-            | "from"
-            | "have"
-            | "need"
-            | "please"
-            | "your"
-            | "about"
-            | "after"
-            | "before"
-            | "there"
-            | "their"
-            | "would"
-            | "should"
-    ) {
+    if trimmed.len() < 3 || trimmed.chars().all(|ch| ch.is_ascii_digit()) {
         return None;
     }
     Some(trimmed)
 }
 
 fn derive_intent_key(message: &str, task_type: &str) -> String {
+    let mut seen = std::collections::HashSet::new();
     let mut tokens = message
         .split_whitespace()
         .filter_map(normalize_token)
+        .filter(|token| seen.insert(token.clone()))
         .take(6)
         .collect::<Vec<_>>();
     if tokens.is_empty() {
@@ -135,6 +121,124 @@ fn tool_names_from_value(value: &Value) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+fn compact_json_value(value: &Value, depth: usize) -> Value {
+    if depth == 0 {
+        return Value::String("[truncated]".to_string());
+    }
+
+    match value {
+        Value::String(text) => Value::String(safe_truncate(text, 240)),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .take(8)
+                .map(|item| compact_json_value(item, depth.saturating_sub(1)))
+                .collect(),
+        ),
+        Value::Object(map) => {
+            let mut compact = serde_json::Map::new();
+            for (key, item) in map.iter().take(16) {
+                compact.insert(
+                    safe_truncate(key, 64),
+                    compact_json_value(item, depth.saturating_sub(1)),
+                );
+            }
+            Value::Object(compact)
+        }
+        other => other.clone(),
+    }
+}
+
+fn parse_operational_json(raw: Option<&str>) -> Option<Value> {
+    raw.and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .map(|value| compact_json_value(&value, 4))
+}
+
+fn summarize_operational_event(row: &crate::storage::entities::operational_log::Model) -> Value {
+    let mut summary = serde_json::Map::new();
+    summary.insert(
+        "created_at".to_string(),
+        Value::String(row.created_at.clone()),
+    );
+    summary.insert("success".to_string(), Value::Bool(row.success));
+    summary.insert("outcome".to_string(), Value::String(row.outcome.clone()));
+    if let Some(latency_ms) = row.latency_ms {
+        summary.insert("latency_ms".to_string(), json!(latency_ms));
+    }
+    if let Some(tool_name) = row
+        .tool_name
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        summary.insert("tool_name".to_string(), Value::String(tool_name.clone()));
+    }
+    if let Some(payload) = parse_operational_json(row.payload.as_deref()) {
+        summary.insert("payload".to_string(), payload);
+    }
+    if let Some(arguments) = parse_operational_json(row.arguments.as_deref()) {
+        summary.insert("arguments".to_string(), arguments);
+    }
+    Value::Object(summary)
+}
+
+fn build_decision_episode(
+    logs: &[crate::storage::entities::operational_log::Model],
+) -> Option<Value> {
+    if logs.is_empty() {
+        return None;
+    }
+
+    let mut decision = serde_json::Map::new();
+    let mut tool_calls = Vec::new();
+    for row in logs {
+        match row.event_type.as_str() {
+            "request_shape_assessment" if !decision.contains_key("request_shape") => {
+                decision.insert(
+                    "request_shape".to_string(),
+                    summarize_operational_event(row),
+                );
+            }
+            "action_selection" if !decision.contains_key("action_selection") => {
+                decision.insert(
+                    "action_selection".to_string(),
+                    summarize_operational_event(row),
+                );
+            }
+            "routing_decision" if !decision.contains_key("routing") => {
+                decision.insert("routing".to_string(), summarize_operational_event(row));
+            }
+            "tool_plan_validation" if !decision.contains_key("tool_plan_validation") => {
+                decision.insert(
+                    "tool_plan_validation".to_string(),
+                    summarize_operational_event(row),
+                );
+            }
+            "llm_decision" if !decision.contains_key("llm_decision") => {
+                decision.insert("llm_decision".to_string(), summarize_operational_event(row));
+            }
+            "tool_batch_summary" if !decision.contains_key("tool_batch") => {
+                decision.insert("tool_batch".to_string(), summarize_operational_event(row));
+            }
+            "tool_call" if tool_calls.len() < 6 => {
+                tool_calls.push(summarize_operational_event(row));
+            }
+            "response_complete" | "request_failed" if !decision.contains_key("outcome") => {
+                decision.insert("outcome".to_string(), summarize_operational_event(row));
+            }
+            _ => {}
+        }
+    }
+    if !tool_calls.is_empty() {
+        tool_calls.reverse();
+        decision.insert("tool_calls".to_string(), Value::Array(tool_calls));
+    }
+    if decision.is_empty() {
+        None
+    } else {
+        Some(Value::Object(decision))
+    }
 }
 
 fn suggested_steps_from_tools(tool_names: &[String]) -> Vec<String> {
@@ -291,6 +395,144 @@ fn workflow_candidate_markdown(
     )
 }
 
+fn build_skill_patch_candidate_content(
+    action: &str,
+    skill_name: &str,
+    target_source: &str,
+    before_content: &str,
+    after_content: &str,
+    diff_summary: &str,
+    evidence: Value,
+    impact_baseline: SkillMetricsSnapshot,
+    history_versions_read: usize,
+) -> Value {
+    let canonical_skill_name = skill_evolution::canonicalize_skill_name(skill_name);
+    json!({
+        "action": action,
+        "skill_name": canonical_skill_name,
+        "target_source": target_source,
+        "before_content": before_content,
+        "after_content": after_content,
+        "content": after_content,
+        "diff_summary": diff_summary,
+        "diff_preview": skill_evolution::build_skill_diff_preview(before_content, after_content),
+        "evidence": evidence,
+        "impact_baseline": impact_baseline,
+        "impact_status": "pending",
+        "history_versions_read": history_versions_read,
+    })
+}
+
+fn run_request_preview(run: &experience_run::Model) -> String {
+    run.request_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| safe_truncate(value, 120))
+        .or_else(|| {
+            run.failure_reason
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| safe_truncate(value, 120))
+        })
+        .unwrap_or_else(|| run.intent_key.clone())
+}
+
+fn run_failure_summary(run: &experience_run::Model) -> Option<String> {
+    run.failure_reason
+        .as_deref()
+        .or(run.outcome_summary.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| safe_truncate(value, 140))
+}
+
+fn run_failure_label(run: &experience_run::Model) -> String {
+    run.task_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| run_request_preview(run))
+}
+
+fn candidate_exclusion_labels(runs: &[&experience_run::Model]) -> Vec<String> {
+    let mut labels = runs
+        .iter()
+        .map(|run| run_failure_label(run))
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    labels.sort();
+    labels.dedup();
+    labels.truncate(4);
+    labels
+}
+
+fn candidate_failure_checks_section(
+    executed_failures: &[&experience_run::Model],
+    selected_only_failures: &[&experience_run::Model],
+) -> Option<String> {
+    let mut bullets = Vec::new();
+
+    let mut tool_names = executed_failures
+        .iter()
+        .flat_map(|run| {
+            run.tool_sequence_json
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|item| item.get("tool_name").and_then(|value| value.as_str()))
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    tool_names.sort();
+    tool_names.dedup();
+    if !tool_names.is_empty() {
+        bullets.push(format!(
+            "- Recheck the workflow before committing when it depends on {}.",
+            tool_names
+                .iter()
+                .take(4)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    let mut failure_notes = executed_failures
+        .iter()
+        .filter_map(|run| run_failure_summary(run))
+        .collect::<Vec<_>>();
+    failure_notes.sort();
+    failure_notes.dedup();
+    if !failure_notes.is_empty() {
+        bullets.push(format!(
+            "- Stop and reassess when you see the same failure mode: {}.",
+            failure_notes
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ));
+    }
+
+    let mismatch_labels = candidate_exclusion_labels(selected_only_failures);
+    if !mismatch_labels.is_empty() {
+        bullets.push(format!(
+            "- Treat {} as out-of-scope unless the request explicitly matches the trigger.",
+            mismatch_labels.join(", ")
+        ));
+    }
+
+    if bullets.is_empty() {
+        return None;
+    }
+    Some(bullets.join("\n"))
+}
+
 pub async fn load_learning_enabled(storage: &Storage) -> bool {
     storage
         .get(LEARNING_ENABLED_KEY)
@@ -425,6 +667,19 @@ pub async fn record_execution_experience(
         "tool_count": tool_attempts.len(),
         "degraded": matches!(execution_run.status, ExecutionRunStatus::Degraded),
     });
+    let decision_episode = if let Some(trace_id) = execution_run
+        .trace_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let logs = storage
+            .list_operational_logs_for_trace_ids(&[trace_id.to_string()], 64)
+            .await
+            .unwrap_or_default();
+        build_decision_episode(&logs)
+    } else {
+        None
+    };
     if let Some(obj) = metadata.as_object_mut() {
         if let Some(version) = classifier_prompt_version.filter(|value| !value.trim().is_empty()) {
             obj.insert(
@@ -437,6 +692,9 @@ pub async fn record_execution_experience(
                 "specialist_prompt_version".to_string(),
                 Value::String(version.to_string()),
             );
+        }
+        if let Some(decision_episode) = decision_episode {
+            obj.insert("decision_episode".to_string(), decision_episode);
         }
     }
     let experience_id = build_experience_run_id(&execution_run.id);
@@ -1386,7 +1644,7 @@ fn apply_candidate_write_outcome(
     }
 }
 
-pub async fn run_candidate_generation(storage: &Storage) -> Result<usize> {
+pub async fn run_candidate_generation(storage: &Storage, data_dir: &Path) -> Result<usize> {
     if !load_learning_enabled(storage).await {
         return Ok(0);
     }
@@ -1451,6 +1709,15 @@ pub async fn run_candidate_generation(storage: &Storage) -> Result<usize> {
 
     let result = async {
         let cap = load_learning_queue_cap(storage).await as u64;
+        let skill_catalog = skill_evolution::load_skill_catalog(data_dir).unwrap_or_default();
+        let known_skill_names = skill_catalog
+            .iter()
+            .map(|entry| entry.name.trim().to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        let recent_runs = storage
+            .list_recent_experience_runs_any_scope(cap.max(192))
+            .await
+            .unwrap_or_default();
         let patterns = storage
             .list_candidate_ready_patterns(3, 0.66, cap)
             .await?
@@ -1478,7 +1745,31 @@ pub async fn run_candidate_generation(storage: &Storage) -> Result<usize> {
                 .unwrap_or_default();
             let action_name = candidate_action_name(&pattern);
             let workflow_content = workflow_candidate_markdown(&pattern, &action_name, &steps);
-            let workflow_candidate_id = stable_id("candidate", &["workflow", pattern.id.as_str()]);
+            let tool_names = pattern
+                .tool_sequence_json
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(|value| value.to_string()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if known_skill_names.contains(&action_name.to_ascii_lowercase())
+                || tool_names
+                    .iter()
+                    .any(|name| known_skill_names.contains(&name.trim().to_ascii_lowercase()))
+            {
+                continue;
+            }
+            let workflow_candidate_id = stable_id(
+                "candidate",
+                &[
+                    "skill_patch_create",
+                    pattern.id.as_str(),
+                    short_hash(&[workflow_content.as_str()]).as_str(),
+                ],
+            );
             let now = chrono::Utc::now().to_rfc3339();
             if !apply_candidate_write_outcome(
                 upsert_generated_learning_candidate(
@@ -1486,18 +1777,37 @@ pub async fn run_candidate_generation(storage: &Storage) -> Result<usize> {
                     &lease_guard,
                     learning_candidate::Model {
                         id: workflow_candidate_id,
-                        candidate_type: "workflow".to_string(),
-                        subject_key: pattern.id.clone(),
-                        title: format!("Workflow candidate: {}", pattern.title),
+                        candidate_type: "skill_patch".to_string(),
+                        subject_key: action_name.clone(),
+                        title: format!("Skill candidate: {}", pattern.title),
                         summary: Some("Generated from repeated successful procedures.".to_string()),
                         project_id: pattern.project_id.clone(),
                         conversation_id: pattern.conversation_id.clone(),
                         pattern_id: Some(pattern.id.clone()),
                         evidence_refs: json!([pattern.id]),
-                        proposed_content: json!({
-                            "name": action_name,
-                            "content": workflow_content,
-                        }),
+                        proposed_content: build_skill_patch_candidate_content(
+                            "create_skill",
+                            &action_name,
+                            "custom",
+                            "",
+                            &workflow_content,
+                            "Create a new reusable skill from a repeated successful procedure.",
+                            json!({
+                                "pattern_id": pattern.id,
+                                "sample_count": pattern.sample_count,
+                                "success_count": pattern.success_count,
+                                "success_rate": pattern.success_rate,
+                                "task_type": pattern
+                                    .metadata
+                                    .get("task_type")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or("general"),
+                                "tool_sequence": tool_names,
+                                "trigger_summary": pattern.trigger_summary,
+                            }),
+                            SkillMetricsSnapshot::default(),
+                            0,
+                        ),
                         confidence: pattern.success_rate,
                         approval_status: "draft".to_string(),
                         review_notes: None,
@@ -1519,16 +1829,6 @@ pub async fn run_candidate_generation(storage: &Storage) -> Result<usize> {
                 .get("task_type")
                 .and_then(|value| value.as_str())
                 .unwrap_or("general");
-            let tool_names = pattern
-                .tool_sequence_json
-                .as_array()
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|item| item.as_str().map(|value| value.to_string()))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
             let strategy_profile =
                 build_strategy_candidate_profile(&pattern, task_type, &tool_names);
             let strategy_candidate_id = stable_id("candidate", &["strategy", pattern.id.as_str()]);
@@ -1554,6 +1854,200 @@ pub async fn run_candidate_generation(storage: &Storage) -> Result<usize> {
                         approved_ref: None,
                         created_at: now.clone(),
                         updated_at: now.clone(),
+                    },
+                )
+                .await?,
+                &mut generated,
+                &lease_alive,
+            ) {
+                break;
+            }
+        }
+
+        for skill in skill_catalog {
+            if !lease_alive.load(std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    "Stopping learning candidate generation after lease ownership was lost"
+                );
+                break;
+            }
+
+            let matched_runs = recent_runs
+                .iter()
+                .filter(|run| skill_evolution::skill_matches_run(run, &skill.name))
+                .collect::<Vec<_>>();
+            if matched_runs.len() < 3 {
+                continue;
+            }
+
+            let baseline = skill_evolution::compute_skill_metrics(
+                &recent_runs,
+                &skill.name,
+                None,
+                SkillWindowDirection::Baseline,
+                8,
+                64,
+            );
+            let selected_only_failures = recent_runs
+                .iter()
+                .filter(|run| {
+                    skill_evolution::skill_selected_by_run(run, &skill.name)
+                        && !skill_evolution::skill_executed_by_run(run, &skill.name)
+                        && (run.correction_state == "corrected" || run.success_state == "failed")
+                })
+                .collect::<Vec<_>>();
+            let executed_failures = recent_runs
+                .iter()
+                .filter(|run| {
+                    skill_evolution::skill_executed_by_run(run, &skill.name)
+                        && (run.correction_state == "corrected" || run.success_state == "failed")
+                })
+                .collect::<Vec<_>>();
+
+            let mut action = None::<&str>;
+            let mut diff_summary = None::<String>;
+            let mut updated_content = None::<String>;
+            let history = skill_evolution::load_skill_history(&skill.history_dir).unwrap_or_default();
+
+            if selected_only_failures.len() >= 2 {
+                let description = skill_evolution::extract_frontmatter_value(&skill.content, "description")
+                    .unwrap_or_else(|| skill.description.clone());
+                if let Some(next_description) = skill_evolution::append_not_for_clause(
+                    &description,
+                    &candidate_exclusion_labels(&selected_only_failures),
+                ) {
+                    let content = skill_evolution::replace_frontmatter_value(
+                        &skill.content,
+                        "description",
+                        &next_description,
+                    );
+                    if content != skill.content {
+                        action = Some("optimize_description");
+                        diff_summary = Some(
+                            "Tighten the trigger description so the skill stops matching known out-of-scope requests."
+                                .to_string(),
+                        );
+                        updated_content = Some(content);
+                    }
+                }
+            }
+
+            if action.is_none()
+                && (executed_failures.len() >= 2
+                    || baseline.failure_rate >= 0.34
+                    || baseline.tool_error_rate >= 0.25)
+            {
+                if let Some(section_body) =
+                    candidate_failure_checks_section(&executed_failures, &selected_only_failures)
+                {
+                    let content = skill_evolution::upsert_markdown_section(
+                        &skill.content,
+                        "## Common failure checks",
+                        &section_body,
+                    );
+                    if content != skill.content {
+                        action = Some("improve_skill");
+                        diff_summary = Some(
+                            "Add a focused failure-check section based on recent corrected and failed runs."
+                                .to_string(),
+                        );
+                        updated_content = Some(content);
+                    }
+                }
+            }
+
+            let (Some(action), Some(diff_summary), Some(after_content)) =
+                (action, diff_summary, updated_content)
+            else {
+                continue;
+            };
+
+            let evidence_refs = recent_runs
+                .iter()
+                .filter(|run| {
+                    skill_evolution::skill_matches_run(run, &skill.name)
+                        && (run.correction_state == "corrected" || run.success_state == "failed")
+                })
+                .take(6)
+                .map(|run| Value::String(run.id.clone()))
+                .collect::<Vec<_>>();
+            let candidate_id = stable_id(
+                "candidate",
+                &[
+                    "skill_patch",
+                    skill.name.as_str(),
+                    action,
+                    short_hash(&[after_content.as_str()]).as_str(),
+                ],
+            );
+            let now = chrono::Utc::now().to_rfc3339();
+            if !apply_candidate_write_outcome(
+                upsert_generated_learning_candidate(
+                    storage,
+                    &lease_guard,
+                    learning_candidate::Model {
+                        id: candidate_id,
+                        candidate_type: "skill_patch".to_string(),
+                        subject_key: skill.name.clone(),
+                        title: format!("Skill patch: {}", skill.name),
+                        summary: Some(diff_summary.clone()),
+                        project_id: None,
+                        conversation_id: None,
+                        pattern_id: None,
+                        evidence_refs: Value::Array(evidence_refs),
+                        proposed_content: build_skill_patch_candidate_content(
+                            action,
+                            &skill.name,
+                            &skill.source,
+                            &skill.content,
+                            &after_content,
+                            &diff_summary,
+                            json!({
+                                "selected_only_failures": selected_only_failures.len(),
+                                "executed_failures": executed_failures.len(),
+                                "matched_runs": matched_runs.len(),
+                                "baseline": baseline,
+                                "recent_failure_reasons": executed_failures
+                                    .iter()
+                                    .filter_map(|run| run_failure_summary(run))
+                                    .take(4)
+                                    .collect::<Vec<_>>(),
+                                "recent_tool_errors": executed_failures
+                                    .iter()
+                                    .flat_map(|run| {
+                                        run.tool_sequence_json
+                                            .as_array()
+                                            .into_iter()
+                                            .flatten()
+                                            .filter(|item| {
+                                                item.get("status")
+                                                    .and_then(|value| value.as_str())
+                                                    .map(|status| status != "success")
+                                                    .unwrap_or(false)
+                                            })
+                                            .filter_map(|item| item.get("tool_name").and_then(|value| value.as_str()))
+                                            .map(|value| value.to_string())
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .take(6)
+                                    .collect::<Vec<_>>(),
+                                "selected_failure_examples": selected_only_failures
+                                    .iter()
+                                    .take(3)
+                                    .map(|run| run_request_preview(run))
+                                    .collect::<Vec<_>>(),
+                                "history_versions_read": history.len(),
+                            }),
+                            baseline,
+                            history.len(),
+                        ),
+                        confidence: ((matched_runs.len().min(8) as f64) / 8.0).clamp(0.35, 0.95),
+                        approval_status: "draft".to_string(),
+                        review_notes: None,
+                        reviewed_at: None,
+                        approved_ref: None,
+                        created_at: now.clone(),
+                        updated_at: now,
                     },
                 )
                 .await?,
@@ -1733,6 +2227,7 @@ pub async fn run_candidate_generation(storage: &Storage) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::entities::operational_log;
 
     #[test]
     fn derive_intent_key_is_task_aware_and_stable() {
@@ -1841,5 +2336,98 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         };
         assert!(experience_item_is_external_source(&item));
+    }
+
+    #[test]
+    fn decision_episode_captures_recent_routing_evidence() {
+        let logs = vec![
+            operational_log::Model {
+                id: "log-outcome".to_string(),
+                created_at: "2026-04-14T01:03:00Z".to_string(),
+                trace_id: Some("trace-1".to_string()),
+                conversation_id: Some("conv-1".to_string()),
+                channel: "web".to_string(),
+                event_type: "response_complete".to_string(),
+                success: true,
+                outcome: "completed".to_string(),
+                tool_name: None,
+                latency_ms: Some(1200),
+                arguments: None,
+                payload: Some(r#"{"status":"completed","tool_calls":1}"#.to_string()),
+                strategy_version: None,
+                policy_version: None,
+                prompt_version: None,
+                model_slot: None,
+            },
+            operational_log::Model {
+                id: "log-routing".to_string(),
+                created_at: "2026-04-14T01:02:00Z".to_string(),
+                trace_id: Some("trace-1".to_string()),
+                conversation_id: Some("conv-1".to_string()),
+                channel: "web".to_string(),
+                event_type: "routing_decision".to_string(),
+                success: true,
+                outcome: "ok".to_string(),
+                tool_name: None,
+                latency_ms: Some(45),
+                arguments: None,
+                payload: Some(
+                    r#"{"complexity":"Complex","needs_delegation":false,"mode":"direct"}"#
+                        .to_string(),
+                ),
+                strategy_version: None,
+                policy_version: None,
+                prompt_version: None,
+                model_slot: None,
+            },
+            operational_log::Model {
+                id: "log-shape".to_string(),
+                created_at: "2026-04-14T01:01:00Z".to_string(),
+                trace_id: Some("trace-1".to_string()),
+                conversation_id: Some("conv-1".to_string()),
+                channel: "web".to_string(),
+                event_type: "request_shape_assessment".to_string(),
+                success: true,
+                outcome: "classified".to_string(),
+                tool_name: None,
+                latency_ms: Some(12),
+                arguments: None,
+                payload: Some(
+                    r#"{"shape":"app","execution_mode":"immediate","preferred_actions":["app_deploy"]}"#
+                        .to_string(),
+                ),
+                strategy_version: None,
+                policy_version: None,
+                prompt_version: None,
+                model_slot: None,
+            },
+        ];
+
+        let episode = build_decision_episode(&logs).expect("decision episode");
+        let payload = episode.as_object().expect("object");
+        assert_eq!(
+            payload
+                .get("request_shape")
+                .and_then(|value| value.get("payload"))
+                .and_then(|value| value.get("shape"))
+                .and_then(Value::as_str),
+            Some("app")
+        );
+        assert_eq!(
+            payload
+                .get("routing")
+                .and_then(|value| value.get("payload"))
+                .and_then(|value| value.get("complexity"))
+                .and_then(Value::as_str),
+            Some("Complex")
+        );
+        assert_eq!(
+            payload
+                .get("outcome")
+                .and_then(|value| value.get("payload"))
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str),
+            Some("completed")
+        );
     }
 }

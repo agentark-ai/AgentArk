@@ -38,6 +38,7 @@ const BENCHMARK_PROFILE_REL_PATH: &str = "assets/self_evolve/classifier_prompt_b
 const DEFAULT_RECENT_LINEAGE_LIMIT: usize = 12;
 const MAX_LINEAGE_ARCHIVE_ENTRIES: usize = 400;
 const MAX_SURFACE_CHARS: usize = 12_000;
+const DEFAULT_FOCUS_CASE_LIMIT: usize = 8;
 
 const JSON_DISCIPLINE_MUTATION: &str = r#"
 - Return only schema-compliant JSON for structured classifiers.
@@ -108,6 +109,8 @@ pub struct ClassifierPromptEvolutionResult {
     pub p_value: f64,
     pub candidate_source: Option<String>,
     pub optimized_surfaces: Vec<String>,
+    pub selection_strategy: String,
+    pub focus_cases: Vec<ClassifierPromptFocusCase>,
     pub promotion_gate: String,
     pub promoted_classifier_bundle: Option<ClassifierPromptBundleProfile>,
     pub lineage_entry_id: String,
@@ -115,6 +118,18 @@ pub struct ClassifierPromptEvolutionResult {
     pub notes: Vec<String>,
     pub diff_summary: ClassifierPromptBundleDiffSummary,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassifierPromptFocusCase {
+    pub surface: String,
+    pub prompt_preview: String,
+    pub baseline_score: f64,
+    pub candidate_score: f64,
+    pub score_delta: f64,
+    pub score_span: f64,
+    pub invalid_json_before: bool,
+    pub invalid_json_after: bool,
 }
 
 impl Default for ClassifierPromptBundleProfile {
@@ -311,28 +326,34 @@ impl ClassifierPromptEvolutionEngine {
         }
 
         let evaluated_candidates = candidates.len();
-        let mut best: Option<(CandidateClassifierBundle, BundleEvaluation, PairedStats)> = None;
+        let mut evaluated = Vec::with_capacity(evaluated_candidates);
         for candidate in candidates {
             let eval = self.evaluate_bundle(&candidate.bundle, &benchmark).await;
             let paired = paired_stats(&baseline_eval.case_scores, &eval.case_scores);
-            let replace = match &best {
-                None => true,
-                Some((_, best_eval, best_paired)) => {
-                    eval.combined_score > best_eval.combined_score
-                        || (f64_eq(eval.combined_score, best_eval.combined_score)
-                            && paired.wins > best_paired.wins)
-                        || (f64_eq(eval.combined_score, best_eval.combined_score)
-                            && paired.wins == best_paired.wins
-                            && paired.p_value < best_paired.p_value)
-                }
-            };
+            evaluated.push((candidate, eval, paired));
+        }
+
+        let mut best_index = 0usize;
+        for idx in 1..evaluated.len() {
+            let (_, eval, paired) = &evaluated[idx];
+            let (_, best_eval, best_paired) = &evaluated[best_index];
+            let replace = eval.combined_score > best_eval.combined_score
+                || (f64_eq(eval.combined_score, best_eval.combined_score)
+                    && paired.wins > best_paired.wins)
+                || (f64_eq(eval.combined_score, best_eval.combined_score)
+                    && paired.wins == best_paired.wins
+                    && paired.p_value < best_paired.p_value);
             if replace {
-                best = Some((candidate, eval, paired));
+                best_index = idx;
             }
         }
 
-        let (mut best_candidate, best_eval, best_stats) =
-            best.context("missing best classifier prompt candidate")?;
+        let focus_cases = select_focus_cases(&baseline_eval, &evaluated, best_index);
+        let selection_strategy = "high_variance_benchmark_cases".to_string();
+        let (mut best_candidate, best_eval, best_stats) = evaluated
+            .into_iter()
+            .nth(best_index)
+            .context("missing best classifier prompt candidate")?;
         best_candidate.bundle.version = format!(
             "classifier-prompt-{}",
             short_hash(&[
@@ -370,7 +391,12 @@ impl ClassifierPromptEvolutionEngine {
         let diff_summary = diff_summary(&baseline_bundle, &best_candidate.bundle);
         let optimized_surfaces = diff_summary.changed_surfaces.clone();
         let candidate_version = best_candidate.bundle.version.clone();
-        let notes = build_result_notes(&baseline_eval, &best_eval, &optimized_surfaces);
+        let notes = build_result_notes(
+            &baseline_eval,
+            &best_eval,
+            &optimized_surfaces,
+            &focus_cases,
+        );
 
         let lineage_entry_id = self
             .append_lineage_entry(&ClassifierPromptLineageEntry {
@@ -391,6 +417,8 @@ impl ClassifierPromptEvolutionEngine {
                 promoted,
                 candidate_source: best_candidate.source.clone(),
                 optimized_surfaces: optimized_surfaces.clone(),
+                selection_strategy: selection_strategy.clone(),
+                focus_cases: focus_cases.clone(),
                 notes: notes.clone(),
                 diff_summary: diff_summary.clone(),
             })
@@ -413,6 +441,8 @@ impl ClassifierPromptEvolutionEngine {
             p_value: round4(best_stats.p_value),
             candidate_source: Some(best_candidate.source),
             optimized_surfaces,
+            selection_strategy,
+            focus_cases,
             promotion_gate,
             promoted_classifier_bundle: if promoted {
                 Some(best_candidate.bundle)
@@ -725,6 +755,8 @@ Baseline bundle:\n{}",
                 promoted: false,
                 candidate_source: "none".to_string(),
                 optimized_surfaces: Vec::new(),
+                selection_strategy: "high_variance_benchmark_cases".to_string(),
+                focus_cases: Vec::new(),
                 notes: vec!["No distinct classifier prompt candidates were generated".to_string()],
                 diff_summary: diff_summary.clone(),
             })
@@ -747,6 +779,8 @@ Baseline bundle:\n{}",
             p_value: 1.0,
             candidate_source: Some("none".to_string()),
             optimized_surfaces: Vec::new(),
+            selection_strategy: "high_variance_benchmark_cases".to_string(),
+            focus_cases: Vec::new(),
             promotion_gate: "no_distinct_candidates".to_string(),
             promoted_classifier_bundle: None,
             lineage_entry_id: entry_id,
@@ -777,6 +811,10 @@ struct ClassifierPromptLineageEntry {
     promoted: bool,
     candidate_source: String,
     optimized_surfaces: Vec<String>,
+    #[serde(default)]
+    selection_strategy: String,
+    #[serde(default)]
+    focus_cases: Vec<ClassifierPromptFocusCase>,
     notes: Vec<String>,
     diff_summary: ClassifierPromptBundleDiffSummary,
 }
@@ -1155,6 +1193,7 @@ fn build_result_notes(
     baseline: &BundleEvaluation,
     candidate: &BundleEvaluation,
     optimized_surfaces: &[String],
+    focus_cases: &[ClassifierPromptFocusCase],
 ) -> Vec<String> {
     let mut notes = Vec::new();
     if !optimized_surfaces.is_empty() {
@@ -1181,7 +1220,93 @@ fn build_result_notes(
     if !regressions.is_empty() {
         notes.push(format!("Observed regressions: {}", regressions.join("; ")));
     }
+    if !focus_cases.is_empty() {
+        notes.push(format!(
+            "Focus cases: {}",
+            focus_cases
+                .iter()
+                .take(3)
+                .map(|case| format!("{} {:+.0} pts", case.surface, case.score_delta * 100.0))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ));
+    }
     notes
+}
+
+fn select_focus_cases(
+    baseline: &BundleEvaluation,
+    evaluated: &[(CandidateClassifierBundle, BundleEvaluation, PairedStats)],
+    best_index: usize,
+) -> Vec<ClassifierPromptFocusCase> {
+    if evaluated.is_empty() || baseline.cases.is_empty() || best_index >= evaluated.len() {
+        return Vec::new();
+    }
+
+    let best_eval = &evaluated[best_index].1;
+    let mut ranked = baseline
+        .cases
+        .iter()
+        .zip(best_eval.cases.iter())
+        .enumerate()
+        .filter_map(|(idx, (baseline_case, best_case))| {
+            let mut min_score = baseline_case.score;
+            let mut max_score = baseline_case.score;
+            for (_, eval, _) in evaluated {
+                if let Some(case) = eval.cases.get(idx) {
+                    min_score = min_score.min(case.score);
+                    max_score = max_score.max(case.score);
+                }
+            }
+            let score_span = round4(max_score - min_score);
+            let score_delta = round4(best_case.score - baseline_case.score);
+            let invalid_flip = baseline_case.invalid_json != best_case.invalid_json;
+            if score_span <= 0.0 && score_delta.abs() <= f64::EPSILON && !invalid_flip {
+                return None;
+            }
+            Some((
+                idx,
+                invalid_flip,
+                score_delta,
+                score_span,
+                ClassifierPromptFocusCase {
+                    surface: baseline_case.surface.as_str().to_string(),
+                    prompt_preview: truncate_chars(baseline_case.prompt.as_str(), 180),
+                    baseline_score: round4(baseline_case.score),
+                    candidate_score: round4(best_case.score),
+                    score_delta,
+                    score_span,
+                    invalid_json_before: baseline_case.invalid_json,
+                    invalid_json_after: best_case.invalid_json,
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| {
+                right
+                    .2
+                    .partial_cmp(&left.2)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                right
+                    .3
+                    .partial_cmp(&left.3)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.0.cmp(&right.0))
+    });
+
+    ranked
+        .into_iter()
+        .take(DEFAULT_FOCUS_CASE_LIMIT)
+        .map(|(_, _, _, _, case)| case)
+        .collect()
 }
 
 fn paired_stats(baseline_scores: &[f64], candidate_scores: &[f64]) -> PairedStats {
@@ -1238,4 +1363,108 @@ fn round4(value: f64) -> f64 {
 
 fn f64_eq(left: f64, right: f64) -> bool {
     (left - right).abs() < 0.0001
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn focus_cases_prioritize_high_variance_improvements() {
+        let baseline = BundleEvaluation {
+            combined_score: 0.4,
+            case_scores: vec![0.0, 0.5, 0.7],
+            cases: vec![
+                ClassifierCaseEvaluation {
+                    surface: ClassifierSurfaceKind::ActionSelector,
+                    prompt: "deploy this github repo".to_string(),
+                    score: 0.0,
+                    invalid_json: true,
+                },
+                ClassifierCaseEvaluation {
+                    surface: ClassifierSurfaceKind::RequestShape,
+                    prompt: "remind me on june 30".to_string(),
+                    score: 0.5,
+                    invalid_json: false,
+                },
+                ClassifierCaseEvaluation {
+                    surface: ClassifierSurfaceKind::Smalltalk,
+                    prompt: "hello".to_string(),
+                    score: 0.7,
+                    invalid_json: false,
+                },
+            ],
+        };
+        let candidate_bundle = CandidateClassifierBundle {
+            bundle: ClassifierPromptBundleProfile::default(),
+            source: "test".to_string(),
+        };
+        let best_eval = BundleEvaluation {
+            combined_score: 0.9,
+            case_scores: vec![1.0, 0.8, 0.7],
+            cases: vec![
+                ClassifierCaseEvaluation {
+                    surface: ClassifierSurfaceKind::ActionSelector,
+                    prompt: "deploy this github repo".to_string(),
+                    score: 1.0,
+                    invalid_json: false,
+                },
+                ClassifierCaseEvaluation {
+                    surface: ClassifierSurfaceKind::RequestShape,
+                    prompt: "remind me on june 30".to_string(),
+                    score: 0.8,
+                    invalid_json: false,
+                },
+                ClassifierCaseEvaluation {
+                    surface: ClassifierSurfaceKind::Smalltalk,
+                    prompt: "hello".to_string(),
+                    score: 0.7,
+                    invalid_json: false,
+                },
+            ],
+        };
+        let weaker_eval = BundleEvaluation {
+            combined_score: 0.6,
+            case_scores: vec![0.2, 0.6, 0.7],
+            cases: vec![
+                ClassifierCaseEvaluation {
+                    surface: ClassifierSurfaceKind::ActionSelector,
+                    prompt: "deploy this github repo".to_string(),
+                    score: 0.2,
+                    invalid_json: true,
+                },
+                ClassifierCaseEvaluation {
+                    surface: ClassifierSurfaceKind::RequestShape,
+                    prompt: "remind me on june 30".to_string(),
+                    score: 0.6,
+                    invalid_json: false,
+                },
+                ClassifierCaseEvaluation {
+                    surface: ClassifierSurfaceKind::Smalltalk,
+                    prompt: "hello".to_string(),
+                    score: 0.7,
+                    invalid_json: false,
+                },
+            ],
+        };
+        let evaluated = vec![
+            (
+                candidate_bundle.clone(),
+                best_eval.clone(),
+                paired_stats(&baseline.case_scores, &best_eval.case_scores),
+            ),
+            (
+                candidate_bundle,
+                weaker_eval.clone(),
+                paired_stats(&baseline.case_scores, &weaker_eval.case_scores),
+            ),
+        ];
+
+        let focus_cases = select_focus_cases(&baseline, &evaluated, 0);
+        assert!(!focus_cases.is_empty());
+        assert_eq!(focus_cases[0].surface, "action_selector");
+        assert!(focus_cases[0].score_delta > 0.9);
+        assert!(focus_cases[0].invalid_json_before);
+        assert!(!focus_cases[0].invalid_json_after);
+    }
 }

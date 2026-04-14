@@ -703,8 +703,9 @@ fn build_openai_responses_request(
 
 fn openai_responses_tool_arguments(value: Option<&serde_json::Value>) -> serde_json::Value {
     match value {
-        Some(serde_json::Value::String(raw)) => serde_json::from_str(raw)
-            .unwrap_or_else(|_| serde_json::json!({ "_raw": raw })),
+        Some(serde_json::Value::String(raw)) => {
+            serde_json::from_str(raw).unwrap_or_else(|_| serde_json::json!({ "_raw": raw }))
+        }
         Some(value) if value.is_object() || value.is_array() => value.clone(),
         Some(value) if value.is_null() => serde_json::json!({}),
         Some(value) => serde_json::json!({ "_raw": value }),
@@ -746,7 +747,10 @@ fn collect_openai_responses_text_from_content(content: &serde_json::Value) -> St
     };
     let mut text = String::new();
     for block in blocks {
-        let block_type = block.get("type").and_then(|value| value.as_str()).unwrap_or("");
+        let block_type = block
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
         if matches!(block_type, "output_text" | "input_text" | "text")
             || block.get("text").is_some()
         {
@@ -766,7 +770,10 @@ fn parse_openai_responses_payload(
     model: &str,
 ) -> Result<LlmResponse> {
     if let Some(error) = payload.get("error").filter(|value| !value.is_null()) {
-        return Err(anyhow!("OpenAI Subscription returned an error payload: {}", error));
+        return Err(anyhow!(
+            "OpenAI Subscription returned an error payload: {}",
+            error
+        ));
     }
 
     let mut content = payload
@@ -779,7 +786,11 @@ fn parse_openai_responses_payload(
 
     if let Some(output) = payload.get("output").and_then(|value| value.as_array()) {
         for item in output {
-            match item.get("type").and_then(|value| value.as_str()).unwrap_or("") {
+            match item
+                .get("type")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+            {
                 "message" => {
                     let item_text = item
                         .get("content")
@@ -1331,14 +1342,9 @@ mod tests {
             "usage": { "input_tokens": 1, "output_tokens": 2, "total_tokens": 3 }
         });
 
-        let response = parse_openai_responses_payload(
-            &payload,
-            1,
-            "",
-            "openai-subscription",
-            "gpt-5.4",
-        )
-        .expect("null error is not an error payload");
+        let response =
+            parse_openai_responses_payload(&payload, 1, "", "openai-subscription", "gpt-5.4")
+                .expect("null error is not an error payload");
         assert_eq!(response.content, "I'm AgentArk.");
     }
 
@@ -2151,9 +2157,7 @@ impl LlmClient {
         request_config: ResolvedOpenAiRequestConfig,
     ) -> Result<LlmResponse> {
         let (token_tx, mut token_rx) = tokio::sync::mpsc::channel(64);
-        let drain_handle = tokio::spawn(async move {
-            while token_rx.recv().await.is_some() {}
-        });
+        let drain_handle = tokio::spawn(async move { while token_rx.recv().await.is_some() {} });
         let result = self
             .chat_openai_codex_responses_stream(
                 model,
@@ -3065,11 +3069,20 @@ impl LlmClient {
         mut request_config: ResolvedOpenAiRequestConfig,
     ) -> Result<LlmResponse> {
         let endpoint = openai_responses_endpoint(&request_config);
-        let request =
-            build_openai_responses_request(model, system_prompt, user_message, history, actions, true);
+        let request = build_openai_responses_request(
+            model,
+            system_prompt,
+            user_message,
+            history,
+            actions,
+            true,
+        );
         let prompt_chars = system_prompt.len()
             + user_message.len()
-            + history.iter().map(|message| message.content.len()).sum::<usize>();
+            + history
+                .iter()
+                .map(|message| message.content.len())
+                .sum::<usize>();
         let send_start = std::time::Instant::now();
         let mut forced_oauth_refresh = false;
 
@@ -3185,7 +3198,11 @@ impl LlmClient {
                     Ok(value) => value,
                     Err(_) => continue,
                 };
-                match parsed.get("type").and_then(|value| value.as_str()).unwrap_or("") {
+                match parsed
+                    .get("type")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                {
                     "response.output_text.delta" => {
                         if let Some(delta) = parsed.get("delta").and_then(|value| value.as_str()) {
                             if first_token {

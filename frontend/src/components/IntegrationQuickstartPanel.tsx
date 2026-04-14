@@ -11,7 +11,6 @@ import {
   DialogContent,
   DialogTitle,
   FormControlLabel,
-  Grid as Grid2,
   MenuItem,
   Stack,
   Switch,
@@ -25,6 +24,7 @@ import {
   Tooltip,
   Typography
 } from "@mui/material";
+import Grid2 from "@mui/material/Grid";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { api } from "../api/client";
@@ -686,3 +686,6 @@ export function IntegrationQuickstartPanel({
     </Stack>
   );
 }
+
+
+

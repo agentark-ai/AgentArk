@@ -484,6 +484,7 @@ mod tests {
                 last_trace,
                 tasks,
                 chat_task_cancellations: Arc::new(RwLock::new(HashMap::new())),
+                chat_conversation_cancellations: Arc::new(RwLock::new(HashMap::new())),
                 user_profile,
                 tiered_rate_limiter: TieredRateLimiter::new(),
                 api_key: Arc::new(RwLock::new(None)),

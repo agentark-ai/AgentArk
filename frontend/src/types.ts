@@ -10,9 +10,15 @@ export type StatusResponse = {
 export type Task = {
   id: string;
   description: string;
+  action?: string;
   status: unknown;
+  task_kind?: string;
+  task_kind_label?: string;
   created_at?: string;
+  scheduled_for?: string | null;
   cron?: string;
+  arguments?: Record<string, unknown>;
+  result?: unknown;
 };
 
 export type BackgroundSessionCounts = {
@@ -49,6 +55,8 @@ export type BackgroundSessionSummary = {
   last_activity_at: string;
   live_summary: string;
   counts: BackgroundSessionCounts;
+  ui_kind?: string;
+  default_visible?: boolean;
 };
 
 export type BackgroundSessionEvent = {
@@ -64,8 +72,11 @@ export type BackgroundSessionLinkedTask = {
   id: string;
   description: string;
   action: string;
+  task_kind?: string;
+  task_kind_label?: string;
   status: string;
   created_at: string;
+  scheduled_for?: string | null;
   cron?: string | null;
   result?: string | null;
 };
@@ -132,6 +143,25 @@ export type Notification = {
   read: boolean;
   source?: string;
   metadata?: Record<string, unknown>;
+};
+
+export type BrowserHandoffStatus = {
+  id: string;
+  task_description: string;
+  status: string;
+  question?: string | null;
+  summary?: string | null;
+  reason?: string | null;
+  created_at: string;
+  updated_at: string;
+  page_url?: string | null;
+  page_title?: string | null;
+  live_view_enabled: boolean;
+  live_view_port?: number | null;
+  live_view_path?: string | null;
+  can_claim: boolean;
+  can_release: boolean;
+  can_complete: boolean;
 };
 
 export type ArkPulseRemediationSpec =
@@ -293,7 +323,7 @@ export type SentinelProposal = {
   trace_id?: string | null;
   run_status?: string | null;
   last_run_summary?: string | null;
-  action?: RecommendedSkill | null;
+  action?: RecommendedAction | null;
   chat_suggestion_id?: string | null;
 };
 
@@ -350,12 +380,12 @@ export type SentinelFeedResponse = {
   };
 };
 
-export type RecommendedSkill = {
+export type RecommendedAction = {
   id: string;
   title: string;
   summary?: string;
   description?: string;
-  skill_kind: string;
+  action_kind: string;
   payload: Record<string, unknown>;
   requires_approval?: boolean;
   trust?: {
@@ -371,7 +401,8 @@ export type BriefingResponse = {
   scope: string;
   top_risks: Array<{ title?: string; summary?: string; detail?: string; severity?: string }>;
   top_opportunities: Array<{ title?: string; summary?: string; detail?: string; score?: number }>;
-  recommended_skills: RecommendedSkill[];
+  recommended_actions?: RecommendedAction[];
+  recommended_skills?: RecommendedAction[];
   trust_summary: Record<string, unknown>;
 };
 
@@ -989,8 +1020,8 @@ export type SkillTestResponse = {
   required_inputs?: string[];
 };
 
-// Backward-compatible aliases while moving from "actions" to "skills".
-export type RecommendedAction = RecommendedSkill;
+// Backward-compatible alias while older components still refer to actions as skills.
+export type RecommendedSkill = RecommendedAction;
 export type ActionImportRequest = SkillImportRequest;
 export type ActionImportResponse = SkillImportResponse;
 export type ActionSecretsResponse = SkillSecretsResponse;

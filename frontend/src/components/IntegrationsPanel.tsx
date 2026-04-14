@@ -13,7 +13,6 @@ import {
   DialogTitle,
   Divider,
   FormControlLabel,
-  Grid as Grid2,
   IconButton,
   Menu,
   MenuItem,
@@ -27,6 +26,7 @@ import {
   TextField,
   Typography
 } from "@mui/material";
+import Grid2 from "@mui/material/Grid";
 import MoreVertIcon from "@mui/icons-material/MoreVert";
 import ExpandMoreRoundedIcon from "@mui/icons-material/ExpandMoreRounded";
 import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
@@ -6617,3 +6617,6 @@ export function IntegrationsPanel({
     </Stack>
   );
 }
+
+
+

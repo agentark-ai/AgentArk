@@ -21,8 +21,7 @@ impl RankedActionIntent {
 }
 
 pub fn action_intent_score(message: &str, action: &ActionDef) -> f32 {
-    let _ = (message, action);
-    0.0
+    crate::core::capability_router::score_action_intent(message, action)
 }
 
 pub fn top_ranked_action_intent(

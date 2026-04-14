@@ -62,9 +62,9 @@ pub(crate) const AGENT_DOC_TOC: &[AgentDocTocEntry] = &[
         use_for: "test commands, CI expectations, release checks, and contributor workflow",
     },
     AgentDocTocEntry {
-        label: "Bundled skills",
-        location: "skills/; src/docs/product_help.rs",
-        use_for: "built-in skill docs, skill discovery, and product help that references bundled skills",
+        label: "Skill management",
+        location: "src/docs/product_help.rs",
+        use_for: "user-added skill import, editing, and product help about skill management",
     },
 ];
 

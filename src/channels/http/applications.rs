@@ -415,12 +415,10 @@ pub(super) async fn launch_application(
                     started_at: Some(chrono::Utc::now().to_rfc3339()),
                     ended_at: None,
                     exit_code: None,
-                    message: Some(
-                        format!(
-                            "Launched from {}. These tools are terminal-first, so copy the command to your own terminal if you need the full interactive UI.",
-                            crate::branding::PRODUCT_NAME
-                        ),
-                    ),
+                    message: Some(format!(
+                        "Launched from {}. These tools are terminal-first, so copy the command to your own terminal if you need the full interactive UI.",
+                        crate::branding::PRODUCT_NAME
+                    )),
                     logs: VecDeque::new(),
                 };
                 push_application_log(

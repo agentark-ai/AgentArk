@@ -929,6 +929,48 @@ async fn load_gws_skills(config_dir: &Path) -> Result<Vec<GwsSkillMetadata>> {
     Ok(skills)
 }
 
+fn gws_skill_related_bundles(skill: &GwsSkillMetadata) -> Vec<String> {
+    let mut bundles = BTreeSet::new();
+    for text in [
+        skill.name.as_str(),
+        skill.description.as_str(),
+        skill.cli_help.as_deref().unwrap_or_default(),
+    ] {
+        for token in text
+            .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
+            .filter(|token| !token.is_empty())
+        {
+            if let Some(bundle) = normalize_bundle_id(token) {
+                bundles.insert(bundle);
+            }
+        }
+    }
+    if let Some(cli_help) = skill.cli_help.as_deref() {
+        let argv = cli_help
+            .split_whitespace()
+            .filter(|token| !token.eq_ignore_ascii_case("gws"))
+            .map(|token| token.to_string())
+            .collect::<Vec<_>>();
+        for bundle in infer_required_bundles_from_gws_argv(&argv) {
+            bundles.insert(bundle);
+        }
+    }
+    bundles.into_iter().collect()
+}
+
+fn gws_skill_visible_for_granted_bundles(
+    skill: &GwsSkillMetadata,
+    granted_bundles: &[String],
+) -> bool {
+    let related_bundles = gws_skill_related_bundles(skill);
+    related_bundles.is_empty()
+        || related_bundles.iter().any(|bundle| {
+            granted_bundles
+                .iter()
+                .any(|granted_bundle| granted_bundle == bundle)
+        })
+}
+
 pub fn load_workspace_tokens(config_dir: &Path) -> Result<Option<GoogleWorkspaceTokens>> {
     read_secret_json::<GoogleWorkspaceTokens>(config_dir, GOOGLE_WORKSPACE_TOKENS_KEY)
 }
@@ -1163,7 +1205,34 @@ pub fn summarize_connection_status(config_dir: &Path) -> Result<(bool, Vec<Strin
     Ok((!granted.is_empty(), granted, missing))
 }
 
-pub async fn gws_help(arguments: &serde_json::Value) -> Result<String> {
+fn ensure_granted_bundle_visibility(config_dir: &Path, required_bundles: &[String]) -> Result<()> {
+    if required_bundles.is_empty() {
+        return Ok(());
+    }
+    let granted = granted_bundles(config_dir)?;
+    let missing = required_bundles
+        .iter()
+        .filter(|bundle| {
+            !granted
+                .iter()
+                .any(|granted_bundle| granted_bundle == *bundle)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "This Google Workspace surface is only available for currently granted bundles. Missing: {}.",
+        missing
+            .iter()
+            .map(|bundle| bundle_label(bundle))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+pub async fn gws_help(config_dir: &Path, arguments: &serde_json::Value) -> Result<String> {
     let args: GwsHelpArgs = serde_json::from_value(arguments.clone())
         .map_err(|e| anyhow!("Invalid gws help args: {}", e))?;
     let argv = if args.argv.is_empty() {
@@ -1180,16 +1249,25 @@ pub async fn gws_help(arguments: &serde_json::Value) -> Result<String> {
             crate::branding::PRODUCT_NAME
         ));
     }
+    let required_bundles = infer_required_bundles_from_gws_argv(&argv);
+    ensure_granted_bundle_visibility(config_dir, &required_bundles)?;
     run_gws_command(None, &argv, &[], false).await
 }
 
-pub async fn gws_schema(arguments: &serde_json::Value) -> Result<String> {
+pub async fn gws_schema(config_dir: &Path, arguments: &serde_json::Value) -> Result<String> {
     let args: GwsSchemaArgs = serde_json::from_value(arguments.clone())
         .map_err(|e| anyhow!("Invalid gws schema args: {}", e))?;
     let target = args.target.trim();
     if target.is_empty() {
         return Err(anyhow!("Missing gws schema target."));
     }
+    let required_bundles = infer_required_bundles_from_gws_argv(
+        &target
+            .split('.')
+            .map(|token| token.to_string())
+            .collect::<Vec<_>>(),
+    );
+    ensure_granted_bundle_visibility(config_dir, &required_bundles)?;
     run_gws_command(
         None,
         &["schema".to_string(), target.to_string()],
@@ -1240,6 +1318,8 @@ pub async fn gws_skills(config_dir: &Path, arguments: &serde_json::Value) -> Res
     let args: GwsSkillsArgs = serde_json::from_value(arguments.clone())
         .map_err(|e| anyhow!("Invalid gws skills args: {}", e))?;
     let mut skills = load_gws_skills(config_dir).await?;
+    let granted_bundles = granted_bundles(config_dir)?;
+    skills.retain(|skill| gws_skill_visible_for_granted_bundles(skill, &granted_bundles));
     if let Some(filter) = args
         .filter
         .as_deref()
@@ -1276,10 +1356,20 @@ pub async fn gws_skills(config_dir: &Path, arguments: &serde_json::Value) -> Res
     }
     let limit = args.limit.unwrap_or(80).clamp(1, 200);
     if skills.is_empty() {
-        return Ok("No generated gws skills found.".to_string());
+        return Ok("No generated gws skills are available for the currently granted Google Workspace bundles.".to_string());
     }
+    let granted_labels = if granted_bundles.is_empty() {
+        "none".to_string()
+    } else {
+        granted_bundles
+            .iter()
+            .map(|bundle| bundle_label(bundle))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     let mut lines = vec![format!(
-        "Generated Google Workspace CLI skills available: {}",
+        "Generated Google Workspace CLI skills available for granted bundles ({}): {}",
+        granted_labels,
         skills.len()
     )];
     for skill in skills.into_iter().take(limit) {
@@ -2078,6 +2168,58 @@ metadata:
         assert_eq!(parsed.name, "gws-docs");
         assert_eq!(parsed.description, "Read and write Google Docs.");
         assert_eq!(parsed.cli_help.as_deref(), Some("gws docs --help"));
+    }
+
+    #[test]
+    fn infers_related_bundle_from_generated_skill_metadata() {
+        let skill = GwsSkillMetadata {
+            name: "gws-drive-search".to_string(),
+            description: "Find files in Google Drive.".to_string(),
+            cli_help: Some("gws drive files list --help".to_string()),
+            path: std::path::PathBuf::from("skills/gws-drive-search/SKILL.md"),
+        };
+        assert_eq!(gws_skill_related_bundles(&skill), vec!["drive".to_string()]);
+    }
+
+    #[test]
+    fn hides_generated_skill_when_bundle_is_not_granted() {
+        let skill = GwsSkillMetadata {
+            name: "gws-admin".to_string(),
+            description: "Inspect Google Workspace Admin users.".to_string(),
+            cli_help: Some("gws admin users list --help".to_string()),
+            path: std::path::PathBuf::from("skills/gws-admin/SKILL.md"),
+        };
+        assert!(!gws_skill_visible_for_granted_bundles(
+            &skill,
+            &["gmail".to_string(), "calendar".to_string()]
+        ));
+        assert!(gws_skill_visible_for_granted_bundles(
+            &skill,
+            &["admin".to_string()]
+        ));
+    }
+
+    #[test]
+    fn granted_bundle_visibility_rejects_ungranted_services() {
+        let dir = tempdir().unwrap();
+        let manager = crate::core::config::SecureConfigManager::new(dir.path()).unwrap();
+        manager
+            .set_custom_secret(
+                GOOGLE_WORKSPACE_TOKENS_KEY,
+                Some(
+                    serde_json::json!({
+                        "access_token": "access",
+                        "refresh_token": "refresh",
+                        "expires_at": Utc::now().timestamp() + 3600,
+                        "granted_bundles": ["gmail"]
+                    })
+                    .to_string(),
+                ),
+            )
+            .unwrap();
+        let error = ensure_granted_bundle_visibility(dir.path(), &["drive".to_string()])
+            .expect_err("drive should be hidden when only gmail is granted");
+        assert!(error.to_string().contains("Drive"));
     }
 
     #[tokio::test]

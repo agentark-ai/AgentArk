@@ -139,9 +139,52 @@ fn builtin_integration_is_connected(
     }
 }
 
+fn configured_secret_present(
+    manager: &crate::core::config::SecureConfigManager,
+    user_key: &str,
+) -> bool {
+    if std::env::var(user_key)
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return true;
+    }
+
+    crate::core::secrets::storage_keys_for_user_key(user_key)
+        .into_iter()
+        .any(|key| {
+            manager
+                .get_custom_secret(&key)
+                .ok()
+                .flatten()
+                .is_some_and(|value| !value.trim().is_empty())
+        })
+}
+
+fn external_integration_is_connected(
+    _config_dir: &Path,
+    manager: &crate::core::config::SecureConfigManager,
+    integration_id: &str,
+) -> Option<bool> {
+    let spec = crate::core::connect_flow::spec_by_id(integration_id)?;
+    let connected = match spec.required.kind {
+        crate::core::connect_flow::SecretRequirementKind::All => spec
+            .required
+            .keys
+            .iter()
+            .all(|key| configured_secret_present(manager, key)),
+        crate::core::connect_flow::SecretRequirementKind::Any => spec
+            .required
+            .keys
+            .iter()
+            .any(|key| configured_secret_present(manager, key)),
+    };
+    Some(connected)
+}
+
 pub fn effective_integration_enabled(config_dir: &Path, integration_id: &str) -> bool {
     let Ok(manager) = crate::core::config::SecureConfigManager::new(config_dir) else {
-        return true;
+        return false;
     };
 
     if stored_bool_secret(&manager, &integration_user_disabled_key(integration_id)).unwrap_or(false)
@@ -154,11 +197,15 @@ pub fn effective_integration_enabled(config_dir: &Path, integration_id: &str) ->
         integration_id,
         "gmail" | "google_calendar" | "google_workspace"
     ) {
+        let Some(connected) =
+            external_integration_is_connected(config_dir, &manager, integration_id)
+        else {
+            return explicit.unwrap_or(true);
+        };
+        if !connected {
+            return false;
+        }
         return explicit.unwrap_or(true);
-    }
-
-    if explicit == Some(true) {
-        return true;
     }
 
     if builtin_integration_is_connected(config_dir, &manager, integration_id) {
@@ -169,7 +216,7 @@ pub fn effective_integration_enabled(config_dir: &Path, integration_id: &str) ->
         return true;
     }
 
-    explicit.unwrap_or(true)
+    false
 }
 
 /// Capabilities an integration can provide
@@ -337,19 +384,40 @@ impl IntegrationManager {
         self.integrations.keys().cloned().collect()
     }
 
-    /// Returns true when an integration is enabled for agent dispatch.
-    /// Missing/invalid flags default to enabled (matching execute-time behavior).
+    /// Returns true when an integration is ready for agent dispatch.
+    /// Setup-dependent integrations stay hidden until they have valid configuration.
     pub fn is_enabled(&self, integration_id: &str) -> bool {
         effective_integration_enabled(&self._config_dir, integration_id)
     }
 
-    /// List integration IDs that are currently enabled for agent dispatch.
-    pub fn enabled_ids(&self) -> Vec<String> {
-        self.integrations
-            .keys()
-            .filter(|id| effective_integration_enabled(&self._config_dir, id.as_str()))
-            .cloned()
-            .collect()
+    /// Returns true when an integration is both enabled and currently usable.
+    pub async fn is_ready(&self, integration_id: &str) -> bool {
+        if !effective_integration_enabled(&self._config_dir, integration_id) {
+            return false;
+        }
+
+        if matches!(
+            integration_id,
+            "gmail" | "google_calendar" | "google_workspace"
+        ) {
+            return true;
+        }
+
+        let Some(integration) = self.integrations.get(integration_id) else {
+            return false;
+        };
+        matches!(integration.status().await, IntegrationStatus::Connected)
+    }
+
+    /// List integration IDs that are both enabled and currently ready to use.
+    pub async fn ready_ids(&self) -> Vec<String> {
+        let mut ready = Vec::new();
+        for id in self.integrations.keys() {
+            if self.is_ready(id).await {
+                ready.push(id.clone());
+            }
+        }
+        ready
     }
 
     /// List all integrations with their status
@@ -562,5 +630,104 @@ mod tests {
                 .as_deref(),
             Some("false")
         );
+    }
+
+    #[test]
+    fn effective_integration_enabled_defaults_false_for_disconnected_builtin_integrations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        assert!(!effective_integration_enabled(dir.path(), "gmail"));
+        assert!(!effective_integration_enabled(
+            dir.path(),
+            "google_calendar"
+        ));
+        assert!(!effective_integration_enabled(
+            dir.path(),
+            "google_workspace"
+        ));
+    }
+
+    #[test]
+    fn effective_integration_enabled_defaults_false_for_disconnected_external_integrations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        assert!(!effective_integration_enabled(dir.path(), "google_places"));
+        assert!(!effective_integration_enabled(dir.path(), "twilio"));
+    }
+
+    #[test]
+    fn effective_integration_enabled_requires_ready_external_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager =
+            crate::core::config::SecureConfigManager::new(dir.path()).expect("secure manager");
+        manager
+            .set_custom_secret("google_places_api_key", Some("test-key".to_string()))
+            .expect("places key saved");
+
+        assert!(effective_integration_enabled(dir.path(), "google_places"));
+
+        manager
+            .set_custom_secret(
+                &integration_enabled_key("google_places"),
+                Some("false".to_string()),
+            )
+            .expect("places disable flag saved");
+
+        assert!(!effective_integration_enabled(dir.path(), "google_places"));
+    }
+
+    #[tokio::test]
+    async fn ready_ids_hide_unconfigured_external_connectors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager = IntegrationManager::new(dir.path());
+        let ready = manager.ready_ids().await;
+        assert!(!ready.iter().any(|id| id == "google_places"));
+
+        let secure =
+            crate::core::config::SecureConfigManager::new(dir.path()).expect("secure manager");
+        secure
+            .set_custom_secret("google_places_api_key", Some("test-key".to_string()))
+            .expect("places key saved");
+
+        let manager = IntegrationManager::new(dir.path());
+        let ready = manager.ready_ids().await;
+        assert!(ready.iter().any(|id| id == "google_places"));
+    }
+
+    #[tokio::test]
+    async fn is_ready_accepts_connected_google_workspace_surfaces() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager =
+            crate::core::config::SecureConfigManager::new(dir.path()).expect("secure manager");
+        manager
+            .set_custom_secret(
+                crate::actions::google_workspace::GOOGLE_WORKSPACE_TOKENS_KEY,
+                Some(
+                    serde_json::json!({
+                        "access_token": "access",
+                        "refresh_token": "refresh",
+                        "expires_at": chrono::Utc::now().timestamp() + 3600,
+                        "granted_scopes": [
+                            "https://www.googleapis.com/auth/gmail.readonly",
+                            "https://www.googleapis.com/auth/gmail.send",
+                            "https://www.googleapis.com/auth/calendar"
+                        ],
+                        "granted_bundles": ["gmail", "calendar"]
+                    })
+                    .to_string(),
+                ),
+            )
+            .expect("workspace tokens saved");
+        manager
+            .set_custom_secret(
+                crate::actions::google_workspace::GOOGLE_WORKSPACE_BUNDLES_KEY,
+                Some(serde_json::json!(["gmail", "calendar"]).to_string()),
+            )
+            .expect("workspace bundles saved");
+
+        let integrations = IntegrationManager::new(dir.path());
+        assert!(integrations.is_ready("gmail").await);
+        assert!(integrations.is_ready("google_calendar").await);
+        assert!(integrations.is_ready("google_workspace").await);
     }
 }

@@ -13,6 +13,7 @@ pub mod search;
 pub mod ssh;
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::runtime::SandboxMode;
 
@@ -114,6 +115,8 @@ pub struct ActionAccessMetadata {
     pub permission_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub integration_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub integration_features: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub requires_ssh_connection: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -335,12 +338,21 @@ pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata 
             meta.side_effect_level = PlannerSideEffectLevel::Write;
             return meta;
         }
-        "file_read" | "list_tasks" | "list_watchers" | "list_integrations" | "app_inspect" => {
+        "file_read"
+        | "list_tasks"
+        | "list_watchers"
+        | "list_integrations"
+        | "app_inspect"
+        | "agentark_inspect"
+        | "postgres_schema_inspect"
+        | "postgres_query_readonly" => {
             meta.role = PlannerActionRole::Inspection;
             meta.integration_class = if name == "file_read" {
                 PlannerIntegrationClass::Filesystem
             } else if name == "app_inspect" {
                 PlannerIntegrationClass::App
+            } else if name == "postgres_schema_inspect" || name == "postgres_query_readonly" {
+                PlannerIntegrationClass::Analytics
             } else {
                 PlannerIntegrationClass::Internal
             };
@@ -384,11 +396,17 @@ pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata 
 
     if capabilities.contains("watcher_inventory")
         || capabilities.contains("integration_inventory")
+        || capabilities.contains("platform_observability")
+        || capabilities.contains("database_readonly")
         || capabilities.contains("memory")
         || capabilities.contains("documents")
     {
         meta.role = PlannerActionRole::Inspection;
-        meta.integration_class = PlannerIntegrationClass::Internal;
+        meta.integration_class = if capabilities.contains("database_readonly") {
+            PlannerIntegrationClass::Analytics
+        } else {
+            PlannerIntegrationClass::Internal
+        };
         meta.cost = PlannerCostTier::Low;
         return meta;
     }

@@ -7,36 +7,33 @@ import {
   Typography,
 } from "@mui/material";
 import AutoAwesomeRoundedIcon from "@mui/icons-material/AutoAwesomeRounded";
-import type { BriefingResponse, RecommendedSkill } from "../types";
+import type { BriefingResponse, RecommendedAction } from "../types";
 
 type Suggestion = {
   id: string;
   title: string;
   detail: string;
   priority: number;
-  skill: RecommendedSkill;
+  action: RecommendedAction;
 };
 
 type Props = {
   briefing?: BriefingResponse;
-  onExecuteSkill: (skill: RecommendedSkill) => void;
+  onExecuteAction: (action: RecommendedAction) => void;
   executing: boolean;
 };
 
 function mergeSuggestions(briefing?: BriefingResponse): Suggestion[] {
   const items: Suggestion[] = [];
-  const skills: RecommendedSkill[] =
-    briefing?.recommended_skills ||
-    ((briefing as unknown as { recommended_actions?: RecommendedSkill[] })?.recommended_actions ||
-      []);
+  const actions: RecommendedAction[] = briefing?.recommended_actions || briefing?.recommended_skills || [];
 
-  for (const skill of skills) {
+  for (const action of actions) {
     items.push({
-      id: skill.id,
-      title: skill.title,
-      detail: skill.summary || skill.description || "",
+      id: action.id,
+      title: action.title,
+      detail: action.summary || action.description || "",
       priority: 3,
-      skill,
+      action,
     });
   }
 
@@ -46,7 +43,7 @@ function mergeSuggestions(briefing?: BriefingResponse): Suggestion[] {
 
 export function SmartSuggestions({
   briefing,
-  onExecuteSkill,
+  onExecuteAction,
   executing,
 }: Props) {
   const suggestions = mergeSuggestions(briefing);
@@ -63,7 +60,7 @@ export function SmartSuggestions({
             <AutoAwesomeRoundedIcon sx={{ fontSize: 18, color: "rgba(244, 245, 247, 0.82)" }} />
             <Box sx={{ flex: 1 }}>
               <Typography variant="body1" sx={{ fontWeight: 700 }}>
-                Recommended Skills
+                Recommended Actions
               </Typography>
               <Typography variant="caption" sx={{
                 color: "text.secondary"
@@ -127,7 +124,7 @@ export function SmartSuggestions({
                         letterSpacing: 0,
                       }}
                     >
-                      Recommended skill
+                      Recommended action
                     </Typography>
                   </Stack>
                   <Typography
@@ -152,7 +149,7 @@ export function SmartSuggestions({
                       variant="contained"
                       size="small"
                       disabled={executing}
-                      onClick={() => onExecuteSkill(suggestion.skill)}
+                      onClick={() => onExecuteAction(suggestion.action)}
                       sx={{ textTransform: "none", minWidth: 52 }}
                     >
                       Run

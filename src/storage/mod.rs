@@ -8,7 +8,7 @@ use crate::crypto::KeyManager;
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use sea_orm::entity::prelude::PgVector;
-use sea_orm::sea_query::{Alias, Expr, Func, OnConflict, Order, Query};
+use sea_orm::sea_query::{Alias, Expr, Func, OnConflict, Order, Query, SimpleExpr};
 #[allow(unused_imports)]
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectOptions, ConnectionTrait, Database,
@@ -68,7 +68,7 @@ pub struct UploadManifest {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, FromQueryResult)]
+#[derive(Debug, Clone, FromQueryResult, serde::Serialize)]
 pub struct ExecutionTraceSummaryRow {
     pub id: String,
     pub message: String,
@@ -304,6 +304,62 @@ fn sql_string_list(values: &[String]) -> String {
         .map(|value| sql_string_literal(value))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn is_safe_db_identifier_part(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn normalize_public_table_name(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("Table name cannot be empty");
+    }
+    let table = if let Some((schema, table)) = trimmed.split_once('.') {
+        if schema.trim() != "public" || !is_safe_db_identifier_part(table.trim()) {
+            anyhow::bail!("Only public-schema AgentArk tables are allowed");
+        }
+        table.trim().to_string()
+    } else {
+        if !is_safe_db_identifier_part(trimmed) {
+            anyhow::bail!("Invalid table name '{}'", trimmed);
+        }
+        trimmed.to_string()
+    };
+    Ok(table)
+}
+
+fn normalize_db_column_name(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if !is_safe_db_identifier_part(trimmed) {
+        anyhow::bail!("Invalid column name '{}'", trimmed);
+    }
+    Ok(trimmed.to_string())
+}
+
+fn json_scalar_to_simple_expr(value: &serde_json::Value) -> Result<SimpleExpr> {
+    match value {
+        serde_json::Value::Bool(inner) => Ok(Expr::value(*inner)),
+        serde_json::Value::Number(inner) => {
+            if let Some(value) = inner.as_i64() {
+                Ok(Expr::value(value))
+            } else if let Some(value) = inner.as_u64() {
+                Ok(Expr::value(value as i64))
+            } else if let Some(value) = inner.as_f64() {
+                Ok(Expr::value(value))
+            } else {
+                anyhow::bail!("Unsupported numeric filter value '{}'", inner);
+            }
+        }
+        serde_json::Value::String(inner) => Ok(Expr::value(inner.clone())),
+        serde_json::Value::Null => anyhow::bail!(
+            "Null filters must use `is_null` or `not_null` operators instead of a scalar value"
+        ),
+        _ => anyhow::bail!("Only scalar filter values are supported in structured DB queries"),
+    }
 }
 
 fn lease_is_active(record: &KvLeaseRecord, now: chrono::DateTime<chrono::Utc>) -> bool {
@@ -583,6 +639,46 @@ pub struct LeaseStatusSummary {
     pub watchers_waiting_retry: u64,
     pub active_run_leases: u64,
     pub runs_pending_cancellation: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ReadonlyTableFilter {
+    pub column: String,
+    pub op: String,
+    #[serde(default)]
+    pub value: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ReadonlyTableSort {
+    pub column: String,
+    #[serde(default)]
+    pub direction: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ReadonlyTableQuery {
+    pub table: String,
+    #[serde(default)]
+    pub columns: Vec<String>,
+    #[serde(default)]
+    pub filters: Vec<ReadonlyTableFilter>,
+    #[serde(default)]
+    pub order_by: Vec<ReadonlyTableSort>,
+    #[serde(default)]
+    pub limit: Option<u64>,
+}
+
+#[derive(Debug, Clone, FromQueryResult)]
+struct DatabaseColumnSchemaRow {
+    table_schema: String,
+    table_name: String,
+    column_name: String,
+    data_type: String,
+    udt_name: String,
+    is_nullable: String,
+    column_default: Option<String>,
+    ordinal_position: i32,
 }
 
 impl Storage {
@@ -6274,6 +6370,318 @@ impl Storage {
             row.payload = decrypt_optional_storage_string(row.payload.clone());
         }
         Ok(rows)
+    }
+
+    async fn database_column_schema_rows(&self) -> Result<Vec<DatabaseColumnSchemaRow>> {
+        let columns_alias = Alias::new("columns");
+        let query = Query::select()
+            .columns([
+                (columns_alias.clone(), Alias::new("table_schema")),
+                (columns_alias.clone(), Alias::new("table_name")),
+                (columns_alias.clone(), Alias::new("column_name")),
+                (columns_alias.clone(), Alias::new("data_type")),
+                (columns_alias.clone(), Alias::new("udt_name")),
+                (columns_alias.clone(), Alias::new("is_nullable")),
+                (columns_alias.clone(), Alias::new("column_default")),
+                (columns_alias.clone(), Alias::new("ordinal_position")),
+            ])
+            .from((Alias::new("information_schema"), columns_alias.clone()))
+            .and_where(Expr::col((columns_alias.clone(), Alias::new("table_schema"))).eq("public"))
+            .order_by(
+                (columns_alias.clone(), Alias::new("table_name")),
+                Order::Asc,
+            )
+            .order_by(
+                (columns_alias.clone(), Alias::new("ordinal_position")),
+                Order::Asc,
+            )
+            .to_owned();
+        let rows = self.db.query_all(DbBackend::Postgres.build(&query)).await?;
+        rows.into_iter()
+            .map(|row| DatabaseColumnSchemaRow::from_query_result(&row, "").map_err(Into::into))
+            .collect()
+    }
+
+    async fn database_column_names_for_table(&self, table: &str) -> Result<Vec<String>> {
+        let table = normalize_public_table_name(table)?;
+        Ok(self
+            .database_column_schema_rows()
+            .await?
+            .into_iter()
+            .filter(|row| row.table_schema == "public" && row.table_name == table)
+            .map(|row| row.column_name)
+            .collect())
+    }
+
+    fn build_structured_db_filter_expr(
+        table_alias: &str,
+        filter: &ReadonlyTableFilter,
+    ) -> Result<SimpleExpr> {
+        let column = normalize_db_column_name(&filter.column)?;
+        let op = filter.op.trim().to_ascii_lowercase();
+        let expr = Expr::col((Alias::new(table_alias), Alias::new(column.as_str())));
+        match op.as_str() {
+            "eq" => Ok(expr.eq(json_scalar_to_simple_expr(
+                filter
+                    .value
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("Filter '{}' requires a value", filter.column))?,
+            )?)),
+            "neq" => Ok(expr.ne(json_scalar_to_simple_expr(
+                filter
+                    .value
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("Filter '{}' requires a value", filter.column))?,
+            )?)),
+            "gt" => Ok(expr.gt(json_scalar_to_simple_expr(
+                filter
+                    .value
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("Filter '{}' requires a value", filter.column))?,
+            )?)),
+            "gte" => Ok(expr.gte(json_scalar_to_simple_expr(
+                filter
+                    .value
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("Filter '{}' requires a value", filter.column))?,
+            )?)),
+            "lt" => Ok(expr.lt(json_scalar_to_simple_expr(
+                filter
+                    .value
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("Filter '{}' requires a value", filter.column))?,
+            )?)),
+            "lte" => Ok(expr.lte(json_scalar_to_simple_expr(
+                filter
+                    .value
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("Filter '{}' requires a value", filter.column))?,
+            )?)),
+            "contains" => {
+                let value = filter
+                    .value
+                    .as_ref()
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| anyhow!("Filter '{}' requires a string value", filter.column))?;
+                Ok(expr.like(format!("%{}%", value)))
+            }
+            "starts_with" => {
+                let value = filter
+                    .value
+                    .as_ref()
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| anyhow!("Filter '{}' requires a string value", filter.column))?;
+                Ok(expr.like(format!("{}%", value)))
+            }
+            "ends_with" => {
+                let value = filter
+                    .value
+                    .as_ref()
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| anyhow!("Filter '{}' requires a string value", filter.column))?;
+                Ok(expr.like(format!("%{}", value)))
+            }
+            "in" => {
+                let values = filter
+                    .value
+                    .as_ref()
+                    .and_then(|value| value.as_array())
+                    .ok_or_else(|| anyhow!("Filter '{}' requires an array value", filter.column))?
+                    .iter()
+                    .map(json_scalar_to_simple_expr)
+                    .collect::<Result<Vec<_>>>()?;
+                if values.is_empty() {
+                    anyhow::bail!("Filter '{}' requires a non-empty array", filter.column);
+                }
+                Ok(expr.is_in(values))
+            }
+            "is_null" => Ok(expr.is_null()),
+            "not_null" => Ok(expr.is_not_null()),
+            _ => anyhow::bail!(
+                "Unsupported filter operator '{}'. Use eq, neq, gt, gte, lt, lte, contains, starts_with, ends_with, in, is_null, or not_null",
+                filter.op
+            ),
+        }
+    }
+
+    /// Inspect the live Postgres schema for agent-facing diagnostics.
+    pub async fn inspect_postgres_schema_json(
+        &self,
+        table_filter: Option<&str>,
+        limit: u64,
+    ) -> Result<serde_json::Value> {
+        let filter = table_filter
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_ascii_lowercase());
+        let mut tables = Vec::new();
+        let mut grouped =
+            std::collections::BTreeMap::<(String, String), Vec<DatabaseColumnSchemaRow>>::new();
+        for row in self.database_column_schema_rows().await? {
+            if let Some(filter) = filter.as_deref() {
+                let table_name = row.table_name.to_ascii_lowercase();
+                let schema_name = row.table_schema.to_ascii_lowercase();
+                if !table_name.contains(filter) && !schema_name.contains(filter) {
+                    continue;
+                }
+            }
+            grouped
+                .entry((row.table_schema.clone(), row.table_name.clone()))
+                .or_default()
+                .push(row);
+        }
+        for ((schema, table), mut columns) in grouped.into_iter().take(limit.clamp(1, 100) as usize)
+        {
+            columns.sort_by_key(|row| row.ordinal_position);
+            tables.push(serde_json::json!({
+                "schema": schema,
+                "table": table,
+                "columns": columns.into_iter().map(|column| serde_json::json!({
+                    "name": column.column_name,
+                    "type": column.data_type,
+                    "udt_name": column.udt_name,
+                    "nullable": column.is_nullable.eq_ignore_ascii_case("YES"),
+                    "default": column.column_default,
+                    "ordinal_position": column.ordinal_position,
+                })).collect::<Vec<_>>(),
+            }));
+        }
+
+        Ok(serde_json::json!({
+            "generated_at": chrono::Utc::now().to_rfc3339(),
+            "schema": "public",
+            "table_filter": table_filter.map(str::trim).filter(|value| !value.is_empty()),
+            "table_count": tables.len(),
+            "tables": tables,
+            "relationships": Vec::<serde_json::Value>::new(),
+            "notes": [
+                "Only public-schema AgentArk tables are exposed here.",
+                "Use the returned table and column names with structured postgres_query_readonly calls."
+            ],
+        }))
+    }
+
+    /// Execute a structured, read-only table query against the live Postgres database.
+    pub async fn query_table_json(
+        &self,
+        request: &ReadonlyTableQuery,
+    ) -> Result<serde_json::Value> {
+        let table = normalize_public_table_name(&request.table)?;
+        let known_tables = self.database_table_names().await?;
+        if !known_tables.iter().any(|name| name == &table) {
+            anyhow::bail!(
+                "Unknown table '{}'. Inspect the live schema with postgres_schema_inspect and retry with a valid public table name",
+                table
+            );
+        }
+
+        let available_columns = self.database_column_names_for_table(&table).await?;
+        if available_columns.is_empty() {
+            anyhow::bail!("Table '{}' has no readable columns", table);
+        }
+
+        let mut selected_columns = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let requested_columns = if request.columns.is_empty() {
+            available_columns.clone()
+        } else {
+            request
+                .columns
+                .iter()
+                .map(|column| normalize_db_column_name(column))
+                .collect::<Result<Vec<_>>>()?
+        };
+        for column in requested_columns {
+            if !available_columns.iter().any(|name| name == &column) {
+                anyhow::bail!(
+                    "Unknown column '{}.{}'. Inspect the live schema with postgres_schema_inspect and retry with a valid column name",
+                    table,
+                    column
+                );
+            }
+            if seen.insert(column.clone()) {
+                selected_columns.push(column);
+            }
+        }
+
+        for filter in &request.filters {
+            let column = normalize_db_column_name(&filter.column)?;
+            if !available_columns.iter().any(|name| name == &column) {
+                anyhow::bail!(
+                    "Unknown filter column '{}.{}'. Inspect the live schema with postgres_schema_inspect and retry with a valid column name",
+                    table,
+                    column
+                );
+            }
+        }
+        for sort in &request.order_by {
+            let column = normalize_db_column_name(&sort.column)?;
+            if !available_columns.iter().any(|name| name == &column) {
+                anyhow::bail!(
+                    "Unknown sort column '{}.{}'. Inspect the live schema with postgres_schema_inspect and retry with a valid column name",
+                    table,
+                    column
+                );
+            }
+        }
+
+        let table_alias = "t";
+        let mut json_object = Func::cust(Alias::new("jsonb_build_object"));
+        for column in &selected_columns {
+            json_object = json_object.arg(column.clone()).arg(Expr::col((
+                Alias::new(table_alias),
+                Alias::new(column.as_str()),
+            )));
+        }
+
+        let mut query = Query::select();
+        query
+            .expr_as(json_object, Alias::new("row_json"))
+            .from_as(Alias::new(table.as_str()), Alias::new(table_alias));
+        for filter in &request.filters {
+            query.and_where(Self::build_structured_db_filter_expr(table_alias, filter)?);
+        }
+        for sort in &request.order_by {
+            let column = normalize_db_column_name(&sort.column)?;
+            let direction = sort.direction.as_deref().unwrap_or("asc");
+            query.order_by(
+                (Alias::new(table_alias), Alias::new(column.as_str())),
+                if direction.eq_ignore_ascii_case("desc") {
+                    Order::Desc
+                } else {
+                    Order::Asc
+                },
+            );
+        }
+        let applied_limit = request.limit.unwrap_or(50).clamp(1, 200);
+        query.limit(applied_limit);
+
+        let rows = self.db.query_all(DbBackend::Postgres.build(&query)).await?;
+        let mut json_rows = Vec::with_capacity(rows.len());
+        for row in rows {
+            if let Ok(value) = row.try_get::<serde_json::Value>("", "row_json") {
+                json_rows.push(value);
+                continue;
+            }
+            let fallback = row
+                .try_get::<String>("", "row_json")
+                .ok()
+                .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+                .ok_or_else(|| anyhow!("Failed to decode structured row JSON"))?;
+            json_rows.push(fallback);
+        }
+
+        Ok(serde_json::json!({
+            "generated_at": chrono::Utc::now().to_rfc3339(),
+            "schema": "public",
+            "table": table,
+            "selected_columns": selected_columns,
+            "filters": request.filters,
+            "order_by": request.order_by,
+            "applied_limit": applied_limit,
+            "row_count": json_rows.len(),
+            "rows": json_rows,
+        }))
     }
 
     pub async fn list_operational_log_version_metrics_by_event(

@@ -27,8 +27,8 @@
 #   - User-owned: /app/data/**, /app/config/bootstrap.toml,
 #     encrypted settings:* KV, memory/profile/preferences, tasks,
 #     /app/data/skills/**, /app/data/cli_skills/**
-#   - System-owned: /app/skills/**, built-in prompt bundles,
-#     frontend/runtime image files, default extension packs
+#   - System-owned: built-in prompt bundles, frontend/runtime image files,
+#     default extension packs
 #   - Release updates may replace system-owned files. User-owned data is changed
 #     only by explicit user actions or future versioned migrations with backups.
 # =============================================================================
@@ -38,6 +38,7 @@ services:
     image: pgvector/pgvector:pg16
     container_name: agentark-postgres
     restart: unless-stopped
+    stop_grace_period: 30s
     command:
       - postgres
       - -c
@@ -82,6 +83,7 @@ services:
     ports:
       - "127.0.0.1:8990:8990"
       - "127.0.0.1:8992:8992"
+      - "127.0.0.1:${AGENTARK_BROWSER_HANDOFF_PORT:-6080}:6080"
     volumes:
       - agentark-data:/app/data
       - agentark-config:/app/config
@@ -110,11 +112,13 @@ services:
       - AGENTARK_STACK_ROLE=control
       - AGENTARK_EXECUTOR_URL=http://agentark-executor:8991
       - AGENTARK_WORKSPACE_URL=http://agentark-workspace:8992
+      - AGENTARK_BROWSER_HANDOFF_PUBLIC_PORT=${AGENTARK_BROWSER_HANDOFF_PORT:-6080}
       - AGENTARK_DEBUG=${AGENTARK_DEBUG:-false}
       - AGENTARK_TUNNEL=${AGENTARK_TUNNEL:-false}
       - AGENTARK_LAN_HELPER_URL=${AGENTARK_LAN_HELPER_URL:-}
       - AGENTARK_LAN_HELPER_TOKEN=${AGENTARK_LAN_HELPER_TOKEN:-}
       - AGENTARK_MASTER_PASSWORD=${AGENTARK_MASTER_PASSWORD:-}
+      - AGENTARK_SELF_WATCHDOG=${AGENTARK_SELF_WATCHDOG:-true}
     networks:
       - agent-network
     healthcheck:
@@ -166,6 +170,7 @@ services:
       - DOCKER_HOST=unix:///var/run/docker.sock
       - AGENTARK_DEBUG=${AGENTARK_DEBUG:-false}
       - AGENTARK_MASTER_PASSWORD=${AGENTARK_MASTER_PASSWORD:-}
+      - AGENTARK_SELF_WATCHDOG=${AGENTARK_SELF_WATCHDOG:-true}
     networks:
       - agent-network
     healthcheck:
@@ -198,6 +203,7 @@ services:
       - AGENTARK_STACK_ROLE=workspace
       - AGENTARK_WORKSPACE_ROOT=${AGENTARK_WORKSPACE_ROOT:-/workspace/agentark}
       - AGENTARK_WORKSPACE_BIND=0.0.0.0:8992
+      - AGENTARK_SELF_WATCHDOG=${AGENTARK_SELF_WATCHDOG:-true}
     networks:
       - agent-network
     healthcheck:

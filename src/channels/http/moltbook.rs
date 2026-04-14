@@ -44,6 +44,7 @@ pub(super) struct MoltbookSettings {
     pub(super) sync_frequency: String, // every_minute | every_5_minutes | every_10_minutes | every_30_minutes | hourly | every_3_hours | every_6_hours | every_12_hours | daily | weekly
     pub(super) write_enabled: bool,
     pub(super) defer_when_busy: bool,
+    pub(super) model_slot_id: Option<String>,
 }
 
 impl Default for MoltbookSettings {
@@ -54,6 +55,7 @@ impl Default for MoltbookSettings {
             sync_frequency: "every_12_hours".to_string(),
             write_enabled: true,
             defer_when_busy: true,
+            model_slot_id: None,
         }
     }
 }
@@ -121,6 +123,13 @@ pub(super) fn normalize_moltbook_frequency(freq: &str) -> String {
     }
 }
 
+pub(super) fn normalize_moltbook_model_slot_id(slot_id: Option<&str>) -> Option<String> {
+    slot_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+}
+
 pub(super) async fn load_moltbook_settings(storage: &crate::storage::Storage) -> MoltbookSettings {
     let raw = match storage.get(MOLTBOOK_SETTINGS_KEY).await {
         Ok(Some(v)) => v,
@@ -130,6 +139,8 @@ pub(super) async fn load_moltbook_settings(storage: &crate::storage::Storage) ->
         Ok(mut settings) => {
             settings.mode = normalize_moltbook_mode(&settings.mode);
             settings.sync_frequency = normalize_moltbook_frequency(&settings.sync_frequency);
+            settings.model_slot_id =
+                normalize_moltbook_model_slot_id(settings.model_slot_id.as_deref());
             settings
         }
         Err(_) => MoltbookSettings::default(),
@@ -143,6 +154,8 @@ pub(super) async fn save_moltbook_settings(
     let mut normalized = settings.clone();
     normalized.mode = normalize_moltbook_mode(&normalized.mode);
     normalized.sync_frequency = normalize_moltbook_frequency(&normalized.sync_frequency);
+    normalized.model_slot_id =
+        normalize_moltbook_model_slot_id(normalized.model_slot_id.as_deref());
     let bytes = serde_json::to_vec(&normalized).map_err(|e| e.to_string())?;
     storage
         .set(MOLTBOOK_SETTINGS_KEY, &bytes)
@@ -547,7 +560,12 @@ async fn distill_moltbook_memory_insights(
 
     let (llm, agent_name) = {
         let agent = state.agent.read().await;
-        (agent.llm.clone(), agent.config.name.clone())
+        (
+            agent
+                .llm_for_explicit_slot_or_primary(settings.model_slot_id.as_deref())
+                .clone(),
+            agent.config.name.clone(),
+        )
     };
 
     let payload = serde_json::json!({
@@ -1165,7 +1183,12 @@ async fn run_moltbook_cycle_with_guard(
     } else if writes_allowed {
         let (llm, agent_name) = {
             let agent = state.agent.read().await;
-            (agent.llm.clone(), agent.config.name.clone())
+            (
+                agent
+                    .llm_for_explicit_slot_or_primary(settings.model_slot_id.as_deref())
+                    .clone(),
+                agent.config.name.clone(),
+            )
         };
         let recent_activity = build_moltbook_recent_activity_context(&storage).await;
         let submolt_context = build_moltbook_submolt_context(&feed_posts_raw);

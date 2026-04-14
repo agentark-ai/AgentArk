@@ -14,6 +14,11 @@ CHILD_PIDS=""
 TAILSCALE_RESTARTS=0
 PLAYWRIGHT_RESTARTS=0
 MAX_OPTIONAL_SERVICE_RESTARTS=${AGENTARK_OPTIONAL_SERVICE_RESTARTS:-1}
+HEALTH_WATCHDOG_PID=""
+XVFB_PID=""
+OPENBOX_PID=""
+X11VNC_PID=""
+NOVNC_PID=""
 
 track_child() {
     if [ -n "${1:-}" ]; then
@@ -27,6 +32,41 @@ cleanup_children() {
             kill "$pid" >/dev/null 2>&1 || true
         fi
     done
+    stop_playwright_display_stack
+}
+
+stop_tracked_process() {
+    local pid="${1:-}"
+    if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
+        kill "$pid" >/dev/null 2>&1 || true
+        wait "$pid" >/dev/null 2>&1 || true
+    fi
+}
+
+cleanup_x_display_state() {
+    local display_name="${1:-:99}"
+    local display_number="${display_name#:}"
+    display_number="${display_number%%.*}"
+    local lock_path="/tmp/.X${display_number}-lock"
+    local socket_path="/tmp/.X11-unix/X${display_number}"
+
+    if command -v pgrep >/dev/null 2>&1 && pgrep -f "Xvfb ${display_name}" >/dev/null 2>&1; then
+        return
+    fi
+
+    rm -f "$lock_path" "$socket_path" >/dev/null 2>&1 || true
+}
+
+stop_playwright_display_stack() {
+    stop_tracked_process "$NOVNC_PID"
+    stop_tracked_process "$X11VNC_PID"
+    stop_tracked_process "$OPENBOX_PID"
+    stop_tracked_process "$XVFB_PID"
+    NOVNC_PID=""
+    X11VNC_PID=""
+    OPENBOX_PID=""
+    XVFB_PID=""
+    cleanup_x_display_state "${DISPLAY:-:99}"
 }
 
 normalized_stack_role() {
@@ -247,24 +287,9 @@ check_volume_mount() {
     fi
 }
 
-check_bundled_skills() {
-    if [ ! -d /app/skills ]; then
-        echo -e "${RED}Bundled skills directory /app/skills is missing. This image is incomplete.${NC}"
-        return
-    fi
-
-    BUNDLED_SKILL_COUNT=$(find /app/skills -mindepth 2 -maxdepth 2 -name SKILL.md 2>/dev/null | wc -l | tr -d ' ')
-    if [ "${BUNDLED_SKILL_COUNT:-0}" -eq 0 ]; then
-        echo -e "${YELLOW}No bundled SKILL.md files are currently present under /app/skills. They may have been removed for this install or omitted from the image.${NC}"
-    else
-        echo -e "${GREEN}Bundled skills available - ${BUNDLED_SKILL_COUNT} SKILL.md files found under /app/skills${NC}"
-    fi
-}
-
 # Run setup as root
 setup_docker_socket
 check_volume_mount
-check_bundled_skills
 load_internal_service_tokens
 
 # WhatsApp bridge is bundled in the full image and managed by the AgentArk backend on demand
@@ -328,6 +353,83 @@ start_tailscale_daemon() {
 start_tailscale_daemon
 
 # Start Playwright bridge in background (localhost-only)
+start_playwright_display_stack() {
+    local role
+    role=$(normalized_stack_role)
+
+    if ! should_start_playwright_bridge; then
+        return
+    fi
+
+    if truthy_env "${PLAYWRIGHT_HEADLESS:-false}"; then
+        echo -e "${GREEN}Skipping Playwright live display stack because PLAYWRIGHT_HEADLESS is enabled${NC}"
+        return
+    fi
+
+    if ! command -v Xvfb >/dev/null 2>&1 || ! command -v x11vnc >/dev/null 2>&1 || ! command -v websockify >/dev/null 2>&1; then
+        echo -e "${YELLOW}Playwright live display stack not available (Xvfb/x11vnc/websockify missing)${NC}"
+        return
+    fi
+
+    export DISPLAY=${DISPLAY:-:99}
+    local vnc_port=${PLAYWRIGHT_VNC_PORT:-5900}
+    local novnc_port=${PLAYWRIGHT_LIVE_VIEW_INTERNAL_PORT:-6080}
+
+    cleanup_x_display_state "$DISPLAY"
+
+    echo -e "${GREEN}Starting Playwright live display stack on ${DISPLAY}...${NC}"
+    Xvfb "$DISPLAY" -screen 0 1440x960x24 -ac +extension RANDR >/tmp/agentark-xvfb.log 2>&1 &
+    XVFB_PID=$!
+    track_child "$XVFB_PID"
+    sleep 1
+
+    if ! kill -0 "$XVFB_PID" >/dev/null 2>&1; then
+        wait "$XVFB_PID" >/dev/null 2>&1 || true
+        XVFB_PID=""
+        cleanup_x_display_state "$DISPLAY"
+        echo -e "${YELLOW}Playwright live display stack disabled because Xvfb failed to start on ${DISPLAY}.${NC}"
+        return
+    fi
+
+    if command -v openbox >/dev/null 2>&1; then
+        DISPLAY="$DISPLAY" openbox >/tmp/agentark-openbox.log 2>&1 &
+        OPENBOX_PID=$!
+        track_child "$OPENBOX_PID"
+    fi
+
+    x11vnc -display "$DISPLAY" -rfbport "$vnc_port" -localhost -forever -shared -nopw -xkb >/tmp/agentark-x11vnc.log 2>&1 &
+    X11VNC_PID=$!
+    track_child "$X11VNC_PID"
+    sleep 1
+
+    if ! kill -0 "$X11VNC_PID" >/dev/null 2>&1; then
+        wait "$X11VNC_PID" >/dev/null 2>&1 || true
+        X11VNC_PID=""
+        stop_playwright_display_stack
+        echo -e "${YELLOW}Playwright live display stack disabled because x11vnc could not attach to ${DISPLAY}.${NC}"
+        return
+    fi
+
+    if [ -d /usr/share/novnc ]; then
+        websockify --web=/usr/share/novnc/ 0.0.0.0:"$novnc_port" 127.0.0.1:"$vnc_port" >/tmp/agentark-novnc.log 2>&1 &
+        NOVNC_PID=$!
+        track_child "$NOVNC_PID"
+        sleep 1
+        if ! kill -0 "$NOVNC_PID" >/dev/null 2>&1; then
+            wait "$NOVNC_PID" >/dev/null 2>&1 || true
+            NOVNC_PID=""
+            echo -e "${YELLOW}Playwright live handoff UI could not be published on localhost:${novnc_port}.${NC}"
+            return
+        fi
+        echo -e "${GREEN}Playwright live handoff UI available on localhost:${novnc_port}${NC}"
+    else
+        echo -e "${YELLOW}noVNC assets not found under /usr/share/novnc; live browser handoff UI will be unavailable${NC}"
+    fi
+}
+
+start_playwright_display_stack
+
+# Start Playwright bridge in background (localhost-only)
 start_playwright_bridge() {
     local role
     role=$(normalized_stack_role)
@@ -356,6 +458,9 @@ start_playwright_bridge() {
         echo -e "${GREEN}Starting Playwright bridge (localhost:3100)...${NC}"
         PLAYWRIGHT_BROWSERS_PATH=${PLAYWRIGHT_BROWSERS_PATH:-/app/.playwright-browsers} \
         PLAYWRIGHT_EXECUTABLE_PATH=${PLAYWRIGHT_EXECUTABLE_PATH:-} \
+        PLAYWRIGHT_HEADLESS=${PLAYWRIGHT_HEADLESS:-false} \
+        PLAYWRIGHT_LIVE_VIEW_PORT=${AGENTARK_BROWSER_HANDOFF_PUBLIC_PORT:-${PLAYWRIGHT_LIVE_VIEW_PORT:-6080}} \
+        PLAYWRIGHT_LIVE_VIEW_PATH=${PLAYWRIGHT_LIVE_VIEW_PATH:-/vnc.html?autoconnect=1&resize=remote&path=websockify} \
         PORT=${PLAYWRIGHT_BRIDGE_PORT:-3100} \
         PLAYWRIGHT_BRIDGE_HOST=${PLAYWRIGHT_BRIDGE_HOST:-127.0.0.1} \
         gosu agent node /app/bridges/playwright-bridge/index.js &
@@ -396,10 +501,75 @@ handle_optional_service_exit() {
 
 # WhatsApp bridge: started by AgentArk on demand for Baileys bundled bridge mode only
 
+default_health_watchdog_url() {
+    local role
+    role=$(normalized_stack_role)
+    case "$role" in
+        executor)
+            echo "http://127.0.0.1:8991/health"
+            ;;
+        workspace)
+            echo "http://127.0.0.1:8992/health"
+            ;;
+        *)
+            echo "http://127.0.0.1:8990/health"
+            ;;
+    esac
+}
+
+start_health_watchdog() {
+    local role
+    role=$(normalized_stack_role)
+
+    # Docker already has an outer healthcheck and restart policy for this image.
+    # Keep the in-process watchdog opt-in so a transient startup stall does not
+    # self-terminate the service.
+    if [ -z "${AGENTARK_SELF_WATCHDOG:-}" ]; then
+        return
+    fi
+    truthy_env "$AGENTARK_SELF_WATCHDOG" || return
+
+    local url=${AGENTARK_SELF_WATCHDOG_URL:-$(default_health_watchdog_url)}
+    local interval=${AGENTARK_SELF_WATCHDOG_INTERVAL_SECS:-15}
+    local timeout=${AGENTARK_SELF_WATCHDOG_TIMEOUT_SECS:-5}
+    local max_failures=${AGENTARK_SELF_WATCHDOG_MAX_FAILURES:-3}
+    local initial_delay=${AGENTARK_SELF_WATCHDOG_INITIAL_DELAY_SECS:-30}
+
+    (
+        failures=0
+        sleep "$initial_delay"
+        while true; do
+            if ! kill -0 "$MAIN_PID" >/dev/null 2>&1; then
+                exit 0
+            fi
+
+            if python3 -c "import urllib.request; urllib.request.urlopen('${url}', timeout=${timeout})" >/dev/null 2>&1; then
+                failures=0
+            else
+                failures=$((failures + 1))
+                echo -e "${YELLOW}Health watchdog: local probe failed (${failures}/${max_failures}) for ${url}.${NC}"
+            fi
+
+            if [ "$failures" -ge "$max_failures" ]; then
+                echo -e "${RED}Health watchdog: ${role:-control} service stopped answering ${url}; terminating AgentArk so Docker can restart it.${NC}"
+                kill "$MAIN_PID" >/dev/null 2>&1 || true
+                sleep 10
+                kill -9 "$MAIN_PID" >/dev/null 2>&1 || true
+                exit 0
+            fi
+
+            sleep "$interval"
+        done
+    ) &
+    HEALTH_WATCHDOG_PID=$!
+    track_child "$HEALTH_WATCHDOG_PID"
+}
+
 # Drop privileges to 'agent' user and start the app under supervision
 gosu agent /app/agentark "$@" &
 MAIN_PID=$!
 track_child "$MAIN_PID"
+start_health_watchdog
 
 while true; do
     if ! kill -0 "$MAIN_PID" >/dev/null 2>&1; then

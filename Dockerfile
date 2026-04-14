@@ -168,7 +168,7 @@ ARG INSTALL_OLLAMA_CLI=false
 RUN set -eux; \
     apt_packages="ca-certificates curl gosu git python3 python3-pip python3-venv"; \
     if [ "${INSTALL_PLAYWRIGHT_RUNTIME}" = "true" ]; then \
-        apt_packages="${apt_packages} chromium"; \
+        apt_packages="${apt_packages} chromium xvfb x11vnc novnc websockify openbox"; \
     fi; \
     if [ "${INSTALL_DOCKER_CLI}" = "true" ]; then \
         apt_packages="${apt_packages} docker.io"; \
@@ -266,9 +266,7 @@ COPY --from=builder --chown=agent:agent /app/prebuilt-embeddings-cache /app/preb
 
 # Copy assets directly from build context (not part of Rust compilation)
 COPY --chown=agent:agent config /app/config
-COPY --chown=agent:agent skills /app/skills
 COPY --chown=agent:agent assets /app/assets
-RUN test -d /app/skills && find /app/skills -mindepth 2 -maxdepth 2 -name SKILL.md | grep -q .
 # Copy frontend assets (built in Docker, not from host)
 COPY --from=frontend-builder --chown=agent:agent /app/frontend/dist /app/frontend/dist
 # frontend/legacy is optional (static fallback assets)
@@ -290,6 +288,9 @@ ENV TS_USERSPACE=true
 # Playwright automation is optional in the slim image. When enabled, the bridge
 # uses a system Chromium binary instead of the full Playwright browser bundle.
 ENV PLAYWRIGHT_BROWSERS_PATH=/app/.playwright-browsers
+ENV PLAYWRIGHT_HEADLESS=false
+ENV PLAYWRIGHT_LIVE_VIEW_PORT=6080
+ENV PLAYWRIGHT_LIVE_VIEW_PATH=/vnc.html?autoconnect=1&resize=remote&path=websockify
 # Default bridge URL for in-container Playwright service
 ENV PLAYWRIGHT_BRIDGE_URL=http://127.0.0.1:3100
 # Secure logging: suppress SQLx queries to prevent sensitive data exposure
@@ -297,6 +298,7 @@ ENV RUST_LOG=info,sqlx::query=warn,sea_orm=warn,hyper=warn,reqwest=warn
 
 # Expose HTTP API port
 EXPOSE 8990
+EXPOSE 6080
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \

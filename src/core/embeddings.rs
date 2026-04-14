@@ -27,10 +27,7 @@ enum LocalEmbeddingStatus {
     Idle,
     Preparing,
     Ready,
-    Failed {
-        error: String,
-        retry_after: Instant,
-    },
+    Failed { error: String, retry_after: Instant },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

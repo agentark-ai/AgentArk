@@ -68,14 +68,14 @@ pub(super) async fn gmail_oauth_start(
                     error: "Gmail not configured. Add credentials in Settings > Gmail.".to_string(),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     };
 
     let redirect_uri = match oauth_redirect_uri_for_request(&state, &headers, None) {
         Ok(value) => value,
         Err(error) => {
-            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response()
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response();
         }
     };
     let (state_token, code_challenge) =
@@ -1761,7 +1761,7 @@ pub(super) async fn disconnect_integration(
                         error: format!("Config error: {}", e),
                     }),
                 )
-                    .into_response()
+                    .into_response();
             }
         };
 
@@ -1895,7 +1895,7 @@ pub(super) async fn configure_integration(
                     error: format!("Config error: {}", e),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -2205,8 +2205,10 @@ pub(super) async fn configure_integration(
                                 Some(state.agent.clone()),
                             );
                             if let Err(error) =
-                                crate::core::integration_sync::ensure_default_enabled(&sync_ctx, &id)
-                                    .await
+                                crate::core::integration_sync::ensure_default_enabled(
+                                    &sync_ctx, &id,
+                                )
+                                .await
                             {
                                 tracing::warn!(
                                     "Failed to enable default background sync for {}: {}",
@@ -2324,7 +2326,7 @@ pub(super) async fn enable_integration(
                         error: format!("Config error: {}", e),
                     }),
                 )
-                    .into_response()
+                    .into_response();
             }
         };
         let has_refresh_token = if id == "gmail" {
@@ -2669,7 +2671,7 @@ pub(super) async fn configure_google_workspace(
                     error: format!("Config error: {}", e),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -2711,7 +2713,7 @@ pub(super) async fn configure_google_workspace(
                         error: error.to_string(),
                     }),
                 )
-                    .into_response()
+                    .into_response();
             }
         }
     } else if let (Some(client_id), Some(client_secret)) = (manual_client_id, manual_client_secret)
@@ -2857,7 +2859,7 @@ pub(super) async fn configure_gmail(
                     error: "Missing client_id".to_string(),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     };
     let client_secret = match request.get("client_secret").and_then(|v| v.as_str()) {
@@ -2869,7 +2871,7 @@ pub(super) async fn configure_gmail(
                     error: "Missing client_secret".to_string(),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -2889,7 +2891,7 @@ pub(super) async fn configure_gmail(
                     error: format!("Config error: {}", e),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -2926,7 +2928,7 @@ pub(super) async fn configure_calendar(
                     error: "Missing client_id".to_string(),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     };
     let client_secret = match request.get("client_secret").and_then(|v| v.as_str()) {
@@ -2938,7 +2940,7 @@ pub(super) async fn configure_calendar(
                     error: "Missing client_secret".to_string(),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -2958,7 +2960,7 @@ pub(super) async fn configure_calendar(
                     error: format!("Config error: {}", e),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -3030,7 +3032,7 @@ pub(super) async fn calendar_oauth_start(
     let redirect_uri = match oauth_redirect_uri_for_request(&state, &headers, None) {
         Ok(value) => value,
         Err(error) => {
-            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response()
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response();
         }
     };
     let (state_token, code_challenge) =
@@ -3183,7 +3185,7 @@ pub(super) async fn calendar_status(State(state): State<AppState>) -> Response {
                 StatusCode::OK,
                 Json(serde_json::json!({"connected": false})),
             )
-                .into_response()
+                .into_response();
         }
     };
     let payload = match manager.get_custom_secret("calendar_tokens") {
@@ -3193,7 +3195,7 @@ pub(super) async fn calendar_status(State(state): State<AppState>) -> Response {
                 StatusCode::OK,
                 Json(serde_json::json!({"connected": false})),
             )
-                .into_response()
+                .into_response();
         }
     };
     let parsed: serde_json::Value =
@@ -3234,7 +3236,7 @@ pub(super) async fn calendar_test(State(state): State<AppState>) -> Response {
                     error: format!("Calendar token error: {}", e),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -3250,7 +3252,7 @@ pub(super) async fn calendar_test(State(state): State<AppState>) -> Response {
                     error: format!("HTTP error: {}", e),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     };
 

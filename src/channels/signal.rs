@@ -209,7 +209,10 @@ pub async fn handle_webhook(
         .get("x-agentark-bridge-token")
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
-    if token.trim() != config.bridge_token.trim() {
+    if !crate::security::constant_time_eq(
+        token.trim().as_bytes(),
+        config.bridge_token.trim().as_bytes(),
+    ) {
         return Err(anyhow!("Signal bridge token mismatch"));
     }
     let event = serde_json::from_slice::<SignalBridgeEvent>(raw_body)?;

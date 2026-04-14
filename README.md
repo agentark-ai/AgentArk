@@ -86,31 +86,32 @@ Your data stays with you. Your secrets are encrypted. You keep the final say on 
 
 ## Architecture
 
-```
-  Telegram / WhatsApp / Web UI / CLI
-          │
-          ▼
-  ┌───────────────────────────┐
-  │       HTTP Gateway        │  ← API, channels, auth, rate limiting
-  └─────────────┬─────────────┘
-                │
-    ┌───────────┼───────────┐
-    ▼           ▼           ▼
- ┌──────┐  ┌────────┐  ┌──────────┐
- │Agent │  │Sentinel│  │ Executor │
- │Engine│  │ & Cron │  │ Sandbox  │
- └──┬───┘  └────┬───┘  └────┬─────┘
-    │           │            │
-    ▼           ▼            ▼
- ┌──────────────────────────────────┐
- │  PostgreSQL + Encrypted Storage  │
- │  Memory · Tasks · Documents ·    │
- │  Secrets · Execution History     │
- └──────────────────────────────────┘
+```text
+Telegram / WhatsApp / Web UI / CLI
+                |
+                v
++---------------------------+
+|       HTTP Gateway        |  <- API, channels, auth, rate limiting
++-------------+-------------+
+              |
+    +---------+---------+
+    |         |         |
+    v         v         v
++--------+ +---------------+ +------------+
+| Agent  | | ArkSentinel   | | Executor   |
+| Engine | | & Cron        | | Sandbox    |
++----+---+ +-------+-------+ +-----+------+
+     |             |               |
+     v             v               v
++----------------------------------+
+| PostgreSQL + Encrypted Storage   |
+| Memory | Tasks | Documents |     |
+| Secrets | Execution History      |
++----------------------------------+
 ```
 
 **Agent Engine** - LLM routing, multi-provider support, sub-agent orchestration, self-evolve pipeline
-**Sentinel & Cron** - Background watchers, scheduled tasks, learning loops, health monitoring
+**ArkSentinel & Cron** - Background watchers, scheduled tasks, learning loops, health monitoring
 **Executor Sandbox** - WASM (Wasmtime) + Docker isolation for code execution, browser automation, app deployment
 
 ---
@@ -369,7 +370,7 @@ ollama launch opencode
 
 - Docker Compose starts Postgres and all internal services automatically
 - Local embeddings use `BAAI/bge-small-en-v1.5` by default; external OpenAI-compatible endpoints supported
-- Bundled skills live under `/app/skills`; user data under `/app/data`
+- User-installed skills live under `/app/data`; app/runtime data stays under Docker volumes
 - Keep Docker volumes attached when updating - `docker compose down -v` is a full reset
 
 ---
@@ -461,6 +462,13 @@ AGENTARK_DEBUG=true docker compose up        # full debug
 RUST_LOG=info,agentark=debug docker compose up   # agent internals only
 ```
 </details>
+
+---
+
+## Roadmap
+
+- Support multiple accounts per provider across integrations, channels, and reasoning, with project-scoped account management and selection.
+- Let users refine an active chat run with extra instructions while AgentArk is still working.
 
 ---
 

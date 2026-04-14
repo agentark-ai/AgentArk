@@ -10,7 +10,6 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -384,70 +383,18 @@ fn strip_automation_meta(value: &serde_json::Value) -> serde_json::Value {
 }
 
 fn normalize_signature_text(value: &str) -> String {
-    value
-        .trim()
-        .to_ascii_lowercase()
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch.is_ascii_whitespace() {
-                ch
-            } else {
-                ' '
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .take(40)
-        .collect::<Vec<_>>()
-        .join(" ")
+    super::task::normalize_signature_text(value)
 }
 
 fn watcher_topic_signature(poll_arguments: &serde_json::Value, description: &str) -> String {
     let cleaned = strip_automation_meta(poll_arguments);
-    let preferred = ["query", "url", "topic", "target", "app_id", "id"]
-        .iter()
-        .find_map(|key| cleaned.get(*key).and_then(|value| value.as_str()))
-        .unwrap_or(description);
-    normalize_signature_text(preferred)
-}
-
-fn normalized_topic_tokens(value: &str) -> BTreeSet<String> {
-    normalize_signature_text(value)
-        .split_whitespace()
-        .filter(|token| token.len() >= 3)
-        .map(|token| token.to_string())
-        .collect()
-}
-
-fn topics_are_similar(left: &str, right: &str) -> bool {
-    if left == right {
-        return true;
+    let arguments_signature = super::task::canonical_signature_value(&cleaned);
+    let description_signature = normalize_signature_text(description);
+    match (arguments_signature.as_str(), description_signature.as_str()) {
+        ("{}" | "null", description) => description.to_string(),
+        (arguments, "") => arguments.to_string(),
+        (arguments, description) => format!("{}|{}", description, arguments),
     }
-    if left.is_empty() || right.is_empty() {
-        return false;
-    }
-    if left.contains(right) || right.contains(left) {
-        return true;
-    }
-
-    let left_tokens = normalized_topic_tokens(left);
-    let right_tokens = normalized_topic_tokens(right);
-    if left_tokens.is_empty() || right_tokens.is_empty() {
-        return false;
-    }
-
-    let shared = left_tokens.intersection(&right_tokens).count();
-    let largest = left_tokens.len().max(right_tokens.len());
-    shared >= 4 && (shared as f32 / largest as f32) >= 0.6
-}
-
-fn topics_overlap_lightly(left: &str, right: &str) -> bool {
-    let left_tokens = normalized_topic_tokens(left);
-    let right_tokens = normalized_topic_tokens(right);
-    if left_tokens.is_empty() || right_tokens.is_empty() {
-        return false;
-    }
-    left_tokens.intersection(&right_tokens).count() >= 2
 }
 
 fn watcher_origin_scope_signature(
@@ -606,19 +553,9 @@ impl WatcherManager {
             watcher_topic_signature(&existing.poll_arguments, &existing.description);
         let candidate_topic =
             watcher_topic_signature(&candidate.poll_arguments, &candidate.description);
-        if topics_are_similar(&existing_topic, &candidate_topic) {
-            return true;
-        }
-
-        match (
-            watcher_origin_scope_signature(&existing.poll_arguments),
-            watcher_origin_scope_signature(&candidate.poll_arguments),
-        ) {
-            (Some(left_scope), Some(right_scope)) if left_scope == right_scope => {
-                topics_overlap_lightly(&existing_topic, &candidate_topic)
-            }
-            _ => false,
-        }
+        existing_topic == candidate_topic
+            && watcher_origin_scope_signature(&existing.poll_arguments)
+                == watcher_origin_scope_signature(&candidate.poll_arguments)
     }
 
     fn replace_watcher(existing: &mut Watcher, watcher: Watcher) {
@@ -1134,7 +1071,7 @@ mod tests {
     }
 
     #[test]
-    fn watchers_are_semantically_similar_for_same_origin_fix_attempts() {
+    fn watcher_similarity_requires_exact_structural_signature() {
         let existing = watcher_with_origin(
             "Monitor current external updates every minute and notify on Telegram when materially important developments occur.",
             "Monitor current external updates every minute and notify on Telegram when materially important developments occur.",
@@ -1147,9 +1084,18 @@ mod tests {
             "conv-1",
             "proj-1",
         );
+        let exact = watcher_with_origin(
+            "Monitor current external updates every minute and notify on Telegram when materially important developments occur.",
+            "Monitor current external updates every minute and notify on Telegram when materially important developments occur.",
+            "conv-1",
+            "proj-1",
+        );
 
-        assert!(WatcherManager::watchers_are_semantically_similar(
+        assert!(!WatcherManager::watchers_are_semantically_similar(
             &existing, &candidate
+        ));
+        assert!(WatcherManager::watchers_are_semantically_similar(
+            &existing, &exact
         ));
     }
 

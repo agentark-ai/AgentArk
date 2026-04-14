@@ -28,7 +28,7 @@ import type {
   Notification,
   StatusResponse,
   Task,
-  RecommendedSkill,
+  RecommendedAction,
   SentinelFeedResponse,
   SentinelSettingsResponse,
   TraceResponse
@@ -1111,7 +1111,7 @@ export const api = {
     const to = params?.to ? `&to=${encodeURIComponent(params.to)}` : "";
     return request<LlmAnalyticsResponse>(`/analytics/llm?range=${range}&bucket=${bucket}${from}${to}`);
   },
-  executeRecommendedSkill: (action: RecommendedSkill) =>
+  executeRecommendedAction: (action: RecommendedAction) =>
       request<AutonomyActionExecutionResponse>("/autonomy/skills/execute", {
         method: "POST",
         body: JSON.stringify({ action, dry_run: false })

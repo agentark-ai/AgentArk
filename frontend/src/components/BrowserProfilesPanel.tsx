@@ -8,12 +8,12 @@ import {
   CardContent,
   Chip,
   Divider,
-  Grid as Grid2,
   MenuItem,
   Stack,
   TextField,
   Typography
 } from "@mui/material";
+import Grid2 from "@mui/material/Grid";
 import { useMemo, useState } from "react";
 import { formatUiDateTime } from "../lib/dateFormat";
 
@@ -439,3 +439,6 @@ export function BrowserProfilesPanel({
     </Box>
   );
 }
+
+
+

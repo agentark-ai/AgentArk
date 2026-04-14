@@ -8,6 +8,7 @@ pub mod autonomy;
 pub mod background_session;
 pub mod browser_profiles;
 pub mod browser_session;
+pub mod capability_router;
 pub mod config;
 pub mod connect_flow;
 pub mod connector;
@@ -47,6 +48,7 @@ pub mod watcher;
 
 pub(crate) use agent::chat_model_is_configured;
 pub(crate) use agent::queue_stream_event;
+pub(crate) use agent::AUTONOMY_SETTINGS_STORAGE_KEY;
 pub use agent::{
     Agent, ConversationMessage, ExecutionStep, ExecutionTrace, RequestExecutionHints,
     RequestPlanConfirmationMode, SecurityEvents, SecuritySnapshot, StreamEvent, UserProfile,
@@ -62,7 +64,7 @@ pub use autonomy::{
 pub use background_session::{
     background_session_id_from_automation, set_background_session_id_in_automation,
     BackgroundSession, BackgroundSessionCreate, BackgroundSessionEvent, BackgroundSessionManager,
-    BackgroundSessionStatus, BackgroundSessionUpdate,
+    BackgroundSessionPolicy, BackgroundSessionStatus, BackgroundSessionUpdate,
 };
 pub use browser_profiles::{
     BrowserLoginState, BrowserProfileControlPlane, BrowserProfileListResponse,

@@ -10,11 +10,11 @@ import {
   CardContent,
   Chip,
   Divider,
-  Grid as Grid2,
   Stack,
   TextField,
   Typography
 } from "@mui/material";
+import Grid2 from "@mui/material/Grid";
 import { formatUiDateTime } from "../lib/dateFormat";
 
 export type ChannelConnectionState =
@@ -465,3 +465,6 @@ export function ChannelsControlPanel({
     </Box>
   );
 }
+
+
+

@@ -1718,7 +1718,7 @@ pub(super) async fn delete_webhook_source(
                     error: error.to_string(),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     };
     let before = sources.len();
@@ -1810,7 +1810,7 @@ pub(super) async fn handle_inbound_webhook(
                     error: error.to_string(),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     };
     let Some(source_index) = sources.iter().position(|source| source.id == source_id) else {
@@ -1910,7 +1910,7 @@ pub(super) async fn test_webhook_source(
                     error: error.to_string(),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     };
     let Some(source_index) = sources.iter().position(|source| source.id == source_id) else {
@@ -2001,6 +2001,7 @@ mod tests {
                 last_trace,
                 tasks,
                 chat_task_cancellations: Arc::new(RwLock::new(HashMap::new())),
+                chat_conversation_cancellations: Arc::new(RwLock::new(HashMap::new())),
                 user_profile,
                 tiered_rate_limiter: TieredRateLimiter::new(),
                 api_key: Arc::new(RwLock::new(None)),

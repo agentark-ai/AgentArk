@@ -395,7 +395,6 @@ pub fn looks_like_agentark_help_query(message: &str) -> bool {
             "daily brief",
             "plugin sdk",
             "google workspace",
-            "bundled skills",
             "skill import",
             "embedding provider",
             "local embeddings",
@@ -514,6 +513,8 @@ pub fn infer_help_topics(message: &str) -> Vec<&'static str> {
         &[
             "self learning",
             "self-learning",
+            "arkevolve",
+            "ark evolve",
             "background learning",
             "reflection pass",
             "experience consolidation",
@@ -530,7 +531,13 @@ pub fn infer_help_topics(message: &str) -> Vec<&'static str> {
     }
     if topic_matches(
         message,
-        &["sentinel", "background learning", "ambient engine"],
+        &[
+            "sentinel",
+            "arksentinel",
+            "ark sentinel",
+            "background learning",
+            "ambient engine",
+        ],
         &[],
     ) {
         topics.push("sentinel");
@@ -687,7 +694,7 @@ pub fn infer_help_topics(message: &str) -> Vec<&'static str> {
     }
     if topic_matches(
         message,
-        &["skill import", "bundled skills"],
+        &["skill import"],
         &["skills", "skill", "capability"],
     ) {
         topics.push("skills");
@@ -858,9 +865,9 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
             "Durable queue, schedules, and approvals.",
         ),
         (
-            "Sentinel",
+            "ArkSentinel",
             "/sentinel",
-            "Ambient engine view with proposals, observations, and Background learning status.",
+            "ArkSentinel view with proposals, observations, and Background learning status.",
         ),
         (
             "Watchers",
@@ -1067,21 +1074,21 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
         ),
     });
 
-    let evolution_content = "Self-learning and evolution surfaces in the current UI.\n\n\
-- Evolution | Main self-learning page with What happened, What helped, Tests running, Review, and Controls tabs.\n\
-- Sentinel > Background learning | Live status for reflection pass, experience consolidation, pattern induction, and candidate generation.\n\
-- Evolution > What happened | Recent tested or promoted changes with lineage and plain-language summaries.\n\
-- Evolution > What helped | Measured impact from prompt, classifier, specialist, and routing changes.\n\
-- Evolution > Tests running | Canary rollout, baseline version, candidate version, and gate result for each evolvable surface.\n\
-- Evolution > Review | Draft workflow, strategy, and memory candidates waiting for review.\n\
-- Evolution > Controls | Self-evolve toggle, learning toggle, local-only mode, default app access guard, and developer-mode canary actions.\n\
+    let evolution_content = "ArkEvolve and self-learning surfaces in the current UI.\n\n\
+- ArkEvolve | Main self-learning page with What happened, What helped, Tests running, Review, and Controls tabs.\n\
+- ArkSentinel > Background learning | Live status for reflection pass, experience consolidation, pattern induction, and candidate generation.\n\
+- ArkEvolve > What happened | Recent tested or promoted changes with lineage and plain-language summaries.\n\
+- ArkEvolve > What helped | Measured impact from prompt, classifier, specialist, and routing changes.\n\
+- ArkEvolve > Tests running | Canary rollout, baseline version, candidate version, and gate result for each evolvable surface.\n\
+- ArkEvolve > Review | Draft workflow, strategy, and memory candidates waiting for review.\n\
+- ArkEvolve > Controls | Self-evolve toggle, learning toggle, local-only mode, default app access guard, and developer-mode canary actions.\n\
 - Learned Memory | Durable facts, rules, lessons, and memory extracted from runs.\n\
 - Learned Procedures | Repeated successful workflows distilled into procedures.\n\
 - Recent Experience Runs | Recent evidence feeding the learning system.\n\
 - Learning Candidates | Draft workflow/strategy/memory actions waiting for review.\n\
 - Canary History and Strategy Metrics | Diagnostics for policy rollout and promotion decisions.";
     items.push(SeedKnowledgeItem {
-        title: "Evolution and self-learning surfaces".to_string(),
+        title: "ArkEvolve and self-learning surfaces".to_string(),
         content: evolution_content.to_string(),
         source: RUNTIME_SOURCE,
         url: Some(crate::branding::help_uri("help/runtime/evolution")),
@@ -1259,6 +1266,9 @@ mod tests {
             "How does self-learning work in {}?",
             crate::branding::PRODUCT_NAME
         )));
+        assert!(
+            infer_help_topics("What has ArkEvolve learned recently?").contains(&"self_learning")
+        );
         assert!(matches!(
             infer_help_mode("Is self-learning enabled right now?"),
             ProductHelpMode::Explain
@@ -1268,9 +1278,9 @@ mod tests {
     #[test]
     fn detects_background_learning_help_queries() {
         assert!(looks_like_agentark_help_query(
-            "Check background learning status in Sentinel"
+            "Check background learning status in ArkSentinel"
         ));
-        let topics = infer_help_topics("Why is background learning in Sentinel not running?");
+        let topics = infer_help_topics("Why is background learning in ArkSentinel not running?");
         assert!(topics.contains(&"self_learning"));
         assert!(topics.contains(&"sentinel"));
         assert!(matches!(

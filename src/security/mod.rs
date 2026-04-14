@@ -30,6 +30,17 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::HashSet;
 
+pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.iter().zip(right.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
 /// Security guard that filters inputs and outputs
 pub struct SecurityGuard {
     /// Patterns that indicate prompt injection attempts
@@ -371,10 +382,6 @@ impl SecurityGuard {
             "secret-key",
             "access_token",
             "bearer ",
-            // Common service prefixes
-            "anthropic",
-            "openai",
-            "claude",
             "telegram_bot_token",
             "bot_token",
             // Internal markers
@@ -449,20 +456,23 @@ impl SecurityGuard {
             } else {
                 redacted_secret_output.text.clone()
             };
-        let mut redactions = redacted_secret_output.redactions;
+        let redactions = redacted_secret_output.redactions;
 
-        // Check for sensitive keywords
+        // Keyword hits are useful for internal diagnostics, but they are not proof that
+        // content was actually redacted.
         let lower = output.to_lowercase();
-        for keyword in &self.sensitive_keywords {
-            if lower.contains(keyword) {
-                redactions.push(format!("Potential sensitive data: {}", keyword));
-            }
-        }
+        let keyword_warnings = self
+            .sensitive_keywords
+            .iter()
+            .filter(|keyword| lower.contains(keyword.as_str()))
+            .map(|keyword| format!("Potential sensitive data: {}", keyword))
+            .collect::<Vec<_>>();
 
         let _is_clean = redactions.is_empty();
         FilteredOutput {
             text: filtered,
             redactions,
+            _warnings: keyword_warnings,
             _is_clean,
         }
     }
@@ -513,6 +523,7 @@ pub struct SanitizedInput {
 pub struct FilteredOutput {
     pub text: String,
     pub redactions: Vec<String>,
+    pub _warnings: Vec<String>,
     pub _is_clean: bool,
 }
 
@@ -635,5 +646,15 @@ mod tests {
         assert!(result.had_secret());
         assert!(result.text.contains("token=[REDACTED_SECRET]"));
         assert!(!result.text.contains("supersecretvalue123456"));
+    }
+
+    #[test]
+    fn test_output_filtering_does_not_flag_plain_vendor_mentions_as_redactions() {
+        let guard = SecurityGuard::new(true);
+
+        let output = "Top headlines mention OpenAI and Anthropic funding activity.";
+        let filtered = guard.filter_output(output);
+        assert!(filtered.redactions.is_empty());
+        assert_eq!(filtered.text, output);
     }
 }

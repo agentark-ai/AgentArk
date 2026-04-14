@@ -55,6 +55,35 @@ pub struct BackgroundSessionEvent {
     pub actor: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BackgroundSessionPolicy {
+    #[serde(default)]
+    pub allowed_action_roles: Vec<String>,
+    #[serde(default)]
+    pub allowed_integration_classes: Vec<String>,
+}
+
+impl BackgroundSessionPolicy {
+    pub fn normalized(mut self) -> Self {
+        self.allowed_action_roles = normalize_policy_values(&self.allowed_action_roles);
+        self.allowed_integration_classes =
+            normalize_policy_values(&self.allowed_integration_classes);
+        self
+    }
+
+    pub fn is_unset(&self) -> bool {
+        self.allowed_action_roles.is_empty() && self.allowed_integration_classes.is_empty()
+    }
+
+    pub fn allows(&self, action_role: &str, integration_class: &str) -> bool {
+        let role = normalize_policy_value(action_role);
+        let class = normalize_policy_value(integration_class);
+        (self.allowed_action_roles.is_empty() || self.allowed_action_roles.contains(&role))
+            && (self.allowed_integration_classes.is_empty()
+                || self.allowed_integration_classes.contains(&class))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackgroundSession {
     pub id: String,
@@ -85,6 +114,8 @@ pub struct BackgroundSession {
     pub linked_task_ids: Vec<String>,
     #[serde(default)]
     pub linked_watcher_ids: Vec<String>,
+    #[serde(default)]
+    pub policy: BackgroundSessionPolicy,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub last_activity_at: DateTime<Utc>,
@@ -121,6 +152,8 @@ pub struct BackgroundSessionCreate {
     pub task_ids: Vec<String>,
     #[serde(default)]
     pub watcher_ids: Vec<String>,
+    #[serde(default)]
+    pub policy: BackgroundSessionPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -145,8 +178,11 @@ pub struct BackgroundSessionUpdate {
     pub last_error: Option<String>,
     #[serde(default)]
     pub preferred_delivery_channel: Option<String>,
+    #[serde(default)]
+    pub policy: Option<BackgroundSessionPolicy>,
 }
 
+#[derive(Clone)]
 pub struct BackgroundSessionManager {
     sessions: Arc<RwLock<HashMap<String, BackgroundSession>>>,
     storage: Option<crate::storage::Storage>,
@@ -189,6 +225,34 @@ fn normalize_id_list(values: &[String]) -> Vec<String> {
                 Some(trimmed.to_string())
             } else {
                 None
+            }
+        })
+        .collect()
+}
+
+fn normalize_policy_value(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>()
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+fn normalize_policy_values(values: &[String]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    values
+        .iter()
+        .filter_map(|value| {
+            let normalized = normalize_policy_value(value);
+            if normalized.is_empty() || !seen.insert(normalized.clone()) {
+                None
+            } else {
+                Some(normalized)
             }
         })
         .collect()
@@ -300,7 +364,10 @@ impl BackgroundSessionManager {
                 Ok(Some(raw)) => match serde_json::from_slice::<Vec<BackgroundSession>>(&raw) {
                     Ok(items) => items
                         .into_iter()
-                        .map(|session| (session.id.clone(), session))
+                        .map(|mut session| {
+                            session.policy = session.policy.normalized();
+                            (session.id.clone(), session)
+                        })
                         .collect(),
                     Err(error) => {
                         tracing::warn!(
@@ -415,6 +482,7 @@ impl BackgroundSessionManager {
             project_id: normalize_text_field(request.project_id, 120),
             linked_task_ids: normalize_id_list(&request.task_ids),
             linked_watcher_ids: normalize_id_list(&request.watcher_ids),
+            policy: request.policy.normalized(),
             created_at: now,
             updated_at: now,
             last_activity_at: now,
@@ -528,6 +596,13 @@ impl BackgroundSessionManager {
                 "preferred_delivery_channel",
                 120,
             );
+            if let Some(policy) = request.policy {
+                let policy = policy.normalized();
+                if policy != session.policy {
+                    session.policy = policy;
+                    changed_fields.push("policy");
+                }
+            }
 
             if changed_fields.is_empty() {
                 return Some(session.clone());

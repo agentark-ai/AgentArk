@@ -471,19 +471,30 @@ Thresholds: long_question_word_threshold={}, long_message_word_threshold={}, mul
         }
     }
 
-    /// Conservative fallback used when semantic routing is unavailable.
+    /// Structural fallback used when semantic routing is unavailable.
     pub(crate) async fn classify_complexity_fallback(
         &self,
         message: &str,
         actions: &[crate::actions::ActionDef],
     ) -> crate::core::task_router::RoutingDecision {
-        let _ = (self, message, actions);
+        let _ = actions;
+        let (policy, _) = self
+            .load_routing_complexity_policy_for_message(message)
+            .await;
+        let score = Self::structural_complexity_score(message, &policy);
+        let complexity = if score >= policy.complex_score_threshold {
+            QueryComplexity::Complex
+        } else if score >= policy.medium_score_threshold {
+            QueryComplexity::Medium
+        } else {
+            QueryComplexity::Simple
+        };
         crate::core::task_router::RoutingDecision {
             needs_delegation: false,
-            complexity: QueryComplexity::Simple,
+            complexity,
             sub_agents: vec![],
-            reasoning: "Conservative fallback classification".to_string(),
-            confidence: 0.40,
+            reasoning: "Structural fallback classification".to_string(),
+            confidence: score,
             should_clarify: false,
             clarification_question: None,
         }

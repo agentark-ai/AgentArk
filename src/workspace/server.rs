@@ -110,13 +110,20 @@ async fn health(State(state): State<WorkspaceState>) -> impl IntoResponse {
     })
 }
 
-async fn status(State(state): State<WorkspaceState>) -> impl IntoResponse {
+async fn status(
+    State(state): State<WorkspaceState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = authorize_internal(&headers, state.config.token.as_deref()) {
+        return status.into_response();
+    }
     Json(WorkspaceStatusResponse {
         service: "workspace".to_string(),
         mode: "workspace".to_string(),
         root_dir: state.config.root_dir.clone(),
         token_configured: state.config.token.is_some(),
     })
+    .into_response()
 }
 
 fn authorize_internal(
@@ -131,7 +138,9 @@ fn authorize_internal(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::trim);
-    if provided == Some(expected) {
+    if provided.is_some_and(|value| {
+        crate::security::constant_time_eq(value.as_bytes(), expected.as_bytes())
+    }) {
         Ok(())
     } else {
         Err(StatusCode::UNAUTHORIZED)

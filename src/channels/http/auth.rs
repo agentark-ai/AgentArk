@@ -132,24 +132,15 @@ pub(super) fn extract_bearer_api_key(headers: &HeaderMap) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (a, b) in left.iter().zip(right.iter()) {
-        diff |= a ^ b;
-    }
-    diff == 0
-}
-
 pub(super) fn has_valid_bearer_api_key(headers: &HeaderMap, expected_key: Option<&str>) -> bool {
     let Some(expected_key) = expected_key else {
         return false;
     };
     extract_bearer_api_key(headers)
         .as_deref()
-        .is_some_and(|provided| constant_time_eq(provided.as_bytes(), expected_key.as_bytes()))
+        .is_some_and(|provided| {
+            crate::security::constant_time_eq(provided.as_bytes(), expected_key.as_bytes())
+        })
 }
 
 fn extract_ui_session_cookie(headers: &HeaderMap) -> Option<String> {
@@ -250,9 +241,9 @@ fn parsed_same_origin_referer_path(headers: &HeaderMap) -> Option<String> {
         return None;
     }
     let url = reqwest::Url::parse(referer).ok()?;
-    let referer_host = normalize_host_for_compare(url.host_str()?);
-    let request_host = extract_request_host(headers)?;
-    if referer_host != request_host {
+    let referer_origin = normalize_origin(referer)?;
+    let request_origin = extract_request_origin(headers)?;
+    if referer_origin != request_origin {
         return None;
     }
     Some(url.path().to_string())
@@ -606,7 +597,7 @@ pub(super) async fn bootstrap_ui_session(
                     error: format!("API authentication is temporarily unavailable: {}", e),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -792,4 +783,37 @@ pub(super) async fn logout_ui_session(
         (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response();
     clear_session_cookie(&mut response, secure);
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    fn loopback_addr() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 45678)
+    }
+
+    #[test]
+    fn trusted_local_ui_api_request_accepts_exact_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("localhost:8990"));
+        headers.insert(
+            header::REFERER,
+            HeaderValue::from_static("http://localhost:8990/ui/v2"),
+        );
+        assert!(is_trusted_local_ui_api_request(&headers, loopback_addr()));
+    }
+
+    #[test]
+    fn trusted_local_ui_api_request_rejects_different_local_port() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("localhost:8990"));
+        headers.insert(
+            header::REFERER,
+            HeaderValue::from_static("http://localhost:3000/ui/v2"),
+        );
+        assert!(!is_trusted_local_ui_api_request(&headers, loopback_addr()));
+    }
 }

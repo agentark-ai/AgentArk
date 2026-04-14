@@ -47,6 +47,23 @@ function parseDateInput(value: DateInput): { raw: string; date: Date | null } {
     const date = new Date(Number(year), Number(month) - 1, Number(day));
     return { raw, date: Number.isNaN(date.getTime()) ? null : date };
   }
+  const naiveUtcDateTimeMatch = raw.match(
+    /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/
+  );
+  if (naiveUtcDateTimeMatch) {
+    const [, year, month, day, hour, minute, second = "0"] = naiveUtcDateTimeMatch;
+    const date = new Date(
+      Date.UTC(
+        Number(year),
+        Number(month) - 1,
+        Number(day),
+        Number(hour),
+        Number(minute),
+        Number(second)
+      )
+    );
+    return { raw, date: Number.isNaN(date.getTime()) ? null : date };
+  }
   const date = new Date(raw);
   return { raw, date: Number.isNaN(date.getTime()) ? null : date };
 }

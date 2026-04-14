@@ -895,7 +895,7 @@ pub async fn verify_webhook(
         .get("hub.verify_token")
         .ok_or_else(|| anyhow!("Missing hub.verify_token parameter"))?;
 
-    if token != verify_token {
+    if !crate::security::constant_time_eq(token.as_bytes(), verify_token.as_bytes()) {
         return Err(anyhow!("Verify token mismatch"));
     }
 
@@ -1457,7 +1457,7 @@ async fn handle_command(text: &str, agent: &SharedAgent, from: &str) -> String {
                  /status - Agent status\n\
                  /skills - List available skills\n\
                  /install <url> - Install a skill from URL\n\
-                 /run <skill> [query] - Run a custom/bundled skill\n\
+                 /run <skill> [query] - Run a custom skill\n\
                  /tasks - View pending tasks\n\
                  /approve-task <task_id> - Approve a waiting task\n\
                  /reject-task <task_id> - Reject a waiting task\n\

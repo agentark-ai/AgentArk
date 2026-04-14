@@ -70,6 +70,9 @@ const ApprovalPromptOverlay = lazy(() =>
 const GuidedTour = lazy(() =>
   import("./components/GuidedTour").then((module) => ({ default: module.GuidedTour }))
 );
+const BrowserHandoffPage = lazy(() =>
+  import("./components/BrowserHandoffPage").then((module) => ({ default: module.BrowserHandoffPage }))
+);
 
 function WorkspacePaneFallback() {
   return (
@@ -223,8 +226,16 @@ const NAV_GROUPS: NavGroup[] = [
       { key: "apps", label: "Apps", icon: <AppsRoundedIcon fontSize="small" /> },
       { key: "swarm", label: "Agents", icon: <HubRoundedIcon fontSize="small" /> },
       { key: "goals", label: "Goals", icon: <FlagRoundedIcon fontSize="small" /> },
-      { key: "evolution", label: "Evolution", icon: <AutoGraphRoundedIcon fontSize="small" /> },
       { key: "moltbook", label: "Moltbook", icon: <AutoStoriesRoundedIcon fontSize="small" /> },
+    ]
+  },
+  {
+    id: "ark_core",
+    label: "Ark Core",
+    items: [
+      { key: "sentinel", label: "ArkSentinel", icon: <NotificationsActiveRoundedIcon fontSize="small" /> },
+      { key: "evolution", label: "ArkEvolve", icon: <AutoGraphRoundedIcon fontSize="small" /> },
+      { key: "arkpulse", label: "ArkPulse", icon: <MonitorHeartRoundedIcon fontSize="small" /> },
     ]
   },
   {
@@ -234,8 +245,6 @@ const NAV_GROUPS: NavGroup[] = [
       { key: "tasks", label: "Tasks", icon: <TaskRoundedIcon fontSize="small" /> },
       { key: "sessions", label: "Sessions", icon: <HubRoundedIcon fontSize="small" /> },
       { key: "status", label: "Watchers", icon: <VisibilityRoundedIcon fontSize="small" /> },
-      { key: "arkpulse", label: "ArkPulse", icon: <MonitorHeartRoundedIcon fontSize="small" /> },
-      { key: "sentinel", label: "Sentinel", icon: <NotificationsActiveRoundedIcon fontSize="small" /> },
       { key: "trace", label: "Trace", icon: <TimelineRoundedIcon fontSize="small" /> },
     ]
   },
@@ -362,6 +371,16 @@ function resolveViewFromPath(pathname: string): { view: ViewKey; matched: boolea
   }
 
   return { view: "overview", matched: false };
+}
+
+function resolveBrowserHandoffPath(pathname: string): string | null {
+  const normalized = pathname.replace(/\/+$/, "");
+  const uiPrefix = "/ui/browser-handoff/";
+  if (normalized.startsWith(uiPrefix)) {
+    const sessionId = normalized.slice(uiPrefix.length).split("/")[0]?.trim() || "";
+    return sessionId || null;
+  }
+  return null;
 }
 
 function formatMetaValue(value: unknown): { text: string; href?: string } {
@@ -571,6 +590,9 @@ export default function App() {
   const openNotification = useUiStore((s) => s.openNotification);
   const closeNotification = useUiStore((s) => s.closeNotification);
   const [view, setViewState] = useState<ViewKey>(() => resolveViewFromPath(window.location.pathname).view);
+  const [browserHandoffSessionId, setBrowserHandoffSessionId] = useState<string | null>(
+    () => resolveBrowserHandoffPath(window.location.pathname)
+  );
   const [lastNonSettingsView, setLastNonSettingsView] = useState<ViewKey>("overview");
   const [settingsInitialTab, setSettingsInitialTab] = useState<number | null>(null);
   const showAdvanced = useUiStore((s) => s.showAdvancedByView[view] ?? false);
@@ -602,6 +624,7 @@ export default function App() {
   const navigateToView = (nextViewRaw: ViewKey | string, replace = false) => {
     const nextView = normalizeViewKey(nextViewRaw);
     const nextPath = viewPath(nextView);
+    setBrowserHandoffSessionId(null);
     if (window.location.pathname !== nextPath) {
       const nextUrl = `${nextPath}${window.location.search}`;
       if (replace) {
@@ -618,6 +641,11 @@ export default function App() {
 
   useEffect(() => {
     const syncFromLocation = (replaceInvalid: boolean) => {
+      const handoffSessionId = resolveBrowserHandoffPath(window.location.pathname);
+      setBrowserHandoffSessionId(handoffSessionId);
+      if (handoffSessionId) {
+        return;
+      }
       const normalizedPath = window.location.pathname.replace(/\/+$/, "");
       if (replaceInvalid && normalizedPath.startsWith("/ui/memory")) {
         const params = new URLSearchParams(window.location.search);
@@ -1010,6 +1038,17 @@ export default function App() {
     </Box>
   );
 
+  if (browserHandoffSessionId) {
+    return (
+      <Suspense fallback={<WorkspacePaneFallback />}>
+        <BrowserHandoffPage
+          sessionId={browserHandoffSessionId}
+          onBack={() => navigateToView("chat", true)}
+        />
+      </Suspense>
+    );
+  }
+
   return (
     <Box className="agi-shell">
       <Box className="bg-orb orb-a" />
@@ -1182,12 +1221,13 @@ export default function App() {
             display: "flex",
             alignItems: "center",
             justifyContent: "space-between",
-            py: 1,
-            px: 1.5,
+            py: 1.25,
+            px: 2,
+            minHeight: 48,
             borderBottom: "1px solid rgba(255, 255, 255, 0.08)"
           }}
         >
-          <Typography variant="h6">Settings</Typography>
+          <Typography variant="h6" sx={{ lineHeight: 1 }}>Settings</Typography>
           <IconButton size="small" onClick={closeSettingsModal} aria-label="Close settings">
             <CloseRoundedIcon fontSize="small" />
           </IconButton>

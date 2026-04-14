@@ -180,18 +180,14 @@ Rules:
 
 /// Default classifier prompt for chat-vs-task routing.
 pub fn chat_routing_classifier_system_prompt_v1() -> String {
-    r#"You classify how a chat request should be routed. Return strict JSON only in the form {"label":"CHAT|TASK|IMPORT_SKILL|SHARE_ONLY","work_type":"task|app|automation|workspace|research","reason":"short string"}.
+    r#"You classify how a chat request should be routed. Return strict JSON only in the form {"label":"CHAT|TASK|IMPORT_SKILL|SHARE_ONLY","work_type":"short semantic label","reason":"short string"}.
 
 Rules:
 - CHAT means answer inline without creating a background task.
 - TASK means create a task because the user wants substantial work performed.
 - IMPORT_SKILL means the user explicitly wants this runtime to install/import/add/register a skill or workflow from a referenced URL or repository.
 - SHARE_ONLY means the user is mainly sharing or saving links/references and is not asking for work now.
-- For TASK, set work_type to exactly one of: task, app, automation, workspace, research.
-- Use app for building/deploying an app/site/dashboard/UI.
-- Use automation for schedules, watchers, reminders, or monitoring flows.
-- Use workspace for file/code/repo/doc work, especially when files are attached.
-- Use research for deep-research style investigation.
+- For TASK, set work_type to a compact semantic label based on the request and available action metadata; do not force it into a fixed taxonomy.
 - If the user wants linked instructions followed now, choose TASK, not IMPORT_SKILL.
 - A URL alone is not enough for IMPORT_SKILL."#
         .to_string()
@@ -204,8 +200,8 @@ Return ONLY valid JSON. Do not include any extra text.
 
 Output schema:
 {
-  "shape": "conversation|inspection|task|watcher|app|integration|goal|unknown",
-  "execution_mode": "none|immediate|scheduled|watch_until",
+  "shape": "short semantic label",
+  "execution_mode": "none|immediate|deferred|background|poll_until|unknown",
   "confidence": 0.0,
   "should_confirm": false,
   "confirmation_question": null,
@@ -221,21 +217,14 @@ Rules:
 - Treat `planner_metadata` as the action's execution contract. Prefer actions whose role/integration class match the request without unnecessary auth, cost, or side effects.
 - Classify by the platform capability the request needs. An action can be available even if auth, setup, or connector configuration may be required later; do not call it unavailable at classification time.
 - Imperative requests asking the agent to do work now, later, repeatedly, or in the background are execution requests, not normal conversation.
-- Use `scheduled` for recurring or indefinite background work.
-- Use `watch_until` for bounded poll-until-condition monitoring with a timeout or stop condition.
-- Use `app` for building, modifying, deploying, fixing, or validating software/UI.
-- Use `integration` for connecting, configuring, scaffolding, or testing external capabilities.
+- Use `execution_mode` to describe timing and durability, not product category.
 - For `integration`, set `integration_id` only to an exact id from the provided known integration targets. If the target is unclear or missing, leave it null and set `should_confirm=true`.
-- Use `inspection` when the user mainly wants to inspect state, logs, traces, configured services, apps, tasks, watchers, or workspace/runtime information.
-- Use `conversation` only for normal chat, explanation, light Q&A, or purely conversational follow-ups.
+- Use `shape` as a compact semantic label grounded in the request and catalog metadata; do not rely on a fixed keyword taxonomy.
 - Set `product_help=true` only when the user is asking about AgentArk itself, this AgentArk instance, its setup/status/settings/capabilities, or how to use built-in AgentArk surfaces. Use `help_topics` only from the provided known product-help topics.
 - Treat first-person/about-self capability questions as AgentArk product-help requests, not generic assistant chat. Prefer the `capabilities` help topic when that is the user's intent.
-- When the recent artifact context is a research report, short follow-up questions about findings, sources, citations, contradictions, or recommendations are usually `conversation`.
-- When that same research-report follow-up clearly asks for more evidence, more sources, re-verification, updates, comparisons, or a new report, prefer `task`.
 - Set `should_confirm=true` only when the execution type or target is genuinely unclear and a wrong guess would send the work down the wrong path.
 - Keep `preferred_actions` short, use only provided action names, and favor actions that match the chosen shape.
 - When execution is needed, use `preferred_actions` to name the minimal concrete action chain the agent should try first.
-- For background monitoring that reads changing public web information, include the orchestration action and the public data-source action when both exist in the action catalog.
 - Do not leave `preferred_actions` empty when the action catalog contains a clear action for requested execution work.
 - For purely conversational clarifications, explanations, or greetings, prefer an empty `preferred_actions` list."#
         .to_string()
@@ -257,24 +246,19 @@ Output schema:
 Rules:
 - Use only the provided actions.
 - Keep the list minimal.
-- Use exact action names from the catalog. User-added and bundled skills are normal actions: select them by their name, description, capabilities, planner metadata, and schema even when the user does not name the skill.
+- Use exact action names from the catalog. User-added skills are normal actions: select them by their name, description, capabilities, planner metadata, and schema even when the user does not name the skill.
 - For purely conversational requests with no execution needed, return an empty `needed_actions` list and set `should_clarify=false`.
 - If execution is requested but no catalog action is a close semantic match, or if multiple actions are competing alternatives for the same role and none is clearly best, return an empty `needed_actions` list and set `should_clarify=true` with one short question.
 - If multiple actions are complementary steps in one execution chain, include them together.
 - Treat `planner_metadata` as a hard planning signal for role, integration class, auth, cost, and side effects.
 - Use any request-shape assessment as a semantic hint, but override it when the action catalog or recent artifact context makes a better match.
 - Prefer actions that directly inspect, operate on, modify, or validate the user's target.
-- If the user asks to build/create/deploy/run a live or public app/service and `app_deploy` is available, include `app_deploy` and prefer it over `shell`. For fresh generated app builds, also include `file_write` so the agent stages files under `/app/data/apps/new/<slug>/...` before the final deploy.
-- If that request also asks for recurring or scheduled execution and `schedule_task` is available, include `schedule_task` too.
-- If the user asks for a date/time reminder or notification and does not clearly require an external calendar write, include `schedule_task` and prefer it over workspace calendar mutation.
 - If the request refers to an existing artifact, file, deployment, or running system, prefer operational actions over topical/domain workflows that merely share keywords.
 - When recent artifact context is provided, treat it as the default target for short follow-up change requests unless the user clearly switches topics or asks to build a different artifact.
-- For fix/debug/repair requests about an existing deployed app, do not include `app_deploy` unless the user explicitly asks to rebuild, replace, or redeploy that app from scratch.
 - When an execution request depends on an unknown upload, missing runtime/tooling, dependency failure, codec/media conversion, or acquiring a capability that may need approval, include `capability_resolve` if it is available; pair it with the direct execution/repair action when that direct action is already clear, and pass that exact catalog action name as `selected_action`.
 - If the request is about what the agent can access, what is configured, or what already exists in the workspace/platform, include the relevant inventory or management actions so the agent can inspect live state instead of guessing.
 - If the request is about the current framework itself, the current workspace, chat/activity UX, traces, prompts, routing, or execution behavior, prefer local code/file/shell actions and ignore deployed-app context unless the user explicitly targets that app.
-- If you include `app_inspect` for a deployed app, also include the companion actions needed to finish the job, such as `file_read`, `file_write`, and `app_restart`. Treat `http_get` as optional validation only when it is useful and available.
-- For fix/debug/repair requests, include the minimal inspect + repair + validation path, not just the first tool."#
+- For modification or repair requests, include the minimal inspect + repair + validation path from the catalog, not just the first tool."#
         .to_string()
 }
 
@@ -297,11 +281,10 @@ Output schema:
 Rules:
 - Trigger source and delivery channel are separate decisions.
 - Treat `planner_metadata` as the execution contract for each action.
-- If the request is only a date/time reminder or notification, prefer `internal_first` and avoid `workspace`.
-- For reminder delivery, only `messaging` or `internal` are valid integration classes. Do not route through workspace mail/calendar surfaces unless the user explicitly asks for them.
+- Choose integration classes from the selected action metadata and the user's explicit delivery/source constraints.
 - If the request depends on external state such as inbox, calendar contents, websites, APIs, or monitored feeds, use `external_required` or `external_optional`.
 - If multiple channels exist and the user did not explicitly ask for fanout, keep `fanout=false`.
-- Use only these integration classes: internal, messaging, workspace, search, browser, filesystem, app, code, network, commerce, analytics, media."#
+- Use only integration classes present in the provided action catalog metadata."#
         .to_string()
 }
 

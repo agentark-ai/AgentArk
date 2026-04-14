@@ -9,8 +9,12 @@ app.use(express.json({ limit: '10mb' }));
 const PORT = process.env.PORT || 3100;
 const HOST = process.env.PLAYWRIGHT_BRIDGE_HOST || process.env.HOST || '127.0.0.1';
 const SESSION_TIMEOUT_MS = 15 * 60 * 1000; // 15 min inactivity timeout
+const HEADLESS = /^(1|true|yes|on)$/i.test(process.env.PLAYWRIGHT_HEADLESS || '');
+const LIVE_VIEW_PORT = Number.parseInt(process.env.PLAYWRIGHT_LIVE_VIEW_PORT || '6080', 10) || 6080;
+const LIVE_VIEW_PATH = process.env.PLAYWRIGHT_LIVE_VIEW_PATH || '/vnc.html?autoconnect=1&resize=remote&path=websockify';
+const LIVE_VIEW_ENABLED = !HEADLESS && Boolean(process.env.DISPLAY);
 
-// Active browser sessions: id -> { context, page, lastActivity, cleanupTimer }
+// Active browser sessions: id -> { context, page, mode, claimed, claimedAt, lastActivity, cleanupTimer }
 const sessions = new Map();
 
 let browser = null;
@@ -18,7 +22,7 @@ let browser = null;
 async function ensureBrowser() {
   if (!browser || !browser.isConnected()) {
     const launchOptions = {
-      headless: true,
+      headless: HEADLESS,
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
     };
     const executablePath = process.env.PLAYWRIGHT_EXECUTABLE_PATH;
@@ -35,6 +39,28 @@ async function ensureBrowser() {
     browser = await chromium.launch(launchOptions);
   }
   return browser;
+}
+
+async function sessionStatePayload(session) {
+  let title = '';
+  let url = '';
+  try {
+    title = await session.page.title();
+  } catch (_) {}
+  try {
+    url = session.page.url();
+  } catch (_) {}
+  return {
+    session_id: session.id,
+    mode: session.mode || (HEADLESS ? 'headless' : 'interactive'),
+    claimed: Boolean(session.claimed),
+    claimed_at: session.claimedAt || null,
+    title,
+    url,
+    live_view_enabled: LIVE_VIEW_ENABLED,
+    live_view_port: LIVE_VIEW_ENABLED ? LIVE_VIEW_PORT : null,
+    live_view_path: LIVE_VIEW_ENABLED ? LIVE_VIEW_PATH : null,
+  };
 }
 
 function touchSession(session) {
@@ -61,17 +87,27 @@ app.get('/health', (req, res) => {
 app.post('/session', async (req, res) => {
   try {
     const b = await ensureBrowser();
+    const requestedMode = String(req.body?.mode || '').trim().toLowerCase() || (HEADLESS ? 'headless' : 'interactive');
     const context = await b.newContext({
       viewport: { width: 1280, height: 720 },
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     });
     const page = await context.newPage();
     const id = uuidv4();
-    const session = { id, context, page, lastActivity: Date.now(), cleanupTimer: null };
+    const session = {
+      id,
+      context,
+      page,
+      mode: requestedMode,
+      claimed: false,
+      claimedAt: null,
+      lastActivity: Date.now(),
+      cleanupTimer: null,
+    };
     sessions.set(id, session);
     touchSession(session);
     console.log(`Session ${id} created (${sessions.size} total)`);
-    res.json({ session_id: id });
+    res.json(await sessionStatePayload(session));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -83,6 +119,46 @@ app.delete('/session/:id', async (req, res) => {
   if (!sessions.has(id)) return res.status(404).json({ error: 'Session not found' });
   await destroySession(id);
   res.json({ status: 'closed' });
+});
+
+app.get('/session/:id/state', async (req, res) => {
+  const session = sessions.get(req.params.id);
+  if (!session) return res.status(404).json({ error: 'Session not found' });
+  touchSession(session);
+  try {
+    res.json(await sessionStatePayload(session));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/session/:id/claim', async (req, res) => {
+  const session = sessions.get(req.params.id);
+  if (!session) return res.status(404).json({ error: 'Session not found' });
+  touchSession(session);
+  try {
+    session.claimed = true;
+    session.claimedAt = new Date().toISOString();
+    if (typeof session.page.bringToFront === 'function') {
+      await session.page.bringToFront();
+    }
+    res.json(await sessionStatePayload(session));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/session/:id/release', async (req, res) => {
+  const session = sessions.get(req.params.id);
+  if (!session) return res.status(404).json({ error: 'Session not found' });
+  touchSession(session);
+  try {
+    session.claimed = false;
+    session.claimedAt = null;
+    res.json(await sessionStatePayload(session));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // Navigate to URL
@@ -280,7 +356,13 @@ app.post('/session/:id/wait', async (req, res) => {
 app.get('/sessions', (req, res) => {
   const list = [];
   for (const [id, s] of sessions) {
-    list.push({ id, lastActivity: s.lastActivity, age_ms: Date.now() - s.lastActivity });
+    list.push({
+      id,
+      mode: s.mode,
+      claimed: Boolean(s.claimed),
+      lastActivity: s.lastActivity,
+      age_ms: Date.now() - s.lastActivity,
+    });
   }
   res.json({ sessions: list });
 });

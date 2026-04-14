@@ -12,12 +12,12 @@ import {
   CardContent,
   Chip,
   Divider,
-  Grid as Grid2,
   MenuItem,
   Stack,
   TextField,
   Typography
 } from "@mui/material";
+import Grid2 from "@mui/material/Grid";
 import { useMemo, useState, type JSX } from "react";
 import { formatUiDateTime } from "../lib/dateFormat";
 
@@ -505,3 +505,6 @@ export function DevicesControlPanel({
     </Box>
   );
 }
+
+
+

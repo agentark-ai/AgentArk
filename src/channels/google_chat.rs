@@ -234,7 +234,10 @@ pub async fn handle_webhook(agent: SharedAgent, payload: &serde_json::Value) -> 
         ));
     }
     let provided = payload.token.as_deref().unwrap_or("").trim();
-    if provided != config.verify_token.trim() {
+    if !crate::security::constant_time_eq(
+        provided.as_bytes(),
+        config.verify_token.trim().as_bytes(),
+    ) {
         return Err(anyhow!("Google Chat verification token mismatch"));
     }
 

@@ -11,7 +11,6 @@ import {
   DialogTitle,
   Divider,
   FormControlLabel,
-  Grid as Grid2,
   IconButton,
   Menu,
   MenuItem,
@@ -27,10 +26,12 @@ import {
   TextField,
   Typography,
 } from "@mui/material";
+import Grid2 from "@mui/material/Grid";
 import MoreVertIcon from "@mui/icons-material/MoreVert";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
+import { isBackgroundSessionVisibleInUi } from "../lib/backgroundSessions";
 import { formatUiDateTime } from "../lib/dateFormat";
 import type { BackgroundSessionDetail, BackgroundSessionSummary } from "../types";
 import { WorkspacePageHeader, WorkspacePageShell } from "./WorkspacePage";
@@ -233,10 +234,13 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
     staleTime: 30_000,
   });
 
-  const sessions = sessionsQ.data?.sessions || [];
+  const sessions = useMemo(
+    () => (sessionsQ.data?.sessions || []).filter((session) => isBackgroundSessionVisibleInUi(session)),
+    [sessionsQ.data],
+  );
 
   useEffect(() => {
-    if (!sessions.length && selectedId !== null) {
+    if (selectedId !== null && !sessions.some((session) => session.id === selectedId)) {
       setSelectedId(null);
     }
   }, [selectedId, sessions]);
@@ -543,9 +547,37 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
         )}
       </Box>
       {/* Session detail dialog — opened via "View" in ops menu */}
-      <Dialog open={selectedId != null} onClose={() => setSelectedId(null)} maxWidth="md" fullWidth>
-        <DialogTitle sx={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={selectedSession?.title || "Session"}>{selectedSession?.title || "Session"}</DialogTitle>
-        <DialogContent>
+      <Dialog
+        open={selectedId != null}
+        onClose={() => setSelectedId(null)}
+        maxWidth="md"
+        fullWidth
+        slotProps={{
+          paper: {
+            sx: {
+              borderRadius: "8px",
+              border: "1px solid rgba(255,255,255,0.08)",
+              background: "linear-gradient(180deg, rgba(18, 19, 22, 0.98), rgba(11, 12, 15, 0.98))",
+              boxShadow: "0 28px 96px rgba(0,0,0,0.5)",
+            },
+          },
+        }}
+      >
+        <DialogTitle
+          sx={{
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+            pb: 1.25,
+            borderBottom: "1px solid rgba(255,255,255,0.06)",
+            fontSize: "1rem",
+            fontWeight: 700,
+          }}
+          title={selectedSession?.title || "Session"}
+        >
+          {selectedSession?.title || "Session"}
+        </DialogTitle>
+        <DialogContent sx={{ pt: 2 }}>
           {!selectedId || detailQ.isLoading ? (
             <Box sx={{ py: 4, textAlign: "center" }}>
               <CircularProgress size={28} />
@@ -553,31 +585,114 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
           ) : detailQ.error || !selectedSession ? (
             <Alert severity="error">{errMessage(detailQ.error)}</Alert>
           ) : (
-            <Stack spacing={1}>
-              <Stack
-                direction="row"
-                spacing={1}
+            <Stack spacing={1.25}>
+              <Box
                 sx={{
-                  flexWrap: "wrap",
-                  alignItems: "center"
-                }}>
-                <Chip
-                  size="small"
-                  label={statusLabel(selectedSession.status)}
-                  color={chipColor(selectedSession.status)}
-                />
-                <Chip size="small" variant="outlined" label={`${selectedSession.counts.tasks_total} tasks`} />
-                <Chip size="small" variant="outlined" label={`${selectedSession.counts.watchers_total} watchers`} />
-                <Chip size="small" variant="outlined" label={`${sessionCount(selectedSession)} linked`} />
-              </Stack>
+                  borderRadius: "8px",
+                  border: "1px solid rgba(96, 165, 250, 0.18)",
+                  background:
+                    "linear-gradient(135deg, rgba(14, 22, 34, 0.96), rgba(15, 17, 22, 0.96))",
+                  p: 1.45,
+                  boxShadow: "inset 0 1px 0 rgba(255,255,255,0.04)",
+                }}
+              >
+                <Stack spacing={1.15}>
+                  <Stack
+                    direction="row"
+                    spacing={1}
+                    useFlexGap
+                    sx={{
+                      flexWrap: "wrap",
+                      alignItems: "center",
+                    }}
+                  >
+                    <Chip
+                      size="small"
+                      label={statusLabel(selectedSession.status)}
+                      color={chipColor(selectedSession.status)}
+                    />
+                    <Chip
+                      size="small"
+                      variant="outlined"
+                      label={`${selectedSession.counts.tasks_total} tasks`}
+                      sx={{
+                        borderColor: "rgba(255,255,255,0.14)",
+                        background: "rgba(255,255,255,0.03)",
+                      }}
+                    />
+                    <Chip
+                      size="small"
+                      variant="outlined"
+                      label={`${selectedSession.counts.watchers_total} watchers`}
+                      sx={{
+                        borderColor: "rgba(255,255,255,0.14)",
+                        background: "rgba(255,255,255,0.03)",
+                      }}
+                    />
+                    <Chip
+                      size="small"
+                      variant="outlined"
+                      label={`${sessionCount(selectedSession)} linked`}
+                      sx={{
+                        borderColor: "rgba(255,255,255,0.14)",
+                        background: "rgba(255,255,255,0.03)",
+                      }}
+                    />
+                  </Stack>
 
-              <Typography variant="caption" sx={{
-                color: "text.secondary"
-              }}>
-                Updated: {formatTimestamp(selectedSession.updated_at)}
-              </Typography>
+                  <Grid2 container spacing={1}>
+                    <Grid2 size={{ xs: 12, sm: 7 }}>
+                      <Box
+                        sx={{
+                          height: "100%",
+                          borderRadius: "8px",
+                          border: "1px solid rgba(255,255,255,0.08)",
+                          background: "rgba(255,255,255,0.03)",
+                          p: 1.15,
+                        }}
+                      >
+                        <Typography variant="caption" sx={{ color: "rgba(188, 198, 212, 0.68)" }}>
+                          Objective
+                        </Typography>
+                        <Typography variant="body1" sx={{ mt: 0.45, fontWeight: 600, lineHeight: 1.45 }}>
+                          {selectedSession.objective}
+                        </Typography>
+                      </Box>
+                    </Grid2>
+                    <Grid2 size={{ xs: 12, sm: 5 }}>
+                      <Box
+                        sx={{
+                          height: "100%",
+                          borderRadius: "8px",
+                          border: "1px solid rgba(255,255,255,0.08)",
+                          background: "rgba(255,255,255,0.03)",
+                          p: 1.15,
+                        }}
+                      >
+                        <Typography variant="caption" sx={{ color: "rgba(188, 198, 212, 0.68)" }}>
+                          Updated
+                        </Typography>
+                        <Typography variant="body2" sx={{ mt: 0.45, color: "rgba(231, 236, 243, 0.78)" }}>
+                          {formatTimestamp(selectedSession.updated_at)}
+                        </Typography>
+                      </Box>
+                    </Grid2>
+                  </Grid2>
+                </Stack>
+              </Box>
 
-              <Tabs value={detailTab} onChange={(_event, value: DetailTab) => setDetailTab(value)}>
+              <Tabs
+                value={detailTab}
+                onChange={(_event, value: DetailTab) => setDetailTab(value)}
+                sx={{
+                  minHeight: 40,
+                  "& .MuiTab-root": {
+                    minHeight: 40,
+                    textTransform: "none",
+                    fontWeight: 600,
+                  },
+                }}
+              >
                 <Tab value="overview" label="Overview" />
                 <Tab value="work" label="Work" />
                 <Tab value="trace" label="Trace" />
@@ -586,20 +701,17 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
 
               {detailTab === "overview" ? (
                 <Stack spacing={1.5}>
-                  <Box className="metadata-box">
-                    <Typography variant="caption" sx={{
-                      color: "text.secondary"
-                    }}>Objective</Typography>
-                    <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
-                      {selectedSession.objective}
-                    </Typography>
-                  </Box>
                   {selectedSession.summary ? (
-                    <Box className="metadata-box">
-                      <Typography variant="caption" sx={{
-                        color: "text.secondary"
-                      }}>Summary</Typography>
-                      <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
+                    <Box
+                      sx={{
+                        borderRadius: "8px",
+                        border: "1px solid rgba(255,255,255,0.08)",
+                        background: "rgba(255,255,255,0.025)",
+                        p: 1.25,
+                      }}
+                    >
+                      <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>Summary</Typography>
+                      <Typography variant="body2" sx={{ mt: 0.7, whiteSpace: "pre-wrap", color: "rgba(231, 236, 243, 0.76)" }}>
                         {selectedSession.summary}
                       </Typography>
                     </Box>
@@ -609,28 +721,40 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                     {[
                       { label: "Current Focus", value: selectedSession.current_focus || "Not set yet." },
                       { label: "Waiting On", value: selectedSession.waiting_on || "Nothing blocking right now." },
-                      {
-                        label: "Next Expected Action",
-                        value: selectedSession.next_expected_action || "No next step recorded yet.",
-                      },
+                      { label: "Next Expected Action", value: selectedSession.next_expected_action || "No next step recorded yet." },
                     ].map((item) => (
                       <Grid2 key={item.label} size={{ xs: 12, md: 4 }}>
-                        <Box className="metadata-box" sx={{ height: "100%" }}>
-                          <Typography variant="caption" sx={{
-                            color: "text.secondary"
-                          }}>{item.label}</Typography>
-                          <Typography variant="body2">{item.value}</Typography>
+                        <Box
+                          sx={{
+                            height: "100%",
+                            borderRadius: "8px",
+                            border: "1px solid rgba(255,255,255,0.08)",
+                            background: "rgba(255,255,255,0.025)",
+                            p: 1.15,
+                          }}
+                        >
+                          <Typography variant="caption" sx={{ color: "rgba(188, 198, 212, 0.68)" }}>
+                            {item.label}
+                          </Typography>
+                          <Typography variant="body2" sx={{ mt: 0.5, lineHeight: 1.5 }}>
+                            {item.value}
+                          </Typography>
                         </Box>
                       </Grid2>
                     ))}
                   </Grid2>
 
                   {detailQ.data?.session_detail.working_memory ? (
-                    <Box className="metadata-box">
-                      <Typography variant="caption" sx={{
-                        color: "text.secondary"
-                      }}>Working memory</Typography>
-                      <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
+                    <Box
+                      sx={{
+                        borderRadius: "8px",
+                        border: "1px solid rgba(255,255,255,0.08)",
+                        background: "rgba(255,255,255,0.025)",
+                        p: 1.25,
+                      }}
+                    >
+                      <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>Working memory</Typography>
+                      <Typography variant="body2" sx={{ mt: 0.75, whiteSpace: "pre-wrap", color: "rgba(231, 236, 243, 0.76)" }}>
                         {detailQ.data.session_detail.working_memory}
                       </Typography>
                     </Box>
@@ -651,12 +775,32 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
               {detailTab === "work" ? (
                 <Grid2 container spacing={1.5}>
                   <Grid2 size={{ xs: 12, md: 6 }}>
-                    <Box className="metadata-box" sx={{ height: "100%" }}>
-                      <Typography variant="subtitle2" sx={{ mb: 1 }}>Linked tasks</Typography>
+                    <Box
+                      sx={{
+                        height: "100%",
+                        borderRadius: "8px",
+                        border: "1px solid rgba(255,255,255,0.08)",
+                        background: "rgba(255,255,255,0.025)",
+                        p: 1.25,
+                      }}
+                    >
+                      <Stack direction="row" spacing={1} sx={{ justifyContent: "space-between", alignItems: "center", mb: 1 }}>
+                        <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>Linked tasks</Typography>
+                        <Chip size="small" variant="outlined" label={detailQ.data?.linked_tasks.length || 0} />
+                      </Stack>
                       {detailQ.data?.linked_tasks.length ? (
                         <Stack spacing={0.9}>
                           {detailQ.data.linked_tasks.map((task) => (
-                            <Box key={task.id} className="micro-surface-list-item">
+                            <Box
+                              key={task.id}
+                              className="micro-surface-list-item"
+                              sx={{
+                                borderRadius: "8px",
+                                border: "1px solid rgba(255,255,255,0.07)",
+                                background: "rgba(255,255,255,0.02)",
+                                borderLeft: "3px solid rgba(96, 165, 250, 0.7)",
+                              }}
+                            >
                               <Stack
                                 direction="row"
                                 spacing={1}
@@ -688,12 +832,32 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                   </Grid2>
 
                   <Grid2 size={{ xs: 12, md: 6 }}>
-                    <Box className="metadata-box" sx={{ height: "100%" }}>
-                      <Typography variant="subtitle2" sx={{ mb: 1 }}>Linked watchers</Typography>
+                    <Box
+                      sx={{
+                        height: "100%",
+                        borderRadius: "8px",
+                        border: "1px solid rgba(255,255,255,0.08)",
+                        background: "rgba(255,255,255,0.025)",
+                        p: 1.25,
+                      }}
+                    >
+                      <Stack direction="row" spacing={1} sx={{ justifyContent: "space-between", alignItems: "center", mb: 1 }}>
+                        <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>Linked watchers</Typography>
+                        <Chip size="small" variant="outlined" label={detailQ.data?.linked_watchers.length || 0} />
+                      </Stack>
                       {detailQ.data?.linked_watchers.length ? (
                         <Stack spacing={0.9}>
                           {detailQ.data.linked_watchers.map((watcher) => (
-                            <Box key={watcher.id} className="micro-surface-list-item">
+                            <Box
+                              key={watcher.id}
+                              className="micro-surface-list-item"
+                              sx={{
+                                borderRadius: "8px",
+                                border: "1px solid rgba(255,255,255,0.07)",
+                                background: "rgba(255,255,255,0.02)",
+                                borderLeft: "3px solid rgba(52, 211, 153, 0.7)",
+                              }}
+                            >
                               <Stack
                                 direction="row"
                                 spacing={1}
@@ -1035,3 +1199,6 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
     </WorkspacePageShell>
   );
 }
+
+
+

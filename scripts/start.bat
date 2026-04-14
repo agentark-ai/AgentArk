@@ -118,9 +118,9 @@ echo Update complete! Your data is intact.
 goto end
 
 :build
-echo Building AgentArk from this checkout (your data will be preserved)...
+echo Building AgentArk from this checkout and force-recreating containers (your data will be preserved)...
 if "%AGENTARK_IMAGE%"=="" set AGENTARK_IMAGE=agentark:dev
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build --force-recreate
 echo Local build complete! Your data is intact.
 goto end
 

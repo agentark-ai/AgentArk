@@ -87,13 +87,12 @@ impl RequestShapeAssessment {
     }
 
     pub fn is_execution_request(&self) -> bool {
-        matches!(
-            self.normalized_shape().as_str(),
-            "task" | "watcher" | "app" | "integration" | "goal" | "calendar_event"
-        ) || matches!(
-            self.normalized_execution_mode().as_str(),
-            "immediate" | "scheduled" | "watch_until"
-        )
+        let shape = self.normalized_shape();
+        let execution_mode = self.normalized_execution_mode();
+        !matches!(
+            shape.as_str(),
+            "" | "conversation" | "inspection" | "unknown"
+        ) || !matches!(execution_mode.as_str(), "" | "none" | "unknown")
     }
 
     pub fn is_conversation_like(&self) -> bool {

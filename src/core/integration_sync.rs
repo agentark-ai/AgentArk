@@ -319,7 +319,10 @@ async fn save_state_store(
         .await
 }
 
-pub async fn ensure_default_enabled(ctx: &IntegrationSyncContext, integration_id: &str) -> Result<()> {
+pub async fn ensure_default_enabled(
+    ctx: &IntegrationSyncContext,
+    integration_id: &str,
+) -> Result<()> {
     let Some(config) = default_config_for(integration_id) else {
         return Ok(());
     };

@@ -19,6 +19,27 @@ struct SessionResponse {
     session_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserSidecarSessionState {
+    pub session_id: String,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub claimed: bool,
+    #[serde(default)]
+    pub claimed_at: Option<String>,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub live_view_enabled: bool,
+    #[serde(default)]
+    pub live_view_port: Option<u16>,
+    #[serde(default)]
+    pub live_view_path: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct NavigateResponse {
     #[serde(rename = "status")]
@@ -88,7 +109,7 @@ fn validate_browser_url(url: &str) -> Result<url::Url> {
             return Err(anyhow!(
                 "Browser only allows http/https URLs, got '{}'",
                 other
-            ))
+            ));
         }
     }
     let host = parsed
@@ -120,6 +141,7 @@ impl BrowserIntegration {
         let resp: SessionResponse = self
             .client
             .post(format!("{}/session", self.bridge_url))
+            .json(&serde_json::json!({ "mode": "interactive" }))
             .send()
             .await?
             .error_for_status()?
@@ -130,6 +152,45 @@ impl BrowserIntegration {
             &resp.session_id[..resp.session_id.len().min(8)]
         );
         Ok(resp.session_id)
+    }
+
+    pub async fn get_session_state(&self, session_id: &str) -> Result<BrowserSidecarSessionState> {
+        let state: BrowserSidecarSessionState = self
+            .client
+            .get(format!("{}/session/{}/state", self.bridge_url, session_id))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(state)
+    }
+
+    pub async fn claim_session(&self, session_id: &str) -> Result<BrowserSidecarSessionState> {
+        let state: BrowserSidecarSessionState = self
+            .client
+            .post(format!("{}/session/{}/claim", self.bridge_url, session_id))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(state)
+    }
+
+    pub async fn release_session(&self, session_id: &str) -> Result<BrowserSidecarSessionState> {
+        let state: BrowserSidecarSessionState = self
+            .client
+            .post(format!(
+                "{}/session/{}/release",
+                self.bridge_url, session_id
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(state)
     }
 
     /// Navigate to a URL
@@ -362,6 +423,27 @@ impl Integration for BrowserIntegration {
             "create_session" => {
                 let sid = self.create_session().await?;
                 Ok(serde_json::json!({ "session_id": sid }))
+            }
+            "claim_session" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("session_id required"))?;
+                Ok(serde_json::to_value(self.claim_session(sid).await?)?)
+            }
+            "release_session" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("session_id required"))?;
+                Ok(serde_json::to_value(self.release_session(sid).await?)?)
+            }
+            "session_state" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("session_id required"))?;
+                Ok(serde_json::to_value(self.get_session_state(sid).await?)?)
             }
             "navigate" => {
                 let sid = params

@@ -126,8 +126,8 @@ case "${1:-start}" in
         echo -e "${GREEN}Update complete! Your data is intact.${NC}"
         ;;
     build)
-        echo -e "${YELLOW}Building AgentArk from this checkout (your data will be preserved)...${NC}"
-        AGENTARK_IMAGE=${AGENTARK_IMAGE:-agentark:dev} docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+        echo -e "${YELLOW}Building AgentArk from this checkout and force-recreating containers (your data will be preserved)...${NC}"
+        AGENTARK_IMAGE=${AGENTARK_IMAGE:-agentark:dev} docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build --force-recreate
         echo -e "${GREEN}Local build complete! Your data is intact.${NC}"
         ;;
     backup)

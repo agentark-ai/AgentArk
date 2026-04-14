@@ -17,7 +17,6 @@ import {
   Drawer,
   Divider,
   FormControlLabel,
-  Grid as Grid2,
   IconButton,
   List,
   ListItem,
@@ -39,6 +38,7 @@ import {
   Tooltip,
   Typography
 } from "@mui/material";
+import Grid2 from "@mui/material/Grid";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import ArrowDropDownRoundedIcon from "@mui/icons-material/ArrowDropDownRounded";
 import AttachFileRoundedIcon from "@mui/icons-material/AttachFileRounded";
@@ -67,6 +67,7 @@ import ReactECharts from "echarts-for-react";
 import { api, apiUrl } from "../api/client";
 import AgentLogo from "../assets/logo.svg";
 import { MetricBarCard } from "./analytics/MetricBarCard";
+import { MoltbookManager } from "./MoltbookManager";
 import { SuggestionRunDialog, type SuggestionRunState } from "./SuggestionRunDialog";
 import { WorkspacePageHeader, WorkspacePageShell } from "./WorkspacePage";
 import {
@@ -91,13 +92,22 @@ import {
   formatUiDateTimeMeta,
   formatUiRelativeDateTimeMeta
 } from "../lib/dateFormat";
+import {
+  isBackgroundSessionVisibleInUi,
+  isOneShotReminderTask,
+  taskActionDisplay,
+  taskKind,
+  taskKindLabel
+} from "../lib/backgroundSessions";
 import type {
   ArkPulseRemediationSpec,
   ArkPulseRunFixRequest,
+  BackgroundSessionSummary,
   LlmAnalyticsResponse,
   MemoryMaintenanceReviewResponse,
   RunMemoryMaintenanceRequest,
   SkillImportResponse,
+  Task,
   TraceOperationalEvent,
   TraceSummary
 } from "../types";
@@ -4703,13 +4713,18 @@ function KeyValuePanel({
   const entries = Object.entries(data || {});
   const shown = entries.slice(0, maxRows ?? 14);
   return (
-    <Box className="metadata-box">
-      <Typography variant="caption" sx={{
-        color: "text.secondary"
-      }}>
+    <Box
+      sx={{
+        borderRadius: "8px",
+        border: "1px solid rgba(255,255,255,0.08)",
+        background: "rgba(255,255,255,0.025)",
+        p: 1.25
+      }}
+    >
+      <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
         {title}
       </Typography>
-      <Stack spacing={0.6} sx={{ mt: 0.75 }}>
+      <Stack spacing={0} sx={{ mt: 0.9 }}>
         {shown.length === 0 ? (
           <Typography variant="body2" sx={{
             color: "text.secondary"
@@ -4717,13 +4732,13 @@ function KeyValuePanel({
             {emptyLabel || "No details available."}
           </Typography>
         ) : (
-          shown.map(([k, v]) => {
+          shown.map(([k, v], index) => {
             const out = formatCompactValue(v);
             const keyLower = (k || "").toLowerCase();
             const renderValue = () => {
               if (typeof v === "string" && looksLikeUrl(v)) {
                 const trimmed = v.trim();
-                const label = trimmed.length > 54 ? `${trimmed.slice(0, 54)}—¦` : trimmed;
+                const label = trimmed.length > 54 ? `${trimmed.slice(0, 54)}...` : trimmed;
                 return (
                   <Typography variant="body2" sx={{ wordBreak: "break-all" }} title={trimmed}>
                     <a href={trimmed} target="_blank" rel="noreferrer" style={{ color: "inherit", textDecoration: "underline" }}>
@@ -4763,7 +4778,7 @@ function KeyValuePanel({
               }
               if (typeof v === "string" && (looksLikeUuid(v) || keyLower.endsWith("_id") || keyLower === "id")) {
                 const trimmed = v.trim();
-                const label = trimmed.length > 22 ? `${trimmed.slice(0, 8)}—¦${trimmed.slice(-6)}` : trimmed;
+                const label = trimmed.length > 22 ? `${trimmed.slice(0, 8)}...${trimmed.slice(-6)}` : trimmed;
                 return (
                   <Chip
                     size="small"
@@ -4792,26 +4807,33 @@ function KeyValuePanel({
               );
             };
             return (
-              <Stack key={k} direction="row" spacing={1} sx={{
-                alignItems: "baseline"
-              }}>
+              <Box
+                key={k}
+                sx={{
+                  display: "grid",
+                  gridTemplateColumns: { xs: "1fr", md: "160px minmax(0, 1fr)" },
+                  gap: { xs: 0.35, md: 1.1 },
+                  py: 0.9,
+                  borderTop: index === 0 ? "none" : "1px solid rgba(255,255,255,0.06)"
+                }}
+              >
                 <Typography
                   variant="caption"
                   sx={{
-                    color: "text.secondary",
-                    width: 160,
-                    flex: "0 0 auto"
+                    color: "rgba(188, 198, 212, 0.68)",
+                    minWidth: 0
                   }}>
                   {k}
                 </Typography>
                 {renderValue()}
-              </Stack>
+              </Box>
             );
           })
         )}
         {entries.length > shown.length ? (
           <Typography variant="caption" sx={{
-            color: "text.secondary"
+            color: "text.secondary",
+            pt: 0.9
           }}>
             {entries.length - shown.length} more field(s) not shown.
           </Typography>
@@ -12862,13 +12884,10 @@ function ChatManager({
                                 </Box>
                               )
                             : (
-                                <Typography
-                                  variant="body2"
-                                  sx={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
-                                >
-                                  {visibleStreamingResponse}
+                                <Box sx={{ position: "relative" }}>
+                                  {renderChatMarkdown(visibleStreamingResponse)}
                                   <span className="stream-caret" />
-                                </Typography>
+                                </Box>
                               )
                         ) : (
                           <div className="typing-dots" aria-label="typing">
@@ -13740,19 +13759,29 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
 
   const tasks = pickRecords(tasksQ.data, "tasks");
   const sessionsById = useMemo(() => {
-    const map = new Map<string, string>();
+    const map = new Map<string, JsonRecord>();
     for (const session of pickRecords(sessionsQ.data, "sessions")) {
       const id = str(session.id, "").trim();
       if (!id) continue;
-      map.set(id, str(session.title, "").trim());
+      map.set(id, session);
     }
     return map;
   }, [sessionsQ.data]);
   const taskBackgroundSessionId = (task: JsonRecord): string =>
     str(asRecord(asRecord(task.arguments)._automation).background_session_id, "").trim();
+  const taskBackgroundSessionVisible = (task: JsonRecord): boolean => {
+    const id = taskBackgroundSessionId(task);
+    if (!id) return false;
+    const session = sessionsById.get(id);
+    if (session) {
+      return isBackgroundSessionVisibleInUi(session as unknown as BackgroundSessionSummary);
+    }
+    return !isOneShotReminderTask(task as unknown as Task);
+  };
   const taskBackgroundSessionTitle = (task: JsonRecord): string => {
     const id = taskBackgroundSessionId(task);
-    return id ? sessionsById.get(id) || "" : "";
+    if (!id) return "";
+    return str(sessionsById.get(id)?.title, "").trim();
   };
   const isWebChatRequestTask = (task: JsonRecord): boolean => {
     const argumentsObj = asRecord(task.arguments);
@@ -13857,7 +13886,7 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
             <TableHead>
               <TableRow>
                 <TableCell>Description</TableCell>
-                <TableCell>Action</TableCell>
+                <TableCell>Type</TableCell>
                 <TableCell>Status</TableCell>
                 <TableCell>Schedule</TableCell>
                 <TableCell>Created</TableCell>
@@ -13868,13 +13897,18 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
               {tasks.map((task) => {
                 const id = str(task.id, "");
                 const cronExpr = str(task.cron, "");
-                const schedule = cronExpr ? `cron: ${cronExpr}` : "manual";
+                const scheduledFor = str(task.scheduled_for, "");
+                const schedule = cronExpr
+                  ? `cron: ${cronExpr}`
+                  : scheduledFor
+                    ? `at ${formatUiDateTime(scheduledFor, { fallback: scheduledFor })}`
+                    : "manual";
                 const rawStatus = str(task.status, "-");
                 const rawStatusLower = rawStatus.toLowerCase();
-                const backgroundSessionId = taskBackgroundSessionId(task);
-                const backgroundSessionTitle = backgroundSessionId
-                  ? sessionsById.get(backgroundSessionId) || ""
-                  : "";
+                const taskDisplay = taskActionDisplay(task as unknown as Task);
+                const backgroundSessionVisible = taskBackgroundSessionVisible(task);
+                const backgroundSessionId = backgroundSessionVisible ? taskBackgroundSessionId(task) : "";
+                const backgroundSessionTitle = backgroundSessionVisible ? taskBackgroundSessionTitle(task) : "";
                 const isChatRequestTask = isWebChatRequestTask(task);
                 const rowActions: RowMenuAction[] = [
                   {
@@ -13947,7 +13981,7 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
                         <Typography variant="body2" noWrap title={str(task.description)}>
                           {str(task.description)}
                         </Typography>
-                        {backgroundSessionId ? (
+                        {backgroundSessionVisible ? (
                           <Typography
                             variant="caption"
                             noWrap
@@ -13964,8 +13998,8 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
                       </Stack>
                     </TableCell>
                     <TableCell sx={{ maxWidth: 220 }}>
-                      <Typography variant="body2" noWrap title={str(task.action)}>
-                        {str(task.action)}
+                      <Typography variant="body2" noWrap title={taskDisplay}>
+                        {taskDisplay}
                       </Typography>
                     </TableCell>
                     <TableCell>
@@ -13990,55 +14024,170 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
           </Table>
         </TableContainer>
       </Box>
-      <Dialog open={selectedTask != null} onClose={() => setSelectedTask(null)} maxWidth="md" fullWidth>
-        <DialogTitle sx={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={str(selectedTask?.description, "Task")}>{str(selectedTask?.description, "Task")}</DialogTitle>
-        <DialogContent>
-          <Stack spacing={1}>
-            <Stack
-              direction="row"
-              spacing={1}
+      <Dialog
+        open={selectedTask != null}
+        onClose={() => setSelectedTask(null)}
+        maxWidth="md"
+        fullWidth
+        slotProps={{
+          paper: {
+            sx: {
+              borderRadius: "8px",
+              border: "1px solid rgba(255,255,255,0.08)",
+              background: "linear-gradient(180deg, rgba(18, 19, 22, 0.98), rgba(11, 12, 15, 0.98))",
+              boxShadow: "0 28px 96px rgba(0,0,0,0.5)"
+            }
+          }
+        }}
+      >
+        <DialogTitle
+          sx={{
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+            pb: 1.2,
+            borderBottom: "1px solid rgba(255,255,255,0.06)",
+            fontSize: "1rem",
+            fontWeight: 700
+          }}
+          title={str(selectedTask?.description, "Task")}
+        >
+          {str(selectedTask?.description, "Task")}
+        </DialogTitle>
+        <DialogContent sx={{ pt: 2 }}>
+          <Stack spacing={1.25}>
+            <Box
               sx={{
-                flexWrap: "wrap",
-                alignItems: "center"
-              }}>
-              <Chip
-                size="small"
-                label={statusLabel(str(selectedTask?.status, ""), selectedTask?.result)}
-                color={statusColor(str(selectedTask?.status, ""), selectedTask?.result)}
-              />
-              <Chip size="small" variant="outlined" label={str(selectedTask?.cron, "") ? "Scheduled" : "Manual"} />
-              <Chip size="small" variant="outlined" label={`Action: ${str(selectedTask?.action, "-")}`} />
-              {selectedTask && taskBackgroundSessionId(selectedTask) ? (
-                <Chip
-                  size="small"
-                  variant="outlined"
-                  label={
-                    taskBackgroundSessionTitle(selectedTask)
-                      ? `Session: ${taskBackgroundSessionTitle(selectedTask)}`
-                      : "Background session linked"
-                  }
-                />
-              ) : null}
-            </Stack>
+                borderRadius: "8px",
+                border: "1px solid rgba(96, 165, 250, 0.18)",
+                background:
+                  "linear-gradient(135deg, rgba(14, 22, 34, 0.96), rgba(15, 17, 22, 0.96))",
+                p: 1.4,
+                boxShadow: "inset 0 1px 0 rgba(255,255,255,0.04)"
+              }}
+            >
+              <Stack spacing={1.15}>
+                <Stack
+                  direction="row"
+                  spacing={1}
+                  useFlexGap
+                  sx={{
+                    flexWrap: "wrap",
+                    alignItems: "center"
+                  }}
+                >
+                  <Chip
+                    size="small"
+                    label={statusLabel(str(selectedTask?.status, ""), selectedTask?.result)}
+                    color={statusColor(str(selectedTask?.status, ""), selectedTask?.result)}
+                  />
+                  <Chip
+                    size="small"
+                    variant="outlined"
+                    label={str(selectedTask?.cron, "") || str(selectedTask?.scheduled_for, "") ? "Scheduled" : "Manual"}
+                    sx={{
+                      borderColor: "rgba(255,255,255,0.14)",
+                      background: "rgba(255,255,255,0.03)"
+                    }}
+                  />
+                  <Chip
+                    size="small"
+                    variant="outlined"
+                    label={
+                      taskKind(selectedTask as Task | null | undefined) === "reminder"
+                        ? `Type: ${taskKindLabel(selectedTask as Task | null | undefined)}`
+                        : `Action: ${str(selectedTask?.action, "-")}`
+                    }
+                    sx={{
+                      borderColor: "rgba(255,255,255,0.14)",
+                      background: "rgba(255,255,255,0.03)"
+                    }}
+                  />
+                  {selectedTask && taskBackgroundSessionVisible(selectedTask) ? (
+                    <Chip
+                      size="small"
+                      variant="outlined"
+                      sx={{
+                        borderColor: "rgba(255,255,255,0.14)",
+                        background: "rgba(255,255,255,0.03)"
+                      }}
+                      label={
+                        taskBackgroundSessionTitle(selectedTask)
+                          ? `Session: ${taskBackgroundSessionTitle(selectedTask)}`
+                          : "Background session linked"
+                      }
+                    />
+                  ) : null}
+                </Stack>
 
-            <Typography variant="caption" sx={{
-              color: "text.secondary"
-            }}>
-              Created: <span title={humanTs(str(selectedTask?.created_at, "-")).tip}>{humanTs(str(selectedTask?.created_at, "-")).label}</span>
-            </Typography>
+                <Grid2 container spacing={1}>
+                  <Grid2 size={{ xs: 12, sm: 6 }}>
+                    <Box
+                      sx={{
+                        height: "100%",
+                        borderRadius: "8px",
+                        border: "1px solid rgba(255,255,255,0.08)",
+                        background: "rgba(255,255,255,0.03)",
+                        p: 1.1
+                      }}
+                    >
+                      <Typography variant="caption" sx={{ color: "rgba(188, 198, 212, 0.68)" }}>
+                        Created
+                      </Typography>
+                      <Typography variant="body2" sx={{ mt: 0.35 }}>
+                        <span title={humanTs(str(selectedTask?.created_at, "-")).tip}>
+                          {humanTs(str(selectedTask?.created_at, "-")).label}
+                        </span>
+                      </Typography>
+                    </Box>
+                  </Grid2>
+                  <Grid2 size={{ xs: 12, sm: 6 }}>
+                    <Box
+                      sx={{
+                        height: "100%",
+                        borderRadius: "8px",
+                        border: "1px solid rgba(255,255,255,0.08)",
+                        background: "rgba(255,255,255,0.03)",
+                        p: 1.1
+                      }}
+                    >
+                      <Typography variant="caption" sx={{ color: "rgba(188, 198, 212, 0.68)" }}>
+                        Execution
+                      </Typography>
+                      <Typography variant="body2" sx={{ mt: 0.35, color: "rgba(231, 236, 243, 0.76)" }}>
+                        {str(selectedTask?.cron, "")
+                          ? "Runs on a schedule and stays queued between executions."
+                          : str(selectedTask?.scheduled_for, "")
+                            ? "Runs once at the scheduled time."
+                            : "Runs once when triggered or approved."}
+                      </Typography>
+                    </Box>
+                  </Grid2>
+                </Grid2>
 
-            {str(selectedTask?.cron, "") ? (
-              <Box className="metadata-box">
-                <Typography variant="caption" sx={{
-                  color: "text.secondary"
-                }}>
-                  Schedule
-                </Typography>
-                <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
-                  {str(selectedTask?.cron)}
-                </Typography>
-              </Box>
-            ) : null}
+                {str(selectedTask?.cron, "") || str(selectedTask?.scheduled_for, "") ? (
+                  <Box
+                    sx={{
+                      borderRadius: "8px",
+                      border: "1px solid rgba(255,255,255,0.08)",
+                      background: "rgba(255,255,255,0.03)",
+                      p: 1.1
+                    }}
+                  >
+                    <Typography variant="caption" sx={{ color: "rgba(188, 198, 212, 0.68)" }}>
+                      Schedule
+                    </Typography>
+                    <Typography variant="body2" sx={{ mt: 0.45, whiteSpace: "pre-wrap" }}>
+                      {str(selectedTask?.cron, "")
+                        ? str(selectedTask?.cron)
+                        : formatUiDateTime(str(selectedTask?.scheduled_for, ""), {
+                            fallback: str(selectedTask?.scheduled_for, "-")
+                          })}
+                    </Typography>
+                  </Box>
+                ) : null}
+              </Stack>
+            </Box>
 
             {selectedTask && inputNeededResult(selectedTask) ? (() => {
               const payload = inputNeededResult(selectedTask);
@@ -14168,26 +14317,44 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
                 </Stack>
               );
             })() : str(selectedTask?.result, "") ? (
-              <Box className="metadata-box">
-                <Typography variant="caption" sx={{
-                  color: "text.secondary"
-                }}>
+              <Box
+                sx={{
+                  borderRadius: "8px",
+                  border: "1px solid rgba(255,255,255,0.08)",
+                  background: "rgba(255,255,255,0.025)",
+                  p: 1.25
+                }}
+              >
+                <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
                   Last Result
                 </Typography>
-                <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
+                <Typography variant="body2" sx={{ mt: 0.8, whiteSpace: "pre-wrap" }}>
                   {str(selectedTask?.result)}
                 </Typography>
               </Box>
             ) : (
-              <Typography variant="body2" sx={{
-                color: "text.secondary"
-              }}>
-                No result yet.
-              </Typography>
+              <Box
+                sx={{
+                  borderRadius: "8px",
+                  border: "1px dashed rgba(255,255,255,0.14)",
+                  background: "rgba(255,255,255,0.018)",
+                  p: 1.2
+                }}
+              >
+                <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                  No result yet.
+                </Typography>
+              </Box>
             )}
 
-            <KeyValuePanel title="Arguments" data={asRecord(selectedTask?.arguments)} emptyLabel="No arguments." maxRows={18} />
-            <KeyValuePanel title="System fields" data={asRecord(selectedTask)} emptyLabel="No extra fields." maxRows={10} />
+            <Grid2 container spacing={1.25}>
+              <Grid2 size={{ xs: 12, lg: 6 }}>
+                <KeyValuePanel title="Arguments" data={asRecord(selectedTask?.arguments)} emptyLabel="No arguments." maxRows={18} />
+              </Grid2>
+              <Grid2 size={{ xs: 12, lg: 6 }}>
+                <KeyValuePanel title="System fields" data={asRecord(selectedTask)} emptyLabel="No extra fields." maxRows={10} />
+              </Grid2>
+            </Grid2>
           </Stack>
         </DialogContent>
       </Dialog>
@@ -14400,7 +14567,6 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
   const [lastImport, setLastImport] = useState<SkillImportSummary | null>(null);
   const [testResults, setTestResults] = useState<Record<string, string>>({});
   const [skillMenuAnchor, setSkillMenuAnchor] = useState<{ el: HTMLElement; name: string } | null>(null);
-  const [bundledSkillsExpanded, setBundledSkillsExpanded] = useState(true);
   const [importOpen, setImportOpen] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
@@ -14555,7 +14721,6 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
     return str(a.name, "").localeCompare(str(b.name, ""));
   };
   const systemSkills = skills.filter((a) => str(a.source).toLowerCase() === "system").filter(skillSearchFilter).sort(skillSortFn);
-  const bundledSkills = skills.filter((a) => str(a.source).toLowerCase() === "bundled").filter(skillSearchFilter).sort(skillSortFn);
   const customSkills = skills.filter((a) => str(a.source).toLowerCase() === "custom").filter(skillSearchFilter).sort(skillSortFn);
   const availableToolNames = dedupeStrings(systemSkills.map((a) => str(a.name, "").trim()).filter(Boolean));
   const allSkillNames = dedupeStrings(skills.map((a) => str(a.name, "").trim()).filter(Boolean));
@@ -14568,12 +14733,6 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
     }
     return map;
   }, [hookRuns]);
-
-  useEffect(() => {
-    if (bundledSkills.length > 0) {
-      setBundledSkillsExpanded(true);
-    }
-  }, [bundledSkills.length]);
 
   const closeEditor = () => {
     setEditOpen(false);
@@ -14877,7 +15036,7 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
     await setEnabledMutation.mutateAsync({ name, enabled: nextEnabled });
   };
 
-  const renderActionRow = (action: JsonRecord, type: "system" | "bundled" | "custom") => {
+  const renderActionRow = (action: JsonRecord, type: "system" | "custom") => {
       const name = str(action.name, "Untitled");
       const description = str(action.description, "No description");
       const version = str(action.version, "?");
@@ -14885,7 +15044,6 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
       const testMessage = testResults[name];
       const isTesting = testMutation.isPending && testMutation.variables?.name === name;
       const isSystem = type === "system";
-      const isBundled = type === "bundled";
 
     const menuOpen = skillMenuAnchor?.name === name;
 
@@ -14986,11 +15144,7 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
                       sx={{ color: "error.main" }}
                       onClick={async () => {
                         setSkillMenuAnchor(null);
-                        const ok = window.confirm(
-                          isBundled
-                            ? `Delete bundled skill "${name}" from this install? Fresh installs restore it from the image defaults.`
-                            : `Delete skill "${name}"? This cannot be undone.`
-                        );
+                        const ok = window.confirm(`Delete skill "${name}"? This cannot be undone.`);
                         if (ok) deleteSkillMutation.mutate(name);
                       }}
                     >
@@ -15020,9 +15174,9 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
   return (
     <WorkspacePageShell spacing={1.5}>
       <WorkspacePageHeader
-        eyebrow="Agent"
+        eyebrow="Ark Core"
         title="Skills"
-        description={`System skills: ${systemSkills.length}, bundled skills: ${bundledSkills.length}, custom skills: ${customSkills.length}, automations: ${hooks.length}.`}
+        description="Create, import, and manage the skills and automations available to this AgentArk workspace."
         actions={
           skillsTab === "manage" ? (
             <Stack
@@ -15043,16 +15197,16 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
               </Button>
               <Button
                 size="small"
-                variant="outlined"
-                sx={WORKSPACE_HEADER_SECONDARY_BUTTON_SX}
+                variant="contained"
+                sx={WORKSPACE_HEADER_PRIMARY_BUTTON_SX}
                 onClick={() => setImportOpen(true)}
               >
                 Import URL
               </Button>
               <Button
                 size="small"
-                variant="outlined"
-                sx={WORKSPACE_HEADER_SECONDARY_BUTTON_SX}
+                variant="contained"
+                sx={WORKSPACE_HEADER_PRIMARY_BUTTON_SX}
                 onClick={() => setBulkOpen(true)}
               >
                 Bulk Import
@@ -15067,6 +15221,16 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
         }}>
           Start with AI Quick Create for new skills, then drop into the editor only when you need manual SKILL.md control.
         </Typography>
+        <Typography
+          variant="caption"
+          sx={{
+            color: "text.secondary",
+            display: "block",
+            mt: 0.5
+          }}
+        >
+          System skills: {systemSkills.length}, custom skills: {customSkills.length}, automations: {hooks.length}.
+        </Typography>
         {skillsTab === "manage" ? (
           <Typography
             variant="caption"
@@ -15075,7 +15239,7 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
               display: "block",
               mt: 0.5
             }}>
-            Create and manage user skills here, while bundled and system skills stay available in their own sections below.
+            Create and manage user skills here.
           </Typography>
         ) : null}
         {lastImport?.message ? (
@@ -15086,6 +15250,7 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
         <Tabs
           value={skillsTab}
           onChange={(_, value: "manage" | "system") => setSkillsTab(value)}
+          className="workspace-page-subnav-tabs"
           sx={{ mt: 1 }}
         >
           <Tab value="manage" label="My Skills" />
@@ -15246,44 +15411,6 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
             </Box>
           ) : null}
 
-          <Box className="list-shell">
-            <Accordion
-              expanded={bundledSkillsExpanded}
-              onChange={(_, expanded) => setBundledSkillsExpanded(expanded)}
-              elevation={0}
-              sx={{
-                background: "transparent",
-                "&::before": { display: "none" }
-              }}
-            >
-                <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ px: 0 }}>
-                  <Stack spacing={0.25}>
-                    <Typography variant="h6">Bundled Skills ({bundledSkills.length})</Typography>
-                    <Typography variant="caption" sx={{
-                      color: "text.secondary"
-                    }}>
-                      Ready-made skills you can enable and use.
-                    </Typography>
-                    <Typography variant="caption" sx={{
-                      color: "text.secondary"
-                    }}>
-                      Deleting one removes it for this install. Fresh installs restore the bundled defaults.
-                    </Typography>
-                  </Stack>
-                </AccordionSummary>
-              <AccordionDetails sx={{ px: 0, pt: 0 }}>
-                  {bundledSkills.length === 0 ? (
-                    <Typography variant="body2" sx={{
-                      color: "text.secondary"
-                    }}>
-                      No bundled skills available in this install.
-                    </Typography>
-                  ) : (
-                  <Stack spacing={1}>{bundledSkills.map((act) => renderActionRow(act, "bundled"))}</Stack>
-                )}
-              </AccordionDetails>
-            </Accordion>
-          </Box>
         </>
       ) : (
         <Box className="list-shell">
@@ -17360,7 +17487,7 @@ function AutonomyManager({ autoRefresh }: { autoRefresh: boolean }) {
       : `Mode: ${modeIndicator} | Waiting on you: ${awaitingApprovals} approval${awaitingApprovals === 1 ? "" : "s"}, ${missingInputs} required input${missingInputs === 1 ? "" : "s"}`;
   const modePlainHint =
     autonomyMode === "off"
-      ? "Autonomy is disabled. Sentinel, ArkPulse, background learning, and chat suggestion scans are paused until you turn it back on."
+      ? "Autonomy is disabled. ArkSentinel, ArkPulse, background learning, and chat suggestion scans are paused until you turn it back on."
       : autonomyMode === "assist"
       ? "Agent prepares work and asks before sensitive actions."
       : "Agent runs allowed work automatically and only asks when required.";
@@ -19402,7 +19529,7 @@ function AutonomyManager({ autoRefresh }: { autoRefresh: boolean }) {
             }}>
               If you disable autonomy:
             </Typography>
-            <Typography variant="body2">1. Sentinel stops preparing and running background work.</Typography>
+            <Typography variant="body2">1. ArkSentinel stops preparing and running background work.</Typography>
             <Typography variant="body2">2. ArkPulse stops running automatic health and follow-up checks.</Typography>
             <Typography variant="body2">3. Background learning, proactive suggestions, and chat suggestion scans pause.</Typography>
             <Typography variant="body2" sx={{
@@ -20933,8 +21060,164 @@ type EvolutionReviewCard = {
   detail: string;
   chips: string[];
   rationale?: string;
+  example?: string;
   evidence?: string;
 };
+
+type EvolutionPatternCard = EvolutionReviewCard & {
+  runs: JsonRecord[];
+  latestSeen?: string;
+  toolSummary?: string;
+  completedCount: number;
+  failedCount: number;
+  acceptedCount: number;
+};
+
+function collapseInlineWhitespace(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function truncateUiText(value: string, maxChars = 120): string {
+  const normalized = collapseInlineWhitespace(value);
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
+}
+
+function titleCaseLabel(value: string): string {
+  return value
+    .split(/[\s_-]+/)
+    .filter(Boolean)
+    .map((token) => token.charAt(0).toUpperCase() + token.slice(1))
+    .join(" ");
+}
+
+function learningEvidenceStatusColor(status: string): "default" | "success" | "warning" | "error" | "info" {
+  const normalized = status.trim().toLowerCase();
+  if (normalized === "completed" || normalized === "success" || normalized === "succeeded") return "success";
+  if (normalized === "failed" || normalized === "error") return "error";
+  if (normalized === "accepted") return "info";
+  if (normalized === "repeating successfully") return "success";
+  if (normalized === "mixed results") return "warning";
+  if (normalized === "needs review") return "error";
+  if (normalized === "user preference captured" || normalized === "seen once") return "info";
+  return "default";
+}
+
+function learningEvidenceTimestampMs(value: string): number {
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function latestLearningEvidenceTimestamp(runs: JsonRecord[]): number {
+  return runs.reduce((latest, run) => Math.max(latest, learningEvidenceTimestampMs(str(run.created_at, ""))), 0);
+}
+
+function learningEvidenceToolLabel(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "schedule_task") return "Scheduled task";
+  if (normalized === "calendar_create") return "Calendar event";
+  return titleCaseLabel(normalized);
+}
+
+function summarizeLearningEvidenceTools(values: string[]): string {
+  if (values.length === 0) return "";
+  const counts = new Map<string, number>();
+  values.forEach((value) => {
+    const key = value.trim().toLowerCase();
+    if (!key) return;
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  });
+  return Array.from(counts.entries())
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .slice(0, 3)
+    .map(([name, count]) => `${learningEvidenceToolLabel(name)}${count > 1 ? ` x${count}` : ""}`)
+    .join(", ");
+}
+
+function uniqueNonEmptyStrings(values: Array<unknown>): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  values.forEach((value) => {
+    const normalized = collapseInlineWhitespace(str(value, "").trim());
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    out.push(normalized);
+  });
+  return out;
+}
+
+function summarizeEvolutionPatternRun(run: JsonRecord): string {
+  const decision = asRecord(run.decision_summary);
+  const executionStatus = asRecord(run.execution_status);
+  const summary = collapseInlineWhitespace(
+    str(
+      run.failure_reason,
+      str(
+        run.outcome_summary,
+        str(
+          decision.summary,
+          str(decision.completion_status, str(executionStatus.status, ""))
+        )
+      )
+    )
+  );
+  return summary || "No summary recorded.";
+}
+
+function evolutionPatternStatusExplanation(card: EvolutionPatternCard): string {
+  const normalized = card.status.trim().toLowerCase();
+  if (normalized === "user preference captured") {
+    return "A direct user correction was recorded here. That kind of signal is strong and can steer similar requests in the future.";
+  }
+  if (normalized === "repeating successfully") {
+    return "Similar requests have been finishing through the same path. AgentArk is checking whether that path is stable enough to reuse by default.";
+  }
+  if (normalized === "mixed results") {
+    return "Similar requests have both worked and failed. AgentArk is comparing the difference before changing behavior.";
+  }
+  if (normalized === "needs review") {
+    return "Similar requests are running into issues often enough that AgentArk may need a guardrail or a different route.";
+  }
+  if (normalized === "seen once") {
+    return "This has only been seen once so far. One example is useful context, but not enough to change behavior yet.";
+  }
+  return "AgentArk is collecting a few more examples before it decides whether this pattern should change how future requests are handled.";
+}
+
+function normalizeLearningEvidenceState(run: JsonRecord): string {
+  const decision = asRecord(run.decision_summary);
+  return collapseInlineWhitespace(str(run.correction_state, str(decision.completion_status, str(run.success_state, "observed")))).toLowerCase();
+}
+
+function inferLearningEvidenceTitle(runs: JsonRecord[], requestPreview: string, taskType: string): string {
+  const combinedRequest = requestPreview.toLowerCase();
+  const allTools = new Set<string>();
+  runs.forEach((run) => {
+    stringList(run.tool_names).forEach((toolName) => {
+      const normalized = toolName.trim().toLowerCase();
+      if (normalized) allTools.add(normalized);
+    });
+  });
+
+  if ((/dont use|don't use|do not use/.test(combinedRequest)) && /(calendar|calender)/.test(combinedRequest)) {
+    return "Operator correction: avoid Calendar";
+  }
+  if (/meeting/.test(combinedRequest) && /(notify|remind|arrive)/.test(combinedRequest)) {
+    return "Meeting-date reminder requests";
+  }
+  if (/(notify|remind)/.test(combinedRequest) && /(date|today|tomorrow|january|february|march|april|may|june|july|august|september|october|november|december|\d{4})/.test(combinedRequest)) {
+    return "Date-based reminder requests";
+  }
+  if (allTools.has("calendar_create") || /(calendar|event)/.test(combinedRequest)) {
+    return "Calendar event creation requests";
+  }
+  if (allTools.has("schedule_task")) {
+    return "Scheduled follow-up requests";
+  }
+  if (taskType) return `${titleCaseLabel(taskType)} requests`;
+  if (requestPreview) return truncateUiText(requestPreview, 80);
+  return "Observed request pattern";
+}
 
 function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewCard[] {
   const cards: EvolutionReviewCard[] = [];
@@ -20944,7 +21227,7 @@ function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewCard[] {
     if (!traceKind.startsWith("self_evolve.")) return;
 
     const status = str(step.type, str(step.step_type, "info")).trim() || "info";
-    const title = str(step.title, "Evolution").trim();
+    const title = str(step.title, "ArkEvolve").trim();
     const detail = str(step.detail, "").trim();
     const chips: string[] = [];
     const evidence: string[] = [];
@@ -21076,6 +21359,7 @@ function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewCard[] {
       const diffSummary = asRecord(data.diff_summary);
       const changedItems = stringList(diffSummary.changed_surfaces).concat(stringList(diffSummary.changed_roles));
       const changePreview = stringList(diffSummary.change_preview);
+      const focusCases = pickRecords(data, "focus_cases");
       chips.push(`${evaluatedCandidates} candidate${evaluatedCandidates === 1 ? "" : "s"}`);
       if (baselineScore || candidateScore) chips.push(`${baselineScore || "?"} -> ${candidateScore || "?"}`);
       if (optimizedSurfaces.length) chips.push(optimizedSurfaces.join(" + "));
@@ -21089,6 +21373,9 @@ function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewCard[] {
       }
       const pValue = num(data.p_value, Number.NaN);
       if (Number.isFinite(pValue)) evidence.push(`P-value: ${pValue.toFixed(4)}`);
+      if (focusCases.length) {
+        evidence.push(`Focus cases: ${focusCases.slice(0, 3).map(buildEvolutionFocusCaseLabel).join(" | ")}`);
+      }
       if (notes.length) evidence.push(`Why: ${notes.join(" | ")}`);
       const lineageId = str(data.lineage_entry_id, "").trim();
       if (lineageId) evidence.push(`Lineage: ${lineageId}`);
@@ -21245,6 +21532,8 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
   const [syncRunPage, setSyncRunPage] = useState(0);
   const [showTraceCharts, setShowTraceCharts] = useState(false);
   const [expandedSteps, setExpandedSteps] = useState<Set<number>>(new Set());
+  const [historyPage, setHistoryPage] = useState(0);
+  const historyPageSize = 20;
   const syncRunPageSize = 12;
 
   const traceSince = traceRangeSinceISO(traceRange);
@@ -21341,7 +21630,7 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
     return (
       <WorkspacePageShell spacing={1.25} className="trace-page-shell">
         <WorkspacePageHeader
-          eyebrow="Observability"
+          eyebrow="Operations"
           title="Trace"
           description="Recent runs, integration activity, and export logs in one place."
           actions={
@@ -21433,67 +21722,34 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
                     {history.length} of {historyTotal} runs
                   </Typography>
                 </Stack>
-                {/* Full-width trace table */}
-                {history.length === 0 ? (
-                  <Alert severity="info">
-                    No trace history yet. New runs will appear here automatically.
-                  </Alert>
-                ) : (
-                  <TableContainer className="table-shell diagnostics-table-shell trace-table-full">
-                    <Table size="small" sx={{ tableLayout: "fixed" }}>
-                      <TableHead>
-                        <TableRow>
-                          <TableCell width="13%">Started</TableCell>
-                          <TableCell width="9%">Source</TableCell>
-                          <TableCell width="44%">Message</TableCell>
-                          <TableCell width="12%">Status</TableCell>
-                          <TableCell width="10%">Steps</TableCell>
-                          <TableCell width="12%">Duration</TableCell>
-                        </TableRow>
-                      </TableHead>
-                      <TableBody>
-                        {history.map((item, idx) => {
-                          const id = str(item.id, `trace-${idx}`);
-                          const status = str(item.status, "running");
-                          return (
-                            <TableRow key={id} hover onClick={() => setSelectedTraceId(id)} sx={{ cursor: "pointer" }}>
-                              <TableCell>
-                                <Typography variant="body2" noWrap title={humanTs(str(item.started_at)).tip}>
-                                  {humanTs(str(item.started_at)).label}
-                                </Typography>
-                              </TableCell>
-                              <TableCell>
-                                <Typography variant="body2" noWrap title={str(item.channel)}>{str(item.channel)}</Typography>
-                              </TableCell>
-                              <TableCell>
-                                <Typography variant="body2" className="diagnostics-cell-clamp diagnostics-cell-clamp--2" title={str(item.message_preview)} sx={{
-                                  fontWeight: 600
-                                }}>
-                                  {str(item.message_preview)}
-                                </Typography>
-                              </TableCell>
-                              <TableCell>
-                                <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.75 }}>
-                                  <Box component="span" sx={{ width: 7, height: 7, borderRadius: "50%", flexShrink: 0, bgcolor: status === "completed" ? "rgba(74,210,157,0.85)" : status === "failed" ? "rgba(255,100,100,0.85)" : "rgba(180,200,220,0.5)" }} />
-                                  <Typography variant="body2" noWrap sx={{
-                                    color: "text.secondary"
-                                  }}>{status}</Typography>
-                                </Box>
-                              </TableCell>
-                              <TableCell>
-                                <Typography variant="body2" noWrap>{num(item.step_count, 0)}</Typography>
-                              </TableCell>
-                              <TableCell>
-                                <Typography variant="body2" noWrap>{formatTraceDuration(item.duration_ms)}</Typography>
-                              </TableCell>
-                            </TableRow>
-                          );
-                        })}
-                      </TableBody>
-                    </Table>
-                  </TableContainer>
-                )}
-                {/* Collapsible charts + console */}
+                {/* Charts — always visible when there's data */}
+                {history.length > 0 ? (
+                  <Stack direction={{ xs: "column", md: "row" }} spacing={1.25}>
+                    <MetricBarCard
+                      className="diagnostics-chart-card trace-metric-card delay-1"
+                      title="Execution Volume"
+                      value={`${history.length} runs`}
+                      values={histTrendValues}
+                      rows={histTrendRows}
+                      palette={["#a882ff", "#9370ff", "#b794ff", "#7c5ce0", "#c4a8ff", "#8b6aed", "#d0b8ff"]}
+                      chartHeight={72}
+                      compact
+                      rowsLimit={5}
+                    />
+                    <MetricBarCard
+                      className="diagnostics-chart-card trace-metric-card delay-2"
+                      title="Failures"
+                      value={`${failed.length} failed`}
+                      values={histFailValues}
+                      rows={histFailRows}
+                      palette={["#ff7a7a", "#ff5555", "#ff9966", "#ff857d", "#ff6b6b", "#ff4444", "#ff8877"]}
+                      chartHeight={72}
+                      compact
+                      rowsLimit={5}
+                    />
+                  </Stack>
+                ) : null}
+                {/* Execution console — collapsible */}
                 {history.length > 0 ? (
                   <Accordion
                     expanded={showTraceCharts}
@@ -21502,43 +21758,88 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
                     disableGutters
                   >
                     <AccordionSummary expandIcon={<ExpandMoreIcon sx={{ color: "rgba(148,190,225,0.6)" }} />} className="trace-charts-accordion-header">
-                      <Typography variant="body2" sx={{
-                        color: "text.secondary"
-                      }}>Charts &amp; Console</Typography>
+                      <Typography variant="body2" sx={{ color: "text.secondary" }}>Execution Console</Typography>
                     </AccordionSummary>
                     <AccordionDetails className="trace-charts-accordion-body">
-                      <Stack spacing={1.25}>
-                        <WorkspaceLazyPanel message="Loading console...">
-                          <LiveEventConsole history={history} events={recentEvents} compact />
-                        </WorkspaceLazyPanel>
-                        <Stack direction={{ xs: "column", md: "row" }} spacing={1.25}>
-                          <MetricBarCard
-                            className="diagnostics-chart-card trace-metric-card delay-1"
-                            title="Execution Volume"
-                            value={`${history.length} runs`}
-                            values={histTrendValues}
-                            rows={histTrendRows}
-                            palette={["#47d7ff", "#29b8ff", "#0fe3c2", "#8be9fd", "#6aa7ff", "#1db5ff", "#67d4ff"]}
-                            chartHeight={64}
-                            compact
-                            rowsLimit={4}
-                          />
-                          <MetricBarCard
-                            className="diagnostics-chart-card trace-metric-card delay-2"
-                            title="Failures"
-                            value={`${failed.length} failed`}
-                            values={histFailValues}
-                            rows={histFailRows}
-                            palette={["#ff7a7a", "#ff5555", "#ff9966", "#ff857d", "#ff6b6b", "#ff4444", "#ff8877"]}
-                            chartHeight={64}
-                            compact
-                            rowsLimit={4}
-                          />
-                        </Stack>
-                      </Stack>
+                      <WorkspaceLazyPanel message="Loading console...">
+                        <LiveEventConsole history={history} events={recentEvents} compact />
+                      </WorkspaceLazyPanel>
                     </AccordionDetails>
                   </Accordion>
                 ) : null}
+                {/* Paginated history table */}
+                {history.length === 0 ? (
+                  <Alert severity="info">
+                    No trace history yet. New runs will appear here automatically.
+                  </Alert>
+                ) : (() => {
+                  const totalPages = Math.max(1, Math.ceil(history.length / historyPageSize));
+                  const pageSlice = history.slice(historyPage * historyPageSize, (historyPage + 1) * historyPageSize);
+                  return (
+                    <>
+                      <TableContainer className="table-shell diagnostics-table-shell trace-table-full">
+                        <Table size="small" sx={{ tableLayout: "fixed" }}>
+                          <TableHead>
+                            <TableRow>
+                              <TableCell width="13%">Started</TableCell>
+                              <TableCell width="9%">Source</TableCell>
+                              <TableCell width="44%">Message</TableCell>
+                              <TableCell width="12%">Status</TableCell>
+                              <TableCell width="10%">Steps</TableCell>
+                              <TableCell width="12%">Duration</TableCell>
+                            </TableRow>
+                          </TableHead>
+                          <TableBody>
+                            {pageSlice.map((item, idx) => {
+                              const id = str(item.id, `trace-${historyPage * historyPageSize + idx}`);
+                              const status = str(item.status, "running");
+                              return (
+                                <TableRow key={id} hover onClick={() => setSelectedTraceId(id)} sx={{ cursor: "pointer" }}>
+                                  <TableCell>
+                                    <Typography variant="body2" noWrap title={humanTs(str(item.started_at)).tip}>
+                                      {humanTs(str(item.started_at)).label}
+                                    </Typography>
+                                  </TableCell>
+                                  <TableCell>
+                                    <Typography variant="body2" noWrap title={str(item.channel)}>{str(item.channel)}</Typography>
+                                  </TableCell>
+                                  <TableCell>
+                                    <Typography variant="body2" className="diagnostics-cell-clamp diagnostics-cell-clamp--2" title={str(item.message_preview)} sx={{ fontWeight: 600 }}>
+                                      {str(item.message_preview)}
+                                    </Typography>
+                                  </TableCell>
+                                  <TableCell>
+                                    <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.75 }}>
+                                      <Box component="span" sx={{ width: 7, height: 7, borderRadius: "50%", flexShrink: 0, bgcolor: status === "completed" ? "rgba(74,210,157,0.85)" : status === "failed" ? "rgba(255,100,100,0.85)" : "rgba(180,200,220,0.5)" }} />
+                                      <Typography variant="body2" noWrap sx={{ color: "text.secondary" }}>{status}</Typography>
+                                    </Box>
+                                  </TableCell>
+                                  <TableCell>
+                                    <Typography variant="body2" noWrap>{num(item.step_count, 0)}</Typography>
+                                  </TableCell>
+                                  <TableCell>
+                                    <Typography variant="body2" noWrap>{formatTraceDuration(item.duration_ms)}</Typography>
+                                  </TableCell>
+                                </TableRow>
+                              );
+                            })}
+                          </TableBody>
+                        </Table>
+                      </TableContainer>
+                      {totalPages > 1 ? (
+                        <Stack direction="row" spacing={1} sx={{ justifyContent: "space-between", alignItems: "center", pt: 0.5 }}>
+                          <Typography variant="caption" color="text.secondary">
+                            Page {historyPage + 1} of {totalPages} ({history.length} runs)
+                          </Typography>
+                          <Stack direction="row" spacing={0.5}>
+                            <Button size="small" disabled={historyPage === 0} onClick={() => setHistoryPage((p) => p - 1)}>Prev</Button>
+                            <Button size="small" disabled={historyPage >= totalPages - 1} onClick={() => setHistoryPage((p) => p + 1)}>Next</Button>
+                          </Stack>
+                        </Stack>
+                      ) : null}
+                    </>
+                  );
+                })()}
               </Stack>
             );
           })()}
@@ -21772,7 +22073,7 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
 
                 {evolutionReviewCards.length > 0 ? (
                   <Box className="diagnostics-content-card diagnostics-content-card--review">
-                    <Typography variant="subtitle2" sx={{ mb: 1 }}>Evolution Review</Typography>
+                    <Typography variant="subtitle2" sx={{ mb: 1 }}>ArkEvolve Review</Typography>
                     <Stack spacing={0.75}>
                       {evolutionReviewCards.map((card) => (
                         <Box key={card.key} className="diagnostics-subcard">
@@ -22586,19 +22887,6 @@ function WatchersManager({ autoRefresh }: { autoRefresh: boolean }) {
       await queryClient.invalidateQueries({ queryKey: ["watchers-page-watchers"] });
     }
   });
-  const pauseAllMutation = useMutation({
-    mutationFn: () => api.rawPost("/watchers/pause-all", {}),
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["watchers-page-watchers"] });
-    }
-  });
-  const resumeAllMutation = useMutation({
-    mutationFn: () => api.rawPost("/watchers/resume-all", {}),
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["watchers-page-watchers"] });
-    }
-  });
-
   const watchers = pickRecords(watchersQ.data, "watchers");
   const sessionsById = useMemo(() => {
     const map = new Map<string, string>();
@@ -22646,55 +22934,6 @@ function WatchersManager({ autoRefresh }: { autoRefresh: boolean }) {
             <span className="stat-strip-value">{s.value}</span>
           </div>
         ))}
-      </Box>
-      <Box className="list-shell">
-        <Stack
-          direction="row"
-          spacing={1}
-          useFlexGap
-          sx={{
-            alignItems: "center",
-            flexWrap: "wrap"
-          }}>
-          <Typography
-            variant="caption"
-            sx={{
-              color: "text.secondary",
-              mr: 0.5
-            }}>
-            Default watcher lifetime is 24h. You can pause, resume, extend, or queue a watcher to run on the next Sentinel tick.
-          </Typography>
-          <Button
-            size="small"
-            variant="outlined"
-            disabled={activeCount === 0 || pauseAllMutation.isPending}
-            onClick={async () => {
-              setError(null);
-              try {
-                await pauseAllMutation.mutateAsync();
-              } catch (e) {
-                setError(errMessage(e));
-              }
-            }}
-          >
-            Pause all active
-          </Button>
-          <Button
-            size="small"
-            variant="outlined"
-            disabled={pausedCount === 0 || resumeAllMutation.isPending}
-            onClick={async () => {
-              setError(null);
-              try {
-                await resumeAllMutation.mutateAsync();
-              } catch (e) {
-                setError(errMessage(e));
-              }
-            }}
-          >
-            Resume all paused
-          </Button>
-        </Stack>
       </Box>
       {watchers.length === 0 ? (
         <Box className="list-shell" sx={{ py: 8, textAlign: "center" }}>
@@ -23221,7 +23460,7 @@ function WatchersManager({ autoRefresh }: { autoRefresh: boolean }) {
 type EvolutionPageTab = "what" | "helped" | "tests" | "review" | "controls";
 
 const EVOLUTION_PAGE_TABS: Array<{ value: EvolutionPageTab; label: string }> = [
-  { value: "what", label: "What happened" },
+  { value: "what", label: "What changed" },
   { value: "helped", label: "What helped" },
   { value: "tests", label: "Tests running" },
   { value: "review", label: "Review" },
@@ -23296,6 +23535,207 @@ function EvolutionRolloutBar({ label, percent }: { label: string; percent: numbe
   );
 }
 
+function buildEvolutionFocusCaseLabel(row: JsonRecord): string {
+  const surface = str(row.surface, "case").trim();
+  const delta = num(row.score_delta, Number.NaN);
+  const preview = str(row.prompt_preview, "").trim();
+  const invalidBefore = toBool(row.invalid_json_before);
+  const invalidAfter = toBool(row.invalid_json_after);
+  const parts = [surface];
+  if (Number.isFinite(delta)) parts.push(`${delta >= 0 ? "+" : ""}${(delta * 100).toFixed(0)} pts`);
+  if (invalidBefore !== invalidAfter) parts.push(invalidAfter ? "JSON regressed" : "JSON stabilized");
+  if (preview) parts.push(preview);
+  return parts.join(" · ");
+}
+
+function buildEvolutionEvidenceCards(runs: JsonRecord[]): EvolutionPatternCard[] {
+  const groupedRuns = new Map<string, JsonRecord[]>();
+  runs.forEach((run, idx) => {
+    const requestText = collapseInlineWhitespace(str(run.request_text, ""));
+    const intentKey = collapseInlineWhitespace(str(run.intent_key, ""));
+    const key = requestText ? `request:${requestText.toLowerCase()}` : intentKey ? `intent:${intentKey.toLowerCase()}` : `run:${str(run.id, String(idx))}`;
+    const existing = groupedRuns.get(key);
+    if (existing) {
+      existing.push(run);
+    } else {
+      groupedRuns.set(key, [run]);
+    }
+  });
+
+  return Array.from(groupedRuns.values())
+    .sort((left, right) => latestLearningEvidenceTimestamp(right) - latestLearningEvidenceTimestamp(left))
+    .map((groupRuns, idx): EvolutionPatternCard | null => {
+      const latestRun = groupRuns.reduce((best, current) => {
+        return learningEvidenceTimestampMs(str(current.created_at, "")) >= learningEvidenceTimestampMs(str(best.created_at, "")) ? current : best;
+      }, groupRuns[0]);
+      const taskType = str(latestRun.task_type, "").trim();
+      const requestPreview = collapseInlineWhitespace(str(latestRun.request_text, ""));
+      const title = inferLearningEvidenceTitle(groupRuns, requestPreview, taskType);
+      const latestSeen = humanTs(str(latestRun.created_at, "")).label;
+
+      const allToolNames: string[] = [];
+      const successfulToolNames: string[] = [];
+      const failedToolNames: string[] = [];
+      const failureReasons: string[] = [];
+      let completedCount = 0;
+      let failedCount = 0;
+      let acceptedCount = 0;
+
+      groupRuns.forEach((run) => {
+        const state = normalizeLearningEvidenceState(run);
+        const toolNames = stringList(run.tool_names);
+        const failureReason = collapseInlineWhitespace(str(run.failure_reason, str(run.outcome_summary, "")));
+        toolNames.forEach((toolName) => {
+          allToolNames.push(toolName);
+          if (state === "completed" || state === "success" || state === "succeeded") successfulToolNames.push(toolName);
+          if (state === "failed" || state === "error") failedToolNames.push(toolName);
+        });
+        if (state === "completed" || state === "success" || state === "succeeded") completedCount += 1;
+        else if (state === "failed" || state === "error") {
+          failedCount += 1;
+          if (failureReason) failureReasons.push(failureReason);
+        } else if (state === "accepted") acceptedCount += 1;
+      });
+
+      if (!title && !requestPreview && allToolNames.length === 0) return null;
+
+      const runCount = groupRuns.length;
+      const allToolSet = new Set(allToolNames.map((name) => name.trim().toLowerCase()).filter(Boolean));
+      const successfulToolSet = new Set(successfulToolNames.map((name) => name.trim().toLowerCase()).filter(Boolean));
+      const failedToolSet = new Set(failedToolNames.map((name) => name.trim().toLowerCase()).filter(Boolean));
+      const dominantBlocker = failureReasons[0] ? truncateUiText(failureReasons[0], 110) : "";
+      const isPreferencePattern = acceptedCount > 0 && completedCount === 0 && failedCount === 0;
+      const recoveredReminderPath =
+        completedCount > 0 &&
+        failedCount > 0 &&
+        (allToolSet.has("schedule_task") || successfulToolSet.has("schedule_task")) &&
+        (allToolSet.has("calendar_create") || failedToolSet.has("calendar_create"));
+
+      let status = "Collecting examples";
+      if (isPreferencePattern) status = "User preference captured";
+      else if (completedCount > 0 && failedCount > 0) status = "Mixed results";
+      else if (completedCount > 1) status = "Repeating successfully";
+      else if (completedCount === 1) status = "Seen once";
+      else if (failedCount > 0) status = "Needs review";
+
+      let detail = `Captured ${runCount} related run${runCount === 1 ? "" : "s"} for comparison.`;
+      let rationale = "ArkEvolve is still collecting enough examples to decide whether a product change is warranted.";
+
+      if (isPreferencePattern) {
+        detail = `Captured an explicit user correction that should steer similar requests from the start.`;
+        rationale = "Direct user constraints are stronger evidence than a default integration guess or a broad tool match.";
+      } else if (recoveredReminderPath) {
+        detail = `Observed ${runCount} similar reminder requests. Earlier attempts went through Calendar and failed. Later runs completed by creating scheduled in-app reminders instead.`;
+        rationale = "This is concrete evidence that date-based 'notify me' requests do not need Calendar when a local reminder already satisfies the request.";
+      } else if (completedCount > 1 && failedCount === 0) {
+        detail = `Observed ${runCount} similar runs completing with a repeatable path.`;
+        rationale = "Repeated success is strong enough to keep the current routing and tool-selection choice under watch.";
+      } else if (completedCount > 0 && failedCount > 0) {
+        detail = `Observed ${runCount} related runs with mixed outcomes. The latest path completed, but earlier attempts show the routing still needs refinement.`;
+        rationale = "ArkEvolve can use the failures to narrow when the alternate path should be avoided.";
+      } else if (failedCount > 0) {
+        detail = `Observed ${runCount} failed run${runCount === 1 ? "" : "s"}${dominantBlocker ? `, mostly blocked by ${dominantBlocker}` : ""}.`;
+        rationale = "This is evidence for a guardrail or tighter trigger before retrying the same path.";
+      } else if (completedCount === 1) {
+        detail = "Observed one completed run. ArkEvolve usually waits for repetition before treating it as a stable lesson.";
+        rationale = "A single success is useful context, but not enough to claim that behavior improved.";
+      }
+
+      const chips = [`${runCount} run${runCount === 1 ? "" : "s"}`];
+      if (completedCount > 0) chips.push(`${completedCount} completed`);
+      if (failedCount > 0) chips.push(`${failedCount} failed`);
+      if (acceptedCount > 0) chips.push(`${acceptedCount} correction${acceptedCount === 1 ? "" : "s"}`);
+
+      const evidence: string[] = [];
+      const toolSummary = summarizeLearningEvidenceTools(allToolNames);
+      if (toolSummary) evidence.push(`Tools used: ${toolSummary}`);
+      if (failedCount > 0 && dominantBlocker) evidence.push(`Main blocker: ${dominantBlocker}`);
+
+      return {
+        key: `${str(latestRun.id, "run")}-${idx}`,
+        title,
+        status,
+        detail,
+        chips,
+        rationale,
+        example: requestPreview ? truncateUiText(requestPreview, 120) : undefined,
+        evidence: evidence.join(" | "),
+        runs: groupRuns,
+        latestSeen: latestSeen !== "-" ? latestSeen : undefined,
+        toolSummary,
+        completedCount,
+        failedCount,
+        acceptedCount
+      };
+    })
+    .filter((card): card is EvolutionPatternCard => card !== null)
+    .slice(0, 4);
+}
+
+function skillEvolutionChipColor(status: string): "default" | "success" | "warning" | "error" | "info" {
+  const normalized = status.trim().toLowerCase();
+  if (normalized === "approved" || normalized === "improved") return "success";
+  if (normalized === "draft" || normalized === "pending" || normalized === "inconclusive") return "warning";
+  if (normalized === "regressed" || normalized === "rejected") return "error";
+  if (normalized === "unchanged") return "info";
+  return "default";
+}
+
+function skillEvolutionAlertSeverity(status: string): "success" | "warning" | "error" | "info" {
+  const normalized = status.trim().toLowerCase();
+  if (normalized === "approved" || normalized === "improved") return "success";
+  if (normalized === "regressed" || normalized === "rejected") return "error";
+  if (normalized === "unchanged") return "info";
+  return "warning";
+}
+
+function skillEvolutionActionLabel(action: string): string {
+  const normalized = action.trim().toLowerCase();
+  if (normalized === "create_skill") return "Create skill";
+  if (normalized === "optimize_description") return "Tune trigger";
+  if (normalized === "improve_skill") return "Improve skill";
+  return action || "Skill change";
+}
+
+function canonicalSkillIdentifier(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  const compact = trimmed.toLowerCase().replace(/[^a-z0-9]+/g, "");
+  if (compact === "trendprophet") return "trend-prophet";
+  return trimmed;
+}
+
+function skillEvolutionMetricRows(row: JsonRecord): Array<{ label: string; before: string; after: string; delta: string; positive: boolean | null }> {
+  const baseline = asRecord(row.impact_baseline);
+  const observed = asRecord(row.impact_observed);
+  const successDelta = num(observed.success_rate, 0) - num(baseline.success_rate, 0);
+  const failureDelta = num(baseline.failure_rate, 0) - num(observed.failure_rate, 0);
+  const toolErrorDelta = num(baseline.tool_error_rate, 0) - num(observed.tool_error_rate, 0);
+  return [
+    {
+      label: "Success",
+      before: percentageLabel(baseline.success_rate, 1) || "-",
+      after: percentageLabel(observed.success_rate, 1) || "-",
+      delta: evolutionGainLabel(successDelta),
+      positive: Number.isFinite(successDelta) ? successDelta >= 0 : null
+    },
+    {
+      label: "Failure",
+      before: percentageLabel(baseline.failure_rate, 1) || "-",
+      after: percentageLabel(observed.failure_rate, 1) || "-",
+      delta: evolutionGainLabel(failureDelta),
+      positive: Number.isFinite(failureDelta) ? failureDelta >= 0 : null
+    },
+    {
+      label: "Tool errors",
+      before: percentageLabel(baseline.tool_error_rate, 1) || "-",
+      after: percentageLabel(observed.tool_error_rate, 1) || "-",
+      delta: evolutionGainLabel(toolErrorDelta),
+      positive: Number.isFinite(toolErrorDelta) ? toolErrorDelta >= 0 : null
+    }
+  ];
+}
+
 function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
   const queryClient = useQueryClient();
   const [tab, setTab] = useState<EvolutionPageTab>("what");
@@ -23303,6 +23743,7 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
   const [developerModeEnabled, setDeveloperModeEnabledState] = useState(getDeveloperModeEnabled);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  const [selectedPatternCard, setSelectedPatternCard] = useState<EvolutionPatternCard | null>(null);
 
   useEffect(() => {
     const refreshDeveloperMode = () => setDeveloperModeEnabledState(getDeveloperModeEnabled());
@@ -23363,6 +23804,13 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
   const classifierMetrics = pickRecords(evolutionDev, "classifier_prompt_metrics");
   const specialistMetrics = pickRecords(evolutionDev, "specialist_prompt_metrics");
   const learningCandidates = pickRecords(evolutionDev, "learning_candidates");
+  const skillEvolutions = pickRecords(evolutionDev, "skill_evolutions");
+  const recentExperienceRuns = pickRecords(evolutionDev, "recent_experience_runs");
+  const skillReviewItems = skillEvolutions.filter((row) => str(row.approval_status, "draft") === "draft");
+  const approvedSkillEvolutions = skillEvolutions.filter((row) => str(row.approval_status, "").trim().toLowerCase() === "approved");
+  const skillHelpedItems = approvedSkillEvolutions.filter((row) => str(row.impact_status, "").trim().toLowerCase() === "improved");
+  const skillObservedItems = approvedSkillEvolutions.filter((row) => str(row.impact_status, "").trim().toLowerCase() !== "improved");
+  const nonSkillLearningCandidates = learningCandidates.filter((row) => str(row.candidate_type, "") !== "skill_patch");
   const lineageRows: JsonRecord[] = [
     ...pickRecords(evolutionDev, "prompt_lineage_recent").map((row): JsonRecord => ({ ...row, surface: "Prompt", gain: row.score_gain })),
     ...pickRecords(evolutionDev, "classifier_prompt_lineage_recent").map((row): JsonRecord => ({ ...row, surface: "Classifier", gain: row.score_gain })),
@@ -23411,6 +23859,11 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
   const activeTests = tests.filter((item) => item.enabled).length;
   const maxRollout = tests.reduce((acc, item) => Math.max(acc, item.rollout), 0);
   const helpedLines = [
+    ...skillHelpedItems.flatMap((row) => {
+      const summary = stringList(asRecord(row.impact_assessment).summary);
+      const prefix = str(row.skill_name, "Skill");
+      return summary.map((line) => `${prefix}: ${line}`);
+    }),
     ...stringList(promptInsights.summary),
     ...stringList(classifierInsights.summary),
     ...stringList(specialistInsights.summary)
@@ -23422,6 +23875,8 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
     ...specialistMetrics.slice(0, 3).map((row): JsonRecord => ({ ...row, surface: "Specialist" }))
   ];
   const metricChartRows = metricRows.slice(0, 10);
+  const classifierFocusCases = pickRecords(classifierLastResult, "focus_cases");
+  const evidenceCards = useMemo(() => buildEvolutionEvidenceCards(recentExperienceRuns), [recentExperienceRuns]);
   const metricChartOption = {
     backgroundColor: "transparent",
     animationDuration: 350,
@@ -23464,13 +23919,35 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
   const statusError = evolutionQ.error ? errMessage(evolutionQ.error) : "";
   const detailError = evolutionDevQ.error ? errMessage(evolutionDevQ.error) : "";
   const activeError = error || statusError;
+  const selectedPatternRuns = selectedPatternCard?.runs ?? [];
+  const selectedPatternRequests = uniqueNonEmptyStrings(
+    selectedPatternRuns
+      .map((run) => str(run.request_text, "").trim())
+      .filter(Boolean)
+  ).slice(0, 6);
+  const selectedPatternPolicies = uniqueNonEmptyStrings(selectedPatternRuns.map((run) => run.policy_version));
+  const selectedPatternStrategies = uniqueNonEmptyStrings(selectedPatternRuns.map((run) => run.strategy_version));
+  const selectedPatternPrompts = uniqueNonEmptyStrings(selectedPatternRuns.map((run) => run.prompt_version));
+  const selectedPatternClassifierPrompts = uniqueNonEmptyStrings(
+    selectedPatternRuns.map((run) => run.classifier_prompt_version)
+  );
+  const selectedPatternSpecialistPrompts = uniqueNonEmptyStrings(
+    selectedPatternRuns.map((run) => run.specialist_prompt_version)
+  );
+  const selectedPatternVersionItems = [
+    { label: "Policy", values: selectedPatternPolicies },
+    { label: "Strategy", values: selectedPatternStrategies },
+    { label: "Prompt", values: selectedPatternPrompts },
+    { label: "Classifier prompt", values: selectedPatternClassifierPrompts },
+    { label: "Specialist prompt", values: selectedPatternSpecialistPrompts }
+  ].filter((item) => item.values.length > 1);
 
   return (
     <WorkspacePageShell className="evolution-page" spacing={1.5}>
       <WorkspacePageHeader
-        eyebrow="Evolution"
-        title="Learning and Tests"
-        description="Plain-language status for what AgentArk learned, what improved, what is still being tested, and what needs review."
+        eyebrow="Agent"
+        title="ArkEvolve"
+        description="Plain-language status for what ArkEvolve learned, what improved, what is still being tested, and what needs review."
         actions={
           <Stack
             direction="row"
@@ -23488,13 +23965,14 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
       {success ? <Alert severity="success">{success}</Alert> : null}
       {activeError ? <Alert severity="error">{activeError}</Alert> : null}
       <EvolutionStatStrip items={[
-        { label: "Learning", value: toBool(evolution.learning_enabled) ? "On" : "Off", helper: toBool(evolution.learning_local_only) ? "Local-only mode" : "Remote help allowed", tone: toBool(evolution.learning_enabled) ? "good" : "default" },
-        { label: "Tests", value: activeTests, helper: `${maxRollout.toFixed(0)}% max rollout`, tone: activeTests > 0 ? "warn" : "info" },
-        { label: "Review queue", value: num(learningQueue.draft_candidates, 0), helper: `${num(learningQueue.pending_consolidation, 0)} waiting consolidation`, tone: num(learningQueue.draft_candidates, 0) > 0 ? "warn" : "default" },
-        { label: "Patterns learned", value: num(learningQueue.active_patterns, 0), helper: `Queue cap ${num(evolution.learning_queue_cap, 64)}`, tone: "info" },
+      { label: "Learning", value: toBool(evolution.learning_enabled) ? "On" : "Off", helper: toBool(evolution.learning_local_only) ? "Local-only mode" : "Remote help allowed", tone: toBool(evolution.learning_enabled) ? "good" : "default" },
+      { label: "Tests", value: activeTests, helper: `${maxRollout.toFixed(0)}% max rollout`, tone: activeTests > 0 ? "warn" : "info" },
+      { label: "Review queue", value: num(learningQueue.draft_candidates, 0), helper: `${num(learningQueue.pending_consolidation, 0)} waiting consolidation`, tone: num(learningQueue.draft_candidates, 0) > 0 ? "warn" : "default" },
+      { label: "Patterns learned", value: num(learningQueue.active_patterns, 0), helper: `Queue cap ${num(evolution.learning_queue_cap, 64)}`, tone: "info" },
+        { label: "Skills improved", value: skillHelpedItems.length, helper: `${approvedSkillEvolutions.length} observed after approval`, tone: skillHelpedItems.length > 0 ? "good" : skillReviewItems.length > 0 ? "warn" : "default" },
       ]} />
       <Box className="list-shell" sx={{ p: 0.75 }}>
-        <Tabs value={tab} onChange={(_, next) => setTab(next as EvolutionPageTab)} variant="scrollable" scrollButtons="auto" aria-label="Evolution page sections">
+        <Tabs value={tab} onChange={(_, next) => setTab(next as EvolutionPageTab)} variant="scrollable" scrollButtons="auto" aria-label="ArkEvolve page sections" className="workspace-page-subnav-tabs">
           {EVOLUTION_PAGE_TABS.map((item) => (
             <Tab key={item.value} value={item.value} label={item.label} />
           ))}
@@ -23508,23 +23986,13 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
             <CircularProgress size={18} />
             <Typography variant="body2" sx={{
               color: "text.secondary"
-            }}>Loading evolution status...</Typography>
+            }}>Loading ArkEvolve status...</Typography>
           </Stack>
         </Box>
       ) : null}
       {tab === "what" ? (
-        <Grid2 container spacing={1.5}>
-          <Grid2 size={{ xs: 12, lg: 7 }}>
-            <Box className="list-shell" sx={{ p: 1.6, minHeight: "100%" }}>
-              <Typography variant="h6" sx={{ color: "#e8f4ff", fontWeight: 700 }}>What happened</Typography>
-              <Typography
-                variant="body2"
-                sx={{
-                  color: "text.secondary",
-                  mb: 1
-                }}>
-                Most recent learning and promotion events, translated into operator-visible changes.
-              </Typography>
+        <Stack spacing={1.5}>
+          <Box className="list-shell" sx={{ p: 1.6 }}>
               {detailLoading ? (
                 <Stack direction="row" spacing={1} sx={{
                   alignItems: "center"
@@ -23536,16 +24004,49 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
                 </Stack>
               ) : detailError ? (
                 <Alert severity="warning" sx={{ borderRadius: 1 }}>
-                  Detailed evolution history is unavailable: {detailError}
+                  Detailed ArkEvolve history is unavailable: {detailError}
                 </Alert>
-              ) : lineageRows.length === 0 ? (
+              ) : lineageRows.length === 0 && skillEvolutions.length === 0 ? (
                 <Typography variant="body2" sx={{
                   color: "text.secondary"
-                }}>No evolution changes have been recorded yet.</Typography>
+                }}>No prompt, routing, or skill changes have been promoted yet. ArkEvolve is still collecting comparable examples.</Typography>
               ) : (
                 <Stack spacing={1}>
-                  {lineageRows.slice(0, 8).map((row, idx) => (
-                    <Box key={`evolution-lineage-${str(row.entry_id, String(idx))}`} sx={{ pb: 1, borderBottom: "1px solid rgba(145,170,205,0.12)" }}>
+                  {skillEvolutions.length > 0 ? (
+                    <Box sx={{ pb: 1, borderBottom: "1px solid rgba(145,170,205,0.12)" }}>
+                      <Typography variant="caption" sx={{ color: "text.secondary", display: "block", mb: 0.75 }}>
+                        Skill evolutions
+                      </Typography>
+                      <Stack spacing={0.85}>
+                        {skillEvolutions.slice(0, 4).map((row, idx) => {
+                          const when = humanTs(str(row.reviewed_at || row.updated_at, "-"));
+                          return (
+                            <Alert key={`skill-evolution-what-${str(row.id, String(idx))}`} severity={skillEvolutionAlertSeverity(str(row.impact_status, str(row.approval_status, "draft")))} sx={{ borderRadius: 1 }}>
+                              <Stack direction="row" spacing={0.75} useFlexGap sx={{ alignItems: "center", flexWrap: "wrap", mb: 0.35 }}>
+                                <Typography variant="body2" sx={{ color: "#e8f4ff", fontWeight: 600 }}>
+                                  {canonicalSkillIdentifier(str(row.skill_name, "Skill"))}
+                                </Typography>
+                                <Chip size="small" label={skillEvolutionActionLabel(str(row.action, ""))} />
+                                <Chip size="small" color={skillEvolutionChipColor(str(row.impact_status, str(row.approval_status, "draft")))} label={str(row.impact_status, str(row.approval_status, "draft")) || "draft"} />
+                                <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                                  {when.label}
+                                </Typography>
+                              </Stack>
+                              <Typography variant="body2">{str(row.diff_summary, str(row.summary, "Reviewable skill change"))}</Typography>
+                            </Alert>
+                          );
+                        })}
+                      </Stack>
+                    </Box>
+                  ) : null}
+                  {lineageRows.slice(0, 8).map((row, idx) => {
+                    const surfaceSummary = stringList(row.optimized_surfaces).concat(stringList(row.optimized_roles)).join(", ");
+                    const notesSummary = stringList(row.notes).join(" | ");
+                    const focusSummary = pickRecords(row, "focus_cases").slice(0, 2).map(buildEvolutionFocusCaseLabel).join(" | ");
+                    const fallbackSummary = str(row.candidate_source, "No summary recorded");
+                    const summary = surfaceSummary || notesSummary || focusSummary || fallbackSummary;
+                    return (
+                      <Box key={`evolution-lineage-${str(row.entry_id, String(idx))}`} sx={{ pb: 1, borderBottom: "1px solid rgba(145,170,205,0.12)" }}>
                       <Stack
                         direction="row"
                         spacing={1}
@@ -23570,31 +24071,280 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
                           display: "block",
                           mt: 0.35
                         }}>
-                        {stringList(row.optimized_surfaces).concat(stringList(row.optimized_roles)).join(", ") || stringList(row.notes).join(" | ") || str(row.candidate_source, "No summary recorded")}
+                        {summary}
                       </Typography>
                     </Box>
-                  ))}
+                    );
+                  })}
                 </Stack>
               )}
-            </Box>
-          </Grid2>
-          <Grid2 size={{ xs: 12, lg: 5 }}>
-            <Box className="list-shell" sx={{ p: 1.6, minHeight: "100%" }}>
-              <Typography variant="h6" sx={{ color: "#e8f4ff", fontWeight: 700, mb: 1 }}>Current state</Typography>
-              <Stack spacing={1.2}>
-                <Typography variant="body2">Last policy promotion: {str(evolution.last_promotion_result, "No policy promotion yet")}</Typography>
-                <Typography variant="body2">Last prompt promotion: {str(evolution.prompt_last_promotion_result, "No prompt promotion yet")}</Typography>
-                <Typography variant="body2">Prompt edits: {stringList(promptLastResult.optimized_surfaces).join(", ") || "No prompt edits recorded yet"}</Typography>
-                <Typography variant="body2">Classifier edits: {stringList(classifierLastResult.optimized_surfaces).join(", ") || "No classifier edits recorded yet"}</Typography>
-                <Typography variant="body2">Specialist edits: {stringList(specialistLastResult.optimized_surfaces).join(", ") || "No specialist edits recorded yet"}</Typography>
-              </Stack>
-            </Box>
-          </Grid2>
-        </Grid2>
+          </Box>
+
+          {evidenceCards.length > 0 ? (
+          <Box className="list-shell" sx={{ p: 1.6 }}>
+              <Typography variant="h6" sx={{ fontWeight: 700, mb: 0.5 }}>Recent patterns</Typography>
+              <Typography
+                variant="body2"
+                sx={{
+                  color: "text.secondary",
+                  mb: 1
+                }}
+              >
+                Select a row to inspect the grouped runs, observed tools, and why ArkEvolve is still only watching the pattern.
+              </Typography>
+              {detailLoading ? (
+                <Stack direction="row" spacing={1} sx={{ alignItems: "center" }}>
+                  <CircularProgress size={16} />
+                  <Typography variant="body2" sx={{ color: "text.secondary" }}>Loading...</Typography>
+                </Stack>
+              ) : detailError ? (
+                <Alert severity="warning" sx={{ borderRadius: 1 }}>{detailError}</Alert>
+              ) : (() => {
+                const patternPageSize = 10;
+                const patternPages = Math.max(1, Math.ceil(evidenceCards.length / patternPageSize));
+                const patternSlice = evidenceCards.slice(0, patternPageSize);
+                return (
+                  <>
+                    <TableContainer className="table-shell" sx={{ width: "100%", overflowX: "auto" }}>
+                      <Table size="small">
+                        <TableHead>
+                          <TableRow>
+                            <TableCell width="25%">Pattern</TableCell>
+                            <TableCell width="10%">Status</TableCell>
+                            <TableCell width="40%">Detail</TableCell>
+                            <TableCell width="25%">Why it matters</TableCell>
+                          </TableRow>
+                        </TableHead>
+                        <TableBody>
+                          {patternSlice.map((card) => (
+                            <TableRow
+                              key={card.key}
+                              hover
+                              role="button"
+                              tabIndex={0}
+                              sx={{ cursor: "pointer" }}
+                              onClick={() => setSelectedPatternCard(card)}
+                              onKeyDown={(event) => {
+                                if (event.key === "Enter" || event.key === " ") {
+                                  event.preventDefault();
+                                  setSelectedPatternCard(card);
+                                }
+                              }}
+                            >
+                              <TableCell>
+                                <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap title={card.title}>{card.title}</Typography>
+                              </TableCell>
+                              <TableCell>
+                                <Chip size="small" color={learningEvidenceStatusColor(card.status)} label={card.status} />
+                              </TableCell>
+                              <TableCell>
+                                <Typography variant="caption" color="text.secondary" sx={{ display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>
+                                  {card.detail}
+                                </Typography>
+                              </TableCell>
+                              <TableCell>
+                                <Typography variant="caption" color="text.secondary" noWrap title={card.rationale || ""}>
+                                  {card.rationale || "-"}
+                                </Typography>
+                              </TableCell>
+                            </TableRow>
+                          ))}
+                        </TableBody>
+                      </Table>
+                    </TableContainer>
+                    {patternPages > 1 ? (
+                      <Typography variant="caption" color="text.secondary" sx={{ pt: 0.5 }}>
+                        Showing {patternSlice.length} of {evidenceCards.length} patterns
+                      </Typography>
+                    ) : null}
+                  </>
+                );
+              })()}
+          </Box>
+          ) : null}
+        </Stack>
       ) : null}
+      <Dialog
+        open={selectedPatternCard != null}
+        onClose={() => setSelectedPatternCard(null)}
+        maxWidth="lg"
+        fullWidth
+      >
+        <DialogTitle>Observed pattern</DialogTitle>
+        <DialogContent dividers>
+          {selectedPatternCard ? (
+            <Stack spacing={1.25}>
+              <Stack
+                direction={{ xs: "column", md: "row" }}
+                spacing={1}
+                sx={{
+                  justifyContent: "space-between",
+                  alignItems: { xs: "flex-start", md: "center" }
+                }}
+              >
+                <Box sx={{ minWidth: 0 }}>
+                  <Typography variant="h6" sx={{ fontWeight: 700 }}>
+                    {selectedPatternCard.title}
+                  </Typography>
+                  <Typography variant="body2" sx={{ color: "text.secondary", mt: 0.35 }}>
+                    {evolutionPatternStatusExplanation(selectedPatternCard)}
+                  </Typography>
+                </Box>
+                <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: "wrap" }}>
+                  <Chip
+                    size="small"
+                    color={learningEvidenceStatusColor(selectedPatternCard.status)}
+                    label={selectedPatternCard.status}
+                  />
+                  {selectedPatternCard.chips.map((chip) => (
+                    <Chip key={`${selectedPatternCard.key}-${chip}`} size="small" variant="outlined" label={chip} />
+                  ))}
+                </Stack>
+              </Stack>
+
+              <Grid2 container spacing={1.25}>
+                <Grid2 size={{ xs: 12, md: 6 }}>
+                  <Box className="metadata-box">
+                    <Stack spacing={0.55}>
+                      <Typography variant="subtitle2">What happened</Typography>
+                      <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
+                        {selectedPatternCard.detail}
+                      </Typography>
+                      <Typography variant="caption" sx={{ color: "text.secondary", whiteSpace: "pre-wrap" }}>
+                        {selectedPatternCard.rationale || "AgentArk is still comparing repeated runs before changing future behavior."}
+                      </Typography>
+                    </Stack>
+                  </Box>
+                </Grid2>
+                <Grid2 size={{ xs: 12, md: 6 }}>
+                  <Box className="metadata-box">
+                    <Stack spacing={0.55}>
+                      <Typography variant="subtitle2">Why this is being tracked</Typography>
+                      {selectedPatternCard.latestSeen ? (
+                        <Typography variant="body2">
+                          <strong>Latest seen:</strong> {selectedPatternCard.latestSeen}
+                        </Typography>
+                      ) : null}
+                      {selectedPatternCard.toolSummary ? (
+                        <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
+                          <strong>Tools used:</strong> {selectedPatternCard.toolSummary}
+                        </Typography>
+                      ) : null}
+                      {selectedPatternCard.evidence
+                        ? selectedPatternCard.evidence.split(" | ").map((line, idx) => (
+                            <Typography
+                              key={`${selectedPatternCard.key}-evidence-${idx}`}
+                              variant="caption"
+                              sx={{ color: "text.secondary", display: "block" }}
+                            >
+                              {line}
+                            </Typography>
+                          ))
+                        : (
+                          <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                            No extra notes recorded yet.
+                          </Typography>
+                        )}
+                    </Stack>
+                  </Box>
+                </Grid2>
+                <Grid2 size={{ xs: 12, md: 6 }}>
+                  <Box className="metadata-box">
+                    <Stack spacing={0.55}>
+                      <Typography variant="subtitle2">Example user messages</Typography>
+                      {selectedPatternRequests.length > 0 ? (
+                        selectedPatternRequests.map((requestText, idx) => (
+                          <Typography
+                            key={`${selectedPatternCard.key}-request-${idx}`}
+                            variant="body2"
+                            sx={{ whiteSpace: "pre-wrap" }}
+                          >
+                            {requestText}
+                          </Typography>
+                        ))
+                      ) : (
+                        <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                          No user message was stored for these runs.
+                        </Typography>
+                      )}
+                    </Stack>
+                  </Box>
+                </Grid2>
+                {selectedPatternVersionItems.length > 0 ? (
+                  <Grid2 size={{ xs: 12, md: 6 }}>
+                    <Box className="metadata-box">
+                      <Stack spacing={0.55}>
+                        <Typography variant="subtitle2">Internal changes across these runs</Typography>
+                        <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                          Shown only when the underlying setup changed between related runs.
+                        </Typography>
+                        {selectedPatternVersionItems.map((item) => (
+                          <Typography key={`${selectedPatternCard.key}-${item.label}`} variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
+                            <strong>{item.label}:</strong> {item.values.join(", ")}
+                          </Typography>
+                        ))}
+                      </Stack>
+                    </Box>
+                  </Grid2>
+                ) : null}
+              </Grid2>
+
+              <Box className="list-shell" sx={{ p: 1.25 }}>
+                <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                  Observed runs
+                </Typography>
+                <TableContainer className="table-shell">
+                  <Table size="small">
+                    <TableHead>
+                      <TableRow>
+                        <TableCell width="18%">When</TableCell>
+                        <TableCell width="14%">Result</TableCell>
+                        <TableCell width="20%">Tools used</TableCell>
+                        <TableCell width="48%">What happened</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {selectedPatternRuns.map((run, idx) => {
+                        const runState = titleCaseLabel(normalizeLearningEvidenceState(run) || "observed");
+                        const toolSummary = summarizeLearningEvidenceTools(stringList(run.tool_names));
+                        const summary = summarizeEvolutionPatternRun(run);
+                        return (
+                          <TableRow key={`${selectedPatternCard.key}-run-${str(run.id, String(idx))}`}>
+                            <TableCell>
+                              <Typography variant="body2" title={humanTs(str(run.created_at, "-")).tip}>
+                                {humanTs(str(run.created_at, "-")).label}
+                              </Typography>
+                            </TableCell>
+                            <TableCell>
+                              <Chip size="small" color={learningEvidenceStatusColor(runState)} label={runState} />
+                            </TableCell>
+                            <TableCell>
+                              <Typography variant="body2" noWrap title={toolSummary || "-"}>
+                                {toolSummary || "-"}
+                              </Typography>
+                            </TableCell>
+                            <TableCell>
+                              <Typography variant="body2" sx={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                                {summary}
+                              </Typography>
+                            </TableCell>
+                          </TableRow>
+                        );
+                      })}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              </Box>
+            </Stack>
+          ) : null}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setSelectedPatternCard(null)}>Close</Button>
+        </DialogActions>
+      </Dialog>
       {tab === "helped" ? (
         <Grid2 container spacing={1.5}>
-          <Grid2 size={{ xs: 12, lg: 6 }}>
+          <Grid2 size={{ xs: 12, lg: 7 }}>
             <Box className="list-shell" sx={{ p: 1.6, minHeight: "100%" }}>
               <Typography variant="h6" sx={{ color: "#e8f4ff", fontWeight: 700 }}>What helped</Typography>
               <Typography
@@ -23618,12 +24368,50 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
                 <Alert severity="warning" sx={{ borderRadius: 1 }}>
                   Impact details are unavailable: {detailError}
                 </Alert>
-              ) : helpedLines.length === 0 ? (
+              ) : skillHelpedItems.length === 0 && helpedLines.length === 0 ? (
                 <Typography variant="body2" sx={{
                   color: "text.secondary"
                 }}>Not enough measured evidence yet.</Typography>
               ) : (
                 <Stack spacing={1}>
+                  {skillHelpedItems.map((row, idx) => {
+                    const assessment = asRecord(row.impact_assessment);
+                    const metricRows = skillEvolutionMetricRows(row);
+                    return (
+                      <Box key={`skill-helped-${str(row.id, String(idx))}`} sx={{ pb: 1, borderBottom: "1px solid rgba(145,170,205,0.12)" }}>
+                        <Stack direction="row" spacing={1} useFlexGap sx={{ alignItems: "center", flexWrap: "wrap" }}>
+                          <Typography variant="body2" sx={{ color: "#e8f4ff", fontWeight: 600 }}>
+                            {str(row.skill_name, "Skill")}
+                          </Typography>
+                          <Chip size="small" label={skillEvolutionActionLabel(str(row.action, ""))} />
+                          <Chip size="small" color={skillEvolutionChipColor(str(row.impact_status, "improved"))} label={str(row.impact_status, "improved")} />
+                        </Stack>
+                        <Typography variant="body2" sx={{ color: "text.secondary", mt: 0.45 }}>
+                          {str(row.diff_summary, str(row.summary, "Measured improvement recorded."))}
+                        </Typography>
+                        {stringList(assessment.summary).map((line, summaryIdx) => (
+                          <Typography key={`skill-helped-summary-${idx}-${summaryIdx}`} variant="caption" sx={{ color: "text.secondary", display: "block", mt: 0.35 }}>
+                            {line}
+                          </Typography>
+                        ))}
+                        <Box sx={{ mt: 1, display: "grid", gridTemplateColumns: { xs: "1fr", sm: "repeat(3, minmax(0,1fr))" }, gap: 1 }}>
+                          {metricRows.map((metric) => (
+                            <Box key={`${str(row.id, "skill")}-${metric.label}`} sx={{ p: 0.9, border: "1px solid rgba(145,170,205,0.12)", borderRadius: 1 }}>
+                              <Typography variant="caption" sx={{ color: "text.secondary", display: "block" }}>{metric.label}</Typography>
+                              <Typography variant="body2">{metric.before}{" -> "}{metric.after}</Typography>
+                              <Typography
+                                variant="caption"
+                                sx={{
+                                  color: metric.positive == null ? "text.secondary" : metric.positive ? "#14f195" : "#fb7185"
+                                }}>
+                                {metric.delta}
+                              </Typography>
+                            </Box>
+                          ))}
+                        </Box>
+                      </Box>
+                    );
+                  })}
                   {helpedLines.slice(0, 8).map((line, idx) => (
                     <Alert key={`evolution-helped-${idx}`} severity="success" sx={{ borderRadius: 1 }}>
                       {line}
@@ -23650,38 +24438,90 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
               </Stack>
             </Box>
           </Grid2>
-          <Grid2 size={{ xs: 12, lg: 6 }}>
-            <Box className="list-shell" sx={{ p: 1.6, minHeight: "100%" }}>
-              <Typography variant="h6" sx={{ color: "#e8f4ff", fontWeight: 700 }}>Optimization graph</Typography>
-              <Typography
-                variant="body2"
-                sx={{
-                  color: "text.secondary",
-                  mb: 1
-                }}>
-                Success and error rates for the versions with recent traffic.
-              </Typography>
-              {detailLoading ? (
-                <Stack direction="row" spacing={1} sx={{
-                  alignItems: "center"
-                }}>
-                  <CircularProgress size={16} />
+          <Grid2 size={{ xs: 12, lg: 5 }}>
+            <Stack spacing={1.5}>
+              <Box className="list-shell" sx={{ p: 1.6 }}>
+                <Typography variant="h6" sx={{ color: "#e8f4ff", fontWeight: 700 }}>Still observing</Typography>
+                <Typography
+                  variant="body2"
+                  sx={{
+                    color: "text.secondary",
+                    mb: 1
+                  }}>
+                  Approved skill changes that have traffic, but have not cleared the improvement threshold yet.
+                </Typography>
+                {detailLoading ? (
+                  <Stack direction="row" spacing={1} sx={{ alignItems: "center" }}>
+                    <CircularProgress size={16} />
+                    <Typography variant="body2" sx={{ color: "text.secondary" }}>Loading observed skill metrics...</Typography>
+                  </Stack>
+                ) : detailError ? (
+                  <Alert severity="warning" sx={{ borderRadius: 1 }}>
+                    Observed skill metrics are unavailable: {detailError}
+                  </Alert>
+                ) : skillObservedItems.length === 0 ? (
+                  <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                    No approved skill changes are waiting on more evidence.
+                  </Typography>
+                ) : (
+                  <Stack spacing={1}>
+                    {skillObservedItems.slice(0, 6).map((row, idx) => {
+                      const metricRows = skillEvolutionMetricRows(row);
+                      return (
+                        <Box key={`skill-observed-${str(row.id, String(idx))}`} sx={{ pb: 1, borderBottom: "1px solid rgba(145,170,205,0.12)" }}>
+                          <Stack direction="row" spacing={0.75} useFlexGap sx={{ alignItems: "center", flexWrap: "wrap", mb: 0.35 }}>
+                            <Typography variant="body2" sx={{ color: "#e8f4ff", fontWeight: 600 }}>
+                              {canonicalSkillIdentifier(str(row.skill_name, "Skill"))}
+                            </Typography>
+                            <Chip size="small" label={skillEvolutionActionLabel(str(row.action, ""))} />
+                            <Chip size="small" color={skillEvolutionChipColor(str(row.impact_status, "pending"))} label={str(row.impact_status, "pending")} />
+                          </Stack>
+                          <Typography variant="caption" sx={{ color: "text.secondary", display: "block", mb: 0.55 }}>
+                            {str(row.diff_summary, str(row.summary, "Observed after approval."))}
+                          </Typography>
+                          {metricRows.map((metric) => (
+                            <Typography key={`${str(row.id, "skill-observed")}-${metric.label}`} variant="caption" sx={{ color: "text.secondary", display: "block" }}>
+                              {metric.label}: {metric.before}{" -> "}{metric.after} ({metric.delta})
+                            </Typography>
+                          ))}
+                        </Box>
+                      );
+                    })}
+                  </Stack>
+                )}
+              </Box>
+              <Box className="list-shell" sx={{ p: 1.6, minHeight: "100%" }}>
+                <Typography variant="h6" sx={{ color: "#e8f4ff", fontWeight: 700 }}>Optimization graph</Typography>
+                <Typography
+                  variant="body2"
+                  sx={{
+                    color: "text.secondary",
+                    mb: 1
+                  }}>
+                  Success and error rates for the versions with recent traffic.
+                </Typography>
+                {detailLoading ? (
+                  <Stack direction="row" spacing={1} sx={{
+                    alignItems: "center"
+                  }}>
+                    <CircularProgress size={16} />
+                    <Typography variant="body2" sx={{
+                      color: "text.secondary"
+                    }}>Loading optimization data...</Typography>
+                  </Stack>
+                ) : detailError ? (
+                  <Alert severity="warning" sx={{ borderRadius: 1 }}>
+                    Optimization data is unavailable: {detailError}
+                  </Alert>
+                ) : metricChartRows.length === 0 ? (
                   <Typography variant="body2" sx={{
                     color: "text.secondary"
-                  }}>Loading optimization data...</Typography>
-                </Stack>
-              ) : detailError ? (
-                <Alert severity="warning" sx={{ borderRadius: 1 }}>
-                  Optimization data is unavailable: {detailError}
-                </Alert>
-              ) : metricChartRows.length === 0 ? (
-                <Typography variant="body2" sx={{
-                  color: "text.secondary"
-                }}>No version metrics yet.</Typography>
-              ) : (
-                <ReactECharts option={metricChartOption} style={{ height: 320 }} />
-              )}
-            </Box>
+                  }}>No version metrics yet.</Typography>
+                ) : (
+                  <ReactECharts option={metricChartOption} style={{ height: 320 }} />
+                )}
+              </Box>
+            </Stack>
           </Grid2>
         </Grid2>
       ) : null}
@@ -23764,65 +24604,199 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
             <Alert severity="warning" sx={{ borderRadius: 1 }}>
               Review queue is unavailable: {detailError}
             </Alert>
-          ) : learningCandidates.length === 0 ? (
+          ) : skillReviewItems.length === 0 && nonSkillLearningCandidates.length === 0 ? (
             <Typography variant="body2" sx={{
               color: "text.secondary"
             }}>No learning candidates are waiting.</Typography>
           ) : (
-            <TableContainer className="table-shell">
-              <Table size="small">
-                <TableHead>
-                  <TableRow>
-                    <TableCell>Suggestion</TableCell>
-                    <TableCell>Why</TableCell>
-                    <TableCell align="right">Confidence</TableCell>
-                    <TableCell>Status</TableCell>
-                    <TableCell align="right">Action</TableCell>
-                  </TableRow>
-                </TableHead>
-                <TableBody>
-                  {learningCandidates.map((row, idx) => {
-                    const candidateId = str(row.id, "");
-                    const status = str(row.approval_status, "draft");
-                    return (
-                      <TableRow key={`${candidateId || "candidate"}-${idx}`}>
-                        <TableCell sx={{ maxWidth: 260 }}>
-                          <Typography variant="body2">{str(row.title, str(row.proposed_name, "-"))}</Typography>
-                          <Typography variant="caption" sx={{
-                            color: "text.secondary"
-                          }}>{str(row.candidate_type, "-")}</Typography>
-                        </TableCell>
-                        <TableCell sx={{ maxWidth: 540 }}>
-                          <Typography variant="body2">{str(row.summary, str(row.preview, "-"))}</Typography>
-                        </TableCell>
-                        <TableCell align="right">{ratioPercent(row.confidence).toFixed(0)}%</TableCell>
-                        <TableCell>
-                          <Chip size="small" color={status === "approved" ? "success" : status === "draft" ? "warning" : "default"} label={status} />
-                        </TableCell>
-                        <TableCell align="right">
-                          {developerModeEnabled ? (
-                            <Stack direction="row" spacing={0.75} sx={{
-                              justifyContent: "flex-end"
-                            }}>
-                              <Button size="small" variant="contained" disabled={runEvolutionActionMutation.isPending || status === "approved" || !candidateId} onClick={() => void runEvolutionAction({ action: "approve_learning_candidate", candidate_id: candidateId }, "Learning candidate approved.")}>
-                                Approve
-                              </Button>
-                              <Button size="small" color="inherit" disabled={runEvolutionActionMutation.isPending || status === "rejected" || !candidateId} onClick={() => void runEvolutionAction({ action: "reject_learning_candidate", candidate_id: candidateId }, "Learning candidate rejected.")}>
-                                Reject
-                              </Button>
+            <Stack spacing={1.5}>
+              {skillReviewItems.length > 0 ? (
+                <Box>
+                  <Typography variant="subtitle2" sx={{ color: "#e8f4ff", mb: 1 }}>
+                    Skill evolution candidates
+                  </Typography>
+                  <Stack spacing={1}>
+                    {skillReviewItems.map((row, idx) => {
+                      const candidateId = str(row.id, "");
+                      const status = str(row.approval_status, "draft");
+                      const evidence = asRecord(row.evidence);
+                      const diffPreview = asRecord(row.diff_preview);
+                      const added = stringList(diffPreview.added);
+                      const removed = stringList(diffPreview.removed);
+                      const headings = stringList(diffPreview.headings);
+                      const baseline = asRecord(row.impact_baseline);
+                      const failureReasons = stringList(evidence.recent_failure_reasons);
+                      const selectedExamples = stringList(evidence.selected_failure_examples);
+                      return (
+                        <Box key={`skill-review-${candidateId || idx}`} sx={{ p: 1.25, border: "1px solid rgba(145,170,205,0.12)", borderRadius: 1 }}>
+                          <Stack direction={{ xs: "column", md: "row" }} spacing={1} sx={{ justifyContent: "space-between", alignItems: { xs: "flex-start", md: "center" } }}>
+                            <Box sx={{ minWidth: 0 }}>
+                              <Stack direction="row" spacing={0.75} useFlexGap sx={{ alignItems: "center", flexWrap: "wrap", mb: 0.45 }}>
+                                <Typography variant="body2" sx={{ color: "#e8f4ff", fontWeight: 600 }}>
+                                  {canonicalSkillIdentifier(str(row.skill_name, str(row.title, "Skill candidate")))}
+                                </Typography>
+                                <Chip size="small" label={skillEvolutionActionLabel(str(row.action, ""))} />
+                                <Chip size="small" color={skillEvolutionChipColor(status)} label={status} />
+                                <Chip size="small" variant="outlined" label={`${ratioPercent(row.confidence).toFixed(0)}% confidence`} />
+                              </Stack>
+                              <Typography variant="body2">{str(row.diff_summary, str(row.summary, "Reviewable skill change"))}</Typography>
+                            </Box>
+                            {developerModeEnabled ? (
+                              <Stack direction="row" spacing={0.75} sx={{ flexShrink: 0 }}>
+                                <Button size="small" variant="contained" disabled={runEvolutionActionMutation.isPending || status === "approved" || !candidateId} onClick={() => void runEvolutionAction({ action: "approve_learning_candidate", candidate_id: candidateId }, "Learning candidate approved.")}>
+                                  Approve
+                                </Button>
+                                <Button size="small" color="inherit" disabled={runEvolutionActionMutation.isPending || status === "rejected" || !candidateId} onClick={() => void runEvolutionAction({ action: "reject_learning_candidate", candidate_id: candidateId }, "Learning candidate rejected.")}>
+                                  Reject
+                                </Button>
+                              </Stack>
+                            ) : (
+                              <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                                Developer mode required
+                              </Typography>
+                            )}
+                          </Stack>
+                          <Box sx={{ mt: 1, display: "grid", gridTemplateColumns: { xs: "1fr", md: "repeat(4, minmax(0,1fr))" }, gap: 1 }}>
+                            <Box>
+                              <Typography variant="caption" sx={{ color: "text.secondary" }}>Matched runs</Typography>
+                              <Typography variant="body2">{num(baseline.matched_runs, 0)}</Typography>
+                            </Box>
+                            <Box>
+                              <Typography variant="caption" sx={{ color: "text.secondary" }}>Success</Typography>
+                              <Typography variant="body2">{percentageLabel(baseline.success_rate, 1) || "-"}</Typography>
+                            </Box>
+                            <Box>
+                              <Typography variant="caption" sx={{ color: "text.secondary" }}>Failure</Typography>
+                              <Typography variant="body2">{percentageLabel(baseline.failure_rate, 1) || "-"}</Typography>
+                            </Box>
+                            <Box>
+                              <Typography variant="caption" sx={{ color: "text.secondary" }}>Tool errors</Typography>
+                              <Typography variant="body2">{percentageLabel(baseline.tool_error_rate, 1) || "-"}</Typography>
+                            </Box>
+                          </Box>
+                          {headings.length > 0 ? (
+                            <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: "wrap", mt: 1 }}>
+                              {headings.map((heading) => (
+                                <Chip key={`${candidateId}-${heading}`} size="small" variant="outlined" label={heading} />
+                              ))}
                             </Stack>
-                          ) : (
-                            <Typography variant="caption" sx={{
-                              color: "text.secondary"
-                            }}>Developer mode required</Typography>
-                          )}
-                        </TableCell>
+                          ) : null}
+                          <Box sx={{ mt: 1, display: "grid", gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" }, gap: 1 }}>
+                            <Box>
+                              <Typography variant="caption" sx={{ color: "text.secondary", display: "block", mb: 0.35 }}>
+                                Added / changed
+                              </Typography>
+                              {added.length === 0 ? (
+                                <Typography variant="body2" sx={{ color: "text.secondary" }}>No added lines recorded.</Typography>
+                              ) : (
+                                <Stack spacing={0.45}>
+                                  {added.slice(0, 5).map((line, lineIdx) => (
+                                    <Typography key={`${candidateId}-added-${lineIdx}`} variant="caption" sx={{ color: "#d8edff", display: "block" }}>
+                                      + {line}
+                                    </Typography>
+                                  ))}
+                                </Stack>
+                              )}
+                            </Box>
+                            <Box>
+                              <Typography variant="caption" sx={{ color: "text.secondary", display: "block", mb: 0.35 }}>
+                                Removed / replaced
+                              </Typography>
+                              {removed.length === 0 ? (
+                                <Typography variant="body2" sx={{ color: "text.secondary" }}>No removed lines recorded.</Typography>
+                              ) : (
+                                <Stack spacing={0.45}>
+                                  {removed.slice(0, 5).map((line, lineIdx) => (
+                                    <Typography key={`${candidateId}-removed-${lineIdx}`} variant="caption" sx={{ color: "#fdb4c0", display: "block" }}>
+                                      - {line}
+                                    </Typography>
+                                  ))}
+                                </Stack>
+                              )}
+                            </Box>
+                          </Box>
+                          {(failureReasons.length > 0 || selectedExamples.length > 0) ? (
+                            <Box sx={{ mt: 1 }}>
+                              <Typography variant="caption" sx={{ color: "text.secondary", display: "block", mb: 0.35 }}>
+                                Evidence
+                              </Typography>
+                              <Stack spacing={0.45}>
+                                {failureReasons.slice(0, 3).map((line, lineIdx) => (
+                                  <Typography key={`${candidateId}-failure-${lineIdx}`} variant="caption" sx={{ color: "text.secondary", display: "block" }}>
+                                    Failure: {line}
+                                  </Typography>
+                                ))}
+                                {selectedExamples.slice(0, 2).map((line, lineIdx) => (
+                                  <Typography key={`${candidateId}-selected-${lineIdx}`} variant="caption" sx={{ color: "text.secondary", display: "block" }}>
+                                    Mismatch: {line}
+                                  </Typography>
+                                ))}
+                              </Stack>
+                            </Box>
+                          ) : null}
+                        </Box>
+                      );
+                    })}
+                  </Stack>
+                </Box>
+              ) : null}
+              {nonSkillLearningCandidates.length > 0 ? (
+                <TableContainer className="table-shell">
+                  <Table size="small">
+                    <TableHead>
+                      <TableRow>
+                        <TableCell>Suggestion</TableCell>
+                        <TableCell>Why</TableCell>
+                        <TableCell align="right">Confidence</TableCell>
+                        <TableCell>Status</TableCell>
+                        <TableCell align="right">Action</TableCell>
                       </TableRow>
-                    );
-                  })}
-                </TableBody>
-              </Table>
-            </TableContainer>
+                    </TableHead>
+                    <TableBody>
+                      {nonSkillLearningCandidates.map((row, idx) => {
+                        const candidateId = str(row.id, "");
+                        const status = str(row.approval_status, "draft");
+                        return (
+                          <TableRow key={`${candidateId || "candidate"}-${idx}`}>
+                            <TableCell sx={{ maxWidth: 260 }}>
+                              <Typography variant="body2">{str(row.title, str(row.proposed_name, "-"))}</Typography>
+                              <Typography variant="caption" sx={{
+                                color: "text.secondary"
+                              }}>{canonicalSkillIdentifier(str(row.candidate_type, "-"))}</Typography>
+                            </TableCell>
+                            <TableCell sx={{ maxWidth: 540 }}>
+                              <Typography variant="body2">{str(row.summary, str(row.preview, "-"))}</Typography>
+                            </TableCell>
+                            <TableCell align="right">{ratioPercent(row.confidence).toFixed(0)}%</TableCell>
+                            <TableCell>
+                              <Chip size="small" color={status === "approved" ? "success" : status === "draft" ? "warning" : "default"} label={status} />
+                            </TableCell>
+                            <TableCell align="right">
+                              {developerModeEnabled ? (
+                                <Stack direction="row" spacing={0.75} sx={{
+                                  justifyContent: "flex-end"
+                                }}>
+                                  <Button size="small" variant="contained" disabled={runEvolutionActionMutation.isPending || status === "approved" || !candidateId} onClick={() => void runEvolutionAction({ action: "approve_learning_candidate", candidate_id: candidateId }, "Learning candidate approved.")}>
+                                    Approve
+                                  </Button>
+                                  <Button size="small" color="inherit" disabled={runEvolutionActionMutation.isPending || status === "rejected" || !candidateId} onClick={() => void runEvolutionAction({ action: "reject_learning_candidate", candidate_id: candidateId }, "Learning candidate rejected.")}>
+                                    Reject
+                                  </Button>
+                                </Stack>
+                              ) : (
+                                <Typography variant="caption" sx={{
+                                  color: "text.secondary"
+                                }}>Developer mode required</Typography>
+                              )}
+                            </TableCell>
+                          </TableRow>
+                        );
+                      })}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              ) : null}
+            </Stack>
           )}
         </Box>
       ) : null}
@@ -23865,7 +24839,7 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
                 <Button size="small" color="warning" disabled={!developerModeEnabled || runEvolutionActionMutation.isPending} onClick={() => void runEvolutionAction({ action: "rollback_baseline" }, "Rolled back to baseline snapshot.", "Rollback baseline policy to stored snapshot?")}>Rollback Baseline</Button>
               </Stack>
               <Alert severity="info" sx={{ mt: 1.5, borderRadius: 1 }}>
-                Code-writing evolution remains disabled unless the runtime explicitly allows it. Prompt and strategy changes still go through benchmark, replay, canary, and promotion gates.
+                Code-writing changes remain disabled unless the runtime explicitly allows them. Prompt and strategy changes still go through benchmark, replay, canary, and promotion gates.
               </Alert>
             </Box>
           </Grid2>
@@ -23920,7 +24894,6 @@ function SettingsManager({
       lifecycle: 14,
       "data-lifecycle": 14,
       retention: 14,
-      moltbook: 7,
       mcp: 8,
       routing: 20,
       browser: 20,
@@ -23945,6 +24918,8 @@ function SettingsManager({
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [restartNotice, setRestartNotice] = useState<string | null>(null);
+  const [rotateInternalCredentialsDialogOpen, setRotateInternalCredentialsDialogOpen] = useState(false);
+  const [rotateInternalCredentialsAccepted, setRotateInternalCredentialsAccepted] = useState(false);
   const [modelConnectivityWarning, setModelConnectivityWarning] = useState<string | null>(null);
   const [initialized, setInitialized] = useState(false);
   const [apiKeyRevealed, setApiKeyRevealed] = useState(false);
@@ -25921,6 +26896,10 @@ function SettingsManager({
   const securityLogs = pickRecords(securityLogsQ.data, "logs");
   const usingDefaultMasterPassword = toBool(sec.using_default);
   const hasCustomMasterPassword = toBool(sec.master_password_set) && !usingDefaultMasterPassword;
+  const internalServiceTokens = pickRecords(sec, "internal_service_tokens");
+  const internalServiceRotationSupported =
+    toBool(sec.internal_service_rotation_supported) && internalServiceTokens.length > 0;
+  const internalServiceEnvManaged = internalServiceTokens.some((row) => toBool(row.managed_by_env));
   const vaultSecrets = pickRecords(vaultSecretsQ.data, "entries");
   const securityStatusTone: "success" | "warning" | "info" = hasCustomMasterPassword
     ? "success"
@@ -26123,6 +27102,73 @@ function SettingsManager({
     { label: "Watchers", value: String(num(selectedPulseDetails.active_watchers, 0)) },
     { label: "Uptime", value: formatDurationFromSeconds(selectedPulseDetails.uptime_secs) }
   ];
+  const selectedPulseScanLog = pickRecords(selectedPulseDetails, "scan_log");
+  const selectedPulseScanStarted = str(selectedPulseDetails.scan_started_at, "").trim();
+  const selectedPulseScanFinished = str(selectedPulseDetails.scan_finished_at, "").trim();
+  const selectedPulseScanDurationMs = num(selectedPulseDetails.scan_duration_ms, 0);
+  const selectedPulseNotificationOutcome = str(selectedPulseDetails.notification_outcome, "").trim();
+  const selectedPulsePalette =
+    selectedPulseGuidance.severity === "success"
+      ? {
+          accent: "#34d399",
+          accentSoft: "rgba(52, 211, 153, 0.16)",
+          border: "rgba(52, 211, 153, 0.22)",
+          background: "linear-gradient(135deg, rgba(14, 28, 24, 0.96), rgba(15, 18, 21, 0.96))"
+        }
+      : selectedPulseGuidance.severity === "warning"
+        ? {
+            accent: "#fbbf24",
+            accentSoft: "rgba(251, 191, 36, 0.16)",
+            border: "rgba(251, 191, 36, 0.24)",
+            background: "linear-gradient(135deg, rgba(31, 24, 14, 0.96), rgba(17, 18, 21, 0.96))"
+          }
+        : {
+            accent: "#60a5fa",
+            accentSoft: "rgba(96, 165, 250, 0.16)",
+            border: "rgba(96, 165, 250, 0.22)",
+            background: "linear-gradient(135deg, rgba(14, 24, 32, 0.96), rgba(16, 18, 22, 0.96))"
+          };
+  const selectedPulseHeroIcon =
+    selectedPulseGuidance.severity === "success" ? (
+      <CheckCircleRoundedIcon sx={{ fontSize: 22 }} />
+    ) : selectedPulseGuidance.severity === "warning" ? (
+      <ErrorOutlineRoundedIcon sx={{ fontSize: 22 }} />
+    ) : (
+      <InfoOutlinedIcon sx={{ fontSize: 22 }} />
+    );
+  const selectedPulsePrimaryStats = [
+    {
+      label: "Health score",
+      value: selectedPulseScore >= 0 ? String(selectedPulseScore) : "-",
+      helper:
+        selectedPulseScore >= 90
+          ? "Healthy run"
+          : selectedPulseFindings.length > 0
+            ? "Needs follow-up"
+            : "Score unavailable",
+      accent:
+        selectedPulseScore >= 90
+          ? "#34d399"
+          : selectedPulseFindings.length > 0
+            ? "#fbbf24"
+            : "#60a5fa"
+    },
+    {
+      label: "Findings",
+      value: String(selectedPulseFindings.length),
+      helper:
+        selectedPulseFindings.length === 0
+          ? "Nothing urgent"
+          : `${selectedPulseFindings.length} item${selectedPulseFindings.length === 1 ? "" : "s"} to review`,
+      accent: selectedPulseFindings.length === 0 ? "#34d399" : "#fbbf24"
+    },
+    {
+      label: "Watchers",
+      value: String(num(selectedPulseDetails.active_watchers, 0)),
+      helper: "Active background monitors",
+      accent: "#60a5fa"
+    }
+  ];
   const storageMaintenanceReview = storageMaintenanceReviewQ.data as MemoryMaintenanceReviewResponse | undefined;
   const storageMaintenanceCounts = asRecord(storageMaintenanceReview?.knowledge_counts);
   const storageMaintenancePolicy = asRecord(storageMaintenanceReview?.policy);
@@ -26194,6 +27240,22 @@ function SettingsManager({
     if (s === "low") return "info";
     if (s === "ok" || s === "info") return "success";
     return "default";
+  }
+
+  function pulseScanStatusColor(status: string): "error" | "warning" | "info" | "success" | "default" {
+    const normalized = (status || "").trim().toLowerCase();
+    if (normalized === "error" || normalized === "critical" || normalized === "high") return "error";
+    if (normalized === "warning" || normalized === "warn" || normalized === "medium") return "warning";
+    if (normalized === "ok" || normalized === "success" || normalized === "completed") return "success";
+    if (normalized === "running" || normalized === "info") return "info";
+    return "default";
+  }
+
+  function pulseScanStatusLabel(status: string): string {
+    const normalized = (status || "").trim().toLowerCase();
+    if (!normalized) return "Unknown";
+    if (normalized === "ok") return "OK";
+    return normalized.replace(/_/g, " ").replace(/\b\w/g, (m) => m.toUpperCase());
   }
 
   function moltbookTriggerLabel(raw: string): string {
@@ -27182,6 +28244,22 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
     onError: (e) => setError(errMessage(e))
   });
 
+  const rotateInternalServiceTokensMutation = useMutation({
+    mutationFn: () => api.rawPost("/security/internal-service-tokens/rotate", {}),
+    onSuccess: async (raw) => {
+      const response = asRecord(raw);
+      await queryClient.invalidateQueries({ queryKey: ["security-status"] });
+      setSuccess(null);
+      setRestartNotice(
+        str(
+          response.message,
+          "Internal service credentials rotated. AgentArk is restarting. The page will refresh automatically when it is ready."
+        )
+      );
+    },
+    onError: (e) => setError(errMessage(e))
+  });
+
   const passwordMutationPending =
     setPasswordMutation.isPending || changePasswordMutation.isPending || removePasswordMutation.isPending;
 
@@ -27279,6 +28357,32 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
     resetPasswordInputs();
   }
 
+  function openRotateInternalCredentialsDialog() {
+    setError(null);
+    setSuccess(null);
+    setRotateInternalCredentialsAccepted(false);
+    setRotateInternalCredentialsDialogOpen(true);
+  }
+
+  function closeRotateInternalCredentialsDialog() {
+    if (rotateInternalServiceTokensMutation.isPending) return;
+    setRotateInternalCredentialsDialogOpen(false);
+    setRotateInternalCredentialsAccepted(false);
+  }
+
+  async function submitRotateInternalCredentials() {
+    if (!rotateInternalCredentialsAccepted) return;
+    setError(null);
+    setSuccess(null);
+    try {
+      await rotateInternalServiceTokensMutation.mutateAsync();
+      closeRotateInternalCredentialsDialog();
+      void monitorRestartRecovery();
+    } catch (e) {
+      setError(errMessage(e));
+    }
+  }
+
   async function submitPasswordDialog() {
     if (!passwordDialogMode) return;
     setError(null);
@@ -27367,12 +28471,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
   const settingsNavActual = settingsNavGroups.flatMap((group) => group.items);
   const selectedSettingsNav =
     settingsNavActual.find((item) => item.value === tab) ||
-    (tab === 7
-      ? {
-          value: 7,
-          label: "Moltbook"
-        }
-      : tab === 9
+    (tab === 9
         ? {
             value: 9,
             label: latestPulseNavCount > 0 ? `ArkPulse (${latestPulseNavCount})` : "ArkPulse"
@@ -27407,11 +28506,11 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
       case 6:
         return { kicker: "Admin", description: "External trace export, privacy mode, and observability delivery configuration." };
       case 7:
-        return { kicker: "Network", description: "Moltbook federation, participation mode, and connector runtime settings." };
+        return { kicker: "Core", description: "Moltbook federation, participation mode, and connector runtime settings." };
       case 8:
         return { kicker: "Knowledge", description: "MCP server registration, transport, auth, and tool/resource exposure." };
       case 9:
-        return { kicker: "Admin", description: "Diagnostics, onboarding readiness, and runtime health in one place." };
+        return { kicker: "Ark Core", description: "Operational health, onboarding readiness, and runtime drift checks in one place." };
       case 11:
         return { kicker: "Observability", description: "Execution history, integration sync runs, and export delivery in one place." };
       case 12:
@@ -27480,6 +28579,8 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
     info?: string | null;
     action?: JSX.Element | null;
   }) => {
+    const showEyebrow =
+      normalizeSettingsHeading(eyebrow) !== normalizeSettingsHeading(selectedSettingsHeaderTitle);
     const duplicatesPageHeader =
       !info &&
       !action &&
@@ -27499,7 +28600,9 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
           alignItems: { xs: "flex-start", md: "center" }
         }}>
         <Box className="settings-section-intro-copy">
-          <Typography className="settings-section-kicker">{eyebrow}</Typography>
+          {showEyebrow ? (
+            <Typography className="settings-section-kicker">{eyebrow}</Typography>
+          ) : null}
           <Stack direction="row" spacing={0.75} className="settings-section-title-row" sx={{
             alignItems: "center"
           }}>
@@ -28945,6 +30048,106 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                             Remove Password
                           </Button>
                         ) : null}
+                      </Stack>
+                    </Stack>
+                  )}
+                </Stack>
+              </Box>
+
+              <Box className="list-shell" sx={{ minHeight: 0 }}>
+                <Stack spacing={1.25}>
+                  {renderSettingsSectionIntro({
+                    eyebrow: "Security",
+                    title: "Internal Service Credentials",
+                    description:
+                      "Executor and workspace trust the control plane with shared bearer credentials. Rotation rewrites those credentials and restarts AgentArk.",
+                    action: (
+                      <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: "wrap" }}>
+                        <Chip size="small" label="Manual rotation" />
+                        <Chip size="small" variant="outlined" label="Restart required" />
+                      </Stack>
+                    ),
+                  })}
+                  {securityStatusQ.isLoading ? (
+                    <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                      Loading internal credential status...
+                    </Typography>
+                  ) : securityStatusQ.error ? (
+                    <Alert severity="error">{errMessage(securityStatusQ.error)}</Alert>
+                  ) : internalServiceTokens.length === 0 ? (
+                    <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                      Internal executor and workspace credentials are not available on this runtime.
+                    </Typography>
+                  ) : (
+                    <Stack spacing={1.1}>
+                      <Stack divider={<Divider flexItem sx={{ borderColor: "divider" }} />} spacing={0}>
+                        {internalServiceTokens.map((row, index) => {
+                          const item = asRecord(row);
+                          const updatedAt = humanTs(str(item.updated_at, ""));
+                          const managedByEnv = toBool(item.managed_by_env);
+                          const configured = toBool(item.configured);
+                          return (
+                            <Stack
+                              key={str(item.id, `token-${index}`)}
+                              direction={{ xs: "column", sm: "row" }}
+                              spacing={1}
+                              sx={{ py: 1 }}
+                            >
+                              <Stack spacing={0.35} sx={{ minWidth: 0, flex: 1 }}>
+                                <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                                  {str(item.label, "Internal service")}
+                                </Typography>
+                                <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                                  {managedByEnv
+                                    ? `Managed by ${str(item.env_var, "environment configuration")}`
+                                    : "Stored in the AgentArk config volume"}
+                                </Typography>
+                              </Stack>
+                              <Stack
+                                direction="row"
+                                spacing={0.75}
+                                useFlexGap
+                                sx={{ flexWrap: "wrap", alignItems: "center" }}
+                              >
+                                <Chip
+                                  size="small"
+                                  color={configured ? "success" : "warning"}
+                                  label={configured ? "Configured" : "Missing"}
+                                />
+                                <Chip
+                                  size="small"
+                                  variant="outlined"
+                                  label={managedByEnv ? "Env managed" : `Updated ${updatedAt.label}`}
+                                  title={managedByEnv ? undefined : updatedAt.tip}
+                                />
+                              </Stack>
+                            </Stack>
+                          );
+                        })}
+                      </Stack>
+                      {internalServiceEnvManaged ? (
+                        <Alert severity="info">
+                          Rotation is disabled here because this deployment provides internal credentials through environment variables.
+                        </Alert>
+                      ) : (
+                        <Alert severity="info">
+                          Rotation rewrites both credentials together, then restarts control, executor, and workspace immediately. Active work can be interrupted while the stack comes back.
+                        </Alert>
+                      )}
+                      <Stack direction={{ xs: "column", sm: "row" }} spacing={1} useFlexGap sx={{ flexWrap: "wrap" }}>
+                        <Button
+                          variant="outlined"
+                          color="warning"
+                          size="large"
+                          disabled={
+                            !internalServiceRotationSupported ||
+                            rotateInternalServiceTokensMutation.isPending ||
+                            !!restartNotice
+                          }
+                          onClick={openRotateInternalCredentialsDialog}
+                        >
+                          {rotateInternalServiceTokensMutation.isPending ? "Rotating..." : "Rotate Internal Credentials"}
+                        </Button>
                       </Stack>
                     </Stack>
                   )}
@@ -31193,76 +32396,232 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
           </Button>
         </DialogActions>
       </Dialog>
-      <Dialog open={selectedPulseEvent != null} onClose={() => setSelectedPulseEvent(null)} maxWidth="lg" fullWidth>
-        <DialogTitle>{str(selectedPulseEvent?.summary, "ArkPulse Details")}</DialogTitle>
-        <DialogContent>
+      <Dialog
+        open={selectedPulseEvent != null}
+        onClose={() => setSelectedPulseEvent(null)}
+        maxWidth="lg"
+        fullWidth
+        slotProps={{
+          paper: {
+            sx: {
+              borderRadius: "8px",
+              border: "1px solid rgba(255,255,255,0.08)",
+              background: "linear-gradient(180deg, rgba(18, 19, 22, 0.98), rgba(11, 12, 15, 0.98))",
+              backgroundImage:
+                "radial-gradient(circle at top right, rgba(52, 211, 153, 0.08), transparent 28%), radial-gradient(circle at top left, rgba(96, 165, 250, 0.06), transparent 24%)",
+              boxShadow: "0 30px 96px rgba(0,0,0,0.5)"
+            }
+          }
+        }}
+      >
+        <DialogTitle
+          sx={{
+            pb: 1.2,
+            borderBottom: "1px solid rgba(255,255,255,0.06)",
+            fontSize: "1rem",
+            fontWeight: 700
+          }}
+        >
+          {str(selectedPulseEvent?.summary, "ArkPulse Details")}
+        </DialogTitle>
+        <DialogContent sx={{ pt: 2 }}>
           <Stack spacing={1.25}>
-            <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{
-              alignItems: { xs: "flex-start", sm: "center" }
-            }}>
-              <Chip size="small" variant="outlined" label={`Captured: ${selectedPulseCaptured.label}`} title={selectedPulseCaptured.tooltip} />
-              <Chip
-                size="small"
-                label={`Status: ${selectedPulseStatus}`}
-                color={selectedPulseStatusOk ? "success" : "warning"}
-                variant={selectedPulseStatusOk ? "filled" : "outlined"}
-              />
-            </Stack>
-            <Alert severity={selectedPulseGuidance.severity} variant="outlined">
-              <Typography variant="subtitle2">{selectedPulseGuidance.title}</Typography>
-              <Typography variant="body2" sx={{
-                color: "text.secondary"
-              }}>
-                {selectedPulseGuidance.detail}
-              </Typography>
-            </Alert>
-            <Divider />
-            <Grid2 container spacing={1}>
-              <Grid2 size={{ xs: 12, md: 4 }}>
-                <Box className="metadata-box">
-                  <Typography variant="caption" sx={{
-                    color: "text.secondary"
-                  }}>
-                    Health score
-                  </Typography>
-                  <Typography variant="h5">
-                    {selectedPulseScore >= 0 ? selectedPulseScore : "-"}
-                  </Typography>
-                </Box>
-              </Grid2>
-              <Grid2 size={{ xs: 12, md: 4 }}>
-                <Box className="metadata-box">
-                  <Typography variant="caption" sx={{
-                    color: "text.secondary"
-                  }}>
-                    Findings
-                  </Typography>
-                  <Typography variant="h5">{selectedPulseFindings.length}</Typography>
-                </Box>
-              </Grid2>
-              <Grid2 size={{ xs: 12, md: 4 }}>
-                <Box className="metadata-box">
-                  <Typography variant="caption" sx={{
-                    color: "text.secondary"
-                  }}>
-                    Watchers
-                  </Typography>
-                  <Typography variant="h5">{num(selectedPulseDetails.active_watchers, 0)}</Typography>
-                </Box>
-              </Grid2>
-            </Grid2>
+            <Box
+              sx={{
+                position: "relative",
+                overflow: "hidden",
+                borderRadius: "8px",
+                border: `1px solid ${selectedPulsePalette.border}`,
+                background: selectedPulsePalette.background,
+                p: { xs: 1.5, sm: 1.75 },
+                boxShadow: "inset 0 1px 0 rgba(255,255,255,0.04)"
+              }}
+            >
+              <Stack spacing={1.5}>
+                <Stack
+                  direction={{ xs: "column", sm: "row" }}
+                  spacing={1}
+                  useFlexGap
+                  sx={{
+                    alignItems: { xs: "flex-start", sm: "center" },
+                    flexWrap: "wrap"
+                  }}
+                >
+                  <Chip
+                    size="small"
+                    variant="outlined"
+                    label={`Captured: ${selectedPulseCaptured.label}`}
+                    title={selectedPulseCaptured.tooltip}
+                    sx={{
+                      borderColor: "rgba(255,255,255,0.14)",
+                      background: "rgba(255,255,255,0.03)"
+                    }}
+                  />
+                  <Chip
+                    size="small"
+                    label={`Status: ${selectedPulseStatus}`}
+                    color={selectedPulseStatusOk ? "success" : "warning"}
+                    variant={selectedPulseStatusOk ? "filled" : "outlined"}
+                  />
+                  <Chip
+                    size="small"
+                    variant="outlined"
+                    label={`${selectedPulseFindings.length} priority item${selectedPulseFindings.length === 1 ? "" : "s"}`}
+                    sx={{
+                      borderColor: "rgba(255,255,255,0.14)",
+                      background: "rgba(255,255,255,0.03)"
+                    }}
+                  />
+                </Stack>
 
-            <Typography variant="subtitle2" sx={{
-              mt: 1
-            }}>
-              Fix these first
-            </Typography>
+                <Grid2 container spacing={1.25} sx={{ alignItems: "stretch" }}>
+                  <Grid2 size={{ xs: 12, lg: 7 }}>
+                    <Stack direction="row" spacing={1.25} sx={{ alignItems: "flex-start" }}>
+                      <Box
+                        sx={{
+                          width: 42,
+                          height: 42,
+                          borderRadius: "8px",
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          color: selectedPulsePalette.accent,
+                          background: selectedPulsePalette.accentSoft,
+                          flex: "0 0 auto"
+                        }}
+                      >
+                        {selectedPulseHeroIcon}
+                      </Box>
+                      <Stack spacing={0.65} sx={{ minWidth: 0 }}>
+                        <Typography variant="h5" sx={{ fontWeight: 700, lineHeight: 1.1 }}>
+                          {selectedPulseGuidance.title}
+                        </Typography>
+                        <Typography
+                          variant="body2"
+                          sx={{
+                            color: "rgba(231, 236, 243, 0.76)",
+                            maxWidth: 560,
+                            lineHeight: 1.55
+                          }}
+                        >
+                          {selectedPulseGuidance.detail}
+                        </Typography>
+                      </Stack>
+                    </Stack>
+                  </Grid2>
+                  <Grid2 size={{ xs: 12, lg: 5 }}>
+                    <Box
+                      sx={{
+                        display: "grid",
+                        gridTemplateColumns: { xs: "1fr", sm: "repeat(3, minmax(0, 1fr))" },
+                        gap: 1,
+                        height: "100%"
+                      }}
+                    >
+                      {selectedPulsePrimaryStats.map((item) => (
+                        <Box
+                          key={item.label}
+                          sx={{
+                            minWidth: 0,
+                            p: 1.2,
+                            borderRadius: "8px",
+                            border: "1px solid rgba(255,255,255,0.08)",
+                            background: "rgba(255,255,255,0.04)"
+                          }}
+                        >
+                          <Typography
+                            variant="caption"
+                            sx={{
+                              display: "block",
+                              color: "rgba(188, 198, 212, 0.7)"
+                            }}
+                          >
+                            {item.label}
+                          </Typography>
+                          <Typography
+                            variant="h5"
+                            sx={{
+                              mt: 0.35,
+                              fontWeight: 700,
+                              fontVariantNumeric: "tabular-nums"
+                            }}
+                          >
+                            {item.value}
+                          </Typography>
+                          <Typography
+                            variant="caption"
+                            sx={{
+                              display: "block",
+                              mt: 0.4,
+                              color: "rgba(231, 236, 243, 0.62)"
+                            }}
+                          >
+                            {item.helper}
+                          </Typography>
+                          <Box
+                            sx={{
+                              mt: 0.9,
+                              height: 3,
+                              borderRadius: 999,
+                              background: item.accent
+                            }}
+                          />
+                        </Box>
+                      ))}
+                    </Box>
+                  </Grid2>
+                </Grid2>
+              </Stack>
+            </Box>
+
+            <Stack spacing={0.3} sx={{ pt: 0.35 }}>
+              <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>
+                Priority actions
+              </Typography>
+              <Typography variant="body2" sx={{ color: "rgba(188, 198, 212, 0.72)" }}>
+                {selectedPulseFindings.length === 0
+                  ? "This run did not return any actionable issues."
+                  : "Work from top to bottom. Each item includes the cause, the recommended remediation, and the safest next action available here."}
+              </Typography>
+            </Stack>
             {selectedPulseFindings.length === 0 ? (
-              <Alert severity="success" variant="outlined">
-                No findings in this run.
-              </Alert>
+              <Box
+                sx={{
+                  borderRadius: "8px",
+                  border: "1px solid rgba(52, 211, 153, 0.18)",
+                  background: "rgba(14, 32, 24, 0.56)",
+                  px: 1.4,
+                  py: 1.25
+                }}
+              >
+                <Stack direction="row" spacing={1.1} sx={{ alignItems: "flex-start" }}>
+                  <Box
+                    sx={{
+                      width: 34,
+                      height: 34,
+                      borderRadius: "8px",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      color: "#34d399",
+                      background: "rgba(52, 211, 153, 0.12)",
+                      flex: "0 0 auto"
+                    }}
+                  >
+                    <CheckCircleRoundedIcon sx={{ fontSize: 20 }} />
+                  </Box>
+                  <Stack spacing={0.35}>
+                    <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                      Nothing urgent in this run
+                    </Typography>
+                    <Typography variant="body2" sx={{ color: "rgba(231, 236, 243, 0.72)" }}>
+                      The system snapshot below is still useful for context, but there is no direct remediation queued from this report.
+                    </Typography>
+                  </Stack>
+                </Stack>
+              </Box>
             ) : (
-              <Stack spacing={1}>
+              <Grid2 container spacing={1.25}>
                 {selectedPulseFindings.slice(0, 20).map((f, idx) => {
                   const fr = asRecord(f);
                   const sev = str(fr.severity, "");
@@ -31279,50 +32638,88 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                   const canReviewStorageMaintenance = target === "knowledge_store";
                   const fixActionId = `${title}:${target}:${idx}`;
                   const fixBusy = runPulseFixMutation.isPending && activePulseFixId === fixActionId;
+                  const severityAccent =
+                    sev.toLowerCase() === "critical" || sev.toLowerCase() === "high" || sev.toLowerCase() === "error"
+                      ? "#fb7185"
+                      : sev.toLowerCase() === "medium" || sev.toLowerCase() === "warning" || sev.toLowerCase() === "warn"
+                        ? "#fbbf24"
+                        : sev.toLowerCase() === "low"
+                          ? "#60a5fa"
+                          : "#94a3b8";
                   return (
-                    <Box key={`${title}-${idx}`} className="metadata-box">
+                    <Grid2 key={`${title}-${idx}`} size={{ xs: 12, xl: 6 }}>
+                    <Box
+                      sx={{
+                        height: "100%",
+                        borderRadius: "8px",
+                        border: "1px solid rgba(255,255,255,0.08)",
+                        borderLeft: `3px solid ${severityAccent}`,
+                        background: "rgba(20, 21, 24, 0.74)",
+                        p: 1.35
+                      }}
+                    >
                       <Stack spacing={0.75}>
                         <Stack
                           direction="row"
                           spacing={1}
                           useFlexGap
                           sx={{
-                            alignItems: "center",
+                            alignItems: "flex-start",
                             flexWrap: "wrap"
                           }}>
+                          <Box
+                            sx={{
+                              minWidth: 28,
+                              height: 28,
+                              borderRadius: "8px",
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "center",
+                              background: "rgba(255,255,255,0.06)",
+                              color: "rgba(243, 246, 250, 0.92)",
+                              fontSize: "0.8rem",
+                              fontWeight: 700
+                            }}
+                          >
+                            {idx + 1}
+                          </Box>
+                          <Stack spacing={0.15} sx={{ minWidth: 0, flex: 1 }}>
+                            <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                              {title}
+                            </Typography>
+                            <Typography variant="caption" sx={{ color: "rgba(188, 198, 212, 0.7)" }}>
+                              Target: {target}
+                            </Typography>
+                          </Stack>
                           <Chip size="small" label={sev || "-"} color={severityChipColor(sev)} />
-                          <Typography variant="subtitle2">{`Fix #${idx + 1}: ${title}`}</Typography>
                         </Stack>
                         <Typography variant="body2" sx={{
-                          color: "text.secondary"
+                          color: "rgba(231, 236, 243, 0.72)",
+                          lineHeight: 1.55
                         }}>
-                          Target: {target}
-                        </Typography>
-                        <Typography variant="body2" sx={{
-                          color: "text.secondary"
-                        }}>
-                          Why this matters: {cause}
+                          {cause === "-" ? "The run flagged this issue but did not include a detailed cause." : cause}
                         </Typography>
                         <Box
                           sx={{
-                            border: "1px solid rgba(62,143,214,0.24)",
-                            borderRadius: 1,
-                            p: 1,
-                            background: "rgba(5,16,31,0.45)"
+                            border: "1px solid rgba(255,255,255,0.06)",
+                            borderRadius: "8px",
+                            p: 1.05,
+                            background: "rgba(255,255,255,0.03)"
                           }}
                         >
                           <Typography variant="caption" sx={{
-                            color: "text.secondary"
+                            color: "rgba(188, 198, 212, 0.7)"
                           }}>
-                            Recommended remediation
+                            Recommended next step
                           </Typography>
                           <Typography
                             variant="body2"
                             sx={{
-                              mt: 0.5,
+                              mt: 0.6,
                               fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
                               whiteSpace: "pre-wrap",
-                              overflowWrap: "anywhere"
+                              overflowWrap: "anywhere",
+                              color: "rgba(245, 247, 250, 0.92)"
                             }}
                           >
                             {fix}
@@ -31336,6 +32733,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                               size="small"
                               variant="contained"
                               color="warning"
+                              sx={{ borderRadius: "8px", textTransform: "none" }}
                               onClick={() => {
                                 setError(null);
                                 setSuccess(null);
@@ -31349,6 +32747,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                           <Button
                             size="small"
                             variant="outlined"
+                            sx={{ borderRadius: "8px", textTransform: "none" }}
                             disabled={!canCopyFix}
                             onClick={async () => {
                               setError(null);
@@ -31366,6 +32765,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                           <Button
                             size="small"
                             variant="contained"
+                            sx={{ borderRadius: "8px", textTransform: "none" }}
                             disabled={!canRunFix || runPulseFixMutation.isPending}
                             onClick={async () => {
                               setError(null);
@@ -31391,7 +32791,8 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                           </Button>
                         </Stack>
                         <Typography variant="caption" sx={{
-                          color: "text.secondary"
+                          color: "rgba(188, 198, 212, 0.66)",
+                          lineHeight: 1.45
                         }}>
                           {canReviewStorageMaintenance
                             ? "Opens a review screen first, then requires explicit confirmation before any episodic cleanup can run."
@@ -31403,33 +32804,241 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                         </Typography>
                       </Stack>
                     </Box>
+                    </Grid2>
+                  );
+                })}
+              </Grid2>
+            )}
+
+            <Stack spacing={0.3} sx={{ pt: 0.25 }}>
+              <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>
+                Run ledger
+              </Typography>
+              <Typography variant="body2" sx={{ color: "rgba(188, 198, 212, 0.72)" }}>
+                This shows exactly what ArkPulse scanned, how long each phase took, and what happened with notifications. Sections stay collapsed until you open them.
+              </Typography>
+            </Stack>
+            <Box
+              sx={{
+                borderRadius: "8px",
+                border: "1px solid rgba(255,255,255,0.08)",
+                background: "rgba(255,255,255,0.02)",
+                p: 1.2
+              }}
+            >
+              <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: "wrap" }}>
+                <Chip
+                  size="small"
+                  variant="outlined"
+                  label={`Scans: ${selectedPulseScanLog.length}`}
+                  sx={{ borderColor: "rgba(255,255,255,0.12)" }}
+                />
+                {selectedPulseScanDurationMs > 0 ? (
+                  <Chip
+                    size="small"
+                    variant="outlined"
+                    label={`Duration: ${formatTraceDuration(selectedPulseScanDurationMs)}`}
+                    sx={{ borderColor: "rgba(255,255,255,0.12)" }}
+                  />
+                ) : null}
+                {selectedPulseNotificationOutcome ? (
+                  <Chip
+                    size="small"
+                    color={pulseScanStatusColor(selectedPulseNotificationOutcome)}
+                    variant="outlined"
+                    label={`Notify: ${pulseScanStatusLabel(selectedPulseNotificationOutcome)}`}
+                  />
+                ) : null}
+                {selectedPulseScanStarted ? (
+                  <Chip
+                    size="small"
+                    variant="outlined"
+                    label={`Started: ${formatTimestampForHumans(selectedPulseScanStarted).label}`}
+                    title={formatTimestampForHumans(selectedPulseScanStarted).tooltip}
+                    sx={{ borderColor: "rgba(255,255,255,0.12)" }}
+                  />
+                ) : null}
+                {selectedPulseScanFinished ? (
+                  <Chip
+                    size="small"
+                    variant="outlined"
+                    label={`Finished: ${formatTimestampForHumans(selectedPulseScanFinished).label}`}
+                    title={formatTimestampForHumans(selectedPulseScanFinished).tooltip}
+                    sx={{ borderColor: "rgba(255,255,255,0.12)" }}
+                  />
+                ) : null}
+              </Stack>
+            </Box>
+            {selectedPulseScanLog.length === 0 ? (
+              <Box
+                sx={{
+                  borderRadius: "8px",
+                  border: "1px dashed rgba(255,255,255,0.1)",
+                  background: "rgba(255,255,255,0.02)",
+                  px: 1.4,
+                  py: 1.25
+                }}
+              >
+                <Typography variant="body2" sx={{ color: "rgba(188, 198, 212, 0.72)" }}>
+                  This run does not include a detailed scan ledger yet.
+                </Typography>
+              </Box>
+            ) : (
+              <Stack spacing={1}>
+                {selectedPulseScanLog.map((section, idx) => {
+                  const row = asRecord(section);
+                  const metrics = pickRecords(row, "metrics");
+                  const status = str(row.status, "ok");
+                  const durationMs = num(row.duration_ms, 0);
+                  const summary = str(row.summary, "").trim();
+                  const detail = str(row.detail, "").trim();
+                  return (
+                    <Accordion
+                      key={`${str(row.id, `scan-${idx}`)}-${idx}`}
+                      disableGutters
+                      sx={{
+                        background: "rgba(255,255,255,0.02)",
+                        boxShadow: "none",
+                        border: "1px solid rgba(255,255,255,0.08)",
+                        borderRadius: "8px",
+                        overflow: "hidden",
+                        "&:before": { display: "none" }
+                      }}
+                    >
+                      <AccordionSummary
+                        expandIcon={<ExpandMoreIcon sx={{ color: "rgba(196, 223, 255, 0.82)" }} />}
+                        sx={{
+                          minHeight: 54,
+                          "& .MuiAccordionSummary-content": {
+                            my: 1,
+                            alignItems: "center",
+                            gap: 1,
+                            flexWrap: "wrap"
+                          }
+                        }}
+                      >
+                        <Box
+                          sx={{
+                            minWidth: 28,
+                            height: 28,
+                            borderRadius: "8px",
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            background: "rgba(255,255,255,0.06)",
+                            color: "rgba(243, 246, 250, 0.92)",
+                            fontSize: "0.8rem",
+                            fontWeight: 700
+                          }}
+                        >
+                          {idx + 1}
+                        </Box>
+                        <Stack spacing={0.15} sx={{ minWidth: 0, flex: 1 }}>
+                          <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                            {str(row.title, `Scan ${idx + 1}`)}
+                          </Typography>
+                          <Typography variant="body2" sx={{ color: "rgba(188, 198, 212, 0.72)" }} noWrap>
+                            {summary || "No summary recorded."}
+                          </Typography>
+                        </Stack>
+                        {durationMs > 0 ? (
+                          <Chip size="small" variant="outlined" label={formatTraceDuration(durationMs)} />
+                        ) : null}
+                        <Chip size="small" color={pulseScanStatusColor(status)} label={pulseScanStatusLabel(status)} />
+                      </AccordionSummary>
+                      <AccordionDetails sx={{ pt: 0, pb: 1.2 }}>
+                        <Stack spacing={1}>
+                          {detail ? (
+                            <Typography variant="body2" sx={{ color: "rgba(231, 236, 243, 0.78)", lineHeight: 1.6 }}>
+                              {detail}
+                            </Typography>
+                          ) : null}
+                          {metrics.length > 0 ? (
+                            <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: "wrap" }}>
+                              {metrics.map((metric, metricIdx) => {
+                                const metricRow = asRecord(metric);
+                                const metricLabel = str(metricRow.label, "").trim();
+                                const metricValue = str(metricRow.value, "").trim();
+                                if (!metricLabel && !metricValue) return null;
+                                return (
+                                  <Chip
+                                    key={`${metricLabel}-${metricValue}-${metricIdx}`}
+                                    size="small"
+                                    variant="outlined"
+                                    label={metricLabel ? `${metricLabel}: ${metricValue || "-"}` : metricValue || "-"}
+                                    sx={{ borderColor: "rgba(255,255,255,0.12)" }}
+                                  />
+                                );
+                              })}
+                            </Stack>
+                          ) : null}
+                        </Stack>
+                      </AccordionDetails>
+                    </Accordion>
                   );
                 })}
               </Stack>
             )}
 
-            <Typography variant="subtitle2" sx={{
-              mt: 0.5
-            }}>
-              Current system snapshot
-            </Typography>
+            <Stack spacing={0.3} sx={{ pt: 0.25 }}>
+              <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>
+                System snapshot
+              </Typography>
+              <Typography variant="body2" sx={{ color: "rgba(188, 198, 212, 0.72)" }}>
+                Runtime state captured with this health check.
+              </Typography>
+            </Stack>
             <Grid2 container spacing={1}>
               {selectedPulseSnapshot.map((item) => (
                 <Grid2 key={item.label} size={{ xs: 6, md: 3 }}>
-                  <Box className="metadata-box" sx={{ minHeight: 86 }}>
-                    <Typography variant="caption" sx={{
-                      color: "text.secondary"
-                    }}>
+                  <Box
+                    sx={{
+                      height: "100%",
+                      borderRadius: "8px",
+                      border: "1px solid rgba(255,255,255,0.07)",
+                      background: "rgba(255,255,255,0.02)",
+                      p: 1.2
+                    }}
+                  >
+                    <Typography
+                      variant="caption"
+                      sx={{
+                        display: "block",
+                        color: "rgba(188, 198, 212, 0.68)"
+                      }}
+                    >
                       {item.label}
                     </Typography>
-                    <Typography variant="h6">{item.value}</Typography>
+                    <Typography
+                      variant="h6"
+                      sx={{
+                        mt: 0.35,
+                        fontWeight: 700,
+                        fontVariantNumeric: "tabular-nums",
+                        fontFamily:
+                          item.label === "Uptime"
+                            ? "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+                            : undefined
+                      }}
+                    >
+                      {item.value}
+                    </Typography>
                   </Box>
                 </Grid2>
               ))}
             </Grid2>
 
             {developerModeEnabled ? (
-              <Accordion disableGutters sx={{ background: "transparent", boxShadow: "none", border: "1px solid rgba(62,143,214,0.24)", borderRadius: 1 }}>
+              <Accordion
+                disableGutters
+                sx={{
+                  background: "rgba(255,255,255,0.02)",
+                  boxShadow: "none",
+                  border: "1px solid rgba(255,255,255,0.08)",
+                  borderRadius: "8px",
+                  "&:before": { display: "none" }
+                }}
+              >
                 <AccordionSummary expandIcon={<ExpandMoreIcon />}>
                   <Typography variant="subtitle2">Technical signals (developer mode)</Typography>
                 </AccordionSummary>
@@ -32183,6 +33792,51 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                 : passwordDialogMode === "change"
                   ? "Change Password"
                   : "Remove Password"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+      <Dialog
+        open={rotateInternalCredentialsDialogOpen}
+        onClose={closeRotateInternalCredentialsDialog}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>Rotate Internal Credentials</DialogTitle>
+        <DialogContent>
+          <Stack spacing={1.2} sx={{ mt: 0.5 }}>
+            <Alert severity="warning">
+              AgentArk will replace the executor and workspace trust credentials, then restart the stack immediately.
+            </Alert>
+            <Typography variant="body2" sx={{ color: "text.secondary" }}>
+              Active tasks, tool runs, and internal requests can be interrupted while control, executor, and workspace restart.
+            </Typography>
+            <FormControlLabel
+              control={
+                <Checkbox
+                  checked={rotateInternalCredentialsAccepted}
+                  onChange={(e) => setRotateInternalCredentialsAccepted(e.target.checked)}
+                />
+              }
+              label="I accept the credential swap and restart."
+            />
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button
+            onClick={closeRotateInternalCredentialsDialog}
+            disabled={rotateInternalServiceTokensMutation.isPending}
+          >
+            Cancel
+          </Button>
+          <Button
+            variant="contained"
+            color="warning"
+            onClick={submitRotateInternalCredentials}
+            disabled={
+              rotateInternalServiceTokensMutation.isPending || !rotateInternalCredentialsAccepted
+            }
+          >
+            {rotateInternalServiceTokensMutation.isPending ? "Rotating..." : "I Accept and Rotate"}
           </Button>
         </DialogActions>
       </Dialog>
@@ -33590,7 +35244,7 @@ export function NativeWorkspace({
   const isChat = view === "chat";
   const isSettingsSurface =
     view === "settings" ||
-    ["connections", "channels", "routing", "webhooks", "devices", "browser", "gatewayops", "failover", "moltbook", "arkpulse", "search"].includes(view);
+    ["connections", "channels", "routing", "webhooks", "devices", "browser", "gatewayops", "failover", "arkpulse", "search"].includes(view);
   const needsProjects = ["chat", "documents", "memory", "projects"].includes(view);
   const showProjectScopeBar = ["documents", "memory"].includes(view);
   const projectsQ = useQuery({
@@ -33660,9 +35314,7 @@ export function NativeWorkspace({
       ) : null}
       {view === "skills" ? <SkillsManager autoRefresh={autoRefresh} /> : null}
       {view === "apps" ? <AppsManager autoRefresh={autoRefresh} /> : null}
-      {view === "moltbook" ? (
-        <SettingsManager autoRefresh={autoRefresh} initialTab={7} hideSettingsNav />
-      ) : null}
+        {view === "moltbook" ? <MoltbookManager autoRefresh={autoRefresh} /> : null}
       {view === "goals" ? <GoalsManager autoRefresh={autoRefresh} /> : null}
       {view === "autonomy" ? <AutonomyManager autoRefresh={autoRefresh} /> : null}
       {view === "evolution" ? <EvolutionManager autoRefresh={autoRefresh} /> : null}

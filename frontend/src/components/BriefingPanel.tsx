@@ -6,11 +6,11 @@ import {
   CardContent,
   Chip,
   Divider,
-  Grid as Grid2,
   Stack,
   Typography,
 } from "@mui/material";
-import type { BriefingResponse, RecommendedSkill } from "../types";
+import Grid2 from "@mui/material/Grid";
+import type { BriefingResponse, RecommendedAction } from "../types";
 import { api } from "../api/client";
 import { useCallback, useState } from "react";
 import IconButton from "@mui/material/IconButton";
@@ -27,9 +27,9 @@ export function BriefingPanel({ briefing, compact = false }: Props) {
     kind: "success" | "error" | "info";
     text: string;
   } | null>(null);
-  const [dismissedSkills, setDismissedSkills] = useState<Set<string>>(new Set());
-  const dismissSkill = useCallback((id: string) => {
-    setDismissedSkills((prev) => new Set(prev).add(id));
+  const [dismissedActions, setDismissedActions] = useState<Set<string>>(new Set());
+  const dismissAction = useCallback((id: string) => {
+    setDismissedActions((prev) => new Set(prev).add(id));
   }, []);
   const actionableRisks = (briefing?.top_risks || []).filter((risk) => {
     const typedRisk = risk as Record<string, unknown>;
@@ -38,10 +38,8 @@ export function BriefingPanel({ briefing, compact = false }: Props) {
     return type !== "none" && title !== "no critical risks detected";
   });
   const visibleOpportunities = briefing?.top_opportunities || [];
-  const visibleSkills: RecommendedSkill[] =
-    briefing?.recommended_skills ||
-    (((briefing as unknown as { recommended_actions?: RecommendedSkill[] })
-      ?.recommended_actions || []) as RecommendedSkill[]);
+  const visibleActions: RecommendedAction[] =
+    briefing?.recommended_actions || briefing?.recommended_skills || [];
   const showSignalRow =
     actionableRisks.length > 0 || visibleOpportunities.length > 0;
 
@@ -78,8 +76,8 @@ export function BriefingPanel({ briefing, compact = false }: Props) {
     return "Executed.";
   }
 
-  const executeSkill = useMutation({
-    mutationFn: api.executeRecommendedSkill,
+  const executeAction = useMutation({
+    mutationFn: api.executeRecommendedAction,
     onSuccess: async (out) => {
       setExecNotice({ kind: "success", text: summarizeExecResult(out) });
       await queryClient.invalidateQueries({ queryKey: ["briefing"] });
@@ -184,21 +182,21 @@ export function BriefingPanel({ briefing, compact = false }: Props) {
 
         {showSignalRow ? <Divider sx={{ my: 2 }} /> : null}
 
-        {visibleSkills.length > 0 ? (
+        {visibleActions.length > 0 ? (
           <Typography variant="subtitle2" sx={{
             mb: 1
           }}>
-            Recommended Skills
+            Recommended Actions
           </Typography>
         ) : null}
         {execNotice ? <Alert severity={execNotice.kind}>{execNotice.text}</Alert> : null}
         <Stack spacing={1}>
-          {visibleSkills
-            .filter((s) => !dismissedSkills.has(s.id))
+          {visibleActions
+            .filter((action) => !dismissedActions.has(action.id))
             .slice(0, compact ? 2 : 3)
-            .map((skill) => (
+            .map((action) => (
               <Stack
-                key={skill.id}
+                key={action.id}
                 direction={{ xs: "column", md: "row" }}
                 spacing={1}
                 className="action-row"
@@ -210,12 +208,12 @@ export function BriefingPanel({ briefing, compact = false }: Props) {
                   <Typography variant="body2" sx={{
                     fontWeight: 700
                   }}>
-                    {skill.title}
+                    {action.title}
                   </Typography>
                   <Typography variant="caption" sx={{
                     color: "text.secondary"
                   }}>
-                    {skill.summary || skill.description || "No description"}
+                    {action.summary || action.description || "No description"}
                   </Typography>
                 </Stack>
                 <Stack direction="row" spacing={0.5} sx={{
@@ -224,14 +222,14 @@ export function BriefingPanel({ briefing, compact = false }: Props) {
                   <Button
                     variant="contained"
                     size="small"
-                    disabled={executeSkill.isPending}
-                    onClick={() => executeSkill.mutate(skill)}
+                    disabled={executeAction.isPending}
+                    onClick={() => executeAction.mutate(action)}
                   >
-                    {executeSkill.isPending ? "Executing..." : "Execute"}
+                    {executeAction.isPending ? "Executing..." : "Execute"}
                   </Button>
                   <IconButton
                     size="small"
-                    onClick={() => dismissSkill(skill.id)}
+                    onClick={() => dismissAction(action.id)}
                     title="Dismiss"
                   >
                     <CloseIcon fontSize="small" />

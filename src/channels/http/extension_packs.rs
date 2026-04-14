@@ -154,7 +154,7 @@ pub(super) async fn upload_extension_pack(
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     format!("Failed to read upload: {}", error),
-                )
+                );
             }
         };
         let Some(field) = next else {
@@ -173,7 +173,7 @@ pub(super) async fn upload_extension_pack(
                     return error_response(
                         StatusCode::BAD_REQUEST,
                         format!("Failed to read trust_unverified: {}", error),
-                    )
+                    );
                 }
             }
             continue;
@@ -186,7 +186,7 @@ pub(super) async fn upload_extension_pack(
                     return error_response(
                         StatusCode::BAD_REQUEST,
                         format!("Failed to read uploaded file: {}", error),
-                    )
+                    );
                 }
             }
         }
@@ -438,7 +438,7 @@ pub(super) async fn handle_extension_pack_webhook(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 Json(serde_json::json!({ "error": "request body too large" })),
             )
-                .into_response()
+                .into_response();
         }
     };
     let body_json = serde_json::from_slice::<serde_json::Value>(&body_bytes).ok();
@@ -610,7 +610,7 @@ pub(super) async fn handle_extension_pack_webhook(
                     return error_response(
                         StatusCode::BAD_REQUEST,
                         format!("Invalid Teams activity payload: {}", error),
-                    )
+                    );
                 }
             };
             let metadata = header_snapshot(&parts.headers, &["content-type", "user-agent"]);
@@ -712,7 +712,7 @@ pub(super) async fn handle_extension_pack_webhook(
                     return error_response(
                         StatusCode::BAD_REQUEST,
                         "Failed to parse WhatsApp webhook payload",
-                    )
+                    );
                 }
             };
             let is_baileys =

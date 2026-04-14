@@ -2,7 +2,6 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 use uuid::Uuid;
 
 /// Task approval policy
@@ -73,7 +72,7 @@ fn strip_automation_meta(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-fn normalize_signature_text(value: &str) -> String {
+pub(crate) fn normalize_signature_text(value: &str) -> String {
     value
         .trim()
         .to_ascii_lowercase()
@@ -87,57 +86,66 @@ fn normalize_signature_text(value: &str) -> String {
         })
         .collect::<String>()
         .split_whitespace()
-        .take(40)
         .collect::<Vec<_>>()
         .join(" ")
 }
 
+pub(crate) fn canonical_signature_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::String(value) => normalize_signature_text(value),
+        serde_json::Value::Array(items) => format!(
+            "[{}]",
+            items
+                .iter()
+                .map(canonical_signature_value)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        serde_json::Value::Object(map) => {
+            let mut entries = map
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        normalize_signature_text(key),
+                        canonical_signature_value(value),
+                    )
+                })
+                .collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            format!(
+                "{{{}}}",
+                entries
+                    .into_iter()
+                    .map(|(key, value)| format!("{}:{}", key, value))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        }
+    }
+}
+
 fn task_topic_signature(arguments: &serde_json::Value, description: &str) -> String {
     let cleaned = strip_automation_meta(arguments);
-    let preferred = ["query", "url", "topic", "target", "app_id", "goal_id", "id"]
-        .iter()
-        .find_map(|key| cleaned.get(*key).and_then(|value| value.as_str()))
-        .unwrap_or(description);
-    normalize_signature_text(preferred)
+    let arguments_signature = canonical_signature_value(&cleaned);
+    let description_signature = normalize_signature_text(description);
+    match (arguments_signature.as_str(), description_signature.as_str()) {
+        ("{}" | "null", description) => description.to_string(),
+        (arguments, "") => arguments.to_string(),
+        (arguments, description) => format!("{}|{}", description, arguments),
+    }
 }
 
-fn normalized_topic_tokens(value: &str) -> BTreeSet<String> {
-    normalize_signature_text(value)
-        .split_whitespace()
-        .filter(|token| token.len() >= 3)
-        .map(|token| token.to_string())
-        .collect()
-}
-
-fn topics_are_similar(left: &str, right: &str) -> bool {
-    if left == right {
-        return true;
-    }
-    if left.is_empty() || right.is_empty() {
-        return false;
-    }
-    if left.contains(right) || right.contains(left) {
-        return true;
-    }
-
-    let left_tokens = normalized_topic_tokens(left);
-    let right_tokens = normalized_topic_tokens(right);
-    if left_tokens.is_empty() || right_tokens.is_empty() {
-        return false;
-    }
-
-    let shared = left_tokens.intersection(&right_tokens).count();
-    let largest = left_tokens.len().max(right_tokens.len());
-    shared >= 4 && (shared as f32 / largest as f32) >= 0.6
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn task_semantic_signature(task: &Task) -> String {
-    let cleaned = strip_automation_meta(&task.arguments);
-    format!(
-        "{}|{}",
-        task.action.trim().to_ascii_lowercase(),
-        task_topic_signature(&cleaned, &task.description)
+    let scheduled_for = task.scheduled_for.as_ref().map(|value| value.to_rfc3339());
+    task_request_signature_from_fields(
+        &task.action,
+        &task.description,
+        &task.arguments,
+        task.cron.as_deref(),
+        scheduled_for.as_deref(),
     )
 }
 
@@ -192,10 +200,7 @@ pub fn tasks_are_semantically_similar(existing: &Task, candidate: &Task) -> bool
     if !existing.action.eq_ignore_ascii_case(&candidate.action) {
         return false;
     }
-
-    let existing_topic = task_topic_signature(&existing.arguments, &existing.description);
-    let candidate_topic = task_topic_signature(&candidate.arguments, &candidate.description);
-    topics_are_similar(&existing_topic, &candidate_topic)
+    task_semantic_signature(existing) == task_semantic_signature(candidate)
 }
 
 impl Task {
@@ -311,5 +316,47 @@ mod tests {
         let right = task_semantic_signature(&task);
 
         assert_eq!(left, right);
+    }
+
+    #[test]
+    fn similar_reminder_templates_with_different_targets_are_not_same_task() {
+        let first = Task::new(
+            "Reminder for event: Meeting with Alpha".to_string(),
+            "notify_user".to_string(),
+            serde_json::json!({
+                "query": "Reminder for event: Meeting with Alpha",
+                "message": "Meeting with Alpha is due now."
+            }),
+        );
+        let second = Task::new(
+            "Reminder for event: Meeting with Beta".to_string(),
+            "notify_user".to_string(),
+            serde_json::json!({
+                "query": "Reminder for event: Meeting with Beta",
+                "message": "Meeting with Beta is due now."
+            }),
+        );
+
+        assert!(!tasks_are_semantically_similar(&first, &second));
+    }
+
+    #[test]
+    fn exact_structural_task_identity_matches() {
+        let first = Task::new(
+            "Monitor provider pricing".to_string(),
+            "web_search".to_string(),
+            serde_json::json!({
+                "query": "Monitor provider pricing"
+            }),
+        );
+        let second = Task::new(
+            "Monitor provider pricing".to_string(),
+            "web_search".to_string(),
+            serde_json::json!({
+                "query": "Monitor provider pricing"
+            }),
+        );
+
+        assert!(tasks_are_semantically_similar(&first, &second));
     }
 }

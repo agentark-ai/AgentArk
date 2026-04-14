@@ -9,14 +9,20 @@ import {
   DialogActions,
   DialogContent,
   DialogTitle,
-  Grid as Grid2,
   MenuItem,
   Stack,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
   TextField,
   Typography
 } from "@mui/material";
+import Grid2 from "@mui/material/Grid";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { api } from "../api/client";
 import { formatUiDateTime } from "../lib/dateFormat";
 import { WorkspacePageHeader, WorkspacePageShell } from "./WorkspacePage";
@@ -1038,6 +1044,154 @@ function RunCard({ run, live = false }: { run: SwarmRun; live?: boolean }) {
   );
 }
 
+function RunHistoryList({ runs }: { runs: SwarmRun[] }) {
+  const pageSize = 8;
+  const [page, setPage] = useState(0);
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  const pageCount = Math.max(1, Math.ceil(runs.length / pageSize));
+  const clampedPage = Math.min(page, Math.max(0, pageCount - 1));
+  const pageRuns = useMemo(() => {
+    const start = clampedPage * pageSize;
+    return runs.slice(start, start + pageSize);
+  }, [clampedPage, runs]);
+  const selectedRun = pageRuns.find((run) => run.id === selectedRunId) ?? pageRuns[0] ?? null;
+
+  useEffect(() => {
+    if (page !== clampedPage) {
+      setPage(clampedPage);
+    }
+  }, [clampedPage, page]);
+
+  useEffect(() => {
+    if (!selectedRunId || !pageRuns.some((run) => run.id === selectedRunId)) {
+      setSelectedRunId(pageRuns[0]?.id ?? null);
+    }
+  }, [pageRuns, selectedRunId]);
+
+  return (
+    <Stack spacing={1.2}>
+      <TableContainer className="table-shell" sx={{ width: "100%", overflowX: "auto" }}>
+        <Table size="small" sx={{ minWidth: 900 }}>
+          <TableHead>
+            <TableRow>
+              <TableCell>Request</TableCell>
+              <TableCell>Status</TableCell>
+              <TableCell>Agents</TableCell>
+              <TableCell>Started</TableCell>
+              <TableCell>Finished</TableCell>
+              <TableCell align="right">Open</TableCell>
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {pageRuns.map((run) => {
+              const trackedAgents = Math.max(run.agentCount, run.agents.length);
+              const isSelected = selectedRun?.id === run.id;
+              return (
+                <TableRow
+                  key={run.id}
+                  hover
+                  selected={isSelected}
+                  onClick={() => setSelectedRunId(run.id)}
+                  sx={{
+                    cursor: "pointer",
+                    "& .MuiTableCell-root": {
+                      borderColor: "rgba(145,170,205,0.12)"
+                    }
+                  }}
+                >
+                  <TableCell sx={{ minWidth: 340, maxWidth: 460 }}>
+                    <Typography variant="body2" sx={{ fontWeight: 700 }}>
+                      {run.request}
+                    </Typography>
+                    <Typography variant="caption" sx={{ color: "text.secondary", display: "block", mt: 0.3 }}>
+                      {run.summary || "Select this run to inspect delegated agent detail."}
+                    </Typography>
+                  </TableCell>
+                  <TableCell>
+                    <Chip size="small" color={statusChipColor(run.status)} label={statusChipLabel(run.status)} />
+                  </TableCell>
+                  <TableCell>
+                    <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                      {trackedAgents}
+                    </Typography>
+                    <Typography variant="caption" sx={{ color: "text.secondary", display: "block", mt: 0.2 }}>
+                      {run.channel || "Workspace"}
+                    </Typography>
+                  </TableCell>
+                  <TableCell>
+                    <Typography variant="body2">{formatTimestamp(run.startedAt)}</Typography>
+                  </TableCell>
+                  <TableCell>
+                    <Typography variant="body2">{formatTimestamp(run.completedAt || run.updatedAt)}</Typography>
+                    <Typography variant="caption" sx={{ color: "text.secondary", display: "block", mt: 0.2 }}>
+                      {run.completedAt ? "finished" : "last update"}
+                    </Typography>
+                  </TableCell>
+                  <TableCell align="right">
+                    <Button
+                      size="small"
+                      variant={isSelected ? "contained" : "outlined"}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        setSelectedRunId(run.id);
+                      }}
+                    >
+                      {isSelected ? "Viewing" : "View"}
+                    </Button>
+                  </TableCell>
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+      </TableContainer>
+
+      <Stack
+        direction={{ xs: "column", sm: "row" }}
+        spacing={0.75}
+        sx={{
+          alignItems: { xs: "flex-start", sm: "center" },
+          justifyContent: "space-between"
+        }}
+      >
+        <Typography variant="caption" className="conversation-pagination-copy">
+          {runs.length} run{runs.length === 1 ? "" : "s"}
+        </Typography>
+        <Stack direction="row" spacing={0.75} sx={{ alignItems: "center", flexWrap: "wrap" }}>
+          <Typography variant="caption" className="conversation-pagination-copy">
+            Page {clampedPage + 1}/{pageCount}
+          </Typography>
+          <Button
+            size="small"
+            variant="outlined"
+            onClick={() => setPage((prev) => Math.max(0, prev - 1))}
+            disabled={clampedPage <= 0}
+          >
+            Prev
+          </Button>
+          <Button
+            size="small"
+            variant="outlined"
+            onClick={() => setPage((prev) => Math.min(pageCount - 1, prev + 1))}
+            disabled={clampedPage >= pageCount - 1}
+          >
+            Next
+          </Button>
+        </Stack>
+      </Stack>
+
+      {selectedRun ? (
+        <Stack spacing={0.8}>
+          <Typography variant="overline" sx={{ letterSpacing: 0, color: "info.light" }}>
+            Run details
+          </Typography>
+          <RunCard run={selectedRun} />
+        </Stack>
+      ) : null}
+    </Stack>
+  );
+}
+
 function AccessScopeSelect({
   label,
   helperText,
@@ -1186,7 +1340,6 @@ function AccessScopeSelect({
 export function SwarmManager({ autoRefresh }: Props) {
   const queryClient = useQueryClient();
   const [createOpen, setCreateOpen] = useState(false);
-  const [agentDialogStep, setAgentDialogStep] = useState<0 | 1>(0);
   const [editingAgentId, setEditingAgentId] = useState<string | null>(null);
   const [draft, setDraft] = useState<AgentDraft>(EMPTY_DRAFT);
   const [accessPlan, setAccessPlan] = useState<AccessPlan | null>(null);
@@ -1378,7 +1531,6 @@ export function SwarmManager({ autoRefresh }: Props) {
     onSuccess: async () => {
       setEditingAgentId(null);
       setCreateOpen(false);
-      setAgentDialogStep(0);
       setAccessPlan(null);
       setDraft(applyModelProfileToDraft({ ...EMPTY_DRAFT, access_scope: emptyAccessScope() }, defaultModelProfile));
       setFormError(null);
@@ -1395,7 +1547,6 @@ export function SwarmManager({ autoRefresh }: Props) {
       if (editingAgentId === id) {
         setEditingAgentId(null);
         setCreateOpen(false);
-        setAgentDialogStep(0);
         setAccessPlan(null);
         setDraft(applyModelProfileToDraft({ ...EMPTY_DRAFT, access_scope: emptyAccessScope() }, defaultModelProfile));
       }
@@ -1445,7 +1596,6 @@ export function SwarmManager({ autoRefresh }: Props) {
         });
         return nextDraft;
       });
-      setAgentDialogStep(1);
     }
   });
   const generateDraft = useMutation({
@@ -1456,6 +1606,7 @@ export function SwarmManager({ autoRefresh }: Props) {
       }),
     onSuccess: (response) => {
       const payload = asRecord(response);
+      setAccessPlan(null);
       setDraft((prev) => ({
         ...prev,
         name: str(payload.name, prev.name),
@@ -1476,7 +1627,6 @@ export function SwarmManager({ autoRefresh }: Props) {
   function closeAgentDialog() {
     if (saveAgent.isPending || planAccess.isPending || deleteAgent.isPending) return;
     setCreateOpen(false);
-    setAgentDialogStep(0);
     setAccessPlan(null);
     setEditingAgentId(null);
     setFormError(null);
@@ -1486,7 +1636,6 @@ export function SwarmManager({ autoRefresh }: Props) {
   function openCreateAgentDialog() {
     setFormError(null);
     setAccessPlan(null);
-    setAgentDialogStep(0);
     setEditingAgentId(null);
     setDraft(applyModelProfileToDraft({ ...EMPTY_DRAFT, access_scope: emptyAccessScope() }, defaultModelProfile));
     setCreateOpen(true);
@@ -1497,7 +1646,6 @@ export function SwarmManager({ autoRefresh }: Props) {
       findMatchingModelProfile(agent, enabledModelProfiles) ?? findMatchingModelProfile(agent, savedModelProfiles);
     setFormError(null);
     setAccessPlan(null);
-    setAgentDialogStep(0);
     setEditingAgentId(agent.id);
     setDraft({
       description: "",
@@ -1542,7 +1690,7 @@ export function SwarmManager({ autoRefresh }: Props) {
   return (
     <WorkspacePageShell spacing={1.5}>
       <WorkspacePageHeader
-        eyebrow="Multi-agent control"
+        eyebrow="Agent"
         title="Agents"
         description="Live delegated runs, specialist roster, and recent swarm history stay visible here. Chat and this view now share the same execution state instead of splitting live work from history."
         actions={
@@ -1840,309 +1988,364 @@ export function SwarmManager({ autoRefresh }: Props) {
         <SectionShell
           eyebrow="History"
           title="Recent swarm runs"
-          detail="Completed, interrupted, and failed runs stay here so you can review exactly which agents worked on each request."
+          detail="Completed, interrupted, and failed runs stay here in a compact list. Select any run to inspect the delegated agent detail."
         >
-          <Stack spacing={1.2}>
-            {recentRuns.slice(0, 18).map((run) => (
-              <RunCard key={run.id} run={run} />
-            ))}
-          </Stack>
+          <RunHistoryList runs={recentRuns} />
         </SectionShell>
       ) : null}
       <Dialog open={createOpen} onClose={closeAgentDialog} maxWidth="md" fullWidth>
         <DialogTitle>{editingAgent ? "Edit custom agent" : "Add custom agent"}</DialogTitle>
         <DialogContent dividers>
-          {agentDialogStep === 0 ? (
-            <Stack spacing={1.35}>
-              <Alert severity="info">
-                Define the agent first. Elevated access is reviewed on the next step from the
-                drafted spec and live tool metadata.
-              </Alert>
-              <TextField
-                fullWidth
-                size="small"
-                multiline
-                minRows={3}
-                label="Describe the agent"
-                value={draft.description}
-                onChange={(event) => setDraft((prev) => ({ ...prev, description: event.target.value }))}
-                placeholder="Example: Handles Slack follow-ups, summarizes urgent threads, drafts replies, and can query our Google Workspace docs."
-                helperText="Optional for manual setup. Required only if you want AI to draft the name, role, capabilities, and system prompt."
-              />
-              <Stack
-                direction={{ xs: "column", sm: "row" }}
-                spacing={1}
-                sx={{
-                  justifyContent: "space-between",
-                  alignItems: { xs: "stretch", sm: "center" }
-                }}>
-                <Typography variant="caption" sx={{
-                  color: "text.secondary"
-                }}>
-                  AI drafting never auto-saves. It only fills the editable fields below.
-                </Typography>
-                <Button
-                  variant="outlined"
-                  disabled={generateDraft.isPending || !draft.description.trim()}
-                  startIcon={generateDraft.isPending ? <CircularProgress size={14} color="inherit" /> : undefined}
-                  onClick={async () => {
-                    setFormError(null);
-                    try {
-                      await generateDraft.mutateAsync();
-                    } catch (error) {
-                      setFormError(errMessage(error));
-                    }
-                  }}
-                >
-                  {generateDraft.isPending ? "Generating..." : "Generate draft"}
-                </Button>
-              </Stack>
+          <Stack spacing={1.35}>
+            <Alert severity="info">
+              Define the agent and review requested access in the same form. Elevated access is derived from the drafted spec and live tool metadata below.
+            </Alert>
+            <TextField
+              fullWidth
+              size="small"
+              multiline
+              minRows={3}
+              label="Describe the agent"
+              value={draft.description}
+              onChange={(event) => {
+                setAccessPlan(null);
+                setDraft((prev) => ({ ...prev, description: event.target.value }));
+              }}
+              placeholder="Example: Handles Slack follow-ups, summarizes urgent threads, drafts replies, and can query our Google Workspace docs."
+              helperText="Optional for manual setup. Required only if you want AI to draft the name, role, capabilities, and system prompt."
+            />
+            <Stack
+              direction={{ xs: "column", sm: "row" }}
+              spacing={1}
+              sx={{
+                justifyContent: "space-between",
+                alignItems: { xs: "stretch", sm: "center" }
+              }}>
+              <Typography variant="caption" sx={{
+                color: "text.secondary"
+              }}>
+                AI drafting never auto-saves. It only fills the editable fields below.
+              </Typography>
+              <Button
+                variant="outlined"
+                disabled={generateDraft.isPending || !draft.description.trim()}
+                startIcon={generateDraft.isPending ? <CircularProgress size={14} color="inherit" /> : undefined}
+                onClick={async () => {
+                  setFormError(null);
+                  try {
+                    await generateDraft.mutateAsync();
+                  } catch (error) {
+                    setFormError(errMessage(error));
+                  }
+                }}
+              >
+                {generateDraft.isPending ? "Generating..." : "Generate draft"}
+              </Button>
+            </Stack>
 
-              <Grid2 container spacing={1}>
-                <Grid2 size={{ xs: 12, md: 6 }}>
-                  <TextField
-                    fullWidth
-                    size="small"
-                    label="Name"
-                    value={draft.name}
-                    onChange={(event) => setDraft((prev) => ({ ...prev, name: event.target.value }))}
-                  />
-                </Grid2>
-                <Grid2 size={{ xs: 12, md: 6 }}>
-                  <TextField
-                    fullWidth
-                    size="small"
-                    label="Role"
-                    value={draft.agent_type}
-                    onChange={(event) => setDraft((prev) => ({ ...prev, agent_type: event.target.value }))}
-                    placeholder="researcher, coder, support specialist, Slack triager"
-                    helperText="Built-ins still work, but custom role labels are allowed."
-                  />
-                </Grid2>
-                <Grid2 size={{ xs: 12 }}>
-                  <TextField
-                    fullWidth
-                    select
-                    size="small"
-                    label="Model profile"
-                    value={draft.model_profile_id}
-                    onChange={(event) => {
-                      const nextProfile =
-                        enabledModelProfiles.find((profile) => profile.id === event.target.value) ?? null;
-                      setDraft((prev) => applyModelProfileToDraft(prev, nextProfile));
-                    }}
-                    helperText={savedProfilesHelperText}
-                    disabled={enabledModelProfiles.length === 0}
-                  >
-                    <MenuItem value="">
-                      {editingAgent ? "Keep current model config" : "Select a saved model profile"}
-                    </MenuItem>
-                    {enabledModelProfiles.map((profile) => (
-                      <MenuItem key={profile.id} value={profile.id}>
-                        {profile.label || `${formatProfileRole(profile.role)} profile`}
-                      </MenuItem>
-                    ))}
-                  </TextField>
-                </Grid2>
+            <Grid2 container spacing={1}>
+              <Grid2 size={{ xs: 12, md: 6 }}>
+                <TextField
+                  fullWidth
+                  size="small"
+                  label="Name"
+                  value={draft.name}
+                  onChange={(event) => {
+                    setAccessPlan(null);
+                    setDraft((prev) => ({ ...prev, name: event.target.value }));
+                  }}
+                />
               </Grid2>
+              <Grid2 size={{ xs: 12, md: 6 }}>
+                <TextField
+                  fullWidth
+                  size="small"
+                  label="Role"
+                  value={draft.agent_type}
+                  onChange={(event) => {
+                    setAccessPlan(null);
+                    setDraft((prev) => ({ ...prev, agent_type: event.target.value }));
+                  }}
+                  placeholder="researcher, coder, support specialist, Slack triager"
+                  helperText="Built-ins still work, but custom role labels are allowed."
+                />
+              </Grid2>
+              <Grid2 size={{ xs: 12 }}>
+                <TextField
+                  fullWidth
+                  select
+                  size="small"
+                  label="Model profile"
+                  value={draft.model_profile_id}
+                  onChange={(event) => {
+                    setAccessPlan(null);
+                    const nextProfile =
+                      enabledModelProfiles.find((profile) => profile.id === event.target.value) ?? null;
+                    setDraft((prev) => applyModelProfileToDraft(prev, nextProfile));
+                  }}
+                  helperText={savedProfilesHelperText}
+                  disabled={enabledModelProfiles.length === 0}
+                >
+                  <MenuItem value="">
+                    {editingAgent ? "Keep current model config" : "Select a saved model profile"}
+                  </MenuItem>
+                  {enabledModelProfiles.map((profile) => (
+                    <MenuItem key={profile.id} value={profile.id}>
+                      {profile.label || `${formatProfileRole(profile.role)} profile`}
+                    </MenuItem>
+                  ))}
+                </TextField>
+              </Grid2>
+            </Grid2>
 
-              {selectedModelProfile ? (
-                <Box
+            {selectedModelProfile ? (
+              <Box
+                sx={{
+                  px: 1.15,
+                  py: 1,
+                  borderRadius: "8px",
+                  border: "1px solid rgba(255,255,255,0.08)",
+                  background: "linear-gradient(180deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.02) 100%)"
+                }}
+              >
+                <Stack
+                  direction={{ xs: "column", sm: "row" }}
+                  spacing={0.75}
+                  useFlexGap
                   sx={{
-                    px: 1.15,
-                    py: 1,
-                    borderRadius: "8px",
-                    border: "1px solid rgba(255,255,255,0.08)",
-                    background: "linear-gradient(180deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.02) 100%)"
+                    flexWrap: "wrap",
+                    alignItems: { xs: "flex-start", sm: "center" }
+                  }}>
+                  <Typography variant="body2" sx={{ fontWeight: 700 }}>
+                    {selectedModelProfile.label || `${formatProfileRole(selectedModelProfile.role)} profile`}
+                  </Typography>
+                  <Chip size="small" variant="outlined" label={formatProfileRole(selectedModelProfile.role)} />
+                  <Typography variant="caption" sx={{
+                    color: "text.secondary"
+                  }}>
+                    Reuses your saved model setup automatically.
+                  </Typography>
+                </Stack>
+              </Box>
+            ) : draft.llm_provider && draft.llm_model ? (
+              <Alert severity="warning">
+                This agent is keeping its stored model config: {draft.llm_provider} / {draft.llm_model}
+                {draft.llm_base_url ? ` / ${draft.llm_base_url}` : ""}. Pick a saved profile above if
+                you want to replace it.
+              </Alert>
+            ) : null}
+
+            <TextField
+              fullWidth
+              size="small"
+              label="Capabilities"
+              value={draft.capabilities}
+              onChange={(event) => {
+                setAccessPlan(null);
+                setDraft((prev) => ({ ...prev, capabilities: event.target.value }));
+              }}
+              placeholder="debugging, code review, refactoring"
+              helperText="Comma-separated skills shown on the agent card."
+            />
+            <TextField
+              fullWidth
+              size="small"
+              multiline
+              minRows={5}
+              label="System prompt"
+              value={draft.system_prompt}
+              onChange={(event) => {
+                setAccessPlan(null);
+                setDraft((prev) => ({ ...prev, system_prompt: event.target.value }));
+              }}
+            />
+
+            <Box
+              sx={{
+                borderRadius: "8px",
+                border: "1px solid rgba(255,255,255,0.08)",
+                background: "rgba(255,255,255,0.02)",
+                px: 1.15,
+                py: 1.05
+              }}
+            >
+              <Stack spacing={1}>
+                <Stack
+                  direction={{ xs: "column", sm: "row" }}
+                  spacing={1}
+                  sx={{
+                    justifyContent: "space-between",
+                    alignItems: { xs: "stretch", sm: "center" }
                   }}
                 >
-                  <Stack
-                    direction={{ xs: "column", sm: "row" }}
-                    spacing={0.75}
-                    useFlexGap
-                    sx={{
-                      flexWrap: "wrap",
-                      alignItems: { xs: "flex-start", sm: "center" }
-                    }}>
-                    <Typography variant="body2" sx={{ fontWeight: 700 }}>
-                      {selectedModelProfile.label || `${formatProfileRole(selectedModelProfile.role)} profile`}
+                  <Box>
+                    <Typography variant="subtitle2" sx={{ fontWeight: 800 }}>
+                      Access review
                     </Typography>
-                    <Chip size="small" variant="outlined" label={formatProfileRole(selectedModelProfile.role)} />
-                    <Typography variant="caption" sx={{
-                      color: "text.secondary"
-                    }}>
-                      Reuses your saved model setup automatically.
+                    <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                      Refresh this section to see exactly which permissions, integrations, and scoped resources this agent is asking for.
                     </Typography>
+                  </Box>
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    disabled={planAccess.isPending}
+                    startIcon={planAccess.isPending ? <CircularProgress size={14} color="inherit" /> : undefined}
+                    onClick={async () => {
+                      const hasModelConfig = Boolean(
+                        (selectedModelProfile?.provider || draft.llm_provider).trim() &&
+                          (selectedModelProfile?.model || draft.llm_model).trim()
+                      );
+                      if (!draft.name.trim() || !draft.agent_type.trim() || !hasModelConfig) {
+                        setFormError("Name, role, and model config are required.");
+                        return;
+                      }
+                      setFormError(null);
+                      try {
+                        await planAccess.mutateAsync();
+                      } catch (error) {
+                        setFormError(errMessage(error));
+                      }
+                    }}
+                  >
+                    {planAccess.isPending ? "Reviewing..." : accessPlan ? "Refresh access review" : "Run access review"}
+                  </Button>
+                </Stack>
+
+                {!accessPlan ? (
+                  <Alert severity="info">
+                    Access review has not run yet. Use the button above to surface approvals and resource scopes before creating the agent.
+                  </Alert>
+                ) : accessPlanReview.requested.length > 0 ? (
+                  <Stack spacing={0.8}>
+                    <Typography variant="subtitle2" sx={{ fontWeight: 800 }}>
+                      Requested access
+                    </Typography>
+
+                    {accessPlanReview.requested
+                      .filter((group) => group.scopeField === "approved_permission_ids")
+                      .map((group) => {
+                        const permissionId = (group.suggestedIds[0] || group.id).toLowerCase();
+                        const checked = draft.access_scope.approved_permission_ids.includes(permissionId);
+                        return (
+                          <Box
+                            key={group.id}
+                            sx={{
+                              px: 1,
+                              py: 0.85,
+                              borderRadius: "8px",
+                              border: "1px solid rgba(255,255,255,0.08)",
+                              background: "rgba(255,255,255,0.02)",
+                              display: "flex",
+                              alignItems: { xs: "stretch", sm: "center" },
+                              justifyContent: "space-between",
+                              gap: 1,
+                              flexDirection: { xs: "column", sm: "row" }
+                            }}
+                          >
+                            <Stack spacing={0.25} sx={{ minWidth: 0 }}>
+                              <Typography variant="body2" sx={{ fontWeight: 700 }}>
+                                {group.label}
+                              </Typography>
+                              <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                                {group.summary || group.reason || "Review this permission before saving the agent."}
+                              </Typography>
+                            </Stack>
+                            <Stack direction="row" spacing={0.75}>
+                              <Button
+                                size="small"
+                                variant={checked ? "contained" : "outlined"}
+                                onClick={() => toggleApprovedPermission(permissionId, true)}
+                              >
+                                Approve
+                              </Button>
+                              <Button
+                                size="small"
+                                color="inherit"
+                                variant={checked ? "outlined" : "contained"}
+                                onClick={() => toggleApprovedPermission(permissionId, false)}
+                              >
+                                Reject
+                              </Button>
+                            </Stack>
+                          </Box>
+                        );
+                      })}
+
+                    {accessPlanReview.requested
+                      .filter((group) => group.scopeField !== "approved_permission_ids")
+                      .map((group) => {
+                        const section = resourceAccessSections.find((item) => item.field === group.scopeField);
+                        if (!section) return null;
+                        return (
+                          <AccessScopeSelect
+                            key={group.id}
+                            label={group.label}
+                            options={section.options}
+                            selectedIds={draft.access_scope[group.scopeField] as string[]}
+                            onChange={(nextIds) => updateAccessScope(group.scopeField as ResourceAccessScopeKey, nextIds)}
+                          />
+                        );
+                      })}
                   </Stack>
-                </Box>
-              ) : draft.llm_provider && draft.llm_model ? (
-                <Alert severity="warning">
-                  This agent is keeping its stored model config: {draft.llm_provider} / {draft.llm_model}
-                  {draft.llm_base_url ? ` / ${draft.llm_base_url}` : ""}. Pick a saved profile above if
-                  you want to replace it.
-                </Alert>
-              ) : null}
+                ) : (
+                  <Alert severity="success">No approval needed for this agent.</Alert>
+                )}
 
-              <TextField
-                fullWidth
-                size="small"
-                label="Capabilities"
-                value={draft.capabilities}
-                onChange={(event) => setDraft((prev) => ({ ...prev, capabilities: event.target.value }))}
-                placeholder="debugging, code review, refactoring"
-                helperText="Comma-separated skills shown on the agent card."
-              />
-              <TextField
-                fullWidth
-                size="small"
-                multiline
-                minRows={5}
-                label="System prompt"
-                value={draft.system_prompt}
-                onChange={(event) => setDraft((prev) => ({ ...prev, system_prompt: event.target.value }))}
-              />
-              {formError ? <Alert severity="error">{formError}</Alert> : null}
-            </Stack>
-          ) : (
-            <Stack spacing={1.1}>
-              {accessPlanReview.requested.length > 0 ? (
-                <Stack spacing={0.8}>
-                  <Typography variant="subtitle2" sx={{ fontWeight: 800 }}>
-                    Tool permissions
-                  </Typography>
+                {accessPlanReview.unavailable.length > 0 ? (
+                  <Stack spacing={0.8}>
+                    {accessPlanReview.unavailable.map((group) => (
+                      <Alert key={group.id} severity="warning">
+                        Configure {group.label} in Settings.
+                      </Alert>
+                    ))}
+                  </Stack>
+                ) : null}
+              </Stack>
+            </Box>
 
-                  {accessPlanReview.requested
-                    .filter((group) => group.scopeField === "approved_permission_ids")
-                    .map((group) => {
-                      const permissionId = (group.suggestedIds[0] || group.id).toLowerCase();
-                      const checked = draft.access_scope.approved_permission_ids.includes(permissionId);
-                      return (
-                        <Box
-                          key={group.id}
-                          sx={{
-                            px: 1,
-                            py: 0.85,
-                            borderRadius: "8px",
-                            border: "1px solid rgba(255,255,255,0.08)",
-                            background: "rgba(255,255,255,0.02)",
-                            display: "flex",
-                            alignItems: { xs: "stretch", sm: "center" },
-                            justifyContent: "space-between",
-                            gap: 1,
-                            flexDirection: { xs: "column", sm: "row" }
-                          }}
-                        >
-                          <Typography variant="body2" sx={{ fontWeight: 700 }}>
-                            {group.label}
-                          </Typography>
-                          <Stack direction="row" spacing={0.75}>
-                            <Button
-                              size="small"
-                              variant={checked ? "contained" : "outlined"}
-                              onClick={() => toggleApprovedPermission(permissionId, true)}
-                            >
-                              Approve
-                            </Button>
-                            <Button
-                              size="small"
-                              color="inherit"
-                              variant={checked ? "outlined" : "contained"}
-                              onClick={() => toggleApprovedPermission(permissionId, false)}
-                            >
-                              Reject
-                            </Button>
-                          </Stack>
-                        </Box>
-                      );
-                    })}
-
-                  {accessPlanReview.requested
-                    .filter((group) => group.scopeField !== "approved_permission_ids")
-                    .map((group) => {
-                      const section = resourceAccessSections.find((item) => item.field === group.scopeField);
-                      if (!section) return null;
-                      return (
-                        <AccessScopeSelect
-                          key={group.id}
-                          label={group.label}
-                          options={section.options}
-                          selectedIds={draft.access_scope[group.scopeField] as string[]}
-                          onChange={(nextIds) => updateAccessScope(group.scopeField as ResourceAccessScopeKey, nextIds)}
-                        />
-                      );
-                    })}
-                </Stack>
-              ) : (
-                <Alert severity="success">No approval needed for this agent.</Alert>
-              )}
-
-              {accessPlanReview.unavailable.length > 0 ? (
-                <Stack spacing={0.8}>
-                  {accessPlanReview.unavailable.map((group) => (
-                    <Alert key={group.id} severity="warning">
-                      Configure {group.label} in Settings.
-                    </Alert>
-                  ))}
-                </Stack>
-              ) : null}
-              {formError ? <Alert severity="error">{formError}</Alert> : null}
-            </Stack>
-          )}
+            {formError ? <Alert severity="error">{formError}</Alert> : null}
+          </Stack>
         </DialogContent>
         <DialogActions>
           <Button onClick={closeAgentDialog}>Cancel</Button>
-          {agentDialogStep === 1 ? <Button onClick={() => setAgentDialogStep(0)}>Back</Button> : null}
-          {agentDialogStep === 0 ? (
-            <Button
-              variant="contained"
-              disabled={planAccess.isPending}
-              startIcon={planAccess.isPending ? <CircularProgress size={14} color="inherit" /> : undefined}
-              onClick={async () => {
-                const hasModelConfig = Boolean(
-                  (selectedModelProfile?.provider || draft.llm_provider).trim() &&
-                    (selectedModelProfile?.model || draft.llm_model).trim()
-                );
-                if (!draft.name.trim() || !draft.agent_type.trim() || !hasModelConfig) {
-                  setFormError("Name, role, and model config are required.");
-                  return;
-                }
+          <Button
+            variant="contained"
+            disabled={saveAgent.isPending}
+            startIcon={saveAgent.isPending ? <CircularProgress size={14} color="inherit" /> : undefined}
+            onClick={async () => {
+              const hasModelConfig = Boolean(
+                (selectedModelProfile?.provider || draft.llm_provider).trim() &&
+                  (selectedModelProfile?.model || draft.llm_model).trim()
+              );
+              if (!draft.name.trim() || !draft.agent_type.trim() || !hasModelConfig) {
+                setFormError("Name, role, and model config are required.");
+                return;
+              }
+              if (!accessPlan) {
                 setFormError(null);
                 try {
                   await planAccess.mutateAsync();
                 } catch (error) {
                   setFormError(errMessage(error));
                 }
-              }}
-            >
-              {planAccess.isPending ? "Reviewing..." : "Review access"}
-            </Button>
-          ) : (
-            <Button
-              variant="contained"
-              disabled={saveAgent.isPending}
-              startIcon={saveAgent.isPending ? <CircularProgress size={14} color="inherit" /> : undefined}
-              onClick={async () => {
-                const hasModelConfig = Boolean(
-                  (selectedModelProfile?.provider || draft.llm_provider).trim() &&
-                    (selectedModelProfile?.model || draft.llm_model).trim()
-                );
-                if (!draft.name.trim() || !draft.agent_type.trim() || !hasModelConfig) {
-                  setFormError("Name, role, and model config are required.");
-                  return;
-                }
-                setFormError(null);
-                try {
-                  await saveAgent.mutateAsync();
-                } catch (error) {
-                  setFormError(errMessage(error));
-                }
-              }}
-            >
-              {saveAgent.isPending ? (editingAgent ? "Saving..." : "Creating...") : editingAgent ? "Save changes" : "Create agent"}
-            </Button>
-          )}
+                return;
+              }
+              setFormError(null);
+              try {
+                await saveAgent.mutateAsync();
+              } catch (error) {
+                setFormError(errMessage(error));
+              }
+            }}
+          >
+            {saveAgent.isPending ? (editingAgent ? "Saving..." : "Creating...") : editingAgent ? "Save changes" : "Create agent"}
+          </Button>
         </DialogActions>
       </Dialog>
     </WorkspacePageShell>
   );
 }
+
+
+

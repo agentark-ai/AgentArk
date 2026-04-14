@@ -55,6 +55,13 @@ impl Default for RuntimeConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct SkillEvolutionApplyResult {
+    pub skill_name: String,
+    pub approved_ref: String,
+    pub history_version: u32,
+}
+
 fn authorization_with_access(
     access: crate::actions::ActionAccessMetadata,
 ) -> crate::actions::ActionAuthorization {
@@ -64,11 +71,35 @@ fn authorization_with_access(
     }
 }
 
-fn google_workspace_authorization() -> crate::actions::ActionAuthorization {
+fn integration_authorization(integration_id: &str) -> crate::actions::ActionAuthorization {
     authorization_with_access(crate::actions::ActionAccessMetadata {
-        integration_ids: vec!["google_workspace".to_string()],
+        integration_ids: vec![integration_id.to_string()],
         ..crate::actions::ActionAccessMetadata::default()
     })
+}
+
+fn integration_authorization_with_features(
+    integration_id: &str,
+    features: &[&str],
+) -> crate::actions::ActionAuthorization {
+    let mut integration_features = BTreeMap::new();
+    integration_features.insert(
+        integration_id.to_string(),
+        features.iter().map(|feature| feature.to_string()).collect(),
+    );
+    authorization_with_access(crate::actions::ActionAccessMetadata {
+        integration_ids: vec![integration_id.to_string()],
+        integration_features,
+        ..crate::actions::ActionAccessMetadata::default()
+    })
+}
+
+fn google_workspace_authorization() -> crate::actions::ActionAuthorization {
+    integration_authorization("google_workspace")
+}
+
+fn google_workspace_bundle_authorization(bundle: &str) -> crate::actions::ActionAuthorization {
+    integration_authorization_with_features("google_workspace", &[bundle])
 }
 
 fn channel_target(argument_key: &str, default_target: &str) -> crate::actions::ActionChannelTarget {
@@ -2708,6 +2739,7 @@ print(json.dumps({
         Ok(Some(review))
     }
 
+    #[cfg(test)]
     fn find_project_root_from_path(start: &Path) -> Option<PathBuf> {
         let mut dir = if start.is_file() {
             start.parent()?
@@ -2723,72 +2755,13 @@ print(json.dumps({
     }
 
     fn bundled_skill_dirs(&self) -> Vec<PathBuf> {
-        let mut dirs = Vec::new();
-        let mut push_unique = |path: PathBuf| {
-            if !path.exists() {
-                return;
-            }
-            let candidate = path.canonicalize().unwrap_or(path);
-            if dirs.iter().any(|existing| existing == &candidate) {
-                return;
-            }
-            dirs.push(candidate);
-        };
-
-        // System-owned bundled skills come from the image/repo and may refresh
-        // on release updates. User overrides live under the data dir instead.
-        let app_skills_dir = PathBuf::from("/app/skills");
-        push_unique(app_skills_dir);
-
-        if let Ok(cwd) = std::env::current_dir() {
-            push_unique(cwd.join("skills"));
-            if let Some(root) = Self::find_project_root_from_path(&cwd) {
-                push_unique(root.join("skills"));
-            }
-        }
-
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(root) = Self::find_project_root_from_path(&exe) {
-                push_unique(root.join("skills"));
-            }
-        }
-
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        push_unique(manifest_dir.join("skills"));
-
-        dirs
+        // Repo-local bundled markdown skills are disabled for this install.
+        Vec::new()
     }
 
     fn is_runtime_owned_bundled_dir(path: &Path) -> bool {
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        canonical == Path::new("/app/skills")
-    }
-
-    async fn prune_removed_bundled_skill_dirs(&self) -> Result<()> {
-        let removed: Vec<String> = self
-            .removed_bundled_actions
-            .read()
-            .await
-            .iter()
-            .cloned()
-            .collect();
-        if removed.is_empty() {
-            return Ok(());
-        }
-
-        for bundled_dir in self.bundled_skill_dirs() {
-            if !Self::is_runtime_owned_bundled_dir(&bundled_dir) {
-                continue;
-            }
-            for name in &removed {
-                let action_dir = bundled_dir.join(name);
-                if action_dir.exists() {
-                    tokio::fs::remove_dir_all(&action_dir).await?;
-                }
-            }
-        }
-
-        Ok(())
+        let _ = path;
+        false
     }
 
     async fn delete_runtime_owned_bundled_skill_dir(&self, name: &str) -> Result<()> {
@@ -3051,17 +3024,10 @@ print(json.dumps({
         )
     }
 
-    /// Load all actions (builtin + bundled + user). Call AFTER set_action_guard.
+    /// Load all actions (builtin + user). Call AFTER set_action_guard.
     pub async fn load_all_actions(&self) -> Result<()> {
         // Load built-in actions
         self.load_builtin_actions().await?;
-        self.prune_removed_bundled_skill_dirs().await?;
-
-        for bundled_dir in self.bundled_skill_dirs() {
-            tracing::info!("Loading bundled skills from {:?}", bundled_dir);
-            self.load_markdown_actions(&bundled_dir, ActionSource::Bundled)
-                .await?;
-        }
 
         // Load user-added skills from data dir
         if self.actions_dir.exists() {
@@ -3841,10 +3807,7 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-            authorization: authorization_with_access(crate::actions::ActionAccessMetadata {
-                integration_ids: vec!["google_workspace".to_string()],
-                ..crate::actions::ActionAccessMetadata::default()
-            }),
+            authorization: integration_authorization("gmail"),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -3865,10 +3828,7 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-            authorization: authorization_with_access(crate::actions::ActionAccessMetadata {
-                integration_ids: vec!["google_workspace".to_string()],
-                ..crate::actions::ActionAccessMetadata::default()
-            }),
+            authorization: integration_authorization("gmail"),
         }).await;
 
         // Web search
@@ -3993,6 +3953,35 @@ print(json.dumps({
         }).await;
 
         self.register_builtin_action(ActionDef {
+            name: "agentark_inspect".to_string(),
+            description: "Inspect live AgentArk internal surfaces such as overview, gateway_ops, arkpulse, sentinel, evolution, moltbook, and trace. Use when the user asks about current AgentArk state, recent internal runs, anomalies, learning status, or what changed.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "surface": {
+                        "type": "string",
+                        "enum": ["overview", "gateway_ops", "arkpulse", "sentinel", "evolution", "moltbook", "trace"],
+                        "description": "Internal AgentArk surface to inspect. Default: overview."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum recent records to include per section (default: 6)."
+                    },
+                    "trace_id": {
+                        "type": "string",
+                        "description": "Optional execution trace id when surface=trace."
+                    }
+                }
+            }),
+            capabilities: vec!["platform_observability".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        authorization: Default::default(),
+        }).await;
+
+        self.register_builtin_action(ActionDef {
             name: "goal_manage".to_string(),
             description: "Create, list, delete, or report on goals. Use when the user asks about goals, deadlines, progress toward a goal, or wants to save a new goal for later tracking.".to_string(),
             version: "1.0.0".to_string(),
@@ -4076,13 +4065,13 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+        authorization: integration_authorization("media_gen"),
         }).await;
 
         // Action management â€” create/update/delete/list custom actions via chat
         self.register_builtin_action(ActionDef {
             name: "manage_actions".to_string(),
-            description: "Create, update, delete, or list bundled and user-added actions/skills/workflows. Use when the user wants to inspect their installed skills, add a new action, or modify the action library.".to_string(),
+            description: "Create, update, delete, or list user-added actions/skills/workflows. Use when the user wants to inspect their installed skills, add a new action, or modify the action library.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -4140,6 +4129,89 @@ print(json.dumps({
 
         // PDF generation â€” creates PDF documents from content
         // Generic extension-pack control plane
+        self.register_builtin_action(ActionDef {
+            name: "postgres_schema_inspect".to_string(),
+            description: "Inspect the live AgentArk Postgres public schema and return valid table and column names for follow-up diagnostics. Use before structured database reads or when a DB-backed internal question needs schema discovery.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "table_filter": {
+                        "type": "string",
+                        "description": "Optional case-insensitive substring filter for table names."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum tables to return (default: 25)."
+                    }
+                }
+            }),
+            capabilities: vec!["database_readonly".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        authorization: Default::default(),
+        }).await;
+
+        self.register_builtin_action(ActionDef {
+            name: "postgres_query_readonly".to_string(),
+            description: "Run a structured, read-only table query against the live AgentArk Postgres database. Supply a public table name, optional columns, filters, sorting, and limit. Do not pass raw SQL. If a table or column is rejected, inspect the schema and retry.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "table": {
+                        "type": "string",
+                        "description": "Public AgentArk table name from postgres_schema_inspect."
+                    },
+                    "columns": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional list of columns to return. Default: all readable columns."
+                    },
+                    "filters": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "column": { "type": "string" },
+                                "op": {
+                                    "type": "string",
+                                    "enum": ["eq", "neq", "gt", "gte", "lt", "lte", "contains", "starts_with", "ends_with", "in", "is_null", "not_null"]
+                                },
+                                "value": {}
+                            },
+                            "required": ["column", "op"]
+                        }
+                    },
+                    "order_by": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "column": { "type": "string" },
+                                "direction": {
+                                    "type": "string",
+                                    "enum": ["asc", "desc"]
+                                }
+                            },
+                            "required": ["column"]
+                        }
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum rows to return (default: 50, max: 200)."
+                    }
+                },
+                "required": ["table"]
+            }),
+            capabilities: vec!["database_readonly".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        authorization: Default::default(),
+        }).await;
+
         self.register_builtin_action(ActionDef {
             name: "extension_pack_list".to_string(),
             description: "List installed and catalog extension packs. Use when the user asks what generic integrations, messaging channels, or other packs are available.".to_string(),
@@ -4453,7 +4525,7 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+        authorization: integration_authorization("github"),
         }).await;
 
         // Notion
@@ -4478,7 +4550,7 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+        authorization: integration_authorization("notion"),
         }).await;
 
         // Twitter/X
@@ -4500,7 +4572,7 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+        authorization: integration_authorization("twitter"),
         }).await;
 
         // 1Password
@@ -4524,7 +4596,7 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+        authorization: integration_authorization("onepassword"),
         }).await;
 
         // Google Places
@@ -4551,7 +4623,7 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+        authorization: integration_authorization("google_places"),
         }).await;
 
         // Twilio (Voice & SMS)
@@ -4574,7 +4646,7 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+        authorization: integration_authorization("twilio"),
         }).await;
 
         // Ordering & Purchasing
@@ -4598,7 +4670,7 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+        authorization: integration_authorization("ordering"),
         }).await;
 
         // Browser automation â€” full headless browser control with human-in-the-loop
@@ -4623,7 +4695,7 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+        authorization: integration_authorization("garmin"),
         }).await;
 
         // WHOOP
@@ -4643,7 +4715,7 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+        authorization: integration_authorization("whoop"),
         }).await;
 
         // GA4
@@ -4677,7 +4749,7 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+        authorization: integration_authorization("ga4"),
         }).await;
 
         // GSC
@@ -4701,7 +4773,7 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+        authorization: integration_authorization("gsc"),
         }).await;
 
         // Social analytics
@@ -4724,7 +4796,7 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+        authorization: integration_authorization("social_analytics"),
         }).await;
 
         // Moltbook (agent social network)
@@ -4754,12 +4826,12 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+        authorization: integration_authorization("moltbook"),
         }).await;
 
         self.register_builtin_action(ActionDef {
             name: "browser_auto".to_string(),
-            description: "Automate browser tasks: navigate websites, fill forms, click buttons, take screenshots, read page content. Use when asked to 'go to a website', 'log into', 'fill out a form', 'book', 'check my account', or any web browsing/automation task. When stuck (CAPTCHA, 2FA, ambiguous UI), takes a screenshot and asks the user for help, then continues. Runs as a background session.".to_string(),
+            description: "Automate browser tasks: navigate websites, fill forms, click buttons, take screenshots, read page content. Use when asked to 'go to a website', 'log into', 'fill out a form', 'book', 'check my account', or any web browsing/automation task. For website logins, start the session, open the auth page, and use live browser handoff for password/MFA entry instead of asking for secrets in chat. When stuck (CAPTCHA, 2FA, ambiguous UI), takes a screenshot and asks the user for help, then continues. Runs as a background session.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -4804,7 +4876,7 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-            authorization: google_workspace_authorization(),
+            authorization: integration_authorization("google_calendar"),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -4822,7 +4894,7 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-            authorization: google_workspace_authorization(),
+            authorization: integration_authorization("google_calendar"),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -4855,7 +4927,7 @@ print(json.dumps({
             file_path: None,
             authorization: authorization_with_access(crate::actions::ActionAccessMetadata {
                 permission_ids: vec!["calendar_write".to_string()],
-                integration_ids: vec!["google_workspace".to_string()],
+                integration_ids: vec!["google_calendar".to_string()],
                 ..crate::actions::ActionAccessMetadata::default()
             }),
         }).await;
@@ -4876,7 +4948,7 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-            authorization: google_workspace_authorization(),
+            authorization: integration_authorization("google_calendar"),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -4894,7 +4966,7 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-            authorization: google_workspace_authorization(),
+            authorization: google_workspace_bundle_authorization("drive"),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -4912,7 +4984,7 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-            authorization: google_workspace_authorization(),
+            authorization: google_workspace_bundle_authorization("docs"),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -4931,7 +5003,7 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-            authorization: google_workspace_authorization(),
+            authorization: google_workspace_bundle_authorization("sheets"),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -4948,7 +5020,7 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-            authorization: google_workspace_authorization(),
+            authorization: google_workspace_bundle_authorization("chat"),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -4967,12 +5039,12 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-            authorization: google_workspace_authorization(),
+            authorization: google_workspace_bundle_authorization("admin"),
         }).await;
 
         self.register_builtin_action(ActionDef {
             name: "google_workspace_gws_help".to_string(),
-            description: "Show Google Workspace CLI help output. Use when you need to discover available gws commands or inspect help for a specific Google Workspace service. Pass argv as the command parts after `gws`, for example [\"drive\",\"--help\"] or [\"gmail\",\"users\",\"messages\",\"list\",\"--help\"].".to_string(),
+            description: "Show Google Workspace CLI help output for the currently connected Workspace integration. Use when you need to inspect gws syntax for a granted service or discover generic commands. Pass argv as the command parts after `gws`, for example [\"gmail\",\"users\",\"messages\",\"list\",\"--help\"] or [\"drive\",\"--help\"].".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -4993,7 +5065,7 @@ print(json.dumps({
 
         self.register_builtin_action(ActionDef {
             name: "google_workspace_gws_schema".to_string(),
-            description: "Inspect the request and response schema for any Google Workspace CLI method. Use when you need the exact shape for a gws command before executing it. Example target: drive.files.list or gmail.users.messages.list.".to_string(),
+            description: "Inspect the request and response schema for a Google Workspace CLI method. Use when you need the exact shape for a gws command within the currently granted Workspace bundles before executing it. Example target: gmail.users.messages.list or drive.files.list.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -5014,7 +5086,7 @@ print(json.dumps({
 
         self.register_builtin_action(ActionDef {
             name: "google_workspace_gws_skills".to_string(),
-            description: "List or read the generated Google Workspace CLI skill docs that ship with gws, including service skills, helper skills, recipes, and personas. Use this when you want exact gws examples for Docs, Drive, Sheets, Gmail, Calendar, Chat, Admin, or other Workspace services before calling google_workspace_gws_schema or google_workspace_gws_command. If name is provided, returns the full SKILL.md content for that skill.".to_string(),
+            description: "List or read the generated Google Workspace CLI skill docs available for the currently granted Workspace bundles. Use this when you want exact gws examples before calling google_workspace_gws_schema or google_workspace_gws_command. If name is provided, returns the full SKILL.md content for that visible skill.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -5042,7 +5114,7 @@ print(json.dumps({
 
         self.register_builtin_action(ActionDef {
             name: "google_workspace_gws_command".to_string(),
-            description: "Execute any non-auth Google Workspace CLI command against the connected Google Workspace account. Use this when you need broader Workspace API coverage than the built-in Gmail/Calendar/Drive helpers provide. Actual behavior is still limited by the granted OAuth scopes: Gmail supports read/send, Calendar supports calendar access, and the current Drive/Docs/Sheets/Chat/Admin bundles are read-only. Prefer google_workspace_gws_skills for examples and google_workspace_gws_schema for exact method shapes before executing unfamiliar commands. Provide argv as the command parts after `gws`, for example [\"drive\",\"files\",\"list\",\"--params\",\"{\\\"pageSize\\\":5}\"] , [\"calendar\",\"+agenda\"], or [\"gmail\",\"users\",\"messages\",\"list\",\"--params\",\"{\\\"maxResults\\\":5,\\\"labelIds\\\":[\\\"INBOX\\\"]}\"] . Set required_bundles when you know which Workspace bundles this command needs, such as [\"drive\"] or [\"gmail\",\"calendar\"].".to_string(),
+            description: "Execute a non-auth Google Workspace CLI command against the connected Google Workspace account, but only within the currently granted Workspace bundles. Use this when you need broader coverage than the built-in Gmail, Calendar, or granted bundle helpers provide. Prefer google_workspace_gws_skills for granted examples and google_workspace_gws_schema for exact method shapes before executing unfamiliar commands. Provide argv as the command parts after `gws`, for example [\"gmail\",\"users\",\"messages\",\"list\",\"--params\",\"{\\\"maxResults\\\":5,\\\"labelIds\\\":[\\\"INBOX\\\"]}\"] , [\"calendar\",\"+agenda\"], or [\"drive\",\"files\",\"list\",\"--params\",\"{\\\"pageSize\\\":5}\"] . Set required_bundles when you know which Workspace bundles this command needs, such as [\"drive\"] or [\"gmail\",\"calendar\"].".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -5303,7 +5375,7 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+        authorization: integration_authorization("media_gen"),
         }).await;
 
         // Self-evolve - policy-first self-improvement
@@ -6412,7 +6484,7 @@ print(json.dumps({
                         action_name
                     );
                 }
-            } else if !self.is_action_integration_enabled(&info) {
+            } else if !self.is_action_integration_ready(&info).await {
                 let integration_id = info
                     .authorization
                     .access
@@ -6434,7 +6506,8 @@ print(json.dumps({
                     .get("url")
                     .and_then(|value| value.as_str())
                     .ok_or_else(|| anyhow::anyhow!("Missing URL"))?;
-                self.resolve_http_get_url_for_context(url, auth_context).await?;
+                self.resolve_http_get_url_for_context(url, auth_context)
+                    .await?;
             }
             _ => {}
         }
@@ -6515,7 +6588,7 @@ print(json.dumps({
                         action_name
                     ));
                 }
-            } else if !self.is_action_integration_enabled(&info) {
+            } else if !self.is_action_integration_ready(&info).await {
                 let integration_id = info
                     .authorization
                     .access
@@ -7324,7 +7397,10 @@ print(json.dumps({
                 Ok(format!("Watch created: {}", desc))
             }
             "manage_actions" => self.execute_manage_actions(arguments).await,
+            "agentark_inspect" => self.execute_agentark_inspect(arguments).await,
             "list_integrations" => self.execute_list_integrations(arguments).await,
+            "postgres_schema_inspect" => self.execute_postgres_schema_inspect(arguments).await,
+            "postgres_query_readonly" => self.execute_postgres_query_readonly(arguments).await,
             "capability_acquire" => self.execute_capability_acquire(arguments).await,
             "capability_resolve" => self.execute_capability_resolve(arguments).await,
             "connector_request" => self.execute_connector_request(arguments).await,
@@ -7364,10 +7440,10 @@ print(json.dumps({
                     .await
             }
             "google_workspace_gws_help" => {
-                crate::actions::google_workspace::gws_help(arguments).await
+                crate::actions::google_workspace::gws_help(&self.config_dir, arguments).await
             }
             "google_workspace_gws_schema" => {
-                crate::actions::google_workspace::gws_schema(arguments).await
+                crate::actions::google_workspace::gws_schema(&self.config_dir, arguments).await
             }
             "google_workspace_gws_skills" => {
                 crate::actions::google_workspace::gws_skills(&self.config_dir, arguments).await
@@ -8169,6 +8245,425 @@ print(result["text"])
             "plugins": plugins,
             "mcp_servers": mcp_servers,
         }))?)
+    }
+
+    fn runtime_storage(&self) -> Result<crate::storage::Storage> {
+        self.storage
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("AgentArk storage is not available in this runtime"))
+    }
+
+    fn compact_text(value: &str, max_chars: usize) -> String {
+        if value.chars().count() <= max_chars {
+            return value.to_string();
+        }
+        value.chars().take(max_chars).collect::<String>()
+    }
+
+    async fn load_storage_json_value(
+        storage: &crate::storage::Storage,
+        key: &str,
+    ) -> Option<serde_json::Value> {
+        storage
+            .get(key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+    }
+
+    async fn load_storage_utf8_value(
+        storage: &crate::storage::Storage,
+        key: &str,
+    ) -> Option<String> {
+        storage
+            .get(key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|raw| String::from_utf8(raw).ok())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+
+    fn preview_json_array(
+        value: Option<serde_json::Value>,
+        limit: usize,
+    ) -> Option<serde_json::Value> {
+        match value {
+            Some(serde_json::Value::Array(items)) => Some(serde_json::Value::Array(
+                items
+                    .into_iter()
+                    .rev()
+                    .take(limit)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect(),
+            )),
+            other => other,
+        }
+    }
+
+    fn pulse_event_from_storage_row(
+        row: crate::storage::arkpulse_event::Model,
+    ) -> Option<crate::sentinel::PulseEvent> {
+        Some(crate::sentinel::PulseEvent {
+            timestamp: row.timestamp,
+            status: row.status,
+            message: row.message,
+            summary: row.summary,
+            flags: serde_json::from_str(&row.flags_json).ok()?,
+            overdue_tasks: row.overdue_tasks.max(0) as usize,
+            failed_tasks: row.failed_tasks.max(0) as usize,
+            details: serde_json::from_str(&row.details_json).ok()?,
+        })
+    }
+
+    fn summarize_pulse_event(row: &crate::storage::arkpulse_event::Model) -> serde_json::Value {
+        let flags = serde_json::from_str::<serde_json::Value>(&row.flags_json)
+            .unwrap_or_else(|_| serde_json::json!([]));
+        let details = serde_json::from_str::<serde_json::Value>(&row.details_json)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let doctor_findings = details
+            .get("doctor_findings")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let health_checks = details
+            .get("health_checks")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        serde_json::json!({
+            "timestamp": row.timestamp,
+            "status": row.status,
+            "message": Self::compact_text(&row.message, 180),
+            "summary": Self::compact_text(&row.summary, 220),
+            "flags": flags,
+            "overdue_tasks": row.overdue_tasks.max(0),
+            "failed_tasks": row.failed_tasks.max(0),
+            "doctor_finding_count": doctor_findings.len(),
+            "health_check_count": health_checks.len(),
+            "details": details,
+        })
+    }
+
+    async fn inspect_arkpulse_json(
+        &self,
+        storage: &crate::storage::Storage,
+        limit: u64,
+    ) -> Result<serde_json::Value> {
+        let rows = storage.list_arkpulse_events(limit.max(12)).await?;
+        let stored_count = storage
+            .count_arkpulse_events()
+            .await
+            .unwrap_or(rows.len() as u64);
+        let latest = rows.first();
+        let latest_details = latest
+            .and_then(|row| serde_json::from_str::<serde_json::Value>(&row.details_json).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let latest_flags = latest
+            .and_then(|row| serde_json::from_str::<serde_json::Value>(&row.flags_json).ok())
+            .unwrap_or_else(|| serde_json::json!([]));
+        let mut anomalies = Vec::new();
+        if let Some(row) = latest {
+            if !row.status.eq_ignore_ascii_case("ok") {
+                anomalies.push(serde_json::json!({
+                    "severity": row.status,
+                    "message": Self::compact_text(&row.summary, 220),
+                }));
+            }
+            if row.failed_tasks > 0 {
+                anomalies.push(serde_json::json!({
+                    "severity": "warn",
+                    "message": format!("{} failed task(s) were observed in the latest ArkPulse run.", row.failed_tasks),
+                }));
+            }
+            if row.overdue_tasks > 0 {
+                anomalies.push(serde_json::json!({
+                    "severity": "warn",
+                    "message": format!("{} overdue task(s) were observed in the latest ArkPulse run.", row.overdue_tasks),
+                }));
+            }
+        }
+        if let Some(findings) = latest_details
+            .get("doctor_findings")
+            .and_then(|value| value.as_array())
+        {
+            for finding in findings.iter().take(limit as usize) {
+                let severity = finding
+                    .get("severity")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("info");
+                if severity.eq_ignore_ascii_case("info") {
+                    continue;
+                }
+                anomalies.push(serde_json::json!({
+                    "severity": severity,
+                    "title": finding.get("title").and_then(|value| value.as_str()),
+                    "message": finding.get("message").and_then(|value| value.as_str()),
+                    "target": finding.get("target").and_then(|value| value.as_str()),
+                }));
+            }
+        }
+        Ok(serde_json::json!({
+            "surface": "arkpulse",
+            "running": crate::sentinel::is_pulse_running(),
+            "stored_event_count": stored_count,
+            "latest_status": latest.map(|row| row.status.clone()),
+            "latest_timestamp": latest.map(|row| row.timestamp.clone()),
+            "latest_flags": latest_flags,
+            "anomalies": anomalies,
+            "recent_events": rows.iter().take(limit as usize).map(Self::summarize_pulse_event).collect::<Vec<_>>(),
+        }))
+    }
+
+    async fn inspect_gateway_ops_json(
+        &self,
+        storage: &crate::storage::Storage,
+        limit: u64,
+    ) -> Result<serde_json::Value> {
+        let config = self.settings_manager()?.load()?;
+        let pulse_rows = storage.list_arkpulse_events(limit.max(12)).await?;
+        let pulse_events = pulse_rows
+            .into_iter()
+            .filter_map(Self::pulse_event_from_storage_row)
+            .collect::<Vec<_>>();
+        let overview = crate::core::GatewayOpsControlPlane::overview_from_parts(
+            storage,
+            &config,
+            Some(pulse_events.as_slice()),
+        )
+        .await?;
+        Ok(serde_json::json!({
+            "surface": "gateway_ops",
+            "overview": overview,
+        }))
+    }
+
+    async fn inspect_sentinel_json(
+        &self,
+        storage: &crate::storage::Storage,
+        limit: u64,
+    ) -> Result<serde_json::Value> {
+        let autonomy_settings = storage
+            .get(crate::core::AUTONOMY_SETTINGS_STORAGE_KEY)
+            .await?
+            .and_then(|raw| serde_json::from_slice::<crate::core::AutonomySettings>(&raw).ok())
+            .unwrap_or_default();
+        let scan_state = Self::load_storage_json_value(storage, "sentinel_scan_state_v1").await;
+        let observations = Self::preview_json_array(
+            Self::load_storage_json_value(storage, "sentinel_observations_v1").await,
+            limit as usize,
+        );
+        let proposals = Self::preview_json_array(
+            Self::load_storage_json_value(storage, "sentinel_proposals_v1").await,
+            limit as usize,
+        );
+        let background_learning =
+            crate::channels::http::load_background_learning_feed(storage, &autonomy_settings).await;
+        Ok(serde_json::json!({
+            "surface": "sentinel",
+            "autonomy_mode": autonomy_settings.autonomy_mode,
+            "agent_paused": autonomy_settings.agent_paused,
+            "settings": autonomy_settings.sentinel,
+            "scan_state": scan_state,
+            "observation_count": observations.as_ref().and_then(|value| value.as_array()).map(|items| items.len()).unwrap_or(0),
+            "proposal_count": proposals.as_ref().and_then(|value| value.as_array()).map(|items| items.len()).unwrap_or(0),
+            "observations": observations,
+            "proposals": proposals,
+            "background_learning": background_learning,
+        }))
+    }
+
+    async fn inspect_evolution_json(
+        &self,
+        storage: &crate::storage::Storage,
+        limit: u64,
+    ) -> Result<serde_json::Value> {
+        let learning_enabled = crate::core::learning::load_learning_enabled(storage).await;
+        let learning_local_only = crate::core::learning::load_learning_local_only(storage).await;
+        let learning_model_slot = crate::core::learning::load_learning_model_slot(storage).await;
+        let learning_queue_cap = crate::core::learning::load_learning_queue_cap(storage).await;
+        let queue_counts = storage.learning_queue_counts().await?;
+        let candidates = storage
+            .list_learning_candidates_with_options(None, false, limit)
+            .await?;
+        let patterns = storage
+            .list_procedural_patterns(None, None, &["active", "draft"], limit)
+            .await?;
+        let items = storage
+            .list_active_experience_items(
+                &["constraint", "personal_fact", "lesson", "procedure"],
+                None,
+                None,
+                limit,
+            )
+            .await?;
+        let recent_runs = storage.list_recent_experience_runs_any_scope(limit).await?;
+        Ok(serde_json::json!({
+            "surface": "evolution",
+            "learning_enabled": learning_enabled,
+            "learning_local_only": learning_local_only,
+            "learning_model_slot": learning_model_slot,
+            "learning_queue_cap": learning_queue_cap,
+            "queue_counts": queue_counts,
+            "review_queue_size": candidates.iter().filter(|candidate| candidate.approval_status == "draft").count(),
+            "recent_candidates": candidates,
+            "recent_patterns": patterns,
+            "recent_items": items,
+            "recent_runs": recent_runs,
+        }))
+    }
+
+    async fn inspect_moltbook_json(
+        &self,
+        storage: &crate::storage::Storage,
+        limit: u64,
+    ) -> Result<serde_json::Value> {
+        let manager = self.settings_manager()?;
+        let has_api_key = std::env::var("MOLTBOOK_API_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .is_some()
+            || manager
+                .get_custom_secret("moltbook_api_key")
+                .ok()
+                .flatten()
+                .filter(|value| !value.trim().is_empty())
+                .is_some();
+        Ok(serde_json::json!({
+            "surface": "moltbook",
+            "has_api_key": has_api_key,
+            "settings": Self::load_storage_json_value(storage, "moltbook_settings_v1").await,
+            "last_run": Self::load_storage_utf8_value(storage, "moltbook_last_run_v1").await,
+            "last_status": Self::load_storage_utf8_value(storage, "moltbook_last_status_v1").await,
+            "next_run": Self::load_storage_utf8_value(storage, "moltbook_next_run_v1").await,
+            "last_post": Self::load_storage_utf8_value(storage, "moltbook_last_post_v1").await,
+            "last_comment": Self::load_storage_utf8_value(storage, "moltbook_last_comment_v1").await,
+            "last_upvote": Self::load_storage_utf8_value(storage, "moltbook_last_upvote_v1").await,
+            "last_engagement": Self::load_storage_utf8_value(storage, "moltbook_last_engagement_v1").await,
+            "last_run_stats": Self::load_storage_json_value(storage, "moltbook_last_run_stats_v1").await,
+            "recent_activity": Self::preview_json_array(
+                Self::load_storage_json_value(storage, "moltbook_activity_log_v1").await,
+                limit as usize,
+            ),
+        }))
+    }
+
+    async fn inspect_trace_json(
+        &self,
+        storage: &crate::storage::Storage,
+        trace_id: Option<&str>,
+        limit: u64,
+    ) -> Result<serde_json::Value> {
+        if let Some(trace_id) = trace_id.map(str::trim).filter(|value| !value.is_empty()) {
+            let trace = storage.get_execution_trace(trace_id).await?;
+            let logs = storage
+                .list_operational_logs_for_trace_ids(&[trace_id.to_string()], limit.max(12))
+                .await?;
+            return Ok(serde_json::json!({
+                "surface": "trace",
+                "trace_id": trace_id,
+                "trace": trace,
+                "operational_logs": logs,
+            }));
+        }
+
+        let traces = storage
+            .list_execution_trace_summaries(None, limit, 0)
+            .await?;
+        let trace_ids = traces
+            .iter()
+            .map(|trace| trace.id.clone())
+            .collect::<Vec<_>>();
+        let logs = storage
+            .list_operational_logs_for_trace_ids(&trace_ids, limit.max(12))
+            .await?;
+        Ok(serde_json::json!({
+            "surface": "trace",
+            "recent_traces": traces,
+            "recent_operational_logs": logs,
+        }))
+    }
+
+    async fn execute_agentark_inspect(&self, arguments: &serde_json::Value) -> Result<String> {
+        let storage = self.runtime_storage()?;
+        let surface = arguments
+            .get("surface")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("overview");
+        let limit = arguments
+            .get("limit")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(6)
+            .clamp(1, 24);
+        let trace_id = arguments.get("trace_id").and_then(|value| value.as_str());
+        let payload = match surface {
+            "overview" => serde_json::json!({
+                "surface": "overview",
+                "generated_at": chrono::Utc::now().to_rfc3339(),
+                "gateway_ops": self.inspect_gateway_ops_json(&storage, limit).await?,
+                "arkpulse": self.inspect_arkpulse_json(&storage, limit).await?,
+                "sentinel": self.inspect_sentinel_json(&storage, limit).await?,
+                "evolution": self.inspect_evolution_json(&storage, limit).await?,
+                "moltbook": self.inspect_moltbook_json(&storage, limit).await?,
+                "trace": self.inspect_trace_json(&storage, None, limit).await?,
+            }),
+            "gateway_ops" => self.inspect_gateway_ops_json(&storage, limit).await?,
+            "arkpulse" => self.inspect_arkpulse_json(&storage, limit).await?,
+            "sentinel" => self.inspect_sentinel_json(&storage, limit).await?,
+            "evolution" => self.inspect_evolution_json(&storage, limit).await?,
+            "moltbook" => self.inspect_moltbook_json(&storage, limit).await?,
+            "trace" => self.inspect_trace_json(&storage, trace_id, limit).await?,
+            other => {
+                anyhow::bail!(
+                    "Unknown AgentArk surface '{}'. Use overview, gateway_ops, arkpulse, sentinel, evolution, moltbook, or trace",
+                    other
+                )
+            }
+        };
+        Ok(serde_json::to_string_pretty(&payload)?)
+    }
+
+    async fn execute_postgres_schema_inspect(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
+        let storage = self.runtime_storage()?;
+        let payload = storage
+            .inspect_postgres_schema_json(
+                arguments
+                    .get("table_filter")
+                    .and_then(|value| value.as_str()),
+                arguments
+                    .get("limit")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(25),
+            )
+            .await?;
+        Ok(serde_json::to_string_pretty(&payload)?)
+    }
+
+    async fn execute_postgres_query_readonly(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
+        let storage = self.runtime_storage()?;
+        let request: crate::storage::ReadonlyTableQuery = serde_json::from_value(arguments.clone())
+            .map_err(|error| {
+                anyhow::anyhow!("Invalid structured database query arguments: {}", error)
+            })?;
+        let payload = storage.query_table_json(&request).await.map_err(|error| {
+            anyhow::anyhow!(
+                "{}. Inspect the live schema with postgres_schema_inspect and retry with corrected table or column names.",
+                error
+            )
+        })?;
+        Ok(serde_json::to_string_pretty(&payload)?)
     }
 
     async fn execute_extension_pack_list(&self, arguments: &serde_json::Value) -> Result<String> {
@@ -9466,14 +9961,51 @@ print(result["text"])
         None
     }
 
-    fn is_action_integration_enabled(&self, action: &ActionDef) -> bool {
-        let integration_ids = &action.authorization.access.integration_ids;
+    async fn is_action_integration_ready(&self, action: &ActionDef) -> bool {
+        let access = &action.authorization.access;
+        let integration_ids = &access.integration_ids;
         if integration_ids.is_empty() {
             return true;
         }
-        integration_ids.iter().any(|integration_id| {
-            crate::integrations::effective_integration_enabled(&self.config_dir, integration_id)
-        })
+        let manager = crate::integrations::IntegrationManager::new(&self.config_dir);
+        let workspace_granted_bundles =
+            if access.integration_features.contains_key("google_workspace") {
+                Some(
+                    crate::actions::google_workspace::granted_bundles(&self.config_dir)
+                        .unwrap_or_default(),
+                )
+            } else {
+                None
+            };
+        for integration_id in integration_ids {
+            if !manager.is_ready(integration_id).await {
+                continue;
+            }
+            let Some(features) = access.integration_features.get(integration_id) else {
+                return true;
+            };
+            if features.is_empty() {
+                return true;
+            }
+            let features_ready = match integration_id.as_str() {
+                "google_workspace" => workspace_granted_bundles.as_ref().is_some_and(|granted| {
+                    features.iter().all(|feature| {
+                        crate::actions::google_workspace::normalize_bundle_id(feature).is_some_and(
+                            |normalized| {
+                                granted
+                                    .iter()
+                                    .any(|granted_bundle| granted_bundle == &normalized)
+                            },
+                        )
+                    })
+                }),
+                _ => true,
+            };
+            if features_ready {
+                return true;
+            }
+        }
+        false
     }
 
     fn pipeline_key_slug(input: &str) -> String {
@@ -11984,7 +12516,8 @@ print(result["text"])
         drop(disabled);
         let mut enabled = Vec::new();
         for action in actions {
-            if action.source == ActionSource::System && !self.is_action_integration_enabled(&action)
+            if action.source == ActionSource::System
+                && !self.is_action_integration_ready(&action).await
             {
                 continue;
             }
@@ -12018,7 +12551,8 @@ print(result["text"])
         let Some(action) = action else {
             return false;
         };
-        if action.source == ActionSource::System && !self.is_action_integration_enabled(&action) {
+        if action.source == ActionSource::System && !self.is_action_integration_ready(&action).await
+        {
             return false;
         }
         if action.source != ActionSource::System {
@@ -12194,6 +12728,86 @@ print(result["text"])
             name
         );
         Ok(true)
+    }
+
+    pub async fn apply_skill_evolution_candidate(
+        &self,
+        action: &str,
+        name: &str,
+        content: &str,
+        evidence_markdown: &str,
+    ) -> Result<SkillEvolutionApplyResult> {
+        let action = action.trim().to_ascii_lowercase();
+        let name = name.trim();
+        let content = content.trim();
+        if name.is_empty() {
+            anyhow::bail!("skill evolution candidate is missing a skill name");
+        }
+        if content.is_empty() {
+            anyhow::bail!("skill evolution candidate is missing skill content");
+        }
+
+        match action.as_str() {
+            "create_skill" | "improve_skill" | "optimize_description" => {}
+            other => anyhow::bail!("unsupported skill evolution action '{}'", other),
+        }
+
+        let existing = self.get_action_content(name).await?;
+        if action == "create_skill" && existing.is_none() {
+            let verdict = self.create_action(name, content, false).await?;
+            if verdict.as_ref().is_some_and(|value| !value.allow_load) {
+                anyhow::bail!("skill creation was blocked by the action security guard");
+            }
+            let history_dir = self.actions_dir.join(name).join("history");
+            tokio::fs::create_dir_all(&history_dir).await?;
+            tokio::fs::write(history_dir.join("v0_evidence.md"), evidence_markdown).await?;
+            return Ok(SkillEvolutionApplyResult {
+                skill_name: name.to_string(),
+                approved_ref: format!("skill:{}:v1", name),
+                history_version: 1,
+            });
+        }
+
+        let Some((info, before_content)) = existing else {
+            anyhow::bail!("skill '{}' does not exist in the current runtime", name);
+        };
+        if info.source == ActionSource::System {
+            anyhow::bail!("system actions cannot be modified by skill evolution");
+        }
+
+        let history_dir = if info.source == ActionSource::Bundled {
+            self.actions_dir.join(name).join("history")
+        } else {
+            info.file_path
+                .as_deref()
+                .and_then(|value| Path::new(value).parent().map(|path| path.join("history")))
+                .unwrap_or_else(|| self.actions_dir.join(name).join("history"))
+        };
+        tokio::fs::create_dir_all(&history_dir).await?;
+        let history_version =
+            crate::core::self_evolve::skill_evolution::next_skill_history_version(&history_dir)?;
+        tokio::fs::write(
+            history_dir.join(format!("v{}.md", history_version)),
+            before_content,
+        )
+        .await?;
+        tokio::fs::write(
+            history_dir.join(format!("v{}_evidence.md", history_version)),
+            evidence_markdown,
+        )
+        .await?;
+        if !self.update_action_content(name, content).await? {
+            anyhow::bail!(
+                "failed to update skill '{}' after snapshotting history",
+                name
+            );
+        }
+
+        Ok(SkillEvolutionApplyResult {
+            skill_name: name.to_string(),
+            approved_ref: format!("skill:{}:v{}", name, history_version + 1),
+            history_version: history_version + 1,
+        })
     }
 
     /// Create a new custom action with security verification
@@ -14641,6 +15255,173 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn list_enabled_actions_hides_disconnected_workspace_tools() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        runtime.load_builtin_actions().await.unwrap();
+        let enabled = runtime.list_enabled_actions().await.unwrap();
+
+        assert!(!enabled.iter().any(|action| action.name == "gmail_scan"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "calendar_create"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_drive_search"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_docs_read"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_sheets_read"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_chat_list_spaces"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_admin_list_users"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_workspace_gws_command"));
+    }
+
+    #[tokio::test]
+    async fn list_enabled_actions_exposes_granted_gmail_without_calendar() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = crate::core::config::SecureConfigManager::new(temp.path()).unwrap();
+        manager
+            .set_custom_secret(
+                crate::actions::google_workspace::GOOGLE_WORKSPACE_TOKENS_KEY,
+                Some(
+                    serde_json::json!({
+                        "access_token": "access",
+                        "refresh_token": "refresh",
+                        "expires_at": chrono::Utc::now().timestamp() + 3600,
+                        "granted_scopes": [
+                            "https://www.googleapis.com/auth/gmail.readonly",
+                            "https://www.googleapis.com/auth/gmail.send"
+                        ],
+                        "granted_bundles": ["gmail"]
+                    })
+                    .to_string(),
+                ),
+            )
+            .unwrap();
+        manager
+            .set_custom_secret(
+                crate::actions::google_workspace::GOOGLE_WORKSPACE_BUNDLES_KEY,
+                Some(serde_json::json!(["gmail"]).to_string()),
+            )
+            .unwrap();
+
+        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        runtime.load_builtin_actions().await.unwrap();
+        let enabled = runtime.list_enabled_actions().await.unwrap();
+
+        assert!(enabled.iter().any(|action| action.name == "gmail_scan"));
+        assert!(enabled.iter().any(|action| action.name == "gmail_reply"));
+        assert!(!enabled.iter().any(|action| action.name == "calendar_today"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "calendar_create"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_drive_search"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_docs_read"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_sheets_read"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_chat_list_spaces"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_admin_list_users"));
+    }
+
+    #[tokio::test]
+    async fn list_enabled_actions_exposes_only_granted_workspace_bundle_tools() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = crate::core::config::SecureConfigManager::new(temp.path()).unwrap();
+        manager
+            .set_custom_secret(
+                crate::actions::google_workspace::GOOGLE_WORKSPACE_TOKENS_KEY,
+                Some(
+                    serde_json::json!({
+                        "access_token": "access",
+                        "refresh_token": "refresh",
+                        "expires_at": chrono::Utc::now().timestamp() + 3600,
+                        "granted_scopes": [
+                            "https://www.googleapis.com/auth/gmail.readonly",
+                            "https://www.googleapis.com/auth/gmail.send",
+                            "https://www.googleapis.com/auth/drive.metadata.readonly"
+                        ],
+                        "granted_bundles": ["gmail", "drive"]
+                    })
+                    .to_string(),
+                ),
+            )
+            .unwrap();
+        manager
+            .set_custom_secret(
+                crate::actions::google_workspace::GOOGLE_WORKSPACE_BUNDLES_KEY,
+                Some(serde_json::json!(["gmail", "drive"]).to_string()),
+            )
+            .unwrap();
+
+        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        runtime.load_builtin_actions().await.unwrap();
+        let enabled = runtime.list_enabled_actions().await.unwrap();
+
+        assert!(enabled.iter().any(|action| action.name == "gmail_scan"));
+        assert!(enabled
+            .iter()
+            .any(|action| action.name == "google_drive_search"));
+        assert!(!enabled.iter().any(|action| action.name == "calendar_today"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_docs_read"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_sheets_read"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_chat_list_spaces"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_admin_list_users"));
+    }
+
+    #[tokio::test]
+    async fn list_enabled_actions_hides_unconfigured_external_connector_tools() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        runtime.load_builtin_actions().await.unwrap();
+        let enabled = runtime.list_enabled_actions().await.unwrap();
+
+        assert!(!enabled.iter().any(|action| action.name == "places"));
+        assert!(!enabled.iter().any(|action| action.name == "twilio"));
+        assert!(!enabled.iter().any(|action| action.name == "github"));
+    }
+
+    #[tokio::test]
+    async fn list_enabled_actions_exposes_ready_external_connector_tools() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = crate::core::config::SecureConfigManager::new(temp.path()).unwrap();
+        manager
+            .set_custom_secret("google_places_api_key", Some("test-key".to_string()))
+            .unwrap();
+
+        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        runtime.load_builtin_actions().await.unwrap();
+        let enabled = runtime.list_enabled_actions().await.unwrap();
+
+        assert!(enabled.iter().any(|action| action.name == "places"));
+    }
+
     #[test]
     fn loopback_http_get_rejects_non_app_paths() {
         let url = reqwest::Url::parse("http://127.0.0.1:8990/api/secret").unwrap();
@@ -14759,12 +15540,9 @@ mod tests {
     }
 
     #[test]
-    fn runtime_owned_bundled_dir_requires_app_skills() {
-        assert!(ActionRuntime::is_runtime_owned_bundled_dir(Path::new(
-            "/app/skills"
-        )));
+    fn runtime_owned_bundled_dirs_are_disabled() {
         assert!(!ActionRuntime::is_runtime_owned_bundled_dir(Path::new(
-            "./skills"
+            "/app/repo-skills"
         )));
     }
 
