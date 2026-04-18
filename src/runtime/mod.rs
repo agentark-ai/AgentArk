@@ -4443,7 +4443,10 @@ print(json.dumps({
                     "to": { "type": "string", "description": "Recipient email address" },
                     "subject": { "type": "string", "description": "Email subject line" },
                     "body": { "type": "string", "description": "Email body text (plain text)" },
-                    "thread_id": { "type": "string", "description": "Gmail thread ID to reply to (from gmail_scan results)" }
+                    "thread_id": { "type": "string", "description": "Gmail thread ID to reply to (from gmail_scan results)" },
+                    "html_body": { "type": "string", "description": "Optional HTML body for multipart email delivery" },
+                    "from": { "type": "string", "description": "Optional sender mailbox address. Defaults to the connected Gmail profile." },
+                    "delivery_source": { "type": "string", "enum": ["auto", "gmail", "google_workspace"], "description": "Choose which connected Gmail backend to send through. Leave as auto unless a specific backend is required." }
                 },
                 "required": ["to", "subject", "body"]
             }),
@@ -17348,6 +17351,7 @@ mod tests {
             cli_skills_dir: PathBuf::from("./cli_skills"),
             config_dir: PathBuf::from("."),
             auto_approved_actions: std::sync::RwLock::new(HashSet::new()),
+            tool_args_guard_config: std::sync::RwLock::new(Default::default()),
             task_queue: None,
             action_guard: None,
             storage: None,

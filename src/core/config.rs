@@ -513,6 +513,147 @@ impl Default for EmbeddingsConfig {
     }
 }
 
+fn default_email_provider() -> String {
+    "auto".to_string()
+}
+
+fn default_email_transport_kind() -> String {
+    "http".to_string()
+}
+
+fn default_email_auth_kind() -> String {
+    "none".to_string()
+}
+
+fn default_email_smtp_port() -> u16 {
+    587
+}
+
+fn default_email_smtp_security() -> String {
+    "starttls".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmailConfig {
+    #[serde(default = "default_email_provider")]
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(default)]
+    pub transport: EmailTransportConfig,
+    #[serde(default)]
+    pub auth: EmailAuthConfig,
+}
+
+impl Default for EmailConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_email_provider(),
+            to_address: None,
+            from_address: None,
+            domain: None,
+            transport: EmailTransportConfig::default(),
+            auth: EmailAuthConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmailTransportConfig {
+    #[serde(default = "default_email_transport_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub http: EmailHttpTransportConfig,
+    #[serde(default)]
+    pub smtp: EmailSmtpTransportConfig,
+}
+
+impl Default for EmailTransportConfig {
+    fn default() -> Self {
+        Self {
+            kind: default_email_transport_kind(),
+            http: EmailHttpTransportConfig::default(),
+            smtp: EmailSmtpTransportConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmailHttpTransportConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmailSmtpTransportConfig {
+    #[serde(default)]
+    pub host: String,
+    #[serde(default = "default_email_smtp_port")]
+    pub port: u16,
+    #[serde(default = "default_email_smtp_security")]
+    pub security: String,
+}
+
+impl Default for EmailSmtpTransportConfig {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            port: default_email_smtp_port(),
+            security: default_email_smtp_security(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmailAuthConfig {
+    #[serde(default = "default_email_auth_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheme: Option<String>,
+    #[serde(default)]
+    pub basic_username: String,
+    #[serde(default)]
+    pub basic_password: String,
+    #[serde(default)]
+    pub aws_access_key_id: String,
+    #[serde(default)]
+    pub aws_secret_access_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws_session_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws_region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws_service: Option<String>,
+}
+
+impl Default for EmailAuthConfig {
+    fn default() -> Self {
+        Self {
+            kind: default_email_auth_kind(),
+            api_key: String::new(),
+            header_name: None,
+            scheme: None,
+            basic_username: String::new(),
+            basic_password: String::new(),
+            aws_access_key_id: String::new(),
+            aws_secret_access_key: String::new(),
+            aws_session_token: None,
+            aws_region: None,
+            aws_service: None,
+        }
+    }
+}
+
 /// Main agent configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -551,6 +692,8 @@ pub struct AgentConfig {
     pub wechat: Option<WeChatChannelConfig>,
     #[serde(default)]
     pub qq: Option<QqChannelConfig>,
+    #[serde(default)]
+    pub email: EmailConfig,
     #[serde(default)]
     pub sandbox: SandboxConfig,
     #[serde(default)]
@@ -624,6 +767,7 @@ impl Default for AgentConfig {
             line: None,
             wechat: None,
             qq: None,
+            email: EmailConfig::default(),
             sandbox: SandboxConfig::default(),
             memory: MemoryConfig::default(),
             embeddings: Some(EmbeddingsConfig::default()),
@@ -1984,6 +2128,29 @@ impl SecureConfigManager {
         })
     }
 
+    fn clear_email_secret_entries(custom: &mut std::collections::HashMap<String, String>) {
+        for key in [
+            "email.auth.api_key",
+            "email.auth.basic_password",
+            "email.auth.aws_secret_access_key",
+            "email.auth.aws_session_token",
+        ] {
+            custom.remove(key);
+        }
+    }
+
+    fn upsert_email_secret_entry(
+        custom: &mut std::collections::HashMap<String, String>,
+        key: &str,
+        value: &str,
+    ) {
+        if value.is_empty() || value == "[ENCRYPTED]" {
+            custom.remove(key);
+        } else {
+            custom.insert(key.to_string(), value.to_string());
+        }
+    }
+
     /// Extract secrets from config
     fn extract_secrets_from_base(&self, mut secrets: Secrets, config: &AgentConfig) -> Secrets {
         // Model-related secrets are derived entirely from the current config/runtime state.
@@ -1992,6 +2159,7 @@ impl SecureConfigManager {
         secrets.embeddings_api_key = None;
         secrets.llm_fallback_api_key = None;
         secrets.model_pool_keys.clear();
+        Self::clear_email_secret_entries(&mut secrets.custom);
 
         // Extract primary LLM API key
         match &config.llm {
@@ -2165,6 +2333,29 @@ impl SecureConfigManager {
             }
         }
 
+        Self::upsert_email_secret_entry(
+            &mut secrets.custom,
+            "email.auth.api_key",
+            &config.email.auth.api_key,
+        );
+        Self::upsert_email_secret_entry(
+            &mut secrets.custom,
+            "email.auth.basic_password",
+            &config.email.auth.basic_password,
+        );
+        Self::upsert_email_secret_entry(
+            &mut secrets.custom,
+            "email.auth.aws_secret_access_key",
+            &config.email.auth.aws_secret_access_key,
+        );
+        if let Some(session_token) = config.email.auth.aws_session_token.as_deref() {
+            Self::upsert_email_secret_entry(
+                &mut secrets.custom,
+                "email.auth.aws_session_token",
+                session_token,
+            );
+        }
+
         secrets
     }
 
@@ -2300,6 +2491,24 @@ impl SecureConfigManager {
                 qq.bridge_token = "[ENCRYPTED]".to_string();
             }
         }
+        if !sanitized.email.auth.api_key.is_empty() {
+            sanitized.email.auth.api_key = "[ENCRYPTED]".to_string();
+        }
+        if !sanitized.email.auth.basic_password.is_empty() {
+            sanitized.email.auth.basic_password = "[ENCRYPTED]".to_string();
+        }
+        if !sanitized.email.auth.aws_secret_access_key.is_empty() {
+            sanitized.email.auth.aws_secret_access_key = "[ENCRYPTED]".to_string();
+        }
+        if sanitized
+            .email
+            .auth
+            .aws_session_token
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        {
+            sanitized.email.auth.aws_session_token = Some("[ENCRYPTED]".to_string());
+        }
 
         if !sanitized.tunnel.ngrok.authtoken.is_empty() {
             sanitized.tunnel.ngrok.authtoken = "[ENCRYPTED]".to_string();
@@ -2379,6 +2588,27 @@ impl SecureConfigManager {
                         _ => {}
                     }
                 }
+            }
+        }
+
+        if let Some(value) = secrets.custom.get("email.auth.api_key") {
+            if !value.is_empty() && value != "[ENCRYPTED]" {
+                config.email.auth.api_key = value.clone();
+            }
+        }
+        if let Some(value) = secrets.custom.get("email.auth.basic_password") {
+            if !value.is_empty() && value != "[ENCRYPTED]" {
+                config.email.auth.basic_password = value.clone();
+            }
+        }
+        if let Some(value) = secrets.custom.get("email.auth.aws_secret_access_key") {
+            if !value.is_empty() && value != "[ENCRYPTED]" {
+                config.email.auth.aws_secret_access_key = value.clone();
+            }
+        }
+        if let Some(value) = secrets.custom.get("email.auth.aws_session_token") {
+            if !value.is_empty() && value != "[ENCRYPTED]" {
+                config.email.auth.aws_session_token = Some(value.clone());
             }
         }
 

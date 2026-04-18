@@ -287,6 +287,14 @@ fn decrypt_storage_string(value: &str) -> String {
     }
 }
 
+fn encrypt_optional_storage_string(value: Option<&str>) -> Result<Option<String>> {
+    value.map(encrypt_storage_string).transpose()
+}
+
+fn decrypt_optional_storage_string(value: Option<String>) -> Option<String> {
+    value.map(|inner| decrypt_storage_string(&inner))
+}
+
 fn pgvector_sql_literal(embedding: &PgVector) -> String {
     let values = embedding
         .as_slice()
@@ -437,17 +445,16 @@ fn is_foreign_key_constraint_error(error: &sea_orm::DbErr) -> bool {
         .contains("foreign key constraint failed")
 }
 
-fn encrypt_optional_storage_string(value: Option<&str>) -> Result<Option<String>> {
-    value.map(encrypt_storage_string).transpose()
-}
-
-fn decrypt_optional_storage_string(value: Option<String>) -> Option<String> {
-    value.map(|inner| decrypt_storage_string(&inner))
-}
-
 fn decrypt_swarm_delegation_model(model: &mut swarm_delegation::Model) {
     model.task_description = decrypt_storage_string(&model.task_description);
     model.result = decrypt_optional_storage_string(model.result.clone());
+}
+
+fn decrypt_memory_operation_model(model: &mut memory_operation::Model) {
+    model.value = decrypt_optional_storage_string(model.value.clone());
+    model.sensitive_reason = decrypt_optional_storage_string(model.sensitive_reason.clone());
+    model.rationale = decrypt_optional_storage_string(model.rationale.clone());
+    model.review_notes = decrypt_optional_storage_string(model.review_notes.clone());
 }
 
 fn encrypt_storage_bytes(value: &[u8]) -> Result<Vec<u8>> {
@@ -3618,6 +3625,85 @@ impl Storage {
         }
     }
 
+    fn memory_capture_event_active_model(
+        event: &memory_capture_event::Model,
+    ) -> memory_capture_event::ActiveModel {
+        memory_capture_event::ActiveModel {
+            id: Set(event.id.clone()),
+            source_message_id: Set(event.source_message_id.clone()),
+            conversation_id: Set(event.conversation_id.clone()),
+            project_id: Set(event.project_id.clone()),
+            channel: Set(event.channel.clone()),
+            status: Set(event.status.clone()),
+            capture_kind: Set(event.capture_kind.clone()),
+            source_hash: Set(event.source_hash.clone()),
+            attempt_metadata: Set(event.attempt_metadata.clone()),
+            error_history: Set(event.error_history.clone()),
+            replay_count: Set(event.replay_count),
+            next_retry_at: Set(event.next_retry_at.clone()),
+            completed_at: Set(event.completed_at.clone()),
+            created_at: Set(event.created_at.clone()),
+            updated_at: Set(event.updated_at.clone()),
+        }
+    }
+
+    fn memory_operation_active_model(
+        operation: &memory_operation::Model,
+    ) -> Result<memory_operation::ActiveModel> {
+        Ok(memory_operation::ActiveModel {
+            id: Set(operation.id.clone()),
+            capture_event_id: Set(operation.capture_event_id.clone()),
+            operation_type: Set(operation.operation_type.clone()),
+            status: Set(operation.status.clone()),
+            target_memory_id: Set(operation.target_memory_id.clone()),
+            applied_memory_id: Set(operation.applied_memory_id.clone()),
+            key: Set(operation.key.clone()),
+            value: Set(encrypt_optional_storage_string(operation.value.as_deref())?),
+            memory_kind: Set(operation.memory_kind.clone()),
+            durability: Set(operation.durability.clone()),
+            scope: Set(operation.scope.clone()),
+            project_id: Set(operation.project_id.clone()),
+            conversation_id: Set(operation.conversation_id.clone()),
+            confidence: Set(operation.confidence),
+            looks_sensitive: Set(operation.looks_sensitive),
+            sensitive_reason: Set(encrypt_optional_storage_string(
+                operation.sensitive_reason.as_deref(),
+            )?),
+            valid_from: Set(operation.valid_from.clone()),
+            expires_at: Set(operation.expires_at.clone()),
+            review_at: Set(operation.review_at.clone()),
+            rationale: Set(encrypt_optional_storage_string(operation.rationale.as_deref())?),
+            evidence_refs: Set(operation.evidence_refs.clone()),
+            model_metadata: Set(operation.model_metadata.clone()),
+            apply_metadata: Set(operation.apply_metadata.clone()),
+            applied_at: Set(operation.applied_at.clone()),
+            reviewed_at: Set(operation.reviewed_at.clone()),
+            review_notes: Set(encrypt_optional_storage_string(
+                operation.review_notes.as_deref(),
+            )?),
+            created_at: Set(operation.created_at.clone()),
+            updated_at: Set(operation.updated_at.clone()),
+        })
+    }
+
+    fn memory_evidence_link_active_model(
+        link: &memory_evidence_link::Model,
+    ) -> memory_evidence_link::ActiveModel {
+        memory_evidence_link::ActiveModel {
+            id: Set(link.id.clone()),
+            operation_id: Set(link.operation_id.clone()),
+            memory_id: Set(link.memory_id.clone()),
+            evidence_kind: Set(link.evidence_kind.clone()),
+            evidence_ref: Set(link.evidence_ref.clone()),
+            source_message_id: Set(link.source_message_id.clone()),
+            capture_event_id: Set(link.capture_event_id.clone()),
+            project_id: Set(link.project_id.clone()),
+            conversation_id: Set(link.conversation_id.clone()),
+            metadata: Set(link.metadata.clone()),
+            created_at: Set(link.created_at.clone()),
+        }
+    }
+
     fn experience_item_is_arkmemory_memory(item: &experience_item::Model) -> bool {
         matches!(item.kind.as_str(), "personal_fact" | "constraint")
     }
@@ -4647,6 +4733,282 @@ impl Storage {
         Ok(true)
     }
 
+    pub async fn upsert_learning_candidate(
+        &self,
+        candidate: &learning_candidate::Model,
+    ) -> Result<()> {
+        let txn = self.db.begin().await?;
+        self.upsert_learning_candidate_txn(&txn, candidate).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    pub async fn upsert_memory_capture_event(
+        &self,
+        event: &memory_capture_event::Model,
+    ) -> Result<()> {
+        memory_capture_event::Entity::insert(Self::memory_capture_event_active_model(event))
+            .on_conflict(
+                OnConflict::column(memory_capture_event::Column::Id)
+                    .update_columns([
+                        memory_capture_event::Column::SourceMessageId,
+                        memory_capture_event::Column::ConversationId,
+                        memory_capture_event::Column::ProjectId,
+                        memory_capture_event::Column::Channel,
+                        memory_capture_event::Column::Status,
+                        memory_capture_event::Column::CaptureKind,
+                        memory_capture_event::Column::SourceHash,
+                        memory_capture_event::Column::AttemptMetadata,
+                        memory_capture_event::Column::ErrorHistory,
+                        memory_capture_event::Column::ReplayCount,
+                        memory_capture_event::Column::NextRetryAt,
+                        memory_capture_event::Column::CompletedAt,
+                        memory_capture_event::Column::UpdatedAt,
+                    ])
+                    .to_owned(),
+            )
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_memory_capture_events_by_statuses(
+        &self,
+        statuses: &[&str],
+        project_id: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<memory_capture_event::Model>> {
+        let mut query = memory_capture_event::Entity::find();
+        if !statuses.is_empty() {
+            query = query.filter(memory_capture_event::Column::Status.is_in(
+                statuses
+                    .iter()
+                    .map(|status| (*status).to_string())
+                    .collect::<Vec<_>>(),
+            ));
+        }
+        query = match project_id.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(pid) => query.filter(
+                Condition::any()
+                    .add(memory_capture_event::Column::ProjectId.is_null())
+                    .add(memory_capture_event::Column::ProjectId.eq(pid.to_string())),
+            ),
+            None => query.filter(memory_capture_event::Column::ProjectId.is_null()),
+        };
+        Ok(query
+            .order_by_desc(memory_capture_event::Column::UpdatedAt)
+            .limit(Self::db_limit(limit))
+            .all(&self.db)
+            .await?)
+    }
+
+    pub async fn count_memory_capture_events_by_statuses_all_scopes(
+        &self,
+        statuses: &[&str],
+    ) -> Result<u64> {
+        let mut query = memory_capture_event::Entity::find();
+        if !statuses.is_empty() {
+            query = query.filter(memory_capture_event::Column::Status.is_in(
+                statuses
+                    .iter()
+                    .map(|status| (*status).to_string())
+                    .collect::<Vec<_>>(),
+            ));
+        }
+        Ok(query.count(&self.db).await?)
+    }
+
+    pub async fn count_memory_capture_events_by_source_hash(
+        &self,
+        source_hash: &str,
+    ) -> Result<u64> {
+        Ok(memory_capture_event::Entity::find()
+            .filter(memory_capture_event::Column::SourceHash.eq(source_hash.to_string()))
+            .count(&self.db)
+            .await?)
+    }
+
+    pub async fn upsert_memory_operation(&self, operation: &memory_operation::Model) -> Result<()> {
+        memory_operation::Entity::insert(Self::memory_operation_active_model(operation)?)
+            .on_conflict(
+                OnConflict::column(memory_operation::Column::Id)
+                    .update_columns([
+                        memory_operation::Column::CaptureEventId,
+                        memory_operation::Column::OperationType,
+                        memory_operation::Column::Status,
+                        memory_operation::Column::TargetMemoryId,
+                        memory_operation::Column::AppliedMemoryId,
+                        memory_operation::Column::Key,
+                        memory_operation::Column::Value,
+                        memory_operation::Column::MemoryKind,
+                        memory_operation::Column::Durability,
+                        memory_operation::Column::Scope,
+                        memory_operation::Column::ProjectId,
+                        memory_operation::Column::ConversationId,
+                        memory_operation::Column::Confidence,
+                        memory_operation::Column::LooksSensitive,
+                        memory_operation::Column::SensitiveReason,
+                        memory_operation::Column::ValidFrom,
+                        memory_operation::Column::ExpiresAt,
+                        memory_operation::Column::ReviewAt,
+                        memory_operation::Column::Rationale,
+                        memory_operation::Column::EvidenceRefs,
+                        memory_operation::Column::ModelMetadata,
+                        memory_operation::Column::ApplyMetadata,
+                        memory_operation::Column::AppliedAt,
+                        memory_operation::Column::ReviewedAt,
+                        memory_operation::Column::ReviewNotes,
+                        memory_operation::Column::UpdatedAt,
+                    ])
+                    .to_owned(),
+            )
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_memory_operation(
+        &self,
+        id: &str,
+    ) -> Result<Option<memory_operation::Model>> {
+        let Some(mut model) = memory_operation::Entity::find_by_id(id.to_string())
+            .one(&self.db)
+            .await?
+        else {
+            return Ok(None);
+        };
+        decrypt_memory_operation_model(&mut model);
+        Ok(Some(model))
+    }
+
+    pub async fn list_memory_operations_for_memory(
+        &self,
+        memory_id: &str,
+        project_id: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<memory_operation::Model>> {
+        let mut query = memory_operation::Entity::find().filter(
+            Condition::any()
+                .add(memory_operation::Column::TargetMemoryId.eq(memory_id.to_string()))
+                .add(memory_operation::Column::AppliedMemoryId.eq(memory_id.to_string())),
+        );
+        query = match project_id.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(pid) => query.filter(
+                Condition::any()
+                    .add(memory_operation::Column::ProjectId.is_null())
+                    .add(memory_operation::Column::ProjectId.eq(pid.to_string())),
+            ),
+            None => query.filter(memory_operation::Column::ProjectId.is_null()),
+        };
+        let mut rows = query
+            .order_by_desc(memory_operation::Column::UpdatedAt)
+            .limit(Self::db_limit(limit))
+            .all(&self.db)
+            .await?;
+        for row in &mut rows {
+            decrypt_memory_operation_model(row);
+        }
+        Ok(rows)
+    }
+
+    pub async fn list_memory_operations_by_statuses(
+        &self,
+        statuses: &[&str],
+        project_id: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<memory_operation::Model>> {
+        let mut query = memory_operation::Entity::find();
+        if !statuses.is_empty() {
+            query = query.filter(memory_operation::Column::Status.is_in(
+                statuses
+                    .iter()
+                    .map(|status| (*status).to_string())
+                    .collect::<Vec<_>>(),
+            ));
+        }
+        query = match project_id.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(pid) => query.filter(
+                Condition::any()
+                    .add(memory_operation::Column::ProjectId.is_null())
+                    .add(memory_operation::Column::ProjectId.eq(pid.to_string())),
+            ),
+            None => query.filter(memory_operation::Column::ProjectId.is_null()),
+        };
+        let mut rows = query
+            .order_by_desc(memory_operation::Column::UpdatedAt)
+            .limit(Self::db_limit(limit))
+            .all(&self.db)
+            .await?;
+        for row in &mut rows {
+            decrypt_memory_operation_model(row);
+        }
+        Ok(rows)
+    }
+
+    pub async fn count_memory_operations_by_statuses_all_scopes(
+        &self,
+        statuses: &[&str],
+    ) -> Result<u64> {
+        let mut query = memory_operation::Entity::find();
+        if !statuses.is_empty() {
+            query = query.filter(memory_operation::Column::Status.is_in(
+                statuses
+                    .iter()
+                    .map(|status| (*status).to_string())
+                    .collect::<Vec<_>>(),
+            ));
+        }
+        Ok(query.count(&self.db).await?)
+    }
+
+    pub async fn upsert_memory_evidence_link(
+        &self,
+        link: &memory_evidence_link::Model,
+    ) -> Result<()> {
+        memory_evidence_link::Entity::insert(Self::memory_evidence_link_active_model(link))
+            .on_conflict(
+                OnConflict::column(memory_evidence_link::Column::Id)
+                    .update_columns([
+                        memory_evidence_link::Column::OperationId,
+                        memory_evidence_link::Column::MemoryId,
+                        memory_evidence_link::Column::EvidenceKind,
+                        memory_evidence_link::Column::EvidenceRef,
+                        memory_evidence_link::Column::SourceMessageId,
+                        memory_evidence_link::Column::CaptureEventId,
+                        memory_evidence_link::Column::ProjectId,
+                        memory_evidence_link::Column::ConversationId,
+                        memory_evidence_link::Column::Metadata,
+                    ])
+                    .to_owned(),
+            )
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_memory_evidence_links_for_memory(
+        &self,
+        memory_id: &str,
+        project_id: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<memory_evidence_link::Model>> {
+        let mut query = memory_evidence_link::Entity::find()
+            .filter(memory_evidence_link::Column::MemoryId.eq(memory_id.to_string()));
+        query = match project_id.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(pid) => query.filter(
+                Condition::any()
+                    .add(memory_evidence_link::Column::ProjectId.is_null())
+                    .add(memory_evidence_link::Column::ProjectId.eq(pid.to_string())),
+            ),
+            None => query.filter(memory_evidence_link::Column::ProjectId.is_null()),
+        };
+        Ok(query
+            .order_by_desc(memory_evidence_link::Column::CreatedAt)
+            .limit(Self::db_limit(limit))
+            .all(&self.db)
+            .await?)
+    }
+
     pub async fn get_learning_candidate(
         &self,
         id: &str,
@@ -4732,6 +5094,38 @@ impl Storage {
         Ok(learning_candidate::Entity::find()
             .filter(learning_candidate::Column::CandidateType.eq(candidate_type.to_string()))
             .filter(learning_candidate::Column::SubjectKey.eq(subject_key.to_string()))
+            .order_by_desc(learning_candidate::Column::UpdatedAt)
+            .limit(Self::db_limit(limit))
+            .all(&self.db)
+            .await?)
+    }
+
+    pub async fn list_learning_candidates_for_subject_key(
+        &self,
+        subject_key: &str,
+        candidate_types: &[&str],
+        project_id: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<learning_candidate::Model>> {
+        let mut query = learning_candidate::Entity::find()
+            .filter(learning_candidate::Column::SubjectKey.eq(subject_key.to_string()));
+        if !candidate_types.is_empty() {
+            query = query.filter(learning_candidate::Column::CandidateType.is_in(
+                candidate_types
+                    .iter()
+                    .map(|candidate_type| (*candidate_type).to_string())
+                    .collect::<Vec<_>>(),
+            ));
+        }
+        query = match project_id.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(pid) => query.filter(
+                Condition::any()
+                    .add(learning_candidate::Column::ProjectId.is_null())
+                    .add(learning_candidate::Column::ProjectId.eq(pid.to_string())),
+            ),
+            None => query.filter(learning_candidate::Column::ProjectId.is_null()),
+        };
+        Ok(query
             .order_by_desc(learning_candidate::Column::UpdatedAt)
             .limit(Self::db_limit(limit))
             .all(&self.db)

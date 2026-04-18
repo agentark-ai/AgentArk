@@ -141,15 +141,24 @@ ArkCore is the operating layer inside AgentArk that keeps memory, follow-up work
 
 ```bash
 git clone https://github.com/agentark-ai/AgentArk.git && cd AgentArk
-docker compose up -d
+./scripts/start.sh
+```
+
+On Windows:
+
+```bat
+git clone https://github.com/agentark-ai/AgentArk.git && cd AgentArk
+scripts\start.bat
 ```
 
 Open **http://localhost:8990**, pick your LLM provider in Settings, start chatting.
 
-**Low-memory systems (2-4 GB RAM):** add the low-memory override to reduce Postgres and service footprint:
+The start scripts generate local secrets automatically in `.agentark/local.env`, pass them to Docker Compose, and preserve Docker volumes across updates. You do not need to create or edit `.env`.
+
+**Low-memory systems (2-4 GB RAM):** after the first script-managed start has created `.agentark/local.env`, add the low-memory override to reduce Postgres and service footprint:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.lowmem.yml up -d
+docker compose --env-file .agentark/local.env -f docker-compose.yml -f docker-compose.lowmem.yml up -d
 ```
 
 The bundled Docker runtime includes Lightpanda for fast free-content fetching, and the install/update scripts verify that it is present after startup.
@@ -274,11 +283,11 @@ Built-in remote access is toggleable from Settings. Cloudflare Quick Tunnel is t
 ### Management
 
 ```bash
-docker compose up -d                            # start
-docker compose pull && docker compose up -d     # update to latest
-docker compose down                             # stop
+./scripts/start.sh                              # start
+./scripts/start.sh update                       # update to latest
+./scripts/start.sh stop                         # stop
 docker compose down -v                          # stop and full reset
-docker compose logs -f agentark-control         # follow logs
+./scripts/start.sh logs                         # follow logs
 ```
 
 ---
@@ -542,8 +551,8 @@ Full interactive API docs available at **http://localhost:8990/docs#/** after st
 <summary>Debug logging</summary>
 
 ```bash
-AGENTARK_DEBUG=true docker compose up        # full debug
-RUST_LOG=info,agentark=debug docker compose up   # agent internals only
+AGENTARK_DEBUG=true ./scripts/start.sh              # full debug
+RUST_LOG=info,agentark=debug ./scripts/start.sh     # agent internals only
 ```
 </details>
 
@@ -577,7 +586,7 @@ cargo build && cargo test
 cd frontend && npm install && npm run dev
 
 # Full stack via Docker
-AGENTARK_IMAGE=agentark:dev docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+AGENTARK_IMAGE=agentark:dev ./scripts/start.sh build
 ```
 
 ### Project structure

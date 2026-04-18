@@ -24,6 +24,7 @@ data/
 # Environment
 .env
 .env.*
+.agentark/
 
 # Test artifacts
 tests/e2e/report/

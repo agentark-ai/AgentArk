@@ -16,6 +16,7 @@ pub mod companion;
 pub(crate) mod data_contract;
 pub mod data_lifecycle;
 pub(crate) mod document_search;
+pub mod email_delivery;
 pub mod embeddings;
 pub mod execution;
 pub mod gateway;

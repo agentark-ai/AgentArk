@@ -108,7 +108,7 @@ pub async fn dispatch_pack_channel_with_overlay(
     }
 
     req = apply_content_type(req, &content_type);
-    req = apply_static_headers(req, &send_spec.headers, inputs, secrets, json_body)?;
+    req = apply_static_headers(req, &send_spec.headers, inputs, secrets)?;
     req = apply_auth_binding(req, &send_spec.auth, inputs, secrets, json_body)?;
 
     if let Some(body_template) = &send_spec.body_template {
@@ -514,19 +514,18 @@ fn apply_static_headers(
     headers: &[MessagingHeaderSpec],
     inputs: &DispatchInputs<'_>,
     secrets: &dyn SecretReader,
-    json_body: bool,
 ) -> Result<reqwest::RequestBuilder> {
     for header in headers {
         let name = header.name.trim();
         if name.is_empty() {
             continue;
         }
-        let escape = if json_body {
-            TemplateEscape::None // header values are not JSON; plain strings
-        } else {
-            TemplateEscape::None
-        };
-        let value = render_template(&header.value_template, inputs, secrets, escape)?;
+        let value = render_template(
+            &header.value_template,
+            inputs,
+            secrets,
+            TemplateEscape::None,
+        )?;
         builder = builder.header(name, value);
     }
     Ok(builder)

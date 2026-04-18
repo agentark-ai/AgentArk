@@ -208,6 +208,9 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
             experience_edge::Entity,
             procedural_pattern::Entity,
             learning_candidate::Entity,
+            memory_capture_event::Entity,
+            memory_operation::Entity,
+            memory_evidence_link::Entity,
             recall_event::Entity,
             recall_test::Entity,
             abuse_tracker_state::Entity
@@ -1579,6 +1582,125 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
             .col(learning_candidate::Column::ProjectId)
             .col(learning_candidate::Column::ApprovalStatus)
             .col(learning_candidate::Column::UpdatedAt)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_memory_capture_events_status")
+            .table(memory_capture_event::Entity)
+            .col(memory_capture_event::Column::Status)
+            .col(memory_capture_event::Column::UpdatedAt)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_memory_capture_events_message")
+            .table(memory_capture_event::Entity)
+            .col(memory_capture_event::Column::SourceMessageId)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_memory_capture_events_scope")
+            .table(memory_capture_event::Entity)
+            .col(memory_capture_event::Column::ProjectId)
+            .col(memory_capture_event::Column::ConversationId)
+            .col(memory_capture_event::Column::CreatedAt)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_memory_operations_status")
+            .table(memory_operation::Entity)
+            .col(memory_operation::Column::Status)
+            .col(memory_operation::Column::OperationType)
+            .col(memory_operation::Column::UpdatedAt)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_memory_operations_capture")
+            .table(memory_operation::Entity)
+            .col(memory_operation::Column::CaptureEventId)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_memory_operations_target")
+            .table(memory_operation::Entity)
+            .col(memory_operation::Column::TargetMemoryId)
+            .col(memory_operation::Column::UpdatedAt)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_memory_operations_scope")
+            .table(memory_operation::Entity)
+            .col(memory_operation::Column::ProjectId)
+            .col(memory_operation::Column::ConversationId)
+            .col(memory_operation::Column::UpdatedAt)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_memory_evidence_links_operation")
+            .table(memory_evidence_link::Entity)
+            .col(memory_evidence_link::Column::OperationId)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_memory_evidence_links_memory")
+            .table(memory_evidence_link::Entity)
+            .col(memory_evidence_link::Column::MemoryId)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_memory_evidence_links_evidence")
+            .table(memory_evidence_link::Entity)
+            .col(memory_evidence_link::Column::EvidenceKind)
+            .col(memory_evidence_link::Column::EvidenceRef)
             .if_not_exists()
             .to_owned(),
     )

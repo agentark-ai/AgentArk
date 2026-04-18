@@ -8,8 +8,8 @@ use crate::{
     identity::IdentityManager,
     proofs::ProofEngine,
     runtime::{
-        ActionRuntime, InstalledCliSkillManifest, WorkflowMissingInputsPayload,
-        parse_workflow_action_marker, parse_workflow_missing_inputs_marker,
+        parse_workflow_action_marker, parse_workflow_missing_inputs_marker, ActionRuntime,
+        InstalledCliSkillManifest, WorkflowMissingInputsPayload,
     },
     safety::SafetyEngine,
     security::SecurityGuard,
@@ -22,16 +22,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{broadcast, RwLock};
 
 use super::{
-    AgentConfig, EmbeddingClient, ExecutionPlan, PlanPromptMode, PlanStep, PlanStepStatus,
-    PlanSubstep, PromptMemory, RequestShapeAssessment,
     automation::{
-        AutomationExecutionPolicy, AutomationOriginContext, AutomationRunRecord,
-        AutomationRunStatus, AutomationSupervisorState, AutomationValidation,
-        AutomationValidationMode, append_run as append_automation_run, compute_retry_at,
+        append_run as append_automation_run, compute_retry_at,
         critique_result as critique_automation_result,
         current_attempt as automation_current_attempt,
         delete_supervisor_state as delete_automation_supervisor_state,
@@ -47,16 +44,21 @@ use super::{
         truncate_text as automation_truncate_text,
         upsert_supervisor_state as upsert_automation_supervisor_state,
         validation_from_request_argument as automation_validation_from_request_argument,
+        AutomationExecutionPolicy, AutomationOriginContext, AutomationRunRecord,
+        AutomationRunStatus, AutomationSupervisorState, AutomationValidation,
+        AutomationValidationMode,
     },
     autonomy::ConversationScope,
     config::{ModelRole, ModelSlot},
-    document_search::{self, DocumentSearchHit, should_skip_clarification_for_document_context},
+    document_search::{self, should_skip_clarification_for_document_context, DocumentSearchHit},
     intent::{action_intent_score, preferred_direct_action_name},
     llm::{LlmClient, LlmProvider, LlmRequestTelemetry},
     orchestra::{Orchestra, OrchestraConfig},
     swarm::{AgentId, SwarmManager},
     task::TaskQueue,
-    tool_handlers::{ToolHandlerContext, default_tool_handlers},
+    tool_handlers::{default_tool_handlers, ToolHandlerContext},
+    AgentConfig, EmbeddingClient, ExecutionPlan, PlanPromptMode, PlanStep, PlanStepStatus,
+    PlanSubstep, PromptMemory, RequestShapeAssessment,
 };
 
 mod operational;
@@ -103,6 +105,8 @@ const USER_LEARNED_MEMORY_RETRACTION_SOURCE: &str = "user_lifecycle_memory_retra
 const USER_FACT_MEMORY_CAPTURE_LOCAL_TIMEOUT_MS: u64 = 6_000;
 const USER_FACT_MEMORY_CAPTURE_REMOTE_TIMEOUT_MS: u64 = 20_000;
 const USER_FACT_MEMORY_CAPTURE_MAX_CANDIDATES: usize = 2;
+const USER_MEMORY_OPERATION_AUTO_APPLY_CONFIDENCE: f64 = 0.80;
+const MEMORY_OPERATION_CANDIDATE_TYPES: &[&str] = &["memory_add", "memory_update", "memory_retract"];
 const SELF_MEMORY_LOOKUP_MAX_ITEMS: usize = 3;
 const INITIAL_TOOL_FOLLOWUP_BUDGET: usize = 6;
 const MAX_TOOL_FOLLOWUP_BUDGET_CAP: usize = 18;
@@ -1779,7 +1783,10 @@ fn sanitize_learned_user_memory_content_for_storage(
     })
 }
 
-fn sanitize_user_memory_prompt_text(raw: &str, max_chars: usize) -> Option<SanitizedUserMemoryText> {
+fn sanitize_user_memory_prompt_text(
+    raw: &str,
+    max_chars: usize,
+) -> Option<SanitizedUserMemoryText> {
     sanitize_user_memory_metadata_text_for_storage(raw, max_chars)
 }
 
@@ -1969,7 +1976,12 @@ fn self_memory_entry_label(kind: &str, key: Option<&str>) -> String {
 
 fn learned_user_memory_semantic_kind(key: Option<&str>, raw_kind: Option<&str>) -> &'static str {
     let normalized = normalize_self_memory_lookup_kind(raw_kind);
-    if normalized != "other" || raw_kind.unwrap_or_default().trim().eq_ignore_ascii_case("other") {
+    if normalized != "other"
+        || raw_kind
+            .unwrap_or_default()
+            .trim()
+            .eq_ignore_ascii_case("other")
+    {
         return normalized;
     }
     key.map(infer_self_memory_kind_from_internal_key)
@@ -2255,6 +2267,91 @@ fn user_memory_capture_payload_has_required_shape(payload: &serde_json::Value) -
             .is_some_and(|value| value.is_array())
 }
 
+fn user_memory_capture_payload_is_empty_decision(payload: &serde_json::Value) -> bool {
+    payload
+        .get("memories")
+        .and_then(|value| value.as_array())
+        .is_some_and(|items| items.is_empty())
+        && payload
+            .get("retractions")
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| items.is_empty())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserMemoryCapturePayloadError {
+    Unparseable,
+    IncompleteShape,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UserMemoryCaptureAttemptRecord {
+    slot_id: String,
+    slot_label: String,
+    role: String,
+    provider: Option<String>,
+    model: Option<String>,
+    stage: String,
+    request_kind: String,
+    outcome: String,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct UserMemoryCaptureRunOutcome {
+    payload: Option<serde_json::Value>,
+    attempts: Vec<UserMemoryCaptureAttemptRecord>,
+    selected_slot_id: Option<String>,
+    selected_slot_label: Option<String>,
+    selected_provider: Option<String>,
+    selected_model: Option<String>,
+    selected_stage: Option<String>,
+    terminal_error: Option<String>,
+}
+
+fn parse_user_memory_capture_payload(
+    raw: &str,
+) -> Result<serde_json::Value, UserMemoryCapturePayloadError> {
+    let Some(payload) = extract_json_object_from_text(raw) else {
+        return Err(UserMemoryCapturePayloadError::Unparseable);
+    };
+    if !user_memory_capture_payload_has_required_shape(&payload) {
+        return Err(UserMemoryCapturePayloadError::IncompleteShape);
+    }
+    Ok(payload)
+}
+
+fn user_memory_capture_response_preview(raw: &str, max_chars: usize) -> String {
+    safe_truncate(&crate::security::redact_secret_input(raw).text, max_chars)
+}
+
+fn log_user_memory_capture_payload_error(
+    stage: &str,
+    conversation_id: Option<&str>,
+    raw: &str,
+    error: UserMemoryCapturePayloadError,
+) {
+    let preview = user_memory_capture_response_preview(raw, 160);
+    match error {
+        UserMemoryCapturePayloadError::Unparseable => {
+            tracing::warn!(
+                "{} returned unparseable content for conversation {:?}. Preview: {}",
+                stage,
+                conversation_id,
+                preview
+            );
+        }
+        UserMemoryCapturePayloadError::IncompleteShape => {
+            tracing::warn!(
+                "{} returned incomplete shape for conversation {:?}; missing `memories` or `retractions` array. Preview: {}",
+                stage,
+                conversation_id,
+                preview
+            );
+        }
+    }
+}
+
 fn build_user_memory_capture_repair_prompt(
     original_prompt: &str,
     invalid_response_preview: &str,
@@ -2298,6 +2395,138 @@ fn learned_user_memory_keys(
         format!("user-memory-{}", hash),
         format!("user_memory::{}::{}", key.trim(), durability.trim()),
     )
+}
+
+fn user_memory_capture_error_entry(code: &str, detail: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({
+        "code": code,
+        "detail": detail.into(),
+        "at": chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+fn user_memory_operation_evidence_refs(
+    source_message_id: Option<&str>,
+    capture_event_id: Option<&str>,
+    channel: &str,
+) -> serde_json::Value {
+    let mut refs = Vec::new();
+    if let Some(source_message_id) = source_message_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        refs.push(serde_json::Value::String(format!(
+            "message:{}",
+            source_message_id
+        )));
+    }
+    if let Some(capture_event_id) = capture_event_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        refs.push(serde_json::Value::String(format!(
+            "capture_event:{}",
+            capture_event_id
+        )));
+    }
+    let trimmed_channel = channel.trim();
+    if !trimmed_channel.is_empty() {
+        refs.push(serde_json::Value::String(format!(
+            "channel:{}",
+            trimmed_channel
+        )));
+    }
+    serde_json::Value::Array(refs)
+}
+
+fn user_memory_operation_evidence_ref_value(
+    evidence_refs: &serde_json::Value,
+    prefix: &str,
+) -> Option<String> {
+    evidence_refs.as_array().and_then(|items| {
+        items.iter().find_map(|item| {
+            item.as_str()
+                .and_then(|value| value.strip_prefix(prefix))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+    })
+}
+
+fn user_memory_operation_candidate_type(operation_type: &str) -> &'static str {
+    match operation_type {
+        "retract" => "memory_retract",
+        "update" => "memory_update",
+        _ => "memory_add",
+    }
+}
+
+fn user_memory_operation_scope_explicit(
+    operation: &crate::storage::memory_operation::Model,
+) -> bool {
+    operation
+        .model_metadata
+        .get("scope_explicit")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(operation.operation_type != "retract")
+}
+
+fn user_memory_operation_semantic_key(
+    operation_type: &str,
+    key: Option<&str>,
+    memory_kind: &str,
+    durability: &str,
+    scope: &str,
+    scope_explicit: bool,
+    project_id: Option<&str>,
+    conversation_id: Option<&str>,
+    target_memory_id: Option<&str>,
+) -> String {
+    if operation_type != "retract" {
+        if let Some(target_memory_id) = target_memory_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return target_memory_id.to_string();
+        }
+    }
+    format!(
+        "memory-operation-subject-{}",
+        ambient_stable_hash(&[
+            operation_type.trim(),
+            key.unwrap_or_default().trim(),
+            memory_kind.trim(),
+            durability.trim(),
+            scope.trim(),
+            if scope_explicit { "explicit" } else { "implicit" },
+            project_id.unwrap_or_default().trim(),
+            conversation_id.unwrap_or_default().trim(),
+        ])
+    )
+}
+
+fn user_memory_operation_subject_key(operation: &crate::storage::memory_operation::Model) -> String {
+    operation
+        .model_metadata
+        .get("semantic_key")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            user_memory_operation_semantic_key(
+                &operation.operation_type,
+                operation.key.as_deref(),
+                &operation.memory_kind,
+                &operation.durability,
+                &operation.scope,
+                user_memory_operation_scope_explicit(operation),
+                operation.project_id.as_deref(),
+                operation.conversation_id.as_deref(),
+                operation.target_memory_id.as_deref(),
+            )
+        })
 }
 
 fn learned_user_memory_expired(
@@ -7103,7 +7332,11 @@ fn synthesize_app_deploy_files_from_recent_writes(
         }
         files.insert(relative, serde_json::Value::String(content));
     }
-    if files.is_empty() { None } else { Some(files) }
+    if files.is_empty() {
+        None
+    } else {
+        Some(files)
+    }
 }
 
 fn rebase_static_site_files_for_deploy(
@@ -7841,7 +8074,7 @@ fn background_session_policy_for_action(
     super::background_session::BackgroundSessionPolicy {
         allowed_action_roles: vec![planner_action_role_name(&meta.role).to_string()],
         allowed_integration_classes: vec![
-            planner_integration_class_name(&meta.integration_class).to_string(),
+            planner_integration_class_name(&meta.integration_class).to_string()
         ],
     }
     .normalized()
@@ -9765,6 +9998,9 @@ pub struct Agent {
     /// Last user activity timestamp (for idle detection by sentinel cleanup)
     pub last_activity: Arc<RwLock<Option<chrono::DateTime<chrono::Utc>>>>,
 
+    /// Foreground message requests currently being processed.
+    active_message_requests: Arc<AtomicUsize>,
+
     /// Security event counters (reset each pulse cycle)
     pub security_events: Arc<SecurityEvents>,
 
@@ -9915,11 +10151,18 @@ impl UserMemoryCaptureWorker {
         channel: &str,
         conversation_id: Option<&str>,
         project_id: Option<&str>,
+        source_message_id: Option<&str>,
     ) {
         self.capture_user_links_as_user_data(message, channel, conversation_id, project_id)
             .await;
-        self.capture_user_facts_with_llm(message, channel, conversation_id, project_id)
-            .await;
+        self.capture_user_facts_with_llm(
+            message,
+            channel,
+            conversation_id,
+            project_id,
+            source_message_id,
+        )
+        .await;
     }
 
     async fn capture_user_links_as_user_data(
@@ -9954,15 +10197,93 @@ impl UserMemoryCaptureWorker {
         channel: &str,
         conversation_id: Option<&str>,
         project_id: Option<&str>,
+        source_message_id: Option<&str>,
     ) {
         let trimmed = message.trim();
-        if trimmed.is_empty() || trimmed.chars().count() > 1_600 {
+        if trimmed.is_empty() {
+            return;
+        }
+        let source_hash = ambient_stable_hash(&[
+            channel.trim(),
+            conversation_id.unwrap_or_default().trim(),
+            project_id.unwrap_or_default().trim(),
+            source_message_id.unwrap_or_default().trim(),
+            trimmed,
+        ]);
+        let capture_now = chrono::Utc::now().to_rfc3339();
+        let replay_count = self
+            .storage
+            .count_memory_capture_events_by_source_hash(&source_hash)
+            .await
+            .unwrap_or(0)
+            .saturating_add(1)
+            .min(i32::MAX as u64) as i32;
+        let event_id = format!("memory-capture-{}", uuid::Uuid::new_v4());
+        let mut capture_event = crate::storage::memory_capture_event::Model {
+            id: event_id.clone(),
+            source_message_id: source_message_id.map(str::to_string),
+            conversation_id: conversation_id.map(str::to_string),
+            project_id: project_id.map(str::to_string),
+            channel: channel.to_string(),
+            status: "processing".to_string(),
+            capture_kind: "user_fact_memory_capture".to_string(),
+            source_hash: source_hash.clone(),
+            attempt_metadata: serde_json::json!({}),
+            error_history: serde_json::json!([]),
+            replay_count,
+            next_retry_at: None,
+            completed_at: None,
+            created_at: capture_now.clone(),
+            updated_at: capture_now.clone(),
+        };
+        capture_event.attempt_metadata = serde_json::json!({
+            "schema_version": 1,
+            "message_chars": trimmed.chars().count(),
+            "semantic_capture_key": source_hash.clone(),
+            "source": USER_LEARNED_MEMORY_CAPTURE_SOURCE,
+        });
+        capture_event.error_history = serde_json::json!([]);
+        if let Err(error) = self
+            .storage
+            .upsert_memory_capture_event(&capture_event)
+            .await
+        {
+            tracing::warn!(
+                "Failed to initialize memory capture event '{}' for conversation {:?}: {}",
+                event_id,
+                conversation_id,
+                error
+            );
+        }
+        if trimmed.chars().count() > 1_600 {
+            capture_event.status = "skipped_oversize".to_string();
+            capture_event.completed_at = Some(chrono::Utc::now().to_rfc3339());
+            capture_event.updated_at = chrono::Utc::now().to_rfc3339();
+            capture_event.error_history = serde_json::json!([user_memory_capture_error_entry(
+                "message_too_large",
+                "Skipped user memory capture because the message exceeded the 1600 character prompt limit.",
+            )]);
+            let _ = self
+                .storage
+                .upsert_memory_capture_event(&capture_event)
+                .await;
             return;
         }
         let Some(safe_message) = sanitize_user_memory_prompt_text(trimmed, 1_600) else {
             tracing::warn!(
                 "Skipping user fact memory extraction because the candidate message looked like credential material"
             );
+            capture_event.status = "rejected_sensitive_input".to_string();
+            capture_event.completed_at = Some(chrono::Utc::now().to_rfc3339());
+            capture_event.updated_at = chrono::Utc::now().to_rfc3339();
+            capture_event.error_history = serde_json::json!([user_memory_capture_error_entry(
+                "sensitive_input",
+                "Skipped user memory capture because the source message looked like credential or secret material.",
+            )]);
+            let _ = self
+                .storage
+                .upsert_memory_capture_event(&capture_event)
+                .await;
             return;
         };
         let prompt_message = safe_message.text;
@@ -9996,80 +10317,80 @@ impl UserMemoryCaptureWorker {
         );
 
         let memory_capture_candidates = self.user_memory_capture_llm_candidates();
+        let memory_capture_candidate_count = memory_capture_candidates.len();
         if memory_capture_candidates.is_empty() {
             tracing::debug!(
                 "Skipping user fact memory extraction because no chat model is configured"
             );
+            capture_event.status = "failed".to_string();
+            capture_event.completed_at = Some(chrono::Utc::now().to_rfc3339());
+            capture_event.updated_at = chrono::Utc::now().to_rfc3339();
+            capture_event.attempt_metadata = serde_json::json!({
+                "schema_version": 1,
+                "message_chars": trimmed.chars().count(),
+                "candidate_count": 0,
+                "semantic_capture_key": source_hash.clone(),
+                "source": USER_LEARNED_MEMORY_CAPTURE_SOURCE,
+            });
+            capture_event.error_history = serde_json::json!([user_memory_capture_error_entry(
+                "no_model_configured",
+                "Skipped user memory capture because no chat model was configured.",
+            )]);
+            let _ = self
+                .storage
+                .upsert_memory_capture_event(&capture_event)
+                .await;
             return;
         }
         let memory_capture_timeout_ms =
             self.user_memory_capture_timeout_ms(&memory_capture_candidates);
-        let Some(resp) = self
-            .run_memory_capture_llm(
+        let capture_outcome = self
+            .run_memory_capture_with_schema_recovery(
                 channel,
                 conversation_id,
                 &prompt,
-                memory_capture_candidates.clone(),
+                response_shape,
+                memory_capture_candidates,
                 memory_capture_timeout_ms,
             )
-            .await
-        else {
+            .await;
+        let capture_attempts_json = serde_json::to_value(&capture_outcome.attempts)
+            .unwrap_or_else(|_| serde_json::json!([]));
+        let selected_slot_id = capture_outcome.selected_slot_id.clone();
+        let selected_slot_label = capture_outcome.selected_slot_label.clone();
+        let selected_provider = capture_outcome.selected_provider.clone();
+        let selected_model = capture_outcome.selected_model.clone();
+        let selected_stage = capture_outcome.selected_stage.clone();
+        capture_event.attempt_metadata = serde_json::json!({
+            "schema_version": 1,
+            "message_chars": trimmed.chars().count(),
+            "candidate_count": memory_capture_candidate_count,
+            "semantic_capture_key": source_hash.clone(),
+            "timeout_ms": memory_capture_timeout_ms,
+            "attempts": capture_attempts_json.clone(),
+            "selected_slot_id": selected_slot_id.clone(),
+            "selected_slot_label": selected_slot_label.clone(),
+            "selected_provider": selected_provider.clone(),
+            "selected_model": selected_model.clone(),
+            "selected_stage": selected_stage.clone(),
+            "source": USER_LEARNED_MEMORY_CAPTURE_SOURCE,
+        });
+        let Some(payload) = capture_outcome.payload.clone() else {
+            capture_event.status = "failed".to_string();
+            capture_event.completed_at = Some(chrono::Utc::now().to_rfc3339());
+            capture_event.updated_at = chrono::Utc::now().to_rfc3339();
+            capture_event.error_history = serde_json::json!([user_memory_capture_error_entry(
+                "schema_recovery_failed",
+                capture_outcome.terminal_error.clone().unwrap_or_else(|| {
+                    "Memory capture failed to produce a schema-compliant payload.".to_string()
+                }),
+            )]);
+            let _ = self
+                .storage
+                .upsert_memory_capture_event(&capture_event)
+                .await;
             return;
         };
-        let mut payload = if let Some(payload) = extract_json_object_from_text(&resp.content) {
-            payload
-        } else {
-            tracing::warn!(
-                "memory capture returned unparseable content for conversation {:?}",
-                conversation_id
-            );
-            let invalid_preview = crate::security::redact_secret_input(&resp.content).text;
-            let Some(repaired) = self
-                .retry_user_memory_capture_with_schema_repair(
-                    channel,
-                    conversation_id,
-                    &prompt,
-                    &invalid_preview,
-                    response_shape,
-                    memory_capture_candidates.clone(),
-                    memory_capture_timeout_ms,
-                )
-                .await
-            else {
-                return;
-            };
-            repaired
-        };
-        if !user_memory_capture_payload_has_required_shape(&payload) {
-            // Shape violation: the capture LLM skipped one or both required
-            // arrays. Historically this was a silent drop; log so the
-            // failure mode is visible. Redact the preview so any accidental
-            // secret material in the model's stray output is never persisted
-            // to logs.
-            let redacted_preview =
-                crate::security::redact_secret_input(&resp.content).text;
-            let preview: String = redacted_preview.chars().take(160).collect();
-            tracing::warn!(
-                "memory capture returned incomplete shape for conversation {:?}; missing `memories` or `retractions` array. Preview: {}",
-                conversation_id,
-                preview
-            );
-            let Some(repaired) = self
-                .retry_user_memory_capture_with_schema_repair(
-                    channel,
-                    conversation_id,
-                    &prompt,
-                    &redacted_preview,
-                    response_shape,
-                    memory_capture_candidates,
-                    memory_capture_timeout_ms,
-                )
-                .await
-            else {
-                return;
-            };
-            payload = repaired;
-        }
         let retractions_raw = payload.get("retractions");
         let items_raw = payload.get("memories");
         let retractions = retractions_raw
@@ -10081,8 +10402,27 @@ impl UserMemoryCaptureWorker {
             .cloned()
             .unwrap_or_default();
         if retractions.is_empty() && items.is_empty() {
+            capture_event.status = "noop".to_string();
+            capture_event.completed_at = Some(chrono::Utc::now().to_rfc3339());
+            capture_event.updated_at = chrono::Utc::now().to_rfc3339();
+            capture_event.error_history = serde_json::json!([]);
+            let _ = self
+                .storage
+                .upsert_memory_capture_event(&capture_event)
+                .await;
             return;
         }
+        let model_metadata = serde_json::json!({
+            "capture_event_id": event_id.clone(),
+            "provider": selected_provider.clone(),
+            "model": selected_model.clone(),
+            "slot_id": selected_slot_id.clone(),
+            "slot_label": selected_slot_label.clone(),
+            "stage": selected_stage.clone(),
+        });
+        let mut applied_count = 0usize;
+        let mut queued_count = 0usize;
+        let mut rejected_sensitive_count = 0usize;
         let mut seen_retractions = HashSet::new();
         for item in &retractions {
             let Some(raw_key) = item.get("key").and_then(|value| value.as_str()) else {
@@ -10112,16 +10452,128 @@ impl UserMemoryCaptureWorker {
                 continue;
             }
             let reason = user_memory_json_text_field(item, "reason", 180);
-            self.retract_learned_user_memory(
-                &key,
-                retraction_kind,
-                scope.as_deref(),
-                channel,
-                conversation_id,
-                project_id,
-                reason.as_deref(),
-            )
-            .await;
+            let (resolved_scope, resolved_project_id, resolved_conversation_id) =
+                learned_user_memory_scope_ids(scope.as_deref(), project_id, conversation_id);
+            let semantic_key = user_memory_operation_semantic_key(
+                "retract",
+                Some(&key),
+                retraction_kind.unwrap_or("any"),
+                "permanent",
+                resolved_scope,
+                scope.is_some(),
+                resolved_project_id,
+                resolved_conversation_id,
+                None,
+            );
+            let mut operation_model_metadata = model_metadata.clone();
+            if let Some(object) = operation_model_metadata.as_object_mut() {
+                object.insert(
+                    "scope_explicit".to_string(),
+                    serde_json::Value::Bool(scope.is_some()),
+                );
+                object.insert(
+                    "requested_scope".to_string(),
+                    serde_json::Value::String(scope.clone().unwrap_or_else(|| "any".to_string())),
+                );
+                object.insert(
+                    "semantic_key".to_string(),
+                    serde_json::Value::String(semantic_key),
+                );
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+            let mut operation = crate::storage::memory_operation::Model {
+                id: format!("memory-operation-{}", uuid::Uuid::new_v4()),
+                capture_event_id: Some(event_id.clone()),
+                operation_type: "retract".to_string(),
+                status: "queued_review".to_string(),
+                target_memory_id: None,
+                applied_memory_id: None,
+                key: Some(key.clone()),
+                value: None,
+                memory_kind: retraction_kind.unwrap_or("any").to_string(),
+                durability: "permanent".to_string(),
+                scope: resolved_scope.to_string(),
+                project_id: resolved_project_id.map(str::to_string),
+                conversation_id: resolved_conversation_id.map(str::to_string),
+                confidence: confidence as f64,
+                looks_sensitive: false,
+                sensitive_reason: None,
+                valid_from: None,
+                expires_at: None,
+                review_at: None,
+                rationale: reason.clone(),
+                evidence_refs: user_memory_operation_evidence_refs(
+                    source_message_id,
+                    Some(&event_id),
+                    channel,
+                ),
+                model_metadata: operation_model_metadata,
+                apply_metadata: serde_json::json!({}),
+                applied_at: None,
+                reviewed_at: None,
+                review_notes: None,
+                created_at: now.clone(),
+                updated_at: now,
+            };
+            if confidence as f64 >= USER_MEMORY_OPERATION_AUTO_APPLY_CONFIDENCE {
+                operation.status = "pending_apply".to_string();
+                if let Err(error) = self.storage.upsert_memory_operation(&operation).await {
+                    tracing::warn!(
+                        "Failed to stage memory retraction operation '{}' for conversation {:?}: {}",
+                        operation.id,
+                        conversation_id,
+                        error
+                    );
+                    continue;
+                }
+                match self
+                    .apply_memory_operation(&operation, "capture_auto_apply")
+                    .await
+                {
+                    Ok(_) => {
+                        applied_count += 1;
+                    }
+                    Err(error) => {
+                        operation.status = "queued_review".to_string();
+                        operation.review_notes = Some(format!(
+                            "Auto-apply failed: {}",
+                            safe_truncate(&error.to_string(), 240)
+                        ));
+                        operation.updated_at = chrono::Utc::now().to_rfc3339();
+                        let _ = self.storage.upsert_memory_operation(&operation).await;
+                        if let Err(queue_error) =
+                            self.queue_memory_operation_candidate(&operation).await
+                        {
+                            tracing::warn!(
+                                "Failed to queue review candidate for memory operation '{}': {}",
+                                operation.id,
+                                queue_error
+                            );
+                        } else {
+                            queued_count += 1;
+                        }
+                    }
+                }
+            } else {
+                if let Err(error) = self.storage.upsert_memory_operation(&operation).await {
+                    tracing::warn!(
+                        "Failed to stage review memory retraction operation '{}' for conversation {:?}: {}",
+                        operation.id,
+                        conversation_id,
+                        error
+                    );
+                    continue;
+                }
+                if let Err(error) = self.queue_memory_operation_candidate(&operation).await {
+                    tracing::warn!(
+                        "Failed to queue review candidate for memory operation '{}': {}",
+                        operation.id,
+                        error
+                    );
+                    continue;
+                }
+                queued_count += 1;
+            }
         }
         let mut seen = HashSet::new();
         for item in &items {
@@ -10134,16 +10586,10 @@ impl UserMemoryCaptureWorker {
             let Some(key) = normalize_user_fact_key(raw_key) else {
                 continue;
             };
-            if user_memory_capture_item_looks_sensitive(item) {
-                tracing::warn!(
-                    "Skipped learned user memory '{}' because the capture model marked it sensitive",
-                    key
-                );
-                continue;
-            }
             let Some(value) = normalize_user_memory_text(raw_value, 320) else {
                 continue;
             };
+            let looks_sensitive = user_memory_capture_item_looks_sensitive(item);
             let mut durability = normalize_user_memory_durability(
                 item.get("durability").and_then(|value| value.as_str()),
             )
@@ -10184,23 +10630,510 @@ impl UserMemoryCaptureWorker {
                 continue;
             }
             let reason = user_memory_json_text_field(item, "reason", 180);
-            self.upsert_learned_user_memory(
+            let sensitive_reason = user_memory_json_text_field(item, "sensitive_reason", 180);
+            let raw_kind = item
+                .get("kind")
+                .and_then(|value| value.as_str())
+                .and_then(|value| normalize_user_memory_text(value, 64))
+                .unwrap_or_else(|| "other".to_string());
+            let (resolved_scope, resolved_project_id, resolved_conversation_id) =
+                learned_user_memory_scope_ids(Some(&scope), project_id, conversation_id);
+            let (target_memory_id, _) = learned_user_memory_keys(
                 &key,
-                &value,
-                item.get("kind").and_then(|value| value.as_str()),
-                Some(&durability),
-                Some(&scope),
-                confidence,
-                channel,
-                conversation_id,
-                project_id,
-                USER_LEARNED_MEMORY_CAPTURE_SOURCE,
-                valid_from,
-                expires_at,
-                review_at,
-                reason.as_deref(),
-            )
+                &durability,
+                resolved_project_id,
+                resolved_conversation_id,
+            );
+            let operation_type = match self.storage.get_experience_item(&target_memory_id).await {
+                Ok(Some(existing)) if existing.status == "active" => "update",
+                _ => "add",
+            };
+            let scope_explicit = item.get("scope").and_then(|value| value.as_str()).is_some();
+            let semantic_key = user_memory_operation_semantic_key(
+                operation_type,
+                Some(&key),
+                &raw_kind,
+                &durability,
+                resolved_scope,
+                scope_explicit,
+                resolved_project_id,
+                resolved_conversation_id,
+                Some(&target_memory_id),
+            );
+            let mut operation_model_metadata = model_metadata.clone();
+            if let Some(object) = operation_model_metadata.as_object_mut() {
+                object.insert(
+                    "scope_explicit".to_string(),
+                    serde_json::Value::Bool(scope_explicit),
+                );
+                object.insert(
+                    "semantic_key".to_string(),
+                    serde_json::Value::String(semantic_key),
+                );
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+            let mut operation = crate::storage::memory_operation::Model {
+                id: format!("memory-operation-{}", uuid::Uuid::new_v4()),
+                capture_event_id: Some(event_id.clone()),
+                operation_type: operation_type.to_string(),
+                status: "queued_review".to_string(),
+                target_memory_id: Some(target_memory_id.clone()),
+                applied_memory_id: None,
+                key: Some(key.clone()),
+                value: if looks_sensitive {
+                    None
+                } else {
+                    Some(value.clone())
+                },
+                memory_kind: raw_kind,
+                durability: durability.clone(),
+                scope: resolved_scope.to_string(),
+                project_id: resolved_project_id.map(str::to_string),
+                conversation_id: resolved_conversation_id.map(str::to_string),
+                confidence: confidence as f64,
+                looks_sensitive,
+                sensitive_reason: sensitive_reason.clone(),
+                valid_from: valid_from.map(|value| value.to_rfc3339()),
+                expires_at: expires_at.map(|value| value.to_rfc3339()),
+                review_at: review_at.map(|value| value.to_rfc3339()),
+                rationale: reason.clone(),
+                evidence_refs: user_memory_operation_evidence_refs(
+                    source_message_id,
+                    Some(&event_id),
+                    channel,
+                ),
+                model_metadata: operation_model_metadata,
+                apply_metadata: serde_json::json!({}),
+                applied_at: None,
+                reviewed_at: None,
+                review_notes: None,
+                created_at: now.clone(),
+                updated_at: now,
+            };
+            if looks_sensitive {
+                tracing::warn!(
+                    "Rejected learned user memory '{}' because the capture model marked it sensitive",
+                    key
+                );
+                operation.status = "rejected_sensitive".to_string();
+                if let Err(error) = self.storage.upsert_memory_operation(&operation).await {
+                    tracing::warn!(
+                        "Failed to persist rejected sensitive memory operation '{}' for conversation {:?}: {}",
+                        operation.id,
+                        conversation_id,
+                        error
+                    );
+                } else {
+                    rejected_sensitive_count += 1;
+                }
+                continue;
+            }
+            if confidence as f64 >= USER_MEMORY_OPERATION_AUTO_APPLY_CONFIDENCE {
+                operation.status = "pending_apply".to_string();
+                if let Err(error) = self.storage.upsert_memory_operation(&operation).await {
+                    tracing::warn!(
+                        "Failed to stage memory operation '{}' for conversation {:?}: {}",
+                        operation.id,
+                        conversation_id,
+                        error
+                    );
+                    continue;
+                }
+                match self
+                    .apply_memory_operation(&operation, "capture_auto_apply")
+                    .await
+                {
+                    Ok(_) => {
+                        applied_count += 1;
+                    }
+                    Err(error) => {
+                        operation.status = "queued_review".to_string();
+                        operation.review_notes = Some(format!(
+                            "Auto-apply failed: {}",
+                            safe_truncate(&error.to_string(), 240)
+                        ));
+                        operation.updated_at = chrono::Utc::now().to_rfc3339();
+                        let _ = self.storage.upsert_memory_operation(&operation).await;
+                        if let Err(queue_error) =
+                            self.queue_memory_operation_candidate(&operation).await
+                        {
+                            tracing::warn!(
+                                "Failed to queue review candidate for memory operation '{}': {}",
+                                operation.id,
+                                queue_error
+                            );
+                        } else {
+                            queued_count += 1;
+                        }
+                    }
+                }
+            } else {
+                if let Err(error) = self.storage.upsert_memory_operation(&operation).await {
+                    tracing::warn!(
+                        "Failed to stage review memory operation '{}' for conversation {:?}: {}",
+                        operation.id,
+                        conversation_id,
+                        error
+                    );
+                    continue;
+                }
+                if let Err(error) = self.queue_memory_operation_candidate(&operation).await {
+                    tracing::warn!(
+                        "Failed to queue review candidate for memory operation '{}': {}",
+                        operation.id,
+                        error
+                    );
+                    continue;
+                }
+                queued_count += 1;
+            }
+        }
+        capture_event.status = if queued_count > 0 {
+            "queued_review".to_string()
+        } else if applied_count > 0 {
+            "applied".to_string()
+        } else if rejected_sensitive_count > 0 {
+            "rejected_sensitive".to_string()
+        } else {
+            "noop".to_string()
+        };
+        capture_event.completed_at = Some(chrono::Utc::now().to_rfc3339());
+        capture_event.updated_at = chrono::Utc::now().to_rfc3339();
+        capture_event.error_history = serde_json::json!([]);
+        capture_event.attempt_metadata = serde_json::json!({
+            "schema_version": 1,
+            "message_chars": trimmed.chars().count(),
+            "candidate_count": memory_capture_candidate_count,
+            "semantic_capture_key": source_hash,
+            "timeout_ms": memory_capture_timeout_ms,
+            "attempts": capture_attempts_json,
+            "selected_slot_id": selected_slot_id,
+            "selected_slot_label": selected_slot_label,
+            "selected_provider": selected_provider,
+            "selected_model": selected_model,
+            "selected_stage": selected_stage,
+            "applied_count": applied_count,
+            "queued_review_count": queued_count,
+            "rejected_sensitive_count": rejected_sensitive_count,
+            "source": USER_LEARNED_MEMORY_CAPTURE_SOURCE,
+        });
+        let _ = self
+            .storage
+            .upsert_memory_capture_event(&capture_event)
             .await;
+    }
+
+    async fn queue_memory_operation_candidate(
+        &self,
+        operation: &crate::storage::memory_operation::Model,
+    ) -> Result<String> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let candidate_type = user_memory_operation_candidate_type(&operation.operation_type);
+        let subject_key = user_memory_operation_subject_key(operation);
+        let title = match operation.operation_type.as_str() {
+            "retract" => format!(
+                "Review memory retraction: {}",
+                operation.key.as_deref().unwrap_or(operation.id.as_str())
+            ),
+            "update" => format!(
+                "Review memory update: {}",
+                operation.key.as_deref().unwrap_or(operation.id.as_str())
+            ),
+            _ => format!(
+                "Review memory addition: {}",
+                operation.key.as_deref().unwrap_or(operation.id.as_str())
+            ),
+        };
+        let candidate = crate::storage::learning_candidate::Model {
+            id: format!("memory-candidate-{}", operation.id),
+            candidate_type: candidate_type.to_string(),
+            subject_key: subject_key.clone(),
+            title,
+            summary: operation.rationale.clone(),
+            project_id: operation.project_id.clone(),
+            conversation_id: operation.conversation_id.clone(),
+            pattern_id: operation.capture_event_id.clone(),
+            evidence_refs: operation.evidence_refs.clone(),
+            proposed_content: serde_json::json!({
+                "operation_id": operation.id.clone(),
+                "capture_event_id": operation.capture_event_id.clone(),
+                "operation_type": operation.operation_type.clone(),
+                "target_memory_id": operation.target_memory_id.clone(),
+                "applied_memory_id": operation.applied_memory_id.clone(),
+                "key": operation.key.clone(),
+                "value": operation.value.clone(),
+                "memory_kind": operation.memory_kind.clone(),
+                "durability": operation.durability.clone(),
+                "scope": operation.scope.clone(),
+                "confidence": operation.confidence,
+                "looks_sensitive": operation.looks_sensitive,
+                "sensitive_reason": operation.sensitive_reason.clone(),
+                "valid_from": operation.valid_from.clone(),
+                "expires_at": operation.expires_at.clone(),
+                "review_at": operation.review_at.clone(),
+                "rationale": operation.rationale.clone(),
+                "status": operation.status.clone(),
+                "scope_explicit": user_memory_operation_scope_explicit(operation),
+                "semantic_key": subject_key.clone(),
+            }),
+            confidence: operation.confidence,
+            approval_status: "draft".to_string(),
+            review_notes: operation.review_notes.clone(),
+            reviewed_at: None,
+            approved_ref: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        self.storage.upsert_learning_candidate(&candidate).await?;
+        let prior_candidates = self
+            .storage
+            .list_learning_candidates_for_subject_key(
+                &candidate.subject_key,
+                MEMORY_OPERATION_CANDIDATE_TYPES,
+                candidate.project_id.as_deref(),
+                32,
+            )
+            .await?;
+        for prior_candidate in prior_candidates {
+            if prior_candidate.id == candidate.id || prior_candidate.approval_status != "draft" {
+                continue;
+            }
+            let superseded = self
+                .storage
+                .update_learning_candidate_review_if_status(
+                    &prior_candidate.id,
+                    "draft",
+                    "superseded",
+                    Some("Superseded by a newer memory operation candidate."),
+                    None,
+                )
+                .await?;
+            if !superseded {
+                continue;
+            }
+            if let Some(operation_id) = prior_candidate
+                .proposed_content
+                .get("operation_id")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                if let Some(mut prior_operation) = self.storage.get_memory_operation(operation_id).await?
+                {
+                    if prior_operation.status == "queued_review" {
+                        prior_operation.status = "superseded".to_string();
+                        prior_operation.reviewed_at = Some(chrono::Utc::now().to_rfc3339());
+                        prior_operation.review_notes =
+                            Some("Superseded by a newer memory operation candidate.".to_string());
+                        prior_operation.updated_at = chrono::Utc::now().to_rfc3339();
+                        let _ = self.storage.upsert_memory_operation(&prior_operation).await;
+                    }
+                }
+            }
+        }
+        Ok(candidate.id)
+    }
+
+    async fn apply_memory_operation_by_id_with_source(
+        &self,
+        operation_id: &str,
+        apply_source: &str,
+    ) -> Result<String> {
+        let operation = self
+            .storage
+            .get_memory_operation(operation_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Memory operation not found."))?;
+        self.apply_memory_operation(&operation, apply_source).await
+    }
+
+    async fn apply_memory_operation(
+        &self,
+        operation: &crate::storage::memory_operation::Model,
+        apply_source: &str,
+    ) -> Result<String> {
+        let mut operation_update = operation.clone();
+        let applied_at = chrono::Utc::now().to_rfc3339();
+        let source_message_id =
+            user_memory_operation_evidence_ref_value(&operation.evidence_refs, "message:");
+        let capture_event_id =
+            user_memory_operation_evidence_ref_value(&operation.evidence_refs, "capture_event:");
+        let evidence_channel =
+            user_memory_operation_evidence_ref_value(&operation.evidence_refs, "channel:")
+                .unwrap_or_else(|| "chat".to_string());
+        let result = async {
+            match operation.operation_type.as_str() {
+                "add" | "update" => {
+                    let key = operation
+                        .key
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("Memory operation is missing key."))?;
+                    let value = operation
+                        .value
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("Memory operation is missing value."))?;
+                    let memory_id = self
+                        .upsert_learned_user_memory(
+                            key,
+                            value,
+                            Some(&operation.memory_kind),
+                            Some(&operation.durability),
+                            Some(&operation.scope),
+                            operation.confidence.clamp(0.0, 1.0) as f32,
+                            &evidence_channel,
+                            operation.conversation_id.as_deref(),
+                            operation.project_id.as_deref(),
+                            USER_LEARNED_MEMORY_CAPTURE_SOURCE,
+                            operation
+                                .valid_from
+                                .as_deref()
+                                .and_then(parse_ambient_rfc3339),
+                            operation
+                                .expires_at
+                                .as_deref()
+                                .and_then(parse_ambient_rfc3339),
+                            operation
+                                .review_at
+                                .as_deref()
+                                .and_then(parse_ambient_rfc3339),
+                            operation.rationale.as_deref(),
+                        )
+                        .await
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Memory operation did not persist a memory item.")
+                        })?;
+                    Ok::<String, anyhow::Error>(memory_id)
+                }
+                "retract" => {
+                    let key = operation
+                        .key
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("Memory retraction is missing key."))?;
+                    let scope = if user_memory_operation_scope_explicit(operation) {
+                        Some(operation.scope.as_str())
+                    } else {
+                        None
+                    };
+                    let retracted_ids = self
+                        .retract_learned_user_memory(
+                            key,
+                            Some(&operation.memory_kind),
+                            scope,
+                            &evidence_channel,
+                            operation.conversation_id.as_deref(),
+                            operation.project_id.as_deref(),
+                            operation.rationale.as_deref(),
+                        )
+                        .await;
+                    Ok::<String, anyhow::Error>(
+                        retracted_ids
+                            .first()
+                            .cloned()
+                            .or_else(|| operation.target_memory_id.clone())
+                            .unwrap_or_else(|| operation.id.clone()),
+                    )
+                }
+                other => Err(anyhow::anyhow!(
+                    "Unsupported memory operation type '{}'.",
+                    other
+                )),
+            }
+        }
+        .await;
+
+        match result {
+            Ok(approved_ref) => {
+                let linked_memory_id = operation.target_memory_id.clone().or_else(|| {
+                    if operation.operation_type == "retract" && approved_ref == operation.id {
+                        None
+                    } else {
+                        Some(approved_ref.clone())
+                    }
+                });
+                operation_update.status = "applied".to_string();
+                operation_update.applied_memory_id = linked_memory_id
+                    .clone()
+                    .or_else(|| Some(approved_ref.clone()));
+                operation_update.applied_at = Some(applied_at.clone());
+                if apply_source != "capture_auto_apply" {
+                    operation_update.reviewed_at = Some(applied_at.clone());
+                }
+                operation_update.review_notes = None;
+                operation_update.updated_at = applied_at.clone();
+                operation_update.apply_metadata = serde_json::json!({
+                    "applied_via": apply_source,
+                    "applied_at": applied_at,
+                });
+                self.storage
+                    .upsert_memory_operation(&operation_update)
+                    .await?;
+                if let Some(memory_id) = linked_memory_id.as_deref() {
+                    if let Some(source_message_id) = source_message_id.as_deref() {
+                        let link = crate::storage::memory_evidence_link::Model {
+                            id: format!(
+                                "memory-evidence-{}",
+                                ambient_stable_hash(&[
+                                    operation.id.as_str(),
+                                    memory_id,
+                                    "message",
+                                    source_message_id,
+                                ])
+                            ),
+                            operation_id: Some(operation.id.clone()),
+                            memory_id: Some(memory_id.to_string()),
+                            evidence_kind: "message".to_string(),
+                            evidence_ref: source_message_id.to_string(),
+                            source_message_id: Some(source_message_id.to_string()),
+                            capture_event_id: capture_event_id.clone(),
+                            project_id: operation.project_id.clone(),
+                            conversation_id: operation.conversation_id.clone(),
+                            metadata: serde_json::json!({ "applied_via": apply_source }),
+                            created_at: chrono::Utc::now().to_rfc3339(),
+                        };
+                        let _ = self.storage.upsert_memory_evidence_link(&link).await;
+                    }
+                    if let Some(capture_event_id) = capture_event_id.as_deref() {
+                        let link = crate::storage::memory_evidence_link::Model {
+                            id: format!(
+                                "memory-evidence-{}",
+                                ambient_stable_hash(&[
+                                    operation.id.as_str(),
+                                    memory_id,
+                                    "capture_event",
+                                    capture_event_id,
+                                ])
+                            ),
+                            operation_id: Some(operation.id.clone()),
+                            memory_id: Some(memory_id.to_string()),
+                            evidence_kind: "capture_event".to_string(),
+                            evidence_ref: capture_event_id.to_string(),
+                            source_message_id: source_message_id.clone(),
+                            capture_event_id: Some(capture_event_id.to_string()),
+                            project_id: operation.project_id.clone(),
+                            conversation_id: operation.conversation_id.clone(),
+                            metadata: serde_json::json!({ "applied_via": apply_source }),
+                            created_at: chrono::Utc::now().to_rfc3339(),
+                        };
+                        let _ = self.storage.upsert_memory_evidence_link(&link).await;
+                    }
+                }
+                Ok(approved_ref)
+            }
+            Err(error) => {
+                operation_update.status = "apply_failed".to_string();
+                operation_update.review_notes = Some(safe_truncate(&error.to_string(), 240));
+                operation_update.updated_at = chrono::Utc::now().to_rfc3339();
+                operation_update.apply_metadata = serde_json::json!({
+                    "applied_via": apply_source,
+                    "failed_at": chrono::Utc::now().to_rfc3339(),
+                    "error": safe_truncate(&error.to_string(), 240),
+                });
+                let _ = self
+                    .storage
+                    .upsert_memory_operation(&operation_update)
+                    .await;
+                Err(error)
+            }
         }
     }
 
@@ -10335,9 +11268,9 @@ impl UserMemoryCaptureWorker {
         mut expires_at: Option<chrono::DateTime<chrono::Utc>>,
         review_at: Option<chrono::DateTime<chrono::Utc>>,
         reason: Option<&str>,
-    ) {
+    ) -> Option<String> {
         let Some(key) = normalize_user_fact_key(key) else {
-            return;
+            return None;
         };
         let Some(sanitized_memory) = sanitize_learned_user_memory_content_for_storage(&key, value)
         else {
@@ -10345,7 +11278,7 @@ impl UserMemoryCaptureWorker {
                 "Skipped learned user memory '{}' because its candidate value looked like credential material",
                 key
             );
-            return;
+            return None;
         };
         let value = sanitized_memory.value;
         let content = sanitized_memory.content;
@@ -10362,11 +11295,11 @@ impl UserMemoryCaptureWorker {
             .map(|dt| dt <= &capture_now)
             .unwrap_or(false)
         {
-            return;
+            return None;
         }
         let confidence = confidence.clamp(0.0, 1.0);
         if confidence < 0.55 {
-            return;
+            return None;
         }
         let normalized_kind = normalize_user_memory_kind(kind);
         let semantic_kind = learned_user_memory_semantic_kind(Some(&key), kind);
@@ -10393,7 +11326,7 @@ impl UserMemoryCaptureWorker {
                     scope,
                     error
                 );
-                return;
+                return None;
             }
         };
         let existing = match self.storage.get_experience_item_txn(&txn, &id).await {
@@ -10405,7 +11338,7 @@ impl UserMemoryCaptureWorker {
                     error
                 );
                 let _ = txn.rollback().await;
-                return;
+                return None;
             }
         };
         let mut metadata = existing
@@ -10467,10 +11400,7 @@ impl UserMemoryCaptureWorker {
                     if reason.redacted_secret {
                         memory_secret_redacted = true;
                     }
-                    metadata.insert(
-                        "reason".to_string(),
-                        serde_json::Value::String(reason.text),
-                    );
+                    metadata.insert("reason".to_string(), serde_json::Value::String(reason.text));
                 }
                 None => {
                     metadata.remove("reason");
@@ -10479,10 +11409,7 @@ impl UserMemoryCaptureWorker {
             }
         }
         if memory_secret_redacted {
-            metadata.insert(
-                "secret_redacted".to_string(),
-                serde_json::Value::Bool(true),
-            );
+            metadata.insert("secret_redacted".to_string(), serde_json::Value::Bool(true));
         }
         let merged_confidence = existing
             .as_ref()
@@ -10492,38 +11419,39 @@ impl UserMemoryCaptureWorker {
             .as_ref()
             .map(|item| item.support_count.saturating_add(1))
             .unwrap_or(1);
-        let build_memory_item = |embedding: Option<PgVector>| crate::storage::experience_item::Model {
-            id: id.clone(),
-            kind: normalized_kind.to_string(),
-            scope: scope.to_string(),
-            project_id: scoped_project_id.map(str::to_string),
-            conversation_id: scoped_conversation_id.map(str::to_string),
-            title: if normalized_kind == "constraint" {
-                "Learned operating constraint".to_string()
-            } else {
-                "Learned user memory".to_string()
-            },
-            content: content.clone(),
-            normalized_key: normalized_key.clone(),
-            confidence: merged_confidence,
-            support_count,
-            contradiction_count: existing
-                .as_ref()
-                .map(|item| item.contradiction_count)
-                .unwrap_or_default(),
-            status: "active".to_string(),
-            metadata: serde_json::Value::Object(metadata.clone()),
-            last_supported_at: Some(now.clone()),
-            last_contradicted_at: existing
-                .as_ref()
-                .and_then(|item| item.last_contradicted_at.clone()),
-            created_at: existing
-                .as_ref()
-                .map(|item| item.created_at.clone())
-                .unwrap_or_else(|| now.clone()),
-            updated_at: now.clone(),
-            embedding,
-        };
+        let build_memory_item =
+            |embedding: Option<PgVector>| crate::storage::experience_item::Model {
+                id: id.clone(),
+                kind: normalized_kind.to_string(),
+                scope: scope.to_string(),
+                project_id: scoped_project_id.map(str::to_string),
+                conversation_id: scoped_conversation_id.map(str::to_string),
+                title: if normalized_kind == "constraint" {
+                    "Learned operating constraint".to_string()
+                } else {
+                    "Learned user memory".to_string()
+                },
+                content: content.clone(),
+                normalized_key: normalized_key.clone(),
+                confidence: merged_confidence,
+                support_count,
+                contradiction_count: existing
+                    .as_ref()
+                    .map(|item| item.contradiction_count)
+                    .unwrap_or_default(),
+                status: "active".to_string(),
+                metadata: serde_json::Value::Object(metadata.clone()),
+                last_supported_at: Some(now.clone()),
+                last_contradicted_at: existing
+                    .as_ref()
+                    .and_then(|item| item.last_contradicted_at.clone()),
+                created_at: existing
+                    .as_ref()
+                    .map(|item| item.created_at.clone())
+                    .unwrap_or_else(|| now.clone()),
+                updated_at: now.clone(),
+                embedding,
+            };
 
         let exact_active_row = existing.as_ref().filter(|item| item.status == "active");
         if let Some(current) = exact_active_row {
@@ -10564,14 +11492,18 @@ impl UserMemoryCaptureWorker {
                 }
             };
             let memory_item = build_memory_item(embedding);
-            if let Err(error) = self.storage.upsert_experience_item_txn(&txn, &memory_item).await {
+            if let Err(error) = self
+                .storage
+                .upsert_experience_item_txn(&txn, &memory_item)
+                .await
+            {
                 tracing::warn!(
                     "Failed to capture lifecycle user memory '{}' into experience graph: {}",
                     key,
                     error
                 );
                 let _ = txn.rollback().await;
-                return;
+                return None;
             }
             if let Err(error) = txn.commit().await {
                 tracing::warn!(
@@ -10579,8 +11511,9 @@ impl UserMemoryCaptureWorker {
                     key,
                     error
                 );
+                return None;
             }
-            return;
+            return Some(id.clone());
         }
 
         let mut insert_embedding = existing.as_ref().and_then(|item| {
@@ -10613,15 +11546,16 @@ impl UserMemoryCaptureWorker {
             )
             .await
             {
-                Ok(crate::core::memory_dedup::AbsorbOutcome::Absorbed { .. }) => {
+                Ok(crate::core::memory_dedup::AbsorbOutcome::Absorbed { canonical_id, .. }) => {
                     if let Err(error) = txn.commit().await {
                         tracing::warn!(
                             "Failed to commit learned user memory absorb for '{}': {}",
                             key,
                             error
                         );
+                        return None;
                     }
-                    return;
+                    return Some(canonical_id);
                 }
                 Ok(crate::core::memory_dedup::AbsorbOutcome::Insert { embedding }) => {
                     insert_embedding = Some(embedding);
@@ -10637,14 +11571,18 @@ impl UserMemoryCaptureWorker {
         }
 
         let memory_item = build_memory_item(insert_embedding);
-        if let Err(error) = self.storage.upsert_experience_item_txn(&txn, &memory_item).await {
+        if let Err(error) = self
+            .storage
+            .upsert_experience_item_txn(&txn, &memory_item)
+            .await
+        {
             tracing::warn!(
                 "Failed to capture lifecycle user memory '{}' into experience graph: {}",
                 key,
                 error
             );
             let _ = txn.rollback().await;
-            return;
+            return None;
         }
         if let Err(error) = txn.commit().await {
             tracing::warn!(
@@ -10652,7 +11590,9 @@ impl UserMemoryCaptureWorker {
                 key,
                 error
             );
+            return None;
         }
+        Some(id)
     }
 
     async fn retract_learned_user_memory(
@@ -10664,9 +11604,9 @@ impl UserMemoryCaptureWorker {
         conversation_id: Option<&str>,
         project_id: Option<&str>,
         reason: Option<&str>,
-    ) {
+    ) -> Vec<String> {
         let Some(key) = normalize_user_fact_key(key) else {
-            return;
+            return Vec::new();
         };
         let requested_kind = kind
             .map(|value| normalize_self_memory_lookup_kind(Some(value)))
@@ -10676,7 +11616,11 @@ impl UserMemoryCaptureWorker {
             learned_user_memory_scope_ids(scope, project_id, conversation_id);
         let now = chrono::Utc::now();
         let mut lock_targets = if explicit_scope {
-            vec![(requested_scope, requested_project_id, requested_conversation_id)]
+            vec![(
+                requested_scope,
+                requested_project_id,
+                requested_conversation_id,
+            )]
         } else {
             let mut targets = vec![("global", None, None)];
             if project_id.is_some() {
@@ -10691,7 +11635,7 @@ impl UserMemoryCaptureWorker {
         let Some((lock_scope, lock_project_id, lock_conversation_id)) =
             lock_targets.first().copied()
         else {
-            return;
+            return Vec::new();
         };
         let txn = match self
             .storage
@@ -10711,7 +11655,7 @@ impl UserMemoryCaptureWorker {
                     requested_scope,
                     error
                 );
-                return;
+                return Vec::new();
             }
         };
         for (extra_scope, extra_project_id, extra_conversation_id) in lock_targets.iter().skip(1) {
@@ -10732,7 +11676,8 @@ impl UserMemoryCaptureWorker {
                     extra_scope,
                     error
                 );
-                return;
+                let _ = txn.rollback().await;
+                return Vec::new();
             }
         }
         let active_items = self
@@ -10752,7 +11697,8 @@ impl UserMemoryCaptureWorker {
                     key,
                     error
                 );
-                return;
+                let _ = txn.rollback().await;
+                return Vec::new();
             }
         };
         let scoped_items = active_items
@@ -10790,6 +11736,7 @@ impl UserMemoryCaptureWorker {
                 }
             }
         }
+        let mut retracted_ids = Vec::new();
         for item in matches {
             let mut updated = item.clone();
             let mut metadata = ambient_intent_metadata_object(&item);
@@ -10816,13 +11763,19 @@ impl UserMemoryCaptureWorker {
             updated.last_contradicted_at = Some(now.to_rfc3339());
             updated.updated_at = now.to_rfc3339();
             updated.metadata = serde_json::Value::Object(metadata);
-            if let Err(error) = self.storage.upsert_experience_item_txn(&txn, &updated).await {
+            if let Err(error) = self
+                .storage
+                .upsert_experience_item_txn(&txn, &updated)
+                .await
+            {
                 tracing::warn!(
                     "Failed to retract learned user memory '{}' from experience graph: {}",
                     key,
                     error
                 );
+                continue;
             }
+            retracted_ids.push(updated.id.clone());
         }
         if let Err(error) = txn.commit().await {
             tracing::warn!(
@@ -10830,7 +11783,9 @@ impl UserMemoryCaptureWorker {
                 key,
                 error
             );
+            return Vec::new();
         }
+        retracted_ids
     }
 
     fn user_selected_model_slot_id(&self) -> Option<String> {
@@ -10910,16 +11865,17 @@ impl UserMemoryCaptureWorker {
         }
     }
 
-    async fn run_memory_capture_llm(
+    async fn run_memory_capture_llm_candidate(
         &self,
         channel: &str,
         conversation_id: Option<&str>,
+        request_kind: &str,
         prompt: &str,
-        candidates: Vec<LlmAttemptCandidate>,
+        candidate: &LlmAttemptCandidate,
         timeout_ms: u64,
-    ) -> Option<super::llm::LlmResponse> {
+    ) -> Result<super::llm::LlmResponse> {
         let request = super::ExecutionRequest {
-            kind: "user_fact_memory_capture".to_string(),
+            kind: request_kind.to_string(),
             channel: Some(channel.to_string()),
             conversation_id: conversation_id.map(str::to_string),
             session_id: conversation_id.map(str::to_string),
@@ -10935,88 +11891,262 @@ impl UserMemoryCaptureWorker {
         };
         let memories: [PromptMemory; 0] = [];
         let actions: [crate::actions::ActionDef; 0] = [];
-        for candidate in candidates
-            .iter()
-            .take(USER_FACT_MEMORY_CAPTURE_MAX_CANDIDATES.max(1))
+        match super::execute_supervised_transport_chat(
+            &self.execution_supervisor,
+            &candidate.client,
+            &request,
+            "You extract lifecycle-aware user memory as strict JSON. Output JSON only.",
+            prompt,
+            &memories,
+            &actions,
+            Some(timeout_ms.max(1)),
+        )
+        .await
         {
-            match super::execute_supervised_transport_chat(
-                &self.execution_supervisor,
-                &candidate.client,
-                &request,
-                "You extract lifecycle-aware user memory as strict JSON. Output JSON only.",
-                prompt,
-                &memories,
-                &actions,
-                Some(timeout_ms.max(1)),
-            )
-            .await
-            {
-                Ok(resp) => {
-                    self.record_llm_usage(channel, "user_fact_memory_capture", &resp)
-                        .await;
-                    return Some(resp);
-                }
-                Err(error) => {
-                    tracing::debug!(
-                        "User memory capture attempt failed on {} [{}]: {}",
-                        candidate.slot_label,
-                        candidate.client.model_name(),
-                        error
-                    );
-                }
+            Ok(resp) => {
+                self.record_llm_usage(channel, "user_fact_memory_capture", &resp)
+                    .await;
+                Ok(resp)
+            }
+            Err(error) => {
+                tracing::debug!(
+                    "User memory capture attempt failed on {} [{}]: {}",
+                    candidate.slot_label,
+                    candidate.client.model_name(),
+                    error
+                );
+                Err(error)
             }
         }
-        None
     }
 
-    async fn retry_user_memory_capture_with_schema_repair(
+    async fn run_memory_capture_with_schema_recovery(
         &self,
         channel: &str,
         conversation_id: Option<&str>,
         original_prompt: &str,
-        invalid_response: &str,
         response_shape: &str,
         candidates: Vec<LlmAttemptCandidate>,
         timeout_ms: u64,
-    ) -> Option<serde_json::Value> {
+    ) -> UserMemoryCaptureRunOutcome {
+        let mut attempts = Vec::new();
         if candidates.is_empty() {
-            return None;
+            return UserMemoryCaptureRunOutcome {
+                payload: None,
+                attempts,
+                selected_slot_id: None,
+                selected_slot_label: None,
+                selected_provider: None,
+                selected_model: None,
+                selected_stage: None,
+                terminal_error: Some("No memory capture candidates were available.".to_string()),
+            };
         }
-        let invalid_preview = safe_truncate(
-            &crate::security::redact_secret_input(invalid_response).text,
-            240,
-        );
-        let repair_prompt = build_user_memory_capture_repair_prompt(
-            original_prompt,
-            &invalid_preview,
-            response_shape,
-        );
-        let resp = self
-            .run_memory_capture_llm(
-                channel,
-                conversation_id,
-                &repair_prompt,
-                candidates,
-                timeout_ms,
-            )
-            .await?;
-        let Some(payload) = extract_json_object_from_text(&resp.content) else {
-            tracing::warn!(
-                "memory capture schema repair returned unparseable content for conversation {:?}",
-                conversation_id
+
+        let limited_candidates = candidates
+            .iter()
+            .take(USER_FACT_MEMORY_CAPTURE_MAX_CANDIDATES.max(1))
+            .collect::<Vec<_>>();
+        let mut attempted_candidates = 0usize;
+        for (idx, candidate) in limited_candidates.iter().copied().enumerate() {
+            attempted_candidates += 1;
+            let role = Agent::model_role_label(&candidate.role).to_string();
+            let resp = match self
+                .run_memory_capture_llm_candidate(
+                    channel,
+                    conversation_id,
+                    "user_fact_memory_capture",
+                    original_prompt,
+                    candidate,
+                    timeout_ms,
+                )
+                .await
+            {
+                Ok(resp) => resp,
+                Err(error) => {
+                    attempts.push(UserMemoryCaptureAttemptRecord {
+                        slot_id: candidate.slot_id.clone(),
+                        slot_label: candidate.slot_label.clone(),
+                        role: role.clone(),
+                        provider: None,
+                        model: None,
+                        stage: "extract".to_string(),
+                        request_kind: "user_fact_memory_capture".to_string(),
+                        outcome: "transport_failed".to_string(),
+                        error: Some(safe_truncate(&error.to_string(), 240)),
+                    });
+                    continue;
+                }
+            };
+
+            match parse_user_memory_capture_payload(&resp.content) {
+                Ok(payload) => {
+                    attempts.push(UserMemoryCaptureAttemptRecord {
+                        slot_id: candidate.slot_id.clone(),
+                        slot_label: candidate.slot_label.clone(),
+                        role: role.clone(),
+                        provider: Some(resp.provider.clone()),
+                        model: Some(resp.model.clone()),
+                        stage: "extract".to_string(),
+                        request_kind: "user_fact_memory_capture".to_string(),
+                        outcome: "ok".to_string(),
+                        error: None,
+                    });
+                    return UserMemoryCaptureRunOutcome {
+                        payload: Some(payload),
+                        attempts,
+                        selected_slot_id: Some(candidate.slot_id.clone()),
+                        selected_slot_label: Some(candidate.slot_label.clone()),
+                        selected_provider: Some(resp.provider.clone()),
+                        selected_model: Some(resp.model.clone()),
+                        selected_stage: Some("extract".to_string()),
+                        terminal_error: None,
+                    };
+                }
+                Err(error) => {
+                    let outcome = match error {
+                        UserMemoryCapturePayloadError::Unparseable => "unparseable",
+                        UserMemoryCapturePayloadError::IncompleteShape => "incomplete_shape",
+                    };
+                    attempts.push(UserMemoryCaptureAttemptRecord {
+                        slot_id: candidate.slot_id.clone(),
+                        slot_label: candidate.slot_label.clone(),
+                        role: role.clone(),
+                        provider: Some(resp.provider.clone()),
+                        model: Some(resp.model.clone()),
+                        stage: "extract".to_string(),
+                        request_kind: "user_fact_memory_capture".to_string(),
+                        outcome: outcome.to_string(),
+                        error: Some(outcome.to_string()),
+                    });
+                    log_user_memory_capture_payload_error(
+                        "memory capture",
+                        conversation_id,
+                        &resp.content,
+                        error,
+                    );
+                }
+            }
+
+            let invalid_preview = user_memory_capture_response_preview(&resp.content, 240);
+            let repair_prompt = build_user_memory_capture_repair_prompt(
+                original_prompt,
+                &invalid_preview,
+                response_shape,
             );
-            return None;
-        };
-        if !user_memory_capture_payload_has_required_shape(&payload) {
-            let redacted_preview = crate::security::redact_secret_input(&resp.content).text;
-            tracing::warn!(
-                "memory capture schema repair returned incomplete shape for conversation {:?}. Preview: {}",
-                conversation_id,
-                safe_truncate(&redacted_preview, 160)
-            );
-            return None;
+            let repaired = match self
+                .run_memory_capture_llm_candidate(
+                    channel,
+                    conversation_id,
+                    "user_fact_memory_capture_schema_repair",
+                    &repair_prompt,
+                    candidate,
+                    timeout_ms,
+                )
+                .await
+            {
+                Ok(resp) => resp,
+                Err(error) => {
+                    attempts.push(UserMemoryCaptureAttemptRecord {
+                        slot_id: candidate.slot_id.clone(),
+                        slot_label: candidate.slot_label.clone(),
+                        role: role.clone(),
+                        provider: None,
+                        model: None,
+                        stage: "schema_repair".to_string(),
+                        request_kind: "user_fact_memory_capture_schema_repair".to_string(),
+                        outcome: "transport_failed".to_string(),
+                        error: Some(safe_truncate(&error.to_string(), 240)),
+                    });
+                    continue;
+                }
+            };
+
+            match parse_user_memory_capture_payload(&repaired.content) {
+                Ok(payload) => {
+                    let empty_retry = idx + 1 < limited_candidates.len()
+                        && user_memory_capture_payload_is_empty_decision(&payload);
+                    attempts.push(UserMemoryCaptureAttemptRecord {
+                        slot_id: candidate.slot_id.clone(),
+                        slot_label: candidate.slot_label.clone(),
+                        role: role.clone(),
+                        provider: Some(repaired.provider.clone()),
+                        model: Some(repaired.model.clone()),
+                        stage: "schema_repair".to_string(),
+                        request_kind: "user_fact_memory_capture_schema_repair".to_string(),
+                        outcome: if empty_retry {
+                            "empty_decision_retry_next".to_string()
+                        } else {
+                            "ok".to_string()
+                        },
+                        error: None,
+                    });
+                    if idx + 1 < limited_candidates.len()
+                        && user_memory_capture_payload_is_empty_decision(&payload)
+                    {
+                        tracing::debug!(
+                            "memory capture schema repair recovered an empty decision for conversation {:?}; trying the next configured capture model",
+                            conversation_id
+                        );
+                        continue;
+                    }
+                    return UserMemoryCaptureRunOutcome {
+                        payload: Some(payload),
+                        attempts,
+                        selected_slot_id: Some(candidate.slot_id.clone()),
+                        selected_slot_label: Some(candidate.slot_label.clone()),
+                        selected_provider: Some(repaired.provider.clone()),
+                        selected_model: Some(repaired.model.clone()),
+                        selected_stage: Some("schema_repair".to_string()),
+                        terminal_error: None,
+                    };
+                }
+                Err(error) => {
+                    let outcome = match error {
+                        UserMemoryCapturePayloadError::Unparseable => "unparseable",
+                        UserMemoryCapturePayloadError::IncompleteShape => "incomplete_shape",
+                    };
+                    attempts.push(UserMemoryCaptureAttemptRecord {
+                        slot_id: candidate.slot_id.clone(),
+                        slot_label: candidate.slot_label.clone(),
+                        role,
+                        provider: Some(repaired.provider.clone()),
+                        model: Some(repaired.model.clone()),
+                        stage: "schema_repair".to_string(),
+                        request_kind: "user_fact_memory_capture_schema_repair".to_string(),
+                        outcome: outcome.to_string(),
+                        error: Some(outcome.to_string()),
+                    });
+                    log_user_memory_capture_payload_error(
+                        "memory capture schema repair",
+                        conversation_id,
+                        &repaired.content,
+                        error,
+                    );
+                }
+            }
         }
-        Some(payload)
+
+        if attempted_candidates > 0 {
+            tracing::warn!(
+                "memory capture failed to produce schema-compliant JSON for conversation {:?} after {} candidate(s)",
+                conversation_id,
+                attempted_candidates
+            );
+        }
+        UserMemoryCaptureRunOutcome {
+            payload: None,
+            attempts,
+            selected_slot_id: None,
+            selected_slot_label: None,
+            selected_provider: None,
+            selected_model: None,
+            selected_stage: None,
+            terminal_error: Some(format!(
+                "Memory capture failed to produce schema-compliant JSON after {} candidate(s).",
+                attempted_candidates
+            )),
+        }
     }
 
     async fn record_llm_usage(
@@ -11286,7 +12416,11 @@ impl WatcherFollowupWorker {
             }
         }
 
-        if ordered.is_empty() { vec![] } else { ordered }
+        if ordered.is_empty() {
+            vec![]
+        } else {
+            ordered
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -11577,9 +12711,7 @@ struct MessageProcessingContext {
 }
 
 enum InboundSecurityPrecheck {
-    Continue {
-        unchecked_reason: Option<String>,
-    },
+    Continue { unchecked_reason: Option<String> },
     Respond(ProcessedMessage),
 }
 
@@ -11617,6 +12749,16 @@ impl MessageProcessingContext {
             request_hints,
             user_message_already_recorded: true,
         }
+    }
+}
+
+struct ActiveMessageRequestGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl Drop for ActiveMessageRequestGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -13434,7 +14576,11 @@ impl Agent {
             let ready = model_pool_map
                 .get(&slot_id)
                 .is_some_and(|(slot, _)| Self::provider_has_runtime_credentials(&slot.provider));
-            if ready { Some(slot_id) } else { None }
+            if ready {
+                Some(slot_id)
+            } else {
+                None
+            }
         });
         if had_persisted_model_override && user_selected_model_slot.is_none() {
             let _ = storage.delete(USER_SELECTED_MODEL_SLOT_KEY).await;
@@ -13838,6 +14984,7 @@ impl Agent {
             ))
             .await,
             last_activity: Arc::new(RwLock::new(None)),
+            active_message_requests: Arc::new(AtomicUsize::new(0)),
             security_events: Arc::new(SecurityEvents::new()),
             user_selected_model_slot_id: Arc::new(std::sync::RwLock::new(user_selected_model_slot)),
             notification_events,
@@ -14475,15 +15622,13 @@ impl Agent {
     ) -> Result<String> {
         use crate::core::integration_auth::{AuthMode, IntegrationAuthManifest};
 
-        let manifest: IntegrationAuthManifest = match self
-            .lookup_integration_auth_manifest(&integration_id)
-            .await
-        {
-            Some(manifest) => manifest,
-            None => {
-                anyhow::bail!("No auth manifest is registered for this credential prompt.");
-            }
-        };
+        let manifest: IntegrationAuthManifest =
+            match self.lookup_integration_auth_manifest(&integration_id).await {
+                Some(manifest) => manifest,
+                None => {
+                    anyhow::bail!("No auth manifest is registered for this credential prompt.");
+                }
+            };
 
         let form_fields = match &manifest.mode {
             AuthMode::Secrets { fields } | AuthMode::Hybrid { fields, .. } => fields.clone(),
@@ -14540,7 +15685,9 @@ impl Agent {
 
         let needs_oauth_launch = matches!(
             &manifest.mode,
-            AuthMode::OAuth2AuthorizationCode(_) | AuthMode::OAuth2DeviceCode(_) | AuthMode::Hybrid { .. }
+            AuthMode::OAuth2AuthorizationCode(_)
+                | AuthMode::OAuth2DeviceCode(_)
+                | AuthMode::Hybrid { .. }
         );
         let mut response = if stored_count > 0 {
             format!(
@@ -14598,8 +15745,8 @@ impl Agent {
         }
         self.clear_pending_chat_credential_prompt(conversation_id)
             .await;
-        let mut response = "Saved the credential securely. The value was not sent to the assistant."
-            .to_string();
+        let mut response =
+            "Saved the credential securely. The value was not sent to the assistant.".to_string();
         if let Some(followup) = self.on_secret_saved_followup(conversation_id).await {
             response.push_str("\n\n");
             response.push_str(&followup);
@@ -14613,7 +15760,9 @@ impl Agent {
         &self,
         integration_id: &str,
     ) -> Option<ChatCredentialPrompt> {
-        let manifest = self.lookup_integration_auth_manifest(integration_id).await?;
+        let manifest = self
+            .lookup_integration_auth_manifest(integration_id)
+            .await?;
         if matches!(
             &manifest.mode,
             crate::core::integration_auth::AuthMode::OAuth2AuthorizationCode(_)
@@ -14668,9 +15817,9 @@ impl Agent {
         }
         let registry = self.extension_packs.read().await;
         if let Ok(Some(pack_view)) = registry.get_pack(needle).await {
-            if let Some(manifest) = crate::core::integration_auth::manifest_from_extension_pack(
-                &pack_view.manifest,
-            ) {
+            if let Some(manifest) =
+                crate::core::integration_auth::manifest_from_extension_pack(&pack_view.manifest)
+            {
                 return Some(manifest);
             }
         }
@@ -14708,10 +15857,7 @@ impl Agent {
                 );
             }
             Err(error) => {
-                tracing::warn!(
-                    "Failed to load custom messaging auth manifests: {}",
-                    error
-                );
+                tracing::warn!("Failed to load custom messaging auth manifests: {}", error);
             }
         }
         manifests
@@ -14731,9 +15877,10 @@ impl Agent {
 
         let is_raw_key = manifest.integration_id == RAW_KEY_MANIFEST_ID;
         let (fields, mode_kind) = match &manifest.mode {
-            AuthMode::Secrets { fields } => {
-                (fields.clone(), if is_raw_key { "raw_key" } else { "secrets" })
-            }
+            AuthMode::Secrets { fields } => (
+                fields.clone(),
+                if is_raw_key { "raw_key" } else { "secrets" },
+            ),
             AuthMode::Hybrid { fields, .. } => (fields.clone(), "hybrid"),
             AuthMode::OAuth2AuthorizationCode(_) => (Vec::new(), "oauth2_authorization_code"),
             AuthMode::OAuth2DeviceCode(_) => (Vec::new(), "oauth2_device_code"),
@@ -14862,10 +16009,7 @@ impl Agent {
                             "extension_pack_connection",
                         );
                     }
-                    PendingChatCredentialPromptKind::IntegrationAuth {
-                        integration_id,
-                        ..
-                    } => {
+                    PendingChatCredentialPromptKind::IntegrationAuth { integration_id, .. } => {
                         if let Some(prompt) = self
                             .load_integration_auth_prompt_view(&integration_id)
                             .await
@@ -15263,8 +16407,7 @@ impl Agent {
                             }
                         }
                         PendingChatCredentialPromptKind::IntegrationAuth {
-                            integration_id,
-                            ..
+                            integration_id, ..
                         } => {
                             return self
                                 .submit_pending_integration_auth_credentials(
@@ -15276,11 +16419,7 @@ impl Agent {
                         }
                         PendingChatCredentialPromptKind::RawSecret { key, .. } => {
                             return self
-                                .submit_pending_raw_secret_credentials(
-                                    cid,
-                                    key.clone(),
-                                    &cleaned,
-                                )
+                                .submit_pending_raw_secret_credentials(cid, key.clone(), &cleaned)
                                 .await;
                         }
                     }
@@ -15841,6 +16980,17 @@ impl Agent {
     /// Get the last user activity timestamp (for idle detection)
     pub fn last_activity_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         self.last_activity.try_read().ok().and_then(|guard| *guard)
+    }
+
+    pub fn active_message_request_count(&self) -> usize {
+        self.active_message_requests.load(Ordering::Acquire)
+    }
+
+    fn track_active_message_request(&self) -> ActiveMessageRequestGuard {
+        self.active_message_requests.fetch_add(1, Ordering::AcqRel);
+        ActiveMessageRequestGuard {
+            counter: Arc::clone(&self.active_message_requests),
+        }
     }
 
     /// Generate a short deterministic title from the user's first message.
@@ -16826,17 +17976,226 @@ impl Agent {
     }
 
     fn email_notification_is_configured(&self) -> bool {
-        if !self.integrations.is_enabled("gmail")
-            && !self.integrations.is_enabled("google_workspace")
-        {
+        let available_backends = self.configured_email_backends();
+        crate::core::email_delivery::email_channel_is_ready(
+            &self.config.email.provider,
+            &available_backends,
+        )
+    }
+
+    fn legacy_gmail_notification_is_configured(&self) -> bool {
+        if !self.integrations.is_enabled("gmail") {
             return false;
         }
-
         crate::core::config::SecureConfigManager::new(&self.config_dir)
             .ok()
             .and_then(|manager| manager.get_custom_secret("gmail_tokens").ok().flatten())
-            .map(|value| !value.trim().is_empty())
+            .is_some_and(|value| !value.trim().is_empty())
+    }
+
+    fn workspace_gmail_notification_is_configured(&self) -> bool {
+        if !self.integrations.is_enabled("google_workspace") {
+            return false;
+        }
+        crate::actions::google_workspace::granted_bundles(&self.config_dir)
+            .map(|bundles| bundles.iter().any(|bundle| bundle == "gmail"))
             .unwrap_or(false)
+    }
+
+    fn configured_email_backends(&self) -> Vec<String> {
+        let mut backends = Vec::new();
+        if self.legacy_gmail_notification_is_configured() {
+            backends.push(crate::core::email_delivery::EMAIL_PROVIDER_GMAIL.to_string());
+        }
+        if self.workspace_gmail_notification_is_configured() {
+            backends.push(
+                crate::core::email_delivery::EMAIL_PROVIDER_GOOGLE_WORKSPACE.to_string(),
+            );
+        }
+        if crate::core::email_delivery::external_email_delivery_is_ready(&self.config.email) {
+            if let Some(provider_id) =
+                crate::core::email_delivery::external_email_provider_id(&self.config.email)
+            {
+                if !backends.iter().any(|existing| existing == &provider_id) {
+                    backends.push(provider_id);
+                }
+            }
+        }
+        backends
+    }
+
+    async fn configured_email_mailboxes(&self) -> Vec<(String, String)> {
+        let mut mailboxes = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for backend in self.configured_email_backends() {
+            if !matches!(
+                backend.as_str(),
+                crate::core::email_delivery::EMAIL_PROVIDER_GMAIL
+                    | crate::core::email_delivery::EMAIL_PROVIDER_GOOGLE_WORKSPACE
+            ) {
+                continue;
+            }
+            match self.email_sender_address_for_backend(&backend).await {
+                Ok(address) => {
+                    let dedupe_key = address.to_ascii_lowercase();
+                    if seen.insert(dedupe_key) {
+                        mailboxes.push((backend, address));
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        "configured_email_mailboxes: failed to load mailbox for {}: {}",
+                        backend,
+                        error
+                    );
+                }
+            }
+        }
+        mailboxes
+    }
+
+    async fn email_sender_address_for_backend(
+        &self,
+        backend: &str,
+    ) -> std::result::Result<String, String> {
+        match backend {
+            crate::core::email_delivery::EMAIL_PROVIDER_GMAIL => {
+                crate::actions::gmail::gmail_profile_email_for_source(
+                    &self.config_dir,
+                    crate::actions::gmail::GmailDeliverySource::Gmail,
+                )
+                .await
+                .map_err(|error| format!("Failed to read Gmail sender address: {}", error))
+            }
+            crate::core::email_delivery::EMAIL_PROVIDER_GOOGLE_WORKSPACE => {
+                crate::actions::gmail::gmail_profile_email_for_source(
+                    &self.config_dir,
+                    crate::actions::gmail::GmailDeliverySource::GoogleWorkspace,
+                )
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Failed to read Google Workspace Gmail sender address: {}",
+                        error
+                    )
+                })
+            }
+            _ => crate::core::email_delivery::validate_optional_email_address(
+                self.config.email.from_address.as_deref(),
+            )
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "email.from_address is required for external email delivery".to_string()),
+        }
+    }
+
+    async fn resolve_email_notification_recipient(
+        &self,
+        backend: &str,
+    ) -> std::result::Result<String, String> {
+        if let Some(address) = self.config.email.to_address.as_deref() {
+            return crate::core::email_delivery::validate_email_address(address)
+                .map_err(|error| error.to_string());
+        }
+        if matches!(
+            backend,
+            crate::core::email_delivery::EMAIL_PROVIDER_GMAIL
+                | crate::core::email_delivery::EMAIL_PROVIDER_GOOGLE_WORKSPACE
+        ) {
+            return self.email_sender_address_for_backend(backend).await;
+        }
+        let mailboxes = self.configured_email_mailboxes().await;
+        match mailboxes.as_slice() {
+            [(_, address)] => Ok(address.clone()),
+            [] => Err(
+                "email.to_address is required for external email delivery when no Gmail or Google Workspace mailbox is connected"
+                    .to_string(),
+            ),
+            _ => Err(
+                "email.to_address is required for external email delivery when multiple Gmail or Google Workspace mailboxes are connected"
+                    .to_string(),
+            ),
+        }
+    }
+
+    async fn send_email_notification_reported(
+        &self,
+        safe_message: &str,
+    ) -> std::result::Result<(), String> {
+        let available_backends = self.configured_email_backends();
+        let backend = crate::core::email_delivery::normalize_email_backend_selection(
+            &self.config.email.provider,
+            &available_backends,
+        )
+        .map_err(|error| error.to_string())?;
+        let recipient = self.resolve_email_notification_recipient(&backend).await?;
+        let (timezone, email_format) = {
+            let profile = self.user_profile.read().await;
+            (
+                profile
+                    .timezone
+                    .as_deref()
+                    .and_then(|value| value.parse::<chrono_tz::Tz>().ok()),
+                profile.email_format.clone(),
+            )
+        };
+        let now = chrono::Utc::now();
+        let (subject_date, generated_at) = match timezone {
+            Some(tz) => (
+                now.with_timezone(&tz).format("%Y-%m-%d").to_string(),
+                now.with_timezone(&tz)
+                    .format("%Y-%m-%d %H:%M %Z")
+                    .to_string(),
+            ),
+            None => (
+                now.format("%Y-%m-%d").to_string(),
+                now.format("%Y-%m-%d %H:%M UTC").to_string(),
+            ),
+        };
+        let subject = format!("{} - {}", self.config.name, subject_date);
+        let rendered = crate::core::email_delivery::render_notification_email(
+            &self.config.name,
+            &subject,
+            safe_message,
+            Some(&generated_at),
+            email_format.as_deref(),
+        );
+        match backend.as_str() {
+            crate::core::email_delivery::EMAIL_PROVIDER_GMAIL => {
+                let args = serde_json::json!({
+                    "to": recipient,
+                    "subject": rendered.subject,
+                    "body": rendered.text_body,
+                    "html_body": rendered.html_body,
+                    "delivery_source": "gmail",
+                });
+                self.runtime
+                    .execute_action("gmail_reply", &args)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            }
+            crate::core::email_delivery::EMAIL_PROVIDER_GOOGLE_WORKSPACE => {
+                let args = serde_json::json!({
+                    "to": recipient,
+                    "subject": rendered.subject,
+                    "body": rendered.text_body,
+                    "html_body": rendered.html_body,
+                    "delivery_source": "google_workspace",
+                });
+                self.runtime
+                    .execute_action("gmail_reply", &args)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            }
+            _ => crate::core::email_delivery::send_external_email(
+                &self.config.email,
+                &rendered,
+                &recipient,
+            )
+            .await
+            .map_err(|error| error.to_string()),
+        }
     }
 
     pub(crate) fn notification_channel_is_configured(&self, channel: &str) -> bool {
@@ -16854,9 +18213,7 @@ impl Agent {
         .ok();
         let packs_guard = self.extension_packs.read().await;
         struct AgentBundledCheck<'a>(&'a Agent);
-        impl<'a> crate::channels::messaging_registry::BundledConfiguredCheck
-            for AgentBundledCheck<'a>
-        {
+        impl<'a> crate::channels::messaging_registry::BundledConfiguredCheck for AgentBundledCheck<'a> {
             fn is_configured(&self, channel_id: &str) -> bool {
                 self.0.notification_channel_is_configured(channel_id)
             }
@@ -16876,7 +18233,10 @@ impl Agent {
         {
             Ok(channels) => channels.into_iter().map(|channel| channel.id).collect(),
             Err(error) => {
-                tracing::debug!("configured_notification_channels: registry failed: {}", error);
+                tracing::debug!(
+                    "configured_notification_channels: registry failed: {}",
+                    error
+                );
                 crate::channels::messaging_registry::BUNDLED_CHANNEL_IDS
                     .iter()
                     .filter(|channel| self.notification_channel_is_configured(channel))
@@ -18391,16 +19751,13 @@ impl Agent {
                         principal: request_hints.caller_principal.clone(),
                         surface: request_hints.execution_surface.clone(),
                         direct_user_intent: request_hints.direct_user_intent,
-                            current_turn_is_explicit_approval: false,
-                            agent_name: None,
-                            agent_access_scope: None,
-                            capability_context_id: Some(format!(
-                                "conversation:{}",
-                                conversation_id
-                            )),
-                        },
+                        current_turn_is_explicit_approval: false,
+                        agent_name: None,
+                        agent_access_scope: None,
+                        capability_context_id: Some(format!("conversation:{}", conversation_id)),
                     },
-                )
+                },
+            )
             .await
         {
             Ok(batch) => batch,
@@ -20009,7 +21366,7 @@ Do not use fixed phrase or keyword rules; reason from the semantics of the reque
     ) {
         let worker = UserMemoryCaptureWorker::from_agent(self);
         worker
-            .capture_user_facts_with_llm(message, channel, conversation_id, project_id)
+            .capture_user_facts_with_llm(message, channel, conversation_id, project_id, None)
             .await;
         if let Some(previous_user_message) = recent_history.iter().rev().find(|entry| {
             entry.role == "user"
@@ -20022,6 +21379,7 @@ Do not use fixed phrase or keyword rules; reason from the semantics of the reque
                     channel,
                     conversation_id,
                     project_id,
+                    None,
                 )
                 .await;
         }
@@ -21877,6 +23235,7 @@ Do not use fixed phrase or keyword rules; reason from the semantics of the reque
         } = context;
         let mut token_tx = token_tx;
         let start_time = chrono::Utc::now();
+        let _active_message_request = self.track_active_message_request();
         let trace_ref =
             trace_override.unwrap_or_else(|| Arc::new(RwLock::new(ExecutionTrace::default())));
         let trace_already_seeded = {
@@ -21953,7 +23312,8 @@ Do not use fixed phrase or keyword rules; reason from the semantics of the reque
                 let response = self
                     .submit_chat_credential_values(Some(&conversation_key), &values)
                     .await?;
-                let persisted_user_message = format!("secure credential saved for {} [REDACTED]", key);
+                let persisted_user_message =
+                    format!("secure credential saved for {} [REDACTED]", key);
                 return self
                     .persist_immediate_exchange(
                         &persisted_user_message,
@@ -21972,8 +23332,10 @@ Do not use fixed phrase or keyword rules; reason from the semantics of the reque
 
             if let Some(key) = crate::core::secrets::parse_use_current_llm_key_command(message) {
                 if !crate::core::secrets::secret_command_escape_hatch_enabled() {
-                    let persisted_user_message =
-                        format!("secure credential link command blocked for {} [REDACTED]", key);
+                    let persisted_user_message = format!(
+                        "secure credential link command blocked for {} [REDACTED]",
+                        key
+                    );
                     return self
                         .persist_immediate_exchange(
                             &persisted_user_message,
@@ -22780,7 +24142,13 @@ Do not use fixed phrase or keyword rules; reason from the semantics of the reque
             {
                 tracing::warn!("Failed to persist user message early: {}", e);
             }
-            self.spawn_user_memory_capture(message, channel, Some(&conversation_key), project_id);
+            self.spawn_user_memory_capture(
+                message,
+                channel,
+                Some(&conversation_key),
+                project_id,
+                Some(&user_msg.id),
+            );
         }
 
         if let Some(resolution) = pending_action_resolution.clone() {
@@ -23411,6 +24779,7 @@ Do not use fixed phrase or keyword rules; reason from the semantics of the reque
                     channel,
                     Some(&conversation_key),
                     project_id,
+                    Some(&user_msg.id),
                 );
                 let asst_msg = crate::storage::entities::message::Model {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -31403,12 +32772,14 @@ Do not ask for JSON. Do not claim deployment is unavailable unless `app_deploy` 
         channel: &str,
         conversation_id: Option<&str>,
         project_id: Option<&str>,
+        source_message_id: Option<&str>,
     ) {
         let worker = UserMemoryCaptureWorker::from_agent(self);
         let message = message.to_string();
         let channel = channel.to_string();
         let conversation_id = conversation_id.map(str::to_string);
         let project_id = project_id.map(str::to_string);
+        let source_message_id = source_message_id.map(str::to_string);
         crate::spawn_logged!("src/core/agent.rs:27118", async move {
             worker
                 .capture_user_memory_hints(
@@ -31416,9 +32787,20 @@ Do not ask for JSON. Do not claim deployment is unavailable unless `app_deploy` 
                     &channel,
                     conversation_id.as_deref(),
                     project_id.as_deref(),
+                    source_message_id.as_deref(),
                 )
                 .await;
         });
+    }
+
+    pub(crate) async fn apply_memory_operation_by_id_with_source(
+        &self,
+        operation_id: &str,
+        apply_source: &str,
+    ) -> Result<String> {
+        UserMemoryCaptureWorker::from_agent(self)
+            .apply_memory_operation_by_id_with_source(operation_id, apply_source)
+            .await
     }
 
     async fn build_ambient_time_context(&self) -> String {
@@ -32391,11 +33773,19 @@ Do not ask for JSON. Do not claim deployment is unavailable unless `app_deploy` 
     }
 
     fn agentark_enabled_label(value: bool) -> &'static str {
-        if value { "enabled" } else { "disabled" }
+        if value {
+            "enabled"
+        } else {
+            "disabled"
+        }
     }
 
     fn agentark_yes_no(value: bool) -> &'static str {
-        if value { "yes" } else { "no" }
+        if value {
+            "yes"
+        } else {
+            "no"
+        }
     }
 
     fn agentark_integration_status_label(
@@ -33785,6 +35175,7 @@ Do not ask for JSON. Do not claim deployment is unavailable unless `app_deploy` 
                     context.channel,
                     Some(context.conversation_key),
                     context.project_id,
+                    Some(&user_msg.id),
                 );
             }
 
@@ -36019,7 +37410,11 @@ Do not ask for JSON. Do not claim deployment is unavailable unless `app_deploy` 
             }
         }
 
-        if ordered.is_empty() { vec![] } else { ordered }
+        if ordered.is_empty() {
+            vec![]
+        } else {
+            ordered
+        }
     }
 
     /// Get LlmClient for a specific role (falls back to primary)
@@ -38025,7 +39420,9 @@ Do not ask for JSON. Do not claim deployment is unavailable unless `app_deploy` 
                     let normalized = preferred.trim().to_ascii_lowercase();
                     if !normalized.is_empty()
                         && (!is_external_notification_channel(&normalized)
-                            || self.notification_channel_is_configured_any(&normalized).await)
+                            || self
+                                .notification_channel_is_configured_any(&normalized)
+                                .await)
                     {
                         return Some(normalized);
                     }
@@ -38051,7 +39448,9 @@ Do not ask for JSON. Do not claim deployment is unavailable unless `app_deploy` 
                     let normalized = preferred.trim().to_ascii_lowercase();
                     if !normalized.is_empty()
                         && (!is_external_notification_channel(&normalized)
-                            || self.notification_channel_is_configured_any(&normalized).await)
+                            || self
+                                .notification_channel_is_configured_any(&normalized)
+                                .await)
                     {
                         return Some(normalized);
                     }
@@ -38354,7 +39753,9 @@ Do not ask for JSON. Do not claim deployment is unavailable unless `app_deploy` 
             return;
         }
         if is_external_notification_channel(&report_to)
-            && !self.notification_channel_is_configured_any(&report_to).await
+            && !self
+                .notification_channel_is_configured_any(&report_to)
+                .await
         {
             let delivery_label = notification_channel_display_name(&report_to);
             let body = format!(
@@ -40619,7 +42020,9 @@ Do not ask for JSON. Do not claim deployment is unavailable unless `app_deploy` 
         }
 
         if is_external_notification_channel(&requested)
-            && !self.notification_channel_is_configured_any(&requested).await
+            && !self
+                .notification_channel_is_configured_any(&requested)
+                .await
         {
             return vec![NotificationDispatchOutcome {
                 channel: requested.clone(),
@@ -40872,7 +42275,11 @@ Return: 1 short status paragraph + 3 bullet next steps.",
         .into_iter()
         .max_by_key(|(_, score)| *score)?;
 
-        if best.1 == 0 { None } else { Some(best.0) }
+        if best.1 == 0 {
+            None
+        } else {
+            Some(best.0)
+        }
     }
 
     async fn synthesize_agentark_reminder_calls_from_request(
@@ -43274,7 +44681,9 @@ Use every distinct event/date the user requested and no extras. Prefer the faile
                     && self.push_channel_is_configured(&preferred)
             } else {
                 !is_external_notification_channel(&preferred)
-                    || self.notification_channel_is_configured_any(&preferred).await
+                    || self
+                        .notification_channel_is_configured_any(&preferred)
+                        .await
             };
             if eligible && seen.insert(preferred.clone()) {
                 candidates.push(preferred);
@@ -43462,7 +44871,8 @@ Use every distinct event/date the user requested and no extras. Prefer the faile
         safe_message: &str,
     ) -> Option<std::result::Result<(), String>> {
         let normalized = channel.trim().to_ascii_lowercase();
-        if !(normalized.starts_with(crate::channels::messaging_registry::EXTENSION_CHANNEL_ID_PREFIX)
+        if !(normalized
+            .starts_with(crate::channels::messaging_registry::EXTENSION_CHANNEL_ID_PREFIX)
             || normalized.starts_with(crate::custom_messaging_channels::CUSTOM_CHANNEL_ID_PREFIX))
         {
             return None;
@@ -43600,65 +45010,7 @@ Use every distinct event/date the user requested and no extras. Prefer the faile
             "qq" => crate::channels::qq::send_message(self, &safe_message)
                 .await
                 .is_ok(),
-            "email" => {
-                if !self.integrations.is_enabled("gmail")
-                    && !self.integrations.is_enabled("google_workspace")
-                {
-                    tracing::warn!(
-                        "try_send_notification: email delivery skipped because Gmail integration is disabled"
-                    );
-                    return false;
-                }
-                // Use gmail to send notification email with user-preferred formatting
-                let email = crate::actions::gmail::gmail_profile_email(&self.config_dir).await;
-                match email {
-                    Ok(addr) if !addr.is_empty() => {
-                        let tz = {
-                            let profile = self.user_profile.read().await;
-                            profile
-                                .timezone
-                                .as_deref()
-                                .and_then(|v| v.parse::<chrono_tz::Tz>().ok())
-                        };
-                        let date = match tz {
-                            Some(tz) => chrono::Utc::now()
-                                .with_timezone(&tz)
-                                .format("%Y-%m-%d")
-                                .to_string(),
-                            None => chrono::Utc::now().format("%Y-%m-%d").to_string(),
-                        };
-                        let subject = format!("{} - {}", self.config.name, date);
-                        let email_format = {
-                            let profile = self.user_profile.read().await;
-                            profile.email_format.clone().unwrap_or_default()
-                        };
-                        let body = match email_format.as_str() {
-                            "narrative" => {
-                                let narrative = safe_message
-                                    .lines()
-                                    .map(|line| line.trim_start_matches("- ").to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(" ");
-                                format!("{}\n\n-- {}", narrative, self.config.name)
-                            }
-                            "sections" => {
-                                format!("Summary\n{}\n\n-- {}", safe_message, self.config.name)
-                            }
-                            _ => format!("{}\n\n-- {}", safe_message, self.config.name),
-                        };
-                        let args = serde_json::json!({
-                            "to": addr,
-                            "subject": subject,
-                            "body": body
-                        });
-                        self.runtime
-                            .execute_action("gmail_reply", &args)
-                            .await
-                            .is_ok()
-                    }
-                    _ => false,
-                }
-            }
+            "email" => self.send_email_notification_reported(&safe_message).await.is_ok(),
             "web" => {
                 // Web notifications are already stored in DB
                 true
@@ -43746,77 +45098,7 @@ Use every distinct event/date the user requested and no extras. Prefer the faile
             "qq" => crate::channels::qq::send_message(self, &safe_message)
                 .await
                 .map_err(|e| e.to_string()),
-            "email" => {
-                if !self.integrations.is_enabled("gmail")
-                    && !self.integrations.is_enabled("google_workspace")
-                {
-                    tracing::warn!(
-                        "try_send_notification: email delivery skipped because Gmail integration is disabled"
-                    );
-                    return NotificationDispatchOutcome {
-                        channel: channel_name,
-                        success: false,
-                        error: Some(
-                            "Email delivery skipped because Gmail integration is disabled"
-                                .to_string(),
-                        ),
-                    };
-                }
-
-                let email = crate::actions::gmail::gmail_profile_email(&self.config_dir).await;
-                match email {
-                    Ok(addr) if !addr.is_empty() => {
-                        let tz = {
-                            let profile = self.user_profile.read().await;
-                            profile
-                                .timezone
-                                .as_deref()
-                                .and_then(|v| v.parse::<chrono_tz::Tz>().ok())
-                        };
-                        let date = match tz {
-                            Some(tz) => chrono::Utc::now()
-                                .with_timezone(&tz)
-                                .format("%Y-%m-%d")
-                                .to_string(),
-                            None => chrono::Utc::now().format("%Y-%m-%d").to_string(),
-                        };
-                        let subject = format!("{} - {}", self.config.name, date);
-                        let email_format = {
-                            let profile = self.user_profile.read().await;
-                            profile.email_format.clone().unwrap_or_default()
-                        };
-                        let body = match email_format.as_str() {
-                            "narrative" => {
-                                let narrative = safe_message
-                                    .lines()
-                                    .map(|line| line.trim_start_matches("- ").to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(" ");
-                                format!("{}\n\n-- {}", narrative, self.config.name)
-                            }
-                            "sections" => {
-                                format!("Summary\n{}\n\n-- {}", safe_message, self.config.name)
-                            }
-                            _ => format!("{}\n\n-- {}", safe_message, self.config.name),
-                        };
-                        let args = serde_json::json!({
-                            "to": addr,
-                            "subject": subject,
-                            "body": body
-                        });
-                        self.runtime
-                            .execute_action("gmail_reply", &args)
-                            .await
-                            .map(|_| ())
-                            .map_err(|e| e.to_string())
-                    }
-                    Ok(_) => Err(
-                        "Email delivery skipped because no Gmail profile address is configured"
-                            .to_string(),
-                    ),
-                    Err(e) => Err(format!("Failed to read Gmail profile email: {}", e)),
-                }
-            }
+            "email" => self.send_email_notification_reported(&safe_message).await,
             "web" => Ok(()),
             other => {
                 if let Some(result) = self
@@ -44458,13 +45740,11 @@ mod tests {
             messages.len().saturating_sub(CONTEXT_RECENT_TAIL)
         );
         assert!(digest.summary.contains("blue environment"));
-        assert!(
-            packed
-                .digest
-                .as_deref()
-                .unwrap_or_default()
-                .contains("blue environment")
-        );
+        assert!(packed
+            .digest
+            .as_deref()
+            .unwrap_or_default()
+            .contains("blue environment"));
     }
 
     #[tokio::test]
@@ -44573,12 +45853,10 @@ mod tests {
             .build_packed_conversation_context(conversation_id, "failing")
             .await;
 
-        assert!(
-            packed
-                .history
-                .iter()
-                .any(|message| message.content.contains("Papers Monitor"))
-        );
+        assert!(packed
+            .history
+            .iter()
+            .any(|message| message.content.contains("Papers Monitor")));
     }
 
     #[test]
@@ -45038,20 +46316,16 @@ mod tests {
 
     #[test]
     fn specialized_app_prompt_guidance_skips_topic_keyword_requests() {
-        assert!(
-            build_specialized_app_prompt_guidance(
-                "Build a CRM dashboard with sales metrics.",
-                true
-            )
-            .is_empty()
-        );
-        assert!(
-            build_specialized_app_prompt_guidance(
-                "Summarize the latest arxiv papers for me.",
-                false
-            )
-            .is_empty()
-        );
+        assert!(build_specialized_app_prompt_guidance(
+            "Build a CRM dashboard with sales metrics.",
+            true
+        )
+        .is_empty());
+        assert!(build_specialized_app_prompt_guidance(
+            "Summarize the latest arxiv papers for me.",
+            false
+        )
+        .is_empty());
     }
 
     #[test]
@@ -45131,18 +46405,14 @@ mod tests {
         assert_eq!(recovered.artifact_id, "papers-monitor");
         assert_eq!(recovered.title, "Papers Monitor");
         assert_eq!(recovered.url, "http://localhost:8990/apps/papers-monitor/");
-        assert!(
-            recovered
-                .related_actions
-                .iter()
-                .any(|name| name == "app_inspect")
-        );
-        assert!(
-            !recovered
-                .related_actions
-                .iter()
-                .any(|name| name == "app_deploy")
-        );
+        assert!(recovered
+            .related_actions
+            .iter()
+            .any(|name| name == "app_inspect"));
+        assert!(!recovered
+            .related_actions
+            .iter()
+            .any(|name| name == "app_deploy"));
     }
 
     #[tokio::test]
@@ -45181,18 +46451,14 @@ mod tests {
             .expect("recent app context should load");
 
         assert_eq!(recovered.artifact_type, "app");
-        assert!(
-            recovered
-                .related_actions
-                .iter()
-                .any(|name| name == "app_restart")
-        );
-        assert!(
-            !recovered
-                .related_actions
-                .iter()
-                .any(|name| name == "app_deploy")
-        );
+        assert!(recovered
+            .related_actions
+            .iter()
+            .any(|name| name == "app_restart"));
+        assert!(!recovered
+            .related_actions
+            .iter()
+            .any(|name| name == "app_deploy"));
     }
 
     #[test]
@@ -45227,11 +46493,9 @@ mod tests {
             related.first().map(String::as_str),
             Some("google_workspace_gws_command")
         );
-        assert!(
-            related
-                .iter()
-                .any(|name| name == "google_workspace_gws_schema")
-        );
+        assert!(related
+            .iter()
+            .any(|name| name == "google_workspace_gws_schema"));
         assert!(related.iter().any(|name| name == "google_drive_search"));
         assert!(!related.iter().any(|name| name == "file_read"));
     }
@@ -45274,30 +46538,22 @@ mod tests {
         assert_eq!(recovered.artifact_type, "google workspace file");
         assert_eq!(recovered.artifact_id, "drive-file-123");
         assert_eq!(recovered.title, "vector_chicken_2017.rar");
-        assert!(
-            recovered
-                .related_actions
-                .iter()
-                .any(|name| name == "google_workspace_gws_command")
-        );
-        assert!(
-            recovered
-                .related_actions
-                .iter()
-                .any(|name| name == "google_workspace_gws_schema")
-        );
-        assert!(
-            recovered
-                .related_actions
-                .iter()
-                .any(|name| name == "google_workspace_gws_skills")
-        );
-        assert!(
-            !recovered
-                .related_actions
-                .iter()
-                .any(|name| name == "app_inspect")
-        );
+        assert!(recovered
+            .related_actions
+            .iter()
+            .any(|name| name == "google_workspace_gws_command"));
+        assert!(recovered
+            .related_actions
+            .iter()
+            .any(|name| name == "google_workspace_gws_schema"));
+        assert!(recovered
+            .related_actions
+            .iter()
+            .any(|name| name == "google_workspace_gws_skills"));
+        assert!(!recovered
+            .related_actions
+            .iter()
+            .any(|name| name == "app_inspect"));
     }
 
     #[tokio::test]
@@ -45328,18 +46584,14 @@ mod tests {
         assert_eq!(recovered.artifact_type, "google drive file");
         assert_eq!(recovered.artifact_id, "drive-file-123");
         assert_eq!(recovered.title, "vector_chicken_2017.rar");
-        assert!(
-            recovered
-                .related_actions
-                .iter()
-                .any(|name| name == "google_drive_search")
-        );
-        assert!(
-            recovered
-                .related_actions
-                .iter()
-                .any(|name| name == "google_workspace_gws_command")
-        );
+        assert!(recovered
+            .related_actions
+            .iter()
+            .any(|name| name == "google_drive_search"));
+        assert!(recovered
+            .related_actions
+            .iter()
+            .any(|name| name == "google_workspace_gws_command"));
     }
 
     #[tokio::test]
@@ -46022,12 +47274,10 @@ mod tests {
                 .as_deref(),
             Some("https://officecli.ai/SKILL.md")
         );
-        assert!(
-            parse_explicit_skill_install_command(
-                "Fetch and then read https://officecli.ai/SKILL.md and follow the instructions"
-            )
-            .is_none()
-        );
+        assert!(parse_explicit_skill_install_command(
+            "Fetch and then read https://officecli.ai/SKILL.md and follow the instructions"
+        )
+        .is_none());
     }
 
     #[test]
@@ -46667,6 +47917,42 @@ Verify: `officecli --version`
         ));
     }
 
+    #[test]
+    fn user_memory_capture_payload_parser_rejects_empty_object_shape() {
+        let parsed = parse_user_memory_capture_payload("{}");
+
+        assert_eq!(parsed, Err(UserMemoryCapturePayloadError::IncompleteShape));
+    }
+
+    #[test]
+    fn user_memory_capture_payload_parser_rejects_unparseable_output() {
+        let parsed = parse_user_memory_capture_payload("not json");
+
+        assert_eq!(parsed, Err(UserMemoryCapturePayloadError::Unparseable));
+    }
+
+    #[test]
+    fn user_memory_capture_payload_parser_accepts_embedded_required_arrays() {
+        let parsed =
+            parse_user_memory_capture_payload("prefix {\"memories\":[],\"retractions\":[]} suffix")
+                .expect("embedded schema-compliant capture payload should parse");
+
+        assert!(parsed.get("memories").is_some_and(|value| value.is_array()));
+        assert!(parsed
+            .get("retractions")
+            .is_some_and(|value| value.is_array()));
+    }
+
+    #[test]
+    fn user_memory_capture_payload_empty_decision_requires_both_arrays_empty() {
+        assert!(user_memory_capture_payload_is_empty_decision(
+            &serde_json::json!({"memories":[],"retractions":[]})
+        ));
+        assert!(!user_memory_capture_payload_is_empty_decision(
+            &serde_json::json!({"memories":[{"key":"x","value":"y"}],"retractions":[]})
+        ));
+    }
+
     fn semantic_test_embedding(axis: usize) -> PgVector {
         let mut values = vec![0.0_f32; 384];
         values[axis] = 1.0;
@@ -46683,7 +47969,10 @@ Verify: `officecli --version`
     ) -> crate::storage::experience_item::Model {
         let now = "2026-04-16T00:00:00Z".to_string();
         let mut metadata = serde_json::Map::new();
-        metadata.insert("key".to_string(), serde_json::Value::String(key.to_string()));
+        metadata.insert(
+            "key".to_string(),
+            serde_json::Value::String(key.to_string()),
+        );
         metadata.insert(
             "memory_kind".to_string(),
             serde_json::Value::String("location".to_string()),
@@ -46786,8 +48075,8 @@ Verify: `officecli --version`
     }
 
     #[tokio::test]
-    async fn upsert_learned_user_memory_clears_stale_embedding_when_exact_key_changes_without_embedder()
-    {
+    async fn upsert_learned_user_memory_clears_stale_embedding_when_exact_key_changes_without_embedder(
+    ) {
         let (agent, _config_dir, _data_dir) = build_test_agent().await;
         let worker = UserMemoryCaptureWorker::from_agent(&agent);
         let seeded = learned_memory_item_for_test(
@@ -46798,7 +48087,8 @@ Verify: `officecli --version`
             Some(semantic_test_embedding(0)),
             &[],
         );
-        agent.storage
+        agent
+            .storage
             .upsert_experience_item(&seeded)
             .await
             .expect("seed learned memory");
@@ -46986,7 +48276,8 @@ Verify: `officecli --version`
             Some(semantic_test_embedding(0)),
             &[],
         );
-        agent.storage
+        agent
+            .storage
             .upsert_experience_item(&canonical)
             .await
             .expect("seed canonical learned memory");
@@ -47089,7 +48380,8 @@ Verify: `officecli --version`
             Some(semantic_test_embedding(0)),
             &[("home_city", "Kolkata, India")],
         );
-        agent.storage
+        agent
+            .storage
             .upsert_experience_item(&seeded)
             .await
             .expect("seed merged learned memory");
@@ -47808,11 +49100,8 @@ Verify: `officecli --version`
         );
 
         assert!(response.contains("I gathered tool evidence"));
-        assert!(
-            response.contains(
-                "File Read read HTML document `arXiv Research Monitor | RL & Time-Series`."
-            )
-        );
+        assert!(response
+            .contains("File Read read HTML document `arXiv Research Monitor | RL & Time-Series`."));
         assert!(!response.contains("<!DOCTYPE html>"));
         assert!(!response.contains("Evidence gathered:"));
     }
@@ -48042,11 +49331,9 @@ Research report: India AI research capacity | 4 sources";
 
         assert!(response.contains("Static app updated: arXiv Research Monitor."));
         assert!(response.contains("[Open app](http://localhost:8990/apps/demo/)"));
-        assert!(
-            !response
-                .to_ascii_lowercase()
-                .contains("important limitation")
-        );
+        assert!(!response
+            .to_ascii_lowercase()
+            .contains("important limitation"));
     }
 
     #[test]
@@ -48279,12 +49566,10 @@ Research report: India AI research capacity | 4 sources";
                 .and_then(|value| value.as_str()),
             Some("node server.js")
         );
-        assert!(
-            normalized
-                .get("files")
-                .and_then(|value| value.as_object())
-                .is_some_and(|files| files.contains_key("index.html"))
-        );
+        assert!(normalized
+            .get("files")
+            .and_then(|value| value.as_object())
+            .is_some_and(|files| files.contains_key("index.html")));
     }
 
     #[test]
@@ -48395,10 +49680,11 @@ Research report: India AI research capacity | 4 sources";
             }),
         }];
 
-        assert!(
-            synthesize_missing_app_deploy_tool_call_from_recent_writes(&current_turn_calls, &[])
-                .is_none()
-        );
+        assert!(synthesize_missing_app_deploy_tool_call_from_recent_writes(
+            &current_turn_calls,
+            &[]
+        )
+        .is_none());
     }
 
     #[test]
@@ -48427,12 +49713,10 @@ Research report: India AI research capacity | 4 sources";
         let normalized = Agent::normalize_app_deploy_arguments(&recovered.arguments);
 
         assert_eq!(recovered.name, "app_deploy");
-        assert!(
-            normalized
-                .get("files")
-                .and_then(|value| value.as_object())
-                .is_some_and(|files| files.contains_key("app.py"))
-        );
+        assert!(normalized
+            .get("files")
+            .and_then(|value| value.as_object())
+            .is_some_and(|files| files.contains_key("app.py")));
     }
 
     #[test]
@@ -48458,10 +49742,11 @@ Research report: India AI research capacity | 4 sources";
             },
         ];
 
-        assert!(
-            synthesize_missing_app_deploy_tool_call_from_recent_writes(&current_turn_calls, &[])
-                .is_none()
-        );
+        assert!(synthesize_missing_app_deploy_tool_call_from_recent_writes(
+            &current_turn_calls,
+            &[]
+        )
+        .is_none());
     }
 
     #[test]
@@ -48552,10 +49837,8 @@ Research report: India AI research capacity | 4 sources";
             response.contains("I created 1 app file, but deployment did not finish cleanly yet.")
         );
         assert!(response.contains("`/app/data/apps/new/arxiv_monitor/app.py`"));
-        assert!(
-            response
-                .contains("The app was not started or verified because the deploy step failed.")
-        );
+        assert!(response
+            .contains("The app was not started or verified because the deploy step failed."));
         assert!(!response.contains("I gathered tool evidence"));
         assert!(!response.contains("File Write:"));
     }
@@ -48631,11 +49914,8 @@ Research report: India AI research capacity | 4 sources";
 
         assert!(response.contains("Stopped waiting for synthesis after 90 seconds"));
         assert!(response.contains("App Inspect matched app `arXiv Research Monitor`."));
-        assert!(
-            response.contains(
-                "File Read read HTML document `arXiv Research Monitor | RL & Time-Series`."
-            )
-        );
+        assert!(response
+            .contains("File Read read HTML document `arXiv Research Monitor | RL & Time-Series`."));
         assert!(!response.contains("<!DOCTYPE html>"));
         assert!(!response.contains("<html>"));
     }
@@ -48674,10 +49954,8 @@ Research report: India AI research capacity | 4 sources";
 
         let response = build_simple_fast_path_tool_response(&batch);
 
-        assert!(
-            response
-                .contains("Current web search for `alpha beta update` found 2 relevant results.")
-        );
+        assert!(response
+            .contains("Current web search for `alpha beta update` found 2 relevant results."));
         assert!(response.contains("example.com"));
         assert!(response.contains("example.org"));
         assert!(!response.contains("final response could not be formatted cleanly"));
@@ -48853,13 +50131,11 @@ Research report: India AI research capacity | 4 sources";
                 .expect("task should still exist")
         };
         assert!(matches!(repaired_task.status, TaskStatus::Cancelled));
-        assert!(
-            repaired_task
-                .result
-                .as_deref()
-                .unwrap_or_default()
-                .contains("could not be restored after restart")
-        );
+        assert!(repaired_task
+            .result
+            .as_deref()
+            .unwrap_or_default()
+            .contains("could not be restored after restart"));
 
         let stored_task = agent
             .storage
@@ -48870,13 +50146,11 @@ Research report: India AI research capacity | 4 sources";
             .find(|row| row.id == task.id.to_string())
             .expect("stored task should exist");
         assert!(stored_task.status.contains("Cancelled"));
-        assert!(
-            stored_task
-                .result
-                .as_deref()
-                .unwrap_or_default()
-                .contains("could not be restored after restart")
-        );
+        assert!(stored_task
+            .result
+            .as_deref()
+            .unwrap_or_default()
+            .contains("could not be restored after restart"));
     }
 
     #[test]
@@ -49052,8 +50326,8 @@ Research report: India AI research capacity | 4 sources";
     }
 
     #[test]
-    fn chat_model_is_configured_accepts_openai_compatible_slots_without_auth_when_endpoint_is_explicit()
-     {
+    fn chat_model_is_configured_accepts_openai_compatible_slots_without_auth_when_endpoint_is_explicit(
+    ) {
         let mut config = AgentConfig::default();
         config.model_pool.slots.push(ModelSlot {
             id: "primary".to_string(),
@@ -49415,11 +50689,8 @@ Research report: India AI research capacity | 4 sources";
             None,
         );
 
-        assert!(
-            system.contains(
-                "Do not add a separate final step just to summarize or present the result."
-            )
-        );
+        assert!(system
+            .contains("Do not add a separate final step just to summarize or present the result."));
     }
 
     #[test]
@@ -50866,11 +52137,8 @@ Research report: India AI research capacity | 4 sources";
 
         let task = build_browser_session_followup_task(&ready_session, "list my submisons");
 
-        assert!(
-            task.contains(
-                "Continue the existing browser workflow from the current live page state."
-            )
-        );
+        assert!(task
+            .contains("Continue the existing browser workflow from the current live page state."));
         assert!(task.contains("Previous browser task: Go to Hacker News, let the user log in, and then list the user's submissions"));
         assert!(task.contains("Current reusable browser state: Logged in successfully and reached the authenticated home page."));
         assert!(task.contains("Latest user request: list my submisons"));

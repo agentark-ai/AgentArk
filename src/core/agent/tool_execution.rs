@@ -830,10 +830,7 @@ impl Agent {
                     .await;
                 }
             }
-            crate::core::integration_auth::ReverseLookupOutcome::Ambiguous {
-                key,
-                candidates,
-            } => {
+            crate::core::integration_auth::ReverseLookupOutcome::Ambiguous { key, candidates } => {
                 tracing::warn!(
                     "Ambiguous auth manifest reverse lookup for key '{}': {:?}",
                     key,
@@ -1345,7 +1342,11 @@ impl Agent {
                 serde_json::Value::String(content.to_string()),
             );
         }
-        if out.is_empty() { None } else { Some(out) }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
     }
 
     pub(crate) fn normalize_app_deploy_arguments(
@@ -1800,7 +1801,11 @@ impl Agent {
                 }
             }
         }
-        if files.is_empty() { None } else { Some(files) }
+        if files.is_empty() {
+            None
+        } else {
+            Some(files)
+        }
     }
 
     /// Recover files from a top-level object that has no `files` key and no nested wrapper.
@@ -2681,9 +2686,9 @@ impl Agent {
                         obj.insert("running".to_string(), serde_json::json!(status.running));
                         obj.insert(
                             "runtime_mode".to_string(),
-                            serde_json::json!(
-                                status.runtime_mode.unwrap_or_else(|| "stopped".to_string())
-                            ),
+                            serde_json::json!(status
+                                .runtime_mode
+                                .unwrap_or_else(|| "stopped".to_string())),
                         );
                         obj.insert(
                             "port".to_string(),
@@ -12757,11 +12762,13 @@ mod tests {
             capability_context_id: None,
         };
 
-        assert!(
-            Agent::legacy_tool_call_allowed_by_safety(&safety, &deploy_call, Some(&direct_chat))
-                .await
-                .expect("legacy safety check should succeed")
-        );
+        assert!(Agent::legacy_tool_call_allowed_by_safety(
+            &safety,
+            &deploy_call,
+            Some(&direct_chat)
+        )
+        .await
+        .expect("legacy safety check should succeed"));
         assert!(
             !Agent::legacy_tool_call_allowed_by_safety(&safety, &deploy_call, None)
                 .await
@@ -12807,15 +12814,13 @@ mod tests {
             capability_context_id: None,
         };
 
-        assert!(
-            Agent::legacy_tool_call_allowed_by_safety(
-                &safety,
-                &file_write_call,
-                Some(&direct_chat),
-            )
-            .await
-            .expect("legacy safety check should succeed")
-        );
+        assert!(Agent::legacy_tool_call_allowed_by_safety(
+            &safety,
+            &file_write_call,
+            Some(&direct_chat),
+        )
+        .await
+        .expect("legacy safety check should succeed"));
         assert!(
             !Agent::legacy_tool_call_allowed_by_safety(&safety, &file_write_call, None)
                 .await

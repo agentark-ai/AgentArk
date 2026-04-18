@@ -25,13 +25,52 @@ CYAN='\033[0;36m'
 RED='\033[0;31m'
 BOLD='\033[1m'
 NC='\033[0m'
+AGENTARK_LOCAL_ENV="${AGENTARK_LOCAL_ENV:-.agentark/local.env}"
+
+compose() {
+    docker compose --env-file "$AGENTARK_LOCAL_ENV" "$@"
+}
+
+compose_dev() {
+    docker compose --env-file "$AGENTARK_LOCAL_ENV" -f docker-compose.yml -f docker-compose.dev.yml "$@"
+}
+
+read_env_value() {
+    local key="$1"
+    local file="$2"
+    [ -f "$file" ] || return 0
+    awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$file"
+}
+
+upsert_managed_env_value() {
+    local key="$1"
+    local value="$2"
+    mkdir -p "$(dirname "$AGENTARK_LOCAL_ENV")"
+    if [ -f "$AGENTARK_LOCAL_ENV" ] && grep -q "^${key}=" "$AGENTARK_LOCAL_ENV"; then
+        local escaped
+        escaped="$(printf '%s' "$value" | sed 's/[&|]/\\&/g')"
+        sed -i.bak "s|^${key}=.*|${key}=${escaped}|" "$AGENTARK_LOCAL_ENV"
+        rm -f "${AGENTARK_LOCAL_ENV}.bak"
+    else
+        printf '%s=%s\n' "$key" "$value" >> "$AGENTARK_LOCAL_ENV"
+    fi
+}
 
 ensure_postgres_password() {
-    if [ ! -f .env ] && [ -f .env.example ]; then
-        cp .env.example .env
+    mkdir -p "$(dirname "$AGENTARK_LOCAL_ENV")"
+    local existing
+    existing="$(read_env_value AGENTARK_POSTGRES_PASSWORD "$AGENTARK_LOCAL_ENV")"
+    if [ -n "$existing" ]; then
+        AGENTARK_POSTGRES_PASSWORD="$existing"
+        export AGENTARK_POSTGRES_PASSWORD
+        return 0
     fi
-
-    if [ -f .env ] && grep -Eq '^AGENTARK_POSTGRES_PASSWORD=.+$' .env; then
+    existing="$(read_env_value AGENTARK_POSTGRES_PASSWORD ".env")"
+    if [ -n "$existing" ]; then
+        upsert_managed_env_value AGENTARK_POSTGRES_PASSWORD "$existing"
+        AGENTARK_POSTGRES_PASSWORD="$existing"
+        export AGENTARK_POSTGRES_PASSWORD
+        echo -e "${GREEN}Migrated local Postgres password to ${AGENTARK_LOCAL_ENV}${NC}"
         return 0
     fi
 
@@ -47,14 +86,11 @@ ensure_postgres_password() {
         return 1
     fi
 
-    if [ -f .env ] && grep -q '^AGENTARK_POSTGRES_PASSWORD=' .env; then
-        sed -i.bak "s/^AGENTARK_POSTGRES_PASSWORD=.*/AGENTARK_POSTGRES_PASSWORD=$generated/" .env
-        rm -f .env.bak
-    else
-        printf '\nAGENTARK_POSTGRES_PASSWORD=%s\n' "$generated" >> .env
-    fi
+    upsert_managed_env_value AGENTARK_POSTGRES_PASSWORD "$generated"
+    AGENTARK_POSTGRES_PASSWORD="$generated"
+    export AGENTARK_POSTGRES_PASSWORD
 
-    echo -e "${GREEN}Generated a local Postgres password and saved it to .env${NC}"
+    echo -e "${GREEN}Generated a local Postgres password in ${AGENTARK_LOCAL_ENV}${NC}"
 }
 
 verify_lightpanda_runtime() {
@@ -62,7 +98,7 @@ verify_lightpanda_runtime() {
 
     echo -e "${CYAN}Verifying bundled Lightpanda runtime...${NC}"
     while [ "$attempts" -gt 0 ]; do
-        if docker compose exec -T agentark-control sh -lc 'command -v lightpanda >/dev/null 2>&1' >/dev/null 2>&1; then
+        if compose exec -T agentark-control sh -lc 'command -v lightpanda >/dev/null 2>&1' >/dev/null 2>&1; then
             echo -e "${GREEN}Lightpanda is available inside the AgentArk runtime.${NC}"
             return 0
         fi
@@ -78,7 +114,7 @@ case "${1:-start}" in
     start)
         ensure_postgres_password || exit 1
         echo -e "${GREEN}Starting AgentArk...${NC}"
-        docker compose up -d
+        compose up -d
         verify_lightpanda_runtime
         echo ""
         echo -e "${GREEN}AgentArk is running!${NC}"
@@ -115,19 +151,14 @@ case "${1:-start}" in
                 exit 0
             fi
 
-            # Save to .env
-            if grep -q "^TUNNEL_TOKEN=" .env 2>/dev/null; then
-                sed -i "s|^TUNNEL_TOKEN=.*|TUNNEL_TOKEN=$token|" .env
-            else
-                echo "TUNNEL_TOKEN=$token" >> .env
-            fi
-            echo -e "${GREEN}Token saved to .env${NC}"
+            upsert_managed_env_value TUNNEL_TOKEN "$token"
+            echo -e "${GREEN}Token saved to ${AGENTARK_LOCAL_ENV}${NC}"
             echo ""
         fi
 
         ensure_postgres_password || exit 1
         echo -e "${GREEN}Starting AgentArk with remote access...${NC}"
-        AGENTARK_TUNNEL=true docker compose up -d
+        AGENTARK_TUNNEL=true compose up -d
         verify_lightpanda_runtime
         echo ""
         echo -e "${GREEN}AgentArk is starting with secure tunnel!${NC}"
@@ -137,8 +168,10 @@ case "${1:-start}" in
         echo ""
 
         # Check if named or quick tunnel
-        if [ -f .env ]; then
-            source .env 2>/dev/null || true
+        if [ -f "$AGENTARK_LOCAL_ENV" ]; then
+            set -a
+            . "$AGENTARK_LOCAL_ENV" 2>/dev/null || true
+            set +a
         fi
         if [ -n "$TUNNEL_TOKEN" ]; then
             echo -e "  Using:   ${CYAN}Permanent custom domain (configured in Cloudflare)${NC}"
@@ -154,29 +187,29 @@ case "${1:-start}" in
         ;;
     stop)
         echo -e "${YELLOW}Stopping AgentArk...${NC}"
-        docker compose down
+        compose down
         echo -e "${GREEN}AgentArk stopped. Your data is preserved.${NC}"
         ;;
     restart)
         echo -e "${YELLOW}Restarting AgentArk...${NC}"
-        docker compose restart agentark-control agentark-workspace agentark-executor
+        compose restart agentark-control agentark-workspace agentark-executor
         verify_lightpanda_runtime
         ;;
     logs)
-        docker compose logs -f
+        compose logs -f
         ;;
     update)
         ensure_postgres_password || exit 1
         echo -e "${YELLOW}Updating AgentArk (your data will be preserved)...${NC}"
-        docker compose pull
-        docker compose up -d
+        compose pull
+        compose up -d
         verify_lightpanda_runtime
         echo -e "${GREEN}Update complete! Your data is intact.${NC}"
         ;;
     build)
         ensure_postgres_password || exit 1
         echo -e "${YELLOW}Building AgentArk from this checkout and force-recreating containers (your data will be preserved)...${NC}"
-        AGENTARK_IMAGE=${AGENTARK_IMAGE:-agentark:dev} docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build --force-recreate
+        AGENTARK_IMAGE=${AGENTARK_IMAGE:-agentark:dev} compose_dev up -d --build --force-recreate
         verify_lightpanda_runtime
         echo -e "${GREEN}Local build complete! Your data is intact.${NC}"
         ;;
@@ -190,7 +223,7 @@ case "${1:-start}" in
         ;;
     status)
         echo -e "${BOLD}AgentArk Status:${NC}"
-        docker compose ps
+        compose ps
         ;;
     chat)
         docker exec -it agentark-control /app/agentark --chat

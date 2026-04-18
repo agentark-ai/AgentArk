@@ -54,6 +54,7 @@ const OAUTH_SIGNAL_STORAGE_KEY = "agentark:oauth-callback";
 const OAUTH_SIGNAL_CHANNEL = "agentark-oauth";
 
 const CHANNEL_ICON_COLORS: Record<string, string> = {
+  email: "#14B8A6",
   telegram: "#26A5E4",
   whatsapp: "#25D366",
   slack: "#4A154B",
@@ -209,6 +210,51 @@ const GOOGLE_WORKSPACE_BUNDLES = [
   { id: "admin", label: "Admin" }
 ] as const;
 
+const EMAIL_PROVIDER_OPTIONS = [
+  { value: "auto", label: "Auto" },
+  { value: "gmail", label: "Gmail" },
+  { value: "google_workspace", label: "Google Workspace" },
+  { value: "resend", label: "Resend" },
+  { value: "postmark", label: "Postmark" },
+  { value: "ses", label: "Amazon SES" },
+  { value: "smtp", label: "SMTP" }
+] as const;
+
+const EMAIL_TRANSPORT_OPTIONS = [
+  { value: "http", label: "HTTPS API" },
+  { value: "smtp", label: "SMTP" }
+] as const;
+
+const EMAIL_AUTH_OPTIONS = [
+  { value: "none", label: "Provider default" },
+  { value: "bearer", label: "Bearer token" },
+  { value: "header", label: "Header token" },
+  { value: "basic", label: "Username + password" },
+  { value: "aws_sigv4", label: "AWS SigV4" }
+] as const;
+
+const EMAIL_SMTP_SECURITY_OPTIONS = [
+  { value: "starttls", label: "STARTTLS" },
+  { value: "tls", label: "TLS / SMTPS" },
+  { value: "none", label: "None" }
+] as const;
+
+const EMAIL_BUILTIN_PROVIDERS = new Set(["gmail", "google_workspace"]);
+const EMAIL_EXTERNAL_PROVIDERS = new Set(["resend", "postmark", "ses", "smtp"]);
+
+function emailProviderLabel(value: string): string {
+  const normalized = (value || "").trim().toLowerCase();
+  return EMAIL_PROVIDER_OPTIONS.find((option) => option.value === normalized)?.label || value || "Email";
+}
+
+function isEmailBuiltInProvider(value: string): boolean {
+  return EMAIL_BUILTIN_PROVIDERS.has((value || "").trim().toLowerCase());
+}
+
+function isEmailExternalProvider(value: string): boolean {
+  return EMAIL_EXTERNAL_PROVIDERS.has((value || "").trim().toLowerCase());
+}
+
 type JsonRecord = Record<string, unknown>;
 type OAuthSignalPayload = {
   type?: string;
@@ -248,6 +294,27 @@ type McpServerForm = {
 };
 
 type ChannelSettingsForm = {
+  email_provider: string;
+  email_to_address: string;
+  email_from_address: string;
+  email_domain: string;
+  email_transport_kind: string;
+  email_http_base_url: string;
+  email_http_send_path: string;
+  email_smtp_host: string;
+  email_smtp_port: string;
+  email_smtp_security: string;
+  email_auth_kind: string;
+  email_auth_api_key: string;
+  email_auth_header_name: string;
+  email_auth_scheme: string;
+  email_auth_basic_username: string;
+  email_auth_basic_password: string;
+  email_auth_aws_access_key_id: string;
+  email_auth_aws_secret_access_key: string;
+  email_auth_aws_session_token: string;
+  email_auth_aws_region: string;
+  email_auth_aws_service: string;
   telegram_enabled: boolean;
   telegram_bot_token: string;
   telegram_allowed_users_csv: string;
@@ -845,6 +912,7 @@ export function IntegrationsPanel({
   const [customMessagingCredentialValues, setCustomMessagingCredentialValues] =
     useState<Record<string, string>>({});
   const [channelsDirty, setChannelsDirty] = useState(false);
+  const [emailSetupOpen, setEmailSetupOpen] = useState(false);
   const [telegramSetupOpen, setTelegramSetupOpen] = useState(false);
   const [slackSetupOpen, setSlackSetupOpen] = useState(false);
   const [discordSetupOpen, setDiscordSetupOpen] = useState(false);
@@ -858,6 +926,27 @@ export function IntegrationsPanel({
   const [wechatSetupOpen, setWechatSetupOpen] = useState(false);
   const [qqSetupOpen, setQqSetupOpen] = useState(false);
   const [channelForm, setChannelForm] = useState<ChannelSettingsForm>({
+    email_provider: "auto",
+    email_to_address: "",
+    email_from_address: "",
+    email_domain: "",
+    email_transport_kind: "http",
+    email_http_base_url: "",
+    email_http_send_path: "",
+    email_smtp_host: "",
+    email_smtp_port: "587",
+    email_smtp_security: "starttls",
+    email_auth_kind: "none",
+    email_auth_api_key: "",
+    email_auth_header_name: "",
+    email_auth_scheme: "",
+    email_auth_basic_username: "",
+    email_auth_basic_password: "",
+    email_auth_aws_access_key_id: "",
+    email_auth_aws_secret_access_key: "",
+    email_auth_aws_session_token: "",
+    email_auth_aws_region: "",
+    email_auth_aws_service: "ses",
     telegram_enabled: false,
     telegram_bot_token: "",
     telegram_allowed_users_csv: "",
@@ -1235,6 +1324,8 @@ export function IntegrationsPanel({
   );
   const integrationSyncFeed = showCatalog ? integrationSyncFeedQ.data?.items || [] : [];
   const settings = asRecord(settingsQ.data);
+  const emailSettings = asRecord(settings.email);
+  const emailAuthSettings = asRecord(emailSettings.auth);
   const senderVerification = asRecord(senderVerificationQ.data);
   const senderVerificationSettings = asRecord(senderVerification.settings);
   const googleChatTrustSettings = asRecord(senderVerificationSettings.google_chat);
@@ -1251,6 +1342,17 @@ export function IntegrationsPanel({
   const gatewayChannels = showIntegrations ? channelsQ.data?.channels || [] : [];
   const waBridge = asRecord(waBridgeQ.data);
   const telegramStatus = asRecord(telegramStatusQ.data);
+  const emailProviderSaved = str(emailSettings.provider, "auto").trim().toLowerCase() || "auto";
+  const emailAvailableBackends = Array.from(new Set(
+    asStringList(emailSettings.available_backends).map((backend) => backend.trim().toLowerCase()).filter(Boolean)
+  ));
+  const emailAvailableBackendLabels = emailAvailableBackends.map((backend) => emailProviderLabel(backend));
+  const emailAutoResolvesTo = str(emailSettings.auto_resolves_to, "").trim().toLowerCase();
+  const emailDeliveryReady = toBool(emailSettings.delivery_ready);
+  const hasEmailApiKey = toBool(emailAuthSettings.has_api_key);
+  const hasEmailBasicPassword = toBool(emailAuthSettings.has_basic_password);
+  const hasEmailAwsSecretAccessKey = toBool(emailAuthSettings.has_aws_secret_access_key);
+  const hasEmailAwsSessionToken = toBool(emailAuthSettings.has_aws_session_token);
   const telegramEnabledSaved = toBool(settings.telegram_enabled);
   const hasTelegramToken = toBool(settings.has_telegram_token);
   const telegramDeliveryReady = toBool(settings.telegram_delivery_ready);
@@ -1271,6 +1373,87 @@ export function IntegrationsPanel({
   const hasLineChannelSecret = toBool(settings.has_line_channel_secret);
   const hasWeChatBridgeToken = toBool(settings.has_wechat_bridge_token);
   const hasQqBridgeToken = toBool(settings.has_qq_bridge_token);
+  const emailSelectedProvider = (channelForm.email_provider || emailProviderSaved || "auto").trim().toLowerCase() || "auto";
+  const emailUsesBuiltInProvider = isEmailBuiltInProvider(emailSelectedProvider);
+  const emailUsesExternalProvider = isEmailExternalProvider(emailSelectedProvider);
+  const emailSelectedTransportKind =
+    (channelForm.email_transport_kind || "http").trim().toLowerCase() === "smtp" ? "smtp" : "http";
+  const emailSelectedAuthKind = (channelForm.email_auth_kind || "none").trim().toLowerCase() || "none";
+  const emailUsesSmtpTransport =
+    emailSelectedProvider === "smtp" || (emailSelectedProvider === "ses" && emailSelectedTransportKind === "smtp");
+  const emailRecipientConfigured = channelForm.email_to_address.trim().length > 0;
+  const emailFromConfigured = channelForm.email_from_address.trim().length > 0;
+  const emailApiKeyConfigured = hasEmailApiKey || channelForm.email_auth_api_key.trim().length > 0;
+  const emailBasicPasswordConfigured =
+    hasEmailBasicPassword || channelForm.email_auth_basic_password.trim().length > 0;
+  const emailAwsSecretConfigured =
+    hasEmailAwsSecretAccessKey || channelForm.email_auth_aws_secret_access_key.trim().length > 0;
+  const emailBuiltInMailboxFallbackCount = emailAvailableBackends.filter((backend) => EMAIL_BUILTIN_PROVIDERS.has(backend)).length;
+  const emailRecipientFallbackReady =
+    emailBuiltInMailboxFallbackCount === 1 || (emailSelectedProvider === "auto" && EMAIL_BUILTIN_PROVIDERS.has(emailAutoResolvesTo));
+  const emailRecipientReady =
+    emailRecipientConfigured || emailUsesBuiltInProvider || emailRecipientFallbackReady;
+  const emailDraftIssues = (() => {
+    const issues: string[] = [];
+    if (emailSelectedProvider === "auto") {
+      if (emailAvailableBackends.length === 0) {
+        issues.push("Connect Gmail or Google Workspace, or configure Resend, Postmark, SES, or SMTP.");
+      } else if (emailAvailableBackends.length > 1) {
+        issues.push("Auto cannot choose between multiple ready backends. Pick a provider explicitly.");
+      }
+      return issues;
+    }
+    if (emailUsesBuiltInProvider) {
+      if (!emailAvailableBackends.includes(emailSelectedProvider)) {
+        issues.push(`Connect ${emailProviderLabel(emailSelectedProvider)} in Integrations first.`);
+      }
+      return issues;
+    }
+    if (!emailFromConfigured) {
+      issues.push("Add a From address on the domain you want AgentArk to send from.");
+    }
+    if (emailSelectedProvider === "resend" || emailSelectedProvider === "postmark") {
+      if (!emailApiKeyConfigured) {
+        issues.push(`Add the ${emailProviderLabel(emailSelectedProvider)} API key.`);
+      }
+    } else if (emailSelectedProvider === "ses") {
+      if (emailUsesSmtpTransport) {
+        if (!channelForm.email_smtp_host.trim()) {
+          issues.push("Add the SES SMTP host.");
+        }
+        if (!channelForm.email_auth_basic_username.trim()) {
+          issues.push("Add the SES SMTP username.");
+        }
+        if (!emailBasicPasswordConfigured) {
+          issues.push("Add the SES SMTP password.");
+        }
+      } else {
+        if (!channelForm.email_auth_aws_access_key_id.trim()) {
+          issues.push("Add the AWS access key ID.");
+        }
+        if (!emailAwsSecretConfigured) {
+          issues.push("Add the AWS secret access key.");
+        }
+        if (!channelForm.email_auth_aws_region.trim()) {
+          issues.push("Add the AWS region.");
+        }
+      }
+    } else if (emailSelectedProvider === "smtp") {
+      if (!channelForm.email_smtp_host.trim()) {
+        issues.push("Add the SMTP host.");
+      }
+      if (!channelForm.email_auth_basic_username.trim()) {
+        issues.push("Add the SMTP username.");
+      }
+      if (!emailBasicPasswordConfigured) {
+        issues.push("Add the SMTP password.");
+      }
+    }
+    if (emailUsesExternalProvider && !emailRecipientReady) {
+      issues.push("Set a recipient email, or keep exactly one connected Google mailbox available for fallback delivery.");
+    }
+    return issues;
+  })();
   const telegramDraftTokenConfigured = channelForm.telegram_bot_token.trim().length > 0;
   const telegramTokenConfigured = hasTelegramToken || telegramDraftTokenConfigured;
   const whatsappTokenConfigured = hasWhatsAppToken || channelForm.whatsapp_access_token.trim().length > 0;
@@ -1298,6 +1481,53 @@ export function IntegrationsPanel({
   const whatsappBridgeInstalled = waBridge.installed !== false;
   const telegramProbeStatus = str(telegramStatus.status, "").trim().toLowerCase();
   const telegramProbeDetail = str(telegramStatus.detail, "").trim();
+  const emailStatusLabel = emailDeliveryReady ? "Delivery ready" : "Setup needed";
+  const emailStatusColor = emailDeliveryReady
+    ? "success"
+    : emailDraftIssues.length > 0
+      ? "warning"
+      : "info";
+  const emailConnectionDetail = (() => {
+    if (emailDeliveryReady) {
+      const activeProviderLabel =
+        emailProviderSaved === "auto" && emailAutoResolvesTo
+          ? `Auto -> ${emailProviderLabel(emailAutoResolvesTo)}`
+          : emailProviderLabel(emailProviderSaved);
+      const recipientText = emailRecipientConfigured
+        ? `Recipient ${channelForm.email_to_address.trim()}.`
+        : emailUsesBuiltInProvider || emailRecipientFallbackReady
+          ? "Recipient falls back to the connected Google mailbox."
+          : "Set a recipient to choose where notification emails land.";
+      const fromText = channelForm.email_from_address.trim()
+        ? `From ${channelForm.email_from_address.trim()}.`
+        : "";
+      return [activeProviderLabel, "is ready.", recipientText, fromText].filter(Boolean).join(" ");
+    }
+    if (emailDraftIssues.length > 0) {
+      return emailDraftIssues[0];
+    }
+    if (emailAvailableBackendLabels.length > 0) {
+      return `Ready backends: ${summarizeInlineNames(emailAvailableBackendLabels, "No ready backends yet")}. Save to apply your selection.`;
+    }
+    return "Connect Gmail or Google Workspace, or configure a provider account you control.";
+  })();
+  const emailProviderHelperText = (() => {
+    if (emailSelectedProvider === "auto" && emailAvailableBackends.length === 1) {
+      return `Auto currently resolves to ${emailProviderLabel(emailAvailableBackends[0])}.`;
+    }
+    if (emailSelectedProvider === "auto" && emailAvailableBackends.length > 1) {
+      return "More than one backend is ready. Pick one explicitly so AgentArk knows where to send.";
+    }
+    if (emailSelectedProvider === "gmail" || emailSelectedProvider === "google_workspace") {
+      return `Use the connected ${emailProviderLabel(emailSelectedProvider)} mailbox for delivery.`;
+    }
+    return "Use a provider account you control for custom domains and branded email delivery.";
+  })();
+  const emailRecipientHelperText = emailRecipientConfigured
+    ? "Notification emails will be delivered to this address."
+    : emailUsesBuiltInProvider || emailRecipientFallbackReady
+      ? "Leave blank when the connected Gmail or Google Workspace mailbox should receive the email."
+      : "Set this for provider accounts you control. Leave blank only when one connected Google mailbox should receive the email.";
   const telegramConnectionStatusRaw = (() => {
     if (!telegramEnabledSaved) return "disabled";
     if (!hasTelegramToken) return "missing_token";
@@ -1793,7 +2023,33 @@ export function IntegrationsPanel({
   useEffect(() => {
     if (!showIntegrations || !settingsQ.data || channelsDirty) return;
     const next = asRecord(settingsQ.data);
+    const emailSettings = asRecord(next.email);
+    const emailTransport = asRecord(emailSettings.transport);
+    const emailHttpTransport = asRecord(emailTransport.http);
+    const emailSmtpTransport = asRecord(emailTransport.smtp);
+    const emailAuthSettings = asRecord(emailSettings.auth);
     setChannelForm({
+      email_provider: str(emailSettings.provider, "auto"),
+      email_to_address: str(emailSettings.to_address, ""),
+      email_from_address: str(emailSettings.from_address, ""),
+      email_domain: str(emailSettings.domain, ""),
+      email_transport_kind: str(emailTransport.kind, "http"),
+      email_http_base_url: str(emailHttpTransport.base_url, ""),
+      email_http_send_path: str(emailHttpTransport.send_path, ""),
+      email_smtp_host: str(emailSmtpTransport.host, ""),
+      email_smtp_port: str(emailSmtpTransport.port, "587"),
+      email_smtp_security: str(emailSmtpTransport.security, "starttls"),
+      email_auth_kind: str(emailAuthSettings.kind, "none"),
+      email_auth_api_key: "",
+      email_auth_header_name: str(emailAuthSettings.header_name, ""),
+      email_auth_scheme: str(emailAuthSettings.scheme, ""),
+      email_auth_basic_username: str(emailAuthSettings.basic_username, ""),
+      email_auth_basic_password: "",
+      email_auth_aws_access_key_id: str(emailAuthSettings.aws_access_key_id, ""),
+      email_auth_aws_secret_access_key: "",
+      email_auth_aws_session_token: "",
+      email_auth_aws_region: str(emailAuthSettings.aws_region, ""),
+      email_auth_aws_service: str(emailAuthSettings.aws_service, "ses"),
       telegram_enabled: toBool(next.telegram_enabled),
       telegram_bot_token: "",
       telegram_allowed_users_csv: asStringList(next.telegram_allowed_users).join(", "),
@@ -1929,6 +2185,11 @@ export function IntegrationsPanel({
   ) => {
     setChannelsDirty(true);
     setChannelForm((prev) => ({ ...prev, [key]: value }));
+  };
+
+  const openEmailSetup = () => {
+    setNotice(null);
+    setEmailSetupOpen(true);
   };
 
   const openTelegramSetup = (enableIfDisabled = false) => {
@@ -2240,6 +2501,38 @@ export function IntegrationsPanel({
     .filter((setup) => setup.displayState === "ready");
 
   const persistChannelSettings = async (form: ChannelSettingsForm) => {
+      const emailProviderForSave = form.email_provider.trim().toLowerCase() || "auto";
+      const emailTransportKindForSave =
+        form.email_transport_kind.trim().toLowerCase() === "smtp" ? "smtp" : "http";
+      const emailAuthKindForSave = (() => {
+        const selected = form.email_auth_kind.trim().toLowerCase() || "none";
+        if (selected !== "none") return selected;
+        if (emailProviderForSave === "ses" && emailTransportKindForSave === "smtp") {
+          return "basic";
+        }
+        return "none";
+      })();
+      const emailAuthPayload: Record<string, unknown> = {
+        kind: emailAuthKindForSave,
+        header_name: form.email_auth_header_name.trim(),
+        scheme: form.email_auth_scheme.trim(),
+        basic_username: form.email_auth_basic_username.trim(),
+        aws_access_key_id: form.email_auth_aws_access_key_id.trim(),
+        aws_region: form.email_auth_aws_region.trim(),
+        aws_service: form.email_auth_aws_service.trim()
+      };
+      if (form.email_auth_api_key.trim()) {
+        emailAuthPayload.api_key = form.email_auth_api_key.trim();
+      }
+      if (form.email_auth_basic_password.trim()) {
+        emailAuthPayload.basic_password = form.email_auth_basic_password.trim();
+      }
+      if (form.email_auth_aws_secret_access_key.trim()) {
+        emailAuthPayload.aws_secret_access_key = form.email_auth_aws_secret_access_key.trim();
+      }
+      if (form.email_auth_aws_session_token.trim()) {
+        emailAuthPayload.aws_session_token = form.email_auth_aws_session_token.trim();
+      }
       const payload: Record<string, unknown> = {
         llm_provider: str(settings.llm_provider, ""),
         llm_model: str(settings.llm_model, ""),
@@ -2249,6 +2542,25 @@ export function IntegrationsPanel({
         llm_fallback_model: settings.llm_fallback_model ?? null,
         llm_fallback_base_url: settings.llm_fallback_base_url ?? null,
         llm_fallback_api_key: null,
+        email: {
+          provider: emailProviderForSave,
+          to_address: form.email_to_address.trim(),
+          from_address: form.email_from_address.trim(),
+          domain: form.email_domain.trim(),
+          transport: {
+            kind: emailTransportKindForSave,
+            http: {
+              base_url: form.email_http_base_url.trim(),
+              send_path: form.email_http_send_path.trim()
+            },
+            smtp: {
+              host: form.email_smtp_host.trim(),
+              port: Number(form.email_smtp_port) || 587,
+              security: form.email_smtp_security.trim() || "starttls"
+            }
+          },
+          auth: emailAuthPayload
+        },
         telegram_enabled: !!form.telegram_enabled,
         telegram_bot_token: form.telegram_bot_token.trim() || null,
         telegram_allowed_users: parseTelegramUsers(form.telegram_allowed_users_csv),
@@ -4008,6 +4320,108 @@ export function IntegrationsPanel({
           ) : null}
           <Stack spacing={1.25}>
             <Box>
+              <Typography variant="subtitle2">Email Delivery</Typography>
+              <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                Send AgentArk emails through Gmail, Google Workspace, or a provider account you control.
+              </Typography>
+            </Box>
+            <Grid2 container spacing={1.25} sx={{ alignItems: "stretch" }}>
+              <Grid2 size={{ xs: 12, md: 6, xl: 4 }} sx={{ display: "flex" }}>
+                <Box
+                  role="button"
+                  tabIndex={0}
+                  onClick={openEmailSetup}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      openEmailSetup();
+                    }
+                  }}
+                  sx={{
+                    height: "100%",
+                    width: "100%",
+                    p: 1.5,
+                    borderRadius: 1.5,
+                    border: emailDeliveryReady
+                      ? "1px solid rgba(64,196,255,0.24)"
+                      : "1px solid rgba(112,153,201,0.16)",
+                    background: emailDeliveryReady ? "rgba(8,24,42,0.56)" : "rgba(7,17,32,0.6)",
+                    cursor: "pointer",
+                    transition: "border-color 0.15s, background 0.15s, box-shadow 0.15s",
+                    "&:hover": {
+                      borderColor: emailDeliveryReady
+                        ? "rgba(64,196,255,0.36)"
+                        : "rgba(112,153,201,0.26)",
+                      background: emailDeliveryReady ? "rgba(8,28,48,0.66)" : "rgba(9,22,40,0.72)",
+                      boxShadow: "0 8px 24px rgba(0,0,0,0.18)"
+                    }
+                  }}
+                >
+                  <Stack spacing={1.1} sx={{ height: "100%", justifyContent: "space-between" }}>
+                    <Box>
+                      <Stack
+                        direction="row"
+                        spacing={0.9}
+                        sx={{
+                          alignItems: "center",
+                          mb: 0.75
+                        }}
+                      >
+                        <ChannelIcon name="Email" size={20} />
+                        <Typography variant="subtitle2" noWrap>
+                          Email Delivery
+                        </Typography>
+                      </Stack>
+                      <Typography
+                        variant="body2"
+                        sx={{
+                          color: "text.secondary",
+                          display: "-webkit-box",
+                          WebkitLineClamp: 3,
+                          WebkitBoxOrient: "vertical",
+                          overflow: "hidden"
+                        }}
+                      >
+                        {emailConnectionDetail}
+                      </Typography>
+                    </Box>
+                    <Stack
+                      direction="row"
+                      spacing={1}
+                      sx={{
+                        justifyContent: "space-between",
+                        alignItems: "center"
+                      }}
+                    >
+                      <Stack direction="row" spacing={0.5} useFlexGap sx={{ flexWrap: "wrap" }}>
+                        <Chip size="small" label="Email" sx={sectionTagChipSx} />
+                        <Chip size="small" label={emailStatusLabel} sx={sectionCountChipSx} />
+                        <Chip
+                          size="small"
+                          label={emailProviderLabel(emailSelectedProvider)}
+                          sx={sectionTagChipSx}
+                        />
+                      </Stack>
+                      <Button
+                        size="small"
+                        variant={emailDeliveryReady ? "outlined" : "contained"}
+                        sx={connectorCardActionButtonSx}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          openEmailSetup();
+                        }}
+                      >
+                        {emailDeliveryReady ? "Open wizard" : "Set up"}
+                      </Button>
+                    </Stack>
+                  </Stack>
+                </Box>
+              </Grid2>
+            </Grid2>
+          </Stack>
+          <Divider sx={{ my: 1.5, borderColor: "rgba(112,153,201,0.12)" }} />
+          <Stack spacing={1.25}>
+            <Box>
               <Typography variant="subtitle2">Setup Wizards</Typography>
               <Typography variant="caption" sx={{
                 color: "text.secondary"
@@ -5066,6 +5480,378 @@ export function IntegrationsPanel({
           </Button>
         </DialogActions>
       </Dialog>
+      {showIntegrations ? (
+      <Dialog open={emailSetupOpen} onClose={() => setEmailSetupOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>Email Delivery</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={1.5}>
+            {notice?.kind === "error" ? <Alert severity="error">{notice.text}</Alert> : null}
+            <Typography variant="body2" sx={{ color: "text.secondary" }}>
+              Send AgentArk notification emails through a connected Google mailbox or a provider account you control.
+            </Typography>
+            <Stack direction="row" spacing={1} sx={{ alignItems: "center", flexWrap: "wrap" }}>
+              <Chip
+                size="small"
+                label={emailStatusLabel}
+                color={emailStatusColor}
+                variant="outlined"
+              />
+              <Chip
+                size="small"
+                label={
+                  emailProviderSaved === "auto" && emailAutoResolvesTo
+                    ? `Auto -> ${emailProviderLabel(emailAutoResolvesTo)}`
+                    : emailProviderLabel(emailProviderSaved)
+                }
+                variant="outlined"
+              />
+            </Stack>
+            <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: "wrap" }}>
+              {emailAvailableBackendLabels.length > 0 ? (
+                emailAvailableBackendLabels.map((label) => (
+                  <Chip key={label} size="small" label={label} variant="outlined" sx={sectionCountChipSx} />
+                ))
+              ) : (
+                <Chip size="small" label="No ready backends yet" variant="outlined" sx={sectionCountChipSx} />
+              )}
+            </Stack>
+            <Alert severity={emailDeliveryReady ? "success" : emailDraftIssues.length > 0 ? "warning" : "info"}>
+              {emailConnectionDetail}
+            </Alert>
+            <TextField
+              select
+              fullWidth
+              size="small"
+              label="Provider"
+              value={channelForm.email_provider}
+              onChange={(e) => setChannelField("email_provider", e.target.value)}
+              helperText={emailProviderHelperText}
+            >
+              {EMAIL_PROVIDER_OPTIONS.map((option) => (
+                <MenuItem key={option.value} value={option.value}>
+                  {option.label}
+                </MenuItem>
+              ))}
+            </TextField>
+            <TextField
+              fullWidth
+              size="small"
+              type="email"
+              label="Recipient Email"
+              value={channelForm.email_to_address}
+              onChange={(e) => setChannelField("email_to_address", e.target.value)}
+              placeholder="you@example.com"
+              helperText={emailRecipientHelperText}
+            />
+            <TextField
+              fullWidth
+              size="small"
+              type="email"
+              label="From Address"
+              value={channelForm.email_from_address}
+              onChange={(e) => setChannelField("email_from_address", e.target.value)}
+              placeholder={
+                emailUsesExternalProvider ? "notifications@example.com" : "Optional if the connected mailbox should send"
+              }
+              helperText={
+                emailUsesExternalProvider
+                  ? "Use an address on the domain you want AgentArk to send from."
+                  : "Leave blank to use the connected mailbox unless you already configured a Google alias."
+              }
+            />
+            <TextField
+              fullWidth
+              size="small"
+              label="Verified Domain"
+              value={channelForm.email_domain}
+              onChange={(e) => setChannelField("email_domain", e.target.value)}
+              placeholder="example.com"
+              helperText="Optional for Gmail and Google Workspace. Use this for provider accounts that send from your own domain."
+            />
+
+            {emailUsesExternalProvider && !emailRecipientReady ? (
+              <Alert severity="info" sx={{ py: 0.75 }}>
+                Set a recipient email unless one connected Gmail or Google Workspace mailbox should receive these notifications.
+              </Alert>
+            ) : null}
+
+            {emailSelectedProvider === "resend" || emailSelectedProvider === "postmark" ? (
+              <>
+                <Divider />
+                <TextField
+                  fullWidth
+                  size="small"
+                  type="password"
+                  label="API Key"
+                  value={channelForm.email_auth_api_key}
+                  onChange={(e) => setChannelField("email_auth_api_key", e.target.value)}
+                  placeholder={hasEmailApiKey ? "Configured (leave blank to keep)" : "Enter API key"}
+                  helperText={
+                    hasEmailApiKey
+                      ? "Leave blank to keep the saved API key."
+                      : `Required for ${emailProviderLabel(emailSelectedProvider)} delivery.`
+                  }
+                />
+              </>
+            ) : null}
+
+            {emailSelectedProvider === "ses" ? (
+              <>
+                <Divider />
+                <TextField
+                  select
+                  fullWidth
+                  size="small"
+                  label="Delivery Transport"
+                  value={channelForm.email_transport_kind}
+                  onChange={(e) => setChannelField("email_transport_kind", e.target.value)}
+                  helperText="Use the HTTPS API for standard SES delivery, or SMTP when you want traditional relay credentials."
+                >
+                  {EMAIL_TRANSPORT_OPTIONS.map((option) => (
+                    <MenuItem key={option.value} value={option.value}>
+                      {option.label}
+                    </MenuItem>
+                  ))}
+                </TextField>
+                {emailSelectedTransportKind === "smtp" ? (
+                  <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" }, gap: 1 }}>
+                    <TextField
+                      fullWidth
+                      size="small"
+                      label="SMTP Host"
+                      value={channelForm.email_smtp_host}
+                      onChange={(e) => setChannelField("email_smtp_host", e.target.value)}
+                      placeholder="email-smtp.us-east-1.amazonaws.com"
+                    />
+                    <TextField
+                      fullWidth
+                      size="small"
+                      label="SMTP Port"
+                      value={channelForm.email_smtp_port}
+                      onChange={(e) => setChannelField("email_smtp_port", e.target.value)}
+                    />
+                    <TextField
+                      select
+                      fullWidth
+                      size="small"
+                      label="Encryption"
+                      value={channelForm.email_smtp_security}
+                      onChange={(e) => setChannelField("email_smtp_security", e.target.value)}
+                    >
+                      {EMAIL_SMTP_SECURITY_OPTIONS.map((option) => (
+                        <MenuItem key={option.value} value={option.value}>
+                          {option.label}
+                        </MenuItem>
+                      ))}
+                    </TextField>
+                    <TextField
+                      fullWidth
+                      size="small"
+                      label="SMTP Username"
+                      value={channelForm.email_auth_basic_username}
+                      onChange={(e) => setChannelField("email_auth_basic_username", e.target.value)}
+                    />
+                    <TextField
+                      fullWidth
+                      size="small"
+                      type="password"
+                      label="SMTP Password"
+                      value={channelForm.email_auth_basic_password}
+                      onChange={(e) => setChannelField("email_auth_basic_password", e.target.value)}
+                      placeholder={hasEmailBasicPassword ? "Configured (leave blank to keep)" : "Enter SMTP password"}
+                      helperText={hasEmailBasicPassword ? "Leave blank to keep the saved SMTP password." : "Required for SES SMTP delivery."}
+                    />
+                  </Box>
+                ) : (
+                  <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" }, gap: 1 }}>
+                    <TextField
+                      fullWidth
+                      size="small"
+                      label="AWS Region"
+                      value={channelForm.email_auth_aws_region}
+                      onChange={(e) => setChannelField("email_auth_aws_region", e.target.value)}
+                      placeholder="us-east-1"
+                    />
+                    <TextField
+                      fullWidth
+                      size="small"
+                      label="Service"
+                      value={channelForm.email_auth_aws_service}
+                      onChange={(e) => setChannelField("email_auth_aws_service", e.target.value)}
+                      helperText="Usually ses."
+                    />
+                    <TextField
+                      fullWidth
+                      size="small"
+                      label="Access Key ID"
+                      value={channelForm.email_auth_aws_access_key_id}
+                      onChange={(e) => setChannelField("email_auth_aws_access_key_id", e.target.value)}
+                    />
+                    <TextField
+                      fullWidth
+                      size="small"
+                      type="password"
+                      label="Secret Access Key"
+                      value={channelForm.email_auth_aws_secret_access_key}
+                      onChange={(e) => setChannelField("email_auth_aws_secret_access_key", e.target.value)}
+                      placeholder={hasEmailAwsSecretAccessKey ? "Configured (leave blank to keep)" : "Enter secret access key"}
+                      helperText={hasEmailAwsSecretAccessKey ? "Leave blank to keep the saved secret access key." : "Required for SES HTTPS delivery."}
+                    />
+                    <TextField
+                      fullWidth
+                      size="small"
+                      type="password"
+                      label="Session Token"
+                      value={channelForm.email_auth_aws_session_token}
+                      onChange={(e) => setChannelField("email_auth_aws_session_token", e.target.value)}
+                      placeholder={hasEmailAwsSessionToken ? "Configured (leave blank to keep)" : "Optional session token"}
+                      helperText={hasEmailAwsSessionToken ? "Leave blank to keep the saved session token." : "Optional. Use it for temporary AWS credentials."}
+                    />
+                  </Box>
+                )}
+              </>
+            ) : null}
+
+            {emailSelectedProvider === "smtp" ? (
+              <>
+                <Divider />
+                <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" }, gap: 1 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    label="SMTP Host"
+                    value={channelForm.email_smtp_host}
+                    onChange={(e) => setChannelField("email_smtp_host", e.target.value)}
+                    placeholder="smtp.example.com"
+                  />
+                  <TextField
+                    fullWidth
+                    size="small"
+                    label="SMTP Port"
+                    value={channelForm.email_smtp_port}
+                    onChange={(e) => setChannelField("email_smtp_port", e.target.value)}
+                  />
+                  <TextField
+                    select
+                    fullWidth
+                    size="small"
+                    label="Encryption"
+                    value={channelForm.email_smtp_security}
+                    onChange={(e) => setChannelField("email_smtp_security", e.target.value)}
+                  >
+                    {EMAIL_SMTP_SECURITY_OPTIONS.map((option) => (
+                      <MenuItem key={option.value} value={option.value}>
+                        {option.label}
+                      </MenuItem>
+                    ))}
+                  </TextField>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    label="SMTP Username"
+                    value={channelForm.email_auth_basic_username}
+                    onChange={(e) => setChannelField("email_auth_basic_username", e.target.value)}
+                  />
+                  <TextField
+                    fullWidth
+                    size="small"
+                    type="password"
+                    label="SMTP Password"
+                    value={channelForm.email_auth_basic_password}
+                    onChange={(e) => setChannelField("email_auth_basic_password", e.target.value)}
+                    placeholder={hasEmailBasicPassword ? "Configured (leave blank to keep)" : "Enter SMTP password"}
+                    helperText={hasEmailBasicPassword ? "Leave blank to keep the saved SMTP password." : "Required for SMTP delivery."}
+                  />
+                </Box>
+              </>
+            ) : null}
+
+            {emailUsesExternalProvider ? (
+              <Accordion
+                disableGutters
+                sx={{
+                  border: "1px solid rgba(110, 160, 255, 0.18)",
+                  borderRadius: 1.5,
+                  background: "rgba(8, 24, 42, 0.32)",
+                  "&:before": { display: "none" }
+                }}
+              >
+                <AccordionSummary expandIcon={<ExpandMoreRoundedIcon />}>
+                  <Box>
+                    <Typography variant="subtitle2">Advanced Delivery Settings</Typography>
+                    <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                      Override auth or endpoint details only when your mail service expects something custom.
+                    </Typography>
+                  </Box>
+                </AccordionSummary>
+                <AccordionDetails sx={{ pt: 0 }}>
+                  <Stack spacing={1.25}>
+                    <TextField
+                      select
+                      fullWidth
+                      size="small"
+                      label="Auth Mode"
+                      value={channelForm.email_auth_kind}
+                      onChange={(e) => setChannelField("email_auth_kind", e.target.value)}
+                      helperText="Provider default uses Bearer for Resend, header token for Postmark, AWS signing for SES HTTPS, and username/password for SMTP."
+                    >
+                      {EMAIL_AUTH_OPTIONS.map((option) => (
+                        <MenuItem key={option.value} value={option.value}>
+                          {option.label}
+                        </MenuItem>
+                      ))}
+                    </TextField>
+                    {!emailUsesSmtpTransport ? (
+                      <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" }, gap: 1 }}>
+                        <TextField
+                          fullWidth
+                          size="small"
+                          label="API Base URL"
+                          value={channelForm.email_http_base_url}
+                          onChange={(e) => setChannelField("email_http_base_url", e.target.value)}
+                          placeholder="Optional override"
+                        />
+                        <TextField
+                          fullWidth
+                          size="small"
+                          label="Send Path"
+                          value={channelForm.email_http_send_path}
+                          onChange={(e) => setChannelField("email_http_send_path", e.target.value)}
+                          placeholder="Optional override"
+                        />
+                      </Box>
+                    ) : null}
+                    {emailSelectedAuthKind === "bearer" || emailSelectedAuthKind === "header" ? (
+                      <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" }, gap: 1 }}>
+                        <TextField
+                          fullWidth
+                          size="small"
+                          label="Header Name"
+                          value={channelForm.email_auth_header_name}
+                          onChange={(e) => setChannelField("email_auth_header_name", e.target.value)}
+                          placeholder="Authorization"
+                        />
+                        <TextField
+                          fullWidth
+                          size="small"
+                          label="Auth Scheme"
+                          value={channelForm.email_auth_scheme}
+                          onChange={(e) => setChannelField("email_auth_scheme", e.target.value)}
+                          placeholder="Bearer"
+                        />
+                      </Box>
+                    ) : null}
+                  </Stack>
+                </AccordionDetails>
+              </Accordion>
+            ) : null}
+          </Stack>
+        </DialogContent>
+        {renderMessagingDialogActions({
+          onClose: () => setEmailSetupOpen(false)
+        })}
+      </Dialog>
+      ) : null}
       {showIntegrations ? (
       <Dialog open={telegramSetupOpen} onClose={() => setTelegramSetupOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>Telegram Setup</DialogTitle>

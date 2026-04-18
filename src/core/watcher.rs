@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use uuid::Uuid;
 
 /// Default watch duration: 24 hours
@@ -361,6 +361,34 @@ pub struct Watcher {
 pub struct WatcherManager {
     watchers: Arc<RwLock<HashMap<Uuid, Watcher>>>,
     storage: Option<crate::storage::Storage>,
+    change_notify: Arc<Notify>,
+}
+
+fn add_secs(base: DateTime<Utc>, secs: u64, fallback: DateTime<Utc>) -> DateTime<Utc> {
+    base.checked_add_signed(chrono::Duration::seconds(secs.min(i64::MAX as u64) as i64))
+        .unwrap_or(fallback)
+}
+
+fn watcher_next_wakeup_at(watcher: &Watcher, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    if watcher.status != WatcherStatus::Active {
+        return None;
+    }
+
+    let timeout_at = add_secs(watcher.created_at, watcher.timeout_secs, now);
+    if timeout_at <= now {
+        return Some(now);
+    }
+
+    let interval_due_at = watcher
+        .last_poll_at
+        .map(|last| add_secs(last, watcher.interval_secs, timeout_at))
+        .unwrap_or(now);
+    let poll_due_at = watcher
+        .next_poll_not_before
+        .map(|not_before| interval_due_at.max(not_before))
+        .unwrap_or(interval_due_at);
+
+    Some(poll_due_at.min(timeout_at))
 }
 
 fn strip_automation_meta(value: &serde_json::Value) -> serde_json::Value {
@@ -503,7 +531,12 @@ impl WatcherManager {
         Self {
             watchers: Arc::new(RwLock::new(watchers)),
             storage,
+            change_notify: Arc::new(Notify::new()),
         }
+    }
+
+    fn notify_changed(&self) {
+        self.change_notify.notify_one();
     }
 
     #[cfg(test)]
@@ -538,6 +571,7 @@ impl WatcherManager {
         let id = watcher.id;
         self.watchers.write().await.insert(id, watcher);
         self.persist().await;
+        self.notify_changed();
         id
     }
 
@@ -596,6 +630,7 @@ impl WatcherManager {
             Self::replace_watcher(existing, watcher);
             drop(watchers);
             self.persist().await;
+            self.notify_changed();
             return Ok((target_id, true, 0));
         }
 
@@ -619,6 +654,7 @@ impl WatcherManager {
             }
             drop(watchers);
             self.persist().await;
+            self.notify_changed();
             return Ok((keeper_id, true, matching_ids.len().saturating_sub(1)));
         }
 
@@ -626,6 +662,7 @@ impl WatcherManager {
         watchers.insert(id, watcher);
         drop(watchers);
         self.persist().await;
+        self.notify_changed();
         Ok((id, false, 0))
     }
 
@@ -667,6 +704,21 @@ impl WatcherManager {
             })
             .cloned()
             .collect()
+    }
+
+    /// Earliest poll, retry, or timeout event for active watchers.
+    pub async fn next_wakeup_at(&self) -> Option<DateTime<Utc>> {
+        let now = Utc::now();
+        let watchers = self.watchers.read().await;
+        watchers
+            .values()
+            .filter_map(|watcher| watcher_next_wakeup_at(watcher, now))
+            .min()
+    }
+
+    /// Wait until watcher definitions or scheduling state changes.
+    pub async fn wait_for_change(&self) {
+        self.change_notify.notified().await;
     }
 
     /// Update a watcher after a successful poll.
@@ -798,6 +850,7 @@ impl WatcherManager {
         };
         if cancelled {
             self.persist().await;
+            self.notify_changed();
         }
         cancelled
     }
@@ -817,6 +870,7 @@ impl WatcherManager {
         };
         if paused {
             self.persist().await;
+            self.notify_changed();
         }
         paused
     }
@@ -837,6 +891,7 @@ impl WatcherManager {
         };
         if resumed {
             self.persist().await;
+            self.notify_changed();
         }
         resumed
     }
@@ -855,6 +910,7 @@ impl WatcherManager {
         }
         if changed > 0 {
             self.persist().await;
+            self.notify_changed();
         }
         changed
     }
@@ -873,6 +929,7 @@ impl WatcherManager {
         }
         if changed > 0 {
             self.persist().await;
+            self.notify_changed();
         }
         changed
     }
@@ -891,6 +948,7 @@ impl WatcherManager {
         };
         if ran {
             self.persist().await;
+            self.notify_changed();
         }
         ran
     }
@@ -915,6 +973,7 @@ impl WatcherManager {
         };
         if updated.is_some() {
             self.persist().await;
+            self.notify_changed();
         }
         updated
     }
@@ -933,6 +992,7 @@ impl WatcherManager {
         };
         if updated.is_some() {
             self.persist().await;
+            self.notify_changed();
         }
         updated
     }
@@ -950,6 +1010,7 @@ impl WatcherManager {
         };
         if updated {
             self.persist().await;
+            self.notify_changed();
         }
         updated
     }
@@ -959,6 +1020,7 @@ impl WatcherManager {
         let deleted = self.watchers.write().await.remove(&id).is_some();
         if deleted {
             self.persist().await;
+            self.notify_changed();
         }
         deleted
     }
@@ -1097,6 +1159,55 @@ mod tests {
         assert!(WatcherManager::watchers_are_semantically_similar(
             &existing, &exact
         ));
+    }
+
+    #[test]
+    fn next_wakeup_is_now_for_never_polled_active_watcher() {
+        let now = Utc::now();
+        let mut watcher = watcher_with_origin("watch", "query", "conv", "proj");
+        watcher.created_at = now;
+        watcher.last_poll_at = None;
+
+        assert_eq!(watcher_next_wakeup_at(&watcher, now), Some(now));
+    }
+
+    #[test]
+    fn next_wakeup_honors_backoff_after_interval() {
+        let now = Utc::now();
+        let mut watcher = watcher_with_origin("watch", "query", "conv", "proj");
+        watcher.created_at = now - chrono::Duration::minutes(10);
+        watcher.last_poll_at = Some(now - chrono::Duration::seconds(30));
+        watcher.interval_secs = 60;
+        watcher.next_poll_not_before = Some(now + chrono::Duration::seconds(120));
+
+        assert_eq!(
+            watcher_next_wakeup_at(&watcher, now),
+            Some(now + chrono::Duration::seconds(120))
+        );
+    }
+
+    #[test]
+    fn next_wakeup_uses_timeout_when_timeout_is_earliest() {
+        let now = Utc::now();
+        let mut watcher = watcher_with_origin("watch", "query", "conv", "proj");
+        watcher.created_at = now - chrono::Duration::seconds(90);
+        watcher.timeout_secs = 100;
+        watcher.last_poll_at = Some(now);
+        watcher.interval_secs = 60;
+
+        assert_eq!(
+            watcher_next_wakeup_at(&watcher, now),
+            Some(now + chrono::Duration::seconds(10))
+        );
+    }
+
+    #[test]
+    fn next_wakeup_ignores_paused_watchers() {
+        let now = Utc::now();
+        let mut watcher = watcher_with_origin("watch", "query", "conv", "proj");
+        watcher.status = WatcherStatus::Paused;
+
+        assert_eq!(watcher_next_wakeup_at(&watcher, now), None);
     }
 
     #[test]

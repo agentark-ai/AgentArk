@@ -2272,6 +2272,7 @@ pub struct SettingsResponse {
     pub language: Option<String>,
     pub tone: Option<String>,
     pub email_format: Option<String>,
+    pub email: EmailSettingsResponse,
     pub daily_brief_enabled: bool,
     pub daily_brief_time: String,
     pub daily_brief_channel: String,
@@ -2437,6 +2438,54 @@ pub struct SettingsResponse {
     pub observability: observability::ObservabilitySettingsResponse,
 }
 
+#[derive(Debug, Serialize)]
+pub struct EmailSettingsResponse {
+    pub provider: String,
+    pub to_address: Option<String>,
+    pub from_address: Option<String>,
+    pub domain: Option<String>,
+    pub available_backends: Vec<String>,
+    pub auto_resolves_to: Option<String>,
+    pub delivery_ready: bool,
+    pub transport: EmailTransportSettingsResponse,
+    pub auth: EmailAuthSettingsResponse,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmailTransportSettingsResponse {
+    pub kind: String,
+    pub http: EmailHttpTransportSettingsResponse,
+    pub smtp: EmailSmtpTransportSettingsResponse,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmailHttpTransportSettingsResponse {
+    pub base_url: Option<String>,
+    pub send_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmailSmtpTransportSettingsResponse {
+    pub host: String,
+    pub port: u16,
+    pub security: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmailAuthSettingsResponse {
+    pub kind: String,
+    pub header_name: Option<String>,
+    pub scheme: Option<String>,
+    pub basic_username: String,
+    pub aws_access_key_id: String,
+    pub aws_region: Option<String>,
+    pub aws_service: Option<String>,
+    pub has_api_key: bool,
+    pub has_basic_password: bool,
+    pub has_aws_secret_access_key: bool,
+    pub has_aws_session_token: bool,
+}
+
 /// Model slot summary for API responses
 #[derive(Debug, Serialize)]
 pub struct ModelSlotSummary {
@@ -2473,6 +2522,8 @@ pub struct SettingsUpdate {
     pub language: Option<String>,
     pub tone: Option<String>,
     pub email_format: Option<String>,
+    #[serde(default)]
+    pub email: Option<EmailSettingsUpdate>,
     #[serde(default)]
     pub daily_brief_enabled: Option<bool>,
     #[serde(default)]
@@ -2693,6 +2744,55 @@ pub struct SettingsUpdate {
     pub data_lifecycle: Option<DataLifecycleSettingsUpdate>,
     #[serde(default)]
     pub observability: Option<observability::ObservabilitySettingsUpdate>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct EmailSettingsUpdate {
+    pub provider: Option<String>,
+    pub to_address: Option<String>,
+    pub from_address: Option<String>,
+    pub domain: Option<String>,
+    #[serde(default)]
+    pub transport: Option<EmailTransportSettingsUpdate>,
+    #[serde(default)]
+    pub auth: Option<EmailAuthSettingsUpdate>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct EmailTransportSettingsUpdate {
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub http: Option<EmailHttpTransportSettingsUpdate>,
+    #[serde(default)]
+    pub smtp: Option<EmailSmtpTransportSettingsUpdate>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct EmailHttpTransportSettingsUpdate {
+    pub base_url: Option<String>,
+    pub send_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct EmailSmtpTransportSettingsUpdate {
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub security: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct EmailAuthSettingsUpdate {
+    pub kind: Option<String>,
+    pub api_key: Option<String>,
+    pub header_name: Option<String>,
+    pub scheme: Option<String>,
+    pub basic_username: Option<String>,
+    pub basic_password: Option<String>,
+    pub aws_access_key_id: Option<String>,
+    pub aws_secret_access_key: Option<String>,
+    pub aws_session_token: Option<String>,
+    pub aws_region: Option<String>,
+    pub aws_service: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -20948,6 +21048,112 @@ fn is_configured_secret(value: &str) -> bool {
     !value.trim().is_empty() && value != "[ENCRYPTED]"
 }
 
+fn trimmed_option_string(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn settings_configured_email_backends(
+    config: &crate::core::config::AgentConfig,
+    config_dir: &FsPath,
+    gmail_enabled: bool,
+    workspace_enabled: bool,
+) -> Vec<String> {
+    let mut backends = Vec::new();
+    let has_legacy_gmail = gmail_enabled
+        && crate::core::config::SecureConfigManager::new(config_dir)
+            .ok()
+            .and_then(|manager| manager.get_custom_secret("gmail_tokens").ok().flatten())
+            .is_some_and(|value| !value.trim().is_empty());
+    if has_legacy_gmail {
+        backends.push(crate::core::email_delivery::EMAIL_PROVIDER_GMAIL.to_string());
+    }
+    let has_workspace_gmail = workspace_enabled
+        && crate::actions::google_workspace::granted_bundles(config_dir)
+            .map(|bundles| bundles.iter().any(|bundle| bundle == "gmail"))
+            .unwrap_or(false);
+    if has_workspace_gmail {
+        backends.push(crate::core::email_delivery::EMAIL_PROVIDER_GOOGLE_WORKSPACE.to_string());
+    }
+    if crate::core::email_delivery::external_email_delivery_is_ready(&config.email) {
+        if let Some(provider_id) =
+            crate::core::email_delivery::external_email_provider_id(&config.email)
+        {
+            if !backends.iter().any(|existing| existing == &provider_id) {
+                backends.push(provider_id);
+            }
+        }
+    }
+    backends
+}
+
+fn build_email_settings_response(
+    config: &crate::core::config::AgentConfig,
+    config_dir: &FsPath,
+    gmail_enabled: bool,
+    workspace_enabled: bool,
+) -> EmailSettingsResponse {
+    let available_backends = settings_configured_email_backends(
+        config,
+        config_dir,
+        gmail_enabled,
+        workspace_enabled,
+    );
+    let provider = crate::core::email_delivery::normalize_email_provider(&config.email.provider);
+    let auto_resolves_to = if provider == crate::core::email_delivery::EMAIL_PROVIDER_AUTO {
+        crate::core::email_delivery::normalize_email_backend_selection(&provider, &available_backends)
+            .ok()
+    } else {
+        None
+    };
+    EmailSettingsResponse {
+        provider,
+        to_address: trimmed_option_string(config.email.to_address.as_deref()),
+        from_address: trimmed_option_string(config.email.from_address.as_deref()),
+        domain: trimmed_option_string(config.email.domain.as_deref()),
+        available_backends: available_backends.clone(),
+        auto_resolves_to,
+        delivery_ready: crate::core::email_delivery::email_channel_is_ready(
+            &config.email.provider,
+            &available_backends,
+        ),
+        transport: EmailTransportSettingsResponse {
+            kind: crate::core::email_delivery::normalize_transport_kind(&config.email.transport.kind),
+            http: EmailHttpTransportSettingsResponse {
+                base_url: trimmed_option_string(config.email.transport.http.base_url.as_deref()),
+                send_path: trimmed_option_string(config.email.transport.http.send_path.as_deref()),
+            },
+            smtp: EmailSmtpTransportSettingsResponse {
+                host: config.email.transport.smtp.host.clone(),
+                port: config.email.transport.smtp.port,
+                security: config.email.transport.smtp.security.clone(),
+            },
+        },
+        auth: EmailAuthSettingsResponse {
+            kind: crate::core::email_delivery::normalize_auth_kind(&config.email.auth.kind),
+            header_name: trimmed_option_string(config.email.auth.header_name.as_deref()),
+            scheme: trimmed_option_string(config.email.auth.scheme.as_deref()),
+            basic_username: config.email.auth.basic_username.clone(),
+            aws_access_key_id: config.email.auth.aws_access_key_id.clone(),
+            aws_region: trimmed_option_string(config.email.auth.aws_region.as_deref()),
+            aws_service: trimmed_option_string(config.email.auth.aws_service.as_deref()),
+            has_api_key: is_configured_secret(&config.email.auth.api_key),
+            has_basic_password: is_configured_secret(&config.email.auth.basic_password),
+            has_aws_secret_access_key: is_configured_secret(
+                &config.email.auth.aws_secret_access_key,
+            ),
+            has_aws_session_token: config
+                .email
+                .auth
+                .aws_session_token
+                .as_deref()
+                .is_some_and(is_configured_secret),
+        },
+    }
+}
+
 fn custom_settings_secret_is_deletable(_key: &str) -> bool {
     true
 }
@@ -21075,6 +21281,42 @@ fn collect_settings_secret_entries(
             "whatsapp_bridge_token".to_string(),
             value,
             "whatsapp",
+            false,
+        );
+    }
+    if let Some(value) = secrets.custom.get("email.auth.api_key") {
+        push_settings_secret_entry(
+            &mut entries,
+            "email.auth.api_key".to_string(),
+            value,
+            "email",
+            false,
+        );
+    }
+    if let Some(value) = secrets.custom.get("email.auth.basic_password") {
+        push_settings_secret_entry(
+            &mut entries,
+            "email.auth.basic_password".to_string(),
+            value,
+            "email",
+            false,
+        );
+    }
+    if let Some(value) = secrets.custom.get("email.auth.aws_secret_access_key") {
+        push_settings_secret_entry(
+            &mut entries,
+            "email.auth.aws_secret_access_key".to_string(),
+            value,
+            "email",
+            false,
+        );
+    }
+    if let Some(value) = secrets.custom.get("email.auth.aws_session_token") {
+        push_settings_secret_entry(
+            &mut entries,
+            "email.auth.aws_session_token".to_string(),
+            value,
+            "email",
             false,
         );
     }
@@ -24961,6 +25203,33 @@ async fn run_evolution_dev_action(
                 )
                     .into_response();
             };
+            let candidate = if arkmemory_candidate_is_memory(&candidate.candidate_type) {
+                let candidate =
+                    match arkmemory_ensure_latest_open_candidate(&storage, &candidate).await {
+                        Ok(candidate) => candidate,
+                        Err(error) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(ErrorResponse {
+                                    error: error.to_string(),
+                                }),
+                            )
+                                .into_response();
+                        }
+                    };
+                if candidate.approval_status != "draft" {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "Learning candidate is no longer pending review.".to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+                candidate
+            } else {
+                candidate
+            };
 
             let approved_ref = match candidate.candidate_type.as_str() {
                 "workflow" => {
@@ -25147,6 +25416,123 @@ async fn run_evolution_dev_action(
                         }
                     }
                 }
+                "memory_add" | "memory_update" | "memory_retract" => {
+                    let operation_id = candidate
+                        .proposed_content
+                        .get("operation_id")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    let Some(operation_id) = operation_id else {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse {
+                                error: "memory operation candidate missing operation_id.".to_string(),
+                            }),
+                        )
+                            .into_response();
+                    };
+                    let claimed = match storage
+                        .update_learning_candidate_review_if_status(
+                            candidate_id,
+                            "draft",
+                            "applying",
+                            Some("Applying from Evolution developer controls."),
+                            None,
+                        )
+                        .await
+                    {
+                        Ok(claimed) => claimed,
+                        Err(error) => {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(ErrorResponse {
+                                    error: format!(
+                                        "Failed to claim memory operation candidate: {}",
+                                        error
+                                    ),
+                                }),
+                            )
+                                .into_response();
+                        }
+                    };
+                    if !claimed {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse {
+                                error: "Learning candidate is no longer pending review.".to_string(),
+                            }),
+                        )
+                            .into_response();
+                    }
+                    let agent = state.agent.read().await;
+                    match agent
+                        .apply_memory_operation_by_id_with_source(
+                            operation_id,
+                            "evolution_controls_review",
+                        )
+                        .await
+                    {
+                        Ok(approved_ref) => {
+                            match storage
+                                .update_learning_candidate_review_if_status(
+                                    candidate_id,
+                                    "applying",
+                                    "approved",
+                                    Some("Approved from Evolution developer controls."),
+                                    Some(&approved_ref),
+                                )
+                                .await
+                            {
+                                Ok(true) => approved_ref,
+                                Ok(false) => {
+                                    return (
+                                        StatusCode::BAD_REQUEST,
+                                        Json(ErrorResponse {
+                                            error: "Learning candidate changed while it was being applied."
+                                                .to_string(),
+                                        }),
+                                    )
+                                        .into_response();
+                                }
+                                Err(error) => {
+                                    return (
+                                        StatusCode::INTERNAL_SERVER_ERROR,
+                                        Json(ErrorResponse {
+                                            error: format!(
+                                                "Failed to record memory operation approval: {}",
+                                                error
+                                            ),
+                                        }),
+                                    )
+                                        .into_response();
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            let note = format!("Apply failed: {}", error);
+                            let _ = storage
+                                .update_learning_candidate_review_if_status(
+                                    candidate_id,
+                                    "applying",
+                                    "draft",
+                                    Some(&note),
+                                    None,
+                                )
+                                .await;
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(ErrorResponse {
+                                    error: format!(
+                                        "Failed to apply memory operation candidate: {}",
+                                        error
+                                    ),
+                                }),
+                            )
+                                .into_response();
+                        }
+                    }
+                }
                 "memory_deprecate" => {
                     let item_id = candidate
                         .proposed_content
@@ -25261,7 +25647,12 @@ async fn run_evolution_dev_action(
                         .into_response();
                 }
             };
-            if candidate.candidate_type != "strategy" {
+            if candidate.candidate_type != "strategy"
+                && !matches!(
+                    candidate.candidate_type.as_str(),
+                    "memory_add" | "memory_update" | "memory_retract"
+                )
+            {
                 if let Err(error) = storage
                     .update_learning_candidate_review(
                         candidate_id,
@@ -25317,6 +25708,33 @@ async fn run_evolution_dev_action(
                 )
                     .into_response();
             };
+            let candidate = if arkmemory_candidate_is_memory(&candidate.candidate_type) {
+                let candidate =
+                    match arkmemory_ensure_latest_open_candidate(&storage, &candidate).await {
+                        Ok(candidate) => candidate,
+                        Err(error) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(ErrorResponse {
+                                    error: error.to_string(),
+                                }),
+                            )
+                                .into_response();
+                        }
+                    };
+                if candidate.approval_status != "draft" {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "Learning candidate is no longer pending review.".to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+                candidate
+            } else {
+                candidate
+            };
             if candidate.candidate_type == "strategy" {
                 if let Err(error) = parse_tool_strategy_candidate_profile(&candidate) {
                     return (
@@ -25345,6 +25763,37 @@ async fn run_evolution_dev_action(
                     )
                         .into_response();
                 }
+            } else if arkmemory_candidate_is_memory(&candidate.candidate_type) {
+                match storage
+                    .update_learning_candidate_review_if_status(
+                        candidate_id,
+                        "draft",
+                        "rejected",
+                        Some("Rejected from Evolution developer controls."),
+                        None,
+                    )
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse {
+                                error: "Learning candidate is no longer pending review.".to_string(),
+                            }),
+                        )
+                            .into_response();
+                    }
+                    Err(error) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse {
+                                error: format!("Failed to record candidate rejection: {}", error),
+                            }),
+                        )
+                            .into_response();
+                    }
+                }
             } else if let Err(error) = storage
                 .update_learning_candidate_review(
                     candidate_id,
@@ -25361,6 +25810,24 @@ async fn run_evolution_dev_action(
                     }),
                 )
                     .into_response();
+            }
+            if arkmemory_candidate_is_memory(&candidate.candidate_type) {
+                if let Some(operation_id) = candidate
+                    .proposed_content
+                    .get("operation_id")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    if let Ok(Some(mut operation)) = storage.get_memory_operation(operation_id).await {
+                        operation.status = "rejected".to_string();
+                        operation.reviewed_at = Some(chrono::Utc::now().to_rfc3339());
+                        operation.review_notes =
+                            Some("Rejected from Evolution developer controls.".to_string());
+                        operation.updated_at = chrono::Utc::now().to_rfc3339();
+                        let _ = storage.upsert_memory_operation(&operation).await;
+                    }
+                }
             }
             format!("Rejected learning candidate '{}'.", candidate.title)
         }
@@ -25541,7 +26008,7 @@ async fn run_evolution_dev_action(
 
 /// Get current settings
 async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
-    let (config, storage, config_dir, data_dir, embedding_client) = {
+    let (config, storage, config_dir, data_dir, embedding_client, gmail_enabled, workspace_enabled) = {
         let agent = state.agent.read().await;
         (
             agent.config.clone(),
@@ -25549,6 +26016,8 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
             agent.config_dir.clone(),
             agent.data_dir.clone(),
             agent.embedding_client.clone(),
+            agent.integrations.is_enabled("gmail"),
+            agent.integrations.is_enabled("google_workspace"),
         )
     };
     let profile = state.user_profile.read().await;
@@ -26216,6 +26685,12 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
         language: profile.language.clone(),
         tone: profile.tone.clone(),
         email_format: profile.email_format.clone(),
+        email: build_email_settings_response(
+            &config,
+            &config_dir,
+            gmail_enabled,
+            workspace_enabled,
+        ),
         daily_brief_enabled,
         daily_brief_time,
         daily_brief_channel,
@@ -26791,6 +27266,37 @@ async fn update_settings(
         }
     }
 
+    if let Some(email) = settings.email.as_ref() {
+        if let Some(to_address) = email.to_address.as_ref() {
+            if !to_address.trim().is_empty() {
+                if let Err(error) = crate::core::email_delivery::validate_email_address(to_address) {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: error.to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        if let Some(from_address) = email.from_address.as_ref() {
+            if !from_address.trim().is_empty() {
+                if let Err(error) =
+                    crate::core::email_delivery::validate_email_address(from_address)
+                {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: error.to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+
     if settings.timezone.is_some()
         || settings.language.is_some()
         || settings.tone.is_some()
@@ -27053,6 +27559,138 @@ async fn update_settings(
             if !personality.is_empty() {
                 agent_guard.config.personality = personality.clone();
             }
+        }
+
+        if let Some(email_settings) = settings.email.as_ref() {
+            let mut email = agent_guard.config.email.clone();
+            if let Some(provider) = email_settings.provider.as_ref() {
+                email.provider = if provider.trim().is_empty() {
+                    crate::core::email_delivery::EMAIL_PROVIDER_AUTO.to_string()
+                } else {
+                    crate::core::email_delivery::normalize_email_provider(provider)
+                };
+            }
+            if let Some(to_address) = email_settings.to_address.as_ref() {
+                let trimmed = to_address.trim();
+                email.to_address = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
+            }
+            if let Some(from_address) = email_settings.from_address.as_ref() {
+                let trimmed = from_address.trim();
+                email.from_address = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
+            }
+            if let Some(domain) = email_settings.domain.as_ref() {
+                let trimmed = domain.trim();
+                email.domain = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
+            }
+            if let Some(transport) = email_settings.transport.as_ref() {
+                if let Some(kind) = transport.kind.as_ref() {
+                    email.transport.kind =
+                        crate::core::email_delivery::normalize_transport_kind(kind);
+                }
+                if let Some(http) = transport.http.as_ref() {
+                    if let Some(base_url) = http.base_url.as_ref() {
+                        let trimmed = base_url.trim();
+                        email.transport.http.base_url = if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        };
+                    }
+                    if let Some(send_path) = http.send_path.as_ref() {
+                        let trimmed = send_path.trim();
+                        email.transport.http.send_path = if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        };
+                    }
+                }
+                if let Some(smtp) = transport.smtp.as_ref() {
+                    if let Some(host) = smtp.host.as_ref() {
+                        email.transport.smtp.host = host.trim().to_string();
+                    }
+                    if let Some(port) = smtp.port {
+                        email.transport.smtp.port = port;
+                    }
+                    if let Some(security) = smtp.security.as_ref() {
+                        email.transport.smtp.security = security.trim().to_string();
+                    }
+                }
+            }
+            if let Some(auth) = email_settings.auth.as_ref() {
+                if let Some(kind) = auth.kind.as_ref() {
+                    email.auth.kind = crate::core::email_delivery::normalize_auth_kind(kind);
+                }
+                if let Some(api_key) = auth.api_key.as_ref() {
+                    email.auth.api_key = api_key.trim().to_string();
+                }
+                if let Some(header_name) = auth.header_name.as_ref() {
+                    let trimmed = header_name.trim();
+                    email.auth.header_name = if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    };
+                }
+                if let Some(scheme) = auth.scheme.as_ref() {
+                    let trimmed = scheme.trim();
+                    email.auth.scheme = if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    };
+                }
+                if let Some(basic_username) = auth.basic_username.as_ref() {
+                    email.auth.basic_username = basic_username.trim().to_string();
+                }
+                if let Some(basic_password) = auth.basic_password.as_ref() {
+                    email.auth.basic_password = basic_password.trim().to_string();
+                }
+                if let Some(aws_access_key_id) = auth.aws_access_key_id.as_ref() {
+                    email.auth.aws_access_key_id = aws_access_key_id.trim().to_string();
+                }
+                if let Some(aws_secret_access_key) = auth.aws_secret_access_key.as_ref() {
+                    email.auth.aws_secret_access_key =
+                        aws_secret_access_key.trim().to_string();
+                }
+                if let Some(aws_session_token) = auth.aws_session_token.as_ref() {
+                    let trimmed = aws_session_token.trim();
+                    email.auth.aws_session_token = if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    };
+                }
+                if let Some(aws_region) = auth.aws_region.as_ref() {
+                    let trimmed = aws_region.trim();
+                    email.auth.aws_region = if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    };
+                }
+                if let Some(aws_service) = auth.aws_service.as_ref() {
+                    let trimmed = aws_service.trim();
+                    email.auth.aws_service = if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    };
+                }
+            }
+            agent_guard.config.email = email;
         }
 
         // Get existing primary API key to preserve if not provided
@@ -37481,7 +38119,13 @@ async fn delete_knowledge_item(State(state): State<AppState>, Path(id): Path<Str
 
 // ==================== ArkMemory Endpoints ====================
 
-const ARKMEMORY_MEMORY_CANDIDATE_TYPES: &[&str] = &["memory_deprecate", "memory_merge"];
+const ARKMEMORY_MEMORY_CANDIDATE_TYPES: &[&str] = &[
+    "memory_deprecate",
+    "memory_merge",
+    "memory_add",
+    "memory_update",
+    "memory_retract",
+];
 const ARKMEMORY_APPLYING_LEASE_TIMEOUT_SECS: i64 = 10 * 60;
 
 fn arkmemory_project_param(params: &HashMap<String, String>) -> Option<&str> {
@@ -37567,6 +38211,101 @@ fn arkmemory_candidate_is_stale_applying(
         .unwrap_or(false)
 }
 
+async fn arkmemory_visible_open_memory_candidates(
+    storage: &crate::storage::Storage,
+    project_id: Option<&str>,
+    limit: u64,
+) -> Result<Vec<crate::storage::learning_candidate::Model>> {
+    let fetch_limit = limit.saturating_mul(2).clamp(50, 200);
+    let rows = storage
+        .list_learning_candidates_for_review(
+            &["draft", "applying"],
+            ARKMEMORY_MEMORY_CANDIDATE_TYPES,
+            project_id,
+            fetch_limit,
+        )
+        .await?;
+    let mut visible = Vec::new();
+    for mut candidate in rows {
+        if candidate.approval_status == "draft" {
+            visible.push(candidate);
+        } else if arkmemory_candidate_is_stale_applying(&candidate) {
+            let reset = storage
+                .update_learning_candidate_review_if_status(
+                    &candidate.id,
+                    "applying",
+                    "draft",
+                    Some("Reset stale ArkMemory apply claim."),
+                    None,
+                )
+                .await?;
+            if reset {
+                candidate.approval_status = "draft".to_string();
+                candidate.review_notes = Some("Reset stale ArkMemory apply claim.".to_string());
+                candidate.updated_at = chrono::Utc::now().to_rfc3339();
+                visible.push(candidate);
+            }
+        } else {
+            visible.push(candidate);
+        }
+    }
+    visible.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    Ok(visible)
+}
+
+async fn arkmemory_latest_open_candidate_for_subject(
+    storage: &crate::storage::Storage,
+    candidate: &crate::storage::learning_candidate::Model,
+) -> Result<Option<crate::storage::learning_candidate::Model>> {
+    let rows = storage
+        .list_learning_candidates_for_subject_key(
+            &candidate.subject_key,
+            ARKMEMORY_MEMORY_CANDIDATE_TYPES,
+            candidate.project_id.as_deref(),
+            32,
+        )
+        .await?;
+    let mut open = Vec::new();
+    for mut row in rows {
+        if row.approval_status == "draft" {
+            open.push(row);
+        } else if arkmemory_candidate_is_stale_applying(&row) {
+            let reset = storage
+                .update_learning_candidate_review_if_status(
+                    &row.id,
+                    "applying",
+                    "draft",
+                    Some("Reset stale ArkMemory apply claim."),
+                    None,
+                )
+                .await?;
+            if reset {
+                row.approval_status = "draft".to_string();
+                row.review_notes = Some("Reset stale ArkMemory apply claim.".to_string());
+                row.updated_at = chrono::Utc::now().to_rfc3339();
+                open.push(row);
+            }
+        } else if row.approval_status == "applying" {
+            open.push(row);
+        }
+    }
+    open.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    Ok(open.into_iter().next())
+}
+
+async fn arkmemory_ensure_latest_open_candidate(
+    storage: &crate::storage::Storage,
+    candidate: &crate::storage::learning_candidate::Model,
+) -> Result<crate::storage::learning_candidate::Model> {
+    let latest = arkmemory_latest_open_candidate_for_subject(storage, candidate)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Memory queue item is no longer pending review."))?;
+    if latest.id != candidate.id {
+        anyhow::bail!("A newer memory queue item exists for this subject.");
+    }
+    Ok(latest)
+}
+
 fn arkmemory_memory_sources(item: &crate::storage::experience_item::Model) -> Vec<String> {
     let mut sources = Vec::new();
     let metadata = item.metadata.as_object();
@@ -37633,36 +38372,14 @@ async fn arkmemory_list_memory_candidates(
     project_id: Option<&str>,
     limit: u64,
 ) -> Result<Vec<crate::storage::learning_candidate::Model>> {
-    let fetch_limit = limit.saturating_mul(2).clamp(50, 200);
-    let rows = storage
-        .list_learning_candidates_for_review(
-            &["draft", "applying"],
-            ARKMEMORY_MEMORY_CANDIDATE_TYPES,
-            project_id,
-            fetch_limit,
-        )
-        .await?;
+    let rows = arkmemory_visible_open_memory_candidates(storage, project_id, limit).await?;
     let mut visible = Vec::new();
-    for mut candidate in rows {
-        if candidate.approval_status == "draft" {
-            visible.push(candidate);
-        } else if arkmemory_candidate_is_stale_applying(&candidate) {
-            let reset = storage
-                .update_learning_candidate_review_if_status(
-                    &candidate.id,
-                    "applying",
-                    "draft",
-                    Some("Reset stale ArkMemory apply claim."),
-                    None,
-                )
-                .await?;
-            if reset {
-                candidate.approval_status = "draft".to_string();
-                candidate.review_notes = Some("Reset stale ArkMemory apply claim.".to_string());
-                candidate.updated_at = chrono::Utc::now().to_rfc3339();
-                visible.push(candidate);
-            }
+    let mut seen_subjects = std::collections::HashSet::new();
+    for candidate in rows {
+        if !seen_subjects.insert(candidate.subject_key.clone()) {
+            continue;
         }
+        visible.push(candidate);
         if visible.len() >= limit as usize {
             break;
         }
@@ -37704,7 +38421,11 @@ async fn arkmemory_build_health_findings(
                 "created_at": item.updated_at,
             }));
         }
-        if arkmemory_memory_sources(&item).is_empty() {
+        let evidence_links = storage
+            .list_memory_evidence_links_for_memory(&item.id, project_id, 16)
+            .await
+            .unwrap_or_default();
+        if arkmemory_memory_sources(&item).is_empty() && evidence_links.is_empty() {
             findings.push(serde_json::json!({
                 "id": format!("source:{}", item.id),
                 "kind": "missing_source",
@@ -37718,6 +38439,58 @@ async fn arkmemory_build_health_findings(
         }
         if findings.len() >= limit as usize {
             break;
+        }
+    }
+    if findings.len() < limit as usize {
+        for event in storage
+            .list_memory_capture_events_by_statuses(&["failed"], project_id, limit)
+            .await?
+        {
+            let capture_event_id = event.id.clone();
+            findings.push(serde_json::json!({
+                "id": format!("capture_failed:{}", capture_event_id),
+                "kind": "capture_failed",
+                "severity": "warning",
+                "capture_event_id": capture_event_id,
+                "title": "Memory capture failed",
+                "detail": "A user-memory capture event failed before it could produce an auditable operation.",
+                "action": "review_capture_pipeline",
+                "created_at": event.updated_at,
+            }));
+            if findings.len() >= limit as usize {
+                break;
+            }
+        }
+    }
+    if findings.len() < limit as usize {
+        for operation in storage
+            .list_memory_operations_by_statuses(&["queued_review", "apply_failed"], project_id, limit)
+            .await?
+        {
+            let operation_id = operation.id.clone();
+            let operation_status = operation.status.clone();
+            let operation_type = operation.operation_type.clone();
+            let memory_id = operation
+                .applied_memory_id
+                .clone()
+                .or_else(|| operation.target_memory_id.clone());
+            findings.push(serde_json::json!({
+                "id": format!("operation:{}", operation_id),
+                "kind": operation_status.clone(),
+                "severity": if operation_status == "apply_failed" { "warning" } else { "review" },
+                "memory_id": memory_id,
+                "operation_id": operation_id,
+                "title": format!("Memory operation {}", operation_type),
+                "detail": operation
+                    .review_notes
+                    .clone()
+                    .unwrap_or_else(|| "This staged memory operation still needs ArkMemory review.".to_string()),
+                "action": "review_memory_operation",
+                "created_at": operation.updated_at,
+            }));
+            if findings.len() >= limit as usize {
+                break;
+            }
         }
     }
     Ok(findings)
@@ -37819,10 +38592,11 @@ async fn arkmemory_record_event_once(
 }
 
 async fn arkmemory_apply_memory_candidate(
-    storage: &crate::storage::Storage,
+    agent: &crate::core::Agent,
     candidate_id: &str,
     project_id: Option<&str>,
 ) -> Result<String> {
+    let storage = &agent.storage;
     let mut candidate = storage
         .get_learning_candidate(candidate_id)
         .await?
@@ -37842,21 +38616,9 @@ async fn arkmemory_apply_memory_candidate(
             }
         }
     }
-    if candidate.approval_status == "applying" && arkmemory_candidate_is_stale_applying(&candidate)
-    {
-        let reset = storage
-            .update_learning_candidate_review_if_status(
-                candidate_id,
-                "applying",
-                "draft",
-                Some("Reset stale ArkMemory apply claim."),
-                None,
-            )
-            .await?;
-        if !reset {
-            anyhow::bail!("Memory queue item is already being applied.");
-        }
-        candidate.approval_status = "draft".to_string();
+    candidate = arkmemory_ensure_latest_open_candidate(storage, &candidate).await?;
+    if candidate.approval_status == "applying" {
+        anyhow::bail!("Memory queue item is already being applied.");
     }
     if candidate.approval_status != "draft" {
         anyhow::bail!("Memory queue item is no longer pending review.");
@@ -37873,7 +38635,7 @@ async fn arkmemory_apply_memory_candidate(
     if !claimed {
         anyhow::bail!("Memory queue item was already claimed by another review.");
     }
-    let result = arkmemory_apply_claimed_memory_candidate(storage, &candidate).await;
+    let result = arkmemory_apply_claimed_memory_candidate(agent, &candidate).await;
     match result {
         Ok(approved_ref) => {
             let finalized = storage
@@ -37907,10 +38669,47 @@ async fn arkmemory_apply_memory_candidate(
 }
 
 async fn arkmemory_apply_claimed_memory_candidate(
-    storage: &crate::storage::Storage,
+    agent: &crate::core::Agent,
     candidate: &crate::storage::learning_candidate::Model,
 ) -> Result<String> {
+    let storage = &agent.storage;
     let approved_ref = match candidate.candidate_type.as_str() {
+        "memory_add" | "memory_update" | "memory_retract" => {
+            let operation_id = candidate
+                .proposed_content
+                .get("operation_id")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("Memory queue item is missing operation_id."))?;
+            let approved_ref = agent
+                .apply_memory_operation_by_id_with_source(operation_id, "arkmemory_review")
+                .await?;
+            let memory_id = storage
+                .get_memory_operation(operation_id)
+                .await?
+                .and_then(|operation| {
+                    operation
+                        .applied_memory_id
+                        .clone()
+                        .or(operation.target_memory_id.clone())
+                });
+            arkmemory_record_event(
+                storage,
+                "queue_memory_operation_applied",
+                memory_id,
+                None,
+                format!("Approved memory operation {}", operation_id),
+                serde_json::json!({
+                    "candidate_id": candidate.id.clone(),
+                    "operation_id": operation_id,
+                    "operation_type": candidate.candidate_type.clone(),
+                }),
+                ArkMemoryEventContext::from_candidate(candidate),
+            )
+            .await?;
+            approved_ref
+        }
         "memory_deprecate" => {
             let item_id = candidate
                 .proposed_content
@@ -38104,7 +38903,7 @@ async fn arkmemory_approve_queue_item(
 ) -> Response {
     let project_id = arkmemory_project_param(&params);
     let agent = state.agent.read().await;
-    match arkmemory_apply_memory_candidate(&agent.storage, &id, project_id).await {
+    match arkmemory_apply_memory_candidate(&agent, &id, project_id).await {
         Ok(approved_ref) => (
             StatusCode::OK,
             Json(serde_json::json!({ "approved": true, "approved_ref": approved_ref })),
@@ -38129,7 +38928,7 @@ async fn arkmemory_reject_queue_item(
     let agent = state.agent.read().await;
     let storage = &agent.storage;
     let result = async {
-        let candidate = storage
+        let mut candidate = storage
             .get_learning_candidate(&id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Memory queue item not found."))?;
@@ -38148,6 +38947,13 @@ async fn arkmemory_reject_queue_item(
                 }
             }
         }
+        candidate = arkmemory_ensure_latest_open_candidate(storage, &candidate).await?;
+        if candidate.approval_status == "applying" {
+            anyhow::bail!("Memory queue item is already being applied.");
+        }
+        if candidate.approval_status != "draft" {
+            anyhow::bail!("Memory queue item is no longer pending review.");
+        }
         let rejected = storage
             .update_learning_candidate_review_if_status(
                 &id,
@@ -38159,6 +38965,21 @@ async fn arkmemory_reject_queue_item(
             .await?;
         if !rejected {
             anyhow::bail!("Memory queue item is no longer pending review.");
+        }
+        if let Some(operation_id) = candidate
+            .proposed_content
+            .get("operation_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if let Some(mut operation) = storage.get_memory_operation(operation_id).await? {
+                operation.status = "rejected".to_string();
+                operation.reviewed_at = Some(chrono::Utc::now().to_rfc3339());
+                operation.review_notes = Some("Rejected from ArkMemory.".to_string());
+                operation.updated_at = chrono::Utc::now().to_rfc3339();
+                storage.upsert_memory_operation(&operation).await?;
+            }
         }
         arkmemory_record_event(
             storage,
@@ -38433,11 +39254,25 @@ async fn arkmemory_sources(
         let events = storage
             .list_recall_events_for_memory(&memory_id, 100, project_id)
             .await?;
+        let operations = storage
+            .list_memory_operations_for_memory(&memory_id, project_id, 100)
+            .await?;
+        let evidence_links = storage
+            .list_memory_evidence_links_for_memory(&memory_id, project_id, 100)
+            .await?;
+        let mut sources = arkmemory_memory_sources(&memory);
+        for link in &evidence_links {
+            sources.push(format!("{}:{}", link.evidence_kind, link.evidence_ref));
+        }
+        sources.sort();
+        sources.dedup();
         Ok::<serde_json::Value, anyhow::Error>(serde_json::json!({
             "memory": memory,
             "edges": edges,
             "events": events,
-            "sources": arkmemory_memory_sources(&memory),
+            "operations": operations,
+            "evidence_links": evidence_links,
+            "sources": sources,
         }))
     }
     .await;

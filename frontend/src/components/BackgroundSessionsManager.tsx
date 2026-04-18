@@ -253,6 +253,51 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
     staleTime: 30_000,
   });
 
+  const availableChannelsQ = useQuery({
+    queryKey: ["available-messaging-channels"],
+    queryFn: () => api.rawGet("/channels/available"),
+    refetchInterval: false,
+    staleTime: 30_000,
+  });
+
+  const availableDeliveryChannels = useMemo(() => {
+    const raw = availableChannelsQ.data as Record<string, unknown> | undefined;
+    const list = Array.isArray(raw?.channels) ? (raw?.channels as unknown[]) : [];
+    const rows = list
+      .map((value) => (value && typeof value === "object" ? (value as Record<string, unknown>) : null))
+      .filter((value): value is Record<string, unknown> => value !== null)
+      .filter((channel) => Boolean(channel.configured))
+      .map((channel) => {
+        const source =
+          channel.source && typeof channel.source === "object"
+            ? (channel.source as Record<string, unknown>)
+            : {};
+        return {
+          id: typeof channel.id === "string" ? channel.id.trim() : "",
+          name: typeof channel.display_name === "string" ? channel.display_name.trim() : "",
+          sourceKind: typeof source.kind === "string" ? source.kind.trim() : "",
+        };
+      })
+      .filter((channel) => channel.id.length > 0);
+    const seen = new Set<string>();
+    return rows.filter((channel) => {
+      if (seen.has(channel.id)) return false;
+      seen.add(channel.id);
+      return true;
+    });
+  }, [availableChannelsQ.data]);
+
+  const deliveryChannelMenuLabel = (channel: {
+    id: string;
+    name: string;
+    sourceKind: string;
+  }) => {
+    const label = channel.name || channel.id;
+    if (channel.sourceKind === "custom_messaging_channel") return `Custom: ${label}`;
+    if (channel.sourceKind === "extension_pack") return `Extension: ${label}`;
+    return label;
+  };
+
   const sessions = useMemo(
     () => (sessionsQ.data?.sessions || []).filter((session) => isBackgroundSessionVisibleInUi(session)),
     [sessionsQ.data],
@@ -1286,12 +1331,35 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                 <TextField
                   fullWidth
                   size="small"
+                  select
                   label="Preferred Delivery Channel"
                   value={form.preferred_delivery_channel}
                   onChange={(event) =>
                     setForm((prev) => ({ ...prev, preferred_delivery_channel: event.target.value }))
                   }
-                />
+                  helperText={
+                    availableDeliveryChannels.length === 0
+                      ? "No delivery channels are configured. Connect one in Integrations to enable delivery."
+                      : undefined
+                  }
+                >
+                  <MenuItem value="">
+                    <em>None</em>
+                  </MenuItem>
+                  {availableDeliveryChannels.map((channel) => (
+                    <MenuItem key={channel.id} value={channel.id}>
+                      {deliveryChannelMenuLabel(channel)}
+                    </MenuItem>
+                  ))}
+                  {form.preferred_delivery_channel &&
+                  !availableDeliveryChannels.some(
+                    (channel) => channel.id === form.preferred_delivery_channel,
+                  ) ? (
+                    <MenuItem value={form.preferred_delivery_channel} disabled>
+                      Not connected: {form.preferred_delivery_channel}
+                    </MenuItem>
+                  ) : null}
+                </TextField>
               </Grid2>
               <Grid2 size={{ xs: 12, md: 6 }}>
                 <TextField

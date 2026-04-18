@@ -76,17 +76,8 @@ async fn save_tokens(config_dir: &Path, tokens: &GmailTokens) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn ensure_access_token(config_dir: &Path) -> Result<String> {
-    let mut tokens = match load_tokens(config_dir).await {
-        Ok(tokens) => tokens,
-        Err(_) => {
-            return crate::actions::google_workspace::ensure_access_token_for_bundles(
-                config_dir,
-                &["gmail"],
-            )
-            .await;
-        }
-    };
+pub(crate) async fn ensure_legacy_access_token(config_dir: &Path) -> Result<String> {
+    let mut tokens = load_tokens(config_dir).await?;
     let now = chrono::Utc::now().timestamp();
 
     if tokens.expires_at > now + 60 {
@@ -121,8 +112,47 @@ pub(crate) async fn ensure_access_token(config_dir: &Path) -> Result<String> {
     Ok(tokens.access_token)
 }
 
-pub(crate) async fn gmail_profile_email(config_dir: &Path) -> Result<String> {
-    let access_token = ensure_access_token(config_dir).await?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GmailDeliverySource {
+    #[default]
+    Auto,
+    Gmail,
+    GoogleWorkspace,
+}
+
+pub(crate) async fn ensure_access_token_for_source(
+    config_dir: &Path,
+    source: GmailDeliverySource,
+) -> Result<String> {
+    match source {
+        GmailDeliverySource::Auto => match ensure_legacy_access_token(config_dir).await {
+            Ok(token) => Ok(token),
+            Err(_) => {
+                crate::actions::google_workspace::ensure_access_token_for_bundles(
+                    config_dir,
+                    &["gmail"],
+                )
+                .await
+            }
+        },
+        GmailDeliverySource::Gmail => ensure_legacy_access_token(config_dir).await,
+        GmailDeliverySource::GoogleWorkspace => {
+            crate::actions::google_workspace::ensure_access_token_for_bundles(config_dir, &["gmail"])
+                .await
+        }
+    }
+}
+
+pub(crate) async fn ensure_access_token(config_dir: &Path) -> Result<String> {
+    ensure_access_token_for_source(config_dir, GmailDeliverySource::Auto).await
+}
+
+pub(crate) async fn gmail_profile_email_for_source(
+    config_dir: &Path,
+    source: GmailDeliverySource,
+) -> Result<String> {
+    let access_token = ensure_access_token_for_source(config_dir, source).await?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
@@ -189,6 +219,12 @@ pub struct GmailReplyArgs {
     pub subject: String,
     pub body: String,
     pub thread_id: Option<String>,
+    #[serde(default)]
+    pub html_body: Option<String>,
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub delivery_source: GmailDeliverySource,
 }
 
 #[derive(Debug, Deserialize)]
@@ -611,46 +647,34 @@ pub async fn gmail_reply(config_dir: &Path, args: &serde_json::Value) -> Result<
     let args: GmailReplyArgs = serde_json::from_value(args.clone())
         .map_err(|e| anyhow!("Invalid Gmail reply args: {}", e))?;
 
-    let access_token = ensure_access_token(config_dir).await?;
+    let access_token = ensure_access_token_for_source(config_dir, args.delivery_source).await?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(12))
         .build()?;
-
-    let raw = format!(
-        "To: {}\r\nSubject: {}\r\nContent-Type: text/plain; charset=\"UTF-8\"\r\n\r\n{}",
-        args.to, args.subject, args.body
-    );
-
-    let raw_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw.as_bytes());
+    let from = match args
+        .from
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(from) => from.to_string(),
+        None => gmail_profile_email_for_source(config_dir, args.delivery_source).await?,
+    };
+    let message = crate::core::email_delivery::build_email_message(
+        &from,
+        &args.to,
+        &args.subject,
+        &args.body,
+        args.html_body.as_deref(),
+        None,
+    )?;
+    let raw_b64 =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(message.formatted());
     let mut body = serde_json::json!({
         "raw": raw_b64
     });
     if let Some(thread_id) = &args.thread_id {
         body["threadId"] = serde_json::Value::String(thread_id.clone());
-    }
-
-    if crate::actions::google_workspace::gws_backend_available().await {
-        let argv = vec![
-            "gmail".to_string(),
-            "users".to_string(),
-            "messages".to_string(),
-            "send".to_string(),
-            "--params".to_string(),
-            serde_json::json!({ "userId": "me" }).to_string(),
-            "--json".to_string(),
-            body.to_string(),
-        ];
-        match crate::actions::google_workspace::gws_text_command(config_dir, &argv, &["gmail"])
-            .await
-        {
-            Ok(_) => return Ok("Reply sent successfully.".to_string()),
-            Err(error) => {
-                tracing::warn!(
-                    "gmail_reply gws path failed, falling back to direct Gmail API: {}",
-                    error
-                );
-            }
-        }
     }
 
     let resp = client

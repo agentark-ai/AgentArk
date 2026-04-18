@@ -63,7 +63,6 @@ import CloseIcon from "@mui/icons-material/Close";
 import FilterListRoundedIcon from "@mui/icons-material/FilterListRounded";
 import SettingsRoundedIcon from "@mui/icons-material/SettingsRounded";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { UserRound } from "lucide-react";
 import {
   Fragment,
   memo,
@@ -15560,7 +15559,7 @@ function ChatManager({
     <Avatar
       variant="rounded"
       className={`chat-avatar chat-avatar-agent${extraClassName ? ` ${extraClassName}` : ""}`}
-      sx={{ width: 34, height: 34 }}
+      sx={{ width: 44, height: 44 }}
     >
       <Box
         component="img"
@@ -15573,13 +15572,20 @@ function ChatManager({
   const renderUserAvatar = (extraClassName = "") => (
     <Avatar
       className={`chat-avatar chat-avatar-user${extraClassName ? ` ${extraClassName}` : ""}`}
-      sx={{ width: 34, height: 34 }}
+      sx={{
+        width: 44,
+        height: 44,
+        background:
+          "linear-gradient(135deg, #8B5CF6 0%, #6D28D9 55%, #4C1D95 100%)",
+        color: "#fff",
+        fontWeight: 600,
+        fontSize: "1.05rem",
+        letterSpacing: "0.01em",
+        border: "1px solid rgba(255,255,255,0.08)",
+        boxShadow: "0 6px 16px rgba(0,0,0,0.22), inset 0 1px 0 rgba(255,255,255,0.08)",
+      }}
     >
-      <UserRound
-        className="chat-avatar-user-icon"
-        size={18}
-        strokeWidth={2.1}
-      />
+      Y
     </Avatar>
   );
   const renderProgressRows = (keyPrefix: string) =>
@@ -43759,33 +43765,23 @@ function SettingsManager({
                         slotProps={{
                           inputLabel: { shrink: true },
                         }}
+                        helperText={
+                          availableDeliveryChannels.length === 0
+                            ? "No delivery channels are configured yet. Connect one in Integrations to enable daily brief delivery."
+                            : undefined
+                        }
                       >
-                        <MenuItem value="telegram">Telegram</MenuItem>
-                        <MenuItem value="slack">Slack</MenuItem>
-                        <MenuItem value="discord">Discord</MenuItem>
-                        <MenuItem value="matrix">Matrix</MenuItem>
-                        <MenuItem value="teams">Teams</MenuItem>
-                        <MenuItem value="whatsapp">WhatsApp</MenuItem>
-                        <MenuItem value="email">Email</MenuItem>
-                        {availableDeliveryChannels
-                          .filter(
-                            (channel) =>
-                              channel.id.startsWith("custom.") ||
-                              channel.id.startsWith("ext."),
-                          )
-                          .map((channel) => (
-                            <MenuItem key={channel.id} value={channel.id}>
-                              {deliveryChannelMenuLabel(channel)}
-                            </MenuItem>
-                          ))}
+                        {availableDeliveryChannels.map((channel) => (
+                          <MenuItem key={channel.id} value={channel.id}>
+                            {deliveryChannelMenuLabel(channel)}
+                          </MenuItem>
+                        ))}
                         {form.daily_brief_channel &&
-                        (form.daily_brief_channel.startsWith("custom.") ||
-                          form.daily_brief_channel.startsWith("ext.")) &&
                         !availableDeliveryChannels.some(
                           (channel) => channel.id === form.daily_brief_channel,
                         ) ? (
                           <MenuItem value={form.daily_brief_channel} disabled>
-                            User-defined: {form.daily_brief_channel}
+                            Not connected: {form.daily_brief_channel}
                           </MenuItem>
                         ) : null}
                       </TextField>

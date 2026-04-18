@@ -33,7 +33,10 @@ const MAINTENANCE_DEFER_MINUTES: i64 = 10;
 const MAINTENANCE_MAX_DEFERS: u32 = 3;
 const PULSE_DEFER_MINUTES: i64 = 5;
 const PULSE_MAX_DEFERS: u32 = 3;
+const PULSE_STARTUP_SETTLE_SECS: u64 = 60;
+const AUTO_ANALYSIS_STAGGER_SECS: u64 = 5 * 60;
 static PULSE_RUNNING: AtomicBool = AtomicBool::new(false);
+static SENTINEL_MAINTENANCE_RUNNING: AtomicBool = AtomicBool::new(false);
 static SCHEDULED_TASK_PERMITS: Lazy<Arc<Semaphore>> = Lazy::new(|| {
     Arc::new(Semaphore::new(
         std::env::var("AGENTARK_TASK_WORKER_CONCURRENCY")
@@ -77,6 +80,13 @@ static SENTINEL_NOTIFY_TIMEOUT_SECS: Lazy<u64> = Lazy::new(|| {
         .filter(|value| *value > 0)
         .unwrap_or(8)
 });
+static SENTINEL_RECENT_ACTIVITY_BUSY_SECS: Lazy<i64> = Lazy::new(|| {
+    std::env::var("AGENTARK_SENTINEL_RECENT_ACTIVITY_BUSY_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(180)
+});
 static WATCHER_TRIGGER_TIMEOUT_SECS: Lazy<u64> = Lazy::new(|| {
     std::env::var("AGENTARK_WATCHER_TRIGGER_TIMEOUT_SECS")
         .ok()
@@ -93,18 +103,44 @@ impl Drop for PulseRunGuard {
     }
 }
 
+struct SentinelMaintenanceGuard;
+
+impl Drop for SentinelMaintenanceGuard {
+    fn drop(&mut self) {
+        SENTINEL_MAINTENANCE_RUNNING.store(false, Ordering::Release);
+    }
+}
+
 pub fn is_pulse_running() -> bool {
     PULSE_RUNNING.load(Ordering::Relaxed)
 }
 
+fn try_start_sentinel_maintenance() -> Option<SentinelMaintenanceGuard> {
+    SENTINEL_MAINTENANCE_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .ok()
+        .map(|_| SentinelMaintenanceGuard)
+}
+
 async fn sentinel_under_load(agent: &SharedAgent) -> bool {
-    let (tasks, watcher_manager, browser_sessions, app_registry) = {
+    let (
+        tasks,
+        watcher_manager,
+        browser_sessions,
+        app_registry,
+        runtime,
+        last_activity,
+        active_message_requests,
+    ) = {
         let agent_guard = agent.read().await;
         (
             agent_guard.tasks.clone(),
             agent_guard.watcher_manager.clone(),
             agent_guard.browser_sessions.clone(),
             agent_guard.app_registry.clone(),
+            agent_guard.runtime.clone(),
+            agent_guard.last_activity_at(),
+            agent_guard.active_message_request_count(),
         )
     };
 
@@ -135,8 +171,19 @@ async fn sentinel_under_load(agent: &SharedAgent) -> bool {
         .into_iter()
         .filter(|v| v.get("running").and_then(|x| x.as_bool()).unwrap_or(false))
         .count();
+    let active_sandbox_containers = runtime.active_container_count().await;
+    let recent_user_activity = last_activity.is_some_and(|last| {
+        let age_secs = (chrono::Utc::now() - last).num_seconds();
+        age_secs >= 0 && age_secs < *SENTINEL_RECENT_ACTIVITY_BUSY_SECS
+    });
 
-    pending_tasks > 25 || watcher_count > 30 || browser_sessions >= 2 || running_apps > 12
+    active_message_requests > 0
+        || recent_user_activity
+        || active_sandbox_containers > 0
+        || pending_tasks > 25
+        || watcher_count > 30
+        || browser_sessions >= 2
+        || running_apps > 12
 }
 
 async fn run_with_busy_deferral<F, Fut>(
@@ -152,6 +199,27 @@ async fn run_with_busy_deferral<F, Fut>(
     let mut defers = 0u32;
     loop {
         if !sentinel_under_load(agent).await {
+            let Some(_maintenance_guard) = try_start_sentinel_maintenance() else {
+                if defers >= max_defers {
+                    tracing::info!(
+                        "ArkSentinel: {} skipped (another maintenance job still active after {} defers)",
+                        label,
+                        max_defers
+                    );
+                    return;
+                }
+
+                defers += 1;
+                tracing::info!(
+                    "ArkSentinel: {} waiting for another maintenance job; deferring {}/{} for {} minutes",
+                    label,
+                    defers,
+                    max_defers,
+                    defer_minutes
+                );
+                tokio::time::sleep(Duration::from_secs((defer_minutes * 60) as u64)).await;
+                continue;
+            };
             tracing::debug!("ArkSentinel: {} started", label);
             match tokio::time::timeout(Duration::from_secs(*SENTINEL_JOB_TIMEOUT_SECS), job()).await
             {
@@ -2232,6 +2300,9 @@ async fn run_data_safety_checks(
         "tool_attempts",
         "watchers",
         "arkpulse_events",
+        "memory_capture_events",
+        "memory_operations",
+        "memory_evidence_links",
     ];
     match storage.database_table_names().await {
         Ok(tables) => {
@@ -2264,6 +2335,68 @@ async fn run_data_safety_checks(
                 e.to_string(),
                 "Schema validation query failed.",
                 "Check Postgres permissions and migration code path".to_string(),
+            );
+        }
+    }
+
+    match storage
+        .count_memory_capture_events_by_statuses_all_scopes(&["failed"])
+        .await
+    {
+        Ok(count) if count > 0 => {
+            push_finding!(
+                findings,
+                "medium",
+                "data_safety",
+                "memory capture pipeline",
+                "Failed memory captures detected",
+                format!("{} memory capture event(s) are in failed state", count),
+                "Some user facts may be missing from ArkMemory until the capture pipeline is reviewed.",
+                "Inspect memory_capture_events and capture model health".to_string(),
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            push_finding!(
+                findings,
+                "low",
+                "data_safety",
+                "memory capture pipeline",
+                "Could not inspect memory capture health",
+                e.to_string(),
+                "Memory capture audit state could not be queried.",
+                "Check Postgres access for memory_capture_events".to_string(),
+            );
+        }
+    }
+
+    match storage
+        .count_memory_operations_by_statuses_all_scopes(&["queued_review", "apply_failed"])
+        .await
+    {
+        Ok(count) if count > 0 => {
+            push_finding!(
+                findings,
+                "medium",
+                "data_safety",
+                "arkmemory queue",
+                "Memory operations need review",
+                format!("{} staged memory operation(s) are queued or failed", count),
+                "Long-lived review backlog can delay or block user-memory corrections.",
+                "Open ArkMemory queue and resolve staged operations".to_string(),
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            push_finding!(
+                findings,
+                "low",
+                "data_safety",
+                "arkmemory queue",
+                "Could not inspect memory operation health",
+                e.to_string(),
+                "Staged memory operations could not be queried.",
+                "Check Postgres access for memory_operations".to_string(),
             );
         }
     }
@@ -2854,7 +2987,7 @@ pub struct SentinelConfig {
     pub _process_check_interval: u64,
     /// How often to check for due tasks (seconds)
     pub scheduler_interval: u64,
-    /// How often to poll watchers (seconds)
+    /// Maximum time to sleep before rescanning watcher schedules (seconds)
     pub watcher_interval: u64,
     /// How often to poll connected integrations for new activity (seconds)
     pub integration_sync_interval: u64,
@@ -2884,7 +3017,7 @@ impl Default for SentinelConfig {
         Self {
             _process_check_interval: 30,
             scheduler_interval: 30,
-            watcher_interval: 1,
+            watcher_interval: 15 * 60,
             integration_sync_interval: 120,
             experience_consolidation_interval: 600,
             heuristic_reflection_interval: 750,
@@ -2919,6 +3052,23 @@ async fn tick_or_shutdown(
     }
 }
 
+fn watcher_sleep_duration(
+    next_wakeup_at: Option<chrono::DateTime<chrono::Utc>>,
+    max_sleep: Duration,
+) -> Duration {
+    let Some(next_wakeup_at) = next_wakeup_at else {
+        return max_sleep;
+    };
+    let now = chrono::Utc::now();
+    if next_wakeup_at <= now {
+        return Duration::ZERO;
+    }
+    (next_wakeup_at - now)
+        .to_std()
+        .unwrap_or(max_sleep)
+        .min(max_sleep)
+}
+
 /// Start all ArkSentinel background loops. Returns join handles for graceful shutdown.
 pub fn start(
     agent: SharedAgent,
@@ -2949,17 +3099,27 @@ pub fn start(
         let agent = agent.clone();
         let mut shutdown = shutdown_rx.clone();
         crate::spawn_logged!("src/sentinel.rs:2948", async move {
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_secs(config.watcher_interval));
+            let max_sleep = Duration::from_secs(config.watcher_interval.max(1));
             loop {
-                if !tick_or_shutdown(&mut interval, &mut shutdown).await {
-                    break;
-                }
                 record_loop_heartbeat(&agent, SENTINEL_WATCHER_HEARTBEAT_KEY).await;
-                if is_agent_autonomy_paused(&agent).await {
-                    continue;
+                let watcher_manager = {
+                    let agent_guard = agent.read().await;
+                    agent_guard.watcher_manager.clone()
+                };
+                let autonomy_paused = is_agent_autonomy_paused(&agent).await;
+                if !autonomy_paused {
+                    run_watchers(&agent).await;
                 }
-                run_watchers(&agent).await;
+                let sleep_for = if autonomy_paused {
+                    max_sleep.min(Duration::from_secs(60))
+                } else {
+                    watcher_sleep_duration(watcher_manager.next_wakeup_at().await, max_sleep)
+                };
+                tokio::select! {
+                    _ = shutdown.changed() => break,
+                    _ = watcher_manager.wait_for_change() => continue,
+                    _ = tokio::time::sleep(sleep_for) => continue,
+                }
             }
         })
     });
@@ -3159,7 +3319,12 @@ pub fn start(
             let mut shutdown = shutdown_rx.clone();
             crate::spawn_logged!("src/sentinel.rs:3127", async move {
                 // Wait for initial startup to settle
-                if !sleep_or_shutdown(std::time::Duration::from_secs(60), &mut shutdown).await {
+                if !sleep_or_shutdown(
+                    std::time::Duration::from_secs(PULSE_STARTUP_SETTLE_SECS),
+                    &mut shutdown,
+                )
+                .await
+                {
                     return;
                 }
                 let mut interval =
@@ -3195,7 +3360,14 @@ pub fn start(
             let agent = agent.clone();
             let mut shutdown = shutdown_rx.clone();
             crate::spawn_logged!("src/sentinel.rs:3164", async move {
-                if !sleep_or_shutdown(std::time::Duration::from_secs(45), &mut shutdown).await {
+                let initial_wait_secs =
+                    PULSE_STARTUP_SETTLE_SECS.saturating_add(AUTO_ANALYSIS_STAGGER_SECS);
+                if !sleep_or_shutdown(
+                    std::time::Duration::from_secs(initial_wait_secs),
+                    &mut shutdown,
+                )
+                .await
+                {
                     return;
                 }
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(
@@ -4259,7 +4431,10 @@ async fn maybe_emit_autonomy_pause_nudge(agent: &SharedAgent, autonomy_paused: b
         )
         .await
     {
-        tracing::debug!("Failed to persist autonomy pause nudge timestamp: {}", error);
+        tracing::debug!(
+            "Failed to persist autonomy pause nudge timestamp: {}",
+            error
+        );
     }
 }
 

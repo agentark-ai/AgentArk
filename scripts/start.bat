@@ -14,10 +14,7 @@ REM   scripts\start.bat status       - Show running containers
 
 setlocal enabledelayedexpansion
 
-REM Create .env from example if it doesn't exist
-if not exist .env (
-    if exist .env.example copy .env.example .env >nul
-)
+set "AGENTARK_LOCAL_ENV=.agentark\local.env"
 
 if "%1"=="" goto start
 if "%1"=="start" goto start
@@ -34,7 +31,7 @@ goto usage
 :start
 call :ensure_postgres_password || exit /b 1
 echo Starting AgentArk...
-docker compose up -d
+docker compose --env-file "%AGENTARK_LOCAL_ENV%" up -d
 call :verify_lightpanda || exit /b 1
 echo.
 echo AgentArk is running!
@@ -52,7 +49,7 @@ if "%2"=="setup" goto tunnel_setup
 call :ensure_postgres_password || exit /b 1
 echo Starting AgentArk with remote access...
 set AGENTARK_TUNNEL=true
-docker compose up -d
+docker compose --env-file "%AGENTARK_LOCAL_ENV%" up -d
 call :verify_lightpanda || exit /b 1
 echo.
 echo AgentArk is starting with secure tunnel!
@@ -88,13 +85,13 @@ if "!TOKEN!"=="" (
     echo Cancelled. You can run this again anytime.
     goto end
 )
-echo TUNNEL_TOKEN=!TOKEN!>> .env
-echo Token saved to .env
+call :upsert_managed_env TUNNEL_TOKEN "!TOKEN!" || exit /b 1
+echo Token saved to %AGENTARK_LOCAL_ENV%
 echo.
 call :ensure_postgres_password || exit /b 1
 echo Starting AgentArk with permanent tunnel...
 set AGENTARK_TUNNEL=true
-docker compose up -d
+docker compose --env-file "%AGENTARK_LOCAL_ENV%" up -d
 echo.
 echo AgentArk is running with your custom domain!
 echo Check your Cloudflare dashboard for the URL.
@@ -102,25 +99,25 @@ goto end
 
 :stop
 echo Stopping AgentArk...
-docker compose down
+docker compose --env-file "%AGENTARK_LOCAL_ENV%" down
 echo AgentArk stopped. Your data is preserved.
 goto end
 
 :restart
 echo Restarting AgentArk...
-docker compose restart agentark-control agentark-workspace agentark-executor
+docker compose --env-file "%AGENTARK_LOCAL_ENV%" restart agentark-control agentark-workspace agentark-executor
 call :verify_lightpanda || exit /b 1
 goto end
 
 :logs
-docker compose logs -f
+docker compose --env-file "%AGENTARK_LOCAL_ENV%" logs -f
 goto end
 
 :update
 call :ensure_postgres_password || exit /b 1
 echo Updating AgentArk (your data will be preserved)...
-docker compose pull
-docker compose up -d
+docker compose --env-file "%AGENTARK_LOCAL_ENV%" pull
+docker compose --env-file "%AGENTARK_LOCAL_ENV%" up -d
 call :verify_lightpanda || exit /b 1
 echo Update complete! Your data is intact.
 goto end
@@ -129,14 +126,14 @@ goto end
 call :ensure_postgres_password || exit /b 1
 echo Building AgentArk from this checkout and force-recreating containers (your data will be preserved)...
 if "%AGENTARK_IMAGE%"=="" set AGENTARK_IMAGE=agentark:dev
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build --force-recreate
+docker compose --env-file "%AGENTARK_LOCAL_ENV%" -f docker-compose.yml -f docker-compose.dev.yml up -d --build --force-recreate
 call :verify_lightpanda || exit /b 1
 echo Local build complete! Your data is intact.
 goto end
 
 :status
 echo AgentArk Status:
-docker compose ps
+docker compose --env-file "%AGENTARK_LOCAL_ENV%" ps
 goto end
 
 :lowmem
@@ -170,7 +167,7 @@ goto end
 echo Verifying bundled Lightpanda runtime...
 set "LIGHTPANDA_RETRIES=20"
 :verify_lightpanda_loop
-docker compose exec -T agentark-control sh -lc "command -v lightpanda >/dev/null 2>&1" >nul 2>&1
+docker compose --env-file "%AGENTARK_LOCAL_ENV%" exec -T agentark-control sh -lc "command -v lightpanda >/dev/null 2>&1" >nul 2>&1
 if %ERRORLEVEL% EQU 0 (
     echo Lightpanda is available inside the AgentArk runtime.
     exit /b 0
@@ -184,24 +181,20 @@ timeout /t 2 >nul
 goto verify_lightpanda_loop
 
 :ensure_postgres_password
-if not exist .env (
-    if exist .env.example copy .env.example .env >nul
-)
-set "HAS_PG_PASS="
-if exist .env (
-    for /f "usebackq tokens=1,* delims==" %%A in (".env") do (
-        if /I "%%A"=="AGENTARK_POSTGRES_PASSWORD" if not "%%B"=="" set "HAS_PG_PASS=1"
-    )
-)
-if defined HAS_PG_PASS exit /b 0
 set "PGPASS="
-for /f "usebackq delims=" %%P in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$rng=[Security.Cryptography.RandomNumberGenerator]::Create(); $bytes=New-Object byte[] 24; $rng.GetBytes($bytes); $value=(($bytes | ForEach-Object { $_.ToString('x2') }) -join ''); $envPath=Join-Path (Get-Location) '.env'; if (Test-Path $envPath) { $lines=Get-Content $envPath; if ($lines -match '^AGENTARK_POSTGRES_PASSWORD=') { $lines=$lines -replace '^AGENTARK_POSTGRES_PASSWORD=.*$', ('AGENTARK_POSTGRES_PASSWORD=' + $value); Set-Content -Path $envPath -Value $lines } else { Add-Content -Path $envPath -Value ('AGENTARK_POSTGRES_PASSWORD=' + $value) } } else { Set-Content -Path $envPath -Value ('AGENTARK_POSTGRES_PASSWORD=' + $value) }; $rng.Dispose(); Write-Output $value"`) do set "PGPASS=%%P"
+for /f "usebackq delims=" %%P in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$dir='.agentark'; $envPath=Join-Path $dir 'local.env'; New-Item -ItemType Directory -Force -Path $dir | Out-Null; function ReadValue($path,$key){ if(Test-Path $path){ foreach($line in Get-Content $path){ if($line -match ('^' + [regex]::Escape($key) + '=(.*)$')){ return $matches[1] } } } return $null }; $value=ReadValue $envPath 'AGENTARK_POSTGRES_PASSWORD'; if([string]::IsNullOrWhiteSpace($value)){ $value=ReadValue '.env' 'AGENTARK_POSTGRES_PASSWORD' }; if([string]::IsNullOrWhiteSpace($value)){ $rng=[Security.Cryptography.RandomNumberGenerator]::Create(); $bytes=New-Object byte[] 24; $rng.GetBytes($bytes); $value=(($bytes | ForEach-Object { $_.ToString('x2') }) -join ''); $rng.Dispose() }; $lines=@(); if(Test-Path $envPath){ $lines=Get-Content $envPath | Where-Object { $_ -notmatch '^AGENTARK_POSTGRES_PASSWORD=' } }; $lines += ('AGENTARK_POSTGRES_PASSWORD=' + $value); Set-Content -Path $envPath -Value $lines; Write-Output $value"`) do set "PGPASS=%%P"
 if not defined PGPASS (
     echo Failed to generate a local Postgres password.
     exit /b 1
 )
-echo Generated a local Postgres password and saved it to .env
+echo Local Postgres password is managed in %AGENTARK_LOCAL_ENV%
 exit /b 0
+
+:upsert_managed_env
+set "AA_ENV_KEY=%~1"
+set "AA_ENV_VALUE=%~2"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$envPath='.agentark\local.env'; New-Item -ItemType Directory -Force -Path (Split-Path $envPath) | Out-Null; $key=$env:AA_ENV_KEY; $value=$env:AA_ENV_VALUE; $lines=@(); if(Test-Path $envPath){ $lines=Get-Content $envPath | Where-Object { $_ -notmatch ('^' + [regex]::Escape($key) + '=') } }; $lines += ($key + '=' + $value); Set-Content -Path $envPath -Value $lines"
+exit /b %ERRORLEVEL%
 
 :usage
 echo Usage: scripts\start.bat [start^|tunnel^|stop^|restart^|logs^|update^|build^|status^|lowmem]

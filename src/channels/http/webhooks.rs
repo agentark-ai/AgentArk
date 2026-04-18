@@ -372,7 +372,29 @@ async fn available_completion_channels(state: &AppState) -> Result<HashSet<Strin
     let has_workspace_gmail = crate::actions::google_workspace::granted_bundles(&config_dir)
         .map(|bundles| bundles.iter().any(|bundle| bundle == "gmail"))
         .unwrap_or(false);
-    if has_legacy_gmail || has_workspace_gmail {
+    let config = manager
+        .load()
+        .unwrap_or_else(|_| crate::core::config::AgentConfig::default());
+    let mut email_backends = Vec::new();
+    if has_legacy_gmail {
+        email_backends.push(crate::core::email_delivery::EMAIL_PROVIDER_GMAIL.to_string());
+    }
+    if has_workspace_gmail {
+        email_backends.push(crate::core::email_delivery::EMAIL_PROVIDER_GOOGLE_WORKSPACE.to_string());
+    }
+    if crate::core::email_delivery::external_email_delivery_is_ready(&config.email) {
+        if let Some(provider_id) =
+            crate::core::email_delivery::external_email_provider_id(&config.email)
+        {
+            if !email_backends.iter().any(|existing| existing == &provider_id) {
+                email_backends.push(provider_id);
+            }
+        }
+    }
+    if crate::core::email_delivery::email_channel_is_ready(
+        &config.email.provider,
+        &email_backends,
+    ) {
         channels.insert("email".to_string());
     }
 
