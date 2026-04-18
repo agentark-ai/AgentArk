@@ -370,6 +370,7 @@ pub fn looks_like_agentark_help_query(message: &str) -> bool {
                 | "new_user"
                 | "capabilities"
                 | "integrations"
+                | "custom_integrations"
                 | "plugins"
                 | "webhooks"
                 | "swarm"
@@ -391,8 +392,17 @@ pub fn looks_like_agentark_help_query(message: &str) -> bool {
             "mission control",
             "approval inbox",
             "background learning",
+            "heuristic reflection",
+            "learned heuristics",
+            "experiential reflective learning",
+            "erl heuristics",
             "reflection pass",
             "daily brief",
+            "custom integrations",
+            "custom integration",
+            "extension pack",
+            "extension packs",
+            "prebuilt connectors",
             "plugin sdk",
             "google workspace",
             "skill import",
@@ -400,7 +410,6 @@ pub fn looks_like_agentark_help_query(message: &str) -> bool {
             "local embeddings",
             "external embeddings",
             "input needed",
-            "/setsecret",
             "/delegate",
             "/rollback",
             "public apps",
@@ -516,6 +525,10 @@ pub fn infer_help_topics(message: &str) -> Vec<&'static str> {
             "arkevolve",
             "ark evolve",
             "background learning",
+            "heuristic reflection",
+            "heuristics",
+            "experiential reflective learning",
+            "erl",
             "reflection pass",
             "experience consolidation",
             "pattern induction",
@@ -677,6 +690,23 @@ pub fn infer_help_topics(message: &str) -> Vec<&'static str> {
     ) {
         topics.push("channels");
     }
+    if topic_matches(
+        message,
+        &[
+            "custom integration",
+            "custom integrations",
+            "user added integration",
+            "user-added integration",
+            "extension pack",
+            "extension packs",
+            "pack based integration",
+            "pack-based integration",
+        ],
+        &[],
+    ) {
+        topics.push("custom_integrations");
+        topics.push("integrations");
+    }
     if contains_any_help_token(message, &["integrations", "integration", "connectors"]) {
         topics.push("integrations");
     }
@@ -703,7 +733,6 @@ pub fn infer_help_topics(message: &str) -> Vec<&'static str> {
         message,
         &[
             "chat shortcuts",
-            "/setsecret",
             "/notifications pause",
             "/notifications resume",
             "/notifications status",
@@ -920,6 +949,7 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
             &[
                 "Settings > Integrations > Messaging Channels",
                 "Settings > Integrations > Prebuilt Connectors",
+                "Settings > Integrations > Custom Integrations",
                 "Settings > Integrations > Webhooks & APIs",
                 "Settings > Integrations > Plugins",
             ],
@@ -927,7 +957,7 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
         (
             "Knowledge",
             &[
-                "Settings > Knowledge > Memory",
+                "ArkMemory",
                 "Settings > Knowledge > MCP Servers",
             ],
         ),
@@ -1038,11 +1068,11 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
 
     let library_content = "Library and knowledge-related surfaces in the current UI.\n\n\
 - Library > Documents | Uploaded files and indexed document context.\n\
-- Settings > Knowledge > Memory | Structured memory and reusable knowledge-base items.\n\
-- Settings > Knowledge > Memory > Facts | Learned facts and operating constraints captured by the memory system.\n\
-- Settings > Knowledge > Memory > Preferences | Durable user preferences and rules.\n\
-- Settings > Knowledge > Memory > User Data | Notes, links, and captured user data.\n\
-- Settings > Knowledge > Memory > Knowledge | Reusable knowledge-base items, including bundled product docs after sync.\n\
+- ArkMemory | Structured memory, source attribution, review, rollback, and reusable knowledge-base items.\n\
+- ArkMemory > Current Memory > Facts | Learned facts and operating constraints captured by the memory system.\n\
+- ArkMemory > Current Memory > Preferences | Durable user preferences and rules.\n\
+- ArkMemory > Current Memory > User Data | Notes, links, and captured user data.\n\
+- ArkMemory > Current Memory > Knowledge | Reusable knowledge-base items, including bundled product docs after sync.\n\
 - Settings > Knowledge > MCP Servers | External MCP server configuration.";
     items.push(SeedKnowledgeItem {
         title: "Library, documents, and memory surfaces".to_string(),
@@ -1075,13 +1105,17 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
     });
 
     let evolution_content = "ArkEvolve and self-learning surfaces in the current UI.\n\n\
-- ArkEvolve | Main self-learning page with What happened, What helped, Tests running, Review, and Controls tabs.\n\
-- ArkSentinel > Background learning | Live status for reflection pass, experience consolidation, pattern induction, and candidate generation.\n\
+- ArkEvolve | Main self-learning page with What happened, What helped, Tests running, Review, and developer controls.\n\
+- ArkSentinel > Background learning | Live status for heuristic reflection, experience consolidation, pattern induction, and candidate generation.\n\
+- Learned Heuristics | Short transferable lessons distilled from completed runs.\n\
 - ArkEvolve > What happened | Recent tested or promoted changes with lineage and plain-language summaries.\n\
 - ArkEvolve > What helped | Measured impact from prompt, classifier, specialist, and routing changes.\n\
 - ArkEvolve > Tests running | Canary rollout, baseline version, candidate version, and gate result for each evolvable surface.\n\
 - ArkEvolve > Review | Draft workflow, strategy, and memory candidates waiting for review.\n\
-- ArkEvolve > Controls | Self-evolve toggle, learning toggle, local-only mode, default app access guard, and developer-mode canary actions.\n\
+- Settings > Advanced > ArkSentinel | Keep ArkSentinel available, choose whether it watches AgentArk activity or connected apps, and control routine detection.\n\
+- Settings > Advanced > ArkEvolve | Self-evolve master switch for background learning and canary experiments.\n\
+- Settings > Advanced > App Deploy Defaults | Default app access guard for new app deploy and public-link flows.\n\
+- ArkEvolve > Controls | Developer-mode canary actions and manual testing controls.\n\
 - Learned Memory | Durable facts, rules, lessons, and memory extracted from runs.\n\
 - Learned Procedures | Repeated successful workflows distilled into procedures.\n\
 - Recent Experience Runs | Recent evidence feeding the learning system.\n\
@@ -1093,7 +1127,7 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
         source: RUNTIME_SOURCE,
         url: Some(crate::branding::help_uri("help/runtime/evolution")),
         tags: Some(
-            "self_learning, evolution, learning, background_learning, sentinel, canary, replay_gate, memory, procedures, candidates, settings"
+            "self_learning, evolution, learning, background_learning, sentinel, canary, replay_gate, memory, procedures, candidates, heuristics, erl, settings"
                 .to_string(),
         ),
     });
@@ -1326,10 +1360,30 @@ mod tests {
     #[test]
     fn detects_chat_shortcuts_help_queries() {
         assert!(looks_like_agentark_help_query(
-            "How do I use /setsecret in AgentArk?"
+            "How do I use /rollback in AgentArk?"
         ));
         let topics = infer_help_topics("What does /rollback do?");
         assert!(topics.contains(&"chat_shortcuts"));
+    }
+
+    #[test]
+    fn detects_custom_integration_help_queries() {
+        assert!(looks_like_agentark_help_query(
+            "How do I install a custom integration in AgentArk?"
+        ));
+        let topics = infer_help_topics("How do I add a user-added extension pack?");
+        assert!(topics.contains(&"custom_integrations"));
+        assert!(topics.contains(&"integrations"));
+    }
+
+    #[test]
+    fn matches_custom_integrations_doc_for_custom_setup_queries() {
+        let matches = match_bundled_help_docs(
+            "How do I add Linear as a custom integration in AgentArk?",
+            3,
+        );
+        assert!(!matches.is_empty());
+        assert_eq!(matches[0].slug, "custom-integrations-and-extension-packs");
     }
 
     #[test]
@@ -1357,7 +1411,10 @@ mod tests {
             .any(|item| item.title == "Environment, deployment, and investigation"));
         assert!(items
             .iter()
-            .any(|item| item.title == "Chat shortcuts and safe command phrases"));
+            .any(|item| item.title == "Chat shortcuts and safe actions"));
+        assert!(items
+            .iter()
+            .any(|item| item.title == "Custom integrations and extension packs"));
         assert!(items
             .iter()
             .any(|item| item.title == "Plugins, webhooks, and custom APIs"));

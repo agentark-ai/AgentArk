@@ -201,8 +201,8 @@ async fn link_current_llm_key_for_chat(agent: &SharedAgent, key: &str) -> Result
         available_keys.join(", ")
     };
     Err(format!(
-        "I can't map '{}' from current model settings. Available model-backed keys: {}. You can set it manually with: /setsecret {}=VALUE",
-        key, available, key
+        "I can't map '{}' from current model settings. Available model-backed keys: {}. Save a credential for this key in the secure web UI.",
+        key, available
     ))
 }
 
@@ -569,6 +569,14 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
                     if lower_text.starts_with("/setsecret")
                         || lower_text.starts_with("/usecurrentkey")
                     {
+                        if !crate::core::secrets::secret_command_escape_hatch_enabled() {
+                            bot.send_message(
+                                chat_id,
+                                crate::core::secrets::setsecret_command_disabled_response(),
+                            )
+                            .await?;
+                            return Ok(());
+                        }
                         let allow_set_secret = {
                             let a = agent.read().await;
                             a.config
@@ -621,7 +629,7 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
                                 Err(e) => e,
                             }
                         } else {
-                            "Usage:\n/setsecret KEY=VALUE\nExample: /setsecret OPENAI_API_KEY=sk-...\n\nOr reuse your configured model key:\n/usecurrentkey OPENAI_API_KEY"
+                            "Use the secure credential form in the web UI to save credentials."
                                 .to_string()
                         };
 
@@ -632,8 +640,7 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
                     let response = handle_command(text, &agent, chat_id).await;
                     bot.send_message(chat_id, response).await?;
                 } else {
-                    // Allow "/setsecret ..." in private chat only, and only when allowlist is configured.
-                    // This stores the secret encrypted and does not send it to the LLM.
+                    // Internal escape hatch only. The product UX is the secure credential form.
                     let allow_set_secret = {
                         let a = agent.read().await;
                         a.config
@@ -642,7 +649,10 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
                             .map(|c| !c.allowed_users.is_empty())
                             .unwrap_or(false)
                     };
-                    if msg.chat.is_private() && allow_set_secret {
+                    if msg.chat.is_private()
+                        && allow_set_secret
+                        && crate::core::secrets::setsecret_command_escape_hatch_enabled()
+                    {
                         if let Some((key, value)) = parse_set_secret(text) {
                             let conversation_id = format!("telegram:{}", chat_id.0);
                             let reply = match store_secret_for_chat(&agent, &key, &value).await {
@@ -861,7 +871,6 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
                 /install <url> - Install a skill from URL\n\
                 /tunnel [start|stop|status] - Manage remote UI access\n\
                 /run <skill> [query] - Run a custom skill\n\
-                /setsecret KEY=VALUE - Store a secret encrypted (private + allowlisted only)\n\
                 /clear - Clear conversation history\n\n\
                 Or just chat with me!",
                 agent.config.name

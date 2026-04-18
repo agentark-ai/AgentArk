@@ -88,6 +88,7 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [hasSavedToken, setHasSavedToken] = useState(false);
+  const [allowManifestUpdate, setAllowManifestUpdate] = useState(false);
   const [form, setForm] = useState(EMPTY_FORM);
 
   const pluginsQ = useQuery({
@@ -171,6 +172,7 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
   function resetForm() {
     setEditingId(null);
     setHasSavedToken(false);
+    setAllowManifestUpdate(false);
     setForm(EMPTY_FORM);
   }
 
@@ -178,6 +180,7 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
     setError(null);
     setSuccess(null);
     resetForm();
+    setAllowManifestUpdate(false);
     setDialogOpen(true);
   }
 
@@ -186,6 +189,7 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
     setSuccess(null);
     setEditingId(pluginId);
     setHasSavedToken(tokenConfigured);
+    setAllowManifestUpdate(false);
     setDialogOpen(true);
   }
 
@@ -223,7 +227,8 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
         auth_header: form.auth_mode === "header" ? form.auth_header.trim() : undefined,
         token: form.token.trim() || undefined,
         clear_token: form.clear_token,
-        subscribed_events: form.subscribed_events
+        subscribed_events: form.subscribed_events,
+        allow_manifest_update: allowManifestUpdate || undefined
       };
       if (!payload.base_url) {
         throw new Error("Base URL is required.");
@@ -355,6 +360,9 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
                 onChange={(e) => setField("base_url", e.target.value)}
                 fullWidth
               />
+              <Alert severity="warning">
+                Plugin endpoints must be public HTTPS. Local addresses, private networks, redirects, and AgentArk control ports are rejected before registration.
+              </Alert>
               <TextField
                 label="Display Name"
                 placeholder="Optional override"
@@ -404,6 +412,17 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
                     />
                   }
                   label="Clear saved token on next save"
+                />
+              ) : null}
+              {editingId ? (
+                <FormControlLabel
+                  control={
+                    <Checkbox
+                      checked={allowManifestUpdate}
+                      onChange={(e) => setAllowManifestUpdate(e.target.checked)}
+                    />
+                  }
+                  label="Accept reviewed manifest changes on save"
                 />
               ) : null}
               <Stack direction="row" spacing={2} sx={{
@@ -517,6 +536,7 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
               {plugins.map((plugin) => {
                 const manifest = asRecord(plugin.manifest);
                 const actions = toStrings(plugin.registered_actions);
+                const capabilities = toStrings(manifest.capabilities);
                 const subscribed = toStrings(plugin.subscribed_events);
                 const availableEvents = toStrings(plugin.available_events);
                 const pluginId = str(plugin.id);
@@ -582,6 +602,13 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
                             <Chip key={actionName} size="small" label={actionName} />
                           ))}
                           {!actions.length ? <Chip size="small" label="No actions" variant="outlined" /> : null}
+                        </Stack>
+                        <Stack direction="row" spacing={0.75} useFlexGap sx={{
+                          flexWrap: "wrap"
+                        }}>
+                          {capabilities.map((capability) => (
+                            <Chip key={`cap-${pluginId}-${capability}`} size="small" label={`Capability: ${capability}`} variant="outlined" />
+                          ))}
                         </Stack>
                         <Stack direction="row" spacing={0.75} useFlexGap sx={{
                           flexWrap: "wrap"

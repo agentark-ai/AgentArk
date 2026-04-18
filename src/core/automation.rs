@@ -336,6 +336,7 @@ pub fn runtime_authorization_context_from_arguments(
         current_turn_is_explicit_approval: persisted.current_turn_is_explicit_approval,
         agent_name: None,
         agent_access_scope: None,
+        capability_context_id: None,
     }
 }
 

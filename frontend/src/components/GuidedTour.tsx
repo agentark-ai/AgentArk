@@ -20,7 +20,7 @@ const TOUR_STEPS: TourStepDef[] = [
     view: "settings",
     targetSelector: "[data-tour-target='settings-models']",
     title: "Welcome. Add your first AI model",
-    body: "Connect an OpenAI, Anthropic, Ollama, or OpenRouter model here. Once one model is set, AgentArk can start helping with daily briefs, memory, replies, and safe automations.",
+    body: "Connect an OpenAI, Anthropic, Ollama, or OpenRouter model here. Once one model is set, AgentArk can run the core AI OS surfaces: chat, memory, tasks, integrations, and reviewable actions.",
     placement: "left",
     spotlightPadding: 10,
     settingsInitialTab: 1,
@@ -29,8 +29,8 @@ const TOUR_STEPS: TourStepDef[] = [
     id: "chat",
     view: "chat",
     targetSelector: "[data-tour-target='nav-chat']",
-    title: "Start with everyday asks",
-    body: "Chat is the main place to ask for summaries, reminders, drafts, research, or help taking action. If something becomes long-running or needs approval, it can turn into a task without leaving the thread.",
+    title: "Command the system from chat",
+    body: "Chat is where you ask for summaries, reminders, drafts, research, app work, or action. If something becomes long-running or needs approval, it can turn into a task without leaving the thread.",
     placement: "right",
     spotlightPadding: 6,
   },
@@ -38,8 +38,8 @@ const TOUR_STEPS: TourStepDef[] = [
     id: "tasks",
     view: "tasks",
     targetSelector: "[data-tour-target='nav-tasks']",
-    title: "Tasks keep deeper work durable",
-    body: "Use Tasks for anything long-running, scheduled, or approval-gated. Daily routines and power-user automations land here when they need follow-up.",
+    title: "Tasks keep work durable",
+    body: "Use Tasks for long-running, scheduled, or approval-gated work. Routines, reminders, and deeper automations land here when they need follow-up.",
     placement: "right",
     spotlightPadding: 6,
   },
@@ -47,17 +47,18 @@ const TOUR_STEPS: TourStepDef[] = [
     id: "apps",
     view: "apps",
     targetSelector: "[data-tour-target='nav-apps']",
-    title: "Apps are a power feature",
-    body: "If AgentArk builds something for you, it lives here with links and guard settings. Most users can ignore this until they need it.",
+    title: "Apps extend the workspace",
+    body: "Generated tools and managed launchers live here with links, restore state, and guard settings.",
     placement: "right",
     spotlightPadding: 6,
   },
   {
     id: "attention",
     view: "overview",
-    targetSelector: "[data-tour-target='overview-attention']",
+    targetSelector:
+      "[data-tour-target='overview-attention'], [data-tour-target='overview-dashboard']",
     title: "Mission Control shows what needs you",
-    body: "Approvals, pauses, failures, and urgent alerts surface here so the assistant stays helpful without acting past your comfort level.",
+    body: "Approvals, pauses, failures, and urgent alerts surface here so AgentArk can keep working without acting past your comfort level.",
     placement: "bottom",
     spotlightPadding: 12,
   },
@@ -65,23 +66,33 @@ const TOUR_STEPS: TourStepDef[] = [
     id: "overview",
     view: "overview",
     targetSelector: "[data-tour-target='overview-dashboard']",
-    title: "Mission Control is your daily overview",
-    body: "Use Mission Control for your brief, attention items, suggestions, highlights, and recent activity. It supports your daily flow; chat remains the main place to talk to AgentArk.",
+    title: "Mission Control is the OS dashboard",
+    body: "Use Mission Control for live work, attention items, suggestions, highlights, and recent activity. Chat remains the main command surface.",
     placement: "bottom",
     spotlightPadding: 12,
   },
   {
     id: "done",
     view: "chat",
-    targetSelector: "[data-tour-target='workspace-shell']",
-    title: "You're ready for daily use",
-    body: "Start in chat, turn on the daily brief when you're ready, and open deeper panels only when needed. You can re-run this tour anytime from Settings > Advanced.",
+    targetSelector:
+      "[data-tour-target='chat-workspace'], [data-tour-target='nav-chat']",
+    title: "You're ready",
+    body: "Start in chat, turn on the daily brief when you want it, and open deeper OS panels when you need memory, tasks, apps, integrations, traces, or health checks. You can re-run this tour anytime from Settings > Advanced.",
     placement: "bottom",
     spotlightPadding: 10,
   },
 ];
 
 type Rect = { top: number; left: number; width: number; height: number };
+type BackdropSlice = {
+  top: number;
+  left: number;
+  width: number;
+  height: number;
+};
+
+const TARGET_MEASURE_RETRY_LIMIT = 30;
+const TARGET_MEASURE_RETRY_DELAY_MS = 200;
 
 function getElementRect(selector: string): Rect | null {
   const el = document.querySelector(selector);
@@ -138,6 +149,37 @@ function tooltipPosition(
   return { top, left };
 }
 
+function backdropSlices(target: Rect, pad: number): BackdropSlice[] {
+  const viewportWidth = window.innerWidth;
+  const viewportHeight = window.innerHeight;
+  const top = Math.max(0, target.top - pad);
+  const left = Math.max(0, target.left - pad);
+  const right = Math.min(viewportWidth, target.left + target.width + pad);
+  const bottom = Math.min(viewportHeight, target.top + target.height + pad);
+
+  return [
+    { top: 0, left: 0, width: viewportWidth, height: top },
+    {
+      top,
+      left: 0,
+      width: left,
+      height: Math.max(0, bottom - top),
+    },
+    {
+      top,
+      left: right,
+      width: Math.max(0, viewportWidth - right),
+      height: Math.max(0, bottom - top),
+    },
+    {
+      top: bottom,
+      left: 0,
+      width: viewportWidth,
+      height: Math.max(0, viewportHeight - bottom),
+    },
+  ].filter((slice) => slice.width > 0 && slice.height > 0);
+}
+
 type Props = {
   openTourStep: (view: string, options?: { settingsInitialTab?: number }) => void;
   currentView: string;
@@ -173,8 +215,11 @@ export function GuidedTour({ openTourStep, currentView }: Props) {
       if (rect) {
         setTargetRect(rect);
         setRenderKey((key) => key + 1);
-      } else if (attempt < 8) {
-        retryRef.current = setTimeout(() => measure(attempt + 1), 200);
+      } else if (attempt < TARGET_MEASURE_RETRY_LIMIT) {
+        retryRef.current = setTimeout(
+          () => measure(attempt + 1),
+          TARGET_MEASURE_RETRY_DELAY_MS,
+        );
       }
     };
 
@@ -221,20 +266,24 @@ export function GuidedTour({ openTourStep, currentView }: Props) {
   const isFirst = tourStep === 0;
   const isLast = tourStep === TOUR_STEPS.length - 1;
   const pos = tooltipPosition(targetRect, stepDef.placement, pad);
+  const slices = targetRect ? backdropSlices(targetRect, pad) : [];
 
   return (
     <>
       <Box
         className="tour-backdrop"
-        onClick={skipTour}
         sx={{
           position: "fixed",
           inset: 0,
           zIndex: 9998,
-          pointerEvents: "auto",
+          pointerEvents: "none",
         }}
       >
-        <svg width="100%" height="100%" style={{ position: "absolute", inset: 0 }}>
+        <svg
+          width="100%"
+          height="100%"
+          style={{ position: "absolute", inset: 0, pointerEvents: "none" }}
+        >
           <defs>
             <mask id="tour-spotlight-mask">
               <rect x="0" y="0" width="100%" height="100%" fill="white" />
@@ -261,6 +310,32 @@ export function GuidedTour({ openTourStep, currentView }: Props) {
           />
         </svg>
       </Box>
+      {targetRect ? (
+        slices.map((slice, index) => (
+          <Box
+            key={`tour-hitbox-${stepDef.id}-${renderKey}-${index}`}
+            onClick={skipTour}
+            sx={{
+              position: "fixed",
+              zIndex: 9998,
+              top: slice.top,
+              left: slice.left,
+              width: slice.width,
+              height: slice.height,
+              background: "transparent",
+            }}
+          />
+        ))
+      ) : (
+        <Box
+          onClick={skipTour}
+          sx={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 9998,
+          }}
+        />
+      )}
       {targetRect ? (
         <Box
           key={renderKey}
@@ -302,6 +377,7 @@ export function GuidedTour({ openTourStep, currentView }: Props) {
           p: 2,
           display: "flex",
           flexDirection: "column",
+          pointerEvents: "auto",
           animation: "tour-tooltip-enter 180ms ease",
         }}
       >

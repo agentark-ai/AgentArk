@@ -1,10 +1,37 @@
-import { Alert, Box, Button, Chip, Dialog, DialogActions, DialogContent, DialogTitle, Divider, Stack, TextField, Typography } from "@mui/material";
+import {
+  Alert,
+  Box,
+  Button,
+  Checkbox,
+  Chip,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
+  Divider,
+  FormControlLabel,
+  IconButton,
+  Menu,
+  MenuItem,
+  Stack,
+  TextField,
+  Typography,
+} from "@mui/material";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import MoreVertIcon from "@mui/icons-material/MoreVert";
+import Grid2 from "@mui/material/Grid";
+import { useEffect, useMemo, useState, type MouseEvent } from "react";
 import { api } from "../api/client";
 import type { ExtensionPackView } from "../types";
 
 type ExtensionPackMode = "all" | "integrations" | "messaging" | "connectors" | "channels";
+type ConnectionSecretField = {
+  key: string;
+  label: string;
+  helperText?: string;
+  multiline?: boolean;
+  sensitive?: boolean;
+};
 
 function packKindFilter(mode: ExtensionPackMode): string | undefined {
   if (mode === "messaging" || mode === "channels") return "messaging_channel";
@@ -47,29 +74,236 @@ function defaultSecretTemplate(pack: ExtensionPackView): string {
   return "{}";
 }
 
-function cardAccent(status: string): { border: string; bg: string; chip: string } {
-  if (status === "connected") {
-    return { border: "rgba(76, 175, 80, 0.35)", bg: "rgba(76, 175, 80, 0.08)", chip: "#81c784" };
+function secretFieldLabel(key: string): string {
+  switch (key) {
+    case "api_key":
+      return "API key";
+    case "access_token":
+      return "Access token";
+    case "client_id":
+      return "Client ID";
+    case "client_secret":
+      return "Client secret";
+    default:
+      return titleize(key);
   }
-  if (status === "needs_auth") {
-    return { border: "rgba(255, 193, 7, 0.35)", bg: "rgba(255, 193, 7, 0.08)", chip: "#ffd54f" };
+}
+
+function isSensitiveSecretField(key: string): boolean {
+  const normalized = key.trim().toLowerCase();
+  return (
+    normalized.includes("token") ||
+    normalized.includes("secret") ||
+    normalized.includes("password") ||
+    normalized.includes("api_key") ||
+    normalized.endsWith("_key") ||
+    normalized === "key"
+  );
+}
+
+function connectionSecretFields(pack: ExtensionPackView): ConnectionSecretField[] {
+  const requiredSecrets = (
+    pack.manifest.auth.required_secrets?.filter((value) => value.trim().length > 0) ||
+    (pack.manifest.auth.mode === "basic"
+      ? ["username", "password"]
+      : pack.manifest.auth.mode === "api_key"
+        ? ["api_key"]
+        : [])
+  );
+  if (requiredSecrets.length === 0) return [];
+  return requiredSecrets.map((key) => ({
+    key,
+    label: secretFieldLabel(key),
+    helperText:
+      key === "access_token"
+        ? "Stored encrypted and never sent through normal chat."
+        : key === "api_key"
+          ? "Stored encrypted and never sent through normal chat."
+          : undefined,
+    multiline: key === "allowed_numbers",
+    sensitive: isSensitiveSecretField(key)
+  }));
+}
+
+function defaultSecretValues(pack: ExtensionPackView): Record<string, string> {
+  return Object.fromEntries(connectionSecretFields(pack).map((field) => [field.key, ""]));
+}
+
+function buildStructuredSecretPayload(values: Record<string, string>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(values)
+      .map(([key, value]) => {
+        const trimmed = value.trim();
+        if (!trimmed) return [key, undefined];
+        if (key === "allowed_numbers") {
+          return [
+            key,
+            trimmed
+              .split(/[\r\n,]+/)
+              .map((entry) => entry.trim())
+              .filter(Boolean)
+          ];
+        }
+        return [key, trimmed];
+      })
+      .filter(([, value]) => value !== undefined)
+  );
+}
+
+function runtimeStatusLabel(status: string): string {
+  return status.replace(/_/g, " ");
+}
+
+function titleize(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  return trimmed
+    .split(/[_\-\s:.]+/)
+    .filter(Boolean)
+    .map((part) => {
+      const lower = part.toLowerCase();
+      if (lower === "api") return "API";
+      if (lower === "oauth") return "OAuth";
+      if (lower === "url") return "URL";
+      if (lower === "uri") return "URI";
+      if (lower === "cli") return "CLI";
+      if (lower === "id") return "ID";
+      return lower.charAt(0).toUpperCase() + lower.slice(1);
+    })
+    .join(" ");
+}
+
+function formatBadgeLabel(value: string): string {
+  return titleize(value.replace(/_/g, " "));
+}
+
+function displayPackName(pack: ExtensionPackView): string {
+  const raw = pack.manifest.name?.trim() || pack.manifest.id;
+  if (/[A-Z]/.test(raw)) return raw;
+  return titleize(raw);
+}
+
+function packIconColor(id: string): string {
+  const palette = [
+    "#5E6AD2",
+    "#4285F4",
+    "#0DBD8B",
+    "#26A5E4",
+    "#FFB020",
+    "#E57373",
+    "#81C784",
+    "#90CAF9",
+  ];
+  const seed = Array.from(id).reduce((sum, ch) => sum + ch.charCodeAt(0), 0);
+  return palette[seed % palette.length];
+}
+
+function PackIcon({ pack, size = 22 }: { pack: ExtensionPackView; size?: number }) {
+  const name = displayPackName(pack);
+  const color = packIconColor(pack.manifest.id);
+  const letter = name.charAt(0).toUpperCase() || "?";
+  return (
+    <Box
+      component="span"
+      sx={{
+        width: size,
+        height: size,
+        borderRadius: "6px",
+        background: color,
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        flexShrink: 0,
+        fontSize: size * 0.5,
+        fontWeight: 800,
+        color: "#fff",
+        lineHeight: 1,
+      }}
+    >
+      {letter}
+    </Box>
+  );
+}
+
+function packCardStatusLine(pack: ExtensionPackView, runtimeReady: boolean): string {
+  const detail =
+    pack.status_detail?.trim() ||
+    pack.runtime_detail?.trim() ||
+    pack.verification_detail?.trim() ||
+    "";
+  if (detail) return detail;
+  if (pack.status === "error") {
+    return "Review setup before the agent relies on this integration.";
   }
-  if (status === "draft") {
-    return { border: "rgba(105, 226, 255, 0.3)", bg: "rgba(105, 226, 255, 0.08)", chip: "#69e2ff" };
+  if (pack.manifest.draft && pack.enabled && runtimeReady && !pack.needs_auth) {
+    return "Draft pack. Review bindings before using it in production workflows.";
   }
-  if (status === "disabled") {
-    return { border: "rgba(158, 158, 158, 0.35)", bg: "rgba(158, 158, 158, 0.08)", chip: "#b0bec5" };
+  return "";
+}
+
+function packStatusLabel(
+  pack: ExtensionPackView,
+  runtimeReady: boolean,
+  installedPack: boolean,
+): string | null {
+  if (!installedPack) {
+    return pack.manifest.draft ? "Draft" : "Available";
   }
-  if (status === "error") {
-    return { border: "rgba(244, 67, 54, 0.35)", bg: "rgba(244, 67, 54, 0.08)", chip: "#ef9a9a" };
+  if (!pack.enabled) {
+    return "Disabled";
   }
-  return { border: "rgba(105, 226, 255, 0.22)", bg: "rgba(255,255,255,0.02)", chip: "#90caf9" };
+  if (pack.runtime_required && !runtimeReady) {
+    return "Runtime missing";
+  }
+  if (pack.status === "error") {
+    return "Needs attention";
+  }
+  if (pack.needs_auth || pack.status === "needs_auth") {
+    return "Needs setup";
+  }
+  if (pack.manifest.draft || pack.status === "draft") {
+    return "Draft";
+  }
+  if (pack.status === "connected" || pack.status === "ready") {
+    return "Ready";
+  }
+  const fallback = formatBadgeLabel(pack.status);
+  return fallback || "Ready";
+}
+
+function packHasConfiguredLook(pack: ExtensionPackView, runtimeReady: boolean): boolean {
+  return pack.enabled && !pack.needs_auth && runtimeReady && pack.status !== "error";
+}
+
+function appendWarning(message: string, warning?: string | null): string {
+  const detail = typeof warning === "string" ? warning.trim() : "";
+  return detail ? `${message} ${detail}` : message;
+}
+
+function runtimeResultMessage(payload: { result?: Record<string, unknown>; warning?: string | null }): string {
+  const detail = typeof payload.result?.detail === "string" ? payload.result.detail : "";
+  if (detail.trim()) {
+    return appendWarning(detail, payload.warning);
+  }
+  const status = typeof payload.result?.status === "string" ? payload.result.status : "ok";
+  return appendWarning(runtimeStatusLabel(status), payload.warning);
+}
+
+function isBuiltinPack(pack: ExtensionPackView): boolean {
+  const metadata = pack.manifest.metadata || {};
+  const authMetadata = pack.manifest.auth.metadata || {};
+  return (
+    typeof metadata.builtin_integration_id === "string" ||
+    typeof authMetadata.builtin_integration_id === "string" ||
+    pack.source_kind === "bundled_registry"
+  );
 }
 
 export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode }) {
   const queryClient = useQueryClient();
   const [search, setSearch] = useState("");
   const [notice, setNotice] = useState<{ kind: "success" | "error"; text: string } | null>(null);
+  const [addDialogOpen, setAddDialogOpen] = useState(false);
   const [linkDialogOpen, setLinkDialogOpen] = useState(false);
   const [uploadDialogOpen, setUploadDialogOpen] = useState(false);
   const [scaffoldDialogOpen, setScaffoldDialogOpen] = useState(false);
@@ -77,7 +311,9 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
   const [eventsPack, setEventsPack] = useState<ExtensionPackView | null>(null);
   const [linkUrl, setLinkUrl] = useState("");
   const [sourcePath, setSourcePath] = useState("");
+  const [linkTrustUnverified, setLinkTrustUnverified] = useState(false);
   const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [uploadTrustUnverified, setUploadTrustUnverified] = useState(false);
   const [scaffoldName, setScaffoldName] = useState("");
   const [scaffoldKind, setScaffoldKind] = useState(mode === "messaging" || mode === "channels" ? "messaging_channel" : "integration");
   const [scaffoldFeatures, setScaffoldFeatures] = useState("");
@@ -86,11 +322,54 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
   const [scaffoldOpenapiText, setScaffoldOpenapiText] = useState("");
   const [scaffoldCurlText, setScaffoldCurlText] = useState("");
   const [connectionName, setConnectionName] = useState("Default connection");
+  const [connectionSecretValues, setConnectionSecretValues] = useState<Record<string, string>>({});
   const [connectionSecretJson, setConnectionSecretJson] = useState("{}");
   const [connectError, setConnectError] = useState<string | null>(null);
   const [selectedConnectionId, setSelectedConnectionId] = useState<string | null>(null);
+  const [packMenuAnchor, setPackMenuAnchor] = useState<HTMLElement | null>(null);
+  const [packMenuTarget, setPackMenuTarget] = useState<ExtensionPackView | null>(null);
+  const actionButtonSx = {
+    minWidth: 0,
+    width: "auto",
+    maxWidth: "fit-content",
+    alignSelf: "flex-start",
+    flex: "0 0 auto",
+    whiteSpace: "nowrap",
+  } as const;
+  const tagChipSx = {
+    height: 22,
+    borderRadius: 1,
+    background: "rgba(14, 25, 43, 0.95)",
+    border: "1px solid rgba(112,153,201,0.18)",
+    color: "rgba(198,214,235,0.82)",
+    "& .MuiChip-label": {
+      px: 1,
+      fontSize: "0.63rem",
+      fontWeight: 700,
+      letterSpacing: 0,
+      textTransform: "uppercase",
+    },
+  } as const;
+  const statusChipSx = {
+    height: 22,
+    borderRadius: 1,
+    background: "rgba(14, 25, 43, 0.92)",
+    border: "1px solid rgba(112,153,201,0.16)",
+    color: "rgba(173,192,214,0.9)",
+    "& .MuiChip-label": {
+      px: 1,
+      fontSize: "0.64rem",
+      fontWeight: 700,
+      letterSpacing: 0,
+      textTransform: "uppercase",
+    },
+  } as const;
 
   const kind = packKindFilter(mode);
+  const connectSecretFields = useMemo(
+    () => (connectPack ? connectionSecretFields(connectPack) : []),
+    [connectPack]
+  );
   const packsQ = useQuery({
     queryKey: ["extension-packs", kind || "all", search],
     queryFn: () =>
@@ -100,8 +379,16 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
       })
   });
 
-  const installed = packsQ.data?.installed || [];
-  const catalog = packsQ.data?.catalog || [];
+  const installed = useMemo(() => {
+    const items = packsQ.data?.installed || [];
+    if (mode !== "integrations" && mode !== "connectors") return items;
+    return items.filter((pack) => !isBuiltinPack(pack));
+  }, [mode, packsQ.data?.installed]);
+  const catalog = useMemo(() => {
+    const items = packsQ.data?.catalog || [];
+    if (mode !== "integrations" && mode !== "connectors") return items;
+    return items.filter((pack) => !isBuiltinPack(pack));
+  }, [mode, packsQ.data?.catalog]);
   const emptyStateVisible =
     !packsQ.isLoading && !packsQ.isFetching && installed.length === 0 && catalog.length === 0;
   const connectDetailQ = useQuery({
@@ -118,7 +405,10 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
   const installMutation = useMutation({
     mutationFn: (payload: Record<string, unknown>) => api.installExtensionPack(payload),
     onSuccess: async (payload) => {
-      setNotice({ kind: "success", text: `${payload.pack.manifest.name} installed.` });
+      setNotice({
+        kind: "success",
+        text: appendWarning(`${payload.pack.manifest.name} installed.`, payload.warning)
+      });
       await queryClient.invalidateQueries({ queryKey: ["extension-packs"] });
     },
     onError: (error: Error) => setNotice({ kind: "error", text: error.message })
@@ -126,9 +416,13 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
   const uploadMutation = useMutation({
     mutationFn: (formData: FormData) => api.uploadExtensionPack(formData),
     onSuccess: async (payload) => {
-      setNotice({ kind: "success", text: `${payload.pack.manifest.name} uploaded and installed.` });
+      setNotice({
+        kind: "success",
+        text: appendWarning(`${payload.pack.manifest.name} uploaded and installed.`, payload.warning)
+      });
       setUploadDialogOpen(false);
       setUploadFile(null);
+      setUploadTrustUnverified(false);
       await queryClient.invalidateQueries({ queryKey: ["extension-packs"] });
     },
     onError: (error: Error) => setNotice({ kind: "error", text: error.message })
@@ -139,7 +433,10 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
     onSuccess: async (payload) => {
       setNotice({
         kind: "success",
-        text: `${payload.pack.manifest.name} scaffolded as an unverified draft pack.`
+        text: appendWarning(
+          `${payload.pack.manifest.name} scaffolded as an unverified draft pack.`,
+          payload.warning
+        )
       });
       setScaffoldDialogOpen(false);
       setScaffoldName("");
@@ -156,11 +453,17 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
   const connectionMutation = useMutation({
     mutationFn: (payload: { packId: string; body: Record<string, unknown> }) =>
       api.upsertExtensionPackConnection(payload.packId, payload.body),
-    onSuccess: async () => {
-      setNotice({ kind: "success", text: "Connection saved." });
+    onSuccess: async (payload) => {
+      setNotice({
+        kind: "success",
+        text: appendWarning("Connection saved.", payload.warning)
+      });
       setConnectPack(null);
       setConnectError(null);
-      await queryClient.invalidateQueries({ queryKey: ["extension-packs"] });
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["extension-packs"] }),
+        queryClient.invalidateQueries({ queryKey: ["extension-pack-detail"] })
+      ]);
     },
     onError: (error: Error) => setConnectError(error.message)
   });
@@ -171,27 +474,63 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
     onSuccess: async (payload) => {
       setNotice({
         kind: "success",
-        text: `${payload.pack.manifest.name} ${payload.pack.enabled ? "enabled" : "disabled"}.`
+        text: appendWarning(
+          `${payload.pack.manifest.name} ${payload.pack.enabled ? "enabled" : "disabled"}.`,
+          payload.warning
+        )
       });
       await queryClient.invalidateQueries({ queryKey: ["extension-packs"] });
+    },
+    onError: (error: Error) => setNotice({ kind: "error", text: error.message })
+  });
+  const runtimeMutation = useMutation({
+    mutationFn: async (payload: {
+      packId: string;
+      operation: "install" | "verify" | "update" | "uninstall";
+    }) => {
+      switch (payload.operation) {
+        case "install":
+          return api.installExtensionPackRuntime(payload.packId);
+        case "verify":
+          return api.verifyExtensionPackRuntime(payload.packId);
+        case "update":
+          return api.updateExtensionPackRuntime(payload.packId);
+        case "uninstall":
+          return api.uninstallExtensionPackRuntime(payload.packId);
+      }
+    },
+    onSuccess: async (payload, variables) => {
+      setNotice({
+        kind: variables.operation === "verify" ? "success" : "success",
+        text: runtimeResultMessage(payload)
+      });
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["extension-packs"] }),
+        queryClient.invalidateQueries({ queryKey: ["extension-pack-detail"] })
+      ]);
     },
     onError: (error: Error) => setNotice({ kind: "error", text: error.message })
   });
 
   useEffect(() => {
     if (!connectPack) return;
-    const first = connectDetailQ.data?.connections?.[0];
-    if (!first) return;
+    const preferred =
+      connectDetailQ.data?.connections?.find((item) => item.state === "ready") ||
+      connectDetailQ.data?.connections?.[0];
+    if (!preferred) return;
     if (!selectedConnectionId) {
-      setSelectedConnectionId(first.connection.id);
-      setConnectionName(first.connection.name || "Default connection");
+      setSelectedConnectionId(preferred.connection.id);
+      setConnectionName(preferred.connection.name || "Default connection");
     }
   }, [connectDetailQ.data, connectPack, selectedConnectionId]);
 
   const deleteMutation = useMutation({
     mutationFn: (packId: string) => api.deleteExtensionPack(packId, { remove_connections: true }),
-    onSuccess: async () => {
-      setNotice({ kind: "success", text: "Pack removed." });
+    onSuccess: async (payload) => {
+      setNotice({
+        kind: "success",
+        text: appendWarning("Pack removed.", payload.warning)
+      });
       await queryClient.invalidateQueries({ queryKey: ["extension-packs"] });
     },
     onError: (error: Error) => setNotice({ kind: "error", text: error.message })
@@ -199,7 +538,7 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
 
   const sectionTitle = useMemo(() => {
     if (mode === "messaging" || mode === "channels") return "Generic Channel Packs";
-    if (mode === "integrations" || mode === "connectors") return "Custom Integrations";
+    if (mode === "integrations" || mode === "connectors") return "User Added Custom Integrations";
     return "Generic Packs";
   }, [mode]);
 
@@ -208,7 +547,7 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
       return "Search installed packs, bundled defaults, upload a bundle, or scaffold a new messaging channel pack.";
     }
     if (mode === "integrations" || mode === "connectors") {
-      return "Search installed integrations, bundled defaults, upload a bundle, or scaffold/import a custom integration from OpenAPI or curl.";
+      return "Install and manage custom integrations you add yourself. Built-in connectors are managed separately.";
     }
     return "Search installed packs, bundled defaults, upload a bundle, or scaffold from OpenAPI/cURL when nothing exists yet.";
   }, [mode]);
@@ -218,9 +557,21 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
       return "No channel pack matched this search. Ask for a link or local path, upload a manifest/bundle, or scaffold a draft channel pack.";
     }
     if (mode === "integrations" || mode === "connectors") {
-      return "No integration matched this search. Ask for a link or local path, upload a manifest/bundle, or scaffold a draft integration from docs/OpenAPI/cURL.";
+      return "No custom integration matched this search yet. Add one from a link, upload, or scaffold a draft.";
     }
     return "No pack matched this search. Ask for a link or local path, upload a manifest/bundle, or scaffold a draft pack from docs/OpenAPI/cURL.";
+  }, [mode]);
+
+  const addButtonLabel = useMemo(() => {
+    if (mode === "messaging" || mode === "channels") return "Add Channel Pack";
+    if (mode === "integrations" || mode === "connectors") return "Add Custom Integration";
+    return "Add Pack";
+  }, [mode]);
+
+  const addDialogTitle = useMemo(() => {
+    if (mode === "messaging" || mode === "channels") return "Add channel pack";
+    if (mode === "integrations" || mode === "connectors") return "Add custom integration";
+    return "Add pack";
   }, [mode]);
 
   async function openOauthConnect(pack: ExtensionPackView) {
@@ -268,161 +619,149 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
     setConnectPack(pack);
     setSelectedConnectionId(null);
     setConnectionName("Default connection");
+    setConnectionSecretValues(defaultSecretValues(pack));
     setConnectionSecretJson(defaultSecretTemplate(pack));
     setConnectError(null);
   }
 
+  function openPackMenu(event: MouseEvent<HTMLElement>, pack: ExtensionPackView) {
+    event.stopPropagation();
+    setPackMenuAnchor(event.currentTarget);
+    setPackMenuTarget(pack);
+  }
+
+  function closePackMenu() {
+    setPackMenuAnchor(null);
+    setPackMenuTarget(null);
+  }
+
   function renderPackCard(pack: ExtensionPackView, installedPack: boolean) {
-    const accent = cardAccent(pack.status);
+    const runtimeReady = !pack.runtime_required || pack.runtime_status === "ready";
+    const packName = displayPackName(pack);
+    const statusLine = packCardStatusLine(pack, runtimeReady);
+    const statusLabel = packStatusLabel(pack, runtimeReady, installedPack);
+    const configuredLook = installedPack
+      ? packHasConfiguredLook(pack, runtimeReady)
+      : false;
+    const primaryLabel = installedPack
+      ? pack.enabled
+        ? "Disable"
+        : "Enable"
+      : "Install";
     return (
       <Box
         key={`${installedPack ? "installed" : "catalog"}-${pack.manifest.id}`}
         sx={{
-          p: 1.4,
-          borderRadius: "8px",
-          border: `1px solid ${accent.border}`,
-          background: accent.bg
+          height: "100%",
+          p: 1.5,
+          borderRadius: 1.5,
+          border: configuredLook
+            ? "1px solid rgba(64,196,255,0.24)"
+            : "1px solid rgba(112,153,201,0.16)",
+          background: configuredLook
+            ? "rgba(8,24,42,0.56)"
+            : "rgba(7,17,32,0.6)",
+          transition: "border-color 0.15s, background 0.15s, box-shadow 0.15s",
+          "&:hover": {
+            borderColor: configuredLook
+              ? "rgba(109, 226, 255, 0.34)"
+              : "rgba(148, 181, 220, 0.24)",
+            background: configuredLook
+              ? "rgba(9,28,48,0.66)"
+              : "rgba(9,21,39,0.72)",
+            boxShadow: "0 8px 24px rgba(0,0,0,0.18)",
+          },
         }}
       >
-        <Stack spacing={1}>
+        <Stack spacing={1.1} sx={{ height: "100%", justifyContent: "space-between" }}>
+          <Box>
           <Stack
             direction="row"
-            spacing={1}
+            spacing={0.9}
             sx={{
               alignItems: "center",
-              justifyContent: "space-between"
-            }}>
-            <Box sx={{ minWidth: 0 }}>
-              <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
-                {pack.manifest.name}
+              mb: 0.75,
+              justifyContent: "space-between",
+            }}
+          >
+            <Stack direction="row" spacing={0.9} sx={{ alignItems: "center", minWidth: 0 }}>
+              <PackIcon pack={pack} size={20} />
+              <Typography variant="subtitle2" noWrap sx={{ fontWeight: 700 }}>
+                {packName}
               </Typography>
-              <Typography variant="caption" sx={{
-                color: "text.secondary"
-              }}>
-                {pack.manifest.kind.replace(/_/g, " ")}
-              </Typography>
-            </Box>
-            <Chip
-              size="small"
-              variant="outlined"
-              label={pack.status.replace(/_/g, " ")}
-              sx={{ color: accent.chip, borderColor: accent.chip }}
-            />
+            </Stack>
+            {installedPack ? (
+              <IconButton
+                size="small"
+                onClick={(event) => openPackMenu(event, pack)}
+                aria-label={`More actions for ${packName}`}
+                sx={{ color: "text.secondary", flexShrink: 0 }}
+              >
+                <MoreVertIcon fontSize="small" />
+              </IconButton>
+            ) : null}
           </Stack>
           <Typography
-            variant="caption"
+            variant="body2"
             sx={{
               color: "text.secondary",
-              lineHeight: 1.5
-            }}>
+              lineHeight: 1.45,
+              display: "-webkit-box",
+              WebkitLineClamp: 2,
+              WebkitBoxOrient: "vertical",
+              overflow: "hidden",
+            }}
+          >
             {pack.manifest.description || "No description provided."}
           </Typography>
-          <Stack direction="row" spacing={0.75} useFlexGap sx={{
-            flexWrap: "wrap"
-          }}>
-            <Chip size="small" label={`${pack.feature_summaries.length} features`} variant="outlined" />
-            <Chip size="small" label={pack.trust_level.replace(/_/g, " ")} variant="outlined" />
-            <Chip size="small" label={pack.verification_status.replace(/_/g, " ")} variant="outlined" />
-            <Chip size="small" label={pack.source_kind.replace(/_/g, " ")} variant="outlined" />
-            {pack.manifest.draft ? <Chip size="small" label="draft" variant="outlined" /> : null}
-          </Stack>
-          {pack.verification_detail ? (
-            <Typography variant="caption" sx={{
-              color: "text.secondary"
-            }}>
-              {pack.verification_detail}
-            </Typography>
-          ) : null}
-          {pack.status_detail ? (
-            <Typography variant="caption" sx={{
-              color: "text.secondary"
-            }}>
-              {pack.status_detail}
-            </Typography>
-          ) : null}
-          {installedPack && pack.supports_webhook && pack.webhook_path ? (
+          {statusLine ? (
             <Typography
               variant="caption"
               sx={{
                 color: "text.secondary",
-                wordBreak: "break-all"
-              }}>
-              Webhook: {`${window.location.origin}${pack.webhook_path}`}
+                lineHeight: 1.45,
+                mt: 0.75,
+                display: "-webkit-box",
+                WebkitLineClamp: 2,
+                WebkitBoxOrient: "vertical",
+                overflow: "hidden",
+              }}
+            >
+              {statusLine}
             </Typography>
           ) : null}
-          <Stack direction="row" spacing={1} useFlexGap sx={{
-            flexWrap: "wrap"
-          }}>
+          </Box>
+          <Stack direction="row" spacing={0.75} sx={{ alignItems: "center", justifyContent: "space-between" }}>
+            <Stack direction="row" spacing={0.5} useFlexGap sx={{ flexWrap: "wrap" }}>
+              <Chip size="small" label="Custom" sx={tagChipSx} />
+              {statusLabel ? <Chip size="small" label={statusLabel} sx={statusChipSx} /> : null}
+            </Stack>
             {!installedPack ? (
               <Button
                 size="small"
                 variant="contained"
-                onClick={() =>
-                  installMutation.mutate({
-                    pack_id: pack.manifest.id
-                  })
-                }
+                sx={actionButtonSx}
+                onClick={() => installMutation.mutate({ pack_id: pack.manifest.id })}
                 disabled={installMutation.isPending}
               >
-                Install
+                {primaryLabel}
               </Button>
             ) : (
-              <>
-                {pack.needs_auth || pack.supports_connect_url ? (
-                  <Button
-                    size="small"
-                    variant="contained"
-                    onClick={() =>
-                      pack.supports_connect_url ? void openOauthConnect(pack) : openConnectDialog(pack)
-                    }
-                  >
-                    Connect
-                  </Button>
-                ) : null}
-                <Button size="small" variant="outlined" onClick={() => void testPack(pack)}>
-                  Test
-                </Button>
-                {pack.supports_webhook ? (
-                  <Button size="small" variant="outlined" onClick={() => setEventsPack(pack)}>
-                    Events
-                  </Button>
-                ) : null}
                 <Button
                   size="small"
-                  variant="outlined"
+                  variant={pack.enabled ? "outlined" : "contained"}
+                  sx={actionButtonSx}
                   onClick={() =>
                     enableMutation.mutate({
                       packId: pack.manifest.id,
-                      enabled: !pack.enabled
+                      enabled: !pack.enabled,
                     })
                   }
                   disabled={enableMutation.isPending}
                 >
-                  {pack.enabled ? "Disable" : "Enable"}
+                  {primaryLabel}
                 </Button>
-                <Button
-                  size="small"
-                  color="error"
-                  variant="outlined"
-                  onClick={() => deleteMutation.mutate(pack.manifest.id)}
-                  disabled={deleteMutation.isPending}
-                >
-                  Remove
-                </Button>
-              </>
             )}
-          </Stack>
-          <Stack direction="row" spacing={0.75} useFlexGap sx={{
-            flexWrap: "wrap"
-          }}>
-            {pack.feature_summaries.slice(0, 4).map((feature) => (
-              <Chip
-                key={`${pack.manifest.id}-${feature.id}`}
-                size="small"
-                label={feature.id}
-                variant="outlined"
-              />
-            ))}
           </Stack>
         </Stack>
       </Box>
@@ -448,17 +787,9 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
                 {sectionSubtitle}
               </Typography>
             </Box>
-            <Stack direction="row" spacing={1}>
-              <Button size="small" variant="outlined" onClick={() => setLinkDialogOpen(true)}>
-                Link or path
-              </Button>
-              <Button size="small" variant="outlined" onClick={() => setUploadDialogOpen(true)}>
-                Upload bundle
-              </Button>
-              <Button size="small" variant="outlined" onClick={() => setScaffoldDialogOpen(true)}>
-                Scaffold draft
-              </Button>
-            </Stack>
+            <Button size="small" variant="contained" onClick={() => setAddDialogOpen(true)}>
+              {addButtonLabel}
+            </Button>
           </Stack>
           <TextField
             size="small"
@@ -496,7 +827,13 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
               }}>
                 Installed
               </Typography>
-              <Stack spacing={1}>{installed.map((pack) => renderPackCard(pack, true))}</Stack>
+              <Grid2 container spacing={1.25}>
+                {installed.map((pack) => (
+                  <Grid2 key={`installed-${pack.manifest.id}`} size={{ xs: 12, md: 6, xl: 4 }}>
+                    {renderPackCard(pack, true)}
+                  </Grid2>
+                ))}
+              </Grid2>
             </Stack>
           ) : null}
           {catalog.length > 0 ? (
@@ -506,11 +843,191 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
               }}>
                 Catalog
               </Typography>
-              <Stack spacing={1}>{catalog.map((pack) => renderPackCard(pack, false))}</Stack>
+              <Grid2 container spacing={1.25}>
+                {catalog.map((pack) => (
+                  <Grid2 key={`catalog-${pack.manifest.id}`} size={{ xs: 12, md: 6, xl: 4 }}>
+                    {renderPackCard(pack, false)}
+                  </Grid2>
+                ))}
+              </Grid2>
             </Stack>
           ) : null}
         </Stack>
       </Box>
+      <Menu
+        anchorEl={packMenuAnchor}
+        open={!!packMenuAnchor && !!packMenuTarget}
+        onClose={closePackMenu}
+        anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
+        transformOrigin={{ vertical: "top", horizontal: "right" }}
+      >
+        {packMenuTarget ? (
+          [
+            <MenuItem key="status" disabled>
+              Status: {formatBadgeLabel(packMenuTarget.status)}
+            </MenuItem>,
+            (packMenuTarget.needs_auth || packMenuTarget.supports_connect_url) ? (
+              <MenuItem
+                key="setup"
+                onClick={() => {
+                  const pack = packMenuTarget;
+                  closePackMenu();
+                  if (!pack) return;
+                  if (pack.supports_connect_url) {
+                    void openOauthConnect(pack);
+                  } else {
+                    openConnectDialog(pack);
+                  }
+                }}
+              >
+                Setup
+              </MenuItem>
+            ) : null,
+            <MenuItem
+              key="test"
+              disabled={!(!packMenuTarget.runtime_required || packMenuTarget.runtime_status === "ready")}
+              onClick={() => {
+                const pack = packMenuTarget;
+                closePackMenu();
+                if (!pack) return;
+                void testPack(pack);
+              }}
+            >
+              Test
+            </MenuItem>,
+            packMenuTarget.supports_webhook ? (
+              <MenuItem
+                key="events"
+                onClick={() => {
+                  const pack = packMenuTarget;
+                  closePackMenu();
+                  if (!pack) return;
+                  setEventsPack(pack);
+                }}
+              >
+                Recent runs
+              </MenuItem>
+            ) : null,
+            packMenuTarget.runtime_required ? (
+              <MenuItem
+                key="runtime-install"
+                onClick={() => {
+                  const pack = packMenuTarget;
+                  closePackMenu();
+                  if (!pack) return;
+                  runtimeMutation.mutate({
+                    packId: pack.manifest.id,
+                    operation: "install",
+                  });
+                }}
+              >
+                {packMenuTarget.runtime_status === "ready" ? "Reinstall runtime" : "Install runtime"}
+              </MenuItem>
+            ) : null,
+            packMenuTarget.runtime_required ? (
+              <MenuItem
+                key="runtime-verify"
+                onClick={() => {
+                  const pack = packMenuTarget;
+                  closePackMenu();
+                  if (!pack) return;
+                  runtimeMutation.mutate({
+                    packId: pack.manifest.id,
+                    operation: "verify",
+                  });
+                }}
+              >
+                Verify runtime
+              </MenuItem>
+            ) : null,
+            packMenuTarget.runtime_required ? (
+              <MenuItem
+                key="runtime-update"
+                onClick={() => {
+                  const pack = packMenuTarget;
+                  closePackMenu();
+                  if (!pack) return;
+                  runtimeMutation.mutate({
+                    packId: pack.manifest.id,
+                    operation: "update",
+                  });
+                }}
+              >
+                Update runtime
+              </MenuItem>
+            ) : null,
+            packMenuTarget.runtime_required ? (
+              <MenuItem
+                key="runtime-uninstall"
+                disabled={packMenuTarget.runtime_status === "missing"}
+                onClick={() => {
+                  const pack = packMenuTarget;
+                  closePackMenu();
+                  if (!pack) return;
+                  runtimeMutation.mutate({
+                    packId: pack.manifest.id,
+                    operation: "uninstall",
+                  });
+                }}
+              >
+                Uninstall runtime
+              </MenuItem>
+            ) : null,
+            <MenuItem
+              key="remove"
+              onClick={() => {
+                const pack = packMenuTarget;
+                closePackMenu();
+                if (!pack) return;
+                if (!window.confirm(`Remove ${displayPackName(pack)}?`)) return;
+                deleteMutation.mutate(pack.manifest.id);
+              }}
+            >
+              Remove
+            </MenuItem>,
+          ].filter(Boolean)
+        ) : null}
+      </Menu>
+      <Dialog open={addDialogOpen} onClose={() => setAddDialogOpen(false)} maxWidth="xs" fullWidth>
+        <DialogTitle>{addDialogTitle}</DialogTitle>
+        <DialogContent sx={{ pt: 1 }}>
+          <Stack spacing={1.25}>
+            <Typography variant="caption" sx={{ color: "text.secondary" }}>
+              Choose how you want to add this integration.
+            </Typography>
+            <Button
+              variant="outlined"
+              onClick={() => {
+                setAddDialogOpen(false);
+                setLinkDialogOpen(true);
+              }}
+            >
+              Link or path
+            </Button>
+            <Button
+              variant="outlined"
+              onClick={() => {
+                setAddDialogOpen(false);
+                setUploadDialogOpen(true);
+              }}
+            >
+              Upload bundle
+            </Button>
+            <Button
+              variant="outlined"
+              onClick={() => {
+                setAddDialogOpen(false);
+                setScaffoldDialogOpen(true);
+              }}
+            >
+              Scaffold draft
+            </Button>
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setAddDialogOpen(false)}>Close</Button>
+        </DialogActions>
+      </Dialog>
       <Dialog open={linkDialogOpen} onClose={() => setLinkDialogOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>Install pack from link or local path</DialogTitle>
         <DialogContent sx={{ pt: 1 }}>
@@ -536,6 +1053,18 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
               onChange={(event) => setSourcePath(event.target.value)}
               placeholder="C:\\packs\\clickup-pack.zip"
             />
+            <Alert severity="warning">
+              Unsigned packs are blocked unless you explicitly accept unverified code, bindings, and runtime commands.
+            </Alert>
+            <FormControlLabel
+              control={
+                <Checkbox
+                  checked={linkTrustUnverified}
+                  onChange={(event) => setLinkTrustUnverified(event.target.checked)}
+                />
+              }
+              label="Install without publisher verification"
+            />
           </Stack>
         </DialogContent>
         <DialogActions>
@@ -547,13 +1076,14 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
                 {
                   source_url: linkUrl.trim() || undefined,
                   source_path: sourcePath.trim() || undefined,
-                  trust_unverified: true
+                  trust_unverified: linkTrustUnverified
                 },
                 {
                   onSuccess: () => {
                     setLinkDialogOpen(false);
                     setLinkUrl("");
                     setSourcePath("");
+                    setLinkTrustUnverified(false);
                   }
                 }
               )
@@ -573,6 +1103,9 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
             }}>
               Upload a manifest JSON/YAML file or a zip bundle containing one of the expected manifest names.
             </Typography>
+            <Alert severity="warning">
+              Review local CLI, runtime installer, HTTP bindings, and secret usage before installing unsigned packs.
+            </Alert>
             <Button variant="outlined" component="label">
               {uploadFile ? uploadFile.name : "Choose file"}
               <input
@@ -582,6 +1115,15 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
                 onChange={(event) => setUploadFile(event.target.files?.[0] ?? null)}
               />
             </Button>
+            <FormControlLabel
+              control={
+                <Checkbox
+                  checked={uploadTrustUnverified}
+                  onChange={(event) => setUploadTrustUnverified(event.target.checked)}
+                />
+              }
+              label="Install upload without publisher verification"
+            />
           </Stack>
         </DialogContent>
         <DialogActions>
@@ -593,7 +1135,7 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
               if (!uploadFile) return;
               const formData = new FormData();
               formData.append("file", uploadFile);
-              formData.append("trust_unverified", "true");
+              formData.append("trust_unverified", String(uploadTrustUnverified));
               uploadMutation.mutate(formData);
             }}
           >
@@ -731,6 +1273,8 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
                       onClick={() => {
                         setSelectedConnectionId(item.connection.id);
                         setConnectionName(item.connection.name || "Default connection");
+                        setConnectionSecretValues(defaultSecretValues(connectPack!));
+                        setConnectionSecretJson(defaultSecretTemplate(connectPack!));
                       }}
                     >
                       {item.connection.name || item.connection.id}
@@ -742,6 +1286,7 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
                     onClick={() => {
                       setSelectedConnectionId(null);
                       setConnectionName("Default connection");
+                      setConnectionSecretValues(defaultSecretValues(connectPack!));
                       setConnectionSecretJson(defaultSecretTemplate(connectPack!));
                     }}
                   >
@@ -750,13 +1295,9 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
                 </Stack>
               </Stack>
             ) : null}
-            <Typography variant="caption" sx={{
-              color: "text.secondary"
-            }}>
-              {
-                "Save a connection secret as JSON. Examples: {\"api_key\":\"...\"} for API-key packs or {\"username\":\"...\",\"password\":\"...\"} for basic-auth packs."
-              }
-            </Typography>
+            <Alert severity="info" sx={{ borderRadius: 1 }}>
+              Never paste secrets in normal chat. Use this secure setup form.
+            </Alert>
             <TextField
               fullWidth
               size="small"
@@ -764,15 +1305,46 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
               value={connectionName}
               onChange={(event) => setConnectionName(event.target.value)}
             />
-            <TextField
-              fullWidth
-              multiline
-              minRows={6}
-              size="small"
-              label="Secret JSON"
-              value={connectionSecretJson}
-              onChange={(event) => setConnectionSecretJson(event.target.value)}
-            />
+            {connectSecretFields.length > 0 ? (
+              <Stack spacing={1}>
+                {connectSecretFields.map((field) => (
+                  <TextField
+                    key={field.key}
+                    fullWidth
+                    size="small"
+                    type={field.sensitive && !field.multiline ? "password" : "text"}
+                    label={field.label}
+                    value={connectionSecretValues[field.key] || ""}
+                    helperText={field.helperText}
+                    multiline={field.multiline}
+                    minRows={field.multiline ? 3 : undefined}
+                    onChange={(event) =>
+                      setConnectionSecretValues((current) => ({
+                        ...current,
+                        [field.key]: event.target.value
+                      }))
+                    }
+                  />
+                ))}
+              </Stack>
+            ) : (
+              <>
+                <Typography variant="caption" sx={{
+                  color: "text.secondary"
+                }}>
+                  This pack uses a nonstandard secret payload. Use advanced JSON only for this setup.
+                </Typography>
+                <TextField
+                  fullWidth
+                  multiline
+                  minRows={6}
+                  size="small"
+                  label="Secret JSON"
+                  value={connectionSecretJson}
+                  onChange={(event) => setConnectionSecretJson(event.target.value)}
+                />
+              </>
+            )}
           </Stack>
         </DialogContent>
         <DialogActions>
@@ -781,6 +1353,31 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
             variant="contained"
             onClick={() => {
               if (!connectPack) return;
+              if (connectSecretFields.length > 0) {
+                const defaultValues = defaultSecretValues(connectPack);
+                const hasSecretEdits = connectSecretFields.some(
+                  (field) =>
+                    (connectionSecretValues[field.key] || "") !== (defaultValues[field.key] || "")
+                );
+                const missingFields = connectSecretFields
+                  .filter((field) => !(connectionSecretValues[field.key] || "").trim())
+                  .map((field) => field.label);
+                if ((!selectedConnectionId || hasSecretEdits) && missingFields.length > 0) {
+                  setConnectError(`Enter ${missingFields.join(", ")} using the secure form.`);
+                  return;
+                }
+                connectionMutation.mutate({
+                  packId: connectPack.manifest.id,
+                  body: {
+                    connection_id: selectedConnectionId || undefined,
+                    name: connectionName.trim() || "Default connection",
+                    secret: hasSecretEdits || !selectedConnectionId
+                      ? buildStructuredSecretPayload(connectionSecretValues)
+                      : undefined
+                  }
+                });
+                return;
+              }
               try {
                 const parsedSecret = JSON.parse(connectionSecretJson);
                 connectionMutation.mutate({

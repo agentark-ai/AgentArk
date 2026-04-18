@@ -556,8 +556,8 @@ async fn link_current_llm_key_for_chat(agent: &SharedAgent, key: &str) -> Result
         available_keys.join(", ")
     };
     Err(format!(
-        "I can't map '{}' from current model settings. Available model-backed keys: {}. You can set it manually with: /setsecret {}=VALUE",
-        key, available, key
+        "I can't map '{}' from current model settings. Available model-backed keys: {}. Save a credential for this key in the secure web UI.",
+        key, available
     ))
 }
 
@@ -1288,7 +1288,7 @@ pub async fn handle_webhook_with_config(
         return Ok("ok".to_string());
     }
 
-    // Secret UX parity for chat channels: handle sensitive commands before LLM processing.
+    // Internal escape hatch only. The product UX is the secure credential form.
     let can_store_secret = if !config.allowed_numbers.is_empty() {
         config.allowed_numbers.iter().any(|n| n == from)
     } else if config.dm_policy == "pairing" {
@@ -1299,6 +1299,15 @@ pub async fn handle_webhook_with_config(
     };
 
     if let Some((key, value)) = parse_set_secret(&text) {
+        if !crate::core::secrets::setsecret_command_escape_hatch_enabled() {
+            send_reply(
+                &config,
+                from,
+                crate::core::secrets::setsecret_command_disabled_response(),
+            )
+            .await?;
+            return Ok("ok".to_string());
+        }
         if !can_store_secret {
             send_reply(
                 &config,
@@ -1332,6 +1341,15 @@ pub async fn handle_webhook_with_config(
     }
 
     if let Some(key) = parse_use_current_llm_key(&text) {
+        if !crate::core::secrets::secret_command_escape_hatch_enabled() {
+            send_reply(
+                &config,
+                from,
+                crate::core::secrets::setsecret_command_disabled_response(),
+            )
+            .await?;
+            return Ok("ok".to_string());
+        }
         if !can_store_secret {
             send_reply(
                 &config,
@@ -1573,7 +1591,6 @@ async fn handle_command(text: &str, agent: &SharedAgent, from: &str) -> String {
                  /search <query> - Web search\n\
                  /image <prompt> - Generate an image\n\
                  /tunnel [start|stop|status] - Manage remote UI access\n\
-                 /setsecret KEY=VALUE - Store a secret encrypted (paired/allowlisted only)\n\
                  /approve <number> - Approve a contact\n\
                  /clear - Clear conversation history\n\n\
                  Or just send me a message!",
@@ -1657,6 +1674,9 @@ async fn handle_command(text: &str, agent: &SharedAgent, from: &str) -> String {
         }
 
         "/setsecret" => {
+            if !crate::core::secrets::setsecret_command_escape_hatch_enabled() {
+                return crate::core::secrets::setsecret_command_disabled_response().to_string();
+            }
             // Security gate: only allow in "pairing" mode with approval or explicit allowlist.
             // Do not accept secrets in open mode.
             let (cfg_opt, storage) = {
@@ -1680,12 +1700,11 @@ async fn handle_command(text: &str, agent: &SharedAgent, from: &str) -> String {
             }
 
             if args.is_empty() {
-                return "Usage: /setsecret KEY=VALUE\nExample: /setsecret OPENAI_API_KEY=sk-..."
-                    .to_string();
+                return "Internal credential command requires KEY=VALUE.".to_string();
             }
             let input = format!("/setsecret {}", args);
             let Some((key, value)) = parse_set_secret(&input) else {
-                return "Invalid syntax. Use: /setsecret KEY=VALUE".to_string();
+                return "Internal credential command requires KEY=VALUE.".to_string();
             };
 
             match store_secret_for_chat(agent, &key, &value).await {
@@ -1709,6 +1728,9 @@ async fn handle_command(text: &str, agent: &SharedAgent, from: &str) -> String {
             }
         }
         "/usecurrentkey" => {
+            if !crate::core::secrets::secret_command_escape_hatch_enabled() {
+                return crate::core::secrets::setsecret_command_disabled_response().to_string();
+            }
             let (cfg_opt, storage) = {
                 let a = agent.read().await;
                 (a.config.whatsapp.clone(), a.storage.clone())
@@ -1730,12 +1752,11 @@ async fn handle_command(text: &str, agent: &SharedAgent, from: &str) -> String {
             }
 
             if args.is_empty() {
-                return "Usage: /usecurrentkey KEY\nExample: /usecurrentkey OPENAI_API_KEY"
-                    .to_string();
+                return "Internal credential command requires KEY.".to_string();
             }
             let input = format!("/usecurrentkey {}", args);
             let Some(key) = parse_use_current_llm_key(&input) else {
-                return "Invalid syntax. Use: /usecurrentkey KEY".to_string();
+                return "Internal credential command requires KEY.".to_string();
             };
 
             match link_current_llm_key_for_chat(agent, &key).await {

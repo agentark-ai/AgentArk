@@ -248,7 +248,11 @@ fn render_message_summary(meta: GmailFullMessage) -> String {
         format!("  ThreadId: {}", meta.thread_id),
     ];
     if !meta.snippet.trim().is_empty() {
-        lines.push(format!("  Snippet: {}", meta.snippet.trim()));
+        // Email body previews are author-controlled; wrap them so the model
+        // treats their contents as data rather than instructions.
+        let wrapped =
+            crate::security::sanitize_untrusted_output("email_snippet", meta.snippet.trim());
+        lines.push(format!("  Snippet: {}", wrapped));
     }
     lines.join("\n")
 }

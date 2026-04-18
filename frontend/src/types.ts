@@ -175,6 +175,13 @@ export type BrowserHandoffStatus = {
   can_complete: boolean;
 };
 
+export type BrowserSessionSummary = BrowserHandoffStatus;
+
+export type BrowserSessionsResponse = {
+  sessions: BrowserSessionSummary[];
+  total: number;
+};
+
 export type ArkPulseRemediationSpec =
   | { kind: "tunnel_start_verify" }
   | { kind: "tunnel_restart_verify" }
@@ -447,6 +454,42 @@ export type IntegrationItem = {
   config_values?: Record<string, unknown> | null;
 };
 
+export type IntegrationAuthManifestField = {
+  key: string;
+  label: string;
+  placeholder?: string | null;
+  help?: string | null;
+  input_type?: string | { kind?: string; options?: string[] } | null;
+  required?: boolean;
+};
+
+export type IntegrationAuthManifest = {
+  integration_id: string;
+  display_name: string;
+  description?: string | null;
+  docs_url?: string | null;
+  warning?: string | null;
+  mode?: ({ kind?: string; fields?: IntegrationAuthManifestField[] } & Record<string, unknown>) | null;
+  post_submit?: Record<string, unknown> | null;
+};
+
+export type CustomMessagingChannel = {
+  id: string;
+  name: string;
+  description?: string;
+  enabled?: boolean;
+  docs_url?: string | null;
+  runtime_channel_id: string;
+  configured: boolean;
+  requires_auth: boolean;
+  required_secret_count?: number;
+  auth_manifest?: IntegrationAuthManifest | null;
+  auth_profile_id?: string | null;
+  last_tested_at?: string | null;
+  last_test_outcome?: string | null;
+  last_test_message?: string | null;
+};
+
 export type ExtensionPackAuthMode =
   | "none"
   | "api_key"
@@ -506,6 +549,13 @@ export type PackFeatureSummary = {
   binding_kind?: string | null;
 };
 
+export type ExtensionPackRuntimeStatus =
+  | "not_required"
+  | "missing"
+  | "ready"
+  | "error"
+  | string;
+
 export type ExtensionPackView = {
   manifest: ExtensionPackManifest;
   installed: boolean;
@@ -518,6 +568,10 @@ export type ExtensionPackView = {
   needs_auth: boolean;
   status: string;
   status_detail?: string | null;
+  runtime_required: boolean;
+  runtime_status: ExtensionPackRuntimeStatus;
+  runtime_detail?: string | null;
+  runtime_executable?: string | null;
   supports_connect_url: boolean;
   supports_webhook: boolean;
   webhook_path?: string | null;
@@ -530,6 +584,7 @@ export type ExtensionPackConnectionView = {
     pack_id: string;
     name: string;
     enabled: boolean;
+    auth_profile_id?: string | null;
     metadata?: Record<string, unknown> | null;
     last_error?: string | null;
     last_tested_at?: string | null;
@@ -796,6 +851,161 @@ export type NodeCommandsResponse = {
   }>;
 };
 
+export type CompanionRiskLevel = "low" | "high" | string;
+
+export type CompanionCapabilityDescriptor = {
+  id: string;
+  label: string;
+  description: string;
+  risk: CompanionRiskLevel;
+  resource_kinds?: string[];
+};
+
+export type CompanionPreset = {
+  id: string;
+  label: string;
+  description: string;
+  platform: string;
+  capability_ids: string[];
+};
+
+export type CompanionDeviceRecord = {
+  id: string;
+  display_name: string;
+  preset_id: string;
+  platform: string;
+  model?: string | null;
+  state: string;
+  transport: string;
+  available_capabilities?: string[];
+  granted_capabilities?: string[];
+  token_capabilities?: string[];
+  paired_at: string;
+  last_seen_at?: string | null;
+  owner?: string | null;
+  metadata?: Record<string, string>;
+  attestation?: {
+    provider?: string | null;
+    platform?: string | null;
+    verified?: boolean;
+    evidence_fingerprint?: string | null;
+    verified_at?: string | null;
+    reason?: string | null;
+  };
+  trusted_unattested?: boolean;
+  active_grant_id: string;
+  command_count?: number;
+};
+
+export type CompanionPairingSession = {
+  id: string;
+  code: string;
+  preset_id: string;
+  display_name: string;
+  platform: string;
+  requested_capabilities?: string[];
+  requested_resources?: Record<string, string[]>;
+  status: string;
+  created_at: string;
+  expires_at: string;
+  claimed_at?: string | null;
+  approved_at?: string | null;
+  completed_at?: string | null;
+  claimed_device_public_key?: string | null;
+  attestation?: {
+    provider?: string | null;
+    platform?: string | null;
+    verified?: boolean;
+    evidence_fingerprint?: string | null;
+    verified_at?: string | null;
+    reason?: string | null;
+  };
+  trusted_unattested?: boolean;
+  metadata?: Record<string, string>;
+  claim_attempts?: number;
+  failed_claim_attempts?: number;
+  claim_locked_until?: string | null;
+};
+
+export type CompanionCommandRecord = {
+  id: string;
+  device_id: string;
+  capability: string;
+  action: string;
+  arguments?: unknown;
+  requested_scopes?: string[];
+  resource_scope?: Record<string, string[]>;
+  risk: CompanionRiskLevel;
+  approval_status: string;
+  status: string;
+  requested_at: string;
+  approved_at?: string | null;
+  dispatched_at?: string | null;
+  completed_at?: string | null;
+  success?: boolean;
+  result_preview?: string | null;
+  result_trust?: string;
+  actor?: string | null;
+  audit_reason?: string | null;
+  error?: string | null;
+};
+
+export type CompanionAuditEvent = {
+  id: string;
+  event_type: string;
+  device_id?: string | null;
+  command_id?: string | null;
+  grant_id?: string | null;
+  actor?: string | null;
+  surface?: string | null;
+  decision: string;
+  reason: string;
+  timestamp: string;
+  metadata?: Record<string, string>;
+  previous_hash?: string | null;
+  event_hash?: string | null;
+};
+
+export type CompanionPresetsResponse = {
+  presets: CompanionPreset[];
+  capabilities: CompanionCapabilityDescriptor[];
+  protocol_version: string;
+};
+
+export type CompanionProtocolDocument = {
+  protocol_version: string;
+  websocket_path: string;
+  auth: string;
+  pairing: string;
+  messages: string[];
+  security: string[];
+};
+
+export type CompanionDevicesResponse = {
+  status?: string;
+  devices: CompanionDeviceRecord[];
+  overview?: {
+    generated_at: string;
+    total: number;
+    online: number;
+    pending_pairing: number;
+    pending_approvals: number;
+    revoked: number;
+  };
+  pairing_sessions?: CompanionPairingSession[];
+  pending_approvals?: CompanionCommandRecord[];
+};
+
+export type CompanionCommandsResponse = {
+  status?: string;
+  commands: CompanionCommandRecord[];
+};
+
+export type CompanionAuditResponse = {
+  status?: string;
+  events: CompanionAuditEvent[];
+};
+
 export type BrowserProfileRecord = {
   id: string;
   name: string;
@@ -951,6 +1161,7 @@ export type SkillImportResponse = {
       explanation?: string;
       matched_text?: string;
       line?: number;
+      file?: string;
       severity?: number;
       contextual?: boolean;
     }>;
@@ -960,6 +1171,20 @@ export type SkillImportResponse = {
     risk_band?: "secure" | "review" | "risky" | string;
     total_findings?: number;
     contextual_findings?: number;
+    capabilities?: Array<{
+      kind?: string;
+      target?: string | null;
+      evidence?: string | null;
+      confidence?: number | null;
+    }>;
+    matched_rules?: Array<{
+      id?: string;
+      effect?: string;
+      message?: string;
+      severity?: number;
+    }>;
+    review_model?: string;
+    review_summary?: string;
   };
 };
 

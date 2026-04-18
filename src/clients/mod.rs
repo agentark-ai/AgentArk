@@ -2,7 +2,7 @@ pub mod executor_client;
 mod internal_auth;
 pub mod workspace_client;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::net::IpAddr;
 
 pub use executor_client::{
@@ -10,13 +10,14 @@ pub use executor_client::{
     ExecutorClient, ExecutorClientConfig,
 };
 pub(crate) use internal_auth::{
-    describe_internal_service_tokens, load_internal_service_token_from_default_config_dir,
-    load_or_create_internal_service_token, read_persisted_internal_service_token,
-    restore_internal_service_token, rotate_internal_service_token, InternalServiceKind,
+    InternalServiceKind, describe_internal_service_tokens,
+    load_internal_service_token_from_default_config_dir, load_or_create_internal_service_token,
+    read_persisted_internal_service_token, restore_internal_service_token,
+    rotate_internal_service_token,
 };
 pub use workspace_client::{WorkspaceClient, WorkspaceClientConfig};
 
-fn allows_plain_http_internal_host(host: &str) -> bool {
+pub(crate) fn host_looks_local_or_internal(host: &str) -> bool {
     let normalized = host
         .trim()
         .trim_start_matches('[')
@@ -43,6 +44,10 @@ fn allows_plain_http_internal_host(host: &str) -> bool {
         || normalized.ends_with(".svc")
         || normalized.ends_with(".svc.cluster.local")
         || normalized.ends_with(".docker.internal")
+}
+
+fn allows_plain_http_internal_host(host: &str) -> bool {
+    host_looks_local_or_internal(host)
 }
 
 pub(crate) fn validate_internal_service_base_url(base_url: &str, service_name: &str) -> Result<()> {
@@ -86,7 +91,7 @@ pub(crate) fn validate_internal_service_base_url(base_url: &str, service_name: &
 
 #[cfg(test)]
 mod tests {
-    use super::validate_internal_service_base_url;
+    use super::{host_looks_local_or_internal, validate_internal_service_base_url};
 
     #[test]
     fn allows_https_for_public_hosts() {
@@ -110,29 +115,52 @@ mod tests {
 
     #[test]
     fn allows_http_for_internal_service_dns_names() {
-        assert!(validate_internal_service_base_url(
-            "http://agentark-workspace:8992",
-            "Workspace service"
-        )
-        .is_ok());
-        assert!(validate_internal_service_base_url(
-            "http://workspace.default.svc.cluster.local:8992",
-            "Workspace service"
-        )
-        .is_ok());
-        assert!(validate_internal_service_base_url(
-            "http://host.docker.internal:8992",
-            "Workspace service"
-        )
-        .is_ok());
+        assert!(
+            validate_internal_service_base_url(
+                "http://agentark-workspace:8992",
+                "Workspace service"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_internal_service_base_url(
+                "http://workspace.default.svc.cluster.local:8992",
+                "Workspace service"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_internal_service_base_url(
+                "http://host.docker.internal:8992",
+                "Workspace service"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn recognizes_local_and_internal_hosts() {
+        assert!(host_looks_local_or_internal("localhost"));
+        assert!(host_looks_local_or_internal("127.0.0.1"));
+        assert!(host_looks_local_or_internal("10.0.0.5"));
+        assert!(host_looks_local_or_internal("192.168.1.8"));
+        assert!(host_looks_local_or_internal("host.docker.internal"));
+        assert!(host_looks_local_or_internal("ollama"));
+        assert!(host_looks_local_or_internal(
+            "workspace.default.svc.cluster.local"
+        ));
+        assert!(!host_looks_local_or_internal("openrouter.ai"));
+        assert!(!host_looks_local_or_internal("api.openai.com"));
     }
 
     #[test]
     fn rejects_http_for_public_hosts() {
         let error = validate_internal_service_base_url("http://example.com", "Executor service")
             .expect_err("public http host should be rejected");
-        assert!(error
-            .to_string()
-            .contains("insecure plain HTTP for a non-internal host"));
+        assert!(
+            error
+                .to_string()
+                .contains("insecure plain HTTP for a non-internal host")
+        );
     }
 }

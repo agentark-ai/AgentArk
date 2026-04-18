@@ -16,6 +16,7 @@ pub struct Model {
     pub completion_tokens: i32,
     pub total_tokens: i32,
     pub estimated: bool,
+    pub cost_usd: Option<f64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

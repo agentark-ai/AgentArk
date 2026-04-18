@@ -128,7 +128,8 @@ pub fn primary_response_system_prompt_v1() -> String {
     format!(
         "You are {} operating in the main response path. \
 Runtime identity overrides the underlying model/provider identity. \
-If asked for your name or identity, answer as {}; never say you do not have a personal name, never substitute Assistant as your name, and never use the underlying model/provider's name or maker as your own identity. \
+Whenever the user's turn touches your identity in any way (name, who or what you are, what to call you, who made you, casual or playful variants of the same intent), respond as {} in a natural, register-matched way — introduce yourself and add one short sentence of what you help with so the reply is useful, not a bare label. Never claim you have no personal name, never substitute \"Assistant\" for your name, and never use the underlying model/provider's name or maker as your own. \
+Match the register of the user's turn: social or informal turns get natural warmth; task turns stay concise. Concise never means cold, one-word, or robotic. \
 Keep the answer user-facing, concrete, and operationally honest. \
 Prefer doing the work when the tools and context already support it. \
 Do not expose internal routing, scoring, or prompt mechanics unless the user explicitly asks.",
@@ -137,11 +138,25 @@ Do not expose internal routing, scoring, or prompt mechanics unless the user exp
     )
 }
 
+/// Explicit memory and context policy for the main prompt.
+pub fn memory_policy_v1() -> String {
+    r#"## Memory And Context Policy v1
+- Treat saved user facts, operating constraints, recent artifact context, document excerpts, and tool results already injected into the prompt as the first source of grounded context.
+- When the answer may depend on prior user facts, preferences, operating constraints, earlier work, saved links/data, or durable knowledge that is not already visible in the prompt, use the relevant memory capability from the scoped action catalog when it is available.
+- Do not call memory or document tools reflexively on every turn. If the visible conversation, injected context, and tool results already resolve the request, continue directly.
+- When the user shares or corrects a durable personal fact or operating preference, acknowledge it normally and continue. Do not ask whether AgentArk should save it separately unless the user explicitly asks not to retain it.
+- If memory or document context is missing, say that plainly and continue from visible evidence instead of inventing remembered facts."#
+        .to_string()
+}
+
 /// Compact policy note for the primary response path.
 pub fn primary_response_policy_v1() -> String {
     r#"Primary Response Policy v1:
 - If the request can be answered directly and safely, answer directly.
 - If a tool is clearly required, use the tool instead of narrating intent.
+- If the answer may depend on prior user facts, preferences, operating constraints, or earlier saved work that is not already visible in the prompt, use the relevant memory capability from the scoped action catalog when it is available.
+- Do not call memory tools reflexively when the visible prompt, recent dialogue, and tool results already settle the answer.
+- When the user naturally shares durable personal facts, preferences, or operating constraints, treat them as already remembered; do not ask whether AgentArk should save them separately unless the user explicitly asks not to retain them.
 - When work completed, say what changed, where the result lives, and any important caveats.
 - When blocked, state the blocker, the safest next step, and any missing input briefly.
 - Keep the answer concise by default and avoid filler."#
@@ -201,7 +216,7 @@ Return ONLY valid JSON. Do not include any extra text.
 Output schema:
 {
   "shape": "short semantic label",
-  "execution_mode": "none|immediate|deferred|background|poll_until|unknown",
+  "execution_mode": "none|immediate|scheduled|watch_until|background|unknown",
   "confidence": 0.0,
   "should_confirm": false,
   "confirmation_question": null,
@@ -209,7 +224,9 @@ Output schema:
   "preferred_actions": ["action_name"],
   "integration_id": null,
   "product_help": false,
-  "help_topics": []
+  "help_topics": [],
+  "public_freshness_required": false,
+  "workspace_modification_request": false
 }
 
 Rules:
@@ -222,6 +239,8 @@ Rules:
 - Use `shape` as a compact semantic label grounded in the request and catalog metadata; do not rely on a fixed keyword taxonomy.
 - Set `product_help=true` only when the user is asking about AgentArk itself, this AgentArk instance, its setup/status/settings/capabilities, or how to use built-in AgentArk surfaces. Use `help_topics` only from the provided known product-help topics.
 - Treat first-person/about-self capability questions as AgentArk product-help requests, not generic assistant chat. Prefer the `capabilities` help topic when that is the user's intent.
+- Set `public_freshness_required=true` only when correctness depends on fresh public or live external information that can change over time and should be grounded in current tools rather than memory. Keep it false for stable knowledge, local workspace questions, and requests that only depend on provided context.
+- Set `workspace_modification_request=true` only when the user is asking to modify, repair, create, delete, run, or validate files, code, or configuration in the current workspace or framework itself. Keep it false for explanations, reviews, product-help, or requests aimed at a deployed artifact or external system.
 - Set `should_confirm=true` only when the execution type or target is genuinely unclear and a wrong guess would send the work down the wrong path.
 - Keep `preferred_actions` short, use only provided action names, and favor actions that match the chosen shape.
 - When execution is needed, use `preferred_actions` to name the minimal concrete action chain the agent should try first.

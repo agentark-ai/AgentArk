@@ -22,6 +22,7 @@ pub const ROUTING_COMPLEXITY_POLICY_CANARY_KEY: &str = "routing_complexity_polic
 pub const ROUTING_COMPLEXITY_CANARY_STATE_KEY: &str = "routing_complexity_policy_canary_state_v1";
 pub const ROUTING_COMPLEXITY_POLICY_BASELINE_SNAPSHOT_KEY: &str =
     "routing_complexity_policy_baseline_snapshot_v1";
+pub const PROMPT_PROFILE_CANARY_SAFETY_EVENTS_KEY: &str = "prompt_profile_canary_safety_events_v1";
 pub const SELF_EVOLVE_LAST_RESULT_KEY: &str = "self_evolve_last_result_v1";
 pub const APP_DEPLOY_ACCESS_GUARD_DEFAULT_KEY: &str = "app_deploy_access_guard_default_v1";
 pub const SELF_EVOLVE_ENABLED_KEY: &str = "self_evolve_enabled_v1";
@@ -112,6 +113,33 @@ pub struct ReplayEvaluationResult {
     pub losses: usize,
     pub p_value: f64,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptProfileCanarySafetyEvent {
+    pub id: String,
+    pub trace_kind: String,
+    pub surface: String,
+    pub surface_label: String,
+    pub status: String,
+    pub review_status: String,
+    #[serde(default)]
+    pub reviewed_at: Option<String>,
+    pub title: String,
+    pub summary: String,
+    pub baseline_version: String,
+    pub candidate_version: String,
+    pub baseline_samples: usize,
+    pub candidate_samples: usize,
+    pub baseline_success_rate: f64,
+    pub candidate_success_rate: f64,
+    pub success_delta: f64,
+    pub wins: usize,
+    pub losses: usize,
+    pub regression_p_value: f64,
+    pub min_success_gain: f64,
+    pub max_sign_test_p_value: f64,
+    pub created_at: String,
 }
 
 fn task_type_for_action_name(action_name: &str) -> Option<&'static str> {
@@ -674,7 +702,7 @@ fn experience_run_success(row: &crate::storage::entities::experience_run::Model)
     row.correction_state != "corrected" && row.success_state == "accepted"
 }
 
-fn one_sided_sign_test_p_value(wins: usize, losses: usize) -> f64 {
+pub fn one_sided_sign_test_p_value(wins: usize, losses: usize) -> f64 {
     let n = wins + losses;
     if n == 0 || wins <= losses {
         return 1.0;
@@ -742,6 +770,12 @@ mod tests {
             consolidated: false,
             accepted_at: None,
             corrected_at: None,
+            heuristic_reflected: false,
+            heuristic_reflection_status: None,
+            heuristic_reflection_attempted_at: None,
+            heuristic_reflection_completed_at: None,
+            heuristic_lesson_id: None,
+            heuristic_reflection_error: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         }

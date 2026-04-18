@@ -18,6 +18,7 @@ use sea_orm::{
     PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
     TryGetable, Unchanged,
 };
+use sha2::{Digest, Sha256};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -306,6 +307,26 @@ fn sql_string_list(values: &[String]) -> String {
         .map(|value| sql_string_literal(value))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn experience_memory_write_lock_key(
+    _kind: &str,
+    scope: &str,
+    project_id: Option<&str>,
+    conversation_id: Option<&str>,
+) -> i64 {
+    let mut hasher = Sha256::new();
+    for part in [
+        "experience_memory_write",
+        scope.trim(),
+        project_id.unwrap_or_default().trim(),
+        conversation_id.unwrap_or_default().trim(),
+    ] {
+        hasher.update([0u8]);
+        hasher.update(part.as_bytes());
+    }
+    let digest = hasher.finalize();
+    i64::from_be_bytes(digest[..8].try_into().expect("sha256 digest has 8 leading bytes"))
 }
 
 fn is_safe_db_identifier_part(value: &str) -> bool {
@@ -627,6 +648,7 @@ pub struct ProceduralPatternSearchHit {
 pub struct LearningQueueCounts {
     pub provisional_runs: u64,
     pub pending_consolidation: u64,
+    pub pending_reflection: u64,
     pub draft_candidates: u64,
     pub active_patterns: u64,
 }
@@ -714,6 +736,15 @@ impl Storage {
 
     fn upload_manifest_key(id: &str) -> String {
         format!("{}{}", Self::UPLOAD_MANIFEST_KEY_PREFIX, id)
+    }
+
+    /// Access the underlying SeaORM connection.
+    ///
+    /// Exposed so security-layer modules (e.g. `security::abuse_tracker`)
+    /// can read and update their own dedicated tables without having to
+    /// duplicate CRUD plumbing inside `Storage`.
+    pub fn db(&self) -> &DatabaseConnection {
+        &self.db
     }
 
     fn preference_row_id(key: &str, project_id: Option<&str>) -> String {
@@ -1588,6 +1619,7 @@ impl Storage {
             completion_tokens: Set(usage.completion_tokens),
             total_tokens: Set(usage.total_tokens),
             estimated: Set(usage.estimated),
+            cost_usd: Set(usage.cost_usd),
         }
         .insert(&self.db)
         .await?;
@@ -1625,7 +1657,6 @@ impl Storage {
         project_id: Option<&str>,
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        let _ = embedding;
         let scope = if project_id.is_some() {
             "project"
         } else {
@@ -1650,6 +1681,7 @@ impl Storage {
             last_contradicted_at: None,
             created_at: now.clone(),
             updated_at: now,
+            embedding,
         })
         .await?;
 
@@ -1786,6 +1818,27 @@ impl Storage {
             model.value = decrypt_storage_string(&model.value);
             Ok(model)
         }
+    }
+
+    /// Get a single user preference by key + scope.
+    pub async fn get_user_preference(
+        &self,
+        key: &str,
+        project_id: Option<&str>,
+    ) -> Result<Option<user_preference::Model>> {
+        let key = key.trim();
+        if key.is_empty() {
+            anyhow::bail!("Preference key cannot be empty");
+        }
+        let id = Self::preference_row_id(key, project_id);
+        let Some(mut model) = user_preference::Entity::find_by_id(id)
+            .one(&self.db)
+            .await?
+        else {
+            return Ok(None);
+        };
+        model.value = decrypt_storage_string(&model.value);
+        Ok(Some(model))
     }
 
     /// List user preferences by scope.
@@ -2073,6 +2126,40 @@ impl Storage {
         Ok(rows)
     }
 
+    fn visible_knowledge_source_filter() -> Condition {
+        Condition::any()
+            .add(knowledge_item::Column::Source.is_null())
+            .add(knowledge_item::Column::Source.is_not_in([
+                crate::core::product_help::CURATED_SOURCE,
+                crate::core::product_help::RUNTIME_SOURCE,
+            ]))
+    }
+
+    /// List knowledge base items visible in end-user memory UI.
+    pub async fn list_visible_knowledge_items(
+        &self,
+        limit: u64,
+        offset: u64,
+        project_id: Option<&str>,
+    ) -> Result<Vec<knowledge_item::Model>> {
+        let mut query = knowledge_item::Entity::find()
+            .filter(Self::visible_knowledge_source_filter())
+            .order_by_desc(knowledge_item::Column::UpdatedAt);
+        if let Some(pid) = project_id {
+            query = query.filter(knowledge_item::Column::ProjectId.eq(pid));
+        }
+        let mut rows = query
+            .limit(Self::db_limit(limit))
+            .offset(Self::db_offset(offset))
+            .all(&self.db)
+            .await?;
+        for row in &mut rows {
+            row.title = decrypt_storage_string(&row.title);
+            row.content = decrypt_storage_string(&row.content);
+        }
+        Ok(rows)
+    }
+
     /// List only global-scope knowledge items.
     pub async fn list_global_knowledge_items(
         &self,
@@ -2093,9 +2180,10 @@ impl Storage {
         Ok(rows)
     }
 
-    /// Count knowledge base items by scope.
-    pub async fn count_knowledge_items(&self, project_id: Option<&str>) -> Result<u64> {
-        let mut query = knowledge_item::Entity::find();
+    /// Count knowledge base items visible in end-user memory UI.
+    pub async fn count_visible_knowledge_items(&self, project_id: Option<&str>) -> Result<u64> {
+        let mut query =
+            knowledge_item::Entity::find().filter(Self::visible_knowledge_source_filter());
         if let Some(pid) = project_id {
             query = query.filter(knowledge_item::Column::ProjectId.eq(pid));
         }
@@ -2410,7 +2498,9 @@ impl Storage {
             .await?;
         }
 
-        task::Entity::delete_by_id(id.to_string()).exec(&txn).await?;
+        task::Entity::delete_by_id(id.to_string())
+            .exec(&txn)
+            .await?;
         txn.commit().await?;
         Ok(())
     }
@@ -2636,7 +2726,8 @@ impl Storage {
 
         automation_supervisor_state::Entity::delete_many()
             .filter(
-                automation_supervisor_state::Column::AutomationId.is_in(automation_id_filter.clone()),
+                automation_supervisor_state::Column::AutomationId
+                    .is_in(automation_id_filter.clone()),
             )
             .exec(db)
             .await?;
@@ -2784,17 +2875,19 @@ impl Storage {
             .status_detail
             .map(|value| decrypt_storage_string(&value));
         let action_history_json = decrypt_storage_string(&row.action_history_json);
-        Ok(Some(crate::core::browser_session::PersistedBrowserSession {
-            id: row.id,
-            status: row.status,
-            task_description,
-            channel: row.channel,
-            chat_id,
-            status_detail,
-            action_history: serde_json::from_str(&action_history_json).unwrap_or_default(),
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-        }))
+        Ok(Some(
+            crate::core::browser_session::PersistedBrowserSession {
+                id: row.id,
+                status: row.status,
+                task_description,
+                channel: row.channel,
+                chat_id,
+                status_detail,
+                action_history: serde_json::from_str(&action_history_json).unwrap_or_default(),
+                created_at: row.created_at,
+                updated_at: row.updated_at,
+            },
+        ))
     }
 
     pub async fn upsert_browser_session(
@@ -2831,6 +2924,13 @@ impl Storage {
         )
         .exec(&self.db)
         .await?;
+        Ok(())
+    }
+
+    pub async fn delete_browser_session(&self, id: &str) -> Result<()> {
+        browser_session::Entity::delete_by_id(id.to_string())
+            .exec(&self.db)
+            .await?;
         Ok(())
     }
 
@@ -2895,6 +2995,18 @@ impl Storage {
 
     pub async fn load_execution_run(&self, id: &str) -> Result<Option<crate::core::ExecutionRun>> {
         Ok(execution_run::Entity::find_by_id(id.to_string())
+            .one(&self.db)
+            .await?
+            .map(model_to_execution_run))
+    }
+
+    pub async fn load_execution_run_by_request_id(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<crate::core::ExecutionRun>> {
+        Ok(execution_run::Entity::find()
+            .filter(execution_run::Column::RequestId.eq(request_id.to_string()))
+            .order_by_desc(execution_run::Column::UpdatedAt)
             .one(&self.db)
             .await?
             .map(model_to_execution_run))
@@ -3051,6 +3163,12 @@ impl Storage {
             consolidated: Set(run.consolidated),
             accepted_at: Set(run.accepted_at.clone()),
             corrected_at: Set(run.corrected_at.clone()),
+            heuristic_reflected: Set(run.heuristic_reflected),
+            heuristic_reflection_status: Set(run.heuristic_reflection_status.clone()),
+            heuristic_reflection_attempted_at: Set(run.heuristic_reflection_attempted_at.clone()),
+            heuristic_reflection_completed_at: Set(run.heuristic_reflection_completed_at.clone()),
+            heuristic_lesson_id: Set(run.heuristic_lesson_id.clone()),
+            heuristic_reflection_error: Set(run.heuristic_reflection_error.clone()),
             created_at: Set(run.created_at.clone()),
             updated_at: Set(run.updated_at.clone()),
         })
@@ -3080,6 +3198,12 @@ impl Storage {
                     experience_run::Column::Consolidated,
                     experience_run::Column::AcceptedAt,
                     experience_run::Column::CorrectedAt,
+                    experience_run::Column::HeuristicReflected,
+                    experience_run::Column::HeuristicReflectionStatus,
+                    experience_run::Column::HeuristicReflectionAttemptedAt,
+                    experience_run::Column::HeuristicReflectionCompletedAt,
+                    experience_run::Column::HeuristicLessonId,
+                    experience_run::Column::HeuristicReflectionError,
                     experience_run::Column::UpdatedAt,
                 ])
                 .to_owned(),
@@ -3287,6 +3411,26 @@ impl Storage {
             .map_err(Into::into)
     }
 
+    pub async fn list_experience_runs_for_heuristic_reflection(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<experience_run::Model>> {
+        Ok(experience_run::Entity::find()
+            .filter(experience_run::Column::Consolidated.eq(true))
+            .filter(experience_run::Column::HeuristicReflected.eq(false))
+            .filter(
+                Condition::any()
+                    .add(experience_run::Column::HeuristicReflectionStatus.is_null())
+                    .add(experience_run::Column::HeuristicReflectionStatus.eq("pending")),
+            )
+            .order_by_asc(experience_run::Column::UpdatedAt)
+            .limit(Self::db_limit(
+                limit.min(Self::MAX_EXPERIENCE_RUN_ROWS_PER_QUERY),
+            ))
+            .all(&self.db)
+            .await?)
+    }
+
     pub async fn mark_experience_run_consolidated(&self, id: &str) -> Result<()> {
         experience_run::Entity::update_many()
             .col_expr(experience_run::Column::Consolidated, Expr::value(true))
@@ -3300,8 +3444,116 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn upsert_experience_item(&self, item: &experience_item::Model) -> Result<()> {
-        experience_item::Entity::insert(experience_item::ActiveModel {
+    pub async fn mark_experience_run_heuristic_reflection_started(&self, id: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        experience_run::Entity::update_many()
+            .col_expr(
+                experience_run::Column::HeuristicReflectionStatus,
+                Expr::value(Option::<String>::Some("pending".to_string())),
+            )
+            .col_expr(
+                experience_run::Column::HeuristicReflectionAttemptedAt,
+                Expr::value(Option::<String>::Some(now.clone())),
+            )
+            .col_expr(experience_run::Column::UpdatedAt, Expr::value(now))
+            .filter(experience_run::Column::Id.eq(id))
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn mark_experience_run_heuristic_reflection_completed(
+        &self,
+        id: &str,
+        lesson_id: &str,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        experience_run::Entity::update_many()
+            .col_expr(
+                experience_run::Column::HeuristicReflected,
+                Expr::value(true),
+            )
+            .col_expr(
+                experience_run::Column::HeuristicReflectionStatus,
+                Expr::value(Option::<String>::Some("completed".to_string())),
+            )
+            .col_expr(
+                experience_run::Column::HeuristicReflectionCompletedAt,
+                Expr::value(Option::<String>::Some(now.clone())),
+            )
+            .col_expr(
+                experience_run::Column::HeuristicLessonId,
+                Expr::value(Option::<String>::Some(lesson_id.to_string())),
+            )
+            .col_expr(
+                experience_run::Column::HeuristicReflectionError,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(experience_run::Column::UpdatedAt, Expr::value(now))
+            .filter(experience_run::Column::Id.eq(id))
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn mark_experience_run_heuristic_reflection_skipped(
+        &self,
+        id: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        experience_run::Entity::update_many()
+            .col_expr(
+                experience_run::Column::HeuristicReflected,
+                Expr::value(true),
+            )
+            .col_expr(
+                experience_run::Column::HeuristicReflectionStatus,
+                Expr::value(Option::<String>::Some("skipped".to_string())),
+            )
+            .col_expr(
+                experience_run::Column::HeuristicReflectionCompletedAt,
+                Expr::value(Option::<String>::Some(now.clone())),
+            )
+            .col_expr(
+                experience_run::Column::HeuristicReflectionError,
+                Expr::value(Option::<String>::Some(reason.to_string())),
+            )
+            .col_expr(experience_run::Column::UpdatedAt, Expr::value(now))
+            .filter(experience_run::Column::Id.eq(id))
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn mark_experience_run_heuristic_reflection_failed(
+        &self,
+        id: &str,
+        error: &str,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        experience_run::Entity::update_many()
+            .col_expr(
+                experience_run::Column::HeuristicReflected,
+                Expr::value(false),
+            )
+            .col_expr(
+                experience_run::Column::HeuristicReflectionStatus,
+                Expr::value(Option::<String>::Some("failed".to_string())),
+            )
+            .col_expr(
+                experience_run::Column::HeuristicReflectionError,
+                Expr::value(Option::<String>::Some(error.to_string())),
+            )
+            .col_expr(experience_run::Column::UpdatedAt, Expr::value(now))
+            .filter(experience_run::Column::Id.eq(id))
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    fn experience_item_active_model(item: &experience_item::Model) -> experience_item::ActiveModel {
+        experience_item::ActiveModel {
             id: Set(item.id.clone()),
             kind: Set(item.kind.clone()),
             scope: Set(item.scope.clone()),
@@ -3319,53 +3571,647 @@ impl Storage {
             last_contradicted_at: Set(item.last_contradicted_at.clone()),
             created_at: Set(item.created_at.clone()),
             updated_at: Set(item.updated_at.clone()),
-        })
-        .on_conflict(
-            OnConflict::column(experience_item::Column::Id)
-                .update_columns([
-                    experience_item::Column::Kind,
-                    experience_item::Column::Scope,
-                    experience_item::Column::ProjectId,
-                    experience_item::Column::ConversationId,
-                    experience_item::Column::Title,
-                    experience_item::Column::Content,
-                    experience_item::Column::NormalizedKey,
-                    experience_item::Column::Confidence,
-                    experience_item::Column::SupportCount,
-                    experience_item::Column::ContradictionCount,
-                    experience_item::Column::Status,
-                    experience_item::Column::Metadata,
-                    experience_item::Column::LastSupportedAt,
-                    experience_item::Column::LastContradictedAt,
-                    experience_item::Column::UpdatedAt,
-                ])
-                .to_owned(),
-        )
-        .exec(&self.db)
-        .await?;
+            embedding: Set(item.embedding.clone()),
+        }
+    }
+
+    fn recall_event_active_model(event: &recall_event::Model) -> recall_event::ActiveModel {
+        recall_event::ActiveModel {
+            id: Set(event.id.clone()),
+            event_type: Set(event.event_type.clone()),
+            memory_id: Set(event.memory_id.clone()),
+            related_memory_id: Set(event.related_memory_id.clone()),
+            scope: Set(event.scope.clone()),
+            project_id: Set(event.project_id.clone()),
+            conversation_id: Set(event.conversation_id.clone()),
+            source_kind: Set(event.source_kind.clone()),
+            source_ref: Set(event.source_ref.clone()),
+            actor: Set(event.actor.clone()),
+            summary: Set(event.summary.clone()),
+            old_snapshot: Set(event.old_snapshot.clone()),
+            new_snapshot: Set(event.new_snapshot.clone()),
+            metadata: Set(event.metadata.clone()),
+            risk_level: Set(event.risk_level.clone()),
+            confidence: Set(event.confidence),
+            reversible: Set(event.reversible),
+            reverted_at: Set(event.reverted_at.clone()),
+            created_at: Set(event.created_at.clone()),
+            updated_at: Set(event.updated_at.clone()),
+        }
+    }
+
+    fn recall_test_active_model(test: &recall_test::Model) -> recall_test::ActiveModel {
+        recall_test::ActiveModel {
+            id: Set(test.id.clone()),
+            memory_id: Set(test.memory_id.clone()),
+            scope: Set(test.scope.clone()),
+            project_id: Set(test.project_id.clone()),
+            conversation_id: Set(test.conversation_id.clone()),
+            prompt: Set(test.prompt.clone()),
+            expected_answer: Set(test.expected_answer.clone()),
+            status: Set(test.status.clone()),
+            last_answer: Set(test.last_answer.clone()),
+            last_run_at: Set(test.last_run_at.clone()),
+            metadata: Set(test.metadata.clone()),
+            created_at: Set(test.created_at.clone()),
+            updated_at: Set(test.updated_at.clone()),
+        }
+    }
+
+    fn experience_item_is_arkmemory_memory(item: &experience_item::Model) -> bool {
+        matches!(item.kind.as_str(), "personal_fact" | "constraint")
+    }
+
+    fn recall_snapshot_experience_item(item: &experience_item::Model) -> Result<serde_json::Value> {
+        let mut value = serde_json::to_value(item)?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert("embedding".to_string(), serde_json::Value::Null);
+        }
+        Ok(value)
+    }
+
+    fn experience_item_recall_event_type(
+        previous: Option<&experience_item::Model>,
+        next: &experience_item::Model,
+    ) -> Option<&'static str> {
+        if !Self::experience_item_is_arkmemory_memory(next) {
+            return None;
+        }
+        let Some(previous) = previous else {
+            return Some("memory_created");
+        };
+        if previous.status != next.status {
+            return Some("memory_status_changed");
+        }
+        if previous.content != next.content
+            || previous.title != next.title
+            || previous.normalized_key != next.normalized_key
+            || previous.scope != next.scope
+            || previous.project_id != next.project_id
+            || previous.conversation_id != next.conversation_id
+        {
+            return Some("memory_updated");
+        }
+        None
+    }
+
+    async fn insert_recall_event_conn<C>(conn: &C, event: &recall_event::Model) -> Result<()>
+    where
+        C: ConnectionTrait,
+    {
+        recall_event::Entity::insert(Self::recall_event_active_model(event))
+            .on_conflict(
+                OnConflict::column(recall_event::Column::Id)
+                    .update_columns([
+                        recall_event::Column::EventType,
+                        recall_event::Column::MemoryId,
+                        recall_event::Column::RelatedMemoryId,
+                        recall_event::Column::Scope,
+                        recall_event::Column::ProjectId,
+                        recall_event::Column::ConversationId,
+                        recall_event::Column::SourceKind,
+                        recall_event::Column::SourceRef,
+                        recall_event::Column::Actor,
+                        recall_event::Column::Summary,
+                        recall_event::Column::OldSnapshot,
+                        recall_event::Column::NewSnapshot,
+                        recall_event::Column::Metadata,
+                        recall_event::Column::RiskLevel,
+                        recall_event::Column::Confidence,
+                        recall_event::Column::Reversible,
+                        recall_event::Column::RevertedAt,
+                        recall_event::Column::UpdatedAt,
+                    ])
+                    .to_owned(),
+            )
+            .exec(conn)
+            .await?;
         Ok(())
     }
 
-    pub async fn update_experience_item_status(&self, id: &str, status: &str) -> Result<()> {
+    async fn record_experience_item_recall_event_conn<C>(
+        conn: &C,
+        event_type: &str,
+        previous: Option<&experience_item::Model>,
+        next: &experience_item::Model,
+        actor: &str,
+        metadata: serde_json::Value,
+    ) -> Result<()>
+    where
+        C: ConnectionTrait,
+    {
+        let now = chrono::Utc::now().to_rfc3339();
+        let summary = match event_type {
+            "memory_created" => format!("Created {}", next.title),
+            "memory_status_changed" => format!("Changed {} status to {}", next.title, next.status),
+            "memory_updated" => format!("Updated {}", next.title),
+            _ => format!("Recorded {}", next.title),
+        };
+        let event = recall_event::Model {
+            id: uuid::Uuid::new_v4().to_string(),
+            event_type: event_type.to_string(),
+            memory_id: Some(next.id.clone()),
+            related_memory_id: None,
+            scope: Some(next.scope.clone()),
+            project_id: next.project_id.clone(),
+            conversation_id: next.conversation_id.clone(),
+            source_kind: Some("experience_item".to_string()),
+            source_ref: Some(next.id.clone()),
+            actor: actor.to_string(),
+            summary: Some(summary),
+            old_snapshot: previous
+                .map(Self::recall_snapshot_experience_item)
+                .transpose()?
+                .unwrap_or(serde_json::Value::Null),
+            new_snapshot: Self::recall_snapshot_experience_item(next)?,
+            metadata,
+            risk_level: None,
+            confidence: Some(next.confidence),
+            reversible: previous.is_some(),
+            reverted_at: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        Self::insert_recall_event_conn(conn, &event).await
+    }
+
+    async fn upsert_experience_item_conn<C>(conn: &C, item: &experience_item::Model) -> Result<()>
+    where
+        C: ConnectionTrait,
+    {
+        let previous = experience_item::Entity::find_by_id(item.id.clone())
+            .one(conn)
+            .await?;
+        experience_item::Entity::insert(Self::experience_item_active_model(item))
+            .on_conflict(
+                OnConflict::column(experience_item::Column::Id)
+                    .update_columns([
+                        experience_item::Column::Kind,
+                        experience_item::Column::Scope,
+                        experience_item::Column::ProjectId,
+                        experience_item::Column::ConversationId,
+                        experience_item::Column::Title,
+                        experience_item::Column::Content,
+                        experience_item::Column::NormalizedKey,
+                        experience_item::Column::Confidence,
+                        experience_item::Column::SupportCount,
+                        experience_item::Column::ContradictionCount,
+                        experience_item::Column::Status,
+                        experience_item::Column::Metadata,
+                        experience_item::Column::LastSupportedAt,
+                        experience_item::Column::LastContradictedAt,
+                        experience_item::Column::UpdatedAt,
+                        experience_item::Column::Embedding,
+                    ])
+                    .to_owned(),
+            )
+            .exec(conn)
+            .await?;
+        if let Some(event_type) = Self::experience_item_recall_event_type(previous.as_ref(), item) {
+            Self::record_experience_item_recall_event_conn(
+                conn,
+                event_type,
+                previous.as_ref(),
+                item,
+                "system",
+                serde_json::json!({ "origin": "experience_item_upsert" }),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn update_experience_item_status_conn<C>(conn: &C, id: &str, status: &str) -> Result<()>
+    where
+        C: ConnectionTrait,
+    {
+        let previous = experience_item::Entity::find_by_id(id.to_string())
+            .one(conn)
+            .await?;
+        let now = chrono::Utc::now().to_rfc3339();
         experience_item::Entity::update_many()
             .col_expr(
                 experience_item::Column::Status,
                 Expr::value(status.to_string()),
             )
-            .col_expr(
-                experience_item::Column::UpdatedAt,
-                Expr::value(chrono::Utc::now().to_rfc3339()),
-            )
+            .col_expr(experience_item::Column::UpdatedAt, Expr::value(now.clone()))
             .filter(experience_item::Column::Id.eq(id))
+            .exec(conn)
+            .await?;
+        if let Some(previous_item) = previous.as_ref() {
+            let mut next = previous_item.clone();
+            next.status = status.to_string();
+            next.updated_at = now;
+            if let Some(event_type) =
+                Self::experience_item_recall_event_type(Some(previous_item), &next)
+            {
+                Self::record_experience_item_recall_event_conn(
+                    conn,
+                    event_type,
+                    Some(previous_item),
+                    &next,
+                    "system",
+                    serde_json::json!({ "origin": "experience_item_status_update" }),
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn get_experience_item_conn<C>(conn: &C, id: &str) -> Result<Option<experience_item::Model>>
+    where
+        C: ConnectionTrait,
+    {
+        Ok(experience_item::Entity::find_by_id(id.to_string())
+            .one(conn)
+            .await?)
+    }
+
+    pub async fn upsert_experience_item(&self, item: &experience_item::Model) -> Result<()> {
+        let txn = self.db.begin().await?;
+        Self::upsert_experience_item_conn(&txn, item).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn upsert_experience_item_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        item: &experience_item::Model,
+    ) -> Result<()> {
+        Self::upsert_experience_item_conn(txn, item).await
+    }
+
+    pub async fn update_experience_item_status(&self, id: &str, status: &str) -> Result<()> {
+        let txn = self.db.begin().await?;
+        Self::update_experience_item_status_conn(&txn, id, status).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn begin_experience_memory_write_txn(
+        &self,
+        kind: &str,
+        scope: &str,
+        project_id: Option<&str>,
+        conversation_id: Option<&str>,
+    ) -> Result<DatabaseTransaction> {
+        let txn = self.db.begin().await?;
+        self.acquire_experience_memory_write_lock_txn(
+            &txn,
+            kind,
+            scope,
+            project_id,
+            conversation_id,
+        )
+        .await?;
+        Ok(txn)
+    }
+
+    pub(crate) async fn acquire_experience_memory_write_lock_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        kind: &str,
+        scope: &str,
+        project_id: Option<&str>,
+        conversation_id: Option<&str>,
+    ) -> Result<()> {
+        if txn.get_database_backend() == DbBackend::Postgres {
+            let lock_key =
+                experience_memory_write_lock_key(kind, scope, project_id, conversation_id);
+            txn.execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT pg_advisory_xact_lock($1)",
+                vec![lock_key.into()],
+            ))
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Cosine-distance nearest-neighbour lookup over active experience items,
+    /// scoped to the provided kinds and scope tuple. Returns (model, distance)
+    /// pairs in ascending distance order (closest first). Distance is the
+    /// pgvector cosine distance: 0.0 is identical, 1.0 is orthogonal, 2.0 is
+    /// diametrically opposite. Callers convert to cosine similarity as
+    /// `1.0 - distance` when scoring against a threshold.
+    async fn nearest_active_experience_items_semantic_conn<C>(
+        conn: &C,
+        kinds: &[&str],
+        scope: &str,
+        project_id: Option<&str>,
+        conversation_id: Option<&str>,
+        embedding: &PgVector,
+        limit: u64,
+    ) -> Result<Vec<(experience_item::Model, f64)>>
+    where
+        C: ConnectionTrait,
+    {
+        if limit == 0 || kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        if conn.get_database_backend() != DbBackend::Postgres {
+            return Ok(Vec::new());
+        }
+        let embedding_sql = pgvector_sql_literal(embedding);
+        let kinds_list = sql_string_list(
+            &kinds
+                .iter()
+                .map(|kind| (*kind).to_string())
+                .collect::<Vec<_>>(),
+        );
+        let scope_filter = format!("scope = {}", sql_string_literal(scope));
+        let project_filter = match project_id {
+            Some(value) => format!("project_id = {}", sql_string_literal(value)),
+            None => "project_id IS NULL".to_string(),
+        };
+        let conversation_filter = match conversation_id {
+            Some(value) => format!("conversation_id = {}", sql_string_literal(value)),
+            None => "conversation_id IS NULL".to_string(),
+        };
+        let sql = format!(
+            "SELECT id, embedding <=> {embedding_sql} AS cosine_distance \
+             FROM experience_items \
+             WHERE status = 'active' \
+               AND embedding IS NOT NULL \
+               AND kind IN ({kinds_list}) \
+               AND {scope_filter} \
+               AND {project_filter} \
+               AND {conversation_filter} \
+             ORDER BY embedding <=> {embedding_sql} ASC \
+             LIMIT {}",
+            Self::db_limit(limit),
+        );
+        let rows = conn
+            .query_all(Statement::from_string(DbBackend::Postgres, sql))
+            .await?;
+        let mut scored: Vec<(String, f64)> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.try_get("", "id")?;
+            let distance: f64 = row.try_get("", "cosine_distance")?;
+            scored.push((id, distance));
+        }
+        if scored.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = scored
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        let models = experience_item::Entity::find()
+            .filter(experience_item::Column::Id.is_in(ids.clone()))
+            .all(conn)
+            .await?;
+        let mut by_id: std::collections::HashMap<String, experience_item::Model> = models
+            .into_iter()
+            .map(|model| (model.id.clone(), model))
+            .collect();
+        Ok(scored
+            .into_iter()
+            .filter_map(|(id, distance)| by_id.remove(&id).map(|model| (model, distance)))
+            .collect())
+    }
+
+    pub(crate) async fn nearest_active_experience_items_semantic_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        kinds: &[&str],
+        scope: &str,
+        project_id: Option<&str>,
+        conversation_id: Option<&str>,
+        embedding: &PgVector,
+        limit: u64,
+    ) -> Result<Vec<(experience_item::Model, f64)>> {
+        Self::nearest_active_experience_items_semantic_conn(
+            txn,
+            kinds,
+            scope,
+            project_id,
+            conversation_id,
+            embedding,
+            limit,
+        )
+        .await
+    }
+
+    pub async fn get_experience_item(&self, id: &str) -> Result<Option<experience_item::Model>> {
+        Self::get_experience_item_conn(&self.db, id).await
+    }
+
+    pub async fn insert_recall_event(&self, event: &recall_event::Model) -> Result<()> {
+        Self::insert_recall_event_conn(&self.db, event).await
+    }
+
+    pub async fn get_recall_event(&self, id: &str) -> Result<Option<recall_event::Model>> {
+        Ok(recall_event::Entity::find_by_id(id.to_string())
+            .one(&self.db)
+            .await?)
+    }
+
+    pub async fn list_recall_events(
+        &self,
+        limit: u64,
+        offset: u64,
+        project_id: Option<&str>,
+    ) -> Result<Vec<recall_event::Model>> {
+        let mut query = recall_event::Entity::find().order_by_desc(recall_event::Column::CreatedAt);
+        query = match project_id.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(pid) => query.filter(
+                Condition::any()
+                    .add(recall_event::Column::ProjectId.is_null())
+                    .add(recall_event::Column::ProjectId.eq(pid.to_string())),
+            ),
+            None => query.filter(recall_event::Column::ProjectId.is_null()),
+        };
+        Ok(query
+            .limit(Self::db_limit(limit))
+            .offset(offset)
+            .all(&self.db)
+            .await?)
+    }
+
+    pub async fn list_recall_events_for_memory(
+        &self,
+        memory_id: &str,
+        limit: u64,
+        project_id: Option<&str>,
+    ) -> Result<Vec<recall_event::Model>> {
+        let mut query = recall_event::Entity::find().filter(
+            Condition::any()
+                .add(recall_event::Column::MemoryId.eq(memory_id.to_string()))
+                .add(recall_event::Column::RelatedMemoryId.eq(memory_id.to_string())),
+        );
+        query = match project_id.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(pid) => query.filter(
+                Condition::any()
+                    .add(recall_event::Column::ProjectId.is_null())
+                    .add(recall_event::Column::ProjectId.eq(pid.to_string())),
+            ),
+            None => query.filter(recall_event::Column::ProjectId.is_null()),
+        };
+        Ok(query
+            .order_by_desc(recall_event::Column::CreatedAt)
+            .limit(Self::db_limit(limit))
+            .all(&self.db)
+            .await?)
+    }
+
+    pub async fn list_reverted_recall_events(
+        &self,
+        limit: u64,
+        project_id: Option<&str>,
+    ) -> Result<Vec<recall_event::Model>> {
+        let mut query = recall_event::Entity::find()
+            .filter(recall_event::Column::RevertedAt.is_not_null())
+            .order_by_desc(recall_event::Column::CreatedAt);
+        query = match project_id.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(pid) => query.filter(
+                Condition::any()
+                    .add(recall_event::Column::ProjectId.is_null())
+                    .add(recall_event::Column::ProjectId.eq(pid.to_string())),
+            ),
+            None => query.filter(recall_event::Column::ProjectId.is_null()),
+        };
+        Ok(query
+            .limit(Self::db_limit(limit))
+            .all(&self.db)
+            .await?)
+    }
+
+    pub async fn count_recall_events(&self, project_id: Option<&str>) -> Result<u64> {
+        let mut query = recall_event::Entity::find();
+        query = match project_id.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(pid) => query.filter(
+                Condition::any()
+                    .add(recall_event::Column::ProjectId.is_null())
+                    .add(recall_event::Column::ProjectId.eq(pid.to_string())),
+            ),
+            None => query.filter(recall_event::Column::ProjectId.is_null()),
+        };
+        Ok(query.count(&self.db).await?)
+    }
+
+    pub async fn rollback_recall_event_with_memory_snapshot(
+        &self,
+        event_id: &str,
+        previous_memory: &experience_item::Model,
+        rollback_event: &recall_event::Model,
+    ) -> Result<bool> {
+        let txn = self.db.begin().await?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let result = recall_event::Entity::update_many()
+            .col_expr(
+                recall_event::Column::RevertedAt,
+                Expr::value(Some(now.clone())),
+            )
+            .col_expr(recall_event::Column::UpdatedAt, Expr::value(now))
+            .filter(recall_event::Column::Id.eq(event_id.to_string()))
+            .filter(recall_event::Column::Reversible.eq(true))
+            .filter(recall_event::Column::RevertedAt.is_null())
+            .exec(&txn)
+            .await?;
+        if result.rows_affected == 0 {
+            txn.rollback().await?;
+            return Ok(false);
+        }
+        Self::upsert_experience_item_conn(&txn, previous_memory).await?;
+        Self::insert_recall_event_conn(&txn, rollback_event).await?;
+        txn.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn upsert_recall_test(&self, test: &recall_test::Model) -> Result<()> {
+        recall_test::Entity::insert(Self::recall_test_active_model(test))
+            .on_conflict(
+                OnConflict::column(recall_test::Column::Id)
+                    .update_columns([
+                        recall_test::Column::MemoryId,
+                        recall_test::Column::Scope,
+                        recall_test::Column::ProjectId,
+                        recall_test::Column::ConversationId,
+                        recall_test::Column::Prompt,
+                        recall_test::Column::ExpectedAnswer,
+                        recall_test::Column::Status,
+                        recall_test::Column::LastAnswer,
+                        recall_test::Column::LastRunAt,
+                        recall_test::Column::Metadata,
+                        recall_test::Column::UpdatedAt,
+                    ])
+                    .to_owned(),
+            )
             .exec(&self.db)
             .await?;
         Ok(())
     }
 
-    pub async fn get_experience_item(&self, id: &str) -> Result<Option<experience_item::Model>> {
-        Ok(experience_item::Entity::find_by_id(id.to_string())
-            .one(&self.db)
+    pub async fn list_recall_tests(
+        &self,
+        limit: u64,
+        offset: u64,
+        project_id: Option<&str>,
+    ) -> Result<Vec<recall_test::Model>> {
+        let mut query = recall_test::Entity::find().order_by_desc(recall_test::Column::UpdatedAt);
+        query = match project_id.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(pid) => query.filter(
+                Condition::any()
+                    .add(recall_test::Column::ProjectId.is_null())
+                    .add(recall_test::Column::ProjectId.eq(pid.to_string())),
+            ),
+            None => query.filter(recall_test::Column::ProjectId.is_null()),
+        };
+        Ok(query
+            .limit(Self::db_limit(limit))
+            .offset(offset)
+            .all(&self.db)
             .await?)
+    }
+
+    pub async fn count_recall_tests(&self, project_id: Option<&str>) -> Result<u64> {
+        let mut query = recall_test::Entity::find();
+        query = match project_id.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(pid) => query.filter(
+                Condition::any()
+                    .add(recall_test::Column::ProjectId.is_null())
+                    .add(recall_test::Column::ProjectId.eq(pid.to_string())),
+            ),
+            None => query.filter(recall_test::Column::ProjectId.is_null()),
+        };
+        Ok(query.count(&self.db).await?)
+    }
+
+    pub async fn list_experience_edges_for_item(
+        &self,
+        item_id: &str,
+        limit: u64,
+    ) -> Result<Vec<experience_edge::Model>> {
+        let capped = Self::db_limit(limit);
+        Ok(experience_edge::Entity::find()
+            .filter(
+                Condition::any()
+                    .add(
+                        Condition::all()
+                            .add(experience_edge::Column::SourceKind.eq("experience_item"))
+                            .add(experience_edge::Column::SourceRef.eq(item_id.to_string())),
+                    )
+                    .add(
+                        Condition::all()
+                            .add(experience_edge::Column::TargetKind.eq("experience_item"))
+                            .add(experience_edge::Column::TargetRef.eq(item_id.to_string())),
+                    ),
+            )
+            .order_by_desc(experience_edge::Column::UpdatedAt)
+            .limit(capped)
+            .all(&self.db)
+            .await?)
+    }
+
+    pub(crate) async fn get_experience_item_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        id: &str,
+    ) -> Result<Option<experience_item::Model>> {
+        Self::get_experience_item_conn(txn, id).await
     }
 
     pub async fn list_active_experience_items(
@@ -3829,6 +4675,45 @@ impl Storage {
             .await?)
     }
 
+    pub async fn list_learning_candidates_for_review(
+        &self,
+        approval_statuses: &[&str],
+        candidate_types: &[&str],
+        project_id: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<learning_candidate::Model>> {
+        let mut query = learning_candidate::Entity::find();
+        if !approval_statuses.is_empty() {
+            query = query.filter(learning_candidate::Column::ApprovalStatus.is_in(
+                approval_statuses
+                    .iter()
+                    .map(|status| (*status).to_string())
+                    .collect::<Vec<_>>(),
+            ));
+        }
+        if !candidate_types.is_empty() {
+            query = query.filter(learning_candidate::Column::CandidateType.is_in(
+                candidate_types
+                    .iter()
+                    .map(|candidate_type| (*candidate_type).to_string())
+                    .collect::<Vec<_>>(),
+            ));
+        }
+        query = match project_id.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(pid) => query.filter(
+                Condition::any()
+                    .add(learning_candidate::Column::ProjectId.is_null())
+                    .add(learning_candidate::Column::ProjectId.eq(pid.to_string())),
+            ),
+            None => query.filter(learning_candidate::Column::ProjectId.is_null()),
+        };
+        Ok(query
+            .order_by_desc(learning_candidate::Column::UpdatedAt)
+            .limit(Self::db_limit(limit))
+            .all(&self.db)
+            .await?)
+    }
+
     pub async fn list_learning_candidates(
         &self,
         approval_status: Option<&str>,
@@ -3885,6 +4770,40 @@ impl Storage {
             .exec(&self.db)
             .await?;
         Ok(())
+    }
+
+    pub async fn update_learning_candidate_review_if_status(
+        &self,
+        id: &str,
+        expected_status: &str,
+        approval_status: &str,
+        review_notes: Option<&str>,
+        approved_ref: Option<&str>,
+    ) -> Result<bool> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let result = learning_candidate::Entity::update_many()
+            .col_expr(
+                learning_candidate::Column::ApprovalStatus,
+                Expr::value(approval_status.to_string()),
+            )
+            .col_expr(
+                learning_candidate::Column::ReviewNotes,
+                Expr::value(review_notes.map(|value| value.to_string())),
+            )
+            .col_expr(
+                learning_candidate::Column::ReviewedAt,
+                Expr::value(Some(now.clone())),
+            )
+            .col_expr(
+                learning_candidate::Column::ApprovedRef,
+                Expr::value(approved_ref.map(|value| value.to_string())),
+            )
+            .col_expr(learning_candidate::Column::UpdatedAt, Expr::value(now))
+            .filter(learning_candidate::Column::Id.eq(id))
+            .filter(learning_candidate::Column::ApprovalStatus.eq(expected_status))
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected > 0)
     }
 
     pub async fn update_learning_candidate_review_guarded(
@@ -4155,6 +5074,16 @@ impl Storage {
             .filter(learning_candidate::Column::ApprovalStatus.eq("draft"))
             .count(&self.db)
             .await?;
+        let pending_reflection = experience_run::Entity::find()
+            .filter(experience_run::Column::Consolidated.eq(true))
+            .filter(experience_run::Column::HeuristicReflected.eq(false))
+            .filter(
+                Condition::any()
+                    .add(experience_run::Column::HeuristicReflectionStatus.is_null())
+                    .add(experience_run::Column::HeuristicReflectionStatus.eq("pending")),
+            )
+            .count(&self.db)
+            .await?;
         let active_patterns = procedural_pattern::Entity::find()
             .filter(procedural_pattern::Column::Status.eq("active"))
             .count(&self.db)
@@ -4162,6 +5091,7 @@ impl Storage {
         Ok(LearningQueueCounts {
             provisional_runs,
             pending_consolidation,
+            pending_reflection,
             draft_candidates,
             active_patterns,
         })
@@ -6330,11 +7260,60 @@ impl Storage {
 
     /// Insert a structured operational telemetry entry.
     pub async fn insert_operational_log(&self, log: &operational_log::Model) -> Result<()> {
-        operational_log::ActiveModel {
+        let trace_id = match log.trace_id.as_deref().map(str::trim).filter(|id| !id.is_empty()) {
+            Some(id) => match execution_trace::Entity::find_by_id(id.to_string())
+                .one(&self.db)
+                .await
+            {
+                Ok(Some(_)) => Some(id.to_string()),
+                Ok(None) => {
+                    tracing::debug!(
+                        "Dropping operational log trace_id before insert because it does not resolve to an execution trace"
+                    );
+                    None
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "Dropping operational log trace_id before insert because validation failed: {}",
+                        error
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        let conversation_id = match log
+            .conversation_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            Some(id) => match conversation::Entity::find_by_id(id.to_string())
+                .one(&self.db)
+                .await
+            {
+                Ok(Some(_)) => Some(id.to_string()),
+                Ok(None) => {
+                    tracing::debug!(
+                        "Dropping operational log conversation_id before insert because it does not resolve to a conversation"
+                    );
+                    None
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "Dropping operational log conversation_id before insert because validation failed: {}",
+                        error
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        let insert_result = operational_log::ActiveModel {
             id: Set(log.id.clone()),
             created_at: Set(log.created_at.clone()),
-            trace_id: Set(log.trace_id.clone()),
-            conversation_id: Set(log.conversation_id.clone()),
+            trace_id: Set(trace_id.clone()),
+            conversation_id: Set(conversation_id.clone()),
             channel: Set(log.channel.clone()),
             event_type: Set(log.event_type.clone()),
             success: Set(log.success),
@@ -6349,7 +7328,40 @@ impl Storage {
             model_slot: Set(log.model_slot.clone()),
         }
         .insert(&self.db)
-        .await?;
+        .await;
+        if let Err(error) = insert_result {
+            if (trace_id.is_some() || conversation_id.is_some())
+                && is_foreign_key_constraint_error(&error)
+            {
+                tracing::warn!(
+                    "Retrying operational log insert '{}' without trace_id/conversation_id after FK failure: {}",
+                    log.id,
+                    error
+                );
+                operational_log::ActiveModel {
+                    id: Set(log.id.clone()),
+                    created_at: Set(log.created_at.clone()),
+                    trace_id: Set(None),
+                    conversation_id: Set(None),
+                    channel: Set(log.channel.clone()),
+                    event_type: Set(log.event_type.clone()),
+                    success: Set(log.success),
+                    outcome: Set(encrypt_storage_string(&log.outcome)?),
+                    tool_name: Set(log.tool_name.clone()),
+                    latency_ms: Set(log.latency_ms),
+                    arguments: Set(encrypt_optional_storage_string(log.arguments.as_deref())?),
+                    payload: Set(encrypt_optional_storage_string(log.payload.as_deref())?),
+                    strategy_version: Set(log.strategy_version.clone()),
+                    policy_version: Set(log.policy_version.clone()),
+                    prompt_version: Set(log.prompt_version.clone()),
+                    model_slot: Set(log.model_slot.clone()),
+                }
+                .insert(&self.db)
+                .await?;
+            } else {
+                return Err(error.into());
+            }
+        }
         if let Err(e) = self.maybe_purge_housekeeping_tables().await {
             tracing::warn!(
                 "Storage housekeeping purge failed after operational log insert: {}",
@@ -6930,8 +7942,12 @@ impl Storage {
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
-            Self::recount_conversations_after_message_batch(&txn, &conversation_ids, message_cutoff)
-                .await?;
+            Self::recount_conversations_after_message_batch(
+                &txn,
+                &conversation_ids,
+                message_cutoff,
+            )
+            .await?;
             txn.commit().await?;
         }
         Ok(())
@@ -7006,7 +8022,9 @@ impl Storage {
             && lifecycle.experience_edge_retention_days == 0
             && lifecycle.learning_candidate_retention_days == 0
             && lifecycle.experience_item_retention_days == 0
-            && lifecycle.procedural_pattern_retention_days == 0;
+            && lifecycle.procedural_pattern_retention_days == 0
+            && lifecycle.recall_event_retention_days == 0
+            && lifecycle.recall_test_retention_days == 0;
 
         if all_retention_disabled {
             self.set(
@@ -7184,6 +8202,32 @@ impl Storage {
                 "updated_at",
                 &procedural_pattern_cutoff,
                 "",
+            )
+            .await?;
+        }
+        if lifecycle.recall_event_retention_days > 0 {
+            let recall_event_cutoff = (now
+                - chrono::Duration::days(lifecycle.recall_event_retention_days as i64))
+            .to_rfc3339();
+            self.delete_by_cutoff_in_batches(
+                "recall_events",
+                "id",
+                "created_at",
+                &recall_event_cutoff,
+                "",
+            )
+            .await?;
+        }
+        if lifecycle.recall_test_retention_days > 0 {
+            let recall_test_cutoff = (now
+                - chrono::Duration::days(lifecycle.recall_test_retention_days as i64))
+            .to_rfc3339();
+            self.delete_by_cutoff_in_batches(
+                "recall_tests",
+                "id",
+                "updated_at",
+                &recall_test_cutoff,
+                "AND status IN ('retired', 'pending', 'passed', 'failed')",
             )
             .await?;
         }

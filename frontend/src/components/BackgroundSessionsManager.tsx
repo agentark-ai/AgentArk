@@ -2,6 +2,7 @@ import {
   Alert,
   Box,
   Button,
+  ButtonBase,
   Checkbox,
   Chip,
   CircularProgress,
@@ -16,12 +17,6 @@ import {
   MenuItem,
   Stack,
   Tab,
-  Table,
-  TableBody,
-  TableCell,
-  TableContainer,
-  TableHead,
-  TableRow,
   Tabs,
   TextField,
   Typography,
@@ -33,7 +28,11 @@ import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
 import { isBackgroundSessionVisibleInUi } from "../lib/backgroundSessions";
 import { formatUiDateTime } from "../lib/dateFormat";
-import type { BackgroundSessionDetail, BackgroundSessionSummary } from "../types";
+import type {
+  BackgroundSessionDetail,
+  BackgroundSessionSummary,
+  BrowserSessionSummary,
+} from "../types";
 import { WorkspacePageHeader, WorkspacePageShell } from "./WorkspacePage";
 
 const REFRESH_MS = 8000;
@@ -127,6 +126,16 @@ function chipColor(status: string): "success" | "warning" | "error" | "default" 
   return "default";
 }
 
+function dotColor(status: string): string {
+  const normalized = status.toLowerCase();
+  if (normalized === "active") return "rgba(57,208,255,0.85)";
+  if (normalized === "completed") return "rgba(74,210,157,0.85)";
+  if (normalized === "failed") return "rgba(255,100,100,0.85)";
+  if (["paused", "waiting", "needs_input"].includes(normalized)) return "rgba(255,191,130,0.85)";
+  if (["draft", "cancelled"].includes(normalized)) return "rgba(180,200,220,0.5)";
+  return "rgba(180,200,220,0.5)";
+}
+
 function statusLabel(status: string): string {
   const normalized = status.toLowerCase();
   if (normalized === "needs_input") return "Needs input";
@@ -139,6 +148,10 @@ function statusLabel(status: string): string {
 
 function formatTimestamp(value?: string | null): string {
   return formatUiDateTime(value, { fallback: "-" });
+}
+
+function browserSessionHandoffUrl(sessionId: string): string {
+  return `/ui/browser-handoff/${encodeURIComponent(sessionId)}`;
 }
 
 function sessionFormFromDetail(detail: BackgroundSessionDetail): SessionFormState {
@@ -213,6 +226,12 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
     refetchInterval: autoRefresh ? REFRESH_MS : false,
   });
 
+  const browserSessionsQ = useQuery({
+    queryKey: ["browser-sessions"],
+    queryFn: api.getBrowserSessions,
+    refetchInterval: autoRefresh ? REFRESH_MS : false,
+  });
+
   const detailQ = useQuery({
     queryKey: ["background-session-detail", selectedId],
     queryFn: () => api.getBackgroundSession(selectedId || ""),
@@ -237,6 +256,10 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
   const sessions = useMemo(
     () => (sessionsQ.data?.sessions || []).filter((session) => isBackgroundSessionVisibleInUi(session)),
     [sessionsQ.data],
+  );
+  const browserSessions = useMemo<BrowserSessionSummary[]>(
+    () => browserSessionsQ.data?.sessions || [],
+    [browserSessionsQ.data],
   );
 
   useEffect(() => {
@@ -302,6 +325,31 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
       await queryClient.invalidateQueries({ queryKey: ["background-session-detail"] });
       await queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
       await queryClient.invalidateQueries({ queryKey: ["watchers-page-watchers"] });
+    },
+    onError: (error) => setNotice({ kind: "error", text: errMessage(error) }),
+  });
+
+  const browserActionMutation = useMutation({
+    mutationFn: async ({
+      kind,
+      sessionId,
+    }: {
+      kind: "stop" | "delete";
+      sessionId: string;
+    }) => {
+      if (kind === "stop") return api.stopBrowserSession(sessionId);
+      return api.deleteBrowserSession(sessionId);
+    },
+    onSuccess: async (_result, variables) => {
+      setNotice({
+        kind: "success",
+        text:
+          variables.kind === "delete"
+            ? "Browser session deleted."
+            : "Browser session stopped.",
+      });
+      await queryClient.invalidateQueries({ queryKey: ["browser-sessions"] });
+      await queryClient.invalidateQueries({ queryKey: ["autonomy-browser-sessions"] });
     },
     onError: (error) => setNotice({ kind: "error", text: errMessage(error) }),
   });
@@ -438,101 +486,275 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
             </Typography>
           </Box>
         ) : (
-          <TableContainer className="table-shell" sx={{ width: "100%", overflowX: "auto" }}>
-            <Table size="small" sx={{ minWidth: 860 }}>
-              <TableHead>
-                <TableRow>
-                  <TableCell>Title</TableCell>
-                  <TableCell>Objective</TableCell>
-                  <TableCell>Status</TableCell>
-                  <TableCell>Tasks</TableCell>
-                  <TableCell>Watchers</TableCell>
-                  <TableCell>Updated</TableCell>
-                  <TableCell align="right">Ops</TableCell>
-                </TableRow>
-              </TableHead>
-              <TableBody>
-                {sessions.map((session) => {
-                  const isPaused = session.status === "paused";
-                  const isTerminal = ["completed", "failed", "cancelled"].includes(session.status);
-                  const rowActions: RowMenuAction[] = [
-                    {
-                      label: "View",
-                      onClick: () => {
-                        setSelectedId(session.id);
-                        setDetailTab("overview");
-                      },
-                    },
-                    {
-                      label: "Edit",
-                      onClick: () => {
-                        setSelectedId(session.id);
-                        // Need detail loaded first — open edit after a tick
-                        setTimeout(() => openEditDialog(session), 200);
-                      },
-                    },
-                    {
-                      label: isPaused ? "Resume" : "Pause",
-                      disabled: isTerminal,
-                      onClick: () =>
-                        actionMutation.mutate({
-                          kind: isPaused ? "resume" : "pause",
-                          sessionId: session.id,
-                        }),
-                    },
-                    {
-                      label: "Stop",
-                      tone: "warning",
-                      disabled: isTerminal,
-                      onClick: () =>
-                        actionMutation.mutate({ kind: "cancel", sessionId: session.id }),
-                    },
-                    {
-                      label: "Delete",
-                      tone: "error",
-                      divider: true,
-                      onClick: () => {
-                        const confirmed = window.confirm(
-                          "Delete this background session? Linked tasks and watchers will be detached but not deleted.",
-                        );
-                        if (!confirmed) return;
-                        actionMutation.mutate({ kind: "delete", sessionId: session.id });
-                      },
-                    },
-                  ];
+          <Box>
+            {sessions.map((session) => {
+              const isPaused = session.status === "paused";
+              const isTerminal = ["completed", "failed", "cancelled"].includes(session.status);
+              const rowActions: RowMenuAction[] = [
+                {
+                  label: "View",
+                  onClick: () => {
+                    setSelectedId(session.id);
+                    setDetailTab("overview");
+                  },
+                },
+                {
+                  label: "Edit",
+                  onClick: () => {
+                    setSelectedId(session.id);
+                    // Need detail loaded first — open edit after a tick
+                    setTimeout(() => openEditDialog(session), 200);
+                  },
+                },
+                {
+                  label: isPaused ? "Resume" : "Pause",
+                  disabled: isTerminal,
+                  onClick: () =>
+                    actionMutation.mutate({
+                      kind: isPaused ? "resume" : "pause",
+                      sessionId: session.id,
+                    }),
+                },
+                {
+                  label: "Stop",
+                  tone: "warning",
+                  disabled: isTerminal,
+                  onClick: () =>
+                    actionMutation.mutate({ kind: "cancel", sessionId: session.id }),
+                },
+                {
+                  label: "Delete",
+                  tone: "error",
+                  divider: true,
+                  onClick: () => {
+                    const confirmed = window.confirm(
+                      "Delete this background session? Linked tasks and watchers will be detached but not deleted.",
+                    );
+                    if (!confirmed) return;
+                    actionMutation.mutate({ kind: "delete", sessionId: session.id });
+                  },
+                },
+              ];
 
-                  return (
-                    <TableRow key={session.id}>
-                      <TableCell sx={{ maxWidth: 280 }}>
-                        <Typography variant="body2" noWrap title={session.title}>
-                          {session.title}
-                        </Typography>
-                      </TableCell>
-                      <TableCell sx={{ maxWidth: 420 }}>
-                        <Typography variant="body2" noWrap title={session.live_summary || session.objective}>
-                          {session.live_summary || session.objective}
-                        </Typography>
-                      </TableCell>
-                      <TableCell>
-                        <Chip size="small" label={statusLabel(session.status)} color={chipColor(session.status)} />
-                      </TableCell>
-                      <TableCell>{session.counts.tasks_total}</TableCell>
-                      <TableCell>{session.counts.watchers_total}</TableCell>
-                      <TableCell sx={{ whiteSpace: "nowrap" }} title={formatTimestamp(session.updated_at)}>
-                        {formatTimestamp(session.updated_at)}
-                      </TableCell>
-                      <TableCell align="right">
-                        <RowOpsMenu actions={rowActions} ariaLabel="Session options" />
-                      </TableCell>
-                    </TableRow>
-                  );
-                })}
-              </TableBody>
-            </Table>
-          </TableContainer>
+              return (
+                <Box key={session.id} sx={{ display: "flex", alignItems: "flex-start" }}>
+                  <ButtonBase
+                    onClick={() => {
+                      setSelectedId(session.id);
+                      setDetailTab("overview");
+                    }}
+                    sx={{
+                      width: "100%",
+                      textAlign: "left",
+                      justifyContent: "flex-start",
+                      px: 0,
+                      py: 1.15,
+                      borderBottom: "1px solid",
+                      borderColor: "divider",
+                      transition: "background 0.15s ease",
+                      "&:hover": { background: "rgba(57, 208, 255, 0.04)" },
+                      display: "block",
+                    }}
+                  >
+                    {/* First line: dot + title ... status text */}
+                    <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+                      <Box
+                        component="span"
+                        sx={{
+                          width: 7,
+                          height: 7,
+                          borderRadius: "50%",
+                          flexShrink: 0,
+                          bgcolor: dotColor(session.status),
+                        }}
+                      />
+                      <Typography
+                        variant="body2"
+                        sx={{ fontWeight: 600, flex: 1, minWidth: 0 }}
+                        noWrap
+                        title={session.title}
+                      >
+                        {session.title}
+                      </Typography>
+                      <Typography
+                        variant="caption"
+                        sx={{ color: "text.secondary", flexShrink: 0 }}
+                      >
+                        {statusLabel(session.status)}
+                      </Typography>
+                    </Box>
+                    {/* Second line: objective summary */}
+                    <Typography
+                      variant="caption"
+                      sx={{ color: "text.secondary", pl: "15px", display: "block" }}
+                      noWrap
+                      title={session.live_summary || session.objective}
+                    >
+                      {session.live_summary || session.objective}
+                    </Typography>
+                    {/* Third line: metadata */}
+                    <Typography
+                      variant="caption"
+                      sx={{ color: "text.secondary", pl: "15px", display: "block" }}
+                    >
+                      Created {formatTimestamp(session.created_at)} &middot; Updated {formatTimestamp(session.updated_at)} &middot; Last activity {formatTimestamp(session.last_activity_at)}
+                    </Typography>
+                  </ButtonBase>
+                  <Box sx={{ flexShrink: 0, pt: 1.15 }}>
+                    <RowOpsMenu actions={rowActions} ariaLabel="Session options" />
+                  </Box>
+                </Box>
+              );
+            })}
+          </Box>
         )}
       </Box>
       {/* Session detail dialog — opened via "View" in ops menu */}
+      <Box className="list-shell">
+        <Stack
+          direction="row"
+          sx={{
+            justifyContent: "space-between",
+            alignItems: "center",
+            mb: 1,
+          }}
+        >
+          <Typography variant="h6">Browser Sessions</Typography>
+          <Button
+            size="small"
+            onClick={() =>
+              queryClient.invalidateQueries({ queryKey: ["browser-sessions"] })
+            }
+          >
+            Refresh
+          </Button>
+        </Stack>
+        {browserSessionsQ.isLoading ? (
+          <Box sx={{ py: 6, textAlign: "center" }}>
+            <CircularProgress size={28} />
+          </Box>
+        ) : browserSessionsQ.error ? (
+          <Alert severity="error">{errMessage(browserSessionsQ.error)}</Alert>
+        ) : browserSessions.length === 0 ? (
+          <Box sx={{ py: 5, textAlign: "center" }}>
+            <Typography
+              variant="body2"
+              sx={{
+                color: "text.secondary",
+                maxWidth: 520,
+                mx: "auto",
+              }}
+            >
+              No active browser sessions.
+            </Typography>
+          </Box>
+        ) : (
+          <Box>
+            {browserSessions.map((session) => {
+              const isTerminal = ["completed", "failed", "interrupted"].includes(session.status);
+              const detailLine =
+                session.summary ||
+                session.question ||
+                session.reason ||
+                session.page_title ||
+                session.page_url ||
+                "Live browser session";
+              const rowActions: RowMenuAction[] = [
+                {
+                  label: "Open live handoff",
+                  onClick: () => {
+                    window.open(browserSessionHandoffUrl(session.id), "_blank", "noopener,noreferrer");
+                  },
+                },
+                {
+                  label: "Stop",
+                  tone: "warning",
+                  disabled: isTerminal,
+                  onClick: () =>
+                    browserActionMutation.mutate({
+                      kind: "stop",
+                      sessionId: session.id,
+                    }),
+                },
+                {
+                  label: "Delete",
+                  tone: "error",
+                  divider: true,
+                  onClick: () => {
+                    const confirmed = window.confirm(
+                      "Delete this browser session? This closes the live browser and removes the saved session record.",
+                    );
+                    if (!confirmed) return;
+                    browserActionMutation.mutate({
+                      kind: "delete",
+                      sessionId: session.id,
+                    });
+                  },
+                },
+              ];
+
+              return (
+                <Box key={session.id} sx={{ display: "flex", alignItems: "flex-start" }}>
+                  <Box
+                    sx={{
+                      width: "100%",
+                      px: 0,
+                      py: 1.15,
+                      borderBottom: "1px solid",
+                      borderColor: "divider",
+                      display: "block",
+                    }}
+                  >
+                    <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+                      <Box
+                        component="span"
+                        sx={{
+                          width: 7,
+                          height: 7,
+                          borderRadius: "50%",
+                          flexShrink: 0,
+                          bgcolor: dotColor(session.status),
+                        }}
+                      />
+                      <Typography
+                        variant="body2"
+                        sx={{ fontWeight: 600, flex: 1, minWidth: 0 }}
+                        noWrap
+                        title={session.task_description}
+                      >
+                        {session.task_description}
+                      </Typography>
+                      <Typography
+                        variant="caption"
+                        sx={{ color: "text.secondary", flexShrink: 0 }}
+                      >
+                        {statusLabel(session.status)}
+                      </Typography>
+                    </Box>
+                    <Typography
+                      variant="caption"
+                      sx={{ color: "text.secondary", pl: "15px", display: "block" }}
+                      noWrap
+                      title={detailLine}
+                    >
+                      {detailLine}
+                    </Typography>
+                    <Typography
+                      variant="caption"
+                      sx={{ color: "text.secondary", pl: "15px", display: "block" }}
+                    >
+                      Created {formatTimestamp(session.created_at)} &middot; Updated {formatTimestamp(session.updated_at)}
+                    </Typography>
+                  </Box>
+                  <Box sx={{ flexShrink: 0, pt: 1.15 }}>
+                    <RowOpsMenu actions={rowActions} ariaLabel="Browser session options" />
+                  </Box>
+                </Box>
+              );
+            })}
+          </Box>
+        )}
+      </Box>
       <Dialog
         open={selectedId != null}
         onClose={() => setSelectedId(null)}
@@ -551,17 +773,34 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
       >
         <DialogTitle
           sx={{
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-            whiteSpace: "nowrap",
-            pb: 1.25,
-            borderBottom: "1px solid rgba(255,255,255,0.06)",
-            fontSize: "1rem",
-            fontWeight: 700,
+            pb: 0.5,
+            display: "flex",
+            alignItems: "center",
+            gap: 1.5,
+            borderBottom: "1px solid",
+            borderColor: "divider",
           }}
-          title={selectedSession?.title || "Session"}
         >
-          {selectedSession?.title || "Session"}
+          <Typography
+            variant="h6"
+            sx={{
+              fontWeight: 700,
+              flex: 1,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+            title={selectedSession?.title || "Session"}
+          >
+            {selectedSession?.title || "Session"}
+          </Typography>
+          {selectedSession ? (
+            <Chip
+              size="small"
+              label={statusLabel(selectedSession.status)}
+              color={chipColor(selectedSession.status)}
+            />
+          ) : null}
         </DialogTitle>
         <DialogContent sx={{ pt: 2 }}>
           {!selectedId || detailQ.isLoading ? (
@@ -1168,9 +1407,10 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
           </Stack>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setDialogOpen(false)}>Cancel</Button>
+          <Button variant="outlined" color="secondary" onClick={() => setDialogOpen(false)}>Cancel</Button>
           <Button
-            variant="contained"
+            variant="outlined"
+            color="secondary"
             disabled={saveMutation.isPending}
             onClick={() => {
               setFormError(null);
@@ -1184,6 +1424,3 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
     </WorkspacePageShell>
   );
 }
-
-
-

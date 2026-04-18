@@ -739,6 +739,21 @@ enum DuplicateAppResolution {
     ReplaceExisting,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RaisedCredentialPromptKind {
+    RawSecret,
+    IntegrationAuth,
+}
+
+impl RaisedCredentialPromptKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RawSecret => "raw_secret",
+            Self::IntegrationAuth => "integration_auth",
+        }
+    }
+}
+
 impl Agent {
     fn canonicalize_json_value(value: &serde_json::Value) -> serde_json::Value {
         match value {
@@ -761,6 +776,117 @@ impl Agent {
             ),
             _ => value.clone(),
         }
+    }
+
+    async fn raise_missing_secret_chat_prompt(
+        &self,
+        missing: &crate::runtime::MissingSecretPlaceholder,
+        conversation_id: Option<&str>,
+        tool_name: &str,
+        trace_id: Option<&str>,
+        stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+    ) -> Option<(String, String)> {
+        let conversation_id = conversation_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+        let storage_key = missing.prompt_storage_key();
+        if storage_key.trim().is_empty() {
+            return None;
+        }
+
+        let manifests = self.integration_auth_manifests().await;
+        let mut prompt_kind = RaisedCredentialPromptKind::RawSecret;
+        let mut prompt_label = storage_key.clone();
+        match crate::core::integration_auth::resolve_secret_key_among_manifests(
+            &storage_key,
+            &manifests,
+        ) {
+            crate::core::integration_auth::ReverseLookupOutcome::Unique(manifest) => {
+                let has_form_fields = match &manifest.mode {
+                    crate::core::integration_auth::AuthMode::Secrets { fields }
+                    | crate::core::integration_auth::AuthMode::Hybrid { fields, .. } => {
+                        !fields.is_empty()
+                    }
+                    crate::core::integration_auth::AuthMode::OAuth2AuthorizationCode(_)
+                    | crate::core::integration_auth::AuthMode::OAuth2DeviceCode(_) => false,
+                };
+                if has_form_fields {
+                    self.remember_integration_auth_chat_prompt(
+                        conversation_id,
+                        &manifest.integration_id,
+                        Some(tool_name),
+                        trace_id,
+                    )
+                    .await;
+                    prompt_kind = RaisedCredentialPromptKind::IntegrationAuth;
+                    prompt_label = manifest.display_name;
+                } else {
+                    self.remember_raw_secret_chat_prompt(
+                        conversation_id,
+                        &storage_key,
+                        Some(tool_name),
+                        trace_id,
+                    )
+                    .await;
+                }
+            }
+            crate::core::integration_auth::ReverseLookupOutcome::Ambiguous {
+                key,
+                candidates,
+            } => {
+                tracing::warn!(
+                    "Ambiguous auth manifest reverse lookup for key '{}': {:?}",
+                    key,
+                    candidates
+                );
+                self.remember_raw_secret_chat_prompt(
+                    conversation_id,
+                    &storage_key,
+                    Some(tool_name),
+                    trace_id,
+                )
+                .await;
+            }
+            crate::core::integration_auth::ReverseLookupOutcome::None => {
+                self.remember_raw_secret_chat_prompt(
+                    conversation_id,
+                    &storage_key,
+                    Some(tool_name),
+                    trace_id,
+                )
+                .await;
+            }
+        }
+
+        let user_content = if matches!(prompt_kind, RaisedCredentialPromptKind::IntegrationAuth) {
+            format!(
+                "I need credentials for {} before `{}` can continue. Use the secure form that appeared in this chat; the value is stored encrypted and is not sent to the assistant.",
+                prompt_label,
+                tool_name
+            )
+        } else {
+            format!(
+                "I need one credential before `{}` can continue. Use the secure form that appeared in this chat; the value is stored encrypted and is not sent to the assistant.",
+                tool_name
+            )
+        };
+        if let Some(tx) = stream_tx {
+            queue_stream_event(
+                tx,
+                StreamEvent::ToolResult {
+                    name: tool_name.to_string(),
+                    content: user_content.clone(),
+                },
+            );
+        }
+        let outcome_content = serde_json::json!({
+            "status": "needs_credentials",
+            "prompt_kind": prompt_kind.as_str(),
+            "secret_key": storage_key,
+            "tool_name": tool_name,
+        })
+        .to_string();
+        Some((user_content, outcome_content))
     }
 
     fn extract_literal_request_urls(text: &str) -> Vec<String> {
@@ -1219,11 +1345,7 @@ impl Agent {
                 serde_json::Value::String(content.to_string()),
             );
         }
-        if out.is_empty() {
-            None
-        } else {
-            Some(out)
-        }
+        if out.is_empty() { None } else { Some(out) }
     }
 
     pub(crate) fn normalize_app_deploy_arguments(
@@ -1349,6 +1471,8 @@ impl Agent {
         "runtime_reason",
         "expose_public",
         "access_guard",
+        "access_password",
+        "access_key",
         "required_inputs",
         "required_secrets",
         "required_env",
@@ -1414,6 +1538,213 @@ impl Agent {
         false
     }
 
+    fn tool_call_is_browser_auto_start_session(call: &crate::core::llm::ToolCall) -> bool {
+        call.name.eq_ignore_ascii_case("browser_auto")
+            && call
+                .arguments
+                .get("action")
+                .and_then(|value| value.as_str())
+                .unwrap_or("start_session")
+                .eq_ignore_ascii_case("start_session")
+    }
+
+    fn should_promote_browser_create_session_to_browser_auto(
+        call: &crate::core::llm::ToolCall,
+        authorization: Option<&crate::actions::ActionAuthorizationContext>,
+    ) -> bool {
+        if !call.name.eq_ignore_ascii_case("browser") {
+            return false;
+        }
+
+        let Some(authorization) = authorization else {
+            return false;
+        };
+        if !matches!(
+            authorization.surface,
+            crate::actions::ActionExecutionSurface::Chat
+        ) {
+            return false;
+        }
+
+        let action = call
+            .arguments
+            .get("action")
+            .and_then(|value| value.as_str())
+            .unwrap_or("create_session");
+        if !action.eq_ignore_ascii_case("create_session") {
+            return false;
+        }
+
+        !call
+            .arguments
+            .get("session_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+    }
+
+    fn managed_browser_task_from_browser_call(
+        call: &crate::core::llm::ToolCall,
+        request_message: &str,
+    ) -> String {
+        let trimmed_request = request_message.trim();
+        let requested_url = call
+            .arguments
+            .get("url")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        match (trimmed_request.is_empty(), requested_url) {
+            (false, Some(url)) if !trimmed_request.contains(url) => {
+                format!("{}\nTarget URL: {}", trimmed_request, url)
+            }
+            (false, _) => trimmed_request.to_string(),
+            (true, Some(url)) => format!(
+                "Open {} in a managed live browser session and continue from the current page state.",
+                url
+            ),
+            (true, None) => {
+                "Continue this website task in a managed live browser session.".to_string()
+            }
+        }
+    }
+
+    fn promote_browser_create_session_to_browser_auto(
+        call: &crate::core::llm::ToolCall,
+        request_message: &str,
+        request_channel: &str,
+        conversation_id: Option<&str>,
+    ) -> crate::core::llm::ToolCall {
+        let mut arguments = serde_json::Map::new();
+        arguments.insert(
+            "action".to_string(),
+            serde_json::Value::String("start_session".to_string()),
+        );
+        arguments.insert(
+            "task".to_string(),
+            serde_json::Value::String(Self::managed_browser_task_from_browser_call(
+                call,
+                request_message,
+            )),
+        );
+        arguments.insert(
+            "channel".to_string(),
+            serde_json::Value::String(request_channel.trim().to_string()),
+        );
+        if let Some(conversation_id) = conversation_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            arguments.insert(
+                "conversation_id".to_string(),
+                serde_json::Value::String(conversation_id.to_string()),
+            );
+        }
+
+        crate::core::llm::ToolCall {
+            id: call.id.clone(),
+            name: "browser_auto".to_string(),
+            arguments: serde_json::Value::Object(arguments),
+        }
+    }
+
+    fn enrich_browser_auto_start_session_call(
+        call: &crate::core::llm::ToolCall,
+        request_channel: &str,
+        conversation_id: Option<&str>,
+    ) -> crate::core::llm::ToolCall {
+        if !Self::tool_call_is_browser_auto_start_session(call) {
+            return call.clone();
+        }
+
+        let mut enriched = call.clone();
+        let mut arguments = enriched.arguments.as_object().cloned().unwrap_or_default();
+
+        let channel_missing = arguments
+            .get("channel")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .is_none_or(|value| value.is_empty());
+        if channel_missing && !request_channel.trim().is_empty() {
+            arguments.insert(
+                "channel".to_string(),
+                serde_json::Value::String(request_channel.trim().to_string()),
+            );
+        }
+
+        let conversation_missing = arguments
+            .get("conversation_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .is_none_or(|value| value.is_empty());
+        if conversation_missing {
+            if let Some(conversation_id) = conversation_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                arguments.insert(
+                    "conversation_id".to_string(),
+                    serde_json::Value::String(conversation_id.to_string()),
+                );
+            }
+        }
+
+        enriched.arguments = serde_json::Value::Object(arguments);
+        enriched
+    }
+
+    fn should_suppress_manual_browser_call_for_browser_auto_batch(
+        call: &crate::core::llm::ToolCall,
+        batch_has_browser_auto_start_session: bool,
+    ) -> bool {
+        if !batch_has_browser_auto_start_session || !call.name.eq_ignore_ascii_case("browser") {
+            return false;
+        }
+
+        let action = call
+            .arguments
+            .get("action")
+            .and_then(|value| value.as_str())
+            .unwrap_or("create_session");
+        if action.eq_ignore_ascii_case("create_session") {
+            return true;
+        }
+
+        call.arguments
+            .get("session_id")
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim().is_empty())
+            .unwrap_or(true)
+    }
+
+    fn skipped_tool_call_result(
+        prepared: &PreparedToolExecution,
+        message: &str,
+    ) -> ExecutedToolCall {
+        let side_effect_level = if prepared.side_effecting {
+            "side_effecting"
+        } else {
+            "read_only"
+        };
+        ExecutedToolCall {
+            original_index: prepared.original_index,
+            output: ToolCallOutput {
+                name: prepared.call.name.clone(),
+                content: message.to_string(),
+            },
+            outcome: crate::core::ToolOutcome {
+                name: prepared.call.name.clone(),
+                content: message.to_string(),
+                status: crate::core::ToolOutcomeStatus::Success,
+                failure_class: None,
+                retryable: false,
+                side_effect_level: side_effect_level.to_string(),
+                error: None,
+            },
+        }
+    }
+
     /// Recover files from a single content key like `content`, `code`, `html`, `source`.
     /// Only recover content that looks like actual source/markup, not generic prose.
     fn recover_files_from_single_content_key(
@@ -1469,11 +1800,7 @@ impl Agent {
                 }
             }
         }
-        if files.is_empty() {
-            None
-        } else {
-            Some(files)
-        }
+        if files.is_empty() { None } else { Some(files) }
     }
 
     /// Recover files from a top-level object that has no `files` key and no nested wrapper.
@@ -2238,7 +2565,8 @@ impl Agent {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let access_key = if access_guard_enabled {
-            app.get("access_key")
+            app.get("access_password")
+                .or_else(|| app.get("access_key"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string()
@@ -2322,6 +2650,7 @@ impl Agent {
           "port": app.get("port").and_then(|v| v.as_u64()),
           "access_guard_enabled": access_guard_enabled,
           "access_key": access_key,
+          "access_password": access_key,
           "entry_command": meta.as_ref().and_then(|m| m.get("entry_command").and_then(|v| v.as_str())),
           "install_command": meta.as_ref().and_then(|m| m.get("install_command").and_then(|v| v.as_str())),
           "runtime_preference": meta.as_ref().and_then(|m| m.get("runtime_preference").and_then(|v| v.as_str())),
@@ -2352,9 +2681,9 @@ impl Agent {
                         obj.insert("running".to_string(), serde_json::json!(status.running));
                         obj.insert(
                             "runtime_mode".to_string(),
-                            serde_json::json!(status
-                                .runtime_mode
-                                .unwrap_or_else(|| "stopped".to_string())),
+                            serde_json::json!(
+                                status.runtime_mode.unwrap_or_else(|| "stopped".to_string())
+                            ),
                         );
                         obj.insert(
                             "port".to_string(),
@@ -3018,9 +3347,7 @@ Requirements:\n\
                                 let content = integration.get_content(&sidecar_session).await?;
                                 let combined = format!("{}\n{}", content.title, content.body_text)
                                     .to_lowercase();
-                                let lock_page_detected = combined.contains("access key required")
-                                    || (combined.contains("enter access key")
-                                        && combined.contains("unlock"));
+                                let lock_page_detected = combined.contains("agentark app guard");
                                 if lock_page_detected {
                                     anyhow::bail!("app opened in locked mode");
                                 }
@@ -3107,8 +3434,7 @@ Requirements:\n\
 
                 let content = integration.get_content(&sidecar_session).await?;
                 let combined = format!("{}\n{}", content.title, content.body_text).to_lowercase();
-                let lock_page_detected = combined.contains("access key required")
-                    || (combined.contains("enter access key") && combined.contains("unlock"));
+                let lock_page_detected = combined.contains("agentark app guard");
                 if lock_page_detected {
                     anyhow::bail!("app opened in locked mode");
                 }
@@ -3872,7 +4198,7 @@ Requirements:\n\
                 },
                 "session_id": {
                     "type": "string",
-                    "description": "Existing browser session id. Required for every action except `create_session`."
+                    "description": "Existing browser session id. Optional when AgentArk can reuse the current chat's live browser session."
                 },
                 "url": {
                     "type": "string",
@@ -4233,6 +4559,10 @@ Requirements:\n\
         } else {
             String::new()
         };
+        let expose_public = meta
+            .get("expose_public")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         if meta.get("access_guard_enabled").is_none() || meta.get("access_key").is_some() {
             meta["access_guard_enabled"] = serde_json::Value::Bool(access_guard_enabled);
@@ -4314,6 +4644,9 @@ Requirements:\n\
                 "access_url": relative_access_url,
                 "local_access_url": local_access_url,
                 "access_guard_enabled": access_guard_enabled,
+                "access_key": access_key.clone(),
+                "access_password": access_key,
+                "expose_public": expose_public,
                 "port": raw.get("port").cloned().unwrap_or(serde_json::Value::Null),
                 "runtime_preference": raw
                     .get("runtime_mode")
@@ -4370,7 +4703,7 @@ Requirements:\n\
                     "required_secrets": required_secret_keys.clone(),
                     "required_env": required_secret_keys,
                     "required_config": required_config_keys,
-                    "message": "Missing required inputs. Use /setsecret KEY=VALUE for sensitive values; provide config for non-sensitive values."
+                    "message": "Missing required inputs. Use the secure credential form in chat or Settings for sensitive values; provide config for non-sensitive values."
                 }));
             }
 
@@ -4410,6 +4743,7 @@ Requirements:\n\
                         port,
                         access_key: access_key.clone(),
                         access_guard_enabled,
+                        expose_public,
                         enabled: true,
                         last_accessed: None,
                     },
@@ -4439,6 +4773,9 @@ Requirements:\n\
                 "access_url": relative_access_url,
                 "local_access_url": local_access_url,
                 "access_guard_enabled": access_guard_enabled,
+                "access_key": access_key.clone(),
+                "access_password": access_key,
+                "expose_public": expose_public,
                 "port": port,
                 "runtime_preference": runtime_preference.as_str(),
             }));
@@ -4453,6 +4790,7 @@ Requirements:\n\
                     is_static: true,
                     access_key: access_key.clone(),
                     access_guard_enabled,
+                    expose_public,
                     enabled: true,
                     last_accessed: None,
                 },
@@ -4468,6 +4806,9 @@ Requirements:\n\
             "access_url": relative_access_url,
             "local_access_url": local_access_url,
             "access_guard_enabled": access_guard_enabled,
+            "access_key": access_key.clone(),
+            "access_password": access_key,
+            "expose_public": expose_public,
             "runtime_preference": runtime_preference.as_str(),
         }))
     }
@@ -6401,8 +6742,63 @@ Requirements:\n\
             return self.handle_research_tool_call(call, stream_tx).await;
         }
 
+        let mut runtime_call = call.clone();
+        if Self::should_promote_browser_create_session_to_browser_auto(&runtime_call, authorization)
+        {
+            let promoted_call = Self::promote_browser_create_session_to_browser_auto(
+                &runtime_call,
+                "",
+                request_channel,
+                conversation_id,
+            );
+            return self
+                .execute_single_tool_call_legacy(
+                    &promoted_call,
+                    trace_ref,
+                    stream_tx.cloned(),
+                    request_channel,
+                    authorization,
+                )
+                .await;
+        }
+        if runtime_call.name.eq_ignore_ascii_case("browser") {
+            let action = runtime_call
+                .arguments
+                .get("action")
+                .and_then(|value| value.as_str())
+                .unwrap_or("create_session");
+            if !action.eq_ignore_ascii_case("create_session") {
+                let requested_session_id = runtime_call
+                    .arguments
+                    .get("session_id")
+                    .and_then(|value| value.as_str());
+                if let Some(resolved_session_id) = self
+                    .browser_sessions
+                    .resolve_browser_tool_session_id(requested_session_id, conversation_id)
+                    .await
+                {
+                    let already_resolved = runtime_call
+                        .arguments
+                        .get("session_id")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        == Some(resolved_session_id.as_str());
+                    if !already_resolved {
+                        let mut normalized_arguments = runtime_call.arguments.clone();
+                        if let Some(obj) = normalized_arguments.as_object_mut() {
+                            obj.insert(
+                                "session_id".to_string(),
+                                serde_json::Value::String(resolved_session_id),
+                            );
+                            runtime_call.arguments = serde_json::Value::Object(obj.clone());
+                        }
+                    }
+                }
+            }
+        }
+
         self.execute_single_tool_call_legacy(
-            call,
+            &runtime_call,
             trace_ref,
             stream_tx.cloned(),
             request_channel,
@@ -6769,11 +7165,12 @@ Requirements:\n\
             .flatten()
             .and_then(|raw| String::from_utf8(raw).ok())
             .map(|s| !s.trim().eq_ignore_ascii_case("false"))
-            .unwrap_or(true);
+            .unwrap_or(true)
+            && crate::core::learning::load_learning_enabled(&self.storage).await;
         if !enabled {
             return Ok(serde_json::json!({
                 "status": "disabled",
-                "message": "Self-evolution is currently disabled. Enable it in Settings > Evolution."
+                "message": "Self-evolution is currently disabled. Enable it in Settings > Advanced > ArkEvolve."
             })
             .to_string());
         }
@@ -8875,6 +9272,63 @@ Requirements:\n\
                 Err(error) => {
                     let latency_ms = call_started.elapsed().as_millis() as u64;
                     let error_text = error.to_string();
+                    if let Some(missing) =
+                        error.downcast_ref::<crate::runtime::MissingSecretPlaceholder>()
+                    {
+                        if let Some((content, outcome_content)) = self
+                            .raise_missing_secret_chat_prompt(
+                                missing,
+                                env.conversation_id,
+                                &call.name,
+                                env.trace_id,
+                                env.stream_tx,
+                            )
+                            .await
+                        {
+                            let payload = serde_json::json!({
+                                "handler": handler.id(),
+                                "missing_placeholder": missing.kind.as_str(),
+                                "secret_key": missing.prompt_storage_key(),
+                            });
+                            self.log_operational_event(super::operational::OperationalEvent {
+                                event_type: "tool_call",
+                                channel: env.request_channel,
+                                success: false,
+                                outcome: "needs_credentials",
+                                trace_id: env.trace_id,
+                                conversation_id: env.conversation_id,
+                                tool_name: Some(&call.name),
+                                latency_ms: Some(latency_ms),
+                                arguments: Some(&call.arguments),
+                                payload: Some(&payload),
+                                strategy_version: env.strategy_version,
+                                policy_version: env.policy_version,
+                                prompt_version: env.prompt_version,
+                                classifier_prompt_version: env.classifier_prompt_version,
+                                specialist_prompt_version: env.specialist_prompt_version,
+                                model_slot: env.model_slot,
+                            })
+                            .await;
+                            self.record_self_tune_tool_outcome(&call.name, false, latency_ms)
+                                .await;
+                            return ExecutedToolCall {
+                                original_index: prepared.original_index,
+                                output: ToolCallOutput {
+                                    name: call.name.clone(),
+                                    content: content.clone(),
+                                },
+                                outcome: crate::core::ToolOutcome {
+                                    name: call.name.clone(),
+                                    content: outcome_content,
+                                    status: crate::core::ToolOutcomeStatus::NeedsInput,
+                                    failure_class: Some(crate::core::FailureClass::ToolError),
+                                    retryable: false,
+                                    side_effect_level: side_effect_level.to_string(),
+                                    error: Some(error_text),
+                                },
+                            };
+                        }
+                    }
                     let payload = serde_json::json!({
                         "handler": handler.id(),
                         "error": safe_truncate(&error_text, 260),
@@ -9070,7 +9524,12 @@ Requirements:\n\
         let classifier_prompt_version = ctx.classifier_prompt_version;
         let specialist_prompt_version = ctx.specialist_prompt_version;
         let model_slot = ctx.model_slot;
-        let authorization = ctx.authorization;
+        let mut authorization = ctx.authorization;
+        if authorization.capability_context_id.is_none() {
+            authorization.capability_context_id = conversation_id
+                .map(|value| format!("conversation:{}", value))
+                .or_else(|| trace_id.map(|value| format!("trace:{}", value)));
+        }
 
         let public_base_url = self.load_public_base_url().await;
         let integration_aliases = self.load_tool_integration_aliases().await;
@@ -9098,7 +9557,25 @@ Requirements:\n\
         }
 
         let mut prepared_calls = Vec::new();
-        for (original_index, call) in unique_calls.into_iter().enumerate() {
+        for (original_index, original_call) in unique_calls.into_iter().enumerate() {
+            let call = if Self::should_promote_browser_create_session_to_browser_auto(
+                &original_call,
+                Some(&authorization),
+            ) {
+                Self::promote_browser_create_session_to_browser_auto(
+                    &original_call,
+                    request_message,
+                    request_channel,
+                    conversation_id,
+                )
+            } else {
+                original_call
+            };
+            let call = Self::enrich_browser_auto_start_session_call(
+                &call,
+                request_channel,
+                conversation_id,
+            );
             let action_def = action_map.get(&call.name.to_ascii_lowercase()).cloned();
             let signature = Self::tool_call_signature(&call);
             let side_effecting = if let Some(cached) = side_effect_cache.get(&signature).copied() {
@@ -9140,10 +9617,39 @@ Requirements:\n\
             user_execution_constraints: &user_execution_constraints,
         };
 
+        let batch_has_browser_auto_start_session = prepared_calls
+            .iter()
+            .any(|prepared| Self::tool_call_is_browser_auto_start_session(&prepared.call));
         let mut executed_calls: Vec<ExecutedToolCall> = Vec::new();
         let mut pending_parallel_batch: Vec<PreparedToolExecution> = Vec::new();
 
         for prepared in prepared_calls {
+            if Self::should_suppress_manual_browser_call_for_browser_auto_batch(
+                &prepared.call,
+                batch_has_browser_auto_start_session,
+            ) {
+                if !pending_parallel_batch.is_empty() {
+                    executed_calls.extend(
+                        self.execute_parallel_read_only_tool_batch(&pending_parallel_batch, &env)
+                            .await,
+                    );
+                    pending_parallel_batch.clear();
+                }
+
+                let message = "Skipped redundant manual browser call because browser_auto already started a managed live browser session in this batch.";
+                if let Some(tx) = env.stream_tx {
+                    queue_stream_event(
+                        tx,
+                        StreamEvent::ToolResult {
+                            name: prepared.call.name.clone(),
+                            content: message.to_string(),
+                        },
+                    );
+                }
+                executed_calls.push(Self::skipped_tool_call_result(&prepared, message));
+                continue;
+            }
+
             if tool_call_supports_parallel_read_only_execution(
                 &prepared.call,
                 prepared.action_def.as_ref(),
@@ -9513,22 +10019,6 @@ Requirements:\n\
                         continue;
                     }
 
-                    if self.browser_sessions.active_count() >= 2 {
-                        tracing::warn!("Browser session limit reached: 2 active sessions");
-                        let formatted = r#"{"error": "session_limit", "detail": "Maximum 2 concurrent browser sessions"}"#.to_string();
-                        if let Some(ref tx) = stream_tx {
-                            queue_stream_event(
-                                tx,
-                                StreamEvent::ToolResult {
-                                    name: call.name.clone(),
-                                    content: formatted.clone(),
-                                },
-                            );
-                        }
-                        results.push(formatted);
-                        continue;
-                    }
-
                     // Create a notification callback that sends messages to the user's channel
                     let chat_id = call
                         .arguments
@@ -9540,6 +10030,7 @@ Requirements:\n\
                     let agent_config = self.config.clone();
                     let storage_clone = self.storage.clone();
                     let encrypted_storage_clone = self.encrypted_storage.clone();
+                    let notification_store = self.notification_store();
                     let local_ui_base = Self::user_facing_local_base_url();
                     let public_ui_base = self.load_public_base_url().await;
                     let notify_conversation_id = call
@@ -9548,7 +10039,18 @@ Requirements:\n\
                         .and_then(|v| v.as_str())
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
-                        .map(str::to_string);
+                        .map(str::to_string)
+                        .or_else(|| {
+                            conversation_id
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string)
+                        });
+                    let browser_session_chat_binding =
+                        notify_conversation_id.clone().or_else(|| {
+                            (!chat_id.trim().is_empty())
+                                .then(|| format!("{}:{}", notify_channel, chat_id))
+                        });
                     let notify_fn: std::sync::Arc<
                         dyn Fn(crate::core::browser_session::BrowserSessionNotification)
                             + Send
@@ -9559,6 +10061,7 @@ Requirements:\n\
                         let chat_id = chat_id.clone();
                         let storage = storage_clone.clone();
                         let encrypted_storage = encrypted_storage_clone.clone();
+                        let notification_store = notification_store.clone();
                         let conversation_id = notify_conversation_id.clone();
                         let local_ui_base = local_ui_base.clone();
                         let public_ui_base = public_ui_base.clone();
@@ -9577,6 +10080,26 @@ Requirements:\n\
                             let local_handoff_url = absolutize(&local_ui_base);
                             let public_handoff_url =
                                 public_ui_base.as_ref().map(|base| absolutize(base));
+                            let conversation_handoff_message = if let Some(public_url) =
+                                public_handoff_url.as_ref()
+                            {
+                                if public_url != &local_handoff_url {
+                                    format!(
+                                        "{}\nOpen live handoff: [Open browser handoff]({})\nLocal fallback: [Open local handoff]({})",
+                                        msg, public_url, local_handoff_url
+                                    )
+                                } else {
+                                    format!(
+                                        "{}\nOpen live handoff: [Open browser handoff]({})",
+                                        msg, public_url
+                                    )
+                                }
+                            } else {
+                                format!(
+                                    "{}\nOpen live handoff: [Open browser handoff]({})",
+                                    msg, local_handoff_url
+                                )
+                            };
                             let delivery_message = match notification.kind {
                                     crate::core::browser_session::BrowserSessionNotificationKind::NeedsInput => {
                                         if let Some(public_url) = public_handoff_url.as_ref() {
@@ -9600,6 +10123,7 @@ Requirements:\n\
                             if matches!(
                                 notification.kind,
                                 crate::core::browser_session::BrowserSessionNotificationKind::Failed
+                                    | crate::core::browser_session::BrowserSessionNotificationKind::Closed
                             ) {
                                 let notif = crate::storage::entities::notification::Model {
                                     id: uuid::Uuid::new_v4().to_string(),
@@ -9619,10 +10143,12 @@ Requirements:\n\
                                         crate::core::browser_session::BrowserSessionNotificationKind::NeedsInput => Some(
                                             format!(
                                                 "[Browser automation] {}",
-                                                delivery_message
+                                                conversation_handoff_message
                                             ),
                                         ),
-                                        crate::core::browser_session::BrowserSessionNotificationKind::Completed
+                                        crate::core::browser_session::BrowserSessionNotificationKind::Notice
+                                        | crate::core::browser_session::BrowserSessionNotificationKind::Completed
+                                        | crate::core::browser_session::BrowserSessionNotificationKind::Closed
                                         | crate::core::browser_session::BrowserSessionNotificationKind::Failed => {
                                             Some(format!("[Browser automation] {}", delivery_message))
                                         }
@@ -9638,8 +10164,24 @@ Requirements:\n\
                                         model_used: Some("browser_auto".to_string()),
                                         trace_id: None,
                                     };
-                                    let _ =
-                                        encrypted_storage.insert_message_encrypted(&asst_msg).await;
+                                    if encrypted_storage
+                                        .insert_message_encrypted(&asst_msg)
+                                        .await
+                                        .is_ok()
+                                    {
+                                        notification_store.broadcast_event(
+                                            crate::core::agent::NotificationEvent {
+                                                kind: "conversation.changed".to_string(),
+                                                id: asst_msg.id.clone(),
+                                                title: "Conversation updated".to_string(),
+                                                body: cid.to_string(),
+                                                level: "info".to_string(),
+                                                source: "browser".to_string(),
+                                                read: true,
+                                                created_at: asst_msg.timestamp.clone(),
+                                            },
+                                        );
+                                    }
                                 }
                             }
 
@@ -9680,14 +10222,22 @@ Requirements:\n\
                     let llm_clone = self.llm.clone();
                     match self
                         .browser_sessions
-                        .start_session(task_desc, channel, llm_clone, notify_fn)
+                        .start_session(
+                            task_desc,
+                            channel,
+                            browser_session_chat_binding.as_deref(),
+                            llm_clone,
+                            notify_fn,
+                        )
                         .await
                     {
-                        Ok(session_id) => {
+                        Ok(started) => {
+                            let session_id = started.session_id;
                             tracing::info!(
-                                "Browser session started: session={}, task_len={}",
+                                "Browser session started: session={}, task_len={}, reused={}",
                                 &session_id[..8],
-                                task_desc.len()
+                                task_desc.len(),
+                                started.reused_existing
                             );
                             // Return structured data - let the LLM craft the user message
                             if let Some(ref tx) = stream_tx {
@@ -9703,12 +10253,15 @@ Requirements:\n\
                                 );
                             }
                             results.push(format!(
-                                r#"{{"status": "session_started", "session_id": "{}", "task": "{}"}}"#,
-                                session_id, task_desc.replace('"', "'")
+                                r#"{{"status": "session_started", "session_id": "{}", "task": "{}", "reused": {}}}"#,
+                                session_id, task_desc.replace('"', "'"), started.reused_existing
                             ));
                         }
                         Err(e) => {
                             tracing::error!("Browser session start failed: error={}", e);
+                            let is_limit_error = e
+                                .to_string()
+                                .contains("Maximum 2 concurrent browser sessions");
                             if let Some(ref tx) = stream_tx {
                                 queue_stream_event(
                                     tx,
@@ -9718,54 +10271,36 @@ Requirements:\n\
                                     },
                                 );
                             }
-                            results.push(format!(
-                                r#"{{"error": "session_start_failed", "detail": "{}"}}"#,
-                                e
-                            ));
+                            if is_limit_error {
+                                results.push(
+                                    r#"{"error": "session_limit", "detail": "Maximum 2 concurrent browser sessions"}"#
+                                        .to_string(),
+                                );
+                            } else {
+                                results.push(format!(
+                                    r#"{{"error": "session_start_failed", "detail": "{}"}}"#,
+                                    e
+                                ));
+                            }
                         }
                     }
                 } else {
-                    // Direct browser actions (for manual control)
-                    let integration = self.browser_sessions.integration();
-                    let resolved_args = self
-                        .runtime
-                        .resolve_secret_placeholders(&call.name, &call.arguments)
-                        .unwrap_or_else(|_| call.arguments.clone());
-                    match self
-                        .integrations
-                        .execute("browser", sub_action, &resolved_args)
-                        .await
-                    {
-                        Ok(result) => {
-                            let formatted = serde_json::to_string_pretty(&result)
-                                .unwrap_or_else(|_| result.to_string());
-                            if let Some(ref tx) = stream_tx {
-                                queue_stream_event(
-                                    tx,
-                                    StreamEvent::ToolResult {
-                                        name: call.name.clone(),
-                                        content: sanitize_stream(&formatted),
-                                    },
-                                );
-                            }
-                            results.push(formatted);
-                        }
-                        Err(e) => {
-                            // Try via direct integration
-                            let _ = integration; // used in future expansion
-                            let formatted = format!("Browser action error: {}", e);
-                            if let Some(ref tx) = stream_tx {
-                                queue_stream_event(
-                                    tx,
-                                    StreamEvent::ToolResult {
-                                        name: call.name.clone(),
-                                        content: formatted.clone(),
-                                    },
-                                );
-                            }
-                            results.push(formatted);
-                        }
+                    let formatted = serde_json::json!({
+                        "error": "unsupported_browser_auto_action",
+                        "requested_action": sub_action,
+                        "detail": "browser_auto only supports start_session. It runs a managed background browser session that handles navigation and live handoff automatically. For explicit manual browser control, use the browser integration tool with create_session/navigate/click/type_text."
+                    })
+                    .to_string();
+                    if let Some(ref tx) = stream_tx {
+                        queue_stream_event(
+                            tx,
+                            StreamEvent::ToolResult {
+                                name: call.name.clone(),
+                                content: sanitize_stream(&formatted),
+                            },
+                        );
                     }
+                    results.push(formatted);
                 }
                 continue;
             }
@@ -9796,6 +10331,17 @@ Requirements:\n\
                     .runtime
                     .resolve_secret_placeholders(&call.name, &normalized_args)
                     .unwrap_or(normalized_args);
+                if resolved_args
+                    .get("access_password")
+                    .or_else(|| resolved_args.get("access_key"))
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .is_some_and(|value| !value.is_empty())
+                {
+                    if let Some(obj) = resolved_args.as_object_mut() {
+                        obj.insert("access_guard".to_string(), serde_json::json!(true));
+                    }
+                }
                 if resolved_args
                     .get("access_guard")
                     .and_then(|v| v.as_bool())
@@ -10326,10 +10872,10 @@ Requirements:\n\
                                     })
                                     .unwrap_or_default();
                                 let reuse_option = if llm_reuse_candidates.is_empty() {
-                                    "1) Use an existing model key: not available for current missing keys.".to_string()
+                                    "No existing model credential is available for the current missing keys.".to_string()
                                 } else {
                                     format!(
-                                        "1) Reuse your current model key for: {}.\n   Reply: /usecurrentkey <KEY>",
+                                        "A current model credential may be reusable for: {}.",
                                         llm_reuse_candidates
                                     )
                                 };
@@ -10347,10 +10893,8 @@ Requirements:\n\
                                 let msg = format!(
                                     "App '{}' is ready, but I need your approval/input for credentials before I continue.\n\
                                       Missing sensitive keys: {}{}\n\n\
-                                      Choose one option:\n\
+                                      Use the secure credential form in chat or Settings for sensitive values.\n\
                                       {}\n\
-                                     2) Provide your own key securely.\n\
-                                        Reply: /setsecret <KEY>=<VALUE>\n\n\
                                       Why I'm asking: credentials are stored encrypted and handled outside model generation to reduce leak risk.\n\
                                       For non-sensitive config values, redeploy/restart with config.{{KEY}}=value.\n\
                                       Then restart app '{}'.{}",
@@ -10428,7 +10972,8 @@ Requirements:\n\
                                     app_id_raw.to_string()
                                 };
                                 let access_key = parsed
-                                    .get("access_key")
+                                    .get("access_password")
+                                    .or_else(|| parsed.get("access_key"))
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("")
                                     .to_string();
@@ -10664,10 +11209,12 @@ Requirements:\n\
                                 if access_guard_enabled {
                                     app_message_lines.push("- Access guard: enabled.".to_string());
                                     if !access_key.trim().is_empty() {
-                                        app_message_lines
-                                            .push(format!("- Access key: `{}`", access_key.trim()));
+                                        app_message_lines.push(format!(
+                                            "- Access password: `{}`",
+                                            access_key.trim()
+                                        ));
                                         app_message_lines.push(
-                                            "- Open the link above and enter the access key if prompted."
+                                            "- Open the link above and enter the access password if prompted."
                                                 .to_string(),
                                         );
                                     }
@@ -11376,8 +11923,142 @@ Requirements:\n\
                         continue;
                     }
 
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result) {
+                        let status = parsed
+                            .get("status")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("");
+                        if status == "needs_credentials" {
+                            if let Some(integration_id) = parsed
+                                .get("integration_id")
+                                .and_then(|value| value.as_str())
+                                .map(str::trim)
+                                .filter(|value| !value.is_empty())
+                            {
+                                if let Some(cid) =
+                                    conversation_id.filter(|value| !value.trim().is_empty())
+                                {
+                                    self.remember_integration_auth_chat_prompt(
+                                        cid,
+                                        integration_id,
+                                        Some(&call.name),
+                                        None,
+                                    )
+                                    .await;
+                                }
+                                let display_name = self
+                                    .lookup_integration_auth_manifest(integration_id)
+                                    .await
+                                    .map(|manifest| manifest.display_name)
+                                    .or_else(|| {
+                                        parsed
+                                            .get("custom_messaging_channel")
+                                            .and_then(|value| value.get("name"))
+                                            .and_then(|value| value.as_str())
+                                            .map(str::to_string)
+                                    })
+                                    .unwrap_or_else(|| "This connection".to_string());
+                                let prompt = format!(
+                                    "{} needs credentials before I can use it.\n\nUse the secure credential form that just appeared in this chat. The values are stored encrypted and are not sent to the assistant.",
+                                    display_name
+                                );
+                                if let Some(ref tx) = stream_tx {
+                                    queue_stream_event(
+                                        tx,
+                                        StreamEvent::ToolResult {
+                                            name: call.name.clone(),
+                                            content: prompt.clone(),
+                                        },
+                                    );
+                                }
+                                results.push(prompt);
+                                continue;
+                            }
+                        }
+                    }
+
+                    if call.name == "extension_pack_connect" {
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result) {
+                            let status = parsed
+                                .get("status")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("");
+                            if status == "needs_credentials" {
+                                let pack_id = parsed
+                                    .get("pack_id")
+                                    .and_then(|value| value.as_str())
+                                    .or_else(|| {
+                                        call.arguments
+                                            .get("pack_id")
+                                            .and_then(|value| value.as_str())
+                                    })
+                                    .unwrap_or("integration");
+                                let pack_name = parsed
+                                    .get("pack_name")
+                                    .and_then(|value| value.as_str())
+                                    .filter(|value| !value.trim().is_empty())
+                                    .unwrap_or(pack_id);
+                                let connection_id = parsed
+                                    .get("connection")
+                                    .and_then(|value| value.get("connection"))
+                                    .and_then(|value| value.get("id"))
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or_default();
+                                let required_secrets = parsed
+                                    .get("required_secrets")
+                                    .and_then(|value| value.as_array())
+                                    .map(|items| {
+                                        items
+                                            .iter()
+                                            .filter_map(|value| value.as_str())
+                                            .map(|value| value.to_string())
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .unwrap_or_default();
+                                if let Some(cid) =
+                                    conversation_id.filter(|value| !value.trim().is_empty())
+                                {
+                                    self.remember_extension_pack_chat_credential_prompt(
+                                        cid,
+                                        pack_id,
+                                        pack_name,
+                                        connection_id,
+                                        &required_secrets,
+                                    )
+                                    .await;
+                                }
+                                let mut prompt = format!(
+                                    "{} is installed, but it still needs credentials before I can use it.\n\nUse the secure credential form that just appeared in this chat. Never paste secrets/API Keys/Password/Sensitive Data into normal chat.",
+                                    pack_name
+                                );
+                                if !required_secrets.is_empty() {
+                                    prompt.push_str("\n\nRequired values:");
+                                    for key in &required_secrets {
+                                        prompt.push_str(&format!("\n- `{}`", key));
+                                    }
+                                }
+                                if let Some(ref tx) = stream_tx {
+                                    queue_stream_event(
+                                        tx,
+                                        StreamEvent::ToolResult {
+                                            name: call.name.clone(),
+                                            content: prompt.clone(),
+                                        },
+                                    );
+                                }
+                                results.push(prompt);
+                                continue;
+                            }
+                            if let Some(cid) =
+                                conversation_id.filter(|value| !value.trim().is_empty())
+                            {
+                                self.clear_extension_pack_chat_credential_prompt(cid).await;
+                            }
+                        }
+                    }
+
                     if let Some(payload) = parse_workflow_missing_inputs_marker(&result) {
-                        if !Self::sensitive_like_input_keys(&payload.missing).is_empty() {
+                        if !payload.sensitive_missing.is_empty() {
                             if let Some(cid) =
                                 conversation_id.filter(|value| !value.trim().is_empty())
                             {
@@ -11457,6 +12138,23 @@ Requirements:\n\
                 }
                 Err(e) => {
                     tracing::error!("Action execution error: {}", e);
+                    if let Some(missing) =
+                        e.downcast_ref::<crate::runtime::MissingSecretPlaceholder>()
+                    {
+                        if let Some((prompt, _)) = self
+                            .raise_missing_secret_chat_prompt(
+                                missing,
+                                conversation_id,
+                                &call.name,
+                                None,
+                                stream_tx.as_ref(),
+                            )
+                            .await
+                        {
+                            results.push(prompt);
+                            continue;
+                        }
+                    }
                     if call.name == "browse" {
                         let target = call
                             .arguments
@@ -11849,6 +12547,198 @@ mod tests {
         assert!(message.contains("health endpoint"));
     }
 
+    #[test]
+    fn browser_auto_start_session_suppresses_manual_browser_calls_in_same_batch() {
+        let browser_auto = call(
+            "1",
+            "browser_auto",
+            json!({
+                "action": "start_session",
+                "task": "Open Hacker News login page and wait for handoff"
+            }),
+        );
+        let browser = call(
+            "2",
+            "browser",
+            json!({
+                "action": "create_session",
+                "url": "https://news.ycombinator.com/login"
+            }),
+        );
+        let browser_with_session = call(
+            "3",
+            "browser",
+            json!({
+                "action": "navigate",
+                "session_id": "existing-session",
+                "url": "https://news.ycombinator.com/login"
+            }),
+        );
+
+        assert!(Agent::tool_call_is_browser_auto_start_session(
+            &browser_auto
+        ));
+        assert!(Agent::should_suppress_manual_browser_call_for_browser_auto_batch(&browser, true));
+        assert!(
+            !Agent::should_suppress_manual_browser_call_for_browser_auto_batch(&browser, false)
+        );
+        assert!(
+            !Agent::should_suppress_manual_browser_call_for_browser_auto_batch(&browser_auto, true)
+        );
+        assert!(
+            !Agent::should_suppress_manual_browser_call_for_browser_auto_batch(
+                &browser_with_session,
+                true
+            )
+        );
+    }
+
+    #[test]
+    fn chat_browser_create_session_promotes_to_managed_browser_auto() {
+        let browser = call(
+            "1",
+            "browser",
+            json!({
+                "action": "create_session",
+                "url": "https://news.ycombinator.com/login"
+            }),
+        );
+        let authorization = crate::actions::ActionAuthorizationContext {
+            principal: Some(crate::actions::ActionCallerPrincipal::local_admin("web")),
+            surface: crate::actions::ActionExecutionSurface::Chat,
+            direct_user_intent: true,
+            current_turn_is_explicit_approval: false,
+            agent_name: None,
+            agent_access_scope: None,
+            capability_context_id: None,
+        };
+
+        assert!(
+            Agent::should_promote_browser_create_session_to_browser_auto(
+                &browser,
+                Some(&authorization)
+            )
+        );
+
+        let promoted = Agent::promote_browser_create_session_to_browser_auto(
+            &browser,
+            "Go to https://news.ycombinator.com/login and log in for me.",
+            "web",
+            Some("conv-123"),
+        );
+
+        assert_eq!(promoted.name, "browser_auto");
+        assert_eq!(
+            promoted.arguments.get("action").and_then(|v| v.as_str()),
+            Some("start_session")
+        );
+        assert_eq!(
+            promoted.arguments.get("channel").and_then(|v| v.as_str()),
+            Some("web")
+        );
+        assert_eq!(
+            promoted
+                .arguments
+                .get("conversation_id")
+                .and_then(|v| v.as_str()),
+            Some("conv-123")
+        );
+        assert_eq!(
+            promoted.arguments.get("task").and_then(|v| v.as_str()),
+            Some("Go to https://news.ycombinator.com/login and log in for me.")
+        );
+    }
+
+    #[test]
+    fn non_chat_browser_create_session_does_not_promote() {
+        let browser = call(
+            "1",
+            "browser",
+            json!({
+                "action": "create_session",
+                "url": "https://news.ycombinator.com/login"
+            }),
+        );
+        let authorization = crate::actions::ActionAuthorizationContext {
+            principal: None,
+            surface: crate::actions::ActionExecutionSurface::Background,
+            direct_user_intent: false,
+            current_turn_is_explicit_approval: false,
+            agent_name: None,
+            agent_access_scope: None,
+            capability_context_id: None,
+        };
+
+        assert!(
+            !Agent::should_promote_browser_create_session_to_browser_auto(
+                &browser,
+                Some(&authorization)
+            )
+        );
+    }
+
+    #[test]
+    fn browser_auto_start_session_inherits_chat_binding() {
+        let browser_auto = call(
+            "1",
+            "browser_auto",
+            json!({
+                "action": "start_session",
+                "task": "Open Hacker News and wait"
+            }),
+        );
+
+        let enriched =
+            Agent::enrich_browser_auto_start_session_call(&browser_auto, "web", Some("conv-456"));
+
+        assert_eq!(
+            enriched
+                .arguments
+                .get("channel")
+                .and_then(|value| value.as_str()),
+            Some("web")
+        );
+        assert_eq!(
+            enriched
+                .arguments
+                .get("conversation_id")
+                .and_then(|value| value.as_str()),
+            Some("conv-456")
+        );
+    }
+
+    #[test]
+    fn browser_auto_start_session_preserves_existing_binding() {
+        let browser_auto = call(
+            "1",
+            "browser_auto",
+            json!({
+                "action": "start_session",
+                "task": "Open Hacker News and wait",
+                "channel": "telegram",
+                "conversation_id": "telegram:123"
+            }),
+        );
+
+        let enriched =
+            Agent::enrich_browser_auto_start_session_call(&browser_auto, "web", Some("conv-456"));
+
+        assert_eq!(
+            enriched
+                .arguments
+                .get("channel")
+                .and_then(|value| value.as_str()),
+            Some("telegram")
+        );
+        assert_eq!(
+            enriched
+                .arguments
+                .get("conversation_id")
+                .and_then(|value| value.as_str()),
+            Some("telegram:123")
+        );
+    }
+
     #[tokio::test]
     async fn legacy_safety_allows_direct_trusted_chat_bypass() {
         let (_temp, safety) = safety_engine_with_require_approval_rule("app_deploy");
@@ -11864,15 +12754,14 @@ mod tests {
             current_turn_is_explicit_approval: false,
             agent_name: None,
             agent_access_scope: None,
+            capability_context_id: None,
         };
 
-        assert!(Agent::legacy_tool_call_allowed_by_safety(
-            &safety,
-            &deploy_call,
-            Some(&direct_chat)
-        )
-        .await
-        .expect("legacy safety check should succeed"));
+        assert!(
+            Agent::legacy_tool_call_allowed_by_safety(&safety, &deploy_call, Some(&direct_chat))
+                .await
+                .expect("legacy safety check should succeed")
+        );
         assert!(
             !Agent::legacy_tool_call_allowed_by_safety(&safety, &deploy_call, None)
                 .await
@@ -11915,15 +12804,18 @@ mod tests {
             current_turn_is_explicit_approval: false,
             agent_name: None,
             agent_access_scope: None,
+            capability_context_id: None,
         };
 
-        assert!(Agent::legacy_tool_call_allowed_by_safety(
-            &safety,
-            &file_write_call,
-            Some(&direct_chat),
-        )
-        .await
-        .expect("legacy safety check should succeed"));
+        assert!(
+            Agent::legacy_tool_call_allowed_by_safety(
+                &safety,
+                &file_write_call,
+                Some(&direct_chat),
+            )
+            .await
+            .expect("legacy safety check should succeed")
+        );
         assert!(
             !Agent::legacy_tool_call_allowed_by_safety(&safety, &file_write_call, None)
                 .await

@@ -12,6 +12,7 @@ pub mod capability_router;
 pub mod config;
 pub mod connect_flow;
 pub mod connector;
+pub mod companion;
 pub(crate) mod data_contract;
 pub mod data_lifecycle;
 pub(crate) mod document_search;
@@ -19,10 +20,12 @@ pub mod embeddings;
 pub mod execution;
 pub mod gateway;
 pub mod gateway_ops;
+pub mod integration_auth;
 pub mod integration_sync;
 pub mod intent;
 pub mod learning;
 pub mod live_run;
+pub mod memory_dedup;
 mod llm;
 pub(crate) mod llm_provider;
 pub mod model_failover;
@@ -35,9 +38,9 @@ pub mod planner;
 pub mod product_help;
 pub mod prompt_memory;
 pub mod prompt_policy;
+pub mod release_updates;
 pub mod request_shape;
 pub mod runtime_image;
-pub mod release_updates;
 pub mod secrets;
 pub mod self_evolve;
 pub mod self_tune;
@@ -76,6 +79,16 @@ pub use browser_profiles::{
 };
 pub use config::{
     AgentConfig, ModelCapabilityTier, ModelCostTier, ModelHealthScope, ModelRole, ModelSlot,
+};
+pub use companion::{
+    companion_presets, presets_response as companion_presets_response,
+    protocol_document as companion_protocol_document, CompanionAttestationClaim,
+    CompanionAuditEvent, CompanionCommand, CompanionCommandCreate, CompanionCommandStatus,
+    CompanionControlPlane, CompanionDevice, CompanionDeviceAttestation, CompanionDeviceState,
+    CompanionGrant, CompanionPairingClaim, CompanionPairingClaimResult, CompanionPairingSession,
+    CompanionPairingSessionCreate, CompanionPairingStatus, CompanionPresetsResponse,
+    CompanionProtocolDocument, CompanionRiskLevel,
+    CompanionTokenRotationRequest, CompanionTokenRotationResult,
 };
 pub use embeddings::EmbeddingClient;
 pub use execution::{
@@ -117,4 +130,6 @@ pub use nodes::{
 pub use planner::{ExecutionPlan, PlanPromptMode, PlanStep, PlanStepStatus, PlanSubstep};
 pub use prompt_memory::PromptMemory;
 pub use request_shape::RequestShapeAssessment;
+pub(crate) use task::{one_shot_reminder_is_expired, one_shot_reminder_needs_delay_notice};
+pub(crate) use task::{task_is_one_shot_scheduled_reminder, task_is_scheduled_reminder};
 pub use task::{status_for_task_approval, Task, TaskApproval, TaskQueue, TaskStatus};

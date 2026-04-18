@@ -1,5 +1,6 @@
 pub const LEGACY_PRODUCT_NAME: &str = "AgentArk";
 pub const PRODUCT_NAME: &str = "AgentArk";
+pub const PRODUCT_CATEGORY: &str = "Personal AI OS";
 pub const PRODUCT_SLUG: &str = "agentark";
 pub const PRODUCT_URI_SCHEME: &str = "agentark";
 pub const PROJECT_DIRS_QUALIFIER: &str = "com";

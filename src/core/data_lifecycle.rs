@@ -59,6 +59,10 @@ pub struct DataLifecycleSettings {
     pub experience_item_retention_days: u64,
     #[serde(default = "default_procedural_pattern_retention_days")]
     pub procedural_pattern_retention_days: u64,
+    #[serde(default = "default_recall_event_retention_days")]
+    pub recall_event_retention_days: u64,
+    #[serde(default = "default_recall_test_retention_days")]
+    pub recall_test_retention_days: u64,
     #[serde(default = "default_housekeeping_interval_secs")]
     pub housekeeping_interval_secs: u64,
     #[serde(default = "default_security_cleanup_interval_days")]
@@ -151,6 +155,14 @@ fn default_procedural_pattern_retention_days() -> u64 {
     365
 }
 
+fn default_recall_event_retention_days() -> u64 {
+    365
+}
+
+fn default_recall_test_retention_days() -> u64 {
+    365
+}
+
 fn default_housekeeping_interval_secs() -> u64 {
     3600
 }
@@ -189,6 +201,8 @@ impl Default for DataLifecycleSettings {
             learning_candidate_retention_days: default_learning_candidate_retention_days(),
             experience_item_retention_days: default_experience_item_retention_days(),
             procedural_pattern_retention_days: default_procedural_pattern_retention_days(),
+            recall_event_retention_days: default_recall_event_retention_days(),
+            recall_test_retention_days: default_recall_test_retention_days(),
             housekeeping_interval_secs: default_housekeeping_interval_secs(),
             security_cleanup_interval_days: default_security_cleanup_interval_days(),
             security_cleanup_idle_threshold_secs: default_security_cleanup_idle_threshold_secs(),
@@ -235,6 +249,10 @@ impl DataLifecycleSettings {
         self.procedural_pattern_retention_days = self
             .procedural_pattern_retention_days
             .min(MAX_RETENTION_DAYS);
+        self.recall_event_retention_days =
+            self.recall_event_retention_days.min(MAX_RETENTION_DAYS);
+        self.recall_test_retention_days =
+            self.recall_test_retention_days.min(MAX_RETENTION_DAYS);
         self.notification_cleanup_interval_secs = self
             .notification_cleanup_interval_secs
             .clamp(MIN_NOTIFICATION_INTERVAL_SECS, MAX_INTERVAL_SECS);

@@ -148,8 +148,7 @@ async fn gmail_exchange_code(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Token exchange failed ({}): {}", status, body));
+        return Err(format!("Token exchange failed ({})", status));
     }
 
     #[derive(Deserialize)]
@@ -1376,6 +1375,7 @@ body {{ font-family: system-ui; background: #1a1a2e; color: #eee; display: flex;
 
     match result {
         Ok(_) => {
+            let mut callback_warnings = Vec::new();
             if matches!(
                 &oauth_target,
                 PendingOAuthTarget::Integration { service_id }
@@ -1416,6 +1416,10 @@ body {{ font-family: system-ui; background: #1a1a2e; color: #eee; display: flex;
                         service_id,
                         error
                     );
+                    callback_warnings.push(format!(
+                        "Connected, but enabling runtime actions failed: {}",
+                        error
+                    ));
                 }
                 if let Err(error) = set_builtin_integration_user_disabled(
                     &config_dir,
@@ -1428,14 +1432,34 @@ body {{ font-family: system-ui; background: #1a1a2e; color: #eee; display: flex;
                         service_id,
                         error
                     );
+                    callback_warnings.push(format!(
+                        "Connected, but clearing manual disable markers failed: {}",
+                        error
+                    ));
                 }
             }
+            let (extension_packs, runtime) = {
+                let agent = state.agent.read().await;
+                (agent.extension_packs.clone(), agent.runtime.clone())
+            };
+            if let Err(error) = extension_packs.read().await.sync_to_runtime(&runtime).await {
+                tracing::warn!(
+                    "oauth_callback: connected '{}' but failed to sync extension-pack actions: {}",
+                    callback_label,
+                    error
+                );
+                callback_warnings.push(format!(
+                    "Connected, but extension-pack actions could not hot-sync: {}",
+                    error
+                ));
+            }
+            let callback_detail = callback_warnings.join(" ");
             let signal = match &oauth_target {
                 PendingOAuthTarget::Integration { service_id } => {
-                    oauth_callback_signal_script(service_id, "connected", "")
+                    oauth_callback_signal_script(service_id, "connected", &callback_detail)
                 }
                 PendingOAuthTarget::AuthProfile { profile_id } => {
-                    oauth_profile_callback_signal_script(profile_id, "connected", "")
+                    oauth_profile_callback_signal_script(profile_id, "connected", &callback_detail)
                 }
             };
             let html = format!(
@@ -3134,8 +3158,7 @@ async fn calendar_exchange_code(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Token exchange failed ({}): {}", status, body));
+        return Err(format!("Token exchange failed ({})", status));
     }
 
     #[derive(Deserialize)]

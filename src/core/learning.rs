@@ -1,19 +1,18 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::Result;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::core::self_evolve::skill_evolution::{self, SkillMetricsSnapshot, SkillWindowDirection};
 use crate::core::{ExecutionRun, ExecutionRunStatus, ToolAttempt};
 use crate::storage::{
-    experience_edge, experience_item, experience_run, learning_candidate, procedural_pattern,
-    KvLeaseGuard, Storage,
+    KvLeaseGuard, Storage, experience_edge, experience_item, experience_run, learning_candidate,
+    procedural_pattern,
 };
 
 pub const LEARNING_ENABLED_KEY: &str = "learning_enabled_v1";
-pub const LEARNING_LOCAL_ONLY_KEY: &str = "learning_local_only_v1";
 pub const LEARNING_MODEL_SLOT_KEY: &str = "learning_model_slot_v1";
 pub const LEARNING_QUEUE_CAP_KEY: &str = "learning_queue_cap_v1";
 const LEARNING_CANDIDATE_GENERATION_LEASE_KEY: &str = "learning_candidate_generation_lease_v1";
@@ -21,6 +20,22 @@ const LEARNING_CANDIDATE_GENERATION_LEASE_TTL_SECS: i64 = 10 * 60;
 const LEARNING_CANDIDATE_GENERATION_LEASE_HEARTBEAT_SECS: u64 = 60;
 const CORRECTION_WINDOW_MINUTES: i64 = 30;
 const DEFAULT_QUEUE_CAP: usize = 64;
+pub(crate) const HEURISTIC_REFLECTION_ORIGIN: &str = "heuristic_reflection";
+pub(crate) const HEURISTIC_REFLECTION_VERSION: &str = "heuristic-reflection-v1";
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReflectedHeuristic {
+    pub heuristic: String,
+    pub polarity: String,
+    pub confidence: f64,
+    pub applicability: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReflectedHeuristicPersistOutcome {
+    pub lesson_id: String,
+    pub merged: bool,
+}
 
 fn safe_truncate(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
@@ -239,6 +254,19 @@ fn build_decision_episode(
     } else {
         Some(Value::Object(decision))
     }
+}
+
+fn prompt_telemetry_from_logs(
+    logs: &[crate::storage::entities::operational_log::Model],
+) -> Option<Value> {
+    logs.iter()
+        .filter(|row| row.event_type == "prompt_telemetry")
+        .max_by_key(|row| row.created_at.as_str())
+        .and_then(|row| {
+            row.payload
+                .as_deref()
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        })
 }
 
 fn suggested_steps_from_tools(tool_names: &[String]) -> Vec<String> {
@@ -544,17 +572,6 @@ pub async fn load_learning_enabled(storage: &Storage) -> bool {
         .unwrap_or(true)
 }
 
-pub async fn load_learning_local_only(storage: &Storage) -> bool {
-    storage
-        .get(LEARNING_LOCAL_ONLY_KEY)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .map(|value| !value.trim().eq_ignore_ascii_case("false"))
-        .unwrap_or(true)
-}
-
 pub async fn load_learning_model_slot(storage: &Storage) -> Option<String> {
     storage
         .get(LEARNING_MODEL_SLOT_KEY)
@@ -667,7 +684,7 @@ pub async fn record_execution_experience(
         "tool_count": tool_attempts.len(),
         "degraded": matches!(execution_run.status, ExecutionRunStatus::Degraded),
     });
-    let decision_episode = if let Some(trace_id) = execution_run
+    let (decision_episode, prompt_telemetry) = if let Some(trace_id) = execution_run
         .trace_id
         .as_deref()
         .filter(|value| !value.trim().is_empty())
@@ -676,9 +693,12 @@ pub async fn record_execution_experience(
             .list_operational_logs_for_trace_ids(&[trace_id.to_string()], 64)
             .await
             .unwrap_or_default();
-        build_decision_episode(&logs)
+        (
+            build_decision_episode(&logs),
+            prompt_telemetry_from_logs(&logs),
+        )
     } else {
-        None
+        (None, None)
     };
     if let Some(obj) = metadata.as_object_mut() {
         if let Some(version) = classifier_prompt_version.filter(|value| !value.trim().is_empty()) {
@@ -695,6 +715,9 @@ pub async fn record_execution_experience(
         }
         if let Some(decision_episode) = decision_episode {
             obj.insert("decision_episode".to_string(), decision_episode);
+        }
+        if let Some(prompt_telemetry) = prompt_telemetry {
+            obj.insert("prompt_telemetry".to_string(), prompt_telemetry);
         }
     }
     let experience_id = build_experience_run_id(&execution_run.id);
@@ -725,6 +748,12 @@ pub async fn record_execution_experience(
             consolidated: false,
             accepted_at: None,
             corrected_at: None,
+            heuristic_reflected: false,
+            heuristic_reflection_status: Some("pending".to_string()),
+            heuristic_reflection_attempted_at: None,
+            heuristic_reflection_completed_at: None,
+            heuristic_lesson_id: None,
+            heuristic_reflection_error: None,
             created_at: execution_run.created_at.clone(),
             updated_at: execution_run.updated_at.clone(),
         })
@@ -884,6 +913,7 @@ pub async fn sync_user_preference_to_experience_item(
                 .map(|item| item.created_at.clone())
                 .unwrap_or_else(|| now.clone()),
             updated_at: now,
+            embedding: existing.as_ref().and_then(|item| item.embedding.clone()),
         })
         .await?;
 
@@ -996,6 +1026,7 @@ async fn consolidate_run(storage: &Storage, run: &experience_run::Model) -> Resu
                 .map(|item| item.created_at.clone())
                 .unwrap_or_else(|| now.clone()),
             updated_at: now.clone(),
+            embedding: existing.as_ref().and_then(|item| item.embedding.clone()),
         })
         .await?;
 
@@ -1179,6 +1210,359 @@ fn build_strategy_candidate_profile(
         ],
         task_guidance,
     }
+}
+
+fn normalize_semantic_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn semantic_token_set(value: &str) -> HashSet<String> {
+    normalize_semantic_text(value)
+        .split_whitespace()
+        .filter(|token| token.len() >= 3)
+        .map(|token| token.to_string())
+        .collect()
+}
+
+fn semantic_similarity_score(left: &str, right: &str) -> f64 {
+    let left_tokens = semantic_token_set(left);
+    let right_tokens = semantic_token_set(right);
+    if left_tokens.is_empty() || right_tokens.is_empty() {
+        return 0.0;
+    }
+    let overlap = left_tokens.intersection(&right_tokens).count() as f64;
+    let union = left_tokens.union(&right_tokens).count() as f64;
+    if union <= f64::EPSILON {
+        0.0
+    } else {
+        overlap / union
+    }
+}
+
+fn experience_item_metadata_text<'a>(
+    item: &'a experience_item::Model,
+    field: &str,
+) -> Option<&'a str> {
+    item.metadata
+        .get(field)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+pub(crate) fn experience_item_is_reflected_heuristic(item: &experience_item::Model) -> bool {
+    item.kind == "lesson"
+        && experience_item_metadata_text(item, "origin") == Some(HEURISTIC_REFLECTION_ORIGIN)
+}
+
+pub(crate) fn reflected_heuristic_task_type<'a>(
+    item: &'a experience_item::Model,
+) -> Option<&'a str> {
+    experience_item_metadata_text(item, "task_type")
+}
+
+pub(crate) fn reflected_heuristic_polarity<'a>(
+    item: &'a experience_item::Model,
+) -> Option<&'a str> {
+    experience_item_metadata_text(item, "polarity")
+}
+
+pub(crate) fn reflected_heuristic_applicability<'a>(
+    item: &'a experience_item::Model,
+) -> Option<&'a str> {
+    experience_item_metadata_text(item, "applicability")
+}
+
+pub(crate) fn reflected_heuristic_confidence(item: &experience_item::Model) -> f64 {
+    item.metadata
+        .get("reflection_confidence")
+        .and_then(|value| value.as_f64())
+        .unwrap_or(item.confidence)
+        .clamp(0.0, 1.0)
+}
+
+fn reflected_heuristic_merge_score(
+    existing: &experience_item::Model,
+    run: &experience_run::Model,
+    heuristic: &ReflectedHeuristic,
+) -> f64 {
+    if !experience_item_is_reflected_heuristic(existing) {
+        return 0.0;
+    }
+    if reflected_heuristic_polarity(existing) != Some(heuristic.polarity.as_str()) {
+        return 0.0;
+    }
+    let existing_task_type = reflected_heuristic_task_type(existing)
+        .or(run.task_type.as_deref())
+        .unwrap_or("general");
+    let current_task_type = run.task_type.as_deref().unwrap_or("general");
+    if existing_task_type != current_task_type {
+        return 0.0;
+    }
+
+    let existing_text = format!(
+        "{} {}",
+        existing.content,
+        reflected_heuristic_applicability(existing).unwrap_or("")
+    );
+    let incoming_text = format!(
+        "{} {}",
+        heuristic.heuristic,
+        heuristic.applicability.as_deref().unwrap_or("")
+    );
+    let mut score = semantic_similarity_score(&existing_text, &incoming_text);
+    if normalize_semantic_text(&existing.content) == normalize_semantic_text(&heuristic.heuristic) {
+        score = score.max(1.0);
+    }
+    score
+}
+
+fn reflected_heuristic_title(run: &experience_run::Model, polarity: &str) -> String {
+    let task_type = run.task_type.as_deref().unwrap_or("general");
+    match polarity {
+        "negative" => format!("Reflected caution for {}", task_type),
+        _ => format!("Reflected heuristic for {}", task_type),
+    }
+}
+
+fn build_reflected_heuristic_normalized_key(
+    run: &experience_run::Model,
+    heuristic: &ReflectedHeuristic,
+) -> String {
+    let task_type = run.task_type.as_deref().unwrap_or("general");
+    let normalized = normalize_semantic_text(&heuristic.heuristic);
+    let applicability = normalize_semantic_text(heuristic.applicability.as_deref().unwrap_or(""));
+    format!(
+        "lesson::heuristic::{}::{}::{}",
+        task_type,
+        heuristic.polarity,
+        short_hash(&[normalized.as_str(), applicability.as_str()])
+    )
+}
+
+fn build_reflected_heuristic_strategy_profile(
+    task_type: &str,
+    lessons: &[experience_item::Model],
+) -> crate::core::self_evolve::strategy_runtime::ToolStrategyProfile {
+    let mut task_guidance = HashMap::new();
+    let mut lines = vec![
+        format!(
+            "Apply these learned heuristics when handling similar {} requests.",
+            task_type
+        ),
+        "Use them as decision guidance, and adapt when the current context clearly differs."
+            .to_string(),
+    ];
+    for lesson in lessons {
+        let content = lesson.content.trim();
+        if content.is_empty() {
+            continue;
+        }
+        lines.push(content.to_string());
+    }
+    lines.truncate(6);
+    task_guidance.insert(task_type.to_string(), lines);
+    crate::core::self_evolve::strategy_runtime::ToolStrategyProfile {
+        version: format!(
+            "learned-strategy-{}",
+            short_hash(&[
+                task_type,
+                &lessons
+                    .iter()
+                    .map(|lesson| lesson.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join("|"),
+            ])
+        ),
+        updated_at: Some(chrono::Utc::now().to_rfc3339()),
+        default_guidance: vec![
+            "Prefer reflected heuristics from successful and corrected runs before improvising a new tool plan."
+                .to_string(),
+        ],
+        task_guidance,
+    }
+}
+
+pub(crate) async fn upsert_reflected_heuristic_lesson(
+    storage: &Storage,
+    run: &experience_run::Model,
+    heuristic: &ReflectedHeuristic,
+) -> Result<ReflectedHeuristicPersistOutcome> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let scope = run.scope.as_str();
+    let project_id = run.project_id.as_deref();
+    let conversation_id = run.conversation_id.as_deref();
+    let current_task_type = run.task_type.as_deref().unwrap_or("general");
+    let lessons = storage
+        .list_active_experience_items(&["lesson"], project_id, conversation_id, 48)
+        .await?
+        .into_iter()
+        .filter(|item| item.scope == scope)
+        .filter(|item| item.project_id.as_deref() == project_id)
+        .filter(|item| item.conversation_id.as_deref() == conversation_id)
+        .filter(experience_item_is_reflected_heuristic)
+        .collect::<Vec<_>>();
+
+    let existing_match = lessons
+        .into_iter()
+        .map(|item| {
+            let score = reflected_heuristic_merge_score(&item, run, heuristic);
+            (item, score)
+        })
+        .filter(|(_, score)| *score >= 0.62)
+        .max_by(|left, right| left.1.total_cmp(&right.1));
+
+    let lesson_id;
+    let merged;
+    if let Some((mut existing, _)) = existing_match {
+        let merged_confidence =
+            ((existing.confidence + heuristic.confidence.clamp(0.0, 1.0)) / 2.0).clamp(0.35, 0.99);
+        let existing_content = normalize_semantic_text(&existing.content);
+        let incoming_content = normalize_semantic_text(&heuristic.heuristic);
+        if incoming_content.len() > existing_content.len()
+            && heuristic.confidence >= existing.confidence
+        {
+            existing.content = safe_truncate(&heuristic.heuristic, 260);
+        }
+
+        let mut metadata = existing.metadata.as_object().cloned().unwrap_or_default();
+        metadata.insert(
+            "origin".to_string(),
+            Value::String(HEURISTIC_REFLECTION_ORIGIN.to_string()),
+        );
+        metadata.insert("source_run_id".to_string(), Value::String(run.id.clone()));
+        metadata.insert(
+            "intent_key".to_string(),
+            Value::String(run.intent_key.clone()),
+        );
+        metadata.insert(
+            "task_type".to_string(),
+            Value::String(current_task_type.to_string()),
+        );
+        metadata.insert(
+            "tool_sequence_digest".to_string(),
+            run.tool_sequence_digest
+                .as_ref()
+                .map(|value| Value::String(value.clone()))
+                .unwrap_or(Value::Null),
+        );
+        metadata.insert(
+            "polarity".to_string(),
+            Value::String(heuristic.polarity.clone()),
+        );
+        metadata.insert(
+            "reflection_version".to_string(),
+            Value::String(HEURISTIC_REFLECTION_VERSION.to_string()),
+        );
+        metadata.insert(
+            "reflection_confidence".to_string(),
+            json!(merged_confidence),
+        );
+        metadata.insert("last_reflected_at".to_string(), Value::String(now.clone()));
+        if let Some(applicability) = heuristic
+            .applicability
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            metadata.insert(
+                "applicability".to_string(),
+                Value::String(safe_truncate(applicability.trim(), 220)),
+            );
+        }
+
+        existing.confidence = merged_confidence;
+        existing.support_count = existing.support_count.saturating_add(1);
+        existing.metadata = Value::Object(metadata);
+        existing.last_supported_at = Some(now.clone());
+        existing.updated_at = now.clone();
+        storage.upsert_experience_item(&existing).await?;
+        lesson_id = existing.id;
+        merged = true;
+    } else {
+        let normalized_key = build_reflected_heuristic_normalized_key(run, heuristic);
+        let id = build_item_id(
+            "lesson",
+            scope,
+            project_id,
+            conversation_id,
+            &normalized_key,
+        );
+        let created_at = chrono::Utc::now().to_rfc3339();
+        storage
+            .upsert_experience_item(&experience_item::Model {
+                id: id.clone(),
+                kind: "lesson".to_string(),
+                scope: scope.to_string(),
+                project_id: run.project_id.clone(),
+                conversation_id: run.conversation_id.clone(),
+                title: reflected_heuristic_title(run, &heuristic.polarity),
+                content: safe_truncate(&heuristic.heuristic, 260),
+                normalized_key,
+                confidence: heuristic.confidence.clamp(0.35, 0.99),
+                support_count: 1,
+                contradiction_count: 0,
+                status: "active".to_string(),
+                metadata: json!({
+                    "origin": HEURISTIC_REFLECTION_ORIGIN,
+                    "source_run_id": run.id.clone(),
+                    "intent_key": run.intent_key.clone(),
+                    "task_type": current_task_type,
+                    "tool_sequence_digest": run.tool_sequence_digest.clone(),
+                    "polarity": heuristic.polarity.clone(),
+                    "reflection_version": HEURISTIC_REFLECTION_VERSION,
+                    "reflection_confidence": heuristic.confidence.clamp(0.0, 1.0),
+                    "applicability": heuristic.applicability.as_deref().map(|value| safe_truncate(value.trim(), 220)),
+                    "last_reflected_at": now.clone(),
+                }),
+                last_supported_at: Some(created_at.clone()),
+                last_contradicted_at: None,
+                created_at: created_at.clone(),
+                updated_at: created_at,
+                embedding: None,
+            })
+            .await?;
+        lesson_id = id;
+        merged = false;
+    }
+
+    let edge_now = chrono::Utc::now().to_rfc3339();
+    storage
+        .upsert_experience_edge(&experience_edge::Model {
+            id: stable_id(
+                "edge",
+                &[run.id.as_str(), "derived_from", lesson_id.as_str()],
+            ),
+            source_ref: lesson_id.clone(),
+            source_kind: "experience_item".to_string(),
+            target_ref: run.id.clone(),
+            target_kind: "experience_run".to_string(),
+            edge_type: "derived_from".to_string(),
+            weight: heuristic.confidence.clamp(0.25, 1.0),
+            source_run_id: Some(run.id.clone()),
+            metadata: json!({
+                "intent_key": run.intent_key.clone(),
+                "task_type": current_task_type,
+                "heuristic_reflection": true,
+                "merged": merged,
+            }),
+            created_at: edge_now.clone(),
+            updated_at: edge_now,
+        })
+        .await?;
+
+    Ok(ReflectedHeuristicPersistOutcome { lesson_id, merged })
 }
 
 fn canonical_memory_merge_signature(item: &experience_item::Model) -> Option<String> {
@@ -1864,6 +2248,108 @@ pub async fn run_candidate_generation(storage: &Storage, data_dir: &Path) -> Res
             }
         }
 
+        let reflected_lessons = storage
+            .list_active_experience_items(&["lesson"], None, None, cap)
+            .await?
+            .into_iter()
+            .filter(experience_item_is_reflected_heuristic)
+            .collect::<Vec<_>>();
+        let mut heuristic_groups: HashMap<String, Vec<experience_item::Model>> = HashMap::new();
+        for lesson in reflected_lessons {
+            if lesson.support_count < 2 || reflected_heuristic_confidence(&lesson) < 0.72 {
+                continue;
+            }
+            let task_type = reflected_heuristic_task_type(&lesson).unwrap_or("general");
+            let subject_key = format!(
+                "heuristic_strategy::{}::{}::{}::{}",
+                lesson.scope,
+                lesson.project_id.as_deref().unwrap_or(""),
+                lesson.conversation_id.as_deref().unwrap_or(""),
+                task_type
+            );
+            heuristic_groups.entry(subject_key).or_default().push(lesson);
+        }
+        for (subject_key, mut lessons) in heuristic_groups {
+            if !lease_alive.load(std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    "Stopping learning candidate generation after lease ownership was lost"
+                );
+                break;
+            }
+            lessons.sort_by(|left, right| {
+                reflected_heuristic_confidence(right)
+                    .total_cmp(&reflected_heuristic_confidence(left))
+                    .then_with(|| right.support_count.cmp(&left.support_count))
+                    .then_with(|| right.updated_at.cmp(&left.updated_at))
+            });
+
+            let mut selected = Vec::new();
+            let mut seen = HashSet::new();
+            for lesson in lessons {
+                let dedupe_key = normalize_semantic_text(&lesson.content);
+                if !seen.insert(dedupe_key) {
+                    continue;
+                }
+                selected.push(lesson);
+                if selected.len() >= 4 {
+                    break;
+                }
+            }
+            if selected.is_empty() {
+                continue;
+            }
+
+            let task_type = reflected_heuristic_task_type(&selected[0]).unwrap_or("general");
+            let avg_confidence = selected
+                .iter()
+                .map(reflected_heuristic_confidence)
+                .sum::<f64>()
+                / selected.len() as f64;
+            let strategy_profile =
+                build_reflected_heuristic_strategy_profile(task_type, &selected);
+            let evidence_refs = Value::Array(
+                selected
+                    .iter()
+                    .map(|lesson| Value::String(lesson.id.clone()))
+                    .collect(),
+            );
+            let now = chrono::Utc::now().to_rfc3339();
+            if !apply_candidate_write_outcome(
+                upsert_generated_learning_candidate(
+                    storage,
+                    &lease_guard,
+                    learning_candidate::Model {
+                        id: stable_id("candidate", &["strategy", subject_key.as_str()]),
+                        candidate_type: "strategy".to_string(),
+                        subject_key: subject_key.clone(),
+                        title: format!("Strategy candidate from reflected heuristics: {}", task_type),
+                        summary: Some(
+                            "Generated from repeated reflected heuristics in the background learning loop."
+                                .to_string(),
+                        ),
+                        project_id: selected[0].project_id.clone(),
+                        conversation_id: selected[0].conversation_id.clone(),
+                        pattern_id: None,
+                        evidence_refs,
+                        proposed_content: serde_json::to_value(strategy_profile)
+                            .unwrap_or(Value::Null),
+                        confidence: avg_confidence.clamp(0.45, 0.98),
+                        approval_status: "draft".to_string(),
+                        review_notes: None,
+                        reviewed_at: None,
+                        approved_ref: None,
+                        created_at: now.clone(),
+                        updated_at: now,
+                    },
+                )
+                .await?,
+                &mut generated,
+                &lease_alive,
+            ) {
+                break;
+            }
+        }
+
         for skill in skill_catalog {
             if !lease_alive.load(std::sync::atomic::Ordering::Relaxed) {
                 tracing::warn!(
@@ -2266,9 +2752,11 @@ mod tests {
         };
         let action_name = candidate_action_name(&pattern);
         assert!(action_name.starts_with("learned-fix-tool-bug-flow"));
-        assert!(action_name
-            .chars()
-            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-'));
+        assert!(
+            action_name
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+        );
     }
 
     #[test]
@@ -2299,6 +2787,7 @@ mod tests {
             last_contradicted_at: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
+            embedding: None,
         };
         let mut variant = base.clone();
         variant.id = "item-2".to_string();
@@ -2334,6 +2823,7 @@ mod tests {
             last_contradicted_at: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
+            embedding: None,
         };
         assert!(experience_item_is_external_source(&item));
     }

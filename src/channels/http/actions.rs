@@ -57,6 +57,8 @@ struct ActionContentResponse {
 #[derive(Debug, Deserialize)]
 pub(super) struct ActionContentUpdate {
     pub content: String,
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// Create action request
@@ -64,7 +66,7 @@ pub(super) struct ActionContentUpdate {
 pub(super) struct CreateActionRequest {
     pub name: String,
     pub content: String,
-    /// Force-add even if security verification blocks it
+    /// Request install after non-blocking warnings. Blocking security findings still stop it.
     #[serde(default)]
     pub force: bool,
 }
@@ -76,7 +78,7 @@ pub(super) struct ImportActionRequest {
     /// Override the action name (otherwise derived from URL)
     #[serde(default)]
     pub name: Option<String>,
-    /// Force-add even if security verification blocks it
+    /// Request install after non-blocking warnings. Blocking security findings still stop it.
     #[serde(default)]
     pub force: bool,
     /// Model to inject into frontmatter (e.g. "anthropic/claude-sonnet-4-20250514")
@@ -251,32 +253,102 @@ pub(super) async fn update_action_content(
 ) -> Response {
     let agent_guard = state.agent.read().await;
 
-    // Check if action exists and is editable
-    match agent_guard
-        .runtime
-        .update_action_content(&name, &update.content)
-        .await
-    {
-        Ok(true) => {
-            let review = match agent_guard.runtime.refresh_action_review_state(&name).await {
-                Ok(Some(review)) => Some(action_review_info(review)),
-                Ok(None) | Err(_) => agent_guard
+    let existing = match agent_guard.runtime.get_action_content(&name).await {
+        Ok(Some((info, _))) => info,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("Skill '{}' not found", name),
+                }),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    if existing.source == crate::actions::ActionSource::System {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "Skill is not editable (system skill)".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    if let Some(declared_name) = extract_skill_name_from_frontmatter(&update.content) {
+        if declared_name != name {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!(
+                        "Skill frontmatter name '{}' must match update target '{}'",
+                        declared_name, name
+                    ),
+                }),
+            )
+                .into_response();
+        }
+    }
+
+    let semantic_review = crate::security::skill_review::review_skill_import_with_configured_model(
+        &agent_guard.llm,
+        &agent_guard.config_dir,
+        &format!("local://skills/{}", name),
+        &name,
+        &update.content,
+    )
+    .await;
+    let blocked = semantic_review.policy.blocked;
+    if blocked {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "blocked",
+                "message": format!("Skill '{}' update blocked by semantic security policy", name),
+                "review": agent_guard
                     .runtime
                     .get_action_review(&name)
                     .await
                     .map(action_review_info),
-            };
+                "security": semantic_review_security_json(&semantic_review)
+            })),
+        )
+            .into_response();
+    }
+
+    match agent_guard
+        .runtime
+        .update_semantically_reviewed_action(&name, &update.content, &semantic_review, update.force)
+        .await
+    {
+        Ok(Some(review)) => {
+            let needs_secrets = !review.missing_env.is_empty();
+            let review = action_review_info(review);
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
-                    "status": "ok",
-                    "message": "Skill updated",
-                    "review": review
+                    "status": if needs_secrets { "needs_secrets" } else { "ok" },
+                    "message": if needs_secrets {
+                        format!("Skill '{}' updated, but needs secrets configured", name)
+                    } else {
+                        format!("Skill '{}' updated", name)
+                    },
+                    "review": review,
+                    "security": semantic_review_security_json(&semantic_review)
                 })),
             )
                 .into_response()
         }
-        Ok(false) => (
+        Ok(None) => (
             StatusCode::FORBIDDEN,
             Json(ErrorResponse {
                 error: "Skill is not editable (system skill)".to_string(),
@@ -363,10 +435,40 @@ pub(super) struct ActionEnabledRequest {
     enabled: bool,
 }
 
+fn split_frontmatter_block(content: &str) -> Option<(&str, &str)> {
+    let body = content
+        .strip_prefix("---\r\n")
+        .or_else(|| content.strip_prefix("---\n"))?;
+    let mut consumed = 0usize;
+    for segment in body.split_inclusive('\n') {
+        let line = segment.trim_end_matches(&['\r', '\n'][..]);
+        if line == "---" {
+            let rest_start = consumed + segment.len();
+            return Some((&body[..consumed], &body[rest_start..]));
+        }
+        consumed += segment.len();
+    }
+    None
+}
+
 fn extract_frontmatter_text(content: &str) -> Option<&str> {
-    let stripped = content.strip_prefix("---")?;
-    let end = stripped.find("---")?;
-    Some(&stripped[..end])
+    split_frontmatter_block(content).map(|(frontmatter, _)| frontmatter)
+}
+
+fn extract_skill_name_from_frontmatter(content: &str) -> Option<String> {
+    let frontmatter = extract_frontmatter_text(content)?;
+    let parsed = serde_yaml::from_str::<serde_yaml::Value>(frontmatter).ok()?;
+    let mapping = parsed.as_mapping()?;
+    for (key, value) in mapping {
+        if key.as_str() == Some("name") {
+            return value
+                .as_str()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string);
+        }
+    }
+    None
 }
 
 fn unique_push(out: &mut Vec<String>, s: String) {
@@ -384,120 +486,42 @@ fn is_known_skill_catalog_host(host: &str) -> bool {
 
 fn extract_required_envs_from_frontmatter(frontmatter: &str) -> Vec<String> {
     let mut envs: Vec<String> = Vec::new();
-
-    // JSON-style embedded metadata e.g. `"env": ["OPENAI_API_KEY"]`
-    let re_env_arr = regex::Regex::new(r#"(?s)"env"\s*:\s*\[([^\]]*)\]"#).ok();
-    let re_quoted = regex::Regex::new(r#""([A-Z0-9_]{2,})""#).ok();
-    if let (Some(re_env_arr), Some(re_quoted)) = (re_env_arr, re_quoted) {
-        for cap in re_env_arr.captures_iter(frontmatter) {
-            if let Some(inner) = cap.get(1).map(|m| m.as_str()) {
-                for c in re_quoted.captures_iter(inner) {
-                    if let Some(name) = c.get(1).map(|m| m.as_str()) {
-                        unique_push(&mut envs, name.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    // Metadata field: `"primaryEnv": "OPENAI_API_KEY"`
-    let re_primary = regex::Regex::new(r#""primaryEnv"\s*:\s*"([A-Z0-9_]{2,})""#).ok();
-    if let Some(re_primary) = re_primary {
-        for cap in re_primary.captures_iter(frontmatter) {
-            if let Some(name) = cap.get(1).map(|m| m.as_str()) {
-                unique_push(&mut envs, name.to_string());
-            }
-        }
-    }
-
-    // Simple YAML-ish lists supported as a fallback:
-    // secrets: [FOO, BAR]  OR  secrets:\n  - FOO
-    let mut in_list: Option<&str> = None;
-    for raw in frontmatter.lines() {
-        let line = raw.trim_end();
-        let t = line.trim();
-        if t.starts_with("secrets:") || t.starts_with("env:") || t.starts_with("required_env:") {
-            in_list = Some(t.split(':').next().unwrap_or("").trim());
-            // Inline list: key: [A, B]
-            if let Some(start) = t.find('[') {
-                if let Some(end) = t.rfind(']') {
-                    if end > start {
-                        let inner = &t[start + 1..end];
-                        for part in inner.split(',') {
-                            let name = part.trim().trim_matches('"').trim_matches('\'');
-                            if is_env_var_style_key(name) {
-                                unique_push(&mut envs, name.to_string());
-                            }
-                        }
-                    }
-                }
-            } else if let Some((_k, rhs)) = t.split_once(':') {
-                // Scalar form: env: OPENAI_API_KEY
-                let name = rhs.trim().trim_matches('"').trim_matches('\'');
-                if is_env_var_style_key(name) {
-                    unique_push(&mut envs, name.to_string());
-                }
-            }
-            continue;
-        }
-        // Stop list if we hit a new top-level key.
-        if !raw.starts_with(' ') && !raw.starts_with('\t') && t.contains(':') {
-            in_list = None;
-        }
-        if in_list.is_some() {
-            if let Some(item) = t.strip_prefix("- ") {
-                let name = item.trim().trim_matches('"').trim_matches('\'');
-                if is_env_var_style_key(name) {
-                    unique_push(&mut envs, name.to_string());
-                }
-            }
-        }
+    if let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(frontmatter) {
+        collect_required_envs_from_yaml(&value, &mut envs);
     }
 
     envs
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ImportRiskSummary {
-    score_10: f32,
-    band: &'static str,
-    total_findings: usize,
-    contextual_findings: usize,
+fn collect_required_envs_from_yaml(value: &serde_yaml::Value, envs: &mut Vec<String>) {
+    match value {
+        serde_yaml::Value::Mapping(map) => {
+            for value in map.values() {
+                collect_required_envs_from_yaml(value, envs);
+            }
+        }
+        serde_yaml::Value::Sequence(items) => {
+            for item in items {
+                collect_required_envs_from_yaml(item, envs);
+            }
+        }
+        serde_yaml::Value::String(text) => {
+            for item in split_env_candidate_text(text) {
+                if item.contains('_') && is_env_var_style_key(&item) {
+                    unique_push(envs, item);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ImportRiskPolicy {
-    severity_score_divisor: f32,
-    max_score: f32,
-    contextual_discount_strong_ratio: f32,
-    contextual_discount_strong_multiplier: f32,
-    contextual_discount_partial_ratio: f32,
-    contextual_discount_partial_multiplier: f32,
-    contextual_floor_ratio: f32,
-    contextual_malicious_floor: f32,
-    review_floor: f32,
-    risky_floor: f32,
-    secure_band_max: f32,
-    review_band_max: f32,
-}
-
-const IMPORT_RISK_POLICY: ImportRiskPolicy = ImportRiskPolicy {
-    severity_score_divisor: 4.0,
-    max_score: 10.0,
-    contextual_discount_strong_ratio: 0.75,
-    contextual_discount_strong_multiplier: 0.65,
-    contextual_discount_partial_ratio: 0.5,
-    contextual_discount_partial_multiplier: 0.8,
-    contextual_floor_ratio: 0.8,
-    contextual_malicious_floor: 4.0,
-    review_floor: 5.0,
-    risky_floor: 8.5,
-    secure_band_max: 5.0,
-    review_band_max: 8.0,
-};
-
-fn is_contextual_import_finding(finding: &crate::security::action_guard::AnalysisFinding) -> bool {
-    finding.is_contextual_import_signal()
+fn split_env_candidate_text(text: &str) -> Vec<String> {
+    text.split(|ch: char| ch == ',' || ch.is_whitespace() || ch == '[' || ch == ']')
+        .map(|item| item.trim().trim_matches('"').trim_matches('\''))
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn import_finding_json(
@@ -510,71 +534,30 @@ fn import_finding_json(
         "explanation": finding.import_explanation(),
         "matched_text": finding.matched_text,
         "line": finding.line_number,
+        "file": finding.file_path,
         "severity": finding.severity,
         "contextual": finding.is_contextual_import_signal(),
     })
 }
 
-fn compute_import_risk_summary(
-    static_analysis: &crate::security::action_guard::StaticAnalysisResult,
-    blocked: bool,
-) -> ImportRiskSummary {
-    let policy = IMPORT_RISK_POLICY;
-    let total_findings = static_analysis.findings.len();
-    let contextual_findings = static_analysis
-        .findings
-        .iter()
-        .filter(|f| is_contextual_import_finding(f))
-        .count();
-
-    let mut score = ((static_analysis.total_severity as f32) / policy.severity_score_divisor)
-        .min(policy.max_score);
-    let contextual_ratio = if total_findings > 0 {
-        (contextual_findings as f32) / (total_findings as f32)
-    } else {
-        0.0
-    };
-    if contextual_ratio >= policy.contextual_discount_strong_ratio {
-        score *= policy.contextual_discount_strong_multiplier;
-    } else if contextual_ratio >= policy.contextual_discount_partial_ratio {
-        score *= policy.contextual_discount_partial_multiplier;
-    }
-
-    match static_analysis.threat_level {
-        crate::security::action_guard::ThreatLevel::Malicious => {
-            // When most findings are standard integration patterns (env refs,
-            // credential examples, curl/https), keep the score explainable.
-            if contextual_ratio >= policy.contextual_floor_ratio {
-                score = score.max(policy.contextual_malicious_floor);
-            } else {
-                score = score.max(policy.risky_floor);
-            }
-        }
-        crate::security::action_guard::ThreatLevel::Suspicious => {
-            score = score.max(policy.review_floor);
-        }
-        crate::security::action_guard::ThreatLevel::Clean => {}
-    }
-    if blocked && contextual_ratio < policy.contextual_floor_ratio {
-        score = score.max(policy.risky_floor);
-    } else if blocked {
-        score = score.max(policy.review_floor);
-    }
-    let score_10 = ((score.clamp(0.0, policy.max_score)) * 10.0).round() / 10.0;
-    let band = if score_10 < policy.secure_band_max {
-        "secure"
-    } else if score_10 < policy.review_band_max {
-        "review"
-    } else {
-        "risky"
-    };
-
-    ImportRiskSummary {
-        score_10,
-        band,
-        total_findings,
-        contextual_findings,
-    }
+fn semantic_review_security_json(
+    review: &crate::security::skill_review::SemanticSkillReview,
+) -> serde_json::Value {
+    serde_json::json!({
+        "threat_level": format!("{:?}", review.policy.threat_level),
+        "warnings": review.policy.warnings.clone(),
+        "findings": review.policy.findings.iter().map(import_finding_json).collect::<Vec<_>>(),
+        "blocked": review.policy.blocked,
+        "total_severity": review.policy.total_severity,
+        "risk_score_10": review.policy.risk_score_10,
+        "risk_band": review.policy.risk_band.clone(),
+        "total_findings": review.policy.findings.len(),
+        "contextual_findings": 0_usize,
+        "capabilities": review.capabilities.clone(),
+        "matched_rules": review.policy.matched_rules.clone(),
+        "review_model": review.model.clone(),
+        "review_summary": review.summary.clone(),
+    })
 }
 
 fn builtin_env_from_agent_config(cfg: &crate::core::config::AgentConfig, env: &str) -> bool {
@@ -1048,161 +1031,126 @@ pub(super) async fn create_action(
     }
 
     let agent_guard = state.agent.read().await;
-
-    match agent_guard
-        .runtime
-        .create_action(&request.name, &request.content, request.force)
-        .await
-    {
-        Ok(verdict) => {
-            let (
-                blocked,
-                warnings,
-                threat_level,
-                findings,
-                total_severity,
-                risk_score_10,
-                risk_band,
-                total_findings,
-                contextual_findings,
-            ) = if let Some(ref v) = verdict {
-                let blocked = !v.allow_load;
-                let risk = compute_import_risk_summary(&v.static_analysis, blocked);
-                let findings: Vec<serde_json::Value> = v
-                    .static_analysis
-                    .findings
-                    .iter()
-                    .map(import_finding_json)
-                    .collect();
-                (
-                    blocked,
-                    v.warnings.clone(),
-                    format!("{:?}", v.static_analysis.threat_level),
-                    findings,
-                    v.static_analysis.total_severity,
-                    risk.score_10,
-                    risk.band.to_string(),
-                    risk.total_findings,
-                    risk.contextual_findings,
-                )
-            } else {
-                (
-                    false,
-                    vec![],
-                    "Clean".to_string(),
-                    vec![],
-                    0_u32,
-                    0.0_f32,
-                    "secure".to_string(),
-                    0_usize,
-                    0_usize,
-                )
-            };
-
-            let mut status = if blocked && !request.force {
-                "blocked"
-            } else {
-                "ok"
-            };
-
-            // Detect required secrets/env vars from frontmatter and report missing ones.
-            let required_env = extract_frontmatter_text(&request.content)
-                .map(extract_required_envs_from_frontmatter)
-                .unwrap_or_default();
-            let (missing_env, bindings) = if status == "ok" && !required_env.is_empty() {
-                let secrets = match crate::core::config::SecureConfigManager::new_with_data_dir(
-                    &agent_guard.config_dir,
-                    Some(&agent_guard.data_dir),
-                )
-                .and_then(|mgr| mgr.load_secrets())
-                {
-                    Ok(secrets) => secrets,
-                    Err(e) => {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ErrorResponse {
-                                error: format!("Failed to load encrypted secrets: {}", e),
-                            }),
-                        )
-                            .into_response();
-                    }
-                };
-                let custom = &secrets.custom;
-
-                let mut missing = Vec::new();
-                let mut bindings: std::collections::HashMap<String, String> =
-                    std::collections::HashMap::new();
-                for env in &required_env {
-                    let binding_key = format!("action_envmap:{}:{}", request.name, env);
-                    if let Some(b) = custom.get(&binding_key) {
-                        bindings.insert(env.clone(), b.clone());
-                    }
-                    if !env_is_configured_for_action(
-                        &agent_guard.config,
-                        custom,
-                        &request.name,
-                        env,
-                    ) {
-                        missing.push(env.clone());
-                    }
-                }
-                (missing, bindings)
-            } else {
-                (Vec::new(), std::collections::HashMap::new())
-            };
-
-            if status == "ok" && !missing_env.is_empty() {
-                status = "needs_secrets";
-            }
-
-            // Gate actions that require secrets: import succeeds but action starts disabled.
-            // User must configure secrets then manually enable.
-            if status == "needs_secrets" {
-                let _ = agent_guard
-                    .runtime
-                    .set_action_enabled(&request.name, false)
-                    .await;
-            }
-
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "status": status,
-                    "message": if blocked && !request.force {
-                        format!("Skill '{}' blocked by security verification", request.name)
-                    } else if status == "needs_secrets" {
-                        format!("Skill '{}' created, but needs secrets configured", request.name)
-                    } else {
-                        format!("Skill '{}' created", request.name)
-                    },
-                    "secrets": {
-                        "required_env": required_env,
-                        "missing_env": missing_env,
-                        "bindings": bindings,
-                    },
-                    "security": {
-                        "threat_level": threat_level,
-                        "warnings": warnings,
-                        "findings": findings,
-                        "blocked": blocked,
-                        "total_severity": total_severity,
-                        "risk_score_10": risk_score_10,
-                        "risk_band": risk_band,
-                        "total_findings": total_findings,
-                        "contextual_findings": contextual_findings,
-                    }
-                })),
+    if let Some(declared_name) = extract_skill_name_from_frontmatter(&request.content) {
+        if declared_name != request.name {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!(
+                        "Skill frontmatter name '{}' must match requested name '{}'",
+                        declared_name, request.name
+                    ),
+                }),
             )
-                .into_response()
+                .into_response();
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
     }
+
+    let semantic_review = crate::security::skill_review::review_skill_import_with_configured_model(
+        &agent_guard.llm,
+        &agent_guard.config_dir,
+        "local://skills",
+        &request.name,
+        &request.content,
+    )
+    .await;
+    let blocked = semantic_review.policy.blocked;
+    let mut status = if blocked { "blocked" } else { "ok" };
+
+    let required_env = extract_frontmatter_text(&request.content)
+        .map(extract_required_envs_from_frontmatter)
+        .unwrap_or_default();
+    let (missing_env, bindings) = if !required_env.is_empty() {
+        let secrets = match crate::core::config::SecureConfigManager::new_with_data_dir(
+            &agent_guard.config_dir,
+            Some(&agent_guard.data_dir),
+        )
+        .and_then(|mgr| mgr.load_secrets())
+        {
+            Ok(secrets) => secrets,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to load encrypted secrets: {}", e),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        let custom = &secrets.custom;
+        let mut missing = Vec::new();
+        let mut bindings: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for env in &required_env {
+            let binding_key = format!("action_envmap:{}:{}", request.name, env);
+            if let Some(b) = custom.get(&binding_key) {
+                bindings.insert(env.clone(), b.clone());
+            }
+            if !env_is_configured_for_action(&agent_guard.config, custom, &request.name, env) {
+                missing.push(env.clone());
+            }
+        }
+        (missing, bindings)
+    } else {
+        (Vec::new(), std::collections::HashMap::new())
+    };
+
+    if status == "ok" && !missing_env.is_empty() {
+        status = "needs_secrets";
+    }
+
+    let mut persisted_review = None;
+    if !blocked {
+        match agent_guard
+            .runtime
+            .install_semantically_reviewed_action(
+                &request.name,
+                &request.content,
+                &semantic_review,
+                request.force,
+            )
+            .await
+        {
+            Ok(review) => {
+                if !review.missing_env.is_empty() {
+                    status = "needs_secrets";
+                }
+                persisted_review = Some(action_review_info(review));
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: e.to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": status,
+            "message": if blocked {
+                format!("Skill '{}' blocked by semantic security policy", request.name)
+            } else if status == "needs_secrets" {
+                format!("Skill '{}' created, but needs secrets configured", request.name)
+            } else {
+                format!("Skill '{}' created", request.name)
+            },
+            "review": persisted_review,
+            "secrets": {
+                "required_env": required_env,
+                "missing_env": missing_env,
+                "bindings": bindings,
+            },
+            "security": semantic_review_security_json(&semantic_review)
+        })),
+    )
+        .into_response()
 }
 
 fn normalize_model_identifier(raw: &str) -> Option<String> {
@@ -1235,32 +1183,35 @@ fn normalize_model_identifier(raw: &str) -> Option<String> {
 
 /// Inject a model field into SKILL.md YAML frontmatter
 fn inject_model_into_frontmatter(content: &str, model: &str) -> String {
-    let model_line = format!("model: {}", model.trim());
-    if let Some(stripped) = content.strip_prefix("---") {
-        if let Some(end_idx) = stripped.find("---") {
-            let fm = &content[..3 + end_idx];
-            let rest = &content[3 + end_idx..];
-            // Replace existing model line or add before closing ---
-            if fm.contains("model:") {
-                let replaced = fm
-                    .lines()
-                    .map(|l| {
-                        if l.trim().starts_with("model:") {
-                            model_line.as_str()
-                        } else {
-                            l
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                return format!("{}\n{}", replaced.trim_end_matches('\n'), rest);
-            }
-            return format!("{}\n{}\n{}", fm.trim_end_matches('\n'), model_line, rest);
-        }
+    fn render_model_frontmatter(frontmatter: &str, model: &str) -> String {
+        let mut mapping = serde_yaml::from_str::<serde_yaml::Value>(frontmatter)
+            .ok()
+            .and_then(|value| value.as_mapping().cloned())
+            .unwrap_or_default();
+        mapping.insert(
+            serde_yaml::Value::String("model".to_string()),
+            serde_yaml::Value::String(model.trim().to_string()),
+        );
+        let rendered = serde_yaml::to_string(&serde_yaml::Value::Mapping(mapping))
+            .unwrap_or_else(|_| format!("model: {:?}", model.trim()));
+        rendered
+            .trim_start_matches("---\n")
+            .trim_end_matches("...\n")
+            .trim_end()
+            .to_string()
     }
-    // No frontmatter - prepend one
-    format!("---\n{}\n---\n\n{}", model_line, content)
+
+    if let Some((frontmatter, rest)) = split_frontmatter_block(content) {
+        let rendered = render_model_frontmatter(frontmatter, model);
+        return format!("---\n{}\n---\n{}", rendered, rest);
+    }
+    let rendered = render_model_frontmatter("", model);
+    format!("---\n{}\n---\n\n{}", rendered, content)
 }
+
+const SKILL_IMPORT_MAX_BYTES: usize = 2 * 1024 * 1024;
+const GITHUB_SKILL_ARCHIVE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const GITHUB_SKILL_ARCHIVE_MAX_ENTRIES: usize = 20_000;
 
 async fn validate_import_fetch_url(raw: &str) -> Result<reqwest::Url, String> {
     crate::core::net::validate_public_https_url(raw)
@@ -1282,7 +1233,7 @@ async fn fetch_text_with_redirects(
             .map_err(|e| e.to_string())?;
         if resp.status().is_success() {
             let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
-            if bytes.len() > 2 * 1024 * 1024 {
+            if bytes.len() > SKILL_IMPORT_MAX_BYTES {
                 return Err("Import content too large".to_string());
             }
             return Ok(String::from_utf8_lossy(&bytes).to_string());
@@ -1563,7 +1514,8 @@ async fn collect_github_skill_urls_from_archive(
                 continue;
             }
         };
-        match fetch_bytes_with_redirects(client, validated, 3, 128 * 1024 * 1024).await {
+        match fetch_bytes_with_redirects(client, validated, 3, GITHUB_SKILL_ARCHIVE_MAX_BYTES).await
+        {
             Ok(bytes) => {
                 archive_bytes = Some(bytes);
                 break;
@@ -1586,6 +1538,13 @@ async fn collect_github_skill_urls_from_archive(
     let cursor = std::io::Cursor::new(archive_bytes);
     let mut archive = zip::ZipArchive::new(cursor)
         .map_err(|e| format!("Invalid repository archive format: {}", e))?;
+    if archive.len() > GITHUB_SKILL_ARCHIVE_MAX_ENTRIES {
+        return Err(format!(
+            "Repository archive has too many entries ({} > {} limit)",
+            archive.len(),
+            GITHUB_SKILL_ARCHIVE_MAX_ENTRIES
+        ));
+    }
 
     let root_path = root_path.trim_matches('/');
     let root_prefix = if root_path.is_empty() {
@@ -1870,24 +1829,7 @@ pub(crate) async fn import_action_from_content_with_agent(
     model_override: Option<&str>,
     preview_only: bool,
 ) -> Result<serde_json::Value, String> {
-    // Try to extract action name from the YAML frontmatter first
-    let name_from_content = if let Some(stripped) = content.strip_prefix("---") {
-        stripped.find("---").and_then(|end| {
-            let frontmatter = &stripped[..end];
-            frontmatter
-                .lines()
-                .find(|l| l.trim().starts_with("name:"))
-                .map(|l| {
-                    l.trim()
-                        .strip_prefix("name:")
-                        .unwrap_or("")
-                        .trim()
-                        .to_string()
-                })
-        })
-    } else {
-        None
-    };
+    let name_from_content = extract_skill_name_from_frontmatter(&content);
 
     // Derive action name: user override > frontmatter > URL path
     let action_name = if let Some(name) = requested_name {
@@ -1950,144 +1892,122 @@ pub(crate) async fn import_action_from_content_with_agent(
         }
     }
 
-    let verdict_result = if preview_only {
-        agent
-            .runtime
-            .preview_action_security(&action_name, &content)
-            .await
+    let semantic_review = crate::security::skill_review::review_skill_import_with_configured_model(
+        &agent.llm,
+        &agent.config_dir,
+        source_url,
+        &action_name,
+        &content,
+    )
+    .await;
+    let blocked = semantic_review.policy.blocked;
+    let findings: Vec<serde_json::Value> = semantic_review
+        .policy
+        .findings
+        .iter()
+        .map(import_finding_json)
+        .collect();
+    let warnings = semantic_review.policy.warnings.clone();
+    let threat_level = format!("{:?}", semantic_review.policy.threat_level);
+    let total_severity = semantic_review.policy.total_severity;
+    let risk_score_10 = semantic_review.policy.risk_score_10;
+    let risk_band = semantic_review.policy.risk_band.clone();
+    let total_findings = semantic_review.policy.findings.len();
+    let contextual_findings = 0_usize;
+    let semantic_capabilities = semantic_review.capabilities.clone();
+    let semantic_matched_rules = semantic_review.policy.matched_rules.clone();
+    let semantic_review_model = semantic_review.model.clone();
+    let semantic_review_summary = semantic_review.summary.clone();
+
+    let mut status = if blocked {
+        "blocked"
+    } else if preview_only {
+        "preview"
     } else {
-        agent
-            .runtime
-            .create_action(&action_name, &content, force)
-            .await
+        "ok"
     };
 
-    match verdict_result {
-        Ok(verdict) => {
-            let (
-                blocked,
-                warnings,
-                threat_level,
-                findings,
-                total_severity,
-                risk_score_10,
-                risk_band,
-                total_findings,
-                contextual_findings,
-            ) = if let Some(ref v) = verdict {
-                let blocked = !v.allow_load;
-                let risk = compute_import_risk_summary(&v.static_analysis, blocked);
-                let findings: Vec<serde_json::Value> = v
-                    .static_analysis
-                    .findings
-                    .iter()
-                    .map(import_finding_json)
-                    .collect();
-                (
-                    blocked,
-                    v.warnings.clone(),
-                    format!("{:?}", v.static_analysis.threat_level),
-                    findings,
-                    v.static_analysis.total_severity,
-                    risk.score_10,
-                    risk.band.to_string(),
-                    risk.total_findings,
-                    risk.contextual_findings,
-                )
-            } else {
-                (
-                    false,
-                    vec![],
-                    "Clean".to_string(),
-                    vec![],
-                    0_u32,
-                    0.0_f32,
-                    "secure".to_string(),
-                    0_usize,
-                    0_usize,
-                )
-            };
+    let required_env = extract_frontmatter_text(&content)
+        .map(extract_required_envs_from_frontmatter)
+        .unwrap_or_default();
+    let (missing_env, bindings) = if !required_env.is_empty() {
+        let secrets = crate::core::config::SecureConfigManager::new_with_data_dir(
+            &agent.config_dir,
+            Some(&agent.data_dir),
+        )
+        .and_then(|mgr| mgr.load_secrets())
+        .map_err(|e| format!("Failed to load encrypted secrets: {}", e))?;
+        let custom = &secrets.custom;
 
-            let mut status = if blocked && !force {
-                "blocked"
-            } else if preview_only {
-                "preview"
-            } else {
-                "ok"
-            };
-
-            let required_env = extract_frontmatter_text(&content)
-                .map(extract_required_envs_from_frontmatter)
-                .unwrap_or_default();
-            let (missing_env, bindings) = if !required_env.is_empty() {
-                let secrets = crate::core::config::SecureConfigManager::new_with_data_dir(
-                    &agent.config_dir,
-                    Some(&agent.data_dir),
-                )
-                .and_then(|mgr| mgr.load_secrets())
-                .map_err(|e| format!("Failed to load encrypted secrets: {}", e))?;
-                let custom = &secrets.custom;
-
-                let mut missing = Vec::new();
-                let mut bindings: std::collections::HashMap<String, String> =
-                    std::collections::HashMap::new();
-                for env in &required_env {
-                    let binding_key = format!("action_envmap:{}:{}", action_name, env);
-                    if let Some(b) = custom.get(&binding_key) {
-                        bindings.insert(env.clone(), b.clone());
-                    }
-                    if !env_is_configured_for_action(&agent.config, custom, &action_name, env) {
-                        missing.push(env.clone());
-                    }
-                }
-                (missing, bindings)
-            } else {
-                (Vec::new(), std::collections::HashMap::new())
-            };
-
-            if !preview_only && status == "ok" && !missing_env.is_empty() {
-                status = "needs_secrets";
+        let mut missing = Vec::new();
+        let mut bindings: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for env in &required_env {
+            let binding_key = format!("action_envmap:{}:{}", action_name, env);
+            if let Some(b) = custom.get(&binding_key) {
+                bindings.insert(env.clone(), b.clone());
             }
-            if !preview_only && status == "needs_secrets" {
-                let _ = agent.runtime.set_action_enabled(&action_name, false).await;
+            if !env_is_configured_for_action(&agent.config, custom, &action_name, env) {
+                missing.push(env.clone());
             }
-
-            Ok(serde_json::json!({
-                "status": status,
-                "name": action_name,
-                "message": if blocked && !force {
-                    format!("Skill '{}' blocked by security verification", action_name)
-                } else if preview_only {
-                    if !missing_env.is_empty() {
-                        format!("Preview ready for '{}'. Required secrets detected.", action_name)
-                    } else {
-                        format!("Preview ready for '{}'. Click Import Template to save.", action_name)
-                    }
-                } else if status == "needs_secrets" {
-                    format!("Skill '{}' imported, but needs secrets configured", action_name)
-                } else {
-                    format!("Skill '{}' imported from URL", action_name)
-                },
-                "secrets": {
-                    "required_env": required_env,
-                    "missing_env": missing_env,
-                    "bindings": bindings,
-                },
-                "security": {
-                    "threat_level": threat_level,
-                    "warnings": warnings,
-                    "findings": findings,
-                    "blocked": blocked,
-                    "total_severity": total_severity,
-                    "risk_score_10": risk_score_10,
-                    "risk_band": risk_band,
-                    "total_findings": total_findings,
-                    "contextual_findings": contextual_findings,
-                }
-            }))
         }
-        Err(e) => Err(e.to_string()),
+        (missing, bindings)
+    } else {
+        (Vec::new(), std::collections::HashMap::new())
+    };
+
+    if !preview_only && status == "ok" && !missing_env.is_empty() {
+        status = "needs_secrets";
     }
+
+    if !preview_only && !blocked {
+        let review = agent
+            .runtime
+            .install_semantically_reviewed_action(&action_name, &content, &semantic_review, force)
+            .await
+            .map_err(|e| e.to_string())?;
+        if !review.missing_env.is_empty() {
+            status = "needs_secrets";
+        }
+    }
+
+    Ok(serde_json::json!({
+        "status": status,
+        "name": action_name,
+        "message": if blocked {
+            format!("Skill '{}' blocked by semantic security policy", action_name)
+        } else if preview_only {
+            if !missing_env.is_empty() {
+                format!("Preview ready for '{}'. Required secrets detected.", action_name)
+            } else {
+                format!("Preview ready for '{}'. Click Import Template to save.", action_name)
+            }
+        } else if status == "needs_secrets" {
+            format!("Skill '{}' imported, but needs secrets configured", action_name)
+        } else {
+            format!("Skill '{}' imported from URL", action_name)
+        },
+        "secrets": {
+            "required_env": required_env,
+            "missing_env": missing_env,
+            "bindings": bindings,
+        },
+        "security": {
+            "threat_level": threat_level,
+            "warnings": warnings,
+            "findings": findings,
+            "blocked": blocked,
+            "total_severity": total_severity,
+            "risk_score_10": risk_score_10,
+            "risk_band": risk_band,
+            "total_findings": total_findings,
+            "contextual_findings": contextual_findings,
+            "capabilities": semantic_capabilities,
+            "matched_rules": semantic_matched_rules,
+            "review_model": semantic_review_model,
+            "review_summary": semantic_review_summary,
+        }
+    }))
 }
 
 async fn import_action_from_content(

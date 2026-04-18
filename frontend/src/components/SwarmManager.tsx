@@ -3,6 +3,7 @@ import {
   Autocomplete,
   Box,
   Button,
+  ButtonBase,
   CircularProgress,
   Chip,
   Dialog,
@@ -11,12 +12,6 @@ import {
   DialogTitle,
   MenuItem,
   Stack,
-  Table,
-  TableBody,
-  TableCell,
-  TableContainer,
-  TableHead,
-  TableRow,
   TextField,
   Typography
 } from "@mui/material";
@@ -62,6 +57,7 @@ type AccessScope = {
   ssh_connection_names: string[];
   custom_api_ids: string[];
   integration_ids: string[];
+  extension_pack_ids: string[];
   channel_ids: string[];
 };
 
@@ -82,6 +78,7 @@ type BuilderOptions = {
   sshConnections: BuilderOption[];
   customApis: BuilderOption[];
   integrations: BuilderOption[];
+  extensionPacks: BuilderOption[];
   channels: BuilderOption[];
 };
 
@@ -249,6 +246,7 @@ function emptyAccessScope(): AccessScope {
     ssh_connection_names: [],
     custom_api_ids: [],
     integration_ids: [],
+    extension_pack_ids: [],
     channel_ids: []
   };
 }
@@ -261,6 +259,7 @@ function cloneAccessScope(scope?: AccessScope | null): AccessScope {
     ssh_connection_names: [...current.ssh_connection_names],
     custom_api_ids: [...current.custom_api_ids],
     integration_ids: [...current.integration_ids],
+    extension_pack_ids: [...current.extension_pack_ids],
     channel_ids: [...current.channel_ids]
   };
 }
@@ -273,6 +272,7 @@ function parseAccessScope(value: unknown): AccessScope {
     ssh_connection_names: parseStringArray(record.ssh_connection_names),
     custom_api_ids: parseStringArray(record.custom_api_ids),
     integration_ids: parseStringArray(record.integration_ids),
+    extension_pack_ids: parseStringArray(record.extension_pack_ids),
     channel_ids: parseStringArray(record.channel_ids)
   };
 }
@@ -338,6 +338,27 @@ function statusChipLabel(status: unknown): string {
       return "Provisioned";
     default:
       return "Idle";
+  }
+}
+
+function statusDotColor(status: unknown): string {
+  switch (normalizeLifecycleStatus(status)) {
+    case "running":
+    case "assigned":
+    case "synthesizing":
+      return "rgba(74,210,157,0.85)";
+    case "failed":
+    case "timed_out":
+    case "panicked":
+    case "offline":
+      return "rgba(255,100,100,0.85)";
+    case "completed":
+    case "interrupted":
+    case "partial":
+    case "disabled":
+      return "rgba(255,191,130,0.85)";
+    default:
+      return "rgba(180,200,220,0.5)";
   }
 }
 
@@ -543,6 +564,7 @@ function filterBuilderOptions(options: BuilderOptions): BuilderOptions {
     sshConnections: sortBuilderOptions(cleanedItems(options.sshConnections)),
     customApis: sortBuilderOptions(cleanedItems(options.customApis).filter((item) => item.enabled)),
     integrations: usableItems(options.integrations),
+    extensionPacks: usableItems(options.extensionPacks),
     channels: usableItems(options.channels)
   };
 }
@@ -591,6 +613,25 @@ function toBuilderOptions(data: unknown): BuilderOptions {
         str(row.id, ""),
         str(row.name, str(row.id, "")),
         [str(row.description, ""), formatBuilderStatus(str(row.status, ""))].filter(Boolean).join(" | ")
+      )
+    )
+    .filter(
+      (item): item is BuilderOption =>
+        item !== null && item.enabled && builderStatusLooksUsable(item.status)
+    );
+  const extensionPacks = pickRecords(payload.extension_packs, "extension_packs")
+    .map((row) =>
+      toBuilderOption(
+        row,
+        str(asRecord(row.manifest).id || row.id, ""),
+        str(asRecord(row.manifest).name || row.name, str(asRecord(row.manifest).id || row.id, "")),
+        [
+          str(asRecord(row.manifest).description || row.description, ""),
+          formatBuilderStatus(str(row.status, "")),
+          str(row.runtime_status, "")
+        ]
+          .filter(Boolean)
+          .join(" | ")
       )
     )
     .filter(
@@ -658,6 +699,22 @@ function toBuilderOptions(data: unknown): BuilderOptions {
           str(row.id, ""),
           str(row.name, str(row.id, "")),
           [str(row.description, ""), str(row.status, "")].filter(Boolean).join(" • ")
+        )
+      )
+      .filter((item): item is BuilderOption => Boolean(item)),
+    extensionPacks: pickRecords(payload.extension_packs, "extension_packs")
+      .map((row) =>
+        toBuilderOption(
+          row,
+          str(asRecord(row.manifest).id || row.id, ""),
+          str(asRecord(row.manifest).name || row.name, str(asRecord(row.manifest).id || row.id, "")),
+          [
+            str(asRecord(row.manifest).description || row.description, ""),
+            str(row.runtime_status, ""),
+            str(row.status, "")
+          ]
+            .filter(Boolean)
+            .join(" â€¢ ")
         )
       )
       .filter((item): item is BuilderOption => Boolean(item)),
@@ -786,6 +843,7 @@ function accessScopeLabels(
     ssh: Record<string, BuilderOption>;
     customApi: Record<string, BuilderOption>;
     integration: Record<string, BuilderOption>;
+    extensionPack: Record<string, BuilderOption>;
     channel: Record<string, BuilderOption>;
   }
 ): string[] {
@@ -795,6 +853,7 @@ function accessScopeLabels(
     ...scope.ssh_connection_names.map((id) => optionMaps.ssh[id]?.label || id),
     ...scope.custom_api_ids.map((id) => optionMaps.customApi[id]?.label || id),
     ...scope.integration_ids.map((id) => optionMaps.integration[id]?.label || id),
+    ...scope.extension_pack_ids.map((id) => optionMaps.extensionPack[id]?.label || id),
     ...scope.channel_ids.map((id) => optionMaps.channel[id]?.label || id)
   ];
 }
@@ -808,6 +867,7 @@ function accessScopeSummary(scope: AccessScope): string[] {
   if (scope.ssh_connection_names.length) parts.push(`${scope.ssh_connection_names.length} SSH`);
   if (scope.custom_api_ids.length) parts.push(`${scope.custom_api_ids.length} API`);
   if (scope.integration_ids.length) parts.push(`${scope.integration_ids.length} integration`);
+  if (scope.extension_pack_ids.length) parts.push(`${scope.extension_pack_ids.length} pack`);
   if (scope.channel_ids.length) parts.push(`${scope.channel_ids.length} channel`);
   return parts;
 }
@@ -973,72 +1033,47 @@ function RunCard({ run, live = false }: { run: SwarmRun; live?: boolean }) {
           ) : null}
         </Stack>
 
-        <Grid2 container spacing={1}>
+        <Stack spacing={0}>
           {run.agents.map((agent) => (
-            <Grid2 key={`${run.id}-${agent.id}`} size={{ xs: 12, xl: 6 }}>
-              <Box
-                sx={{
-                  height: "100%",
-                  p: 1.1,
-                  borderRadius: "8px",
-                  border: "1px solid rgba(255,255,255,0.06)",
-                  background: "rgba(7, 12, 24, 0.58)"
-                }}
-              >
-                <Stack spacing={0.75}>
-                  <Stack
-                    direction={{ xs: "column", sm: "row" }}
-                    sx={{
-                      alignItems: { xs: "flex-start", sm: "center" },
-                      justifyContent: "space-between",
-                      gap: 0.75
-                    }}>
-                    <Box sx={{ minWidth: 0 }}>
-                      <Typography variant="body2" sx={{ fontWeight: 700 }}>
-                        {agent.agentRole
-                          ? `${agent.agentName} · ${agent.agentRole}`
-                          : agent.agentName}
-                      </Typography>
-                      <Typography variant="caption" sx={{
-                        color: "text.secondary"
-                      }}>
-                        {agent.modelName || (agent.isSpecialist ? "Specialist model" : "Auto agent")}
-                      </Typography>
-                    </Box>
-                    <Stack direction="row" spacing={0.75} useFlexGap sx={{
-                      flexWrap: "wrap"
-                    }}>
-                      <Chip
-                        size="small"
-                        color={statusChipColor(agent.status)}
-                        label={statusChipLabel(agent.status)}
-                        sx={{ height: 22 }}
-                      />
-                      {agent.elapsedMs ? (
-                        <Chip
-                          size="small"
-                          variant="outlined"
-                          label={formatElapsedMs(agent.elapsedMs)}
-                          sx={{ height: 22 }}
-                        />
-                      ) : null}
-                    </Stack>
-                  </Stack>
-                  {agent.task ? (
-                    <Typography variant="body2" sx={{ color: "rgba(231, 239, 251, 0.94)" }}>
-                      {agent.task}
+            <Box
+              key={`${run.id}-${agent.id}`}
+              sx={{ width: "100%", px: 0, py: 1.15, borderBottom: "1px solid", borderColor: "divider", transition: "background 0.15s ease", "&:hover": { background: "rgba(57, 208, 255, 0.04)" } }}
+            >
+              <Stack spacing={0.4}>
+                {/* Line 1: dot + agent name ... status right */}
+                <Stack direction="row" sx={{ alignItems: "center", justifyContent: "space-between", gap: 1 }}>
+                  <Stack direction="row" sx={{ alignItems: "center", gap: 1, minWidth: 0 }}>
+                    <Box sx={{ width: 7, height: 7, borderRadius: "50%", flexShrink: 0, background: statusDotColor(agent.status) }} />
+                    <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                      {agent.agentRole
+                        ? `${agent.agentName} · ${agent.agentRole}`
+                        : agent.agentName}
                     </Typography>
-                  ) : null}
-                  <Typography variant="caption" sx={{
-                    color: "text.secondary"
-                  }}>
-                    {agent.latestUpdate || agent.summary || "No extra detail recorded."}
-                  </Typography>
+                  </Stack>
+                  <Stack direction="row" sx={{ alignItems: "center", gap: 0.75, flexShrink: 0 }}>
+                    <Typography variant="caption" sx={{ color: "text.secondary" }}>{statusChipLabel(agent.status)}</Typography>
+                    {agent.elapsedMs ? (
+                      <Typography variant="caption" sx={{ color: "text.secondary" }}>{formatElapsedMs(agent.elapsedMs)}</Typography>
+                    ) : null}
+                  </Stack>
                 </Stack>
-              </Box>
-            </Grid2>
+                {/* Line 2: specialist type, model */}
+                <Typography variant="caption" sx={{ color: "text.secondary", pl: "15px" }}>
+                  {agent.modelName || (agent.isSpecialist ? "Specialist model" : "Auto agent")}
+                </Typography>
+                {/* Line 3: task / update */}
+                {agent.task ? (
+                  <Typography variant="caption" sx={{ color: "text.secondary", pl: "15px" }}>
+                    {agent.task}
+                  </Typography>
+                ) : null}
+                <Typography variant="caption" sx={{ color: "text.secondary", pl: "15px" }}>
+                  {agent.latestUpdate || agent.summary || "No extra detail recorded."}
+                </Typography>
+              </Stack>
+            </Box>
           ))}
-        </Grid2>
+        </Stack>
       </Stack>
     </Box>
   );
@@ -1070,64 +1105,38 @@ function RunHistoryList({ runs }: { runs: SwarmRun[] }) {
 
   return (
     <Stack spacing={1.2}>
-      <TableContainer className="table-shell" sx={{ width: "100%", overflowX: "auto" }}>
-        <Table size="small" sx={{ minWidth: 900 }}>
-          <TableHead>
-            <TableRow>
-              <TableCell>Request</TableCell>
-              <TableCell>Status</TableCell>
-              <TableCell>Agents</TableCell>
-              <TableCell>Started</TableCell>
-              <TableCell>Finished</TableCell>
-              <TableCell align="right">Open</TableCell>
-            </TableRow>
-          </TableHead>
-          <TableBody>
-            {pageRuns.map((run) => {
-              const trackedAgents = Math.max(run.agentCount, run.agents.length);
-              const isSelected = selectedRun?.id === run.id;
-              return (
-                <TableRow
-                  key={run.id}
-                  hover
-                  selected={isSelected}
-                  onClick={() => setSelectedRunId(run.id)}
-                  sx={{
-                    cursor: "pointer",
-                    "& .MuiTableCell-root": {
-                      borderColor: "rgba(145,170,205,0.12)"
-                    }
-                  }}
-                >
-                  <TableCell sx={{ minWidth: 340, maxWidth: 460 }}>
-                    <Typography variant="body2" sx={{ fontWeight: 700 }}>
+      <Stack spacing={0}>
+        {pageRuns.map((run) => {
+          const trackedAgents = Math.max(run.agentCount, run.agents.length);
+          const isSelected = selectedRun?.id === run.id;
+          return (
+            <ButtonBase
+              key={run.id}
+              onClick={() => setSelectedRunId(run.id)}
+              sx={{
+                width: "100%",
+                textAlign: "left",
+                display: "block",
+                px: 0,
+                py: 1.15,
+                borderBottom: "1px solid",
+                borderColor: "divider",
+                transition: "background 0.15s ease",
+                "&:hover": { background: "rgba(57, 208, 255, 0.04)" },
+                ...(isSelected ? { background: "rgba(57, 208, 255, 0.07)" } : {})
+              }}
+            >
+              <Stack spacing={0.4}>
+                {/* Line 1: dot + request ... status right */}
+                <Stack direction="row" sx={{ alignItems: "center", justifyContent: "space-between", gap: 1 }}>
+                  <Stack direction="row" sx={{ alignItems: "center", gap: 1, minWidth: 0 }}>
+                    <Box sx={{ width: 7, height: 7, borderRadius: "50%", flexShrink: 0, background: statusDotColor(run.status) }} />
+                    <Typography variant="body2" sx={{ fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                       {run.request}
                     </Typography>
-                    <Typography variant="caption" sx={{ color: "text.secondary", display: "block", mt: 0.3 }}>
-                      {run.summary || "Select this run to inspect delegated agent detail."}
-                    </Typography>
-                  </TableCell>
-                  <TableCell>
-                    <Chip size="small" color={statusChipColor(run.status)} label={statusChipLabel(run.status)} />
-                  </TableCell>
-                  <TableCell>
-                    <Typography variant="body2" sx={{ fontWeight: 600 }}>
-                      {trackedAgents}
-                    </Typography>
-                    <Typography variant="caption" sx={{ color: "text.secondary", display: "block", mt: 0.2 }}>
-                      {run.channel || "Workspace"}
-                    </Typography>
-                  </TableCell>
-                  <TableCell>
-                    <Typography variant="body2">{formatTimestamp(run.startedAt)}</Typography>
-                  </TableCell>
-                  <TableCell>
-                    <Typography variant="body2">{formatTimestamp(run.completedAt || run.updatedAt)}</Typography>
-                    <Typography variant="caption" sx={{ color: "text.secondary", display: "block", mt: 0.2 }}>
-                      {run.completedAt ? "finished" : "last update"}
-                    </Typography>
-                  </TableCell>
-                  <TableCell align="right">
+                  </Stack>
+                  <Stack direction="row" sx={{ alignItems: "center", gap: 0.75, flexShrink: 0 }}>
+                    <Typography variant="caption" sx={{ color: "text.secondary" }}>{statusChipLabel(run.status)}</Typography>
                     <Button
                       size="small"
                       variant={isSelected ? "contained" : "outlined"}
@@ -1138,13 +1147,21 @@ function RunHistoryList({ runs }: { runs: SwarmRun[] }) {
                     >
                       {isSelected ? "Viewing" : "View"}
                     </Button>
-                  </TableCell>
-                </TableRow>
-              );
-            })}
-          </TableBody>
-        </Table>
-      </TableContainer>
+                  </Stack>
+                </Stack>
+                {/* Line 2: summary */}
+                <Typography variant="caption" sx={{ color: "text.secondary", pl: "15px" }}>
+                  {run.summary || "Select this run to inspect delegated agent detail."}
+                </Typography>
+                {/* Line 3: metadata */}
+                <Typography variant="caption" sx={{ color: "text.secondary", pl: "15px" }}>
+                  {trackedAgents} agent{trackedAgents === 1 ? "" : "s"} · {run.channel || "Workspace"} · Started {formatTimestamp(run.startedAt)} · {run.completedAt ? `Finished ${formatTimestamp(run.completedAt)}` : `Updated ${formatTimestamp(run.updatedAt)}`}
+                </Typography>
+              </Stack>
+            </ButtonBase>
+          );
+        })}
+      </Stack>
 
       <Stack
         direction={{ xs: "column", sm: "row" }}
@@ -1390,6 +1407,7 @@ export function SwarmManager({ autoRefresh }: Props) {
       ssh_connection_names: builderOptions.sshConnections,
       custom_api_ids: builderOptions.customApis,
       integration_ids: builderOptions.integrations,
+      extension_pack_ids: builderOptions.extensionPacks,
       channel_ids: builderOptions.channels
     }),
     [builderOptions]
@@ -1438,6 +1456,13 @@ export function SwarmManager({ autoRefresh }: Props) {
           selectedIds: draft.access_scope.integration_ids
         },
         {
+          field: "extension_pack_ids" as ResourceAccessScopeKey,
+          label: "Extension packs",
+          helperText: "Attach installed custom integrations that register runtime actions through the generic pack system.",
+          options: builderOptions.extensionPacks,
+          selectedIds: draft.access_scope.extension_pack_ids
+        },
+        {
           field: "channel_ids" as ResourceAccessScopeKey,
           label: "Messaging channels",
           helperText: "Only selected messaging channels can be attached for agent delivery or reporting flows.",
@@ -1453,6 +1478,7 @@ export function SwarmManager({ autoRefresh }: Props) {
       ssh: buildOptionMap(builderOptions.sshConnections),
       customApi: buildOptionMap(builderOptions.customApis),
       integration: buildOptionMap(builderOptions.integrations),
+      extensionPack: buildOptionMap(builderOptions.extensionPacks),
       channel: buildOptionMap(builderOptions.channels)
     }),
     [builderOptions]
@@ -1809,177 +1835,102 @@ export function SwarmManager({ autoRefresh }: Props) {
           </Stack>
 
         {customAgents.length > 0 ? (
-          <Grid2 container spacing={1.15}>
+          <Stack spacing={0}>
             {customAgents.map((agent) => (
-              <Grid2 key={agent.id} size={{ xs: 12, md: 6, xl: 4 }}>
-                <Box
-                  sx={{
-                    height: "100%",
-                    p: 1.4,
-                    borderRadius: "8px",
-                    border: "1px solid rgba(255,255,255,0.07)",
-                    background: "linear-gradient(180deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.02) 100%)"
-                  }}
-                >
-                  <Stack spacing={1}>
-                    <Stack
-                      direction={{ xs: "column", sm: "row" }}
-                      sx={{
-                        alignItems: { xs: "flex-start", sm: "center" },
-                        justifyContent: "space-between",
-                        gap: 0.9
-                      }}>
-                      <Box sx={{ minWidth: 0 }}>
-                        <Typography variant="body1" sx={{ fontWeight: 700 }}>
-                          {agent.agentType
-                            ? `${agent.displayName} · ${agent.agentType}`
-                            : agent.displayName}
-                        </Typography>
-                        <Typography variant="caption" sx={{
-                          color: "text.secondary"
-                        }}>
-                          {agent.provider} / {agent.model}
-                        </Typography>
-                      </Box>
-                      <Stack direction="row" spacing={0.75} useFlexGap sx={{
-                        flexWrap: "wrap"
-                      }}>
-                        <Chip
-                          size="small"
-                          color={statusChipColor(agent.enabled ? agent.status : "disabled")}
-                          label={statusChipLabel(agent.enabled ? agent.status : "disabled")}
-                        />
-                        <Button size="small" variant="outlined" onClick={() => openEditAgentDialog(agent)}>
-                          Edit
-                        </Button>
-                        <Button
-                          size="small"
-                          color="error"
-                          variant="outlined"
-                          disabled={deleteAgent.isPending}
-                          onClick={() => {
-                            if (window.confirm(`Delete ${agent.displayName}?`)) {
-                              deleteAgent.mutate(agent.id);
-                            }
-                          }}
-                        >
-                          Delete
-                        </Button>
-                      </Stack>
+              <Box
+                key={agent.id}
+                sx={{ width: "100%", px: 0, py: 1.15, borderBottom: "1px solid", borderColor: "divider", transition: "background 0.15s ease", "&:hover": { background: "rgba(57, 208, 255, 0.04)" } }}
+              >
+                <Stack spacing={0.5}>
+                  {/* Line 1: dot + agent name ... enabled/disabled right */}
+                  <Stack direction="row" sx={{ alignItems: "center", justifyContent: "space-between", gap: 1 }}>
+                    <Stack direction="row" sx={{ alignItems: "center", gap: 1, minWidth: 0 }}>
+                      <Box sx={{ width: 7, height: 7, borderRadius: "50%", flexShrink: 0, background: statusDotColor(agent.enabled ? agent.status : "disabled") }} />
+                      <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                        {agent.agentType
+                          ? `${agent.displayName} · ${agent.agentType}`
+                          : agent.displayName}
+                      </Typography>
                     </Stack>
-
-                    <Stack direction="row" spacing={0.75} useFlexGap sx={{
-                      flexWrap: "wrap"
-                    }}>
+                    <Typography variant="caption" sx={{ color: "text.secondary", flexShrink: 0 }}>
+                      {statusChipLabel(agent.enabled ? agent.status : "disabled")}
+                    </Typography>
+                  </Stack>
+                  {/* Line 2: role, model, access scope summary */}
+                  <Typography variant="caption" sx={{ color: "text.secondary", pl: "15px" }}>
+                    {agent.provider} / {agent.model}
+                    {accessScopeSummary(agent.accessScope).length > 0
+                      ? ` · ${accessScopeSummary(agent.accessScope).join(", ")}`
+                      : " · No elevated access"}
+                  </Typography>
+                  {/* Line 3: capabilities */}
+                  {agent.capabilities.length > 0 || agent.systemPrompt ? (
+                    <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: "wrap", pl: "15px" }}>
                       {agent.capabilities.slice(0, 5).map((capability) => (
                         <Chip
                           key={`${agent.id}-${capability}`}
                           size="small"
                           variant="outlined"
                           label={capability}
-                          sx={{ height: 22 }}
+                          sx={{ height: 20 }}
                         />
                       ))}
                       {agent.systemPrompt ? (
-                        <Chip size="small" variant="outlined" color="info" label="Prompt set" sx={{ height: 22 }} />
+                        <Chip size="small" variant="outlined" color="info" label="Prompt set" sx={{ height: 20 }} />
                       ) : null}
                     </Stack>
-
-                    <Box
-                      sx={{
-                        p: 1,
-                        borderRadius: "8px",
-                        background: "rgba(6, 11, 23, 0.48)",
-                        border: "1px solid rgba(255,255,255,0.05)"
-                      }}
-                    >
-                      <Typography variant="caption" sx={{
-                        color: "text.secondary"
-                      }}>
-                        Access
-                      </Typography>
-                      <Stack
-                        direction="row"
-                        spacing={0.75}
-                        useFlexGap
-                        sx={{
-                          flexWrap: "wrap",
-                          mt: 0.75
-                        }}>
-                        {accessScopeSummary(agent.accessScope).length > 0 ? (
-                          accessScopeSummary(agent.accessScope).map((summary) => (
-                            <Chip key={`${agent.id}-${summary}`} size="small" variant="filled" label={summary} sx={{ height: 22 }} />
-                          ))
-                        ) : (
-                          <Chip size="small" variant="outlined" label="No elevated access" sx={{ height: 22 }} />
-                        )}
-                      </Stack>
-                      {accessScopeLabels(agent.accessScope, optionMaps).length > 0 ? (
-                        <Stack
-                          direction="row"
-                          spacing={0.75}
-                          useFlexGap
-                          sx={{
-                            flexWrap: "wrap",
-                            mt: 0.75
-                          }}>
-                          {accessScopeLabels(agent.accessScope, optionMaps)
-                            .slice(0, 4)
-                            .map((label) => (
-                              <Chip key={`${agent.id}-${label}`} size="small" variant="outlined" label={label} sx={{ height: 22 }} />
-                            ))}
-                          {accessScopeLabels(agent.accessScope, optionMaps).length > 4 ? (
-                            <Chip
-                              size="small"
-                              variant="outlined"
-                              label={`+${accessScopeLabels(agent.accessScope, optionMaps).length - 4} more`}
-                              sx={{ height: 22 }}
-                            />
-                          ) : null}
-                        </Stack>
+                  ) : null}
+                  {/* Line 4: access scope labels */}
+                  {accessScopeLabels(agent.accessScope, optionMaps).length > 0 ? (
+                    <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: "wrap", pl: "15px" }}>
+                      {accessScopeLabels(agent.accessScope, optionMaps)
+                        .slice(0, 4)
+                        .map((label) => (
+                          <Chip key={`${agent.id}-${label}`} size="small" variant="outlined" label={label} sx={{ height: 20 }} />
+                        ))}
+                      {accessScopeLabels(agent.accessScope, optionMaps).length > 4 ? (
+                        <Chip
+                          size="small"
+                          variant="outlined"
+                          label={`+${accessScopeLabels(agent.accessScope, optionMaps).length - 4} more`}
+                          sx={{ height: 20 }}
+                        />
                       ) : null}
-                    </Box>
-
-                    <Box
-                      sx={{
-                        p: 1,
-                        borderRadius: "8px",
-                        background: "rgba(6, 11, 23, 0.48)",
-                        border: "1px solid rgba(255,255,255,0.05)"
-                      }}
-                    >
-                      <Typography variant="caption" sx={{
-                        color: "text.secondary"
-                      }}>
-                        Latest task
-                      </Typography>
-                      <Typography variant="body2" sx={{ mt: 0.25, color: "rgba(231, 239, 251, 0.94)" }}>
-                        {agent.lastTask || "No delegated task recorded yet."}
-                      </Typography>
-                      <Typography
-                        variant="caption"
-                        sx={{
-                          color: "text.secondary",
-                          display: "block",
-                          mt: 0.45
-                        }}>
-                        {agent.lastUpdate || agent.lastSummary || "This specialist is ready for new work."}
-                      </Typography>
-                    </Box>
-
-                    <Stack direction="row" spacing={0.75} useFlexGap sx={{
-                      flexWrap: "wrap"
-                    }}>
-                      {agent.lastActivityAt ? (
-                        <Chip size="small" variant="outlined" label={`Last active ${formatTimestamp(agent.lastActivityAt)}`} />
-                      ) : null}
-                      <Chip size="small" variant="outlined" label={`Created ${formatTimestamp(agent.createdAt)}`} />
+                    </Stack>
+                  ) : null}
+                  {/* Line 5: latest task */}
+                  <Typography variant="caption" sx={{ color: "text.secondary", pl: "15px" }}>
+                    {agent.lastTask || "No delegated task recorded yet."}
+                    {(agent.lastUpdate || agent.lastSummary) ? ` — ${agent.lastUpdate || agent.lastSummary}` : ""}
+                  </Typography>
+                  {/* Line 6: timestamps + action buttons */}
+                  <Stack direction="row" sx={{ alignItems: "center", justifyContent: "space-between", pl: "15px", gap: 1 }}>
+                    <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                      {agent.lastActivityAt ? `Last active ${formatTimestamp(agent.lastActivityAt)} · ` : ""}Created {formatTimestamp(agent.createdAt)}
+                    </Typography>
+                    <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexShrink: 0 }}>
+                      <Button size="small" variant="outlined" onClick={() => openEditAgentDialog(agent)}>
+                        Edit
+                      </Button>
+                      <Button
+                        size="small"
+                        color="error"
+                        variant="outlined"
+                        disabled={deleteAgent.isPending}
+                        onClick={() => {
+                          if (window.confirm(`Delete ${agent.displayName}?`)) {
+                            deleteAgent.mutate(agent.id);
+                          }
+                        }}
+                      >
+                        Delete
+                      </Button>
                     </Stack>
                   </Stack>
-                </Box>
-              </Grid2>
+                </Stack>
+              </Box>
             ))}
-          </Grid2>
+          </Stack>
         ) : null}
         </Stack>
       </SectionShell>
@@ -1993,7 +1944,7 @@ export function SwarmManager({ autoRefresh }: Props) {
           <RunHistoryList runs={recentRuns} />
         </SectionShell>
       ) : null}
-      <Dialog open={createOpen} onClose={closeAgentDialog} maxWidth="md" fullWidth>
+      <Dialog open={createOpen} onClose={closeAgentDialog} maxWidth="md" fullWidth slotProps={{ paper: { sx: { borderRadius: "8px", border: "1px solid var(--surface-border)", background: "var(--surface-bg-elevated)", boxShadow: "0 28px 96px rgba(0,0,0,0.5)" } } }}>
         <DialogTitle>{editingAgent ? "Edit custom agent" : "Add custom agent"}</DialogTitle>
         <DialogContent dividers>
           <Stack spacing={1.35}>
@@ -2346,6 +2297,3 @@ export function SwarmManager({ autoRefresh }: Props) {
     </WorkspacePageShell>
   );
 }
-
-
-

@@ -15,8 +15,8 @@
 # DEFAULT IMAGE
 # =============================================================================
 #
-# AgentArk now ships as a single full-runtime image. This is the image profile
-# used by docker compose and the published GHCR release image.
+# AgentArk uses a single full-runtime image profile. This is the canonical
+# image definition used by docker compose and local container builds.
 #
 #   docker build -t agentark:dev .
 #

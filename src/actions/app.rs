@@ -63,6 +63,12 @@ fn control_plane_catalog_mode() -> bool {
         })
 }
 
+fn executor_service_mode() -> bool {
+    std::env::var("AGENTARK_STACK_ROLE")
+        .ok()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("executor"))
+}
+
 fn control_plane_executor_client() -> Option<crate::clients::ExecutorClient> {
     if !control_plane_catalog_mode() {
         return None;
@@ -129,6 +135,7 @@ async fn restart_delegated_runtime(
         "url": url,
         "access_url": access_url,
         "access_key": access_key,
+        "access_password": access_key,
         "access_guard_enabled": access_guard_enabled,
         "port": raw.get("port").cloned().unwrap_or(serde_json::Value::Null),
         "runtime_preference": raw
@@ -1450,10 +1457,17 @@ async fn deploy_repo_bundle(
         .get("expose_public")
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
-    let access_guard_enabled = arguments
+    let requested_access_guard_enabled = arguments
         .get("access_guard")
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
+    let access_secret = access_secret_from_arguments(arguments)?;
+    let access_guard_enabled = requested_access_guard_enabled || access_secret.is_some();
+    if expose_public && access_secret.is_none() {
+        anyhow::bail!(
+            "Public apps require an explicit access password. Provide access_password when expose_public=true."
+        );
+    }
     let runtime_image = arguments.get("runtime_image").cloned();
 
     let fingerprint = repo_deploy_fingerprint(
@@ -1590,6 +1604,12 @@ async fn deploy_repo_bundle(
             "access_guard".to_string(),
             serde_json::json!(access_guard_enabled),
         );
+        if let Some(access_secret) = access_secret.as_ref() {
+            service_args.insert(
+                "access_password".to_string(),
+                serde_json::json!(access_secret),
+            );
+        }
         service_args.insert("repo_url".to_string(), serde_json::json!(repo_url));
         service_args.insert("repo_bundle_id".to_string(), serde_json::json!(bundle_id));
         service_args.insert(
@@ -1676,8 +1696,9 @@ async fn deploy_repo_bundle(
                         .and_then(|value| value.as_bool())
                         .unwrap_or(access_guard_enabled);
                     let delegated_access_key = parsed
-                        .get("access_key")
+                        .get("access_password")
                         .and_then(|value| value.as_str())
+                        .or_else(|| parsed.get("access_key").and_then(|value| value.as_str()))
                         .unwrap_or_default();
                     match restart_delegated_runtime(
                         app_id,
@@ -2611,6 +2632,9 @@ async fn spawn_local_process_with_fallback(
 }
 
 fn docker_required() -> bool {
+    if executor_service_mode() {
+        return true;
+    }
     std::env::var("AGENTARK_APP_REQUIRE_DOCKER")
         .map(|v| {
             let normalized = v.trim().to_ascii_lowercase();
@@ -2666,6 +2690,24 @@ pub fn runtime_preference_from_opt(raw: Option<&str>) -> RuntimePreference {
         "container" | "docker" => RuntimePreference::Container,
         _ => default_runtime_preference(),
     }
+}
+
+fn access_secret_from_arguments(arguments: &serde_json::Value) -> Result<Option<String>> {
+    let provided = arguments
+        .get("access_password")
+        .and_then(|value| value.as_str())
+        .or_else(|| arguments.get("access_key").and_then(|value| value.as_str()));
+    let Some(raw) = provided else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("Access password cannot be empty");
+    }
+    if trimmed.chars().count() > 256 {
+        anyhow::bail!("Access password is too long (max 256 characters)");
+    }
+    Ok(Some(trimmed.to_string()))
 }
 
 fn with_node_bin_path(app_dir: &Path) -> Option<String> {
@@ -3427,6 +3469,8 @@ pub struct RunningApp {
     pub access_key: String,
     /// Whether access guard/key is enforced.
     pub access_guard_enabled: bool,
+    /// Whether this app was requested for public exposure.
+    pub expose_public: bool,
     /// Whether the user wants this app enabled and serveable.
     pub enabled: bool,
     /// Whether this app is still being restored in the background.
@@ -3645,6 +3689,7 @@ pub struct DynamicAppRegistration {
     pub port: u16,
     pub access_key: String,
     pub access_guard_enabled: bool,
+    pub expose_public: bool,
     pub enabled: bool,
     pub last_accessed: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -3655,6 +3700,7 @@ pub struct StoredAppRegistration {
     pub is_static: bool,
     pub access_key: String,
     pub access_guard_enabled: bool,
+    pub expose_public: bool,
     pub enabled: bool,
     pub last_accessed: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -3672,6 +3718,7 @@ struct RestoreAppCandidate {
     config_values: HashMap<String, String>,
     access_guard_enabled: bool,
     access_key: String,
+    expose_public: bool,
     enabled: bool,
     last_accessed: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -3934,6 +3981,7 @@ impl AppRegistry {
                 String::new()
             };
             let access_guard_enabled = app.access_guard_enabled;
+            let expose_public = app.expose_public;
             let enabled = app.enabled;
             let restoring = app.restoring;
             let restore_error = app.restore_error.clone();
@@ -3954,7 +4002,9 @@ impl AppRegistry {
                 "url": relative_app_root_url(&id),
                 "access_url": access_url,
                 "access_key": access_key,
+                "access_password": access_key,
                 "access_guard_enabled": access_guard_enabled,
+                "expose_public": expose_public,
                 "enabled": enabled,
                 "restoring": restoring,
                 "restore_error": restore_error,
@@ -4071,6 +4121,7 @@ impl AppRegistry {
             request_count: 0,
             access_key: registration.access_key,
             access_guard_enabled: registration.access_guard_enabled,
+            expose_public: registration.expose_public,
             enabled: registration.enabled,
             restoring: false,
             restore_error: None,
@@ -4111,6 +4162,7 @@ impl AppRegistry {
             request_count: 0,
             access_key: registration.access_key,
             access_guard_enabled: registration.access_guard_enabled,
+            expose_public: registration.expose_public,
             enabled: registration.enabled,
             restoring: false,
             restore_error: None,
@@ -4139,6 +4191,7 @@ impl AppRegistry {
         app_dir: PathBuf,
         access_key: String,
         access_guard_enabled: bool,
+        expose_public: bool,
     ) -> Option<u16> {
         let now = chrono::Utc::now();
         let mut apps = self.apps.write().await;
@@ -4167,6 +4220,7 @@ impl AppRegistry {
                 request_count: 0,
                 access_key,
                 access_guard_enabled,
+                expose_public,
                 enabled: true,
                 restoring: true,
                 restore_error: None,
@@ -4203,7 +4257,10 @@ impl AppRegistry {
             if !app.access_guard_enabled {
                 return true;
             }
-            return app.access_key == key;
+            return crate::security::constant_time_eq(
+                app.access_key.trim().as_bytes(),
+                key.trim().as_bytes(),
+            );
         }
         false
     }
@@ -4260,6 +4317,7 @@ impl AppRegistry {
         &self,
         app_id: &str,
         enabled: bool,
+        access_secret: Option<&str>,
         regenerate_key: bool,
     ) -> Result<String> {
         let app_handle = {
@@ -4270,11 +4328,22 @@ impl AppRegistry {
 
         let (app_dir, access_key) = {
             let mut app = app_handle.write().await;
-            let should_rotate = regenerate_key || app.access_key.trim().is_empty();
-            let next_key = if should_rotate {
-                generate_access_key()
+            if !enabled && app.expose_public {
+                anyhow::bail!("Public apps must keep App Guard enabled with an access password.");
+            }
+            let explicit_secret = access_secret.map(str::trim).filter(|value| !value.is_empty());
+            let next_key = if enabled {
+                if let Some(secret) = explicit_secret {
+                    secret.to_string()
+                } else if regenerate_key {
+                    generate_access_key()
+                } else if !app.access_key.trim().is_empty() {
+                    app.access_key.clone()
+                } else {
+                    anyhow::bail!("Access password required");
+                }
             } else {
-                app.access_key.clone()
+                String::new()
             };
             app.access_guard_enabled = enabled;
             app.access_key = next_key.clone();
@@ -4497,6 +4566,7 @@ impl AppRegistry {
             config_values,
             access_guard_enabled,
             access_key,
+            expose_public,
             enabled: _enabled,
             last_accessed,
         } = candidate;
@@ -4525,6 +4595,7 @@ impl AppRegistry {
                         is_static: true,
                         access_key: access_key.clone(),
                         access_guard_enabled,
+                        expose_public,
                         enabled: true,
                         last_accessed,
                     },
@@ -4549,6 +4620,7 @@ impl AppRegistry {
                     is_static: true,
                     access_key: access_key.clone(),
                     access_guard_enabled,
+                    expose_public,
                     enabled: true,
                     last_accessed,
                 },
@@ -4586,6 +4658,7 @@ impl AppRegistry {
                         port,
                         access_key: access_key.clone(),
                         access_guard_enabled,
+                        expose_public,
                         enabled: true,
                         last_accessed,
                     },
@@ -4604,6 +4677,7 @@ impl AppRegistry {
                             is_static: true,
                             access_key: access_key.clone(),
                             access_guard_enabled,
+                            expose_public,
                             enabled: true,
                             last_accessed,
                         },
@@ -4626,6 +4700,7 @@ impl AppRegistry {
                         is_static: true,
                         access_key: access_key.clone(),
                         access_guard_enabled,
+                        expose_public,
                         enabled: true,
                         last_accessed,
                     },
@@ -4722,6 +4797,10 @@ impl AppRegistry {
                 } else {
                     String::new()
                 };
+                let expose_public = meta
+                    .as_ref()
+                    .and_then(|m| m.get("expose_public").and_then(|v| v.as_bool()))
+                    .unwrap_or(false);
                 let enabled = meta
                     .as_ref()
                     .and_then(|m| m.get("enabled").and_then(|v| v.as_bool()))
@@ -4740,6 +4819,7 @@ impl AppRegistry {
                     config_values,
                     access_guard_enabled,
                     access_key,
+                    expose_public,
                     enabled,
                     last_accessed,
                 });
@@ -4762,6 +4842,7 @@ impl AppRegistry {
                             is_static: candidate.entry_command.is_none(),
                             access_key: candidate.access_key.clone(),
                             access_guard_enabled: candidate.access_guard_enabled,
+                            expose_public: candidate.expose_public,
                             enabled: false,
                             last_accessed: candidate.last_accessed,
                         },
@@ -4777,6 +4858,7 @@ impl AppRegistry {
                             is_static: candidate.entry_command.is_none(),
                             access_key: candidate.access_key.clone(),
                             access_guard_enabled: candidate.access_guard_enabled,
+                            expose_public: candidate.expose_public,
                             enabled: true,
                             last_accessed: candidate.last_accessed,
                         },
@@ -4808,6 +4890,7 @@ impl AppRegistry {
                         is_static: candidate.entry_command.is_none(),
                         access_key: candidate.access_key.clone(),
                         access_guard_enabled: candidate.access_guard_enabled,
+                        expose_public: candidate.expose_public,
                         enabled: false,
                         last_accessed: candidate.last_accessed,
                     },
@@ -4827,6 +4910,7 @@ impl AppRegistry {
                         is_static: true,
                         access_key: candidate.access_key.clone(),
                         access_guard_enabled: candidate.access_guard_enabled,
+                        expose_public: candidate.expose_public,
                         enabled: true,
                         last_accessed: candidate.last_accessed,
                     },
@@ -4844,6 +4928,7 @@ impl AppRegistry {
                     candidate.app_dir.clone(),
                     candidate.access_key.clone(),
                     candidate.access_guard_enabled,
+                    candidate.expose_public,
                 )
                 .await
             else {
@@ -4857,6 +4942,7 @@ impl AppRegistry {
                         is_static: true,
                         access_key: candidate.access_key.clone(),
                         access_guard_enabled: candidate.access_guard_enabled,
+                        expose_public: candidate.expose_public,
                         enabled: true,
                         last_accessed: candidate.last_accessed,
                     },
@@ -5028,10 +5114,17 @@ pub async fn app_deploy(
         .get("expose_public")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let access_guard_enabled = arguments
+    let requested_access_guard_enabled = arguments
         .get("access_guard")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let access_secret = access_secret_from_arguments(arguments)?;
+    let access_guard_enabled = requested_access_guard_enabled || access_secret.is_some();
+    if expose_public && access_secret.is_none() {
+        anyhow::bail!(
+            "Public apps require an explicit access password. Provide access_password when expose_public=true."
+        );
+    }
     let required_inputs = parse_required_inputs(arguments);
     let config_values = parse_config_values(arguments);
     if entry_command.is_none() {
@@ -5047,10 +5140,10 @@ pub async fn app_deploy(
     }
     let is_static = entry_command.is_none();
 
-    // Generate app ID and optional access key.
+    // Generate app ID and optional access password.
     let app_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
     let access_key = if access_guard_enabled {
-        generate_access_key()
+        access_secret.unwrap_or_else(generate_access_key)
     } else {
         String::new()
     };
@@ -5193,6 +5286,7 @@ pub async fn app_deploy(
                     is_static: true,
                     access_key: access_key.clone(),
                     access_guard_enabled,
+                    expose_public,
                     enabled: true,
                     last_accessed: None,
                 },
@@ -5210,6 +5304,7 @@ pub async fn app_deploy(
             "runtime_preference": runtime_preference.as_str(),
             "expose_public": expose_public,
             "access_key": access_key,
+            "access_password": access_key,
             "access_guard_enabled": access_guard_enabled,
         })
         .to_string());
@@ -5236,6 +5331,7 @@ pub async fn app_deploy(
                     is_static: true,
                     access_key: access_key.clone(),
                     access_guard_enabled,
+                    expose_public,
                     enabled: true,
                     last_accessed: None,
                 },
@@ -5258,6 +5354,7 @@ pub async fn app_deploy(
             "runtime_preference": runtime_preference.as_str(),
             "expose_public": expose_public,
             "access_key": access_key,
+            "access_password": access_key,
             "access_guard_enabled": access_guard_enabled,
             "required_inputs": required_inputs,
             "required_secrets": required_secret_keys.clone(),
@@ -5266,7 +5363,7 @@ pub async fn app_deploy(
             "missing_env": missing_sensitive,
             "missing_config": missing_config,
             "llm_reuse_candidates": llm_reuse_candidates,
-            "message": "Missing required inputs. For sensitive keys use: /setsecret KEY=VALUE (or /usecurrentkey KEY when offered). For non-sensitive values pass config.{KEY} when deploying/restarting."
+            "message": "Missing required inputs. For sensitive keys, use the secure credential form in chat or Settings. For non-sensitive values pass config.{KEY} when deploying/restarting."
         })
         .to_string());
     }
@@ -5281,6 +5378,7 @@ pub async fn app_deploy(
                     is_static: false,
                     access_key: access_key.clone(),
                     access_guard_enabled,
+                    expose_public,
                     enabled: true,
                     last_accessed: None,
                 },
@@ -5302,6 +5400,7 @@ pub async fn app_deploy(
             "runtime_preference": runtime_preference.as_str(),
             "expose_public": expose_public,
             "access_key": access_key,
+            "access_password": access_key,
             "access_guard_enabled": access_guard_enabled,
         })
         .to_string());
@@ -5375,6 +5474,7 @@ pub async fn app_deploy(
                 port,
                 access_key: access_key.clone(),
                 access_guard_enabled,
+                expose_public,
                 enabled: true,
                 last_accessed: None,
             },
@@ -5409,6 +5509,7 @@ pub async fn app_deploy(
         "runtime_preference": runtime_preference.as_str(),
         "expose_public": expose_public,
         "access_key": access_key,
+        "access_password": access_key,
         "access_guard_enabled": access_guard_enabled,
     })
     .to_string())
@@ -5715,6 +5816,7 @@ $ npm run dev
                     is_static: false,
                     access_key: "ak_demo".to_string(),
                     access_guard_enabled: false,
+                    expose_public: false,
                     enabled: false,
                     last_accessed: None,
                 },
@@ -5752,6 +5854,7 @@ $ npm run dev
                     is_static: true,
                     access_key: "ak_demo".to_string(),
                     access_guard_enabled: false,
+                    expose_public: false,
                     enabled: true,
                     last_accessed: None,
                 },

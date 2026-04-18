@@ -11,15 +11,20 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
-use crate::integrations::browser::{BrowserIntegration, BrowserSidecarSessionState};
+use crate::integrations::browser::{BrowserIntegration, BrowserSidecarSessionState, PageContent};
 
 const MAX_ITERATIONS: u32 = 30;
 const MAX_PERSISTED_ACTION_HISTORY: usize = 80;
 const OPERATOR_HANDOFF_TIMEOUT_SECS: u64 = 30 * 60;
+const LIVE_SESSION_IDLE_TIMEOUT_SECS: i64 = 15 * 60;
+const LIVE_SESSION_IDLE_WARNING_SECS: i64 = LIVE_SESSION_IDLE_TIMEOUT_SECS - 60;
+const IDLE_WATCHDOG_POLL_SECS: u64 = 15;
 const INTERRUPTED_BROWSER_SESSION_REASON: &str =
     "Browser session was interrupted by an app restart before it could finish.";
 const INTERRUPTED_BROWSER_HANDOFF_REASON: &str =
     "Browser handoff was interrupted by an app restart before it could finish.";
+const INTERRUPTED_READY_SESSION_REASON: &str =
+    "Browser session ended during an app restart. Restart the browser task.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedBrowserSession {
@@ -42,6 +47,7 @@ pub enum SessionStatus {
     Active,
     WaitingForOperator { question: String },
     OperatorClaimed { question: String },
+    Ready { summary: String },
     AwaitingResume { question: String },
     Interrupted { reason: String },
     Completed { summary: String },
@@ -57,6 +63,7 @@ pub struct BrowserSession {
     pub id: String,
     pub sidecar_session_id: String,
     pub channel: String,
+    pub conversation_id: Option<String>,
     pub task_description: String,
     pub status: SessionStatus,
     pub action_history: Vec<String>,
@@ -69,8 +76,10 @@ pub struct BrowserSession {
 pub enum BrowserSessionNotificationKind {
     Progress,
     NeedsInput,
+    Notice,
     Completed,
     Failed,
+    Closed,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +113,15 @@ impl BrowserSessionNotification {
         }
     }
 
+    fn notice(session_id: &str, message: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            kind: BrowserSessionNotificationKind::Notice,
+            message: message.into(),
+            screenshot: None,
+        }
+    }
+
     fn completed(
         session_id: &str,
         message: impl Into<String>,
@@ -123,6 +141,15 @@ impl BrowserSessionNotification {
             kind: BrowserSessionNotificationKind::Failed,
             message: message.into(),
             screenshot,
+        }
+    }
+
+    fn closed(session_id: &str, message: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            kind: BrowserSessionNotificationKind::Closed,
+            message: message.into(),
+            screenshot: None,
         }
     }
 }
@@ -147,11 +174,25 @@ pub struct BrowserSessionView {
     pub can_complete: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct BrowserConversationSessionSummary {
+    pub id: String,
+    pub task_description: String,
+    pub status: String,
+    pub detail: Option<String>,
+    pub updated_at: String,
+}
+
 #[derive(Clone)]
 pub struct BrowserSessionManager {
     sessions: Arc<DashMap<String, BrowserSession>>,
     integration: Arc<BrowserIntegration>,
     storage: Option<crate::storage::Storage>,
+}
+
+pub struct StartedBrowserSession {
+    pub session_id: String,
+    pub reused_existing: bool,
 }
 
 impl BrowserSessionManager {
@@ -177,9 +218,40 @@ impl BrowserSessionManager {
         &self,
         task: &str,
         channel: &str,
+        conversation_id: Option<&str>,
         llm_client: super::llm::LlmClient,
         notify_fn: Arc<dyn Fn(BrowserSessionNotification) + Send + Sync>,
-    ) -> Result<String> {
+    ) -> Result<StartedBrowserSession> {
+        self.cleanup_stale_sessions().await;
+        self.prune_unreachable_live_sessions().await;
+        let conversation_id = conversation_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        if let Some(existing_session_id) = self
+            .take_reusable_ready_session(conversation_id.as_deref(), task, channel)
+            .await
+        {
+            self.spawn_session_loop(existing_session_id.clone(), llm_client, notify_fn);
+            return Ok(StartedBrowserSession {
+                session_id: existing_session_id,
+                reused_existing: true,
+            });
+        }
+        if let Some(existing_session_id) = self
+            .latest_managed_live_session_for_conversation(conversation_id.as_deref())
+            .await
+        {
+            return Ok(StartedBrowserSession {
+                session_id: existing_session_id,
+                reused_existing: true,
+            });
+        }
+
+        if self.active_count() >= 2 {
+            anyhow::bail!("Maximum 2 concurrent browser sessions");
+        }
+
         let sidecar_id = self.integration.create_session().await?;
         let session_id = uuid::Uuid::new_v4().to_string();
         let created_at = now_rfc3339();
@@ -190,6 +262,7 @@ impl BrowserSessionManager {
                 id: session_id.clone(),
                 sidecar_session_id: sidecar_id.clone(),
                 channel: channel.to_string(),
+                conversation_id,
                 task_description: task.to_string(),
                 status: SessionStatus::Active,
                 action_history: Vec::new(),
@@ -199,60 +272,12 @@ impl BrowserSessionManager {
             },
         );
         self.persist_session(&session_id).await;
-
-        let sessions = self.sessions.clone();
-        let integration = self.integration.clone();
-        let sid = session_id.clone();
-        let task_desc = task.to_string();
-        let storage = self.storage.clone();
-
-        crate::spawn_logged!("src/core/browser_session.rs:209", async move {
-            let result = run_browser_loop(
-                &sid,
-                BrowserLoopContext {
-                    sidecar_id: &sidecar_id,
-                    task: &task_desc,
-                    sessions: &sessions,
-                    integration: &integration,
-                    llm: &llm_client,
-                    notify: &notify_fn,
-                    storage: storage.clone(),
-                },
-            )
-            .await;
-
-            let _ = integration.close_session(&sidecar_id).await;
-            let snapshot = if let Some(mut entry) = sessions.get_mut(&sid) {
-                entry.status = match result {
-                    Ok(summary) => SessionStatus::Completed { summary },
-                    Err(error) => {
-                        let error_text = error.to_string();
-                        if !error_text.starts_with("Reached max iterations (") {
-                            let message = format!("Browser automation failed: {}", error_text);
-                            notify_fn(BrowserSessionNotification::failed(&sid, message, None));
-                        }
-                        SessionStatus::Failed(error_text)
-                    }
-                };
-                entry.operator_handoff_tx = None;
-                entry.updated_at = now_rfc3339();
-                Some(PersistedBrowserSession::from_session(&entry))
-            } else {
-                None
-            };
-            if let Some(snapshot) = snapshot {
-                persist_browser_session(storage.as_ref(), &snapshot).await;
-            }
-            let should_remove = sessions
-                .get(&sid)
-                .map(|entry| session_status_is_terminal(&entry.status))
-                .unwrap_or(false);
-            if should_remove {
-                sessions.remove(&sid);
-            }
-        });
-
-        Ok(session_id)
+        self.spawn_idle_watchdog(session_id.clone(), notify_fn.clone());
+        self.spawn_session_loop(session_id.clone(), llm_client, notify_fn);
+        Ok(StartedBrowserSession {
+            session_id,
+            reused_existing: false,
+        })
     }
 
     pub async fn describe_session(&self, session_id: &str) -> Option<BrowserSessionView> {
@@ -282,10 +307,29 @@ impl BrowserSessionManager {
 
         let sidecar_state =
             if session_status_has_live_session(&status) && !sidecar_session_id.trim().is_empty() {
-                self.integration
-                    .get_session_state(&sidecar_session_id)
-                    .await
-                    .ok()
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(1500),
+                    self.integration.get_session_state(&sidecar_session_id),
+                )
+                .await
+                {
+                    Ok(Ok(state)) => Some(state),
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            "Browser handoff: failed to load sidecar session state for {}: {}",
+                            &id,
+                            error
+                        );
+                        None
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "Browser handoff: timed out loading sidecar session state for {}",
+                            &id
+                        );
+                        None
+                    }
+                }
             } else {
                 None
             };
@@ -298,6 +342,28 @@ impl BrowserSessionManager {
             updated_at,
             sidecar_state,
         ))
+    }
+
+    pub async fn list_session_views(&self) -> Vec<BrowserSessionView> {
+        self.cleanup_stale_sessions().await;
+        self.prune_unreachable_live_sessions().await;
+
+        let mut sessions = self
+            .sessions
+            .iter()
+            .map(|entry| {
+                build_browser_session_view(
+                    entry.id.clone(),
+                    entry.task_description.clone(),
+                    entry.status.clone(),
+                    entry.created_at.clone(),
+                    entry.updated_at.clone(),
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        sessions
     }
 
     pub async fn claim_operator_handoff(&self, session_id: &str) -> Result<BrowserSessionView> {
@@ -314,6 +380,14 @@ impl BrowserSessionManager {
                 SessionStatus::WaitingForOperator { question } => {
                     entry.status = SessionStatus::OperatorClaimed {
                         question: question.clone(),
+                    };
+                }
+                SessionStatus::Ready { summary } => {
+                    entry.status = SessionStatus::OperatorClaimed {
+                        question: format!(
+                            "The browser is ready for manual control. {}",
+                            summary.trim()
+                        ),
                     };
                 }
                 SessionStatus::OperatorClaimed { .. } => {}
@@ -519,19 +593,340 @@ impl BrowserSessionManager {
             .collect()
     }
 
+    pub async fn latest_ready_session_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Option<BrowserConversationSessionSummary> {
+        self.cleanup_stale_sessions().await;
+        self.prune_unreachable_live_sessions().await;
+
+        let conversation_id = conversation_id.trim();
+        if conversation_id.is_empty() {
+            return None;
+        }
+
+        let mut candidates = self
+            .sessions
+            .iter()
+            .filter_map(|entry| {
+                (entry.conversation_id.as_deref() == Some(conversation_id)
+                    && matches!(entry.status, SessionStatus::Ready { .. }))
+                .then(|| BrowserConversationSessionSummary {
+                    id: entry.id.clone(),
+                    task_description: entry.task_description.clone(),
+                    status: entry.status.kind().to_string(),
+                    detail: entry.status.detail(),
+                    updated_at: entry.updated_at.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        candidates.into_iter().next()
+    }
+
+    pub async fn stop_session(&self, session_id: &str) -> Result<BrowserSessionView> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return Err(anyhow!("Browser session not found"));
+        }
+
+        let (view, sidecar_session_id, snapshot) =
+            if let Some(mut entry) = self.sessions.get_mut(session_id) {
+                entry.status = SessionStatus::Interrupted {
+                    reason: "Browser session stopped by user.".to_string(),
+                };
+                entry.operator_handoff_tx = None;
+                entry.updated_at = now_rfc3339();
+                let view = build_browser_session_view(
+                    entry.id.clone(),
+                    entry.task_description.clone(),
+                    entry.status.clone(),
+                    entry.created_at.clone(),
+                    entry.updated_at.clone(),
+                    None,
+                );
+                (
+                    view,
+                    entry.sidecar_session_id.clone(),
+                    Some(PersistedBrowserSession::from_session(&entry)),
+                )
+            } else if let Some(storage) = self.storage.as_ref() {
+                let Some(persisted) = storage.load_browser_session(session_id).await? else {
+                    return Err(anyhow!("Browser session not found"));
+                };
+                let (session, changed) = BrowserSession::restore_from_persisted(persisted);
+                let snapshot = changed.then(|| PersistedBrowserSession::from_session(&session));
+                (
+                    build_browser_session_view(
+                        session.id.clone(),
+                        session.task_description.clone(),
+                        session.status.clone(),
+                        session.created_at.clone(),
+                        session.updated_at.clone(),
+                        None,
+                    ),
+                    session.sidecar_session_id,
+                    snapshot,
+                )
+            } else {
+                return Err(anyhow!("Browser session not found"));
+            };
+
+        if let Some(snapshot) = snapshot {
+            persist_browser_session(self.storage.as_ref(), &snapshot).await;
+        }
+        self.sessions.remove(session_id);
+        self.close_sidecar_best_effort(&sidecar_session_id).await;
+        Ok(view)
+    }
+
+    pub async fn delete_session(&self, session_id: &str) -> Result<bool> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return Ok(false);
+        }
+
+        let removed_sidecar_session_id = self
+            .sessions
+            .remove(session_id)
+            .map(|(_, mut session)| {
+                session.operator_handoff_tx = None;
+                session.sidecar_session_id
+            })
+            .unwrap_or_default();
+
+        let existed_in_storage = if let Some(storage) = self.storage.as_ref() {
+            storage.load_browser_session(session_id).await?.is_some()
+        } else {
+            false
+        };
+
+        self.close_sidecar_best_effort(&removed_sidecar_session_id).await;
+        delete_persisted_browser_session(self.storage.as_ref(), session_id).await;
+        Ok(!removed_sidecar_session_id.is_empty() || existed_in_storage)
+    }
+
+    pub async fn resolve_browser_tool_session_id(
+        &self,
+        requested_session_id: Option<&str>,
+        conversation_id: Option<&str>,
+    ) -> Option<String> {
+        self.cleanup_stale_sessions().await;
+        self.prune_unreachable_live_sessions().await;
+        let conversation_id = conversation_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        if let Some(requested) = requested_session_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if let Some(sidecar_session_id) = self.touch_live_session(requested).await {
+                return Some(sidecar_session_id);
+            }
+
+            let managed_session_id = self
+                .sessions
+                .iter()
+                .find(|entry| {
+                    session_status_has_live_session(&entry.status)
+                        && entry.sidecar_session_id.trim() == requested
+                })
+                .map(|entry| entry.id.clone());
+            if let Some(managed_session_id) = managed_session_id {
+                if let Some(sidecar_session_id) =
+                    self.touch_live_session(managed_session_id.as_str()).await
+                {
+                    return Some(sidecar_session_id);
+                }
+            }
+
+            let mut prefix_matches = self
+                .sessions
+                .iter()
+                .filter_map(|entry| {
+                    let requested_matches = session_status_has_live_session(&entry.status)
+                        && (entry.id.starts_with(requested)
+                            || entry.sidecar_session_id.starts_with(requested));
+                    requested_matches.then(|| {
+                        (
+                            entry.id.clone(),
+                            entry.updated_at.clone(),
+                            conversation_id.is_some_and(|conversation_id| {
+                                entry.conversation_id.as_deref() == Some(conversation_id)
+                            }),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            if prefix_matches.len() > 1 && conversation_id.is_some() {
+                prefix_matches.retain(|(_, _, same_conversation)| *same_conversation);
+            }
+            prefix_matches.sort_by(|left, right| right.1.cmp(&left.1));
+            prefix_matches.dedup_by(|left, right| left.0 == right.0);
+            if prefix_matches.len() == 1 {
+                if let Some(sidecar_session_id) =
+                    self.touch_live_session(prefix_matches[0].0.as_str()).await
+                {
+                    return Some(sidecar_session_id);
+                }
+            }
+
+            if let Some(conversation_id) = conversation_id {
+                if let Some(sidecar_session_id) = self
+                    .latest_live_session_for_conversation(conversation_id)
+                    .await
+                {
+                    return Some(sidecar_session_id);
+                }
+            }
+
+            return Some(requested.to_string());
+        }
+
+        let conversation_id = conversation_id?;
+        self.latest_live_session_for_conversation(conversation_id).await
+    }
+
     pub fn active_count(&self) -> usize {
         self.sessions
             .iter()
-            .filter(|entry| {
-                matches!(
-                    entry.status,
-                    SessionStatus::Active
-                        | SessionStatus::WaitingForOperator { .. }
-                        | SessionStatus::OperatorClaimed { .. }
-                        | SessionStatus::AwaitingResume { .. }
-                )
-            })
+            .filter(|entry| session_counts_against_live_limit(&entry.status))
             .count()
+    }
+
+    async fn cleanup_stale_sessions(&self) {
+        let stale_sessions: Vec<_> = self
+            .sessions
+            .iter()
+            .filter(|entry| {
+                session_should_be_cleaned_up(&entry.status)
+                    || ready_session_is_expired(entry.value())
+            })
+            .map(|entry| (entry.id.clone(), entry.status.kind().to_string()))
+            .collect();
+
+        for (session_id, status) in stale_sessions {
+            self.sessions.remove(&session_id);
+            tracing::info!(
+                "Cleaning up stale browser session '{}' with status '{}'",
+                session_id,
+                status
+            );
+            delete_persisted_browser_session(self.storage.as_ref(), &session_id).await;
+        }
+    }
+
+    async fn prune_unreachable_live_sessions(&self) {
+        let live_sessions = self
+            .sessions
+            .iter()
+            .filter_map(|entry| {
+                (session_status_has_live_session(&entry.status)
+                    && !entry.sidecar_session_id.trim().is_empty())
+                .then(|| (entry.id.clone(), entry.sidecar_session_id.clone()))
+            })
+            .collect::<Vec<_>>();
+
+        for (session_id, sidecar_session_id) in live_sessions {
+            let missing = match tokio::time::timeout(
+                tokio::time::Duration::from_millis(1500),
+                self.integration.get_session_state(&sidecar_session_id),
+            )
+            .await
+            {
+                Ok(Err(error)) => browser_sidecar_session_missing_error(&error),
+                _ => false,
+            };
+            if !missing {
+                continue;
+            }
+
+            tracing::info!(
+                "Cleaning up unreachable browser session '{}' because sidecar session '{}' is missing",
+                session_id,
+                sidecar_session_id
+            );
+            self.sessions.remove(&session_id);
+            delete_persisted_browser_session(self.storage.as_ref(), &session_id).await;
+        }
+    }
+
+    async fn touch_live_session(&self, session_id: &str) -> Option<String> {
+        let touched = if let Some(mut entry) = self.sessions.get_mut(session_id) {
+            if !session_status_has_live_session(&entry.status)
+                || entry.sidecar_session_id.trim().is_empty()
+            {
+                return None;
+            }
+            entry.updated_at = now_rfc3339();
+            let sidecar_session_id = entry.sidecar_session_id.clone();
+            let snapshot = PersistedBrowserSession::from_session(&entry);
+            Some((sidecar_session_id, snapshot))
+        } else {
+            None
+        };
+        let (sidecar_session_id, snapshot) = touched?;
+        persist_browser_session(self.storage.as_ref(), &snapshot).await;
+        Some(sidecar_session_id)
+    }
+
+    async fn latest_live_session_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Option<String> {
+        let managed_session_id = self
+            .latest_managed_live_session_for_conversation(Some(conversation_id))
+            .await?;
+        self.sessions
+            .get(&managed_session_id)
+            .map(|entry| entry.sidecar_session_id.clone())
+    }
+
+    async fn latest_managed_live_session_for_conversation(
+        &self,
+        conversation_id: Option<&str>,
+    ) -> Option<String> {
+        let conversation_id = conversation_id?.trim();
+        if conversation_id.is_empty() {
+            return None;
+        }
+        let mut candidates = self
+            .sessions
+            .iter()
+            .filter_map(|entry| {
+                (entry.conversation_id.as_deref() == Some(conversation_id)
+                    && session_status_has_live_session(&entry.status))
+                .then(|| (entry.id.clone(), entry.updated_at.clone()))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| right.1.cmp(&left.1));
+        for (managed_session_id, _) in candidates {
+            if self
+                .touch_live_session(managed_session_id.as_str())
+                .await
+                .is_some()
+            {
+                return Some(managed_session_id);
+            }
+        }
+        None
+    }
+
+    async fn close_sidecar_best_effort(&self, sidecar_session_id: &str) {
+        let sidecar_session_id = sidecar_session_id.trim();
+        if sidecar_session_id.is_empty() {
+            return;
+        }
+        if let Err(error) = self.integration.close_session(sidecar_session_id).await {
+            if !browser_sidecar_session_missing_error(&error) {
+                tracing::warn!(
+                    "Failed to close browser sidecar session '{}': {}",
+                    sidecar_session_id,
+                    error
+                );
+            }
+        }
     }
 
     async fn persist_session(&self, session_id: &str) {
@@ -567,6 +962,225 @@ impl BrowserSessionManager {
             }
         }
     }
+
+    async fn take_reusable_ready_session(
+        &self,
+        conversation_id: Option<&str>,
+        task: &str,
+        channel: &str,
+    ) -> Option<String> {
+        let conversation_id = conversation_id?.trim();
+        if conversation_id.is_empty() {
+            return None;
+        }
+
+        let mut candidates = self
+            .sessions
+            .iter()
+            .filter_map(|entry| {
+                (entry.conversation_id.as_deref() == Some(conversation_id)
+                    && matches!(entry.status, SessionStatus::Ready { .. }))
+                .then(|| {
+                    (
+                        entry.id.clone(),
+                        entry.sidecar_session_id.clone(),
+                        entry.updated_at.clone(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| right.2.cmp(&left.2));
+
+        for (session_id, sidecar_session_id, _) in candidates {
+            if sidecar_session_id.trim().is_empty() {
+                self.sessions.remove(&session_id);
+                delete_persisted_browser_session(self.storage.as_ref(), &session_id).await;
+                continue;
+            }
+
+            let sidecar_alive = tokio::time::timeout(
+                tokio::time::Duration::from_millis(1500),
+                self.integration.get_session_state(&sidecar_session_id),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .is_some();
+            if !sidecar_alive {
+                self.sessions.remove(&session_id);
+                delete_persisted_browser_session(self.storage.as_ref(), &session_id).await;
+                continue;
+            }
+
+            let snapshot = if let Some(mut entry) = self.sessions.get_mut(&session_id) {
+                entry.status = SessionStatus::Active;
+                entry.channel = channel.to_string();
+                entry.task_description = task.to_string();
+                entry.action_history.clear();
+                entry.operator_handoff_tx = None;
+                entry.updated_at = now_rfc3339();
+                Some(PersistedBrowserSession::from_session(&entry))
+            } else {
+                None
+            };
+            if let Some(snapshot) = snapshot {
+                persist_browser_session(self.storage.as_ref(), &snapshot).await;
+            }
+            return Some(session_id);
+        }
+
+        None
+    }
+
+    fn spawn_session_loop(
+        &self,
+        session_id: String,
+        llm_client: super::llm::LlmClient,
+        notify_fn: Arc<dyn Fn(BrowserSessionNotification) + Send + Sync>,
+    ) {
+        let sessions = self.sessions.clone();
+        let integration = self.integration.clone();
+        let storage = self.storage.clone();
+
+        crate::spawn_logged!(
+            "src/core/browser_session.rs:spawn_session_loop",
+            async move {
+                let Some((sidecar_id, task_desc)) = sessions.get(&session_id).map(|entry| {
+                    (
+                        entry.sidecar_session_id.clone(),
+                        entry.task_description.clone(),
+                    )
+                }) else {
+                    return;
+                };
+
+                let result = run_browser_loop(
+                    &session_id,
+                    BrowserLoopContext {
+                        sidecar_id: &sidecar_id,
+                        task: &task_desc,
+                        sessions: &sessions,
+                        integration: &integration,
+                        llm: &llm_client,
+                        notify: &notify_fn,
+                        storage: storage.clone(),
+                    },
+                )
+                .await;
+
+                let mut close_sidecar = false;
+                let snapshot = if let Some(mut entry) = sessions.get_mut(&session_id) {
+                    entry.status = match result {
+                        Ok(summary) => SessionStatus::Ready { summary },
+                        Err(error) => {
+                            close_sidecar = true;
+                            let error_text = error.to_string();
+                            if !error_text.starts_with("Reached max iterations (") {
+                                let message = format!("Browser automation failed: {}", error_text);
+                                notify_fn(BrowserSessionNotification::failed(
+                                    &session_id,
+                                    message,
+                                    None,
+                                ));
+                            }
+                            SessionStatus::Failed(error_text)
+                        }
+                    };
+                    entry.operator_handoff_tx = None;
+                    entry.updated_at = now_rfc3339();
+                    Some(PersistedBrowserSession::from_session(&entry))
+                } else {
+                    None
+                };
+                if let Some(snapshot) = snapshot {
+                    persist_browser_session(storage.as_ref(), &snapshot).await;
+                }
+                if close_sidecar {
+                    let _ = integration.close_session(&sidecar_id).await;
+                }
+                let should_remove = sessions
+                    .get(&session_id)
+                    .map(|entry| session_status_is_terminal(&entry.status))
+                    .unwrap_or(false);
+                if should_remove {
+                    sessions.remove(&session_id);
+                }
+            }
+        );
+    }
+
+    fn spawn_idle_watchdog(
+        &self,
+        session_id: String,
+        notify_fn: Arc<dyn Fn(BrowserSessionNotification) + Send + Sync>,
+    ) {
+        let sessions = self.sessions.clone();
+        let integration = self.integration.clone();
+        let storage = self.storage.clone();
+
+        crate::spawn_logged!(
+            "src/core/browser_session.rs:spawn_idle_watchdog",
+            async move {
+                let mut warned_for_updated_at: Option<String> = None;
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(IDLE_WATCHDOG_POLL_SECS))
+                        .await;
+
+                    let Some((status, updated_at, sidecar_session_id)) =
+                        sessions.get(&session_id).map(|entry| {
+                            (
+                                entry.status.clone(),
+                                entry.updated_at.clone(),
+                                entry.sidecar_session_id.clone(),
+                            )
+                        })
+                    else {
+                        return;
+                    };
+
+                    if !session_status_has_live_session(&status)
+                        || session_status_is_terminal(&status)
+                    {
+                        return;
+                    }
+
+                    let Some(last_updated_at) = parse_rfc3339_utc(&updated_at) else {
+                        continue;
+                    };
+                    let idle_secs = (Utc::now() - last_updated_at).num_seconds();
+                    if idle_secs < LIVE_SESSION_IDLE_WARNING_SECS {
+                        warned_for_updated_at = None;
+                        continue;
+                    }
+
+                    if idle_secs >= LIVE_SESSION_IDLE_WARNING_SECS
+                        && warned_for_updated_at.as_deref() != Some(updated_at.as_str())
+                    {
+                        notify_fn(BrowserSessionNotification::notice(
+                        &session_id,
+                        "This browser session has been idle for almost 15 minutes. It will close automatically in about 1 minute unless you continue the task or reopen the live handoff.",
+                    ));
+                        warned_for_updated_at = Some(updated_at.clone());
+                    }
+
+                    if idle_secs < LIVE_SESSION_IDLE_TIMEOUT_SECS {
+                        continue;
+                    }
+
+                    if !sidecar_session_id.trim().is_empty() {
+                        let _ = integration.close_session(&sidecar_session_id).await;
+                    }
+                    sessions.remove(&session_id);
+                    delete_persisted_browser_session(storage.as_ref(), &session_id).await;
+                    notify_fn(BrowserSessionNotification::closed(
+                    &session_id,
+                    "Browser session closed after 15 minutes of inactivity to keep AgentArk responsive. Ask me to reopen it if you want to continue.",
+                ));
+                    return;
+                }
+            }
+        );
+    }
 }
 
 fn now_rfc3339() -> String {
@@ -578,17 +1192,56 @@ fn trimmed_action_history(history: &[String]) -> Vec<String> {
     history[start..].to_vec()
 }
 
+fn parse_rfc3339_utc(value: &str) -> Option<chrono::DateTime<Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+fn browser_sidecar_session_missing_error(error: &anyhow::Error) -> bool {
+    let lower = error.to_string().to_ascii_lowercase();
+    lower.contains("404")
+        || (lower.contains("not found") && lower.contains("/session/"))
+        || lower.contains("unknown session")
+        || lower.contains("session does not exist")
+}
+
 fn session_status_has_live_session(status: &SessionStatus) -> bool {
     matches!(
         status,
         SessionStatus::Active
             | SessionStatus::WaitingForOperator { .. }
             | SessionStatus::OperatorClaimed { .. }
+            | SessionStatus::Ready { .. }
     )
 }
 
+fn session_counts_against_live_limit(status: &SessionStatus) -> bool {
+    session_status_has_live_session(status)
+}
+
+fn session_should_be_cleaned_up(status: &SessionStatus) -> bool {
+    matches!(
+        status,
+        SessionStatus::AwaitingResume { .. } | SessionStatus::Interrupted { .. }
+    )
+}
+
+fn ready_session_is_expired(session: &BrowserSession) -> bool {
+    if !matches!(session.status, SessionStatus::Ready { .. }) {
+        return false;
+    }
+
+    parse_rfc3339_utc(&session.updated_at)
+        .map(|updated_at| (Utc::now() - updated_at).num_seconds() >= LIVE_SESSION_IDLE_TIMEOUT_SECS)
+        .unwrap_or(false)
+}
+
 fn session_status_is_terminal(status: &SessionStatus) -> bool {
-    matches!(status, SessionStatus::Completed { .. } | SessionStatus::Failed(_))
+    matches!(
+        status,
+        SessionStatus::Completed { .. } | SessionStatus::Failed(_)
+    )
 }
 
 fn build_browser_session_view(
@@ -627,6 +1280,15 @@ fn build_browser_session_view(
             false,
             true,
             true,
+        ),
+        SessionStatus::Ready { summary } => (
+            String::from("ready"),
+            None,
+            Some(summary),
+            None,
+            true,
+            false,
+            false,
         ),
         SessionStatus::AwaitingResume { question } => (
             String::from("awaiting_resume"),
@@ -713,6 +1375,22 @@ async fn persist_browser_session(
     }
 }
 
+async fn delete_persisted_browser_session(
+    storage: Option<&crate::storage::Storage>,
+    session_id: &str,
+) {
+    let Some(storage) = storage else {
+        return;
+    };
+    if let Err(error) = storage.delete_browser_session(session_id).await {
+        tracing::warn!(
+            "Failed to delete stale browser session '{}': {}",
+            session_id,
+            error
+        );
+    }
+}
+
 async fn sync_session_history(
     sessions: &Arc<DashMap<String, BrowserSession>>,
     storage: Option<&crate::storage::Storage>,
@@ -758,7 +1436,7 @@ impl PersistedBrowserSession {
             status: session.status.kind().to_string(),
             task_description: session.task_description.clone(),
             channel: session.channel.clone(),
-            chat_id: None,
+            chat_id: session.conversation_id.clone(),
             status_detail: session.status.detail(),
             action_history: trimmed_action_history(&session.action_history),
             created_at: session.created_at.clone(),
@@ -774,7 +1452,7 @@ impl BrowserSession {
             status,
             task_description,
             channel,
-            chat_id: _,
+            chat_id,
             status_detail,
             action_history,
             created_at,
@@ -784,6 +1462,13 @@ impl BrowserSession {
             "active" => (
                 SessionStatus::Interrupted {
                     reason: INTERRUPTED_BROWSER_SESSION_REASON.to_string(),
+                },
+                true,
+            ),
+            "ready" => (
+                SessionStatus::Interrupted {
+                    reason: status_detail
+                        .unwrap_or_else(|| INTERRUPTED_READY_SESSION_REASON.to_string()),
                 },
                 true,
             ),
@@ -836,6 +1521,7 @@ impl BrowserSession {
                 id,
                 sidecar_session_id: String::new(),
                 channel,
+                conversation_id: chat_id,
                 task_description,
                 status,
                 action_history: trimmed_action_history(&action_history),
@@ -854,6 +1540,7 @@ impl SessionStatus {
             Self::Active => "active",
             Self::WaitingForOperator { .. } => "waiting_for_operator",
             Self::OperatorClaimed { .. } => "operator_claimed",
+            Self::Ready { .. } => "ready",
             Self::AwaitingResume { .. } => "awaiting_resume",
             Self::Interrupted { .. } => "interrupted",
             Self::Completed { .. } => "completed",
@@ -866,6 +1553,7 @@ impl SessionStatus {
             Self::Active => None,
             Self::WaitingForOperator { question } => Some(question.clone()),
             Self::OperatorClaimed { question } => Some(question.clone()),
+            Self::Ready { summary } => Some(summary.clone()),
             Self::AwaitingResume { question } => Some(question.clone()),
             Self::Interrupted { reason } => Some(reason.clone()),
             Self::Completed { summary } => Some(summary.clone()),
@@ -897,11 +1585,23 @@ async fn run_browser_loop(session_id: &str, ctx: BrowserLoopContext<'_>) -> Resu
          - {{\"action\":\"press_key\",\"key\":\"Enter\"}}\n\
          - {{\"action\":\"ask_user\",\"question\":\"...\"}} when the site needs a real human to take over the live browser for login, MFA, CAPTCHA, or other sensitive steps. Do not ask the user to paste website passwords or one-time codes into chat when live browser handoff will work.\n\
          - {{\"action\":\"notify\",\"message\":\"...\"}}\n\
-         - {{\"action\":\"done\",\"summary\":\"...\",\"message\":\"...\"}}\n",
+         - {{\"action\":\"done\",\"summary\":\"...\",\"message\":\"...\"}}\n\n\
+         Guardrails:\n\
+         - Treat the task as a multi-step objective. If it includes a gated step such as login plus later explicit website work, use live handoff only for the gated step, then continue the remaining task yourself after the handoff resumes.\n\
+         - Base every decision on the current page snapshot shown in the latest step.\n\
+         - Treat any operator note from a live handoff as an unverified hint, never as proof.\n\
+         - After a live handoff resumes, inspect the fresh page state before deciding what changed.\n\
+         - If the task already states what should happen after login, MFA, CAPTCHA, or another gated checkpoint, continue directly instead of asking for confirmation.\n\
+         - Use ask_user only when a real human must operate the site or when the task is genuinely underspecified even after considering the task text and current page.\n\
+         - Only claim a gated checkpoint succeeded when the current page directly supports that claim.\n\
+         - If the requested checkpoint cannot be directly verified from the current page, summarize the visible state conservatively instead of inventing hidden state.\n\
+         - Use done only when the requested outcome is completed, or when you are blocked and have already asked the user for the missing human step.\n\
+         - Only stop and ask what to do next when the explicit task is complete and no further action is implied by the task itself.",
         ctx.task
     );
 
     let mut history: Vec<String> = Vec::new();
+    let mut pending_resume_context: Option<String> = None;
 
     for iteration in 0..MAX_ITERATIONS {
         let content = ctx.integration.get_content(ctx.sidecar_id).await?;
@@ -942,6 +1642,9 @@ async fn run_browser_loop(session_id: &str, ctx: BrowserLoopContext<'_>) -> Resu
             body_preview,
             elements_str
         )];
+        if let Some(resume_context) = pending_resume_context.take() {
+            messages.insert(0, resume_context);
+        }
         if !history.is_empty() {
             messages.insert(0, format!("Previous actions:\n{}", history.join("\n")));
         }
@@ -1073,9 +1776,17 @@ async fn run_browser_loop(session_id: &str, ctx: BrowserLoopContext<'_>) -> Resu
                             "Step {}: Operator completed live browser handoff",
                             iteration + 1
                         ));
-                        if !outcome.note.trim().is_empty() {
-                            history.push(format!("Operator note: {}", outcome.note.trim()));
-                        }
+                        let operator_note = outcome.note.trim();
+                        let operator_note = if operator_note.is_empty() {
+                            "No operator note was provided.".to_string()
+                        } else {
+                            format!("Operator note (hint only): {}", operator_note)
+                        };
+                        pending_resume_context = Some(format!(
+                            "This step just resumed after a live operator handoff.\nPage state immediately before the handoff:\n{}\n{}\nUse the current page snapshot below as the source of truth. The operator note is a hint, not proof.",
+                            describe_page_snapshot(&content),
+                            operator_note
+                        ));
                     }
                     Ok(Err(_)) => {
                         return Err(anyhow!("Live browser handoff channel closed unexpectedly"));
@@ -1131,6 +1842,46 @@ async fn run_browser_loop(session_id: &str, ctx: BrowserLoopContext<'_>) -> Resu
     Err(anyhow!("Reached max iterations ({})", MAX_ITERATIONS))
 }
 
+fn describe_page_snapshot(content: &PageContent) -> String {
+    let mut lines = vec![
+        format!("URL: {}", content.url.trim()),
+        format!("Title: {}", content.title.trim()),
+    ];
+    let body = content.body_text.trim();
+    if !body.is_empty() {
+        let body_preview = if body.chars().count() > 500 {
+            let preview = body.chars().take(500).collect::<String>();
+            format!("{}...", preview)
+        } else {
+            body.to_string()
+        };
+        lines.push(format!("Body preview: {}", body_preview));
+    }
+    let element_preview = content
+        .elements
+        .iter()
+        .take(8)
+        .map(|element| {
+            let label = if !element.text.trim().is_empty() {
+                element.text.trim()
+            } else if !element.name.trim().is_empty() {
+                element.name.trim()
+            } else if !element.id.trim().is_empty() {
+                element.id.trim()
+            } else if !element.href.trim().is_empty() {
+                element.href.trim()
+            } else {
+                element.tag.trim()
+            };
+            format!("<{}> {}", element.tag.trim(), label)
+        })
+        .collect::<Vec<_>>();
+    if !element_preview.is_empty() {
+        lines.push(format!("Elements: {}", element_preview.join("; ")));
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1164,6 +1915,23 @@ mod tests {
         assert_eq!(claimed.status, "operator_claimed");
         assert!(claimed.can_release);
         assert!(claimed.can_complete);
+
+        let ready = build_browser_session_view(
+            "session-1".to_string(),
+            "demo".to_string(),
+            SessionStatus::Ready {
+                summary: "Browser is ready for follow-up.".to_string(),
+            },
+            "2026-01-01T00:00:00Z".to_string(),
+            "2026-01-01T00:01:00Z".to_string(),
+            None,
+        );
+        assert_eq!(ready.status, "ready");
+        assert!(ready.can_claim);
+        assert_eq!(
+            ready.summary.as_deref(),
+            Some("Browser is ready for follow-up.")
+        );
     }
 
     #[test]
@@ -1183,11 +1951,269 @@ mod tests {
         let (session, changed) = BrowserSession::restore_from_persisted(persisted);
 
         assert!(changed);
+        assert_eq!(session.conversation_id.as_deref(), Some("conversation-1"));
         match session.status {
             SessionStatus::AwaitingResume { question } => {
                 assert!(question.contains("Please finish the live login"));
             }
             other => panic!("unexpected restored status: {:?}", other),
         }
+    }
+
+    #[test]
+    fn awaiting_resume_does_not_count_against_live_session_limit() {
+        assert!(session_counts_against_live_limit(&SessionStatus::Active));
+        assert!(session_counts_against_live_limit(
+            &SessionStatus::WaitingForOperator {
+                question: "Log in".to_string(),
+            }
+        ));
+        assert!(session_counts_against_live_limit(
+            &SessionStatus::OperatorClaimed {
+                question: "Log in".to_string(),
+            }
+        ));
+        assert!(session_counts_against_live_limit(&SessionStatus::Ready {
+            summary: "Browser is ready".to_string(),
+        }));
+        assert!(!session_counts_against_live_limit(
+            &SessionStatus::AwaitingResume {
+                question: "Restart the browser task".to_string(),
+            }
+        ));
+    }
+
+    #[test]
+    fn interrupted_restart_sessions_are_marked_for_cleanup() {
+        assert!(session_should_be_cleaned_up(
+            &SessionStatus::AwaitingResume {
+                question: "Restart the browser task".to_string(),
+            }
+        ));
+        assert!(session_should_be_cleaned_up(&SessionStatus::Interrupted {
+            reason: "App restarted".to_string(),
+        }));
+        assert!(!session_should_be_cleaned_up(&SessionStatus::Active));
+        assert!(!session_should_be_cleaned_up(
+            &SessionStatus::WaitingForOperator {
+                question: "Log in".to_string(),
+            }
+        ));
+        assert!(!session_should_be_cleaned_up(&SessionStatus::Ready {
+            summary: "Browser is ready".to_string(),
+        }));
+    }
+
+    fn test_manager() -> BrowserSessionManager {
+        BrowserSessionManager {
+            sessions: Arc::new(DashMap::new()),
+            integration: Arc::new(BrowserIntegration::new()),
+            storage: None,
+        }
+    }
+
+    fn test_session(
+        id: &str,
+        sidecar_session_id: &str,
+        conversation_id: Option<&str>,
+        status: SessionStatus,
+        updated_at: &str,
+    ) -> BrowserSession {
+        BrowserSession {
+            id: id.to_string(),
+            sidecar_session_id: sidecar_session_id.to_string(),
+            channel: "web".to_string(),
+            conversation_id: conversation_id.map(str::to_string),
+            task_description: "demo task".to_string(),
+            status,
+            action_history: Vec::new(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: updated_at.to_string(),
+            operator_handoff_tx: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_browser_tool_session_id_maps_managed_session_to_sidecar() {
+        let manager = test_manager();
+        manager.sessions.insert(
+            "managed-1".to_string(),
+            test_session(
+                "managed-1",
+                "sidecar-1",
+                Some("conversation-1"),
+                SessionStatus::Ready {
+                    summary: "Browser ready".to_string(),
+                },
+                "2026-01-01T00:05:00Z",
+            ),
+        );
+
+        let resolved = manager
+            .resolve_browser_tool_session_id(Some("managed-1"), Some("conversation-1"))
+            .await;
+
+        assert_eq!(resolved.as_deref(), Some("sidecar-1"));
+    }
+
+    #[tokio::test]
+    async fn resolve_browser_tool_session_id_reuses_latest_live_chat_session_when_missing() {
+        let manager = test_manager();
+        manager.sessions.insert(
+            "managed-old".to_string(),
+            test_session(
+                "managed-old",
+                "sidecar-old",
+                Some("conversation-1"),
+                SessionStatus::Ready {
+                    summary: "Browser ready".to_string(),
+                },
+                "2026-01-01T00:05:00Z",
+            ),
+        );
+        manager.sessions.insert(
+            "managed-new".to_string(),
+            test_session(
+                "managed-new",
+                "sidecar-new",
+                Some("conversation-1"),
+                SessionStatus::Active,
+                "2026-01-01T00:10:00Z",
+            ),
+        );
+
+        let resolved = manager
+            .resolve_browser_tool_session_id(None, Some("conversation-1"))
+            .await;
+
+        assert_eq!(resolved.as_deref(), Some("sidecar-new"));
+    }
+
+    #[tokio::test]
+    async fn resolve_browser_tool_session_id_accepts_short_managed_prefix() {
+        let manager = test_manager();
+        manager.sessions.insert(
+            "3fd67131-full-managed-id".to_string(),
+            test_session(
+                "3fd67131-full-managed-id",
+                "sidecar-1",
+                Some("conversation-1"),
+                SessionStatus::Ready {
+                    summary: "Browser ready".to_string(),
+                },
+                "2026-01-01T00:05:00Z",
+            ),
+        );
+
+        let resolved = manager
+            .resolve_browser_tool_session_id(Some("3fd67131"), Some("conversation-1"))
+            .await;
+
+        assert_eq!(resolved.as_deref(), Some("sidecar-1"));
+    }
+
+    #[tokio::test]
+    async fn resolve_browser_tool_session_id_prefers_conversation_live_session_over_bad_requested_id() {
+        let manager = test_manager();
+        manager.sessions.insert(
+            "managed-1".to_string(),
+            test_session(
+                "managed-1",
+                "sidecar-1",
+                Some("conversation-1"),
+                SessionStatus::Ready {
+                    summary: "Browser ready".to_string(),
+                },
+                "2026-01-01T00:05:00Z",
+            ),
+        );
+
+        let resolved = manager
+            .resolve_browser_tool_session_id(Some("bad-short-id"), Some("conversation-1"))
+            .await;
+
+        assert_eq!(resolved.as_deref(), Some("sidecar-1"));
+    }
+
+    #[tokio::test]
+    async fn latest_ready_session_for_conversation_prefers_most_recent_ready() {
+        let manager = test_manager();
+        manager.sessions.insert(
+            "managed-active".to_string(),
+            test_session(
+                "managed-active",
+                "sidecar-active",
+                Some("conversation-1"),
+                SessionStatus::Active,
+                "2026-01-01T00:15:00Z",
+            ),
+        );
+        manager.sessions.insert(
+            "managed-old".to_string(),
+            test_session(
+                "managed-old",
+                "sidecar-old",
+                Some("conversation-1"),
+                SessionStatus::Ready {
+                    summary: "Older ready browser".to_string(),
+                },
+                "2026-01-01T00:05:00Z",
+            ),
+        );
+        manager.sessions.insert(
+            "managed-new".to_string(),
+            test_session(
+                "managed-new",
+                "sidecar-new",
+                Some("conversation-1"),
+                SessionStatus::Ready {
+                    summary: "Newest ready browser".to_string(),
+                },
+                "2026-01-01T00:10:00Z",
+            ),
+        );
+
+        let summary = manager
+            .latest_ready_session_for_conversation("conversation-1")
+            .await
+            .expect("expected reusable ready browser session");
+
+        assert_eq!(summary.id, "managed-new");
+        assert_eq!(summary.status, "ready");
+        assert_eq!(summary.detail.as_deref(), Some("Newest ready browser"));
+    }
+
+    #[tokio::test]
+    async fn latest_managed_live_session_for_conversation_prefers_most_recent_live_session() {
+        let manager = test_manager();
+        manager.sessions.insert(
+            "managed-old".to_string(),
+            test_session(
+                "managed-old",
+                "sidecar-old",
+                Some("conversation-1"),
+                SessionStatus::WaitingForOperator {
+                    question: "Log in".to_string(),
+                },
+                "2026-01-01T00:05:00Z",
+            ),
+        );
+        manager.sessions.insert(
+            "managed-new".to_string(),
+            test_session(
+                "managed-new",
+                "sidecar-new",
+                Some("conversation-1"),
+                SessionStatus::Active,
+                "2026-01-01T00:10:00Z",
+            ),
+        );
+
+        let session_id = manager
+            .latest_managed_live_session_for_conversation(Some("conversation-1"))
+            .await
+            .expect("expected reusable live browser session");
+
+        assert_eq!(session_id, "managed-new");
     }
 }

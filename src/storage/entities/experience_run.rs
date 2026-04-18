@@ -48,6 +48,17 @@ pub struct Model {
     pub accepted_at: Option<String>,
     #[sea_orm(nullable)]
     pub corrected_at: Option<String>,
+    pub heuristic_reflected: bool,
+    #[sea_orm(nullable)]
+    pub heuristic_reflection_status: Option<String>,
+    #[sea_orm(nullable)]
+    pub heuristic_reflection_attempted_at: Option<String>,
+    #[sea_orm(nullable)]
+    pub heuristic_reflection_completed_at: Option<String>,
+    #[sea_orm(nullable)]
+    pub heuristic_lesson_id: Option<String>,
+    #[sea_orm(nullable)]
+    pub heuristic_reflection_error: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

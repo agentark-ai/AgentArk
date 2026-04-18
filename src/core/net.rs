@@ -33,7 +33,7 @@ pub fn build_internal_control_client(timeout_secs: u64) -> Result<reqwest::Clien
     Ok(builder.build()?)
 }
 
-fn is_private_or_local_ip(ip: std::net::IpAddr) -> bool {
+pub fn is_private_or_local_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
             v4.is_private()
@@ -55,7 +55,7 @@ fn is_private_or_local_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
-fn is_disallowed_public_hostname(host: &str) -> bool {
+pub fn is_disallowed_public_hostname(host: &str) -> bool {
     let normalized = host.trim().trim_end_matches('.').to_ascii_lowercase();
     normalized.is_empty()
         || normalized == "localhost"
@@ -63,6 +63,80 @@ fn is_disallowed_public_hostname(host: &str) -> bool {
         || normalized.ends_with(".local")
         || normalized == "0.0.0.0"
         || normalized == "[::]"
+}
+
+pub fn production_tls_required() -> bool {
+    std::env::var("AGENTARK_ENV")
+        .map(|value| value.eq_ignore_ascii_case("production"))
+        .unwrap_or(false)
+        || std::env::var("AGENTARK_REQUIRE_TLS")
+            .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false)
+}
+
+pub fn allow_insecure_local_transport() -> bool {
+    std::env::var("AGENTARK_ALLOW_INSECURE_LOCAL_TRANSPORT")
+        .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+        || !production_tls_required()
+}
+
+pub fn validate_no_userinfo(url: &reqwest::Url) -> Result<()> {
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(anyhow!("Userinfo is not allowed in external URLs"));
+    }
+    Ok(())
+}
+
+pub async fn validate_external_https_url(raw: &str) -> Result<reqwest::Url> {
+    let url = reqwest::Url::parse(raw).map_err(|error| anyhow!("Invalid URL: {}", error))?;
+    if url.scheme() != "https" {
+        return Err(anyhow!("Only HTTPS URLs are supported for external extensions"));
+    }
+    validate_no_userinfo(&url)?;
+    validate_public_url_host(&url).await?;
+    Ok(url)
+}
+
+pub async fn validate_public_url_host(url: &reqwest::Url) -> Result<()> {
+    let host = url
+        .host()
+        .ok_or_else(|| anyhow!("URL must include a host"))?;
+    let port = url.port_or_known_default().unwrap_or(443);
+    if port == 8990 {
+        return Err(anyhow!("AgentArk control ports are not valid external extension endpoints"));
+    }
+    match host {
+        url::Host::Domain(domain) => {
+            if is_disallowed_public_hostname(domain) {
+                return Err(anyhow!("Disallowed public host"));
+            }
+            let mut resolved_any = false;
+            let addrs = tokio::net::lookup_host((domain, port))
+                .await
+                .map_err(|_| anyhow!("Failed to resolve host"))?;
+            for addr in addrs {
+                resolved_any = true;
+                if is_private_or_local_ip(addr.ip()) {
+                    return Err(anyhow!("URL resolves to a private or local IP"));
+                }
+            }
+            if !resolved_any {
+                return Err(anyhow!("Failed to resolve host"));
+            }
+        }
+        url::Host::Ipv4(ip) => {
+            if is_private_or_local_ip(std::net::IpAddr::V4(ip)) {
+                return Err(anyhow!("URL IP is private or local"));
+            }
+        }
+        url::Host::Ipv6(ip) => {
+            if is_private_or_local_ip(std::net::IpAddr::V6(ip)) {
+                return Err(anyhow!("URL IP is private or local"));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub async fn validate_public_https_url(raw: &str) -> Result<reqwest::Url> {

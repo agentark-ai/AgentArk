@@ -365,7 +365,9 @@ impl Agent {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        let preferred_direct_action = "none".to_string();
+        let preferred_direct_action =
+            crate::core::intent::preferred_direct_action_name(message, actions)
+                .unwrap_or_else(|| "none".to_string());
         let policy_hint_block = format!(
             "Active routing policy version: {}\n\
 Routing fallback signals are structure-first (not keyword lists).\n\

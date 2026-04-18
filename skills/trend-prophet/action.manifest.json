@@ -1,8 +1,0 @@
-{
-  "action_name": "trend-prophet",
-  "bundle_hash": "dc5a2c6d4d0b14b02f8cb9f6cac738292cbda749c95961a71ed36a8662740089",
-  "publisher_did": "did:key:z6MktwS4jbR4hMa49jniuUJa1zs6Ds2YGjXqWPyvg6Ad9Dg1",
-  "signature": "2e7b3962ee4898675757e23e2594a9c59181d3bf49335bcf1aa79cf0f4de365a2df058fad2af70014105b428ee018fd616fab6d68bcdbf28b115fc8ba2243608",
-  "signed_at": "2026-03-29T09:22:22.569196300Z",
-  "manifest_version": 1
-}

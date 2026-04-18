@@ -12,6 +12,10 @@ pub struct RequestShapeAssessment {
     pub integration_id: Option<String>,
     pub product_help: bool,
     pub help_topics: Vec<String>,
+    #[serde(default)]
+    pub public_freshness_required: bool,
+    #[serde(default)]
+    pub workspace_modification_request: bool,
 }
 
 impl RequestShapeAssessment {
@@ -53,11 +57,13 @@ impl RequestShapeAssessment {
     fn normalized_execution_mode(&self) -> String {
         match Self::canonical_label(&self.execution_mode).as_str() {
             "now" | "right_now" | "execute_now" | "run_now" | "direct" => "immediate".to_string(),
-            "schedule" | "scheduled_task" | "recurring" | "recurring_schedule" => {
-                "scheduled".to_string()
-            }
+            "schedule" | "scheduled_task" | "recurring" | "recurring_schedule" | "deferred"
+            | "later" => "scheduled".to_string(),
             "watch" | "monitor" | "monitoring" | "until" | "poll_until" => {
                 "watch_until".to_string()
+            }
+            "background" | "async" | "durable_background" | "long_running" => {
+                "background".to_string()
             }
             "none_needed" | "no_execution" | "not_applicable" | "na" => "none".to_string(),
             other => other.to_string(),
@@ -122,9 +128,19 @@ mod tests {
             execution_mode: "run now".to_string(),
             ..Default::default()
         };
+        let deferred = RequestShapeAssessment {
+            execution_mode: "later".to_string(),
+            ..Default::default()
+        };
+        let background = RequestShapeAssessment {
+            execution_mode: "long running".to_string(),
+            ..Default::default()
+        };
 
         assert!(shape.shape_is("calendar_event"));
         assert!(shape.execution_mode_is("immediate"));
         assert!(shape.is_execution_request());
+        assert!(deferred.execution_mode_is("scheduled"));
+        assert!(background.execution_mode_is("background"));
     }
 }

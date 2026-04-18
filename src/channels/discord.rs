@@ -536,7 +536,10 @@ async fn load_recent_event_state(storage: &Storage) -> Result<DiscordRecentEvent
     Ok(DiscordRecentEventState::default())
 }
 
-async fn persist_recent_event_state(storage: &Storage, state: &DiscordRecentEventState) -> Result<()> {
+async fn persist_recent_event_state(
+    storage: &Storage,
+    state: &DiscordRecentEventState,
+) -> Result<()> {
     let raw = serde_json::to_vec(state)?;
     storage.set(RECENT_EVENT_IDS_STORAGE_KEY, &raw).await?;
     Ok(())

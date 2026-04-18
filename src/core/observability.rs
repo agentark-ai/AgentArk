@@ -3,7 +3,7 @@ use crate::core::AgentConfig;
 use crate::storage::Storage;
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -338,6 +338,105 @@ fn build_trace_attributes(
     attributes
 }
 
+fn sanitize_prompt_section_key(section: &str) -> String {
+    section
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string()
+}
+
+fn telemetry_i64(value: Option<&Value>) -> Option<i64> {
+    value.and_then(|entry| entry.as_i64().or_else(|| entry.as_u64().map(|n| n as i64)))
+}
+
+fn telemetry_string(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(|entry| entry.as_str())
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+}
+
+fn append_prompt_telemetry_attributes(attributes: &mut Vec<serde_json::Value>, data: &str) {
+    let Ok(payload) = serde_json::from_str::<Value>(data) else {
+        return;
+    };
+    if payload
+        .get("trace_kind")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        != Some("prompt_telemetry")
+    {
+        return;
+    }
+
+    for (key, attr_key) in [
+        (
+            "assembled_system_prompt_chars",
+            "agentark.prompt.assembled_system_prompt_chars",
+        ),
+        (
+            "final_system_prompt_chars",
+            "agentark.prompt.final_system_prompt_chars",
+        ),
+        ("user_message_chars", "agentark.prompt.user_message_chars"),
+        ("history_chars", "agentark.prompt.history_chars"),
+        ("prompt_chars", "agentark.prompt.prompt_chars"),
+        ("tool_count", "agentark.prompt.tool_count"),
+        ("tool_schema_chars", "agentark.prompt.tool_schema_chars"),
+        (
+            "estimated_total_request_chars",
+            "agentark.prompt.estimated_total_request_chars",
+        ),
+        (
+            "estimated_total_request_tokens",
+            "agentark.prompt.estimated_total_request_tokens",
+        ),
+        ("section_sum_chars", "agentark.prompt.section_sum_chars"),
+        ("untracked_chars", "agentark.prompt.untracked_chars"),
+        ("attempt", "agentark.prompt.attempt"),
+    ] {
+        if let Some(value) = telemetry_i64(payload.get(key)) {
+            attributes.push(otel_attribute_int(attr_key, value));
+        }
+    }
+
+    for (key, attr_key) in [
+        ("provider", "agentark.prompt.provider"),
+        ("model", "agentark.prompt.model"),
+        ("model_slot", "agentark.prompt.model_slot"),
+        ("tool_schema_format", "agentark.prompt.tool_schema_format"),
+        ("request_mode", "agentark.prompt.request_mode"),
+    ] {
+        if let Some(value) = telemetry_string(payload.get(key)) {
+            attributes.push(otel_attribute_string(attr_key, value));
+        }
+    }
+
+    if let Some(sections) = payload.get("sections").and_then(|value| value.as_object()) {
+        for (section, value) in sections {
+            let sanitized = sanitize_prompt_section_key(section);
+            if sanitized.is_empty() {
+                continue;
+            }
+            if let Some(chars) = telemetry_i64(Some(value)) {
+                attributes.push(otel_attribute_int(
+                    &format!("agentark.prompt.section.{}.chars", sanitized),
+                    chars,
+                ));
+            }
+        }
+    }
+}
+
 fn build_step_attributes(
     trace: &ExecutionTrace,
     step: &super::agent::ExecutionStep,
@@ -364,6 +463,7 @@ fn build_step_attributes(
                 attributes.push(otel_attribute_string(&attr_key, value));
             }
         }
+        append_prompt_telemetry_attributes(&mut attributes, data);
     }
     // LangSmith: populate input/output on step spans so tool calls show data
     if let Some(detail) = redact_by_mode(mode, &step.detail, 2000) {

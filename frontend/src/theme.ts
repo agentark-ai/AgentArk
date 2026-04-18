@@ -453,10 +453,12 @@ export const appTheme = createTheme({
     MuiDialog: {
       styleOverrides: {
         paper: {
-          background: "#0a1220",
-          border: "1px solid rgba(118, 152, 190, 0.14)",
-          borderRadius: 16,
+          background: "var(--surface-bg-elevated)",
+          backgroundImage: "none",
+          border: "1px solid var(--surface-border)",
+          borderRadius: 8,
           backdropFilter: "blur(14px)",
+          boxShadow: "0 28px 96px rgba(0,0,0,0.5)",
         },
       },
     },

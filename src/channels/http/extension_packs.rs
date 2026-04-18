@@ -41,6 +41,22 @@ fn error_response(status: StatusCode, error: impl ToString) -> Response {
         .into_response()
 }
 
+async fn sync_extension_pack_runtime(
+    state: &AppState,
+    registry: &std::sync::Arc<tokio::sync::RwLock<crate::extension_packs::ExtensionPackRegistry>>,
+) -> Option<String> {
+    let runtime = {
+        let agent = state.agent.read().await;
+        agent.runtime.clone()
+    };
+    let guard = registry.read().await;
+    guard
+        .sync_to_runtime(&runtime)
+        .await
+        .err()
+        .map(|e| e.to_string())
+}
+
 fn header_snapshot(headers: &HeaderMap, names: &[&str]) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     for name in names {
@@ -133,9 +149,16 @@ pub(super) async fn install_extension_pack(
         let agent = state.agent.read().await;
         agent.extension_packs.clone()
     };
-    let mut guard = registry.write().await;
-    match guard.install(request).await {
-        Ok(pack) => Json(serde_json::json!({ "status": "ok", "pack": pack })).into_response(),
+    let result = {
+        let mut guard = registry.write().await;
+        guard.install(request).await
+    };
+    match result {
+        Ok(pack) => {
+            let warning = sync_extension_pack_runtime(&state, &registry).await;
+            Json(serde_json::json!({ "status": "ok", "pack": pack, "warning": warning }))
+                .into_response()
+        }
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }
 }
@@ -144,7 +167,7 @@ pub(super) async fn upload_extension_pack(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Response {
-    let mut trust_unverified = true;
+    let mut trust_unverified = false;
     let mut filename: Option<String> = None;
     let mut bytes: Option<Vec<u8>> = None;
     loop {
@@ -198,12 +221,18 @@ pub(super) async fn upload_extension_pack(
         let agent = state.agent.read().await;
         agent.extension_packs.clone()
     };
-    let mut guard = registry.write().await;
-    match guard
-        .install_uploaded_bundle(filename.as_deref(), &bytes, trust_unverified)
-        .await
-    {
-        Ok(pack) => Json(serde_json::json!({ "status": "ok", "pack": pack })).into_response(),
+    let result = {
+        let mut guard = registry.write().await;
+        guard
+            .install_uploaded_bundle(filename.as_deref(), &bytes, trust_unverified)
+            .await
+    };
+    match result {
+        Ok(pack) => {
+            let warning = sync_extension_pack_runtime(&state, &registry).await;
+            Json(serde_json::json!({ "status": "ok", "pack": pack, "warning": warning }))
+                .into_response()
+        }
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }
 }
@@ -216,9 +245,16 @@ pub(super) async fn scaffold_extension_pack(
         let agent = state.agent.read().await;
         agent.extension_packs.clone()
     };
-    let mut guard = registry.write().await;
-    match guard.scaffold(request).await {
-        Ok(pack) => Json(serde_json::json!({ "status": "ok", "pack": pack })).into_response(),
+    let result = {
+        let mut guard = registry.write().await;
+        guard.scaffold(request).await
+    };
+    match result {
+        Ok(pack) => {
+            let warning = sync_extension_pack_runtime(&state, &registry).await;
+            Json(serde_json::json!({ "status": "ok", "pack": pack, "warning": warning }))
+                .into_response()
+        }
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }
 }
@@ -251,13 +287,20 @@ pub(super) async fn upsert_extension_pack_connection(
         let agent = state.agent.read().await;
         agent.extension_packs.clone()
     };
-    let mut guard = registry.write().await;
-    match guard.upsert_connection(pack_id.as_str(), request).await {
-        Ok(connection) => Json(serde_json::json!({
-            "status": "ok",
-            "connection": connection,
-        }))
-        .into_response(),
+    let result = {
+        let mut guard = registry.write().await;
+        guard.upsert_connection(pack_id.as_str(), request).await
+    };
+    match result {
+        Ok(connection) => {
+            let warning = sync_extension_pack_runtime(&state, &registry).await;
+            Json(serde_json::json!({
+                "status": "ok",
+                "connection": connection,
+                "warning": warning,
+            }))
+            .into_response()
+        }
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }
 }
@@ -272,27 +315,68 @@ pub(super) async fn get_extension_pack_connect_url(
         let agent = state.agent.read().await;
         agent.extension_packs.clone()
     };
-    let redirect_uri =
+    let requested_redirect_uri =
         match oauth_redirect_uri_for_request(&state, &headers, query.redirect_uri.as_deref()) {
             Ok(value) => value,
             Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
         };
-    let (state_token, code_challenge) =
-        auth::issue_oauth_state_with_pkce(&state, pack_id.as_str(), Some(redirect_uri.clone()))
-            .await;
-    let guard = registry.read().await;
-    if !guard.supports_connect_url(pack_id.as_str()) {
+    let supports_connect_url = {
+        let guard = registry.read().await;
+        guard.supports_connect_url(pack_id.as_str())
+    };
+    if !supports_connect_url {
         return error_response(
             StatusCode::BAD_REQUEST,
             "This pack does not expose a browser connect URL",
         );
     }
-    match guard.build_connect_url(
-        pack_id.as_str(),
-        &redirect_uri,
-        &state_token,
-        &code_challenge,
-    ) {
+    let redirect_uri = if pack_id.eq_ignore_ascii_case("google_workspace") {
+        requested_redirect_uri.clone()
+    } else {
+        let guard = registry.read().await;
+        match guard.connect_redirect_uri(pack_id.as_str(), &requested_redirect_uri) {
+            Ok(value) => value,
+            Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
+        }
+    };
+
+    let (state_token, code_challenge) = if pack_id.eq_ignore_ascii_case("google_workspace") {
+        auth::issue_oauth_state_with_pkce(&state, pack_id.as_str(), Some(redirect_uri.clone()))
+            .await
+    } else {
+        let profile_id = {
+            let mut guard = registry.write().await;
+            match guard.ensure_connect_auth_profile(pack_id.as_str()).await {
+                Ok(Some(profile_id)) => profile_id,
+                Ok(None) => {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        "This pack does not expose a browser connect URL",
+                    );
+                }
+                Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
+            }
+        };
+        auth::issue_auth_profile_oauth_state_with_pkce(
+            &state,
+            &profile_id,
+            Some(redirect_uri.clone()),
+        )
+        .await
+    };
+
+    let result = {
+        let mut guard = registry.write().await;
+        guard
+            .build_connect_url(
+                pack_id.as_str(),
+                &redirect_uri,
+                &state_token,
+                &code_challenge,
+            )
+            .await
+    };
+    match result {
         Ok(url) => Json(serde_json::json!({
             "auth_url": url,
             "url": url,
@@ -314,7 +398,7 @@ pub(super) async fn verify_extension_pack_webhook(
     };
     let resolved = {
         let guard = registry.read().await;
-        match guard.resolve_webhook_binding(pack_id.as_str()) {
+        match guard.resolve_webhook_binding(pack_id.as_str()).await {
             Ok(value) => value,
             Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
         }
@@ -425,7 +509,7 @@ pub(super) async fn handle_extension_pack_webhook(
     };
     let resolved = {
         let guard = registry.read().await;
-        match guard.resolve_webhook_binding(pack_id.as_str()) {
+        match guard.resolve_webhook_binding(pack_id.as_str()).await {
             Ok(value) => value,
             Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
         }
@@ -872,12 +956,18 @@ pub(super) async fn set_extension_pack_enabled(
         let agent = state.agent.read().await;
         agent.extension_packs.clone()
     };
-    let mut guard = registry.write().await;
-    match guard
-        .set_pack_enabled(pack_id.as_str(), request.enabled)
-        .await
-    {
-        Ok(pack) => Json(serde_json::json!({ "status": "ok", "pack": pack })).into_response(),
+    let result = {
+        let mut guard = registry.write().await;
+        guard
+            .set_pack_enabled(pack_id.as_str(), request.enabled)
+            .await
+    };
+    match result {
+        Ok(pack) => {
+            let warning = sync_extension_pack_runtime(&state, &registry).await;
+            Json(serde_json::json!({ "status": "ok", "pack": pack, "warning": warning }))
+                .into_response()
+        }
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }
 }
@@ -891,12 +981,105 @@ pub(super) async fn delete_extension_pack(
         let agent = state.agent.read().await;
         agent.extension_packs.clone()
     };
-    let mut guard = registry.write().await;
-    match guard
-        .delete_pack(pack_id.as_str(), query.remove_connections.unwrap_or(true))
-        .await
-    {
-        Ok(()) => Json(serde_json::json!({ "status": "ok" })).into_response(),
+    let result = {
+        let mut guard = registry.write().await;
+        guard
+            .delete_pack(pack_id.as_str(), query.remove_connections.unwrap_or(true))
+            .await
+    };
+    match result {
+        Ok(()) => {
+            let warning = sync_extension_pack_runtime(&state, &registry).await;
+            Json(serde_json::json!({ "status": "ok", "warning": warning })).into_response()
+        }
+        Err(error) => error_response(StatusCode::BAD_REQUEST, error),
+    }
+}
+
+pub(super) async fn install_extension_pack_runtime(
+    State(state): State<AppState>,
+    Path(pack_id): Path<String>,
+) -> Response {
+    let registry = {
+        let agent = state.agent.read().await;
+        agent.extension_packs.clone()
+    };
+    let result = {
+        let mut guard = registry.write().await;
+        guard.install_runtime(pack_id.as_str()).await
+    };
+    match result {
+        Ok(runtime) => {
+            let warning = sync_extension_pack_runtime(&state, &registry).await;
+            Json(serde_json::json!({ "status": "ok", "result": runtime, "warning": warning }))
+                .into_response()
+        }
+        Err(error) => error_response(StatusCode::BAD_REQUEST, error),
+    }
+}
+
+pub(super) async fn verify_extension_pack_runtime(
+    State(state): State<AppState>,
+    Path(pack_id): Path<String>,
+) -> Response {
+    let registry = {
+        let agent = state.agent.read().await;
+        agent.extension_packs.clone()
+    };
+    let result = {
+        let mut guard = registry.write().await;
+        guard.verify_runtime(pack_id.as_str()).await
+    };
+    match result {
+        Ok(runtime) => {
+            let warning = sync_extension_pack_runtime(&state, &registry).await;
+            Json(serde_json::json!({ "status": "ok", "result": runtime, "warning": warning }))
+                .into_response()
+        }
+        Err(error) => error_response(StatusCode::BAD_REQUEST, error),
+    }
+}
+
+pub(super) async fn update_extension_pack_runtime(
+    State(state): State<AppState>,
+    Path(pack_id): Path<String>,
+) -> Response {
+    let registry = {
+        let agent = state.agent.read().await;
+        agent.extension_packs.clone()
+    };
+    let result = {
+        let mut guard = registry.write().await;
+        guard.update_runtime(pack_id.as_str()).await
+    };
+    match result {
+        Ok(runtime) => {
+            let warning = sync_extension_pack_runtime(&state, &registry).await;
+            Json(serde_json::json!({ "status": "ok", "result": runtime, "warning": warning }))
+                .into_response()
+        }
+        Err(error) => error_response(StatusCode::BAD_REQUEST, error),
+    }
+}
+
+pub(super) async fn uninstall_extension_pack_runtime(
+    State(state): State<AppState>,
+    Path(pack_id): Path<String>,
+) -> Response {
+    let registry = {
+        let agent = state.agent.read().await;
+        agent.extension_packs.clone()
+    };
+    let result = {
+        let mut guard = registry.write().await;
+        guard.uninstall_runtime(pack_id.as_str()).await
+    };
+    match result {
+        Ok(runtime) => {
+            let warning = sync_extension_pack_runtime(&state, &registry).await;
+            Json(serde_json::json!({ "status": "ok", "result": runtime, "warning": warning }))
+                .into_response()
+        }
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }
 }

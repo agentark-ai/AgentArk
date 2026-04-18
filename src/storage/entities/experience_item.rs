@@ -29,6 +29,8 @@ pub struct Model {
     pub last_contradicted_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    #[sea_orm(nullable)]
+    pub embedding: Option<PgVector>,
 }
 
 #[allow(dead_code)]

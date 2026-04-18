@@ -677,6 +677,42 @@ fn build_openai_responses_tools(actions: &[crate::actions::ActionDef]) -> Vec<se
         .collect()
 }
 
+fn build_openai_chat_tools(actions: &[crate::actions::ActionDef]) -> Vec<serde_json::Value> {
+    actions
+        .iter()
+        .map(|action| {
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": action.name,
+                    "description": action.description,
+                    "parameters": normalize_openai_tool_schema(&action.input_schema),
+                }
+            })
+        })
+        .collect()
+}
+
+fn build_anthropic_tools(actions: &[crate::actions::ActionDef]) -> Vec<serde_json::Value> {
+    actions
+        .iter()
+        .map(|action| {
+            serde_json::json!({
+                "name": action.name,
+                "description": action.description,
+                "input_schema": action.input_schema,
+            })
+        })
+        .collect()
+}
+
+fn serialized_value_char_count(value: &serde_json::Value) -> usize {
+    serde_json::to_string(value)
+        .ok()
+        .map(|text| text_char_count(&text))
+        .unwrap_or(0)
+}
+
 fn build_openai_responses_request(
     model: &str,
     system_prompt: &str,
@@ -732,13 +768,46 @@ fn openai_responses_usage(
     let total_tokens = usage
         .get("total_tokens")
         .and_then(|value| value.as_u64())
+        .map(|value| total_tokens_or_sum(value, input_tokens, output_tokens))
         .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
     Some(LlmTokenUsage {
         prompt_tokens: input_tokens,
         completion_tokens: output_tokens,
         total_tokens,
         estimated: false,
+        cost_usd: usage.get("cost").and_then(parse_json_f64),
     })
+}
+
+fn parse_json_f64(value: &serde_json::Value) -> Option<f64> {
+    if let Some(v) = value.as_f64() {
+        return Some(v).filter(|v| v.is_finite() && *v >= 0.0);
+    }
+    if let Some(v) = value.as_i64() {
+        return Some(v as f64).filter(|v| v.is_finite() && *v >= 0.0);
+    }
+    value
+        .as_str()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+}
+
+fn total_tokens_or_sum(total_tokens: u64, prompt_tokens: u64, completion_tokens: u64) -> u64 {
+    if total_tokens > 0 {
+        total_tokens
+    } else {
+        prompt_tokens.saturating_add(completion_tokens)
+    }
+}
+
+fn should_request_openai_stream_usage(provider_label: &str, is_openrouter: bool) -> bool {
+    is_openrouter || provider_label.eq_ignore_ascii_case("openai")
+}
+
+fn merge_usage_field(target: &mut Option<u64>, update: Option<u64>) {
+    if let Some(value) = update {
+        *target = Some(value);
+    }
 }
 
 fn collect_openai_responses_text_from_content(content: &serde_json::Value) -> String {
@@ -869,6 +938,7 @@ fn parse_openai_responses_payload(
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
             estimated: true,
+            cost_usd: None,
         })
     });
 
@@ -1218,9 +1288,10 @@ fn normalize_openai_tool_schema_in_place(node: &mut serde_json::Value, is_root: 
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_partial_draft_files, json_contains_tool_call_indicators,
+        extract_partial_draft_files, json_contains_tool_call_indicators, merge_usage_field,
         normalize_openai_tool_schema, openai_stream_data_has_terminal_finish_reason,
         parse_openai_responses_payload, parse_partial_tool_arguments,
+        should_request_openai_stream_usage, total_tokens_or_sum,
     };
 
     #[test]
@@ -1349,6 +1420,28 @@ mod tests {
     }
 
     #[test]
+    fn openai_responses_parser_preserves_usage_cost() {
+        let payload = serde_json::json!({
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "priced response" }]
+            }],
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 4,
+                "total_tokens": 14,
+                "cost": "0.00125"
+            }
+        });
+
+        let response =
+            parse_openai_responses_payload(&payload, 1, "", "openrouter", "openai/gpt-4")
+                .expect("usage cost should parse");
+        let usage = response.usage.expect("usage should be present");
+        assert_eq!(usage.cost_usd, Some(0.00125));
+    }
+
+    #[test]
     fn extract_partial_draft_files_reads_partial_app_deploy_files() {
         let previews = extract_partial_draft_files(
             "app_deploy",
@@ -1405,6 +1498,38 @@ mod tests {
         assert!(!openai_stream_data_has_terminal_finish_reason(
             r#"{"choices":[{"delta":{"content":"hello"}}]}"#
         ));
+    }
+
+    #[test]
+    fn openai_stream_usage_only_chunk_is_not_terminal_finish_reason() {
+        assert!(!openai_stream_data_has_terminal_finish_reason(
+            r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14,"cost":"0.00125"}}"#
+        ));
+    }
+
+    #[test]
+    fn total_tokens_or_sum_recovers_missing_total_tokens() {
+        assert_eq!(total_tokens_or_sum(0, 12, 5), 17);
+        assert_eq!(total_tokens_or_sum(21, 12, 5), 21);
+    }
+
+    #[test]
+    fn should_request_openai_stream_usage_is_limited_to_supported_providers() {
+        assert!(should_request_openai_stream_usage("openai", false));
+        assert!(should_request_openai_stream_usage("openrouter", true));
+        assert!(!should_request_openai_stream_usage(
+            "openai-compatible",
+            false
+        ));
+    }
+
+    #[test]
+    fn merge_usage_field_preserves_existing_value_on_missing_update() {
+        let mut value = Some(42);
+        merge_usage_field(&mut value, None);
+        assert_eq!(value, Some(42));
+        merge_usage_field(&mut value, Some(77));
+        assert_eq!(value, Some(77));
     }
 }
 
@@ -1480,15 +1605,35 @@ pub struct LlmResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmRequestTelemetry {
+    pub provider: String,
+    pub model: String,
+    pub tool_schema_format: String,
+    pub system_prompt_chars: usize,
+    pub user_message_chars: usize,
+    pub history_chars: usize,
+    pub prompt_chars: usize,
+    pub tool_count: usize,
+    pub tool_schema_chars: usize,
+    pub estimated_total_request_chars: usize,
+    pub estimated_total_request_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmTokenUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
     pub estimated: bool,
+    pub cost_usd: Option<f64>,
 }
 
 fn estimate_tokens_from_chars(chars: usize) -> u64 {
     ((chars.saturating_add(3)) / 4) as u64
+}
+
+fn text_char_count(value: &str) -> usize {
+    value.chars().count()
 }
 
 /// LLM client
@@ -1868,6 +2013,129 @@ impl LlmClient {
         .await
     }
 
+    pub async fn preview_primary_assistant_turn_request_telemetry(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        history: &[ConversationMessage],
+        actions: &[crate::actions::ActionDef],
+        policy: &crate::security::ModelPrivacyConfig,
+        allow_sensitive_context: bool,
+    ) -> Result<LlmRequestTelemetry> {
+        self.preview_request_telemetry(
+            ModelRequestMode::PrimaryAssistantTurn,
+            system_prompt,
+            user_message,
+            history,
+            actions,
+            policy,
+            allow_sensitive_context,
+        )
+        .await
+    }
+
+    async fn preview_request_telemetry(
+        &self,
+        mode: ModelRequestMode,
+        system_prompt: &str,
+        user_message: &str,
+        history: &[ConversationMessage],
+        actions: &[crate::actions::ActionDef],
+        policy: &crate::security::ModelPrivacyConfig,
+        allow_sensitive_context: bool,
+    ) -> Result<LlmRequestTelemetry> {
+        let (system_prompt, user_message, history) = sanitize_model_request_bundle(
+            mode,
+            system_prompt,
+            user_message,
+            history,
+            policy,
+            allow_sensitive_context,
+        );
+        let system_prompt_chars = text_char_count(&system_prompt);
+        let user_message_chars = text_char_count(&user_message);
+        let history_chars = history
+            .iter()
+            .map(|message| text_char_count(&message.content))
+            .sum::<usize>();
+        let prompt_chars = system_prompt_chars
+            .saturating_add(user_message_chars)
+            .saturating_add(history_chars);
+
+        let (provider, model, tool_schema_format, tool_schema_chars) = match &self.provider {
+            LlmProvider::Anthropic { model, .. } => {
+                let tool_schema_chars = if actions.is_empty() {
+                    0
+                } else {
+                    serialized_value_char_count(&serde_json::Value::Array(build_anthropic_tools(
+                        actions,
+                    )))
+                };
+                (
+                    "anthropic".to_string(),
+                    model.to_string(),
+                    "anthropic_tools".to_string(),
+                    tool_schema_chars,
+                )
+            }
+            LlmProvider::OpenAI {
+                api_key,
+                model,
+                base_url,
+            } => {
+                let request_config =
+                    resolve_openai_request_config(&self.client, api_key, base_url.as_deref())
+                        .await?;
+                let (tool_schema_format, tool_schema_chars) = if actions.is_empty() {
+                    ("none".to_string(), 0)
+                } else if request_config.uses_codex_cli_oauth {
+                    (
+                        "openai_responses_tools".to_string(),
+                        serialized_value_char_count(&serde_json::Value::Array(
+                            build_openai_responses_tools(actions),
+                        )),
+                    )
+                } else {
+                    (
+                        "openai_chat_tools".to_string(),
+                        serialized_value_char_count(&serde_json::Value::Array(
+                            build_openai_chat_tools(actions),
+                        )),
+                    )
+                };
+                (
+                    request_config.provider_label.to_string(),
+                    model.to_string(),
+                    tool_schema_format,
+                    tool_schema_chars,
+                )
+            }
+            LlmProvider::Ollama { model, .. } => (
+                "ollama".to_string(),
+                model.to_string(),
+                "none".to_string(),
+                0,
+            ),
+        };
+        let estimated_total_request_chars = prompt_chars.saturating_add(tool_schema_chars);
+
+        Ok(LlmRequestTelemetry {
+            provider,
+            model,
+            tool_schema_format,
+            system_prompt_chars,
+            user_message_chars,
+            history_chars,
+            prompt_chars,
+            tool_count: actions.len(),
+            tool_schema_chars,
+            estimated_total_request_chars,
+            estimated_total_request_tokens: estimate_tokens_from_chars(
+                estimated_total_request_chars,
+            ),
+        })
+    }
+
     async fn chat_with_history_in_mode(
         &self,
         mode: ModelRequestMode,
@@ -2121,6 +2389,7 @@ impl LlmClient {
             completion_tokens: u.output_tokens,
             total_tokens: u.input_tokens + u.output_tokens,
             estimated: false,
+            cost_usd: None,
         });
 
         let prompt_chars = system_prompt.len()
@@ -2134,6 +2403,7 @@ impl LlmClient {
                 completion_tokens,
                 total_tokens: prompt_tokens + completion_tokens,
                 estimated: true,
+                cost_usd: None,
             })
         });
 
@@ -2228,6 +2498,8 @@ impl LlmClient {
             completion_tokens: u64,
             #[serde(default)]
             total_tokens: u64,
+            #[serde(default)]
+            cost: Option<serde_json::Value>,
         }
 
         #[derive(Deserialize)]
@@ -2500,6 +2772,7 @@ impl LlmClient {
                             completion_tokens,
                             total_tokens: prompt_tokens + completion_tokens,
                             estimated: true,
+                            cost_usd: None,
                         }),
                         provider: request_config.provider_label.to_string(),
                         model: model.to_string(),
@@ -2544,6 +2817,7 @@ impl LlmClient {
                                 completion_tokens,
                                 total_tokens: prompt_tokens + completion_tokens,
                                 estimated: true,
+                                cost_usd: None,
                             }),
                             provider: request_config.provider_label.to_string(),
                             model: model.to_string(),
@@ -2599,8 +2873,13 @@ impl LlmClient {
             let usage = response.usage.map(|u| LlmTokenUsage {
                 prompt_tokens: u.prompt_tokens,
                 completion_tokens: u.completion_tokens,
-                total_tokens: u.total_tokens,
+                total_tokens: total_tokens_or_sum(
+                    u.total_tokens,
+                    u.prompt_tokens,
+                    u.completion_tokens,
+                ),
                 estimated: false,
+                cost_usd: u.cost.as_ref().and_then(parse_json_f64),
             });
             let usage = usage.or_else(|| {
                 let prompt_tokens = estimate_tokens_from_chars(prompt_chars);
@@ -2610,6 +2889,7 @@ impl LlmClient {
                     completion_tokens,
                     total_tokens: prompt_tokens + completion_tokens,
                     estimated: true,
+                    cost_usd: None,
                 })
             });
 
@@ -2881,6 +3161,7 @@ impl LlmClient {
                 completion_tokens: c,
                 total_tokens: p + c,
                 estimated: false,
+                cost_usd: None,
             }),
             _ => {
                 let prompt_tokens = estimate_tokens_from_chars(prompt_chars);
@@ -2890,6 +3171,7 @@ impl LlmClient {
                     completion_tokens,
                     total_tokens: prompt_tokens + completion_tokens,
                     estimated: true,
+                    cost_usd: None,
                 })
             }
         };
@@ -3035,6 +3317,7 @@ impl LlmClient {
                 completion_tokens: c,
                 total_tokens: p + c,
                 estimated: false,
+                cost_usd: None,
             }),
             _ => {
                 let prompt_tokens = estimate_tokens_from_chars(prompt_chars);
@@ -3044,6 +3327,7 @@ impl LlmClient {
                     completion_tokens,
                     total_tokens: prompt_tokens + completion_tokens,
                     estimated: true,
+                    cost_usd: None,
                 })
             }
         };
@@ -3254,6 +3538,7 @@ impl LlmClient {
                 completion_tokens,
                 total_tokens: prompt_tokens + completion_tokens,
                 estimated: true,
+                cost_usd: None,
             }),
             provider: request_config.provider_label.to_string(),
             model: model.to_string(),
@@ -3276,6 +3561,11 @@ impl LlmClient {
         use std::collections::HashMap;
 
         #[derive(Serialize)]
+        struct OpenAIStreamOptions {
+            include_usage: bool,
+        }
+
+        #[derive(Serialize)]
         struct OpenAIRequest {
             model: String,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -3284,6 +3574,8 @@ impl LlmClient {
             #[serde(skip_serializing_if = "Vec::is_empty")]
             tools: Vec<OpenAITool>,
             stream: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            stream_options: Option<OpenAIStreamOptions>,
         }
 
         #[derive(Serialize)]
@@ -3310,6 +3602,20 @@ impl LlmClient {
         struct OpenAIStreamChunk {
             #[serde(default)]
             choices: Vec<OpenAIStreamChoice>,
+            #[serde(default)]
+            usage: Option<OpenAIStreamUsage>,
+        }
+
+        #[derive(Deserialize)]
+        struct OpenAIStreamUsage {
+            #[serde(default)]
+            prompt_tokens: u64,
+            #[serde(default)]
+            completion_tokens: u64,
+            #[serde(default)]
+            total_tokens: u64,
+            #[serde(default)]
+            cost: Option<serde_json::Value>,
         }
 
         #[derive(Deserialize)]
@@ -3423,12 +3729,23 @@ impl LlmClient {
             tools.len()
         );
 
+        let stream_options = if should_request_openai_stream_usage(
+            request_config.provider_label,
+            request_config.is_openrouter,
+        ) {
+            Some(OpenAIStreamOptions {
+                include_usage: true,
+            })
+        } else {
+            None
+        };
         let request = OpenAIRequest {
             model: model.to_string(),
             max_tokens: None,
             messages,
             tools,
             stream: true,
+            stream_options,
         };
         let send_start = std::time::Instant::now();
         let mut req = self
@@ -3567,9 +3884,11 @@ impl LlmClient {
 
         let mut buffer = String::new();
         let mut done = false;
+        let mut saw_terminal_finish_reason = false;
         let mut consecutive_errors: u32 = 0;
         let mut stream = response.bytes_stream();
         let mut stream_broken = false;
+        let mut usage: Option<LlmTokenUsage> = None;
         loop {
             if send_start.elapsed().as_secs() >= total_timeout_secs {
                 tracing::warn!(
@@ -3605,7 +3924,12 @@ impl LlmClient {
                     }
                     continue;
                 }
-                Ok(None) => break, // stream ended normally
+                Ok(None) => {
+                    if saw_terminal_finish_reason {
+                        done = true;
+                    }
+                    break;
+                } // stream ended normally
                 Err(_) => {
                     tracing::warn!(
                         "Stream stalled ({}s no data), breaking with partial response",
@@ -3637,6 +3961,21 @@ impl LlmClient {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
+
+                if let Some(chunk_usage) = parsed.usage.as_ref() {
+                    usage = Some(LlmTokenUsage {
+                        prompt_tokens: chunk_usage.prompt_tokens,
+                        completion_tokens: chunk_usage.completion_tokens,
+                        total_tokens: total_tokens_or_sum(
+                            chunk_usage.total_tokens,
+                            chunk_usage.prompt_tokens,
+                            chunk_usage.completion_tokens,
+                        ),
+                        estimated: false,
+                        cost_usd: chunk_usage.cost.as_ref().and_then(parse_json_f64),
+                    });
+                    chunk_had_meaningful_progress = true;
+                }
 
                 for choice in parsed.choices {
                     if let Some(rc) = choice.delta.reasoning_content {
@@ -3795,8 +4134,11 @@ impl LlmClient {
                                 finish_reason,
                                 send_start.elapsed().as_millis()
                             );
+                            // OpenRouter can send a final usage chunk after the
+                            // terminal finish_reason chunk, so keep reading
+                            // until the stream actually ends or [DONE] arrives.
                             chunk_had_meaningful_progress = true;
-                            done = true;
+                            saw_terminal_finish_reason = true;
                         }
                     }
                 }
@@ -3900,13 +4242,16 @@ impl LlmClient {
         let prompt_chars = system_prompt.len()
             + user_message.len()
             + history.iter().map(|m| m.content.len()).sum::<usize>();
-        let prompt_tokens = estimate_tokens_from_chars(prompt_chars);
-        let completion_tokens = estimate_tokens_from_chars(content.len());
-        let usage = Some(LlmTokenUsage {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens: prompt_tokens + completion_tokens,
-            estimated: true,
+        let usage = usage.or_else(|| {
+            let prompt_tokens = estimate_tokens_from_chars(prompt_chars);
+            let completion_tokens = estimate_tokens_from_chars(content.len());
+            Some(LlmTokenUsage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
+                estimated: true,
+                cost_usd: None,
+            })
         });
 
         Ok(LlmResponse {
@@ -3968,6 +4313,26 @@ impl LlmClient {
         struct ContentBlockDeltaEvent {
             index: usize,
             delta: AnthropicDelta,
+        }
+
+        #[derive(Deserialize, Default)]
+        struct AnthropicStreamUsage {
+            #[serde(default)]
+            input_tokens: Option<u64>,
+            #[serde(default)]
+            output_tokens: Option<u64>,
+        }
+
+        #[derive(Deserialize, Default)]
+        struct MessageStartEvent {
+            #[serde(default)]
+            usage: AnthropicStreamUsage,
+        }
+
+        #[derive(Deserialize, Default)]
+        struct MessageDeltaEvent {
+            #[serde(default)]
+            usage: AnthropicStreamUsage,
         }
 
         #[derive(Deserialize)]
@@ -4065,6 +4430,8 @@ impl LlmClient {
         let mut buffer = String::new();
         let mut current_event: Option<String> = None;
         let mut done = false;
+        let mut input_tokens: Option<u64> = None;
+        let mut output_tokens: Option<u64> = None;
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
@@ -4090,6 +4457,18 @@ impl LlmClient {
                 }
 
                 match ev.as_str() {
+                    "message_start" => {
+                        if let Ok(parsed) = serde_json::from_str::<MessageStartEvent>(data) {
+                            merge_usage_field(&mut input_tokens, parsed.usage.input_tokens);
+                            merge_usage_field(&mut output_tokens, parsed.usage.output_tokens);
+                        }
+                    }
+                    "message_delta" => {
+                        if let Ok(parsed) = serde_json::from_str::<MessageDeltaEvent>(data) {
+                            merge_usage_field(&mut input_tokens, parsed.usage.input_tokens);
+                            merge_usage_field(&mut output_tokens, parsed.usage.output_tokens);
+                        }
+                    }
                     "content_block_start" => {
                         if let Ok(parsed) = serde_json::from_str::<ContentBlockStartEvent>(data) {
                             match parsed.content_block {
@@ -4256,13 +4635,16 @@ impl LlmClient {
         let prompt_chars = system_prompt.len()
             + user_message.len()
             + history.iter().map(|m| m.content.len()).sum::<usize>();
-        let prompt_tokens = estimate_tokens_from_chars(prompt_chars);
-        let completion_tokens = estimate_tokens_from_chars(content.len());
+        let prompt_tokens =
+            input_tokens.unwrap_or_else(|| estimate_tokens_from_chars(prompt_chars));
+        let completion_tokens =
+            output_tokens.unwrap_or_else(|| estimate_tokens_from_chars(content.len()));
         let usage = Some(LlmTokenUsage {
             prompt_tokens,
             completion_tokens,
-            total_tokens: prompt_tokens + completion_tokens,
-            estimated: true,
+            total_tokens: total_tokens_or_sum(0, prompt_tokens, completion_tokens),
+            estimated: input_tokens.is_none() || output_tokens.is_none(),
+            cost_usd: None,
         });
 
         Ok(LlmResponse {

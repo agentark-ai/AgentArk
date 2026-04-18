@@ -1043,8 +1043,7 @@ pub async fn exchange_code(
     let response = http_client.post(TOKEN_URL).form(&params).send().await?;
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!("Token exchange failed ({}): {}", status, body));
+        return Err(anyhow!("Token exchange failed ({})", status));
     }
 
     let token: TokenResponse = response.json().await?;
@@ -1128,11 +1127,9 @@ async fn refresh_workspace_token(
     let response = http_client.post(TOKEN_URL).form(&params).send().await?;
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
         return Err(anyhow!(
-            "Failed to refresh Google Workspace token ({}): {}",
-            status,
-            body
+            "Failed to refresh Google Workspace token ({})",
+            status
         ));
     }
     let token: TokenResponse = response.json().await?;

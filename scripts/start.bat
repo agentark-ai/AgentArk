@@ -108,7 +108,7 @@ goto end
 
 :restart
 echo Restarting AgentArk...
-docker compose restart
+docker compose restart agentark-control agentark-workspace agentark-executor
 call :verify_lightpanda || exit /b 1
 goto end
 

@@ -271,10 +271,14 @@
         calcMode="spline" keySplines="0.45 0 0.55 1; 0.45 0 0.55 1"/>
       <!-- Arm -->
       <path d="M340 490 C310 515 285 550 280 575 C277 590 284 598 298 594"
-            stroke="url(#gArm)" stroke-width="36" stroke-linecap="round" fill="none"/>
-      <!-- Hand (little rounded mitt) -->
-      <circle cx="290" cy="590" r="24" fill="#6D28D9"/>
-      <circle cx="290" cy="585" r="18" fill="#7C3AED" opacity="0.5"/>
+            stroke="#8B5CF6" stroke-width="36" stroke-linecap="round" fill="none"/>
+      <path d="M340 490 C310 515 285 550 280 575 C277 590 284 598 298 594"
+            stroke="#00D4FF" stroke-width="36" stroke-linecap="round" fill="none" opacity="0.12"/>
+      <!-- Hand (little rounded mitt — cyan glow for visibility) -->
+      <circle cx="290" cy="590" r="24" fill="#7C3AED"/>
+      <circle cx="290" cy="590" r="24" fill="none" stroke="#00D4FF" stroke-width="3" opacity="0.6"/>
+      <circle cx="290" cy="585" r="16" fill="#A78BFA" opacity="0.7"/>
+      <circle cx="288" cy="582" r="6" fill="#FFFFFF" opacity="0.35"/>
     </g>
 
     <!-- Right arm (cool casual hang) -->
@@ -283,9 +287,14 @@
         values="0 684 520; 4 684 520; 0 684 520" dur="3.6s" repeatCount="indefinite"
         calcMode="spline" keySplines="0.45 0 0.55 1; 0.45 0 0.55 1"/>
       <path d="M684 490 C714 515 739 550 744 575 C747 590 740 598 726 594"
-            stroke="url(#gArm)" stroke-width="36" stroke-linecap="round" fill="none"/>
-      <circle cx="734" cy="590" r="24" fill="#6D28D9"/>
-      <circle cx="734" cy="585" r="18" fill="#7C3AED" opacity="0.5"/>
+            stroke="#8B5CF6" stroke-width="36" stroke-linecap="round" fill="none"/>
+      <path d="M684 490 C714 515 739 550 744 575 C747 590 740 598 726 594"
+            stroke="#F59E0B" stroke-width="36" stroke-linecap="round" fill="none" opacity="0.12"/>
+      <!-- Hand (little rounded mitt — amber glow for visibility) -->
+      <circle cx="734" cy="590" r="24" fill="#7C3AED"/>
+      <circle cx="734" cy="590" r="24" fill="none" stroke="#F59E0B" stroke-width="3" opacity="0.6"/>
+      <circle cx="734" cy="585" r="16" fill="#A78BFA" opacity="0.7"/>
+      <circle cx="736" cy="582" r="6" fill="#FFFFFF" opacity="0.35"/>
     </g>
 
     <!-- ===== FACE ===== -->
@@ -370,37 +379,33 @@
         dur="5.5s" repeatCount="indefinite"/>
     </line>
 
-    <!-- ===== SMILE (asymmetric smirk — cute but cool) ===== -->
-    <!-- Main smirk: right side lifts higher -->
-    <path d="M458 558 C478 586 536 590 568 554"
-          stroke="#C4B5FD" stroke-width="8" stroke-linecap="round" fill="none" opacity="0.85"/>
-    <!-- Smirk highlight -->
-    <path d="M464 562 C482 582 534 586 562 558"
-          stroke="#E9DDFF" stroke-width="3" stroke-linecap="round" fill="none" opacity="0.35"/>
-    <!-- Tiny cool dimple on the smirk side -->
-    <circle cx="572" cy="550" r="4" fill="#A78BFA" opacity="0.25"/>
-
-    <!-- ===== CHEST CORE (neural heart) ===== -->
+    <!-- ===== NOSE (neural core moved up — sniffing pulsing nose) ===== -->
     <g filter="url(#fGlowBig)">
-      <circle cx="512" cy="640" r="18" fill="url(#gCore)">
+      <circle cx="512" cy="542" r="18" fill="url(#gCore)">
         <animate attributeName="r" values="16;20;16" dur="2.5s" repeatCount="indefinite"
           calcMode="spline" keySplines="0.45 0 0.55 1; 0.45 0 0.55 1"/>
       </circle>
-      <circle cx="512" cy="640" r="10" fill="#C084FC" opacity="0.8">
+      <circle cx="512" cy="542" r="10" fill="#C084FC" opacity="0.8">
         <animate attributeName="r" values="8;12;8" dur="2.5s" repeatCount="indefinite"
           calcMode="spline" keySplines="0.45 0 0.55 1; 0.45 0 0.55 1"/>
         <animate attributeName="opacity" values="0.6;1;0.6" dur="2.5s" repeatCount="indefinite"/>
       </circle>
-      <circle cx="512" cy="640" r="4" fill="#FFFFFF" opacity="0.7">
+      <circle cx="512" cy="542" r="4" fill="#FFFFFF" opacity="0.7">
         <animate attributeName="opacity" values="0.5;0.9;0.5" dur="2.5s" repeatCount="indefinite"/>
       </circle>
       <!-- Core ring -->
-      <circle cx="512" cy="640" r="28" fill="none" stroke="#A855F7" stroke-width="1.5" opacity="0.3">
+      <circle cx="512" cy="542" r="28" fill="none" stroke="#A855F7" stroke-width="1.5" opacity="0.3">
         <animate attributeName="r" values="26;32;26" dur="2.5s" repeatCount="indefinite"
           calcMode="spline" keySplines="0.45 0 0.55 1; 0.45 0 0.55 1"/>
         <animate attributeName="opacity" values="0.3;0.15;0.3" dur="2.5s" repeatCount="indefinite"/>
       </circle>
     </g>
+
+    <!-- ===== SMILE (moved down to let nose breathe) ===== -->
+    <path d="M458 588 C478 616 536 620 568 584"
+          stroke="#FFFFFF" stroke-width="10" stroke-linecap="round" fill="none" opacity="0.95"/>
+    <path d="M462 590 C480 614 534 618 564 586"
+          stroke="#E0D4FF" stroke-width="5" stroke-linecap="round" fill="none" opacity="0.5"/>
 
     <!-- ===== TINY NEURAL SPARKLES around body ===== -->
     <g opacity="0.6">

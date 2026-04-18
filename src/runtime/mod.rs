@@ -19,7 +19,7 @@ use futures::TryStreamExt;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 
@@ -42,6 +42,59 @@ pub struct RuntimeConfig {
     pub enable_rollback: bool,
     pub snapshot_dir: PathBuf,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingSecretPlaceholderKind {
+    Secret,
+    Env,
+}
+
+impl MissingSecretPlaceholderKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Secret => "secret",
+            Self::Env => "env",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingSecretPlaceholder {
+    pub action_name: String,
+    pub kind: MissingSecretPlaceholderKind,
+    pub key: String,
+}
+
+impl MissingSecretPlaceholder {
+    pub fn new(action_name: &str, kind: MissingSecretPlaceholderKind, key: &str) -> Self {
+        Self {
+            action_name: action_name.trim().to_string(),
+            kind,
+            key: key.trim().to_string(),
+        }
+    }
+
+    pub fn prompt_storage_key(&self) -> String {
+        match self.kind {
+            MissingSecretPlaceholderKind::Secret => self.key.clone(),
+            MissingSecretPlaceholderKind::Env => format!("env:{}", self.key),
+        }
+    }
+}
+
+impl std::fmt::Display for MissingSecretPlaceholder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Missing credential {}:{} for action '{}'",
+            self.kind.as_str(),
+            self.key,
+            self.action_name
+        )
+    }
+}
+
+impl std::error::Error for MissingSecretPlaceholder {}
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
@@ -123,6 +176,8 @@ pub struct ActionRuntime {
     /// Persisted security/readiness state for all non-builtin actions.
     action_reviews: tokio::sync::RwLock<HashMap<String, ActionReviewRecord>>,
     action_reviews_file: PathBuf,
+    /// In-memory capability observations scoped to active conversations/runs.
+    capability_run_contexts: tokio::sync::RwLock<HashMap<String, CapabilityRunCorrelationRecord>>,
     /// Bundled actions deleted by user for this install (persisted on disk)
     removed_bundled_actions: tokio::sync::RwLock<HashSet<String>>,
     removed_bundled_actions_file: PathBuf,
@@ -135,6 +190,9 @@ pub struct ActionRuntime {
     action_guard: Option<std::sync::Arc<crate::security::ActionGuard>>,
     /// Actions explicitly auto-approved by the user in Settings > Advanced.
     auto_approved_actions: std::sync::RwLock<HashSet<String>>,
+    /// Structural guard for outward URLs used by runtime-backed actions.
+    tool_args_guard_config:
+        std::sync::RwLock<crate::security::tool_args_guard::ToolArgsGuardConfig>,
     /// Shared storage for expense + entity operations
     storage: Option<crate::storage::Storage>,
     /// MCP registry for external tools/resources
@@ -156,6 +214,9 @@ const HTTP_GET_TIMEOUT_SECS: u64 = 10;
 const HTTP_GET_MAX_BODY_BYTES: usize = 1_000_000;
 const MAX_NATIVE_ENV_OVERRIDES: usize = 32;
 const ACTION_REVIEW_HISTORY_LIMIT: usize = 10;
+const CAPABILITY_CONTEXT_TTL_SECS: i64 = 60 * 60;
+const CAPABILITY_CONTEXT_LIMIT: usize = 128;
+const CAPABILITY_CONTEXT_OBSERVATION_LIMIT: usize = 96;
 #[cfg(feature = "docker")]
 const AGENTARK_SANDBOX_LABEL_KEY: &str = "agentark.runtime";
 #[cfg(feature = "docker")]
@@ -203,6 +264,14 @@ struct LoadedAction {
     plugin_binding: Option<PluginBinding>,
     /// Optional imported custom API binding
     custom_api_binding: Option<CustomApiBinding>,
+    /// Optional installed extension-pack feature binding
+    extension_pack_binding: Option<ExtensionPackActionBinding>,
+}
+
+#[derive(Debug, Clone)]
+struct CapabilityRunCorrelationRecord {
+    updated_at: chrono::DateTime<chrono::Utc>,
+    context: crate::security::capabilities::RunCapabilityContext,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -213,6 +282,8 @@ pub struct ActionScopeHint {
     pub custom_api_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub integration_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extension_pack_ids: Vec<String>,
     #[serde(default)]
     pub requires_ssh_connection: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -304,6 +375,19 @@ pub struct CustomApiBinding {
     pub parameters: Vec<crate::custom_apis::CustomApiParameter>,
     #[serde(default)]
     pub body_required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtensionPackActionBinding {
+    pub pack_id: String,
+    pub feature_id: String,
+    pub action_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<String>,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub binding_kind: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -409,6 +493,8 @@ pub const TOOL_COMPLETION_MARKER: &str = "__TOOL_COMPLETION__:";
 pub struct WorkflowMissingInputsPayload {
     pub action: String,
     pub missing: Vec<String>,
+    #[serde(default)]
+    pub sensitive_missing: Vec<String>,
     pub required: Vec<String>,
     pub provided: Vec<String>,
     pub query: String,
@@ -1571,14 +1657,17 @@ print(json.dumps({
         let entry = reviews
             .entry(review.action_name.clone())
             .or_insert_with(ActionReviewRecord::default);
-        if !entry.current.action_name.is_empty()
-            && (entry.current.fingerprint != review.fingerprint
-                || entry.current.status != review.status
-                || entry.current.blocked_reason != review.blocked_reason
-                || entry.current.missing_env != review.missing_env
-                || entry.current.auth_configured != review.auth_configured
-                || entry.current.allow_execute != review.allow_execute)
-        {
+        let changed = entry.current.action_name.is_empty()
+            || entry.current.fingerprint != review.fingerprint
+            || entry.current.status != review.status
+            || entry.current.blocked_reason != review.blocked_reason
+            || entry.current.missing_env != review.missing_env
+            || entry.current.auth_configured != review.auth_configured
+            || entry.current.allow_execute != review.allow_execute
+            || entry.current.permissions_needed != review.permissions_needed
+            || entry.current.warnings != review.warnings
+            || (entry.current.risk_score_10 - review.risk_score_10).abs() > f32::EPSILON;
+        if changed && !entry.current.action_name.is_empty() {
             entry.history.push(entry.current.clone());
             if entry.history.len() > ACTION_REVIEW_HISTORY_LIMIT {
                 let drop_count = entry.history.len() - ACTION_REVIEW_HISTORY_LIMIT;
@@ -1587,7 +1676,11 @@ print(json.dumps({
         }
         entry.current = review;
         drop(reviews);
-        self.save_action_reviews().await
+        self.save_action_reviews().await?;
+        if changed {
+            self.record_cross_layer_capability_correlation().await;
+        }
+        Ok(())
     }
 
     async fn remove_action_review(&self, name: &str) -> Result<()> {
@@ -1726,20 +1819,9 @@ print(json.dumps({
     fn is_contextual_review_finding(
         finding: &crate::security::action_guard::AnalysisFinding,
     ) -> bool {
-        let lower = finding.matched_text.to_ascii_lowercase();
-        let placeholders = [
-            "your-api-key",
-            "your_api_key",
-            "example",
-            "dummy",
-            "changeme",
-            "replace_me",
-            "test-key",
-            "sample-key",
-        ];
-        let placeholder_like = lower.contains('$')
-            || lower.contains("${")
-            || placeholders.iter().any(|token| lower.contains(token));
+        let placeholder_like = finding.matched_text.contains('$')
+            || finding.matched_text.contains("${")
+            || finding.matched_text.contains("{{");
         match finding.category {
             crate::security::action_guard::FindingCategory::NetworkAccess
             | crate::security::action_guard::FindingCategory::EnvironmentAccess => true,
@@ -1868,73 +1950,64 @@ print(json.dumps({
                 out.push(value);
             }
         };
-
-        let re_env_arr = regex::Regex::new(r#"(?s)"env"\s*:\s*\[([^\]]*)\]"#).ok();
-        let re_quoted = regex::Regex::new(r#""([A-Z0-9_]{2,})""#).ok();
-        if let (Some(re_env_arr), Some(re_quoted)) = (re_env_arr, re_quoted) {
-            for cap in re_env_arr.captures_iter(frontmatter) {
-                if let Some(inner) = cap.get(1).map(|m| m.as_str()) {
-                    for c in re_quoted.captures_iter(inner) {
-                        if let Some(name) = c.get(1).map(|m| m.as_str()) {
-                            unique_push(&mut envs, name.to_string());
-                        }
-                    }
-                }
-            }
-        }
-
-        let re_primary = regex::Regex::new(r#""primaryEnv"\s*:\s*"([A-Z0-9_]{2,})""#).ok();
-        if let Some(re_primary) = re_primary {
-            for cap in re_primary.captures_iter(frontmatter) {
-                if let Some(name) = cap.get(1).map(|m| m.as_str()) {
-                    unique_push(&mut envs, name.to_string());
-                }
-            }
-        }
-
-        let mut in_list = false;
-        for raw in frontmatter.lines() {
-            let line = raw.trim_end();
-            let trimmed = line.trim();
-            if trimmed.starts_with("secrets:")
-                || trimmed.starts_with("env:")
-                || trimmed.starts_with("required_env:")
-            {
-                in_list = true;
-                if let Some(start) = trimmed.find('[') {
-                    if let Some(end) = trimmed.rfind(']') {
-                        if end > start {
-                            let inner = &trimmed[start + 1..end];
-                            for part in inner.split(',') {
-                                let name = part.trim().trim_matches('"').trim_matches('\'');
-                                if Self::is_env_var_style_key(name) {
-                                    unique_push(&mut envs, name.to_string());
-                                }
-                            }
-                        }
-                    }
-                } else if let Some((_k, rhs)) = trimmed.split_once(':') {
-                    let name = rhs.trim().trim_matches('"').trim_matches('\'');
-                    if Self::is_env_var_style_key(name) {
-                        unique_push(&mut envs, name.to_string());
-                    }
-                }
-                continue;
-            }
-            if !raw.starts_with(' ') && !raw.starts_with('\t') && trimmed.contains(':') {
-                in_list = false;
-            }
-            if in_list {
-                if let Some(item) = trimmed.strip_prefix("- ") {
-                    let name = item.trim().trim_matches('"').trim_matches('\'');
-                    if Self::is_env_var_style_key(name) {
-                        unique_push(&mut envs, name.to_string());
-                    }
-                }
-            }
+        if let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(frontmatter) {
+            Self::collect_required_envs_from_yaml(&value, &mut envs, &unique_push);
         }
 
         envs
+    }
+
+    fn collect_required_envs_from_yaml<F>(
+        value: &serde_yaml::Value,
+        envs: &mut Vec<String>,
+        unique_push: &F,
+    ) where
+        F: Fn(&mut Vec<String>, String),
+    {
+        match value {
+            serde_yaml::Value::Mapping(map) => {
+                for value in map.values() {
+                    Self::collect_required_envs_from_yaml(value, envs, unique_push);
+                }
+            }
+            serde_yaml::Value::Sequence(items) => {
+                for item in items {
+                    Self::collect_required_envs_from_yaml(item, envs, unique_push);
+                }
+            }
+            serde_yaml::Value::String(text) => {
+                for item in Self::split_env_candidate_text(text) {
+                    if item.contains('_') && Self::is_env_var_style_key(&item) {
+                        unique_push(envs, item);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn split_env_candidate_text(text: &str) -> Vec<String> {
+        text.split(|ch: char| ch == ',' || ch.is_whitespace() || ch == '[' || ch == ']')
+            .map(|item| item.trim().trim_matches('"').trim_matches('\''))
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn split_frontmatter_block(content: &str) -> Option<(&str, &str)> {
+        let body = content
+            .strip_prefix("---\r\n")
+            .or_else(|| content.strip_prefix("---\n"))?;
+        let mut consumed = 0usize;
+        for segment in body.split_inclusive('\n') {
+            let line = segment.trim_end_matches(&['\r', '\n'][..]);
+            if line == "---" {
+                let rest_start = consumed + segment.len();
+                return Some((&body[..consumed], &body[rest_start..]));
+            }
+            consumed += segment.len();
+        }
+        None
     }
 
     fn parse_frontmatter_yaml(frontmatter: &str) -> Option<serde_yaml::Value> {
@@ -2140,6 +2213,277 @@ print(json.dumps({
         }
     }
 
+    fn apply_capability_report_to_review(
+        review: &mut ActionReviewSnapshot,
+        report: crate::security::capabilities::CapabilityLayerReport,
+    ) {
+        for observation in &report.observations {
+            let selector = observation.selector();
+            if !review
+                .permissions_needed
+                .iter()
+                .any(|existing| existing == &selector)
+            {
+                review.permissions_needed.push(selector);
+            }
+        }
+        for warning in &report.warnings {
+            if !review.warnings.iter().any(|existing| existing == warning) {
+                review.warnings.push(warning.clone());
+            }
+            if !review.notes.iter().any(|existing| existing == warning) {
+                review.notes.push(warning.clone());
+            }
+        }
+        for rule in &report.matched_rules {
+            let note = format!("Capability policy rule '{}': {}", rule.id, rule.message);
+            if !review.notes.iter().any(|existing| existing == &note) {
+                review.notes.push(note);
+            }
+        }
+        review.findings.extend(report.findings);
+        review.total_findings = review.findings.len();
+        review.total_severity = review.total_severity.saturating_add(report.total_severity);
+        if report.risk_score_10 > review.risk_score_10 {
+            review.risk_score_10 = report.risk_score_10;
+            review.risk_band = report.risk_band.clone();
+        }
+        if matches!(
+            report.threat_level,
+            crate::security::action_guard::ThreatLevel::Malicious
+        ) {
+            review.threat_level = "Malicious".to_string();
+        } else if matches!(
+            report.threat_level,
+            crate::security::action_guard::ThreatLevel::Suspicious
+        ) && review.threat_level != "Malicious"
+        {
+            review.threat_level = "Suspicious".to_string();
+        }
+
+        if report.blocked {
+            review.status = ActionReviewStatus::Blocked;
+            review.ready = false;
+            review.allow_load = false;
+            review.allow_execute = false;
+            review.visible_in_catalog = false;
+            review.blocked_reason = report
+                .warnings
+                .first()
+                .cloned()
+                .or_else(|| Some("Blocked by capability security policy.".to_string()));
+            return;
+        }
+
+        if matches!(review.status, ActionReviewStatus::Ready)
+            && (!report.warnings.is_empty()
+                || report.risk_band == "review"
+                || report.risk_band == "risky")
+        {
+            review.status = ActionReviewStatus::Warning;
+            review.ready = true;
+            review.allow_execute = true;
+            review.visible_in_catalog = true;
+        }
+    }
+
+    async fn record_security_event(
+        &self,
+        event_type: &str,
+        severity: &str,
+        message: String,
+        source: Option<String>,
+    ) {
+        let Some(storage) = self.storage.as_ref() else {
+            tracing::info!(
+                event_type = event_type,
+                severity = severity,
+                source = source.as_deref().unwrap_or("runtime"),
+                "{}",
+                message
+            );
+            return;
+        };
+        let log = crate::storage::entities::security_log::Model {
+            id: uuid::Uuid::new_v4().to_string(),
+            event_type: event_type.to_string(),
+            severity: severity.to_string(),
+            message: crate::security::redact_pii(&message),
+            source,
+            count: 1,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        if let Err(error) = storage.insert_security_log(&log).await {
+            tracing::debug!("Failed to persist action security event: {}", error);
+        }
+    }
+
+    async fn record_custom_messaging_channel_upsert_event(
+        &self,
+        channel: &crate::custom_messaging_channels::CustomMessagingChannelView,
+        operation: &'static str,
+    ) {
+        self.record_security_event(
+            if operation == "update" {
+                "custom_messaging_channel_update"
+            } else {
+                "custom_messaging_channel_create"
+            },
+            "medium",
+            format!(
+                "Custom messaging channel {} by runtime action. channel_id={}",
+                operation, channel.id
+            ),
+            Some(format!(
+                "actor=runtime_action;source_kind=custom_channel;channel_id={}",
+                channel.id
+            )),
+        )
+        .await;
+
+        let mut capabilities = vec![
+            "calls-network".to_string(),
+            "sends-message".to_string(),
+            "sends-external".to_string(),
+        ];
+        if channel.requires_auth {
+            capabilities.push("requests-secrets".to_string());
+            capabilities.push("uses-auth-profile".to_string());
+        }
+        let report = crate::security::capabilities::evaluate_declared_capabilities(
+            "custom_channel",
+            &channel.id,
+            &capabilities,
+        );
+        let severity = if report.blocked || report.risk_score_10 >= 8.0 {
+            "high"
+        } else if report.risk_score_10 >= 5.0 || !report.warnings.is_empty() {
+            "medium"
+        } else {
+            "low"
+        };
+        let rules = report
+            .matched_rules
+            .iter()
+            .map(|rule| rule.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.record_security_event(
+            "capability_review",
+            severity,
+            format!(
+                "Custom messaging channel capability review: channel_id={}, risk_score={}, capabilities=[{}], rules=[{}]",
+                channel.id,
+                report.risk_score_10,
+                capabilities.join(", "),
+                rules
+            ),
+            Some(format!(
+                "actor=runtime_action;source_kind=custom_channel;channel_id={}",
+                channel.id
+            )),
+        )
+        .await;
+    }
+
+    fn review_event_severity(review: &ActionReviewSnapshot) -> &'static str {
+        if matches!(review.status, ActionReviewStatus::Blocked) || review.risk_score_10 >= 8.0 {
+            "high"
+        } else if review.risk_score_10 >= 5.0 || !review.warnings.is_empty() {
+            "medium"
+        } else {
+            "low"
+        }
+    }
+
+    fn has_semantic_skill_review_marker(review: &ActionReviewSnapshot) -> bool {
+        review.notes.iter().any(|note| {
+            note.starts_with("Semantic capability review used configured model ")
+                || note.starts_with("Semantic capability review used configured model '")
+        })
+    }
+
+    async fn record_action_review_event(&self, review: &ActionReviewSnapshot) {
+        if review.permissions_needed.is_empty()
+            && review.warnings.is_empty()
+            && !matches!(review.status, ActionReviewStatus::Blocked)
+        {
+            return;
+        }
+        let message = format!(
+            "Action capability review: action='{}', source='{}', status='{:?}', risk_score={}, capabilities=[{}], warnings={}",
+            review.action_name,
+            review.source_kind,
+            review.status,
+            review.risk_score_10,
+            review.permissions_needed.join(", "),
+            review.warnings.len()
+        );
+        self.record_security_event(
+            "capability_review",
+            Self::review_event_severity(review),
+            message,
+            Some(format!(
+                "source_kind={};action={}",
+                review.source_kind, review.action_name
+            )),
+        )
+        .await;
+    }
+
+    async fn record_cross_layer_capability_correlation(&self) {
+        let observations = {
+            let reviews = self.action_reviews.read().await;
+            let mut observations = Vec::new();
+            for record in reviews.values() {
+                let review = &record.current;
+                if matches!(review.status, ActionReviewStatus::Blocked)
+                    || !review.allow_load
+                    || review.permissions_needed.is_empty()
+                {
+                    continue;
+                }
+                observations.extend(
+                    crate::security::capabilities::observations_from_declared_capabilities(
+                        &review.source_kind,
+                        &review.action_name,
+                        &review.permissions_needed,
+                    ),
+                );
+            }
+            observations
+        };
+        let Some(report) =
+            crate::security::capabilities::evaluate_cross_layer_capabilities(observations)
+        else {
+            return;
+        };
+        let rules = report
+            .matched_rules
+            .iter()
+            .map(|rule| rule.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let subjects = report
+            .observations
+            .iter()
+            .map(|observation| format!("{}:{}", observation.layer, observation.entity_id))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.record_security_event(
+            "capability_correlation",
+            "high",
+            format!(
+                "Cross-layer capability policy match: rules=[{}], subjects=[{}]",
+                rules, subjects
+            ),
+            Some("scope=runtime".to_string()),
+        )
+        .await;
+    }
+
     fn prune_cli_auth_exported_envs(review: &mut ActionReviewSnapshot, binding: &CliToolBinding) {
         if binding.auth_env_exports.is_empty() {
             return;
@@ -2244,7 +2588,20 @@ print(json.dumps({
         if capabilities.is_empty() {
             String::new()
         } else {
-            format!("permissions: [{}]", capabilities.join(", "))
+            let mut mapping = serde_yaml::Mapping::new();
+            mapping.insert(
+                serde_yaml::Value::String("permissions".to_string()),
+                serde_yaml::Value::Sequence(
+                    capabilities
+                        .iter()
+                        .map(|capability| serde_yaml::Value::String(capability.clone()))
+                        .collect(),
+                ),
+            );
+            serde_yaml::to_string(&serde_yaml::Value::Mapping(mapping))
+                .unwrap_or_else(|_| "permissions: []".to_string())
+                .trim_end()
+                .to_string()
         }
     }
 
@@ -2425,7 +2782,7 @@ print(json.dumps({
         let verdict = guard
             .evaluate_inline_action(&info.name, &content, &frontmatter, notes.clone())
             .await?;
-        Ok(Self::build_review_from_verdict(ActionReviewBuildInput {
+        let mut review = Self::build_review_from_verdict(ActionReviewBuildInput {
             action_name: &info.name,
             source_kind: "plugin",
             fingerprint,
@@ -2435,7 +2792,15 @@ print(json.dumps({
             requires_auth: binding.auth_required,
             auth_configured,
             notes,
-        }))
+        });
+        let capability_report = crate::security::capabilities::evaluate_declared_capabilities(
+            "plugin",
+            &info.name,
+            &info.capabilities,
+        );
+        Self::apply_capability_report_to_review(&mut review, capability_report);
+        self.record_action_review_event(&review).await;
+        Ok(review)
     }
 
     async fn review_custom_api_action(
@@ -2510,7 +2875,7 @@ print(json.dumps({
         } else {
             true
         };
-        Ok(Self::build_review_from_verdict(ActionReviewBuildInput {
+        let mut review = Self::build_review_from_verdict(ActionReviewBuildInput {
             action_name: &info.name,
             source_kind: "custom_api",
             fingerprint,
@@ -2520,7 +2885,128 @@ print(json.dumps({
             requires_auth,
             auth_configured,
             notes,
-        }))
+        });
+        let capability_report = crate::security::capabilities::evaluate_declared_capabilities(
+            "custom_api",
+            &info.name,
+            &info.capabilities,
+        );
+        Self::apply_capability_report_to_review(&mut review, capability_report);
+        self.record_action_review_event(&review).await;
+        Ok(review)
+    }
+
+    async fn review_extension_pack_action(
+        &self,
+        info: &ActionDef,
+        binding: &ExtensionPackActionBinding,
+    ) -> Result<ActionReviewSnapshot> {
+        let fingerprint = Self::fingerprint_text(&[
+            info.name.as_str(),
+            info.description.as_str(),
+            &binding.pack_id,
+            &binding.feature_id,
+            &binding.action_name,
+            &binding.binding_kind,
+            &serde_json::to_string(&info.input_schema).unwrap_or_default(),
+            &info.capabilities.join(","),
+        ]);
+        let Some(action_guard) = self.action_guard.as_ref() else {
+            return Ok(Self::build_blocked_review(
+                &info.name,
+                "extension_pack",
+                fingerprint,
+                "Action security is unavailable, so extension-pack actions are not loadable.",
+            ));
+        };
+        let Some(registry) = self.extension_pack_registry.as_ref() else {
+            return Ok(Self::build_blocked_review(
+                &info.name,
+                "extension_pack",
+                fingerprint,
+                "Extension-pack registry is unavailable in this runtime.",
+            ));
+        };
+
+        let pack = {
+            let guard = registry.read().await;
+            guard.get_pack(&binding.pack_id).await?
+        };
+        let Some(pack) = pack else {
+            return Ok(Self::build_blocked_review(
+                &info.name,
+                "extension_pack",
+                fingerprint,
+                format!("Extension pack '{}' was not found.", binding.pack_id),
+            ));
+        };
+
+        let mut notes = Vec::new();
+        notes.push(format!(
+            "Uses extension pack '{}' ({}).",
+            pack.manifest.name, pack.manifest.id
+        ));
+        notes.push(format!("Feature '{}'.", binding.feature_id));
+        notes.push(format!("Binding kind: {}.", binding.binding_kind));
+        if let Some(connection_id) = binding.connection_id.as_deref() {
+            notes.push(format!("Connection '{}'.", connection_id));
+        }
+        if matches!(
+            pack.trust_level,
+            crate::extension_packs::ExtensionPackTrustLevel::Unverified
+        ) {
+            notes.push("Pack is installed as unverified.".to_string());
+        }
+
+        let frontmatter = Self::capabilities_frontmatter(&info.capabilities);
+        let content = format!(
+            "name: {}\nsource: extension_pack\npack_id: {}\npack_name: {}\nfeature_id: {}\nbinding_kind: {}\ndescription: {}\ncapabilities: {}\ninput_schema: {}",
+            info.name,
+            binding.pack_id,
+            pack.manifest.name,
+            binding.feature_id,
+            binding.binding_kind,
+            info.description,
+            info.capabilities.join(", "),
+            serde_json::to_string_pretty(&info.input_schema).unwrap_or_default()
+        );
+        let verdict = action_guard
+            .evaluate_inline_action(&info.name, &content, &frontmatter, notes.clone())
+            .await?;
+        let mut review = Self::build_review_from_verdict(ActionReviewBuildInput {
+            action_name: &info.name,
+            source_kind: "extension_pack",
+            fingerprint,
+            verdict: &verdict,
+            required_env: Vec::new(),
+            missing_env: Vec::new(),
+            requires_auth: false,
+            auth_configured: true,
+            notes,
+        });
+        if matches!(
+            pack.trust_level,
+            crate::extension_packs::ExtensionPackTrustLevel::Unverified
+        ) && (!binding.read_only || binding.binding_kind.eq_ignore_ascii_case("local_cli"))
+        {
+            review.status = ActionReviewStatus::Blocked;
+            review.ready = false;
+            review.allow_load = false;
+            review.allow_execute = false;
+            review.visible_in_catalog = false;
+            review.blocked_reason = Some(
+                "Unverified extension packs may not expose host CLI or write-capable actions."
+                    .to_string(),
+            );
+        }
+        let capability_report = crate::security::capabilities::evaluate_declared_capabilities(
+            "extension_pack",
+            &info.name,
+            &info.capabilities,
+        );
+        Self::apply_capability_report_to_review(&mut review, capability_report);
+        self.record_action_review_event(&review).await;
+        Ok(review)
     }
 
     async fn review_mcp_action(
@@ -2566,7 +3052,7 @@ print(json.dumps({
         let verdict = guard
             .evaluate_inline_action(&info.name, &content, &frontmatter, warnings.clone())
             .await?;
-        Ok(Self::build_review_from_verdict(ActionReviewBuildInput {
+        let mut review = Self::build_review_from_verdict(ActionReviewBuildInput {
             action_name: &info.name,
             source_kind: "mcp",
             fingerprint,
@@ -2576,7 +3062,15 @@ print(json.dumps({
             requires_auth: binding.auth_required,
             auth_configured,
             notes: warnings,
-        }))
+        });
+        let capability_report = crate::security::capabilities::evaluate_declared_capabilities(
+            "mcp",
+            &info.name,
+            &info.capabilities,
+        );
+        Self::apply_capability_report_to_review(&mut review, capability_report);
+        self.record_action_review_event(&review).await;
+        Ok(review)
     }
 
     pub async fn refresh_action_review_state(
@@ -2592,10 +3086,18 @@ print(json.dumps({
                     action.plugin_binding.clone(),
                     action.custom_api_binding.clone(),
                     action.mcp_binding.clone(),
+                    action.extension_pack_binding.clone(),
                 )
             })
         };
-        let Some((info, cli_binding, plugin_binding, custom_api_binding, mcp_binding)) = loaded
+        let Some((
+            info,
+            cli_binding,
+            plugin_binding,
+            custom_api_binding,
+            mcp_binding,
+            extension_pack_binding,
+        )) = loaded
         else {
             return Ok(None);
         };
@@ -2603,6 +3105,99 @@ print(json.dumps({
             Some(review) => review,
             None => return Ok(None),
         };
+
+        if info.source != ActionSource::System {
+            if let Some(action_dir) = info
+                .file_path
+                .as_deref()
+                .and_then(|file_path| Path::new(file_path).parent().map(Path::to_path_buf))
+            {
+                match crate::security::ActionGuard::compute_bundle_hash(&action_dir) {
+                    Ok(current_fingerprint)
+                        if !review.fingerprint.is_empty()
+                            && current_fingerprint != review.fingerprint =>
+                    {
+                        let note = "Skill files changed on disk outside the reviewed API path; re-import or update the skill to run semantic review again.".to_string();
+                        review.status = ActionReviewStatus::Blocked;
+                        review.ready = false;
+                        review.allow_load = false;
+                        review.allow_execute = false;
+                        review.visible_in_catalog = false;
+                        review.integrity_ok = false;
+                        review.threat_level = "Malicious".to_string();
+                        review.risk_band = "risky".to_string();
+                        review.risk_score_10 = review.risk_score_10.max(8.5);
+                        review.total_severity = review.total_severity.saturating_add(10);
+                        review.blocked_reason = Some(note.clone());
+                        if !review.warnings.iter().any(|existing| existing == &note) {
+                            review.warnings.push(note.clone());
+                        }
+                        if !review.notes.iter().any(|existing| existing == &note) {
+                            review.notes.push(note.clone());
+                        }
+                        review
+                            .findings
+                            .push(crate::security::action_guard::AnalysisFinding {
+                                category:
+                                    crate::security::action_guard::FindingCategory::BundleShape,
+                                description:
+                                    "Reviewed skill fingerprint no longer matches disk content."
+                                        .to_string(),
+                                matched_text: "disk-content-changed-after-review".to_string(),
+                                line_number: 1,
+                                severity: 10,
+                                file_path: info.file_path.clone(),
+                            });
+                        review.total_findings = review.findings.len();
+                        self.upsert_action_review(review.clone()).await?;
+                        {
+                            let mut disabled = self.disabled_actions.write().await;
+                            if disabled.insert(action_name.to_string()) {
+                                drop(disabled);
+                                self.save_disabled_actions().await?;
+                            }
+                        }
+                        self.record_action_review_event(&review).await;
+                        return Ok(Some(review));
+                    }
+                    Err(error) => {
+                        let note = format!(
+                            "Unable to re-check reviewed skill bundle fingerprint: {}",
+                            error
+                        );
+                        review.status = ActionReviewStatus::Blocked;
+                        review.ready = false;
+                        review.allow_load = false;
+                        review.allow_execute = false;
+                        review.visible_in_catalog = false;
+                        review.integrity_ok = false;
+                        review.threat_level = "Malicious".to_string();
+                        review.risk_band = "risky".to_string();
+                        review.risk_score_10 = review.risk_score_10.max(8.5);
+                        review.total_severity = review.total_severity.saturating_add(10);
+                        review.blocked_reason = Some(note.clone());
+                        if !review.warnings.iter().any(|existing| existing == &note) {
+                            review.warnings.push(note.clone());
+                        }
+                        if !review.notes.iter().any(|existing| existing == &note) {
+                            review.notes.push(note.clone());
+                        }
+                        self.upsert_action_review(review.clone()).await?;
+                        {
+                            let mut disabled = self.disabled_actions.write().await;
+                            if disabled.insert(action_name.to_string()) {
+                                drop(disabled);
+                                self.save_disabled_actions().await?;
+                            }
+                        }
+                        self.record_action_review_event(&review).await;
+                        return Ok(Some(review));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         if matches!(review.status, ActionReviewStatus::Blocked) {
             return Ok(Some(review));
         }
@@ -2710,6 +3305,16 @@ print(json.dumps({
                 } else {
                     binding.auth_configured
                 };
+        }
+
+        if let Some(binding) = extension_pack_binding {
+            let note = format!(
+                "Uses extension pack '{}' feature '{}'.",
+                binding.pack_id, binding.feature_id
+            );
+            if !review.notes.iter().any(|existing| existing == &note) {
+                review.notes.push(note);
+            }
         }
 
         Self::reconcile_dynamic_review_state(&mut review);
@@ -2843,6 +3448,7 @@ print(json.dumps({
             disabled_actions_file,
             action_reviews: tokio::sync::RwLock::new(action_reviews),
             action_reviews_file,
+            capability_run_contexts: tokio::sync::RwLock::new(HashMap::new()),
             removed_bundled_actions: tokio::sync::RwLock::new(removed_bundled_actions),
             removed_bundled_actions_file,
             actions_dir: actions_dir.clone(),
@@ -2851,6 +3457,7 @@ print(json.dumps({
             task_queue: None,
             action_guard: None,
             auto_approved_actions: std::sync::RwLock::new(HashSet::new()),
+            tool_args_guard_config: std::sync::RwLock::new(Default::default()),
             storage: None,
             mcp_registry: None,
             plugin_registry: None,
@@ -2885,6 +3492,22 @@ print(json.dumps({
         if let Ok(mut set) = self.auto_approved_actions.write() {
             *set = approved;
         }
+    }
+
+    pub fn set_tool_args_guard_config(
+        &self,
+        config: crate::security::tool_args_guard::ToolArgsGuardConfig,
+    ) {
+        if let Ok(mut current) = self.tool_args_guard_config.write() {
+            *current = config;
+        }
+    }
+
+    fn tool_args_guard_config(&self) -> crate::security::tool_args_guard::ToolArgsGuardConfig {
+        self.tool_args_guard_config
+            .read()
+            .map(|config| config.clone())
+            .unwrap_or_default()
     }
 
     /// Set shared storage reference for expense/entity operations (called from Agent::init)
@@ -3582,7 +4205,7 @@ print(json.dumps({
 
         self.register_builtin_action(ActionDef {
             name: "capability_acquire".to_string(),
-            description: "Scaffold a reusable integration/action when the needed capability does not already exist. Generates a reviewable custom SKILL.md backed by connector_request and/or browser_auto, registers it immediately, and returns the new action plus any remaining auth/config requirements.".to_string(),
+            description: "Scaffold a reusable integration/action when the needed capability does not already exist. Generates a reviewable custom SKILL.md backed by connector_request and/or browser_auto, registers it immediately, and returns the new action plus any remaining auth/config requirements. Do not use this for extension-pack integrations or connector installs; use the extension_pack_* actions for those.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -3607,7 +4230,7 @@ print(json.dumps({
                     "openapi_text": { "type": "string", "description": "Inline OpenAPI/Swagger JSON content" },
                     "docs_url": { "type": "string", "description": "Optional provider documentation URL" },
                     "docs_text": { "type": "string", "description": "Inline documentation or API notes" },
-                    "force": { "type": "boolean", "description": "Force-load even if the security guard warns" },
+                    "force": { "type": "boolean", "description": "Request installation after non-blocking warnings. Blocking security findings still prevent loading." },
                     "allow_duplicate": { "type": "boolean", "description": "Create another matching capability scaffold instead of updating/reusing an existing one. Default false." }
                 },
                 "required": ["name", "description"]
@@ -4306,7 +4929,7 @@ print(json.dumps({
 
         self.register_builtin_action(ActionDef {
             name: "extension_pack_connect".to_string(),
-            description: "Create or update a pack connection. For OAuth-style packs this returns a browser connect URL when supported; for secret-based packs it stores the provided secret payload.".to_string(),
+            description: "Create or update a pack connection. For OAuth-style packs this returns a browser connect URL when supported. For secret-based packs, omit the secret when AgentArk should collect credentials securely through the UI; do not ask users to paste raw secrets into normal chat.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -4330,8 +4953,148 @@ print(json.dumps({
         }).await;
 
         self.register_builtin_action(ActionDef {
+            name: "custom_messaging_channel_upsert".to_string(),
+            description: "Create or update a reusable custom messaging channel for outbound AgentArk notifications using a declared HTTP send spec. Use when the user wants AgentArk to deliver messages through a non-bundled channel, webhook, internal notification service, or provider-specific messaging API. Declare credential fields and {{secret:KEY}} placeholders only; never include raw credential values in this action.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Optional stable slug. If omitted, derived from name." },
+                    "name": { "type": "string", "description": "User-facing channel name." },
+                    "description": { "type": "string" },
+                    "enabled": { "type": "boolean" },
+                    "docs_url": { "type": "string" },
+                    "auth_profile_id": { "type": "string", "description": "Optional reusable auth profile id for OAuth or advanced auth handled outside direct secret fields." },
+                    "credential_fields": {
+                        "type": "array",
+                        "description": "Credential fields to collect securely. Do not include values.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "key": { "type": "string" },
+                                "label": { "type": "string" },
+                                "placeholder": { "type": "string" },
+                                "help": { "type": "string" },
+                                "input_type": { "type": "string", "enum": ["password", "text", "textarea"] },
+                                "required": { "type": "boolean" }
+                            },
+                            "required": ["key"]
+                        }
+                    },
+                    "auth_manifest": {
+                        "type": "object",
+                        "description": "Optional advanced IntegrationAuthManifest for multi-field, OAuth2 code, device code, or hybrid auth. Storage targets are normalized by AgentArk."
+                    },
+                    "send": {
+                        "type": "object",
+                        "description": "HTTP send template. Supported placeholders are {{text}}, {{subject}}, {{to}}, {{conversation_id}}, and {{secret:KEY}}.",
+                        "properties": {
+                            "method": { "type": "string", "enum": ["post", "put", "patch", "get", "delete"] },
+                            "url_template": { "type": "string" },
+                            "headers": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": { "type": "string" },
+                                        "value_template": { "type": "string" }
+                                    },
+                                    "required": ["name", "value_template"]
+                                }
+                            },
+                            "body_template": { "type": "string" },
+                            "content_type": { "type": "string" },
+                            "auth": {
+                                "type": "object",
+                                "description": "Auth transport binding. Examples: {kind:'none'}, {kind:'bearer', secret_key:'token'}, {kind:'custom_header', name:'X-Api-Key', value_template:'{{secret:api_key}}'}, {kind:'basic', username_key:'username', password_key:'password'}, {kind:'query_param', name:'key', value_template:'{{secret:api_key}}'}."
+                            },
+                            "expect_status": { "type": "array", "items": { "type": "integer" } }
+                        },
+                        "required": ["url_template"]
+                    }
+                },
+                "required": ["name", "send"]
+            }),
+            capabilities: vec!["integration_admin".to_string(), "notify".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+            authorization: ActionAuthorization {
+                risk_level: ActionRiskLevel::High,
+                requires_auth: true,
+                rate_limit: Some(crate::actions::ActionRateLimit {
+                    max_calls: 5,
+                    window_seconds: 300,
+                }),
+                human_approval: crate::actions::ActionHumanApproval { required: true },
+                outbound: crate::actions::ActionEgressPolicy {
+                    outbound_write: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        }).await;
+
+        self.register_builtin_action(ActionDef {
+            name: "extension_pack_set_enabled".to_string(),
+            description: "Enable or disable an installed extension pack so its registered actions can be used by the agent.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pack_id": { "type": "string" },
+                    "enabled": { "type": "boolean" }
+                },
+                "required": ["pack_id", "enabled"]
+            }),
+            capabilities: vec!["integration_admin".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+            authorization: Default::default(),
+        }).await;
+
+        for (name, description) in [
+            (
+                "extension_pack_runtime_install",
+                "Install or verify the local runtime declared by an installed extension pack.",
+            ),
+            (
+                "extension_pack_runtime_verify",
+                "Verify the local runtime declared by an installed extension pack and refresh its recorded status.",
+            ),
+            (
+                "extension_pack_runtime_update",
+                "Update the local runtime declared by an installed extension pack when update commands are available.",
+            ),
+            (
+                "extension_pack_runtime_uninstall",
+                "Uninstall the local runtime declared by an installed extension pack and mark the runtime as missing.",
+            ),
+        ] {
+            self.register_builtin_action(ActionDef {
+                name: name.to_string(),
+                description: description.to_string(),
+                version: "1.0.0".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "pack_id": { "type": "string" }
+                    },
+                    "required": ["pack_id"]
+                }),
+                capabilities: vec!["integration_admin".to_string()],
+                sandbox_mode: Some(SandboxMode::Native),
+                source: ActionSource::System,
+                file_path: None,
+                authorization: Default::default(),
+            })
+            .await;
+        }
+
+        self.register_builtin_action(ActionDef {
             name: "extension_pack_test_connection".to_string(),
-            description: "Run a pack connection health test when available.".to_string(),
+            description: "Run a pack connection health test when available. If connection_id is omitted, AgentArk tests the preferred saved connection for that pack.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -4339,7 +5102,7 @@ print(json.dumps({
                     "pack_id": { "type": "string" },
                     "connection_id": { "type": "string" }
                 },
-                "required": ["pack_id", "connection_id"]
+                "required": ["pack_id"]
             }),
             capabilities: vec!["integration_inventory".to_string()],
             sandbox_mode: Some(SandboxMode::Native),
@@ -4834,28 +5597,20 @@ print(json.dumps({
 
         self.register_builtin_action(ActionDef {
             name: "browser_auto".to_string(),
-            description: "Automate browser tasks: navigate websites, fill forms, click buttons, take screenshots, read page content. Use when asked to 'go to a website', 'log into', 'fill out a form', 'book', 'check my account', or any web browsing/automation task. For website logins, start the session, open the auth page, and use live browser handoff for password/MFA entry instead of asking for secrets in chat. When stuck (CAPTCHA, 2FA, ambiguous UI), takes a screenshot and asks the user for help, then continues. Runs as a background session.".to_string(),
+            description: "Start a managed background browser session for website interaction. Use when asked to go to a website, log in, fill a form, or otherwise work through a live web UI. For login, MFA, CAPTCHA, or other human-only steps, let the managed session pause for live browser handoff instead of asking for secrets in chat. Do not chain manual browser sub-actions here; use the browser integration tool for explicit create_session/navigate/click/type_text flows.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["start_session", "navigate", "click", "type_text", "screenshot", "get_content", "scroll", "press_key", "ask_user", "end_session"],
-                        "description": "Browser action to perform. Use start_session first, then chain actions."
+                        "enum": ["start_session"],
+                        "description": "Starts a managed browser session."
                     },
                     "task": { "type": "string", "description": "High-level description of what to accomplish (for start_session)" },
-                    "url": { "type": "string", "description": "URL to navigate to" },
-                    "session_id": { "type": "string", "description": "Browser session ID (required after start_session)" },
-                    "selector": { "type": "string", "description": "CSS selector for click/type target" },
-                    "text": { "type": "string", "description": "Text to type or link text to click" },
-                    "x": { "type": "integer", "description": "X coordinate for click" },
-                    "y": { "type": "integer", "description": "Y coordinate for click" },
-                    "clear": { "type": "boolean", "description": "Clear field before typing (default: false)" },
-                    "direction": { "type": "string", "enum": ["up", "down"], "description": "Scroll direction" },
-                    "key": { "type": "string", "description": "Key to press (Enter, Tab, Escape, etc.)" },
-                    "question": { "type": "string", "description": "Question to ask the user (for ask_user)" },
-                    "channel": { "type": "string", "description": "Channel to notify on (telegram, whatsapp, web)" }
+                    "channel": { "type": "string", "description": "Channel to notify on (telegram, whatsapp, web)" },
+                    "chat_id": { "type": "string", "description": "Optional channel chat identifier for notifications" },
+                    "conversation_id": { "type": "string", "description": "Optional conversation id to append browser handoff updates into chat" }
                 },
                 "required": ["action"]
             }),
@@ -5228,7 +5983,7 @@ print(json.dumps({
         self.register_builtin_action(ActionDef {
             name: "app_deploy".to_string(),
             description: format!(
-                "Deploy a web app or server and return a live URL. Supports either generated files OR a repository source. Use when asked to build a dashboard, create a tool, make a website, build an app, or deploy/run a repo locally for the user. For file-based apps, provide a `files` object. For repo-based apps, provide `repo_url` (and optionally `repo_ref`, `repo_subdir`, `service_mode`) so {} can clone the repo, inspect the README/manifests, stand up the detected frontend/backend services, and return managed endpoints. For generated file bundles, only request a dynamic runtime when it is genuinely needed by setting `runtime_required=true` and providing an `entry_command` (optionally `runtime_reason`). Otherwise the bundle is treated as a static/local app. Repo-based deploys default to container runtime unless overridden. Dynamic app containers default to the installed {} image unless `runtime_image` or a runner-image env override is provided. Public exposure stays off unless explicitly requested (`expose_public=true`). Declare required inputs via required_inputs and mark each item sensitive=true/false. Access guard is optional and defaults to false.",
+                "Deploy a web app or server and return a live URL. Supports either generated files OR a repository source. Use when asked to build a dashboard, create a tool, make a website, build an app, or deploy/run a repo locally for the user. For file-based apps, provide a `files` object. For repo-based apps, provide `repo_url` (and optionally `repo_ref`, `repo_subdir`, `service_mode`) so {} can clone the repo, inspect the README/manifests, stand up the detected frontend/backend services, and return managed endpoints. For generated file bundles, only request a dynamic runtime when it is genuinely needed by setting `runtime_required=true` and providing an `entry_command` (optionally `runtime_reason`). Otherwise the bundle is treated as a static/local app. Repo-based deploys default to container runtime unless overridden. Dynamic app containers default to the installed {} image unless `runtime_image` or a runner-image env override is provided. Public exposure stays off unless explicitly requested (`expose_public=true`). Declare required inputs via required_inputs and mark each item sensitive=true/false. Access guard follows the current app-hosting default when omitted for local/private apps. Public exposure requires `access_password`, and providing `access_password` enables App Guard.",
                 crate::branding::PRODUCT_NAME,
                 crate::branding::PRODUCT_NAME
             ),
@@ -5335,7 +6090,11 @@ print(json.dumps({
                     },
                     "access_guard": {
                         "type": "boolean",
-                        "description": "Enable access-key guard for the shared app URL. Default: false."
+                        "description": "Enable access-password guard for the shared app URL. Providing `access_password` enables this automatically. Public exposure requires it."
+                    },
+                    "access_password": {
+                        "type": "string",
+                        "description": "Operator-chosen or UI-generated access password. Required when `expose_public=true` and enables App Guard."
                     },
                     "replace_existing": {
                         "type": "boolean",
@@ -5619,6 +6378,205 @@ print(json.dumps({
         }
     }
 
+    fn capability_context_key(auth_context: &ActionAuthorizationContext) -> Option<String> {
+        auth_context
+            .capability_context_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.chars().take(256).collect::<String>())
+    }
+
+    fn prune_capability_run_contexts(
+        contexts: &mut HashMap<String, CapabilityRunCorrelationRecord>,
+    ) {
+        let cutoff = chrono::Utc::now() - chrono::Duration::seconds(CAPABILITY_CONTEXT_TTL_SECS);
+        contexts.retain(|_, record| record.updated_at >= cutoff);
+        while contexts.len() > CAPABILITY_CONTEXT_LIMIT {
+            let Some(oldest_key) = contexts
+                .iter()
+                .min_by_key(|(_, record)| record.updated_at)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            contexts.remove(&oldest_key);
+        }
+    }
+
+    fn capability_correlation_message(
+        action_name: &str,
+        decision: &crate::security::capabilities::CapabilityCorrelationDecision,
+    ) -> String {
+        let detail = decision.message.as_deref().unwrap_or(match decision.effect {
+            crate::security::capabilities::CapabilityCorrelationEffect::Block => {
+                "Blocked by cross-layer capability policy."
+            }
+            crate::security::capabilities::CapabilityCorrelationEffect::RequireApproval => {
+                "This action requires explicit approval because it combines sensitive access with external delivery."
+            }
+            crate::security::capabilities::CapabilityCorrelationEffect::Allow => {
+                "Allowed by capability policy."
+            }
+        });
+        match decision.effect {
+            crate::security::capabilities::CapabilityCorrelationEffect::Block => {
+                format!(
+                    "Tool '{}' is blocked by security policy. {}",
+                    action_name, detail
+                )
+            }
+            crate::security::capabilities::CapabilityCorrelationEffect::RequireApproval => {
+                format!(
+                    "Tool '{}' requires explicit approval before it can run. {}",
+                    action_name, detail
+                )
+            }
+            crate::security::capabilities::CapabilityCorrelationEffect::Allow => detail.to_string(),
+        }
+    }
+
+    async fn authorize_capability_correlation(
+        &self,
+        action_name: &str,
+        action_def: &ActionDef,
+        arguments: &serde_json::Value,
+        auth_context: &ActionAuthorizationContext,
+    ) -> Option<ActionAuthorizationDecision> {
+        if matches!(
+            auth_context.surface,
+            ActionExecutionSurface::Internal | ActionExecutionSurface::Test
+        ) {
+            return None;
+        }
+        let Some(context_key) = Self::capability_context_key(auth_context) else {
+            return None;
+        };
+        let candidate = crate::security::capabilities::observations_from_action_def(
+            "runtime",
+            action_def,
+            Some(arguments),
+        );
+        if candidate.is_empty() {
+            return None;
+        }
+
+        let mut contexts = self.capability_run_contexts.write().await;
+        Self::prune_capability_run_contexts(&mut contexts);
+        let record =
+            contexts
+                .entry(context_key.clone())
+                .or_insert_with(|| CapabilityRunCorrelationRecord {
+                    updated_at: chrono::Utc::now(),
+                    context: crate::security::capabilities::RunCapabilityContext::default(),
+                });
+        let decision = crate::security::capabilities::evaluate_capability_correlation(
+            record.context.observations(),
+            &candidate,
+        );
+        match decision.effect {
+            crate::security::capabilities::CapabilityCorrelationEffect::Allow => {
+                record.context.extend(candidate);
+                record
+                    .context
+                    .retain_recent(CAPABILITY_CONTEXT_OBSERVATION_LIMIT);
+                record.updated_at = chrono::Utc::now();
+                None
+            }
+            crate::security::capabilities::CapabilityCorrelationEffect::Block => {
+                drop(contexts);
+                self.record_capability_correlation_decision(
+                    action_name,
+                    &context_key,
+                    "blocked",
+                    &decision,
+                )
+                .await;
+                Some(ActionAuthorizationDecision::deny(
+                    Self::capability_correlation_message(action_name, &decision),
+                ))
+            }
+            crate::security::capabilities::CapabilityCorrelationEffect::RequireApproval => {
+                if auth_context.current_turn_is_explicit_approval {
+                    record.context.extend(candidate);
+                    record
+                        .context
+                        .retain_recent(CAPABILITY_CONTEXT_OBSERVATION_LIMIT);
+                    record.updated_at = chrono::Utc::now();
+                    drop(contexts);
+                    self.record_capability_correlation_decision(
+                        action_name,
+                        &context_key,
+                        "approved",
+                        &decision,
+                    )
+                    .await;
+                    None
+                } else {
+                    drop(contexts);
+                    self.record_capability_correlation_decision(
+                        action_name,
+                        &context_key,
+                        "approval_required",
+                        &decision,
+                    )
+                    .await;
+                    Some(ActionAuthorizationDecision::require_explicit_approval(
+                        Self::capability_correlation_message(action_name, &decision),
+                    ))
+                }
+            }
+        }
+    }
+
+    async fn record_capability_correlation_decision(
+        &self,
+        action_name: &str,
+        context_key: &str,
+        outcome: &str,
+        decision: &crate::security::capabilities::CapabilityCorrelationDecision,
+    ) {
+        let Some(report) = decision.report.as_ref() else {
+            return;
+        };
+        let rules = report
+            .matched_rules
+            .iter()
+            .map(|rule| rule.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let subjects = report
+            .observations
+            .iter()
+            .map(|observation| format!("{}:{}", observation.layer, observation.entity_id))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let severity = if matches!(
+            decision.effect,
+            crate::security::capabilities::CapabilityCorrelationEffect::Block
+        ) {
+            "high"
+        } else {
+            "medium"
+        };
+        self.record_security_event(
+            "capability_correlation",
+            severity,
+            format!(
+                "Runtime capability correlation: outcome={}, action='{}', rules=[{}], subjects=[{}]",
+                outcome, action_name, rules, subjects
+            ),
+            Some(format!(
+                "scope=runtime;context={};action={}",
+                Self::truncate_audit_text(context_key, 128),
+                action_name
+            )),
+        )
+        .await;
+    }
+
     pub async fn authorize_action_invocation(
         &self,
         action_name: &str,
@@ -5651,17 +6609,17 @@ print(json.dumps({
                     "Internal execution bypassed the interactive permission gate.",
                 )
             }
-            _ if Self::direct_trusted_chat_tool_override(auth_context) => {
-                ActionAuthorizationDecision::allow(format!(
-                    "Tool '{}' is allowed because this is a direct authenticated chat request.",
-                    action_name
-                ))
-            }
             _ if authorization.human_approval.required
                 && !auth_context.current_turn_is_explicit_approval =>
             {
                 ActionAuthorizationDecision::deny(format!(
                     "Tool '{}' requires explicit user approval before it can run.",
+                    action_name
+                ))
+            }
+            _ if Self::direct_trusted_chat_tool_override(auth_context) => {
+                ActionAuthorizationDecision::allow(format!(
+                    "Tool '{}' is allowed because this is a direct authenticated chat request.",
                     action_name
                 ))
             }
@@ -5766,6 +6724,21 @@ print(json.dumps({
         }
 
         if let Some(action_def) = action_def {
+            if let Some(capability_decision) = self
+                .authorize_capability_correlation(action_name, action_def, arguments, auth_context)
+                .await
+            {
+                self.log_authorization_audit(
+                    action_name,
+                    arguments,
+                    &authorization,
+                    auth_context,
+                    &capability_decision,
+                )
+                .await;
+                return Ok(capability_decision);
+            }
+
             let unapproved_permissions = self
                 .unapproved_permissions_for_action(action_def, auth_context)
                 .await;
@@ -5800,6 +6773,7 @@ print(json.dumps({
                 mcp_binding: None,
                 plugin_binding: None,
                 custom_api_binding: None,
+                extension_pack_binding: None,
             },
         );
     }
@@ -5817,6 +6791,7 @@ print(json.dumps({
                 mcp_binding: None,
                 plugin_binding: None,
                 custom_api_binding: None,
+                extension_pack_binding: None,
             },
         );
     }
@@ -5833,6 +6808,7 @@ print(json.dumps({
                 mcp_binding: None,
                 plugin_binding: None,
                 custom_api_binding: None,
+                extension_pack_binding: None,
             },
         );
     }
@@ -5851,6 +6827,7 @@ print(json.dumps({
                 mcp_binding: Some(binding),
                 plugin_binding: None,
                 custom_api_binding: None,
+                extension_pack_binding: None,
             },
         );
         match review {
@@ -5879,6 +6856,7 @@ print(json.dumps({
                 mcp_binding: None,
                 plugin_binding: Some(binding),
                 custom_api_binding: None,
+                extension_pack_binding: None,
             },
         );
         match review {
@@ -5910,6 +6888,7 @@ print(json.dumps({
                 mcp_binding: None,
                 plugin_binding: None,
                 custom_api_binding: Some(binding),
+                extension_pack_binding: None,
             },
         );
         match review {
@@ -5924,6 +6903,45 @@ print(json.dumps({
             Err(error) => {
                 tracing::warn!(
                     "Failed to review custom API action during registration: {}",
+                    error
+                );
+            }
+        }
+    }
+
+    /// Register an installed extension-pack feature as a real runtime action.
+    pub async fn register_extension_pack_action(
+        &self,
+        info: ActionDef,
+        binding: ExtensionPackActionBinding,
+    ) {
+        let info = Self::normalize_action_definition(info);
+        let review = self.review_extension_pack_action(&info, &binding).await;
+        self.actions.write().await.insert(
+            info.name.clone(),
+            LoadedAction {
+                info,
+                wasm_module: None,
+                workflow_content: None,
+                cli_binding: None,
+                mcp_binding: None,
+                plugin_binding: None,
+                custom_api_binding: None,
+                extension_pack_binding: Some(binding),
+            },
+        );
+        match review {
+            Ok(review) => {
+                if let Err(error) = self.upsert_action_review(review).await {
+                    tracing::warn!(
+                        "Failed to persist extension-pack action review state: {}",
+                        error
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to review extension-pack action during registration: {}",
                     error
                 );
             }
@@ -5971,7 +6989,7 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::Custom,
             file_path: Some(skill_path.to_string_lossy().to_string()),
-        authorization: Default::default(),
+            authorization: Default::default(),
         }
     }
 
@@ -6237,6 +7255,24 @@ print(json.dumps({
         removed_names.len()
     }
 
+    /// Remove all installed extension-pack feature actions.
+    pub async fn unregister_extension_pack_actions(&self) -> usize {
+        let removed_names = {
+            let mut actions = self.actions.write().await;
+            let removed = actions
+                .iter()
+                .filter(|(_, action)| action.extension_pack_binding.is_some())
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>();
+            actions.retain(|_, a| a.extension_pack_binding.is_none());
+            removed
+        };
+        let _ = self
+            .remove_action_reviews(|name| removed_names.iter().any(|n| n == name))
+            .await;
+        removed_names.len()
+    }
+
     fn resolve_optional_cli_cwd(&self, raw: Option<&str>) -> Result<Option<PathBuf>> {
         let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
             return Ok(None);
@@ -6493,10 +7529,11 @@ print(json.dumps({
                     .access
                     .integration_ids
                     .first()
+                    .or_else(|| info.authorization.access.extension_pack_ids.first())
                     .map(String::as_str)
                     .unwrap_or("required");
                 anyhow::bail!(
-                    "Action '{}' is unavailable because integration '{}' is disabled.",
+                    "Action '{}' is unavailable because required integration '{}' is not ready.",
                     action_name,
                     integration_id
                 );
@@ -6530,6 +7567,7 @@ print(json.dumps({
             mcp_binding,
             plugin_binding,
             custom_api_binding,
+            extension_pack_binding,
             source,
             info,
         ) = {
@@ -6547,6 +7585,7 @@ print(json.dumps({
                 action.mcp_binding.clone(),
                 action.plugin_binding.clone(),
                 action.custom_api_binding.clone(),
+                action.extension_pack_binding.clone(),
                 action.info.source.clone(),
                 action.info.clone(),
             )
@@ -6597,10 +7636,11 @@ print(json.dumps({
                     .access
                     .integration_ids
                     .first()
+                    .or_else(|| info.authorization.access.extension_pack_ids.first())
                     .map(String::as_str)
                     .unwrap_or("required");
                 return Err(anyhow::anyhow!(
-                    "Action '{}' is unavailable because integration '{}' is disabled.",
+                    "Action '{}' is unavailable because required integration '{}' is not ready.",
                     action_name,
                     integration_id
                 ));
@@ -6664,6 +7704,17 @@ print(json.dumps({
             };
             return self
                 .execute_custom_api_action(binding, &outbound_args)
+                .await;
+        }
+
+        if let Some(binding) = extension_pack_binding {
+            let outbound_args = if binding.read_only {
+                resolved_args.clone()
+            } else {
+                Self::sanitize_outbound_action_arguments(action_name, &resolved_args)?
+            };
+            return self
+                .execute_extension_pack_action(binding, &outbound_args)
                 .await;
         }
 
@@ -6855,18 +7906,21 @@ print(json.dumps({
                 out.push_str(&s[last..m.start()]);
                 let kind = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                 let key = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-                let val = match kind {
-                    "secret" => resolve_secret(key),
-                    "env" => resolve_env(key),
-                    _ => None,
+                let placeholder_kind = match kind {
+                    "secret" => MissingSecretPlaceholderKind::Secret,
+                    "env" => MissingSecretPlaceholderKind::Env,
+                    _ => MissingSecretPlaceholderKind::Secret,
+                };
+                let val = match placeholder_kind {
+                    MissingSecretPlaceholderKind::Secret => resolve_secret(key),
+                    MissingSecretPlaceholderKind::Env => resolve_env(key),
                 }
                 .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Missing secret/env '{}:{}' for action '{}'",
-                        kind,
+                    anyhow::Error::new(MissingSecretPlaceholder::new(
+                        action_name,
+                        placeholder_kind,
                         key,
-                        action_name
-                    )
+                    ))
                 })?;
                 out.push_str(&val);
                 last = m.end();
@@ -6953,6 +8007,12 @@ print(json.dumps({
         binding: McpBinding,
         arguments: &serde_json::Value,
     ) -> Result<String> {
+        crate::security::tool_args_guard::check_outward_urls_in_json_anyhow(
+            arguments,
+            &self.tool_args_guard_config(),
+        )
+        .await
+        .context("MCP action arguments denied by outbound URL guard")?;
         let registry = self
             .mcp_registry
             .as_ref()
@@ -6975,6 +8035,12 @@ print(json.dumps({
         binding: PluginBinding,
         arguments: &serde_json::Value,
     ) -> Result<String> {
+        crate::security::tool_args_guard::check_outward_urls_in_json_anyhow(
+            arguments,
+            &self.tool_args_guard_config(),
+        )
+        .await
+        .context("Plugin action arguments denied by outbound URL guard")?;
         let registry = self
             .plugin_registry
             .as_ref()
@@ -6991,6 +8057,12 @@ print(json.dumps({
         binding: CustomApiBinding,
         arguments: &serde_json::Value,
     ) -> Result<String> {
+        crate::security::tool_args_guard::check_outward_urls_in_json_anyhow(
+            arguments,
+            &self.tool_args_guard_config(),
+        )
+        .await
+        .context("Custom API action arguments denied by outbound URL guard")?;
         let mut path = binding.path.clone();
         let mut query_pairs = binding.default_query.clone();
         let mut dynamic_headers = reqwest::header::HeaderMap::new();
@@ -7084,6 +8156,12 @@ print(json.dumps({
         if let Some(overlay) = auth_overlay.as_ref() {
             overlay.apply_to_url(&mut url);
         }
+        url = crate::security::tool_args_guard::check_outward_url_anyhow(
+            url.as_str(),
+            &self.tool_args_guard_config(),
+        )
+        .await
+        .with_context(|| format!("custom API URL denied for '{}'", binding.operation_name))?;
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(20))
@@ -7209,6 +8287,7 @@ print(json.dumps({
             rendered
         };
         let rendered = crate::security::redact_secret_input(&rendered).text;
+        let rendered = crate::security::sanitize_untrusted_output("custom_api", &rendered);
         if !status.is_success() {
             return Err(anyhow::anyhow!(
                 "Custom API '{}' returned HTTP {}:\n{}",
@@ -7231,6 +8310,51 @@ print(json.dumps({
             binding.method.to_ascii_uppercase(),
             binding.operation_name,
             rendered
+        ))
+    }
+
+    async fn execute_extension_pack_action(
+        &self,
+        binding: ExtensionPackActionBinding,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
+        crate::security::tool_args_guard::check_outward_urls_in_json_anyhow(
+            arguments,
+            &self.tool_args_guard_config(),
+        )
+        .await
+        .context("Extension-pack action arguments denied by outbound URL guard")?;
+        let registry = self
+            .extension_pack_registry
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Extension-pack registry not initialized"))?;
+        let mut registry = registry.write().await;
+        let result = registry
+            .invoke_feature(
+                crate::extension_packs::ExtensionPackInvokeRequest {
+                    pack_id: Some(binding.pack_id.clone()),
+                    connection_id: binding.connection_id.clone(),
+                    feature_id: binding.feature_id.clone(),
+                    arguments: arguments.clone(),
+                },
+                self.mcp_registry.clone(),
+                self.plugin_registry.clone(),
+            )
+            .await?;
+        if !result.ok {
+            anyhow::bail!(
+                "{}",
+                result
+                    .message
+                    .or(result.error)
+                    .unwrap_or_else(|| "Extension-pack invocation failed".to_string())
+            );
+        }
+        let payload = serde_json::to_string_pretty(&result.data.unwrap_or(serde_json::Value::Null))
+            .unwrap_or_else(|_| "null".to_string());
+        Ok(crate::security::sanitize_untrusted_output(
+            "extension_pack",
+            &crate::security::redact_secret_input(&payload).text,
         ))
     }
 
@@ -7412,7 +8536,27 @@ print(json.dumps({
             "extension_pack_search" => self.execute_extension_pack_search(arguments).await,
             "extension_pack_install" => self.execute_extension_pack_install(arguments).await,
             "extension_pack_scaffold" => self.execute_extension_pack_scaffold(arguments).await,
+            "custom_messaging_channel_upsert" => {
+                self.execute_custom_messaging_channel_upsert(arguments)
+                    .await
+            }
             "extension_pack_connect" => self.execute_extension_pack_connect(arguments).await,
+            "extension_pack_set_enabled" => {
+                self.execute_extension_pack_set_enabled(arguments).await
+            }
+            "extension_pack_runtime_install" => {
+                self.execute_extension_pack_runtime_install(arguments).await
+            }
+            "extension_pack_runtime_verify" => {
+                self.execute_extension_pack_runtime_verify(arguments).await
+            }
+            "extension_pack_runtime_update" => {
+                self.execute_extension_pack_runtime_update(arguments).await
+            }
+            "extension_pack_runtime_uninstall" => {
+                self.execute_extension_pack_runtime_uninstall(arguments)
+                    .await
+            }
             "extension_pack_test_connection" => {
                 self.execute_extension_pack_test_connection(arguments).await
             }
@@ -8093,15 +9237,27 @@ print(result["text"])
                             let required = Self::collect_required_fields_from_schema(
                                 &action.info.input_schema,
                             );
+                            let sensitive_required =
+                                Self::collect_sensitive_required_fields_from_schema(
+                                    &action.info.input_schema,
+                                );
                             let missing: Vec<String> = required
                                 .iter()
                                 .filter(|k| !Self::has_non_empty_argument(arguments, k))
                                 .cloned()
                                 .collect();
                             if !missing.is_empty() {
+                                let sensitive_missing = missing
+                                    .iter()
+                                    .filter(|key| {
+                                        sensitive_required.iter().any(|required| required == *key)
+                                    })
+                                    .cloned()
+                                    .collect();
                                 let payload = WorkflowMissingInputsPayload {
                                     action: other.to_string(),
                                     missing,
+                                    sensitive_missing,
                                     required,
                                     provided: Self::collect_provided_argument_keys(arguments),
                                     query: user_query,
@@ -8486,7 +9642,6 @@ print(result["text"])
         limit: u64,
     ) -> Result<serde_json::Value> {
         let learning_enabled = crate::core::learning::load_learning_enabled(storage).await;
-        let learning_local_only = crate::core::learning::load_learning_local_only(storage).await;
         let learning_model_slot = crate::core::learning::load_learning_model_slot(storage).await;
         let learning_queue_cap = crate::core::learning::load_learning_queue_cap(storage).await;
         let queue_counts = storage.learning_queue_counts().await?;
@@ -8508,7 +9663,6 @@ print(result["text"])
         Ok(serde_json::json!({
             "surface": "evolution",
             "learning_enabled": learning_enabled,
-            "learning_local_only": learning_local_only,
             "learning_model_slot": learning_model_slot,
             "learning_queue_cap": learning_queue_cap,
             "queue_counts": queue_counts,
@@ -8669,6 +9823,15 @@ print(result["text"])
         Ok(serde_json::to_string_pretty(&payload)?)
     }
 
+    async fn sync_extension_pack_runtime_actions(&self) -> Result<()> {
+        let registry = self
+            .extension_pack_registry
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Extension-pack registry not available"))?;
+        let guard = registry.read().await;
+        guard.sync_to_runtime(self).await
+    }
+
     async fn execute_extension_pack_list(&self, arguments: &serde_json::Value) -> Result<String> {
         let registry = self
             .extension_pack_registry
@@ -8698,10 +9861,12 @@ print(result["text"])
             .extension_pack_registry
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Extension-pack registry not available"))?;
-        let mut guard = registry.write().await;
-        Ok(serde_json::to_string_pretty(
-            &guard.install(request).await?,
-        )?)
+        let pack = {
+            let mut guard = registry.write().await;
+            guard.install(request).await?
+        };
+        self.sync_extension_pack_runtime_actions().await?;
+        Ok(serde_json::to_string_pretty(&pack)?)
     }
 
     async fn execute_extension_pack_scaffold(
@@ -8716,10 +9881,69 @@ print(result["text"])
             .extension_pack_registry
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Extension-pack registry not available"))?;
-        let mut guard = registry.write().await;
-        Ok(serde_json::to_string_pretty(
-            &guard.scaffold(request).await?,
-        )?)
+        let pack = {
+            let mut guard = registry.write().await;
+            guard.scaffold(request).await?
+        };
+        self.sync_extension_pack_runtime_actions().await?;
+        Ok(serde_json::to_string_pretty(&pack)?)
+    }
+
+    async fn execute_custom_messaging_channel_upsert(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
+        let storage = self.runtime_storage()?;
+        let request: crate::custom_messaging_channels::CustomMessagingChannelUpsertRequest =
+            serde_json::from_value(arguments.clone()).map_err(|error| {
+                anyhow::anyhow!("Invalid custom messaging channel arguments: {}", error)
+            })?;
+        let requested_id = crate::custom_messaging_channels::config_id_for_request(&request);
+        let existing = crate::custom_messaging_channels::get_custom_messaging_channel_config(
+            &storage,
+            &requested_id,
+        )
+        .await?;
+        let operation = if existing.is_some() {
+            "update"
+        } else {
+            "create"
+        };
+        let view = crate::custom_messaging_channels::upsert_custom_messaging_channel(
+            &storage,
+            &self.config_dir,
+            self.data_dir(),
+            request,
+            existing.as_ref().map(|_| requested_id.as_str()),
+        )
+        .await?;
+        self.record_custom_messaging_channel_upsert_event(&view, operation)
+            .await;
+        let integration_id = view
+            .config
+            .auth_manifest
+            .as_ref()
+            .map(|manifest| manifest.integration_id.clone());
+        let channel_id = view.runtime_channel_id.clone();
+        let config_id = view.config.id.clone();
+        let channel_name = view.config.name.clone();
+        let needs_credentials = view.requires_auth && !view.configured;
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "status": if needs_credentials { "needs_credentials" } else { "configured" },
+            "channel_id": channel_id,
+            "integration_id": integration_id,
+            "custom_messaging_channel": {
+                "id": config_id,
+                "name": channel_name,
+                "configured": view.configured,
+                "requires_auth": view.requires_auth,
+            },
+            "message": if needs_credentials {
+                "Custom messaging channel saved. Credentials are still required. Use the secure credential form; do not paste secrets into normal chat."
+            } else {
+                "Custom messaging channel saved and ready."
+            }
+        }))?)
     }
 
     async fn execute_extension_pack_connect(
@@ -8740,9 +9964,13 @@ print(result["text"])
             .extension_pack_registry
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Extension-pack registry not available"))?;
-        let mut guard = registry.write().await;
-        let connection = guard.upsert_connection(pack_id, request).await?;
-        let oauth_hint = guard.supports_connect_url(pack_id);
+        let (connection, oauth_hint) = {
+            let mut guard = registry.write().await;
+            let connection = guard.upsert_connection(pack_id, request).await?;
+            let oauth_hint = guard.supports_connect_url(pack_id);
+            (connection, oauth_hint)
+        };
+        self.sync_extension_pack_runtime_actions().await?;
         let redirect_uri = arguments
             .get("redirect_uri")
             .and_then(|value| value.as_str())
@@ -8765,17 +9993,180 @@ print(result["text"])
         let connect_url = connect_path
             .as_deref()
             .map(|path| format!("{}{}", crate::core::net::internal_api_base_url(), path));
+        let (pack_name, required_secrets) = {
+            let guard = registry.read().await;
+            let pack = guard.get_pack(pack_id).await?;
+            let pack_name = pack
+                .as_ref()
+                .map(|pack| pack.manifest.name.clone())
+                .unwrap_or_else(|| pack_id.to_string());
+            let required_secrets = pack
+                .as_ref()
+                .map(|pack| {
+                    pack.manifest
+                        .auth
+                        .required_secrets
+                        .iter()
+                        .map(|value| value.trim())
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|items| !items.is_empty())
+                .unwrap_or_else(|| match connection.auth_mode {
+                    crate::extension_packs::ExtensionPackAuthMode::ApiKey => {
+                        vec!["api_key".to_string(), "access_token".to_string()]
+                    }
+                    crate::extension_packs::ExtensionPackAuthMode::Basic => {
+                        vec!["username".to_string(), "password".to_string()]
+                    }
+                    _ => Vec::new(),
+                });
+            (pack_name, required_secrets)
+        };
+        let needs_credentials = !oauth_hint
+            && matches!(
+                connection.state,
+                crate::extension_packs::ExtensionConnectionState::NeedsAuth
+            )
+            && !required_secrets.is_empty();
         Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "status": if needs_credentials {
+                "needs_credentials"
+            } else if oauth_hint {
+                "oauth_pending"
+            } else {
+                "connected"
+            },
+            "pack_id": pack_id,
+            "pack_name": pack_name,
             "connection": connection,
+            "required_secrets": required_secrets,
             "oauth_connect_in_ui": oauth_hint,
             "connect_url_endpoint": connect_path,
             "connect_url": connect_url,
-            "message": if oauth_hint {
+            "message": if needs_credentials {
+                "Connection draft saved. Credentials are still required. Never paste secrets, API keys, passwords, or sensitive data into normal chat. Use the secure credential UI."
+            } else if oauth_hint {
                 "Connection record saved. Complete OAuth by opening the returned connect_url in a browser."
             } else {
                 "Connection saved."
             }
         }))?)
+    }
+
+    async fn execute_extension_pack_set_enabled(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
+        let pack_id = arguments
+            .get("pack_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Missing pack_id"))?;
+        let enabled = arguments
+            .get("enabled")
+            .and_then(|value| value.as_bool())
+            .ok_or_else(|| anyhow::anyhow!("Missing enabled"))?;
+        let registry = self
+            .extension_pack_registry
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Extension-pack registry not available"))?;
+        let pack = {
+            let mut guard = registry.write().await;
+            guard.set_pack_enabled(pack_id, enabled).await?
+        };
+        self.sync_extension_pack_runtime_actions().await?;
+        Ok(serde_json::to_string_pretty(&pack)?)
+    }
+
+    async fn execute_extension_pack_runtime_install(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
+        let pack_id = arguments
+            .get("pack_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Missing pack_id"))?;
+        let registry = self
+            .extension_pack_registry
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Extension-pack registry not available"))?;
+        let result = {
+            let mut guard = registry.write().await;
+            guard.install_runtime(pack_id).await?
+        };
+        self.sync_extension_pack_runtime_actions().await?;
+        Ok(serde_json::to_string_pretty(&result)?)
+    }
+
+    async fn execute_extension_pack_runtime_verify(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
+        let pack_id = arguments
+            .get("pack_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Missing pack_id"))?;
+        let registry = self
+            .extension_pack_registry
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Extension-pack registry not available"))?;
+        let result = {
+            let mut guard = registry.write().await;
+            guard.verify_runtime(pack_id).await?
+        };
+        self.sync_extension_pack_runtime_actions().await?;
+        Ok(serde_json::to_string_pretty(&result)?)
+    }
+
+    async fn execute_extension_pack_runtime_update(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
+        let pack_id = arguments
+            .get("pack_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Missing pack_id"))?;
+        let registry = self
+            .extension_pack_registry
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Extension-pack registry not available"))?;
+        let result = {
+            let mut guard = registry.write().await;
+            guard.update_runtime(pack_id).await?
+        };
+        self.sync_extension_pack_runtime_actions().await?;
+        Ok(serde_json::to_string_pretty(&result)?)
+    }
+
+    async fn execute_extension_pack_runtime_uninstall(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
+        let pack_id = arguments
+            .get("pack_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Missing pack_id"))?;
+        let registry = self
+            .extension_pack_registry
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Extension-pack registry not available"))?;
+        let result = {
+            let mut guard = registry.write().await;
+            guard.uninstall_runtime(pack_id).await?
+        };
+        self.sync_extension_pack_runtime_actions().await?;
+        Ok(serde_json::to_string_pretty(&result)?)
     }
 
     async fn execute_extension_pack_test_connection(
@@ -8788,27 +10179,77 @@ print(result["text"])
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow::anyhow!("Missing pack_id"))?;
-        let connection_id = arguments
+        let requested_connection_id = arguments
             .get("connection_id")
             .and_then(|value| value.as_str())
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("Missing connection_id"))?;
+            .map(str::to_string);
         let registry = self
             .extension_pack_registry
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Extension-pack registry not available"))?;
         let mut guard = registry.write().await;
-        Ok(serde_json::to_string_pretty(
-            &guard
-                .test_connection(
-                    pack_id,
-                    connection_id,
-                    self.mcp_registry.clone(),
-                    self.plugin_registry.clone(),
-                )
-                .await?,
-        )?)
+        let pick_connection_id =
+            |connections: Vec<crate::extension_packs::ExtensionPackConnectionView>| {
+                connections
+                    .iter()
+                    .find(|item| {
+                        item.connection.enabled
+                            && matches!(
+                                item.state,
+                                crate::extension_packs::ExtensionConnectionState::Ready
+                            )
+                    })
+                    .or_else(|| connections.iter().find(|item| item.connection.enabled))
+                    .or_else(|| connections.first())
+                    .map(|item| item.connection.id.clone())
+            };
+        let resolved_connection_id = if let Some(connection_id) = requested_connection_id.clone() {
+            connection_id
+        } else {
+            pick_connection_id(guard.list_connections(pack_id).await?).ok_or_else(|| {
+                anyhow::anyhow!("No connection is configured for pack '{}'", pack_id)
+            })?
+        };
+        let (resolved_connection_id, result) = match guard
+            .test_connection(
+                pack_id,
+                &resolved_connection_id,
+                self.mcp_registry.clone(),
+                self.plugin_registry.clone(),
+            )
+            .await
+        {
+            Ok(result) => (resolved_connection_id, result),
+            Err(error)
+                if requested_connection_id
+                    .as_deref()
+                    .is_some_and(|value| value.eq_ignore_ascii_case(pack_id))
+                    && error
+                        .to_string()
+                        .contains(&format!("Connection '{}' was not found", pack_id)) =>
+            {
+                let fallback_id = pick_connection_id(guard.list_connections(pack_id).await?)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("No connection is configured for pack '{}'", pack_id)
+                    })?;
+                let result = guard
+                    .test_connection(
+                        pack_id,
+                        &fallback_id,
+                        self.mcp_registry.clone(),
+                        self.plugin_registry.clone(),
+                    )
+                    .await?;
+                (fallback_id, result)
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "resolved_connection_id": resolved_connection_id,
+            "result": result,
+        }))?)
     }
 
     async fn execute_extension_pack_list_events(
@@ -8941,6 +10382,124 @@ print(result["text"])
                 "reason": "Use sandbox-local Python packages first; do not run host installers unless the sandbox reports a missing binary.",
             }));
             notes.push("Audio-like upload detected by bytes; prefer the selected sandbox action path before any host install.".to_string());
+        }
+
+        let pack_query = requested_capability
+            .or(selected_action)
+            .unwrap_or(goal)
+            .trim();
+        if !pack_query.is_empty() {
+            if let Some(registry) = self.extension_pack_registry.as_ref() {
+                let pack_search = {
+                    let guard = registry.read().await;
+                    guard
+                        .search_packs(Some(pack_query), Some("integration"))
+                        .await
+                        .ok()
+                };
+                if let Some(pack_search) = pack_search {
+                    let top_installed = pack_search
+                        .installed
+                        .into_iter()
+                        .take(3)
+                        .collect::<Vec<_>>();
+                    let top_catalog = pack_search.catalog.into_iter().take(3).collect::<Vec<_>>();
+                    let mut candidate_labels = top_installed
+                        .iter()
+                        .map(|pack| {
+                            format!(
+                                "{} ({})",
+                                pack.manifest.name.as_str(),
+                                pack.manifest.id.as_str()
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    candidate_labels.extend(top_catalog.iter().map(|pack| {
+                        format!(
+                            "{} ({})",
+                            pack.manifest.name.as_str(),
+                            pack.manifest.id.as_str()
+                        )
+                    }));
+                    if !candidate_labels.is_empty() {
+                        notes.push(format!(
+                            "Extension-pack candidates for this capability: {}.",
+                            candidate_labels.join(", ")
+                        ));
+                        routes.push(serde_json::json!({
+                            "route": "extension_pack",
+                            "approval_required": false,
+                            "auto_allowed": true,
+                            "query": pack_query,
+                            "installed_matches": top_installed.len(),
+                            "catalog_matches": top_catalog.len(),
+                            "requires_confirmation": top_installed.is_empty() && top_catalog.len() > 1,
+                            "reason": "Use the generic extension-pack lifecycle for integration install, runtime setup, auth, and action registration.",
+                        }));
+                    }
+                    for pack in &top_installed {
+                        if !pack.enabled {
+                            next_actions.push(serde_json::json!({
+                                "name": "extension_pack_set_enabled",
+                                "arguments": {
+                                    "pack_id": pack.manifest.id.clone(),
+                                    "enabled": true
+                                },
+                                "why": format!(
+                                    "Enable the installed extension pack '{}' so its registered actions can be used.",
+                                    pack.manifest.name.as_str()
+                                )
+                            }));
+                            continue;
+                        }
+                        if pack.runtime_required
+                            && pack.runtime_status
+                                != crate::extension_packs::ExtensionPackRuntimeStatus::Ready
+                        {
+                            next_actions.push(serde_json::json!({
+                                "name": "extension_pack_runtime_install",
+                                "arguments": {
+                                    "pack_id": pack.manifest.id.clone()
+                                },
+                                "why": format!(
+                                    "Install or verify the local runtime declared by '{}'.",
+                                    pack.manifest.name.as_str()
+                                )
+                            }));
+                        }
+                        if pack.needs_auth
+                            && matches!(
+                                pack.status.as_str(),
+                                "needs_auth" | "runtime_missing" | "available"
+                            )
+                        {
+                            next_actions.push(serde_json::json!({
+                                "name": "extension_pack_connect",
+                                "arguments": {
+                                    "pack_id": pack.manifest.id.clone()
+                                },
+                                "why": format!(
+                                    "Create or refresh the connection record for '{}'.",
+                                    pack.manifest.name.as_str()
+                                )
+                            }));
+                        }
+                    }
+                    if top_installed.is_empty() && top_catalog.len() == 1 {
+                        let pack = &top_catalog[0];
+                        next_actions.push(serde_json::json!({
+                            "name": "extension_pack_install",
+                            "arguments": {
+                                "pack_id": pack.manifest.id.clone()
+                            },
+                            "why": format!(
+                                "Install the catalog integration '{}' through the shared extension-pack flow.",
+                                pack.manifest.name.as_str()
+                            )
+                        }));
+                    }
+                }
+            }
         }
 
         if let Some(requested) = requested_capability_key.as_deref() {
@@ -9726,6 +11285,15 @@ print(result["text"])
                 .as_ref()
                 .map(|binding| binding.api_id.clone()),
             integration_ids: loaded.info.authorization.access.integration_ids.clone(),
+            extension_pack_ids: {
+                let mut ids = loaded.info.authorization.access.extension_pack_ids.clone();
+                if let Some(binding) = loaded.extension_pack_binding.as_ref() {
+                    if !ids.iter().any(|value| value == &binding.pack_id) {
+                        ids.push(binding.pack_id.clone());
+                    }
+                }
+                ids
+            },
             requires_ssh_connection: loaded.info.authorization.access.requires_ssh_connection,
             channel_targets: loaded.info.authorization.access.channel_targets.clone(),
         }
@@ -9913,6 +11481,18 @@ print(result["text"])
             )));
         }
 
+        if !hint.extension_pack_ids.is_empty()
+            && !hint.extension_pack_ids.iter().any(|pack_id| {
+                Self::scope_contains_case_insensitive_value(&scope.extension_pack_ids, pack_id)
+            })
+        {
+            return Some(ActionAuthorizationDecision::deny(format!(
+                "{} is not allowed to use extension pack(s): {}.",
+                actor,
+                hint.extension_pack_ids.join(", ")
+            )));
+        }
+
         if hint.requires_ssh_connection {
             if scope.ssh_connection_names.is_empty() {
                 return Some(ActionAuthorizationDecision::deny(format!(
@@ -9967,45 +11547,66 @@ print(result["text"])
     async fn is_action_integration_ready(&self, action: &ActionDef) -> bool {
         let access = &action.authorization.access;
         let integration_ids = &access.integration_ids;
-        if integration_ids.is_empty() {
+        let extension_pack_ids = &access.extension_pack_ids;
+        if integration_ids.is_empty() && extension_pack_ids.is_empty() {
             return true;
         }
-        let manager = crate::integrations::IntegrationManager::new(&self.config_dir);
-        let workspace_granted_bundles =
-            if access.integration_features.contains_key("google_workspace") {
-                Some(
-                    crate::actions::google_workspace::granted_bundles(&self.config_dir)
-                        .unwrap_or_default(),
-                )
-            } else {
-                None
-            };
-        for integration_id in integration_ids {
-            if !manager.is_ready(integration_id).await {
-                continue;
+        if !integration_ids.is_empty() {
+            let manager = crate::integrations::IntegrationManager::new(&self.config_dir);
+            let workspace_granted_bundles =
+                if access.integration_features.contains_key("google_workspace") {
+                    Some(
+                        crate::actions::google_workspace::granted_bundles(&self.config_dir)
+                            .unwrap_or_default(),
+                    )
+                } else {
+                    None
+                };
+            for integration_id in integration_ids {
+                if !manager.is_ready(integration_id).await {
+                    continue;
+                }
+                let Some(features) = access.integration_features.get(integration_id) else {
+                    return true;
+                };
+                if features.is_empty() {
+                    return true;
+                }
+                let features_ready = match integration_id.as_str() {
+                    "google_workspace" => {
+                        workspace_granted_bundles.as_ref().is_some_and(|granted| {
+                            features.iter().all(|feature| {
+                                crate::actions::google_workspace::normalize_bundle_id(feature)
+                                    .is_some_and(|normalized| {
+                                        granted
+                                            .iter()
+                                            .any(|granted_bundle| granted_bundle == &normalized)
+                                    })
+                            })
+                        })
+                    }
+                    _ => true,
+                };
+                if features_ready {
+                    return true;
+                }
             }
-            let Some(features) = access.integration_features.get(integration_id) else {
-                return true;
+        }
+        if !extension_pack_ids.is_empty() {
+            let Some(registry) = self.extension_pack_registry.as_ref() else {
+                return false;
             };
-            if features.is_empty() {
-                return true;
-            }
-            let features_ready = match integration_id.as_str() {
-                "google_workspace" => workspace_granted_bundles.as_ref().is_some_and(|granted| {
-                    features.iter().all(|feature| {
-                        crate::actions::google_workspace::normalize_bundle_id(feature).is_some_and(
-                            |normalized| {
-                                granted
-                                    .iter()
-                                    .any(|granted_bundle| granted_bundle == &normalized)
-                            },
-                        )
-                    })
-                }),
-                _ => true,
-            };
-            if features_ready {
-                return true;
+            let guard = registry.read().await;
+            for pack_id in extension_pack_ids {
+                let Ok(Some(pack)) = guard.get_pack(pack_id).await else {
+                    continue;
+                };
+                if pack.enabled
+                    && pack.installed
+                    && matches!(pack.status.as_str(), "ready" | "connected")
+                {
+                    return true;
+                }
             }
         }
         false
@@ -10140,7 +11741,7 @@ print(result["text"])
                 return Err(anyhow::anyhow!(
                     "Invalid action '{}'. Use start, stop, or status.",
                     other
-                ))
+                ));
             }
         };
 
@@ -11402,46 +13003,69 @@ print(result["text"])
         // {sandbox_dir} is replaced with the writable execution workspace.
         match lang {
             // Interpreted
-            "python" | "python3" | "py"
-                => Some(("python:3-slim", "py", None, "PIP_ROOT_USER_ACTION=ignore PIP_DISABLE_PIP_VERSION_CHECK=1 python3 {file}")),
-            "javascript" | "js" | "node"
-                => Some(("node:22-slim", "js", None, "node {file}")),
-            "typescript" | "ts"
-                => Some(("node:22-slim", "ts", Some("npm i -g tsx 2>/dev/null"), "npx tsx {file}")),
-            "bash" | "sh" | "shell"
-                => Some(("bash:latest", "sh", None, "bash {file}")),
-            "ruby" | "rb"
-                => Some(("ruby:3-slim", "rb", None, "ruby {file}")),
-            "php"
-                => Some(("php:8-cli", "php", None, "php {file}")),
-            "perl" | "pl"
-                => Some(("perl:5-slim", "pl", None, "perl {file}")),
-            "lua"
-                => Some(("nickblah/lua:5.4", "lua", None, "lua {file}")),
-            "r" | "rlang"
-                => Some(("r-base:latest", "R", None, "Rscript {file}")),
+            "python" | "python3" | "py" => Some((
+                "python:3-slim",
+                "py",
+                None,
+                "PIP_ROOT_USER_ACTION=ignore PIP_DISABLE_PIP_VERSION_CHECK=1 python3 {file}",
+            )),
+            "javascript" | "js" | "node" => Some(("node:22-slim", "js", None, "node {file}")),
+            "typescript" | "ts" => Some((
+                "node:22-slim",
+                "ts",
+                Some("npm i -g tsx 2>/dev/null"),
+                "npx tsx {file}",
+            )),
+            "bash" | "sh" | "shell" => Some(("bash:latest", "sh", None, "bash {file}")),
+            "ruby" | "rb" => Some(("ruby:3-slim", "rb", None, "ruby {file}")),
+            "php" => Some(("php:8-cli", "php", None, "php {file}")),
+            "perl" | "pl" => Some(("perl:5-slim", "pl", None, "perl {file}")),
+            "lua" => Some(("nickblah/lua:5.4", "lua", None, "lua {file}")),
+            "r" | "rlang" => Some(("r-base:latest", "R", None, "Rscript {file}")),
 
             // Compiled
-            "java"
-                => Some(("eclipse-temurin:21-jdk", "java", Some("javac {file}"), "java -cp {sandbox_dir} Main")),
-            "c"
-                => Some(("gcc:latest", "c", Some("gcc {file} -o {sandbox_dir}/a.out -lm"), "{sandbox_dir}/a.out")),
-            "cpp" | "c++"
-                => Some(("gcc:latest", "cpp", Some("g++ {file} -o {sandbox_dir}/a.out -lm"), "{sandbox_dir}/a.out")),
-            "go" | "golang"
-                => Some(("golang:1-bookworm", "go", None, "go run {file}")),
-            "rust" | "rs"
-                => Some(("rust:1-slim-bookworm", "rs", Some("rustc {file} -o {sandbox_dir}/a.out"), "{sandbox_dir}/a.out")),
-            "swift"
-                => Some(("swift:latest", "swift", None, "swift {file}")),
-            "kotlin" | "kt"
-                => Some(("zenika/kotlin:latest", "kt", Some("kotlinc {file} -include-runtime -d {sandbox_dir}/out.jar 2>/dev/null"), "java -jar {sandbox_dir}/out.jar")),
+            "java" => Some((
+                "eclipse-temurin:21-jdk",
+                "java",
+                Some("javac {file}"),
+                "java -cp {sandbox_dir} Main",
+            )),
+            "c" => Some((
+                "gcc:latest",
+                "c",
+                Some("gcc {file} -o {sandbox_dir}/a.out -lm"),
+                "{sandbox_dir}/a.out",
+            )),
+            "cpp" | "c++" => Some((
+                "gcc:latest",
+                "cpp",
+                Some("g++ {file} -o {sandbox_dir}/a.out -lm"),
+                "{sandbox_dir}/a.out",
+            )),
+            "go" | "golang" => Some(("golang:1-bookworm", "go", None, "go run {file}")),
+            "rust" | "rs" => Some((
+                "rust:1-slim-bookworm",
+                "rs",
+                Some("rustc {file} -o {sandbox_dir}/a.out"),
+                "{sandbox_dir}/a.out",
+            )),
+            "swift" => Some(("swift:latest", "swift", None, "swift {file}")),
+            "kotlin" | "kt" => Some((
+                "zenika/kotlin:latest",
+                "kt",
+                Some("kotlinc {file} -include-runtime -d {sandbox_dir}/out.jar 2>/dev/null"),
+                "java -jar {sandbox_dir}/out.jar",
+            )),
 
             // Jupyter notebook â€” execute in-place and output results
-            "jupyter" | "notebook" | "ipynb"
-                => Some(("python:3-slim", "ipynb",
-                    Some("PIP_ROOT_USER_ACTION=ignore PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --no-cache-dir -q jupyter nbconvert nbformat matplotlib pandas numpy scikit-learn seaborn 2>/dev/null"),
-                    "jupyter nbconvert --to notebook --execute --inplace {file} 2>&1 && python3 -c \"import json; nb=json.load(open('{file}')); [print(o.get('text','')) for c in nb['cells'] for o in c.get('outputs',[]) if o.get('output_type')=='stream']\" ")),
+            "jupyter" | "notebook" | "ipynb" => Some((
+                "python:3-slim",
+                "ipynb",
+                Some(
+                    "PIP_ROOT_USER_ACTION=ignore PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --no-cache-dir -q jupyter nbconvert nbformat matplotlib pandas numpy scikit-learn seaborn 2>/dev/null",
+                ),
+                "jupyter nbconvert --to notebook --execute --inplace {file} 2>&1 && python3 -c \"import json; nb=json.load(open('{file}')); [print(o.get('text','')) for c in nb['cells'] for o in c.get('outputs',[]) if o.get('output_type')=='stream']\" ",
+            )),
 
             _ => None,
         }
@@ -12428,9 +14052,9 @@ print(result["text"])
             "perl" | "pl" => ("perl", vec!["-e".to_string(), code.to_string()]),
             _ => {
                 return Err(anyhow::anyhow!(
-                "Native fallback only supports interpreted languages. Docker required for '{}'.",
-                language
-            ))
+                    "Native fallback only supports interpreted languages. Docker required for '{}'.",
+                    language
+                ));
             }
         };
 
@@ -12733,6 +14357,7 @@ print(result["text"])
         Ok(true)
     }
 
+    #[allow(dead_code)]
     pub async fn apply_skill_evolution_candidate(
         &self,
         action: &str,
@@ -12813,14 +14438,100 @@ print(result["text"])
         })
     }
 
+    pub async fn apply_semantically_reviewed_skill_evolution_candidate(
+        &self,
+        action: &str,
+        name: &str,
+        content: &str,
+        evidence_markdown: &str,
+        semantic_review: &crate::security::skill_review::SemanticSkillReview,
+    ) -> Result<SkillEvolutionApplyResult> {
+        let action = action.trim().to_ascii_lowercase();
+        let name = name.trim();
+        let content = content.trim();
+        if name.is_empty() {
+            anyhow::bail!("skill evolution candidate is missing a skill name");
+        }
+        if content.is_empty() {
+            anyhow::bail!("skill evolution candidate is missing skill content");
+        }
+        match action.as_str() {
+            "create_skill" | "improve_skill" | "optimize_description" => {}
+            other => anyhow::bail!("unsupported skill evolution action '{}'", other),
+        }
+
+        let existing = self.get_action_content(name).await?;
+        if action == "create_skill" && existing.is_none() {
+            let review = self
+                .install_semantically_reviewed_action(name, content, semantic_review, false)
+                .await?;
+            if !review.allow_load {
+                anyhow::bail!("skill creation was blocked by semantic security policy");
+            }
+            let history_dir = self.actions_dir.join(name).join("history");
+            tokio::fs::create_dir_all(&history_dir).await?;
+            tokio::fs::write(history_dir.join("v0_evidence.md"), evidence_markdown).await?;
+            return Ok(SkillEvolutionApplyResult {
+                skill_name: name.to_string(),
+                approved_ref: format!("skill:{}:v1", name),
+                history_version: 1,
+            });
+        }
+
+        let Some((info, before_content)) = existing else {
+            anyhow::bail!("skill '{}' does not exist in the current runtime", name);
+        };
+        if info.source == ActionSource::System {
+            anyhow::bail!("system actions cannot be modified by skill evolution");
+        }
+
+        let history_dir = if info.source == ActionSource::Bundled {
+            self.actions_dir.join(name).join("history")
+        } else {
+            info.file_path
+                .as_deref()
+                .and_then(|value| Path::new(value).parent().map(|path| path.join("history")))
+                .unwrap_or_else(|| self.actions_dir.join(name).join("history"))
+        };
+        tokio::fs::create_dir_all(&history_dir).await?;
+        let history_version =
+            crate::core::self_evolve::skill_evolution::next_skill_history_version(&history_dir)?;
+        tokio::fs::write(
+            history_dir.join(format!("v{}.md", history_version)),
+            before_content,
+        )
+        .await?;
+        tokio::fs::write(
+            history_dir.join(format!("v{}_evidence.md", history_version)),
+            evidence_markdown,
+        )
+        .await?;
+        let review = self
+            .update_semantically_reviewed_action(name, content, semantic_review, false)
+            .await?;
+        if review.is_none() {
+            anyhow::bail!(
+                "failed to update skill '{}' after snapshotting history",
+                name
+            );
+        }
+
+        Ok(SkillEvolutionApplyResult {
+            skill_name: name.to_string(),
+            approved_ref: format!("skill:{}:v{}", name, history_version + 1),
+            history_version: history_version + 1,
+        })
+    }
+
     /// Create a new custom action with security verification
     /// Returns the security verdict so the caller can present it to the user.
-    /// If `force` is true, the action is loaded even if security blocks it.
+    /// `force` can keep non-blocking warnings visible, but semantic/security
+    /// blocks are never overridden.
     pub async fn create_action(
         &self,
         name: &str,
         content: &str,
-        force: bool,
+        _force: bool,
     ) -> Result<Option<crate::security::action_guard::ActionSecurityVerdict>> {
         let guard = self.action_guard.as_ref().ok_or_else(|| {
             anyhow::anyhow!("Action security is unavailable, so importing new skills is disabled.")
@@ -12849,7 +14560,7 @@ print(result["text"])
             .await?;
         let fingerprint = crate::security::ActionGuard::compute_bundle_hash(&action_dir)
             .unwrap_or_else(|_| Self::fingerprint_text(&[&workflow_content, &frontmatter]));
-        let mut review = Self::build_review_from_verdict(ActionReviewBuildInput {
+        let review = Self::build_review_from_verdict(ActionReviewBuildInput {
             action_name: &info.name,
             source_kind: Self::action_source_label(&info.source),
             fingerprint,
@@ -12862,7 +14573,7 @@ print(result["text"])
         });
         let blocked = !verdict.allow_load;
 
-        if blocked && !force {
+        if blocked {
             tracing::warn!(
                 "New action '{}' BLOCKED by security guard: {:?}",
                 name,
@@ -12876,18 +14587,6 @@ print(result["text"])
         for warning in &verdict.warnings {
             tracing::warn!("Action '{}': {}", name, warning);
         }
-        if blocked && force {
-            tracing::warn!("Action '{}' force-loaded despite security warnings", name);
-            review.status = ActionReviewStatus::Warning;
-            review.ready = true;
-            review.allow_execute = true;
-            review.visible_in_catalog = true;
-            review.blocked_reason = None;
-            review
-                .notes
-                .push("Security review was explicitly overridden during import.".to_string());
-        }
-
         self.register_workflow_action(info, workflow_content).await;
         self.upsert_action_review(review).await?;
         tracing::info!(
@@ -12896,70 +14595,176 @@ print(result["text"])
             action_file
         );
         Ok(Some(verdict))
+    }
 
-        /* Legacy duplicate import path removed.
-        match self
+    /// Create a custom action after the import path has completed semantic
+    /// capability review with the configured model. This signs and persists the
+    /// skill, then stores the deterministic policy verdict without reclassifying
+    /// the content through wording-based checks.
+    pub async fn install_semantically_reviewed_action(
+        &self,
+        name: &str,
+        content: &str,
+        semantic_review: &crate::security::skill_review::SemanticSkillReview,
+        _force: bool,
+    ) -> Result<ActionReviewSnapshot> {
+        if semantic_review.policy.blocked {
+            anyhow::bail!("Skill '{}' blocked by semantic security policy", name);
+        }
+
+        let action_dir = self.actions_dir.join(name);
+        tokio::fs::create_dir_all(&action_dir).await?;
+        let action_file = Self::preferred_skill_markdown_path(&action_dir);
+        tokio::fs::write(&action_file, content).await?;
+
+        let (info, workflow_content, frontmatter) = self
             .parse_action_md(&action_file, ActionSource::Custom)
             .await
-        {
-            Ok((info, workflow_content, frontmatter)) => {
-                // Security evaluation for newly created actions
-                let verdict = if let Some(ref guard) = self.action_guard {
-                    match guard
-                        .evaluate_action(&action_dir, name, &workflow_content, &frontmatter)
-                        .await
-                    {
-                        Ok(v) => Some(v),
-                        Err(e) => {
-                            tracing::warn!(
-                                "Security check failed for new action '{}': {} â€” loading anyway",
-                                name,
-                                e
-                            );
-                            None
-                        }
-                    }
+            .map_err(|error| anyhow::anyhow!("Failed to parse action: {}", error))?;
+        let Some(ref guard) = self.action_guard else {
+            anyhow::bail!("Action security is unavailable, so importing new skills is disabled.");
+        };
+        guard
+            .resign_action(&action_dir, name)
+            .await
+            .with_context(|| format!("Failed to sign semantically reviewed skill '{}'", name))?;
+        let integrity_ok = true;
+
+        let required_env = Self::extract_required_envs_from_frontmatter(&frontmatter);
+        let missing_env = self
+            .compute_missing_required_envs(&info.name, &required_env)
+            .await?;
+        let fingerprint = crate::security::ActionGuard::compute_bundle_hash(&action_dir)
+            .unwrap_or_else(|_| Self::fingerprint_text(&[&workflow_content, &frontmatter]));
+
+        let mut notes = Vec::new();
+        notes.push(format!(
+            "Semantic capability review used configured model '{}'.",
+            semantic_review.model
+        ));
+        if !semantic_review.summary.trim().is_empty() {
+            notes.push(format!(
+                "Semantic summary: {}",
+                semantic_review.summary.trim()
+            ));
+        }
+        let capabilities = semantic_review
+            .capabilities
+            .iter()
+            .map(|capability| {
+                if let Some(target) = capability.target.as_deref() {
+                    format!("{}:{}", capability.normalized_kind(), target)
                 } else {
-                    None
-                };
-
-                // Check if blocked
-                let blocked = verdict.as_ref().map(|v| !v.allow_load).unwrap_or(false);
-
-                if blocked && !force {
-                    tracing::warn!(
-                        "New action '{}' BLOCKED by security guard: {:?}",
-                        name,
-                        verdict.as_ref().map(|v| &v.warnings)
-                    );
-                    // Delete the saved files since we're not loading it
-                    let _ = tokio::fs::remove_dir_all(&action_dir).await;
-                    return Ok(verdict);
+                    capability.normalized_kind()
                 }
+            })
+            .collect::<Vec<_>>();
+        if !capabilities.is_empty() {
+            notes.push(format!("Capabilities: {}.", capabilities.join(", ")));
+        }
+        for rule in &semantic_review.policy.matched_rules {
+            notes.push(format!("Policy rule '{}': {}", rule.id, rule.message));
+        }
 
-                if let Some(ref v) = verdict {
-                    for w in &v.warnings {
-                        tracing::warn!("Action '{}': {}", name, w);
-                    }
-                    if blocked && force {
-                        tracing::warn!("Action '{}' force-loaded despite security warnings", name);
-                    }
-                }
+        let warnings = semantic_review.policy.warnings.clone();
+        let allow_load = !semantic_review.policy.blocked;
+        let status = if !missing_env.is_empty() {
+            ActionReviewStatus::NeedsSecrets
+        } else if !warnings.is_empty()
+            || semantic_review.policy.risk_band == "review"
+            || semantic_review.policy.risk_band == "risky"
+        {
+            ActionReviewStatus::Warning
+        } else {
+            ActionReviewStatus::Ready
+        };
 
-                self.register_workflow_action(info, workflow_content).await;
-                tracing::info!(
-                    "Created and registered action '{}' at {:?}",
-                    name,
-                    action_file
-                );
-                Ok(verdict)
+        let allow_execute = matches!(
+            status,
+            ActionReviewStatus::Ready | ActionReviewStatus::Warning
+        );
+        let blocked_reason = if semantic_review.policy.blocked {
+            semantic_review
+                .policy
+                .warnings
+                .first()
+                .cloned()
+                .or_else(|| Some("Blocked by semantic skill security policy.".to_string()))
+        } else if !missing_env.is_empty() {
+            Some(format!(
+                "Required secrets missing: {}",
+                missing_env.join(", ")
+            ))
+        } else {
+            None
+        };
+
+        let review = ActionReviewSnapshot {
+            action_name: info.name.clone(),
+            source_kind: Self::action_source_label(&info.source).to_string(),
+            reviewed_at: chrono::Utc::now().to_rfc3339(),
+            fingerprint,
+            status,
+            ready: allow_execute,
+            allow_load,
+            allow_execute,
+            visible_in_catalog: allow_execute,
+            integrity_ok,
+            threat_level: format!("{:?}", semantic_review.policy.threat_level),
+            total_severity: semantic_review.policy.total_severity,
+            total_findings: semantic_review.policy.findings.len(),
+            risk_score_10: semantic_review.policy.risk_score_10,
+            risk_band: semantic_review.policy.risk_band.clone(),
+            warnings,
+            findings: semantic_review.policy.findings.clone(),
+            required_env,
+            missing_env,
+            permissions_needed: capabilities,
+            requires_auth: false,
+            auth_configured: true,
+            notes,
+            blocked_reason,
+        };
+
+        self.register_workflow_action(info, workflow_content).await;
+        self.upsert_action_review(review.clone()).await?;
+        self.record_action_review_event(&review).await;
+        if review.allow_execute {
+            let mut disabled = self.disabled_actions.write().await;
+            if disabled.remove(name) {
+                drop(disabled);
+                self.save_disabled_actions().await?;
             }
-            Err(e) => {
-                tracing::warn!("Created action file but failed to parse: {}", e);
-                Err(anyhow::anyhow!("Failed to parse action: {}", e))
+        } else {
+            let mut disabled = self.disabled_actions.write().await;
+            if disabled.insert(name.to_string()) {
+                drop(disabled);
+                self.save_disabled_actions().await?;
             }
         }
-        */
+        Ok(review)
+    }
+
+    pub async fn update_semantically_reviewed_action(
+        &self,
+        name: &str,
+        content: &str,
+        semantic_review: &crate::security::skill_review::SemanticSkillReview,
+        force: bool,
+    ) -> Result<Option<ActionReviewSnapshot>> {
+        let editable = {
+            let actions = self.actions.read().await;
+            let Some(action) = actions.get(name) else {
+                return Ok(None);
+            };
+            action.info.source != ActionSource::System
+        };
+        if !editable {
+            return Ok(None);
+        }
+        self.install_semantically_reviewed_action(name, content, semantic_review, force)
+            .await
+            .map(Some)
     }
 
     fn capability_acquire_required_inputs(arguments: &serde_json::Value) -> Vec<String> {
@@ -13872,44 +15677,6 @@ required:{required_block}
         )
     }
 
-    /// Preview security verdict for an action without persisting or registering it.
-    pub async fn preview_action_security(
-        &self,
-        name: &str,
-        content: &str,
-    ) -> Result<Option<crate::security::action_guard::ActionSecurityVerdict>> {
-        let guard = self.action_guard.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("Action security is unavailable, so skill preview is disabled.")
-        })?;
-        let preview_dir = self.actions_dir.join(format!(
-            ".preview-{}-{}",
-            name,
-            uuid::Uuid::new_v4().simple()
-        ));
-        tokio::fs::create_dir_all(&preview_dir).await?;
-        let action_file = Self::preferred_skill_markdown_path(&preview_dir);
-        tokio::fs::write(&action_file, content).await?;
-
-        let parsed = self
-            .parse_action_md(&action_file, ActionSource::Custom)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to parse action preview: {}", e));
-
-        let verdict = match parsed {
-            Ok((_info, workflow_content, frontmatter)) => guard
-                .evaluate_action(&preview_dir, name, &workflow_content, &frontmatter)
-                .await
-                .map(Some),
-            Err(e) => {
-                let _ = tokio::fs::remove_dir_all(&preview_dir).await;
-                return Err(e);
-            }
-        };
-
-        let _ = tokio::fs::remove_dir_all(&preview_dir).await;
-        verdict
-    }
-
     /// Delete/disable an action.
     /// - Custom actions: deleted from disk and runtime.
     /// - Bundled actions: deleted from runtime-owned bundled directories for this install.
@@ -14051,7 +15818,11 @@ required:{required_block}
 
         let user_prompt = format!(
             "Execute the workflow above. User's additional context/query: '{}'. Generate the complete output following the exact format specified in the workflow.",
-            if user_query.is_empty() { "none" } else { user_query }
+            if user_query.is_empty() {
+                "none"
+            } else {
+                user_query
+            }
         );
 
         // Step 4: Call LLM to generate the formatted output
@@ -14098,6 +15869,28 @@ required:{required_block}
             .unwrap_or_default()
     }
 
+    fn collect_sensitive_required_fields_from_schema(schema: &serde_json::Value) -> Vec<String> {
+        let required = Self::collect_required_fields_from_schema(schema);
+        let properties = schema.get("properties").and_then(|value| value.as_object());
+        required
+            .into_iter()
+            .filter(|key| {
+                properties
+                    .and_then(|items| items.get(key))
+                    .and_then(|value| value.as_object())
+                    .is_some_and(|property| {
+                        property.get("sensitive").and_then(|value| value.as_bool()) == Some(true)
+                            || property.get("writeOnly").and_then(|value| value.as_bool())
+                                == Some(true)
+                            || property
+                                .get("format")
+                                .and_then(|value| value.as_str())
+                                .is_some_and(|value| value.eq_ignore_ascii_case("password"))
+                    })
+            })
+            .collect()
+    }
+
     fn has_non_empty_argument(arguments: &serde_json::Value, key: &str) -> bool {
         let Some(value) = arguments.get(key) else {
             return false;
@@ -14132,6 +15925,7 @@ required:{required_block}
             let fallback = serde_json::json!({
                 "action": payload.action,
                 "missing": payload.missing,
+                "sensitive_missing": payload.sensitive_missing,
                 "required": payload.required,
                 "provided": payload.provided,
                 "query": payload.query
@@ -14465,9 +16259,43 @@ required:{required_block}
                         }
                     }
 
-                    let review = self
-                        .review_markdown_action(&path, &info, &workflow_content, &frontmatter)
-                        .await?;
+                    let review = if source == ActionSource::Custom {
+                        let fingerprint = crate::security::ActionGuard::compute_bundle_hash(&path)
+                            .unwrap_or_else(|_| {
+                                Self::fingerprint_text(&[&workflow_content, &frontmatter])
+                            });
+                        match self.get_action_review(&info.name).await {
+                            Some(mut stored) if stored.fingerprint == fingerprint => {
+                                if Self::has_semantic_skill_review_marker(&stored) {
+                                    stored.source_kind =
+                                        Self::action_source_label(&info.source).to_string();
+                                    stored
+                                } else {
+                                    Self::build_blocked_review(
+                                        &info.name,
+                                        Self::action_source_label(&info.source),
+                                        fingerprint,
+                                        "Custom skill review predates the semantic security layer. Re-import or update the skill before it can run.",
+                                    )
+                                }
+                            }
+                            Some(_) => Self::build_blocked_review(
+                                &info.name,
+                                Self::action_source_label(&info.source),
+                                fingerprint,
+                                "Skill files changed on disk outside the reviewed API path; re-import or update the skill to run semantic review again.",
+                            ),
+                            None => Self::build_blocked_review(
+                                &info.name,
+                                Self::action_source_label(&info.source),
+                                fingerprint,
+                                "Custom skill has no semantic security review. Re-import or update the skill before it can run.",
+                            ),
+                        }
+                    } else {
+                        self.review_markdown_action(&path, &info, &workflow_content, &frontmatter)
+                            .await?
+                    };
                     for warning in &review.warnings {
                         tracing::warn!("Action '{}': {}", info.name, warning);
                     }
@@ -14542,19 +16370,28 @@ required:{required_block}
         let mut version = "1.0.0".to_string();
         let mut frontmatter_text = String::new();
 
-        if let Some(stripped) = content.strip_prefix("---") {
-            if let Some(end_pos) = stripped.find("---") {
-                let frontmatter = &stripped[..end_pos];
-                frontmatter_text = frontmatter.to_string();
-                for line in frontmatter.lines() {
-                    let line = line.trim();
-                    if let Some(val) = line.strip_prefix("name:") {
-                        name = val.trim().trim_matches('"').to_string();
-                    } else if let Some(val) = line.strip_prefix("description:") {
-                        description = val.trim().trim_matches('"').to_string();
-                    } else if let Some(val) = line.strip_prefix("version:") {
-                        version = val.trim().trim_matches('"').to_string();
-                    }
+        if let Some((frontmatter, _rest)) = Self::split_frontmatter_block(&content) {
+            frontmatter_text = frontmatter.to_string();
+            if let Some(root) = Self::parse_frontmatter_yaml(frontmatter)
+                .and_then(|value| value.as_mapping().cloned())
+            {
+                if let Some(value) = root
+                    .get(serde_yaml::Value::String("name".to_string()))
+                    .and_then(|value| value.as_str())
+                {
+                    name = value.trim().to_string();
+                }
+                if let Some(value) = root
+                    .get(serde_yaml::Value::String("description".to_string()))
+                    .and_then(|value| value.as_str())
+                {
+                    description = value.trim().to_string();
+                }
+                if let Some(value) = root
+                    .get(serde_yaml::Value::String("version".to_string()))
+                    .and_then(|value| value.as_str())
+                {
+                    version = value.trim().to_string();
                 }
             }
         }
@@ -15504,6 +17341,7 @@ mod tests {
             disabled_actions_file: PathBuf::from("./disabled_actions.json"),
             action_reviews: tokio::sync::RwLock::new(HashMap::new()),
             action_reviews_file: PathBuf::from("./action_reviews.json"),
+            capability_run_contexts: tokio::sync::RwLock::new(HashMap::new()),
             removed_bundled_actions: tokio::sync::RwLock::new(HashSet::new()),
             removed_bundled_actions_file: PathBuf::from("./removed_bundled_actions.json"),
             actions_dir: PathBuf::from("./skills"),
@@ -15690,6 +17528,21 @@ version: "1.2.3"
             .expect("action should exist")
     }
 
+    fn trusted_chat_context(
+        capability_context_id: &str,
+        current_turn_is_explicit_approval: bool,
+    ) -> ActionAuthorizationContext {
+        ActionAuthorizationContext {
+            principal: Some(ActionCallerPrincipal::local_admin("test")),
+            surface: ActionExecutionSurface::Chat,
+            direct_user_intent: true,
+            current_turn_is_explicit_approval,
+            agent_name: None,
+            agent_access_scope: None,
+            capability_context_id: Some(capability_context_id.to_string()),
+        }
+    }
+
     #[tokio::test]
     async fn trusted_chat_allows_high_risk_builtin_actions() {
         let runtime = runtime_for_authorization_tests().await;
@@ -15706,6 +17559,7 @@ version: "1.2.3"
                     current_turn_is_explicit_approval: false,
                     agent_name: None,
                     agent_access_scope: None,
+                    capability_context_id: None,
                 },
             )
             .await
@@ -15735,6 +17589,7 @@ version: "1.2.3"
                     current_turn_is_explicit_approval: false,
                     agent_name: None,
                     agent_access_scope: None,
+                    capability_context_id: None,
                 },
             )
             .await
@@ -15760,6 +17615,7 @@ version: "1.2.3"
                     current_turn_is_explicit_approval: true,
                     agent_name: None,
                     agent_access_scope: None,
+                    capability_context_id: None,
                 },
             )
             .await
@@ -15784,6 +17640,7 @@ version: "1.2.3"
                     current_turn_is_explicit_approval: false,
                     agent_name: None,
                     agent_access_scope: None,
+                    capability_context_id: None,
                 },
             )
             .await
@@ -15808,6 +17665,7 @@ version: "1.2.3"
                     current_turn_is_explicit_approval: false,
                     agent_name: None,
                     agent_access_scope: None,
+                    capability_context_id: None,
                 },
             )
             .await
@@ -15833,6 +17691,7 @@ version: "1.2.3"
                     current_turn_is_explicit_approval: false,
                     agent_name: None,
                     agent_access_scope: None,
+                    capability_context_id: None,
                 },
             )
             .await
@@ -15857,6 +17716,7 @@ version: "1.2.3"
                     current_turn_is_explicit_approval: false,
                     agent_name: None,
                     agent_access_scope: None,
+                    capability_context_id: None,
                 },
             )
             .await
@@ -15880,11 +17740,86 @@ version: "1.2.3"
                     current_turn_is_explicit_approval: false,
                     agent_name: None,
                     agent_access_scope: None,
+                    capability_context_id: None,
                 },
             )
             .await;
 
         assert!(unapproved.is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_correlation_requires_approval_for_sensitive_read_then_external_send() {
+        let runtime = runtime_for_authorization_tests().await;
+        let memory = action_def_by_name(&runtime, "memory_lookup").await;
+        let schedule = action_def_by_name(&runtime, "schedule_task").await;
+        let context = trusted_chat_context("test-sensitive-send", false);
+
+        let read_decision = runtime
+            .authorize_action_invocation(
+                "memory_lookup",
+                Some(&memory),
+                &serde_json::json!({ "query": "saved user context" }),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert!(read_decision.allowed);
+
+        let send_decision = runtime
+            .authorize_action_invocation(
+                "schedule_task",
+                Some(&schedule),
+                &serde_json::json!({
+                    "task": "Send a summary",
+                    "at": "2026-04-18T12:00:00+05:30",
+                    "report_to": "ext.custom.ops"
+                }),
+                &context,
+            )
+            .await
+            .unwrap();
+
+        assert!(!send_decision.allowed);
+        assert!(send_decision.requires_explicit_approval);
+    }
+
+    #[tokio::test]
+    async fn runtime_correlation_allows_sensitive_send_after_explicit_approval() {
+        let runtime = runtime_for_authorization_tests().await;
+        let memory = action_def_by_name(&runtime, "memory_lookup").await;
+        let schedule = action_def_by_name(&runtime, "schedule_task").await;
+        let context = trusted_chat_context("test-sensitive-send-approved", false);
+
+        assert!(
+            runtime
+                .authorize_action_invocation(
+                    "memory_lookup",
+                    Some(&memory),
+                    &serde_json::json!({ "query": "saved user context" }),
+                    &context,
+                )
+                .await
+                .unwrap()
+                .allowed
+        );
+
+        let approved_context = trusted_chat_context("test-sensitive-send-approved", true);
+        let send_decision = runtime
+            .authorize_action_invocation(
+                "schedule_task",
+                Some(&schedule),
+                &serde_json::json!({
+                    "task": "Send a summary",
+                    "at": "2026-04-18T12:00:00+05:30",
+                    "report_to": "ext.custom.ops"
+                }),
+                &approved_context,
+            )
+            .await
+            .unwrap();
+
+        assert!(send_decision.allowed);
     }
 
     #[tokio::test]
@@ -15922,6 +17857,7 @@ version: "1.2.3"
                         channel_ids: vec!["teams".to_string()],
                         ..Default::default()
                     }),
+                    capability_context_id: None,
                 },
             )
             .await
@@ -15953,6 +17889,7 @@ version: "1.2.3"
                         ssh_connection_names: vec!["prod-box".to_string()],
                         ..Default::default()
                     }),
+                    capability_context_id: None,
                 },
             )
             .await

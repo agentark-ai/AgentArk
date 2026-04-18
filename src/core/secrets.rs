@@ -9,6 +9,30 @@
 use anyhow::Result;
 use std::path::Path;
 
+pub fn secret_command_escape_hatch_enabled() -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    std::env::var("AGENTARK_ENABLE_SECRET_CHAT_COMMANDS")
+        .or_else(|_| std::env::var("AGENTARK_ENABLE_SETSECRET_COMMAND"))
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+pub fn setsecret_command_escape_hatch_enabled() -> bool {
+    secret_command_escape_hatch_enabled()
+}
+
+pub fn setsecret_command_disabled_response() -> &'static str {
+    "Use the secure credential form in chat or Settings to save credentials."
+}
+
 fn is_env_var_style_key(key: &str) -> bool {
     !key.is_empty()
         && key.len() <= 128

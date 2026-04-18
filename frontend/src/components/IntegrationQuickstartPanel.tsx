@@ -75,7 +75,7 @@ type IntegrationQuickstartPanelProps = {
 };
 
 const INTEGRATION_SORT_ORDER: Record<string, number> = {
-  google_workspace: 0, github: 1, "1password": 2, notion: 3, jira: 4, sentry: 5, linear: 6,
+  google_workspace: 0, github: 1, moltbook: 2, "1password": 3, notion: 4, jira: 5, sentry: 6, linear: 7,
   google_analytics: 10, google_search_console: 11, garmin: 12, shopify: 13, social_analytics: 14,
   google_places: 99,
 };

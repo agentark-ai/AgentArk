@@ -151,6 +151,7 @@ struct LoadedAppSpec {
     app_dir: PathBuf,
     access_guard_enabled: bool,
     access_key: String,
+    expose_public: bool,
     is_static: bool,
     entry_command: Option<String>,
     install_command: Option<String>,
@@ -194,6 +195,30 @@ pub async fn run_service(config: ExecutorServiceConfig) -> Result<()> {
             {
                 Ok(guard) => {
                     tracing::info!("Executor action security guard initialized");
+                    let guard = match crate::core::config::SecureConfigManager::new_with_data_dir(
+                        &config.config_dir,
+                        Some(&config.data_dir),
+                    )
+                    .and_then(|manager| manager.load())
+                    {
+                        Ok(agent_config) => match crate::core::LlmClient::new(&agent_config.llm) {
+                            Ok(llm) => guard.with_semantic_reviewer(llm),
+                            Err(error) => {
+                                tracing::warn!(
+                                    "Executor semantic action reviewer unavailable: {} - user-added skills will remain blocked until a model is configured",
+                                    error
+                                );
+                                guard
+                            }
+                        },
+                        Err(error) => {
+                            tracing::warn!(
+                                "Executor semantic action reviewer unavailable: {} - user-added skills will remain blocked until settings can be loaded",
+                                error
+                            );
+                            guard
+                        }
+                    };
                     runtime.set_action_guard(Arc::new(guard));
                 }
                 Err(error) => {
@@ -507,12 +532,18 @@ async fn spawn_stack_update_job(request: &StackUpdateRequest) -> Result<()> {
     );
     let output = tokio::process::Command::new("docker")
         .args(["run", "-d", "--rm", "--name", updater_name.as_str()])
-        .args(["-e", &format!("AGENTARK_RELEASE_TAG={}", request.release_tag)])
+        .args([
+            "-e",
+            &format!("AGENTARK_RELEASE_TAG={}", request.release_tag),
+        ])
         .args([
             "-e",
             &format!("AGENTARK_RELEASE_VERSION={}", request.release_version),
         ])
-        .args(["-e", &format!("AGENTARK_RELEASE_REPO={}", request.release_repo)])
+        .args([
+            "-e",
+            &format!("AGENTARK_RELEASE_REPO={}", request.release_repo),
+        ])
         .args([
             "-e",
             &format!("AGENTARK_IMAGE_REPOSITORY={}", request.image_repository),
@@ -696,9 +727,18 @@ async fn load_spec(state: &ExecutorState, app_id: &str) -> Result<LoadedAppSpec>
         .and_then(|v| v.get("access_guard_enabled").and_then(|v| v.as_bool()))
         .or_else(|| bool_val(&meta, "access_guard_enabled"))
         .unwrap_or(false);
+    let expose_public = row
+        .as_ref()
+        .and_then(|v| v.get("expose_public").and_then(|v| v.as_bool()))
+        .or_else(|| bool_val(&meta, "expose_public"))
+        .unwrap_or(false);
     let mut access_key = row
         .as_ref()
-        .and_then(|v| v.get("access_key").and_then(|v| v.as_str()))
+        .and_then(|v| {
+            v.get("access_password")
+                .or_else(|| v.get("access_key"))
+                .and_then(|value| value.as_str())
+        })
         .map(|s| s.to_string())
         .unwrap_or_default();
     if access_key.trim().is_empty() {
@@ -717,6 +757,7 @@ async fn load_spec(state: &ExecutorState, app_id: &str) -> Result<LoadedAppSpec>
         app_dir,
         access_guard_enabled,
         access_key,
+        expose_public,
         is_static,
         entry_command: str_val(&meta, "entry_command"),
         install_command: str_val(&meta, "install_command"),
@@ -840,6 +881,7 @@ async fn start_dynamic(state: &ExecutorState, app_id: &str) -> Result<Value> {
                 port,
                 access_key: spec.access_key.clone(),
                 access_guard_enabled: spec.access_guard_enabled,
+                expose_public: spec.expose_public,
                 enabled: true,
                 last_accessed: None,
             },
@@ -865,7 +907,10 @@ async fn start_dynamic(state: &ExecutorState, app_id: &str) -> Result<Value> {
         "is_isolated_runtime": true,
         "url": format!("/internal/v1/apps/{}/proxy/", app_id),
         "access_url": format!("/internal/v1/apps/{}/proxy/", app_id),
+        "access_key": spec.access_key.clone(),
+        "access_password": spec.access_key,
         "access_guard_enabled": spec.access_guard_enabled,
+        "expose_public": spec.expose_public,
         "enabled": true
     }))
 }
@@ -885,6 +930,7 @@ async fn start_static(state: &ExecutorState, app_id: &str) -> Result<Value> {
                     is_static: true,
                     access_key: spec.access_key.clone(),
                     access_guard_enabled: spec.access_guard_enabled,
+                    expose_public: spec.expose_public,
                     enabled: true,
                     last_accessed: None,
                 },
@@ -898,7 +944,10 @@ async fn start_static(state: &ExecutorState, app_id: &str) -> Result<Value> {
         "title": spec.title,
         "url": format!("/internal/v1/apps/{}/proxy/", app_id),
         "access_url": format!("/internal/v1/apps/{}/proxy/", app_id),
+        "access_key": spec.access_key.clone(),
+        "access_password": spec.access_key,
         "access_guard_enabled": spec.access_guard_enabled,
+        "expose_public": spec.expose_public,
         "enabled": true
     }))
 }
@@ -1086,6 +1135,13 @@ async fn app_deploy(
     }
     if let Some(value) = request.access_guard {
         arguments.insert("access_guard".to_string(), json!(value));
+    }
+    if let Some(value) = request
+        .access_password
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        arguments.insert("access_password".to_string(), json!(value));
     }
     if !request.required_inputs.is_empty() {
         arguments.insert(

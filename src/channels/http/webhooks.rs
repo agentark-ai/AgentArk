@@ -815,9 +815,15 @@ and only ask for approval or missing credentials if required.\n\n",
     prompt.push_str("\n\nNormalized event summary:\n");
     prompt.push_str(event.summary.trim());
     prompt.push_str("\n\nRedacted payload excerpt:\n");
-    prompt.push_str(&clip_chars(
+    // Webhook bodies are attacker-controllable; wrap them in the untrusted
+    // envelope so the model treats their contents as data, not instructions.
+    let clipped_excerpt = clip_chars(
         event.payload_excerpt.trim(),
         WEBHOOK_PROMPT_EXCERPT_MAX_CHARS,
+    );
+    prompt.push_str(&crate::security::sanitize_untrusted_output(
+        "webhook_payload",
+        &clipped_excerpt,
     ));
     prompt
 }

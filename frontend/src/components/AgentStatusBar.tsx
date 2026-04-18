@@ -72,7 +72,9 @@ export function AgentStatusBar({
     {
       label: "Autonomy",
       value: agentPaused ? "Paused" : "Active",
-      detail: agentPaused ? "Background execution suspended" : "Background execution enabled",
+      detail: agentPaused
+        ? "Background autonomy paused; scheduled reminders still fire"
+        : "Background execution enabled",
       tone: agentPaused ? "#ffb84d" : "#74f7bf",
     },
     {

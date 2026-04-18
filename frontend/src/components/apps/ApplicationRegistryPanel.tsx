@@ -52,12 +52,12 @@ async function copyText(value: string): Promise<void> {
   throw new Error("Clipboard is not available in this browser session.");
 }
 
-function stateColor(state: string): "success" | "warning" | "error" | "default" {
+function stateDotColor(state: string): string {
   const normalized = state.trim().toLowerCase();
-  if (normalized === "running") return "success";
-  if (normalized === "failed") return "error";
-  if (normalized === "completed" || normalized === "stopped") return "warning";
-  return "default";
+  if (normalized === "running") return "rgba(74,210,157,0.85)";
+  if (normalized === "failed") return "rgba(255,100,100,0.85)";
+  if (normalized === "stopped" || normalized === "completed") return "rgba(255,191,130,0.85)";
+  return "rgba(180,200,220,0.5)";
 }
 
 export function ApplicationRegistryPanel({ autoRefresh }: { autoRefresh: boolean }) {
@@ -222,69 +222,42 @@ export function ApplicationRegistryPanel({ autoRefresh }: { autoRefresh: boolean
                 (stopMutation.isPending && stopMutation.variables?.id === id);
 
               return (
-                <Box key={id} className="action-row" sx={{ p: 1.25, borderRadius: 2, border: "1px solid var(--surface-border)" }}>
-                  <Stack spacing={1}>
-                    <Stack direction={{ xs: "column", md: "row" }} spacing={1} sx={{
-                      justifyContent: "space-between"
-                    }}>
-                      <Box sx={{ minWidth: 0 }}>
-                        <Stack
-                          direction="row"
-                          spacing={1}
-                          useFlexGap
-                          sx={{
-                            alignItems: "center",
-                            flexWrap: "wrap"
-                          }}>
-                        <Typography variant="subtitle1" sx={{
-                          fontWeight: 700
-                        }}>
-                            {label}
-                          </Typography>
-                          <Chip size="small" label="External" variant="outlined" />
-                          <Chip size="small" label={state || "idle"} color={stateColor(state)} />
-                          {currentMode ? <Chip size="small" label={currentMode} variant="outlined" /> : null}
-                          {currentModel ? <Chip size="small" label={currentModel} variant="outlined" /> : null}
-                        </Stack>
-                        <Typography variant="body2" sx={{
-                          color: "text.secondary"
-                        }}>
-                          {str(app.tagline)}
-                        </Typography>
-                        <Typography variant="caption" sx={{
-                          color: "text.secondary"
-                        }}>
-                          {str(app.description)}
-                        </Typography>
-                      </Box>
-                      <Stack
-                        direction="row"
-                        spacing={1}
-                        useFlexGap
-                        sx={{
-                          alignItems: "center",
-                          flexWrap: "wrap"
-                        }}>
-                        <Link href={str(app.docs_url)} target="_blank" rel="noreferrer" underline="hover">
-                          Docs
-                        </Link>
+                <Box key={id} sx={{ width: "100%", px: 0, py: 1.15, borderBottom: "1px solid", borderColor: "divider", transition: "background 0.15s ease", "&:hover": { background: "rgba(57, 208, 255, 0.04)" } }}>
+                  <Stack spacing={0.75}>
+                    {/* Line 1: dot + name ... status text */}
+                    <Stack direction="row" sx={{ alignItems: "center", justifyContent: "space-between", gap: 1 }}>
+                      <Stack direction="row" sx={{ alignItems: "center", gap: 1, minWidth: 0 }}>
+                        <Box sx={{ width: 7, height: 7, borderRadius: "50%", flexShrink: 0, background: stateDotColor(state) }} />
+                        <Typography variant="body2" sx={{ fontWeight: 600 }}>{label}</Typography>
+                        <Chip size="small" label="External" variant="outlined" sx={{ height: 20 }} />
+                      </Stack>
+                      <Stack direction="row" sx={{ alignItems: "center", gap: 1, flexShrink: 0 }}>
+                        <Typography variant="caption" sx={{ color: "text.secondary" }}>{state || "idle"}</Typography>
+                        {currentMode ? <Typography variant="caption" sx={{ color: "text.secondary" }}>{currentMode}</Typography> : null}
+                        {currentModel ? <Typography variant="caption" sx={{ color: "text.secondary" }}>{currentModel}</Typography> : null}
+                        <Link href={str(app.docs_url)} target="_blank" rel="noreferrer" underline="hover" sx={{ fontSize: "0.75rem" }}>Docs</Link>
                         <Tooltip title="These launchers are terminal-first tools. For the full interactive experience, copy the command into your own terminal." arrow>
-                          <Chip size="small" label="Terminal-first" variant="outlined" />
+                          <Typography variant="caption" sx={{ color: "text.secondary", cursor: "help" }}>Terminal-first</Typography>
                         </Tooltip>
                       </Stack>
                     </Stack>
 
+                    {/* Line 2: tagline / description */}
+                    {str(app.tagline) || str(app.description) ? (
+                      <Typography variant="caption" sx={{ color: "text.secondary", pl: "15px" }}>
+                        {str(app.tagline)}{str(app.tagline) && str(app.description) ? " — " : ""}{str(app.description)}
+                      </Typography>
+                    ) : null}
+
+                    {/* Line 3: aliases */}
                     {aliases.length > 0 ? (
-                      <Typography variant="caption" sx={{
-                        color: "text.secondary"
-                      }}>
+                      <Typography variant="caption" sx={{ color: "text.secondary", pl: "15px" }}>
                         Aliases: {aliases.join(", ")}
                       </Typography>
                     ) : null}
 
-                    <Stack direction={{ xs: "column", md: "row" }} spacing={1} sx={{
-                      alignItems: { xs: "stretch", md: "center" }
-                    }}>
+                    {/* Model override + action buttons */}
+                    <Stack direction={{ xs: "column", md: "row" }} spacing={1} sx={{ alignItems: { xs: "stretch", md: "center" }, pl: "15px" }}>
                       <TextField
                         fullWidth
                         size="small"
@@ -298,9 +271,7 @@ export function ApplicationRegistryPanel({ autoRefresh }: { autoRefresh: boolean
                           }))
                         }
                       />
-                      <Stack direction="row" spacing={1} useFlexGap sx={{
-                        flexWrap: "wrap"
-                      }}>
+                      <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: "wrap", flexShrink: 0 }}>
                         <Button
                           size="small"
                           variant="outlined"
@@ -402,9 +373,7 @@ export function ApplicationRegistryPanel({ autoRefresh }: { autoRefresh: boolean
                     </Stack>
 
                     {recommendedModels.length > 0 ? (
-                      <Stack direction="row" spacing={0.75} useFlexGap sx={{
-                        flexWrap: "wrap"
-                      }}>
+                      <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: "wrap", pl: "15px" }}>
                         {recommendedModels.map((model) => (
                           <Chip
                             key={`${id}-${model}`}
@@ -422,7 +391,7 @@ export function ApplicationRegistryPanel({ autoRefresh }: { autoRefresh: boolean
                       </Stack>
                     ) : null}
 
-                    <Box className="metadata-box micro-surface" sx={{ p: 1.1, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
+                    <Box className="metadata-box micro-surface" sx={{ p: 1.1, ml: "15px", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
                       <Typography className="micro-surface-kicker">Runtime</Typography>
                       <Typography className="micro-surface-title">
                         {runtimeInDocker ? "Launch commands" : "Launch command"}
@@ -481,7 +450,7 @@ export function ApplicationRegistryPanel({ autoRefresh }: { autoRefresh: boolean
                     </Box>
 
                     {currentMessage || currentCommand || currentLogs.length > 0 ? (
-                      <Box className="metadata-box micro-surface" sx={{ p: 1.1 }}>
+                      <Box className="metadata-box micro-surface" sx={{ p: 1.1, ml: "15px" }}>
                         <Stack spacing={0.6}>
                           <Box className="micro-surface-head" sx={{ mb: 0.2 }}>
                             <Typography className="micro-surface-kicker">Runtime</Typography>

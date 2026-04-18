@@ -401,10 +401,7 @@ async fn slack_api_post_message(
     let response = super::outbound_rate_limit::send_with_bounded_retries(
         "slack",
         "chat.postMessage",
-        client
-            .post(&url)
-            .bearer_auth(&config.bot_token)
-            .json(&body),
+        client.post(&url).bearer_auth(&config.bot_token).json(&body),
     )
     .await?;
 

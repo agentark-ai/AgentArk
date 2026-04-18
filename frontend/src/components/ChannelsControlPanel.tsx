@@ -128,7 +128,7 @@ export function ChannelsControlPanel({
             Channels
           </Typography>
           <Typography variant="h5" sx={{ fontWeight: 700, letterSpacing: 0 }}>
-            Gateway surface and delivery readiness
+            Channel routing and delivery readiness
           </Typography>
           <Typography
             variant="body2"
@@ -136,8 +136,7 @@ export function ChannelsControlPanel({
               color: "text.secondary",
               maxWidth: 780
             }}>
-            Keep channel connections visible, route-specific, and recoverable. This panel is meant to show the live
-            channel fabric without forcing the user into Settings.
+            Keep channel connections visible, route-specific, and recoverable without leaving the OS workspace.
           </Typography>
         </Box>
 

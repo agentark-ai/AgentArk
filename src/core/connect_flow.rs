@@ -241,9 +241,7 @@ pub fn connect_instructions(spec: &IntegrationConnectSpec) -> String {
         "Integration setup: {} (`{}`)\n\n",
         spec.name, spec.id
     ));
-    out.push_str("Send secrets using one of these safe commands:\n");
-    out.push_str("- Telegram/WhatsApp: `/setsecret KEY=VALUE`\n");
-    out.push_str("- Web chat: `/setsecret KEY=VALUE`\n\n");
+    out.push_str("Use the secure credential form in chat or Settings to save credentials.\n\n");
 
     match spec.required.kind {
         SecretRequirementKind::All => {

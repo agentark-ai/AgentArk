@@ -2,6 +2,11 @@
 
 use serde::{Deserialize, Serialize};
 
+pub const AUTONOMY_PAUSED_SINCE_KEY: &str = "autonomy_paused_since_v1";
+pub const AUTONOMY_PAUSE_NUDGE_LAST_SENT_AT_KEY: &str =
+    "autonomy_pause_nudge_last_sent_at_v1";
+pub const AUTONOMY_PAUSE_NUDGE_INTERVAL_SECS: i64 = 7 * 24 * 60 * 60;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
@@ -172,6 +177,10 @@ pub struct SentinelSettings {
     pub confidence_threshold: f32,
     #[serde(default = "default_sentinel_max_proposals_per_scan")]
     pub max_proposals_per_scan: u32,
+}
+
+pub fn autonomy_background_paused(settings: &AutonomySettings) -> bool {
+    settings.agent_paused || settings.autonomy_mode.eq_ignore_ascii_case("off")
 }
 
 fn default_autonomy_mode() -> String {

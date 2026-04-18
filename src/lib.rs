@@ -1,4 +1,4 @@
-//! AgentArk - A secure personal AI assistant for daily briefs and safe automation
+//! AgentArk - A personal AI OS for memory, agents, apps, automations, and reviewable actions
 //!
 //! Features:
 //! - Daily briefs, reminders, and channel delivery
@@ -17,6 +17,7 @@ mod clients;
 mod core;
 mod crypto;
 mod custom_apis;
+mod custom_messaging_channels;
 mod docs;
 mod executor;
 mod extension_packs;
@@ -364,11 +365,14 @@ pub async fn run() -> Result<()> {
             env!("CARGO_PKG_VERSION")
         );
         println!("║                                                           ║");
-        println!("║   A secure daily AI assistant with:                       ║");
+        println!(
+            "║   A {} with:                                  ║",
+            branding::PRODUCT_CATEGORY
+        );
+        println!("║   • Chat, memory, agents, apps, and automations          ║");
         println!("║   • Daily briefs, reminders, and follow-up               ║");
-        println!("║   • Personal memory that compounds over time             ║");
         println!("║   • Safe actions with approvals and sandboxing           ║");
-        println!("║   • Power automations when you want them                 ║");
+        println!("║   • Connected tools and companion devices                ║");
         println!("║                                                           ║");
         println!("╚═══════════════════════════════════════════════════════════╝");
         println!();

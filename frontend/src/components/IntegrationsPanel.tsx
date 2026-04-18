@@ -35,6 +35,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import { formatUiDateTime } from "../lib/dateFormat";
 import type {
+  CustomMessagingChannel,
+  IntegrationAuthManifestField,
   GatewayChannelDescriptor,
   IntegrationConfigField,
   IntegrationItem,
@@ -44,6 +46,7 @@ import type {
 import { ExtensionPacksPanel } from "./ExtensionPacksPanel";
 import { IntegrationQuickstartPanel } from "./IntegrationQuickstartPanel";
 import { IntegrationRoutingPanel } from "./IntegrationRoutingPanel";
+import { MoltbookManager } from "./MoltbookManager";
 import { PluginSdkPanel } from "./PluginSdkPanel";
 
 const REFRESH_MS = 8000;
@@ -574,6 +577,28 @@ function toBool(value: unknown): boolean {
   return false;
 }
 
+function customMessagingCredentialFields(channel?: CustomMessagingChannel | null): IntegrationAuthManifestField[] {
+  const mode = channel?.auth_manifest?.mode;
+  if (!mode || typeof mode !== "object") return [];
+  const fields = (mode as { fields?: unknown }).fields;
+  return Array.isArray(fields)
+    ? fields.filter((field): field is IntegrationAuthManifestField => isRecord(field) && typeof field.key === "string")
+    : [];
+}
+
+function authFieldInputKind(field: IntegrationAuthManifestField): "text" | "password" | "textarea" {
+  const input = field.input_type;
+  const raw =
+    typeof input === "string"
+      ? input
+      : input && typeof input === "object"
+        ? str((input as Record<string, unknown>).kind, "")
+        : "";
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === "text" || normalized === "textarea") return normalized;
+  return "password";
+}
+
 function extractAuthUrl(payload: unknown): string {
   if (typeof payload === "string") {
     const trimmed = payload.trim();
@@ -778,6 +803,7 @@ export function IntegrationsPanel({
   const showConnectorsPage = mode === "connectors";
   const shouldLoadConnectorCatalog = showCatalog || showConnectorsPage;
   const [active, setActive] = useState<IntegrationItem | null>(null);
+  const [moltbookOpen, setMoltbookOpen] = useState(false);
   const [formValues, setFormValues] = useState<Record<string, string>>({});
   const [formError, setFormError] = useState<string | null>(null);
   const [googleWorkspaceHelpOpen, setGoogleWorkspaceHelpOpen] = useState(false);
@@ -814,6 +840,10 @@ export function IntegrationsPanel({
   const [showDisabledIntegrations, setShowDisabledIntegrations] = useState(false);
   const [oauthBusyId, setOauthBusyId] = useState<string | null>(null);
   const [oauthPendingId, setOauthPendingId] = useState<string | null>(null);
+  const [customMessagingCredentialTarget, setCustomMessagingCredentialTarget] =
+    useState<CustomMessagingChannel | null>(null);
+  const [customMessagingCredentialValues, setCustomMessagingCredentialValues] =
+    useState<Record<string, string>>({});
   const [channelsDirty, setChannelsDirty] = useState(false);
   const [telegramSetupOpen, setTelegramSetupOpen] = useState(false);
   const [slackSetupOpen, setSlackSetupOpen] = useState(false);
@@ -982,6 +1012,12 @@ export function IntegrationsPanel({
     refetchInterval: autoRefresh ? REFRESH_MS : false,
     enabled: showIntegrations
   });
+  const customMessagingChannelsQ = useQuery({
+    queryKey: ["custom-messaging-channels"],
+    queryFn: api.listCustomMessagingChannels,
+    refetchInterval: autoRefresh ? REFRESH_MS : false,
+    enabled: showChannelsPage
+  });
   const senderVerificationQ = useQuery({
     queryKey: ["settings-sender-verification-inline"],
     queryFn: () => api.rawGet("/sender-verification"),
@@ -1148,9 +1184,46 @@ export function IntegrationsPanel({
       ]);
     }
   });
+  const saveCustomMessagingCredentialsMutation = useMutation({
+    mutationFn: ({ id, values }: { id: string; values: Record<string, string> }) =>
+      api.storeCustomMessagingChannelCredentials(id, values),
+    onSuccess: async () => {
+      setNotice({ kind: "success", text: "Custom channel credentials saved." });
+      setCustomMessagingCredentialTarget(null);
+      setCustomMessagingCredentialValues({});
+      await Promise.allSettled([
+        queryClient.invalidateQueries({ queryKey: ["custom-messaging-channels"] }),
+        queryClient.invalidateQueries({ queryKey: ["gateway-channels-integrations"] })
+      ]);
+    },
+    onError: (err) => setNotice({ kind: "error", text: asErrorMessage(err) })
+  });
+  const testCustomMessagingChannelMutation = useMutation({
+    mutationFn: (id: string) => api.testCustomMessagingChannel(id),
+    onSuccess: async (payload) => {
+      const detail = payload.result?.detail || "Test completed.";
+      setNotice({
+        kind: payload.result?.ok ? "success" : "error",
+        text: detail
+      });
+      await queryClient.invalidateQueries({ queryKey: ["custom-messaging-channels"] });
+    },
+    onError: (err) => setNotice({ kind: "error", text: asErrorMessage(err) })
+  });
+  const deleteCustomMessagingChannelMutation = useMutation({
+    mutationFn: (id: string) => api.deleteCustomMessagingChannel(id),
+    onSuccess: async () => {
+      setNotice({ kind: "success", text: "Custom messaging channel removed." });
+      await Promise.allSettled([
+        queryClient.invalidateQueries({ queryKey: ["custom-messaging-channels"] }),
+        queryClient.invalidateQueries({ queryKey: ["gateway-channels-integrations"] })
+      ]);
+    },
+    onError: (err) => setNotice({ kind: "error", text: asErrorMessage(err) })
+  });
 
   const integrations = shouldLoadConnectorCatalog
-    ? (integrationsQ.data?.integrations || []).filter((item) => normalizeIntegrationId(item.id) !== "moltbook")
+    ? (integrationsQ.data?.integrations || [])
     : [];
   const integrationSyncStatuses = showCatalog ? integrationSyncStatusQ.data?.statuses || [] : [];
   const integrationSyncStatusById = useMemo(
@@ -1427,6 +1500,10 @@ export function IntegrationsPanel({
     () => asRecords(asRecord(customApisQ.data).custom_apis),
     [customApisQ.data]
   );
+  const customMessagingChannels = useMemo(
+    () => customMessagingChannelsQ.data?.custom_messaging_channels || [],
+    [customMessagingChannelsQ.data]
+  );
   const pluginSummaries = useMemo(
     () => asRecords(asRecord(pluginsSummaryQ.data).plugins),
     [pluginsSummaryQ.data]
@@ -1596,6 +1673,23 @@ export function IntegrationsPanel({
     }
   }
 
+  function openCustomMessagingCredentials(channel: CustomMessagingChannel) {
+    const nextValues = Object.fromEntries(
+      customMessagingCredentialFields(channel).map((field) => [field.key, ""])
+    );
+    setCustomMessagingCredentialValues(nextValues);
+    setCustomMessagingCredentialTarget(channel);
+  }
+
+  function submitCustomMessagingCredentials() {
+    const channel = customMessagingCredentialTarget;
+    if (!channel) return;
+    saveCustomMessagingCredentialsMutation.mutate({
+      id: channel.id,
+      values: customMessagingCredentialValues
+    });
+  }
+
   const needsPendingConnectionRefresh =
     !!oauthPendingId ||
     (telegramEnabledSaved &&
@@ -1612,8 +1706,9 @@ export function IntegrationsPanel({
       const payload = parseOAuthSignalPayload(value);
       if (!payload) return;
       const targetId = normalizeIntegrationId(str(payload.integration_id ?? payload.service_id, ""));
-      if (!targetId) return;
-      const targetName = integrationDisplayName(targetId, integrations);
+      const targetName = targetId
+        ? integrationDisplayName(targetId, integrations)
+        : "Connection";
       const status = str(payload.status, "").trim().toLowerCase();
       const detail = str(payload.detail, "").trim();
       if (status === "error") {
@@ -1621,13 +1716,20 @@ export function IntegrationsPanel({
           kind: "error",
           text: detail ? `${targetName} connection failed: ${detail}` : `${targetName} connection failed.`
         });
+      } else if (detail) {
+        setNotice({
+          kind: "error",
+          text: `${targetName}: ${detail}`
+        });
       }
       try {
         window.localStorage.removeItem(OAUTH_SIGNAL_STORAGE_KEY);
       } catch {
         // Best effort.
       }
-      void refreshIntegrationState(targetId);
+      if (targetId) {
+        void refreshIntegrationState(targetId);
+      }
     };
 
     const handleStorage = (event: StorageEvent) => {
@@ -2130,6 +2232,12 @@ export function IntegrationsPanel({
     (setup) => messagingDisplayState(setup.status, setup.enabled) === "ready"
   ).length;
   const messagingAttentionCount = messagingSetups.length - messagingReadyCount;
+  const connectedMessagingSetups = messagingSetups
+    .map((setup) => ({
+      ...setup,
+      displayState: messagingDisplayState(setup.status, setup.enabled)
+    }))
+    .filter((setup) => setup.displayState === "ready");
 
   const persistChannelSettings = async (form: ChannelSettingsForm) => {
       const payload: Record<string, unknown> = {
@@ -2582,6 +2690,10 @@ export function IntegrationsPanel({
   };
 
   const openConfig = (integration: IntegrationItem) => {
+    if (normalizeIntegrationId(integration.id) === "moltbook") {
+      setMoltbookOpen(true);
+      return;
+    }
     setActive(integration);
     setFormError(null);
     const nextValues: Record<string, string> = {};
@@ -2712,8 +2824,8 @@ export function IntegrationsPanel({
       if (mcpForm.transport_type === "http") {
         if (!mcpForm.url.trim()) throw new Error("HTTP URL is required.");
         const urlLower = mcpForm.url.trim().toLowerCase();
-        if (!urlLower.startsWith("http://") && !urlLower.startsWith("https://")) {
-            throw new Error("MCP URL must start with http:// or https://");
+        if (!urlLower.startsWith("https://")) {
+            throw new Error("MCP URL must start with https://");
         }
         payload.transport = { type: "http", url: mcpForm.url.trim() };
       } else {
@@ -3209,7 +3321,7 @@ export function IntegrationsPanel({
                 : mode === "channels"
                   ? "Messaging Channels"
                   : mode === "connectors"
-                    ? "Prebuilt Connectors"
+                    ? "Integrations"
                     : mode === "messaging"
                       ? "Messaging Setup"
                       : "Integrations"}
@@ -3226,7 +3338,7 @@ export function IntegrationsPanel({
             <Typography variant="caption" sx={{
               color: "text.secondary"
             }}>
-              OAuth-based integrations for Google Workspace, GitHub, Jira, and more. Connect once, then the agent can use them in any conversation.
+              Built-in connectors and user-added custom integrations the agent can use across chat, tasks, and automation.
             </Typography>
           ) : mode === "messaging" ? (
             <>
@@ -3254,12 +3366,12 @@ export function IntegrationsPanel({
                   color: "#69e2ff"
                 }}
               >
-                These are pre-built integrations. You can always chat with the agent to build any custom integration on your own.
+                Built-in integrations and custom integrations are managed separately here.
               </Typography>
               <Typography variant="caption" sx={{
                 color: "text.secondary"
               }}>
-                Integrations are long-lived connectors (auth + config). To import skills from a URL, use the Skills tab.
+                Use built-in integrations for first-party connectors and the custom integrations panel for pack-based installs.
               </Typography>
             </>
           ) : (
@@ -3280,19 +3392,51 @@ export function IntegrationsPanel({
           {integrationsQ.error instanceof Error ? integrationsQ.error.message : "Unknown error"}
         </Alert>
       ) : null}
-      {showIntegrations && !showChannelsPage && !showConnectorsPage ? (
-        <ExtensionPacksPanel
-          mode={
-            showMessagingOnly
-              ? "messaging"
-              : "all"
-          }
-        />
+      {showCatalog ? (
+        <Accordion
+          disableGutters
+          expanded={expandedSection === "custom_integrations"}
+          onChange={(_, expanded) => setExpandedSection(expanded ? "custom_integrations" : false)}
+          sx={sectionAccordionSx}
+        >
+          <AccordionSummary expandIcon={<ExpandMoreRoundedIcon />}>
+            <Stack
+              direction={{ xs: "column", sm: "row" }}
+              spacing={1}
+              sx={{
+                justifyContent: "space-between",
+                alignItems: { xs: "flex-start", sm: "center" },
+                width: "100%"
+              }}>
+              <Box>
+                <Typography variant="subtitle2">Custom Integrations</Typography>
+                <Typography variant="caption" sx={{
+                  color: "text.secondary"
+                }}>
+                  Install, connect, and manage pack-based integrations separately from the built-in connector catalog.
+                </Typography>
+              </Box>
+              <Chip size="small" variant="outlined" label="Pack-based" sx={sectionCountChipSx} />
+            </Stack>
+          </AccordionSummary>
+          <AccordionDetails>
+            <ExtensionPacksPanel mode="integrations" />
+          </AccordionDetails>
+        </Accordion>
       ) : null}
       {showConnectorsPage ? (
         <>
+          <IntegrationQuickstartPanel
+            integrations={integrations}
+            loading={integrationsQ.isLoading || (integrationsQ.isFetching && !integrationsQ.error)}
+            loadError={integrationsQ.error instanceof Error ? integrationsQ.error.message : null}
+            autoRefresh={autoRefresh}
+            embedded
+            onConfigureIntegration={openConfig}
+          />
           {readyList.length > 0 ? (
-            <Box className="list-shell">
+            <Box className="list-shell" sx={{ mb: 1.5 }}>
+              <Stack spacing={1.25}>
               <Stack
                 direction={{ xs: "column", sm: "row" }}
                 spacing={1}
@@ -3311,122 +3455,116 @@ export function IntegrationsPanel({
                 </Box>
                 <Chip size="small" variant="outlined" label={`${readyList.length} connected`} sx={sectionCountChipSx} />
               </Stack>
-              <Grid2 container spacing={1}>
-                {readyList.map((integration) => {
-                  const cardState = integrationCardState(integration);
-                  const accent = integrationCardAccent(cardState);
-                  const dotColor = integrationCardDotColor(cardState);
-                  return (
-                    <Grid2 key={`connected-${integration.id}`} size={{ xs: 12, sm: 6, md: 4, lg: 3 }}>
-                      <Box
-                        role="button"
-                        tabIndex={0}
-                        onClick={() => {
-                          if (integration.config_fields && integration.config_fields.length > 0) {
-                            openConfig(integration);
-                          }
-                        }}
-                        onKeyDown={(e) => {
-                          if ((e.key === "Enter" || e.key === " ") && integration.config_fields && integration.config_fields.length > 0) {
-                            e.preventDefault();
-                            openConfig(integration);
-                          }
-                        }}
-                        sx={{
-                          height: "100%",
-                          p: 1.35,
-                          borderRadius: "8px",
-                          border: `1px solid ${accent.border}`,
-                          background: accent.background,
-                          cursor: "pointer",
-                          transition: "border-color 0.15s, background 0.15s, box-shadow 0.15s",
-                          "&:hover": {
-                            borderColor: accent.hoverBorder,
-                            background: accent.hoverBackground,
-                            boxShadow: "0 8px 24px rgba(0,0,0,0.18)"
-                          }
-                        }}
-                      >
-                        <Stack spacing={0.75}>
-                          <Stack
-                            direction="row"
-                            spacing={1}
-                            sx={{
-                              alignItems: "center",
-                              justifyContent: "space-between"
-                            }}>
-                            <Stack direction="row" spacing={0.75} sx={{
-                              alignItems: "center"
-                            }}>
-                              <ConnectorIcon id={integration.id} name={integration.name} />
-                              <Typography variant="subtitle2" noWrap sx={{ fontWeight: 700 }}>
-                                {integration.name}
-                              </Typography>
-                            </Stack>
-                            <Box
-                              sx={{
-                                width: 8,
-                                height: 8,
-                                borderRadius: "50%",
-                                background: dotColor,
-                                flex: "0 0 auto"
-                              }}
-                            />
-                          </Stack>
-                          <Typography
-                            variant="caption"
-                            sx={{
-                              color: "text.secondary",
-                              lineHeight: 1.45,
-                              display: "-webkit-box",
-                              WebkitLineClamp: 2,
-                              WebkitBoxOrient: "vertical",
-                              overflow: "hidden"
-                            }}>
-                            {integrationCardCopy(integration)}
-                          </Typography>
-                          <Stack
-                            direction="row"
-                            spacing={1}
-                            sx={{
-                              justifyContent: "space-between",
-                              alignItems: "center"
-                            }}>
-                            <Chip
-                              size="small"
-                              label={integrationCardLabel(cardState)}
-                              sx={{
-                                height: 20,
-                                fontSize: "0.68rem",
-                                fontWeight: 700,
-                                borderColor: accent.chipBorder,
-                                color: accent.chipColor
-                              }}
-                              variant="outlined"
-                            />
-                            <Button size="small" variant="text" sx={{ minWidth: 0 }} onClick={(e) => {
-                              e.stopPropagation();
+                <Grid2 container spacing={1}>
+                  {readyList.map((integration) => {
+                    const cardState = integrationCardState(integration);
+                    const accent = integrationCardAccent(cardState);
+                    const dotColor = integrationCardDotColor(cardState);
+                    return (
+                      <Grid2 key={`connected-${integration.id}`} size={{ xs: 12, sm: 6, md: 4, lg: 3 }}>
+                        <Box
+                          role="button"
+                          tabIndex={0}
+                          onClick={() => {
+                            if (integration.config_fields && integration.config_fields.length > 0) {
                               openConfig(integration);
-                            }}>
-                              Manage
-                            </Button>
+                            }
+                          }}
+                          onKeyDown={(e) => {
+                            if ((e.key === "Enter" || e.key === " ") && integration.config_fields && integration.config_fields.length > 0) {
+                              e.preventDefault();
+                              openConfig(integration);
+                            }
+                          }}
+                          sx={{
+                            height: "100%",
+                            p: 1.35,
+                            borderRadius: "8px",
+                            border: `1px solid ${accent.border}`,
+                            background: accent.background,
+                            cursor: "pointer",
+                            transition: "border-color 0.15s, background 0.15s, box-shadow 0.15s",
+                            "&:hover": {
+                              borderColor: accent.hoverBorder,
+                              background: accent.hoverBackground,
+                              boxShadow: "0 8px 24px rgba(0,0,0,0.18)"
+                            }
+                          }}
+                        >
+                          <Stack spacing={0.75}>
+                            <Stack
+                              direction="row"
+                              spacing={1}
+                              sx={{
+                                alignItems: "center",
+                                justifyContent: "space-between"
+                              }}>
+                              <Stack direction="row" spacing={0.75} sx={{
+                                alignItems: "center"
+                              }}>
+                                <ConnectorIcon id={integration.id} name={integration.name} />
+                                <Typography variant="subtitle2" noWrap sx={{ fontWeight: 700 }}>
+                                  {integration.name}
+                                </Typography>
+                              </Stack>
+                              <Box
+                                sx={{
+                                  width: 8,
+                                  height: 8,
+                                  borderRadius: "50%",
+                                  background: dotColor,
+                                  flex: "0 0 auto"
+                                }}
+                              />
+                            </Stack>
+                            <Typography
+                              variant="caption"
+                              sx={{
+                                color: "text.secondary",
+                                lineHeight: 1.45,
+                                display: "-webkit-box",
+                                WebkitLineClamp: 2,
+                                WebkitBoxOrient: "vertical",
+                                overflow: "hidden"
+                              }}>
+                              {integrationCardCopy(integration)}
+                            </Typography>
+                            <Stack
+                              direction="row"
+                              spacing={1}
+                              sx={{
+                                justifyContent: "space-between",
+                                alignItems: "center"
+                              }}>
+                              <Chip
+                                size="small"
+                                label={integrationCardLabel(cardState)}
+                                sx={{
+                                  height: 20,
+                                  fontSize: "0.68rem",
+                                  fontWeight: 700,
+                                  borderColor: accent.chipBorder,
+                                  color: accent.chipColor
+                                }}
+                                variant="outlined"
+                              />
+                              <Button size="small" variant="text" sx={{ minWidth: 0 }} onClick={(e) => {
+                                e.stopPropagation();
+                                openConfig(integration);
+                              }}>
+                                Manage
+                              </Button>
+                            </Stack>
                           </Stack>
-                        </Stack>
-                      </Box>
-                    </Grid2>
-                  );
-                })}
-              </Grid2>
+                        </Box>
+                      </Grid2>
+                    );
+                  })}
+                </Grid2>
+              </Stack>
             </Box>
           ) : null}
-          <IntegrationQuickstartPanel
-            integrations={integrations}
-            loading={integrationsQ.isLoading || (integrationsQ.isFetching && !integrationsQ.error)}
-            loadError={integrationsQ.error instanceof Error ? integrationsQ.error.message : null}
-            autoRefresh={autoRefresh}
-            embedded
-            onConfigureIntegration={openConfig}
-          />
+          <ExtensionPacksPanel mode="connectors" />
         </>
       ) : null}
       {showCatalog ? (
@@ -3813,72 +3951,61 @@ export function IntegrationsPanel({
       ) : null}
       {showChannelsPage ? (
         <Box className="list-shell">
-          <Typography variant="subtitle2" sx={{ mb: 1 }}>
-            Connected Channels
-          </Typography>
           {settingsQ.error ? (
             <Alert severity="error">
               Failed to load channels: {(settingsQ.error as Error)?.message || "Unknown error"}
             </Alert>
-          ) : (
-            <Table size="small" sx={{ "& td, & th": { borderColor: "rgba(112,153,201,0.12)", py: 0.75 } }}>
-              <TableHead>
-                <TableRow>
-                  <TableCell sx={{ fontWeight: 600, width: "22%" }}>Channel</TableCell>
-                  <TableCell sx={{ fontWeight: 600, width: "18%" }}>Status</TableCell>
-                  <TableCell sx={{ fontWeight: 600 }}>Details</TableCell>
-                  <TableCell sx={{ fontWeight: 600, width: "10%", textAlign: "right" }} />
-                </TableRow>
-              </TableHead>
-              <TableBody>
-                {[
-                  { name: "Telegram", enabled: telegramEnabledSaved, statusRaw: telegramConnectionStatusRaw, detail: telegramConnectionDetail || (telegramTokenConfigured ? "Token set" : "Not configured"), onSetup: () => openTelegramSetup(!channelForm.telegram_enabled), ready: telegramDeliveryReady, actionLabel: channelForm.telegram_enabled ? "Setup" : "Enable" },
-                  { name: "WhatsApp", enabled: channelForm.whatsapp_enabled, statusRaw: whatsappConnectionStatusRaw, detail: whatsappConnectionDetail || whatsappModeSummary, onSetup: () => openWhatsAppSetup(!channelForm.whatsapp_enabled), ready: messagingDisplayState(whatsappConnectionStatusRaw, channelForm.whatsapp_enabled) === "ready", actionLabel: channelForm.whatsapp_enabled ? "Setup" : "Enable" },
-                  { name: "Slack", enabled: toBool(settings.slack_enabled), statusRaw: slackConnectionStatusRaw, detail: slackConnectionDetail || "Not configured", onSetup: () => openSlackSetup(!channelForm.slack_enabled), ready: toBool(settings.slack_delivery_ready), actionLabel: channelForm.slack_enabled ? "Setup" : "Enable" },
-                  { name: "Discord", enabled: toBool(settings.discord_enabled), statusRaw: discordConnectionStatusRaw, detail: discordConnectionDetail || "Not configured", onSetup: () => openDiscordSetup(!channelForm.discord_enabled), ready: toBool(settings.discord_delivery_ready), actionLabel: channelForm.discord_enabled ? "Setup" : "Enable" },
-                  { name: "Matrix", enabled: toBool(settings.matrix_enabled), statusRaw: matrixConnectionStatusRaw, detail: matrixConnectionDetail || "Not configured", onSetup: () => openMatrixSetup(!channelForm.matrix_enabled), ready: toBool(settings.matrix_delivery_ready), actionLabel: channelForm.matrix_enabled ? "Setup" : "Enable" },
-                  { name: "Teams", enabled: toBool(settings.teams_enabled), statusRaw: teamsConnectionStatusRaw, detail: teamsConnectionDetail || "Not configured", onSetup: () => openTeamsSetup(!channelForm.teams_enabled), ready: toBool(settings.teams_delivery_ready), actionLabel: channelForm.teams_enabled ? "Setup" : "Enable" },
-                  { name: "Google Chat", enabled: toBool(settings.google_chat_enabled), statusRaw: googleChatConnectionStatusRaw, detail: googleChatConnectionDetail || "Not configured", onSetup: () => openGoogleChatSetup(!channelForm.google_chat_enabled), ready: toBool(settings.google_chat_delivery_ready), actionLabel: channelForm.google_chat_enabled ? "Setup" : "Enable" },
-                  { name: "Signal", enabled: toBool(settings.signal_enabled), statusRaw: signalConnectionStatusRaw, detail: signalConnectionDetail || "Not configured", onSetup: () => openSignalSetup(!channelForm.signal_enabled), ready: toBool(settings.signal_delivery_ready), actionLabel: channelForm.signal_enabled ? "Setup" : "Enable" },
-                  { name: "iMessage", enabled: toBool(settings.imessage_enabled), statusRaw: imessageConnectionStatusRaw, detail: imessageConnectionDetail || "Not configured", onSetup: () => openIMessageSetup(!channelForm.imessage_enabled), ready: toBool(settings.imessage_delivery_ready), actionLabel: channelForm.imessage_enabled ? "Setup" : "Enable" },
-                  { name: "LINE", enabled: toBool(settings.line_enabled), statusRaw: lineConnectionStatusRaw, detail: lineConnectionDetail || "Not configured", onSetup: () => openLineSetup(!channelForm.line_enabled), ready: toBool(settings.line_delivery_ready), actionLabel: channelForm.line_enabled ? "Setup" : "Enable" },
-                  { name: "WeChat", enabled: toBool(settings.wechat_enabled), statusRaw: wechatConnectionStatusRaw, detail: wechatConnectionDetail || "Not configured", onSetup: () => openWeChatSetup(!channelForm.wechat_enabled), ready: toBool(settings.wechat_delivery_ready), actionLabel: channelForm.wechat_enabled ? "Setup" : "Enable" },
-                  { name: "QQ", enabled: toBool(settings.qq_enabled), statusRaw: qqConnectionStatusRaw, detail: qqConnectionDetail || "Not configured", onSetup: () => openQqSetup(!channelForm.qq_enabled), ready: toBool(settings.qq_delivery_ready), actionLabel: channelForm.qq_enabled ? "Setup" : "Enable" },
-                ]
-                  .filter((ch) => ch.ready || ch.enabled)
-                  .sort((a, b) => (a.ready === b.ready ? 0 : a.ready ? -1 : 1))
-                  .map((ch) => (
-                  <TableRow key={ch.name}>
-                    <TableCell>
-                      <Stack direction="row" spacing={1} sx={{
-                        alignItems: "center"
-                      }}>
-                        <ChannelIcon name={ch.name} />
-                        <Typography variant="body2">{ch.name}</Typography>
-                      </Stack>
-                    </TableCell>
-                    <TableCell>
-                      <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.75 }}>
-                        <Box component="span" sx={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, bgcolor: ch.ready ? "rgba(74,210,157,0.85)" : ch.enabled ? "rgba(255,180,50,0.85)" : "rgba(180,200,220,0.5)" }} />
+          ) : null}
+          {connectedMessagingSetups.length > 0 ? (
+            <>
+              <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                Connected Channels
+              </Typography>
+              <Table size="small" sx={{ "& td, & th": { borderColor: "rgba(112,153,201,0.12)", py: 0.75 } }}>
+                <TableHead>
+                  <TableRow>
+                    <TableCell sx={{ fontWeight: 600, width: "22%" }}>Channel</TableCell>
+                    <TableCell sx={{ fontWeight: 600, width: "18%" }}>Status</TableCell>
+                    <TableCell sx={{ fontWeight: 600 }}>Details</TableCell>
+                    <TableCell sx={{ fontWeight: 600, width: "10%", textAlign: "right" }} />
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {connectedMessagingSetups.map((channel) => (
+                    <TableRow key={channel.id}>
+                      <TableCell>
+                        <Stack direction="row" spacing={1} sx={{
+                          alignItems: "center"
+                        }}>
+                          <ChannelIcon name={channel.name} />
+                          <Typography variant="body2">{channel.name}</Typography>
+                        </Stack>
+                      </TableCell>
+                      <TableCell>
+                        <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.75 }}>
+                          <Box component="span" sx={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, bgcolor: "rgba(74,210,157,0.85)" }} />
+                          <Typography variant="body2" noWrap sx={{
+                            color: "text.secondary"
+                          }}>{channelStatusLabel(channel.status, channel.enabled)}</Typography>
+                        </Box>
+                      </TableCell>
+                      <TableCell>
                         <Typography variant="body2" noWrap sx={{
                           color: "text.secondary"
-                        }}>{channelStatusLabel(ch.statusRaw, ch.enabled)}</Typography>
-                      </Box>
-                    </TableCell>
-                    <TableCell>
-                      <Typography variant="body2" noWrap sx={{
-                        color: "text.secondary"
-                      }}>{ch.detail}</Typography>
-                    </TableCell>
-                    <TableCell align="right">
-                      <Button size="small" variant="text" onClick={ch.onSetup} sx={{ minWidth: 0 }}>{ch.actionLabel || "Setup"}</Button>
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          )}
-          <Divider sx={{ my: 1.5, borderColor: "rgba(112,153,201,0.12)" }} />
+                        }}>{channel.detail}</Typography>
+                      </TableCell>
+                      <TableCell align="right">
+                        <Button size="small" variant="text" onClick={channel.open} sx={{ minWidth: 0 }}>
+                          {channel.actionLabel || "Setup"}
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+              <Divider sx={{ my: 1.5, borderColor: "rgba(112,153,201,0.12)" }} />
+            </>
+          ) : null}
           <Stack spacing={1.25}>
             <Box>
               <Typography variant="subtitle2">Setup Wizards</Typography>
@@ -3977,6 +4104,153 @@ export function IntegrationsPanel({
                 );
               })}
             </Grid2>
+          </Stack>
+          <Divider sx={{ my: 1.5, borderColor: "rgba(112,153,201,0.12)" }} />
+          <Stack spacing={1.25}>
+            <Stack
+              direction={{ xs: "column", sm: "row" }}
+              spacing={1}
+              sx={{ justifyContent: "space-between", alignItems: { xs: "flex-start", sm: "center" } }}
+            >
+              <Box>
+                <Typography variant="subtitle2">Custom Messaging Channels</Typography>
+                <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                  User-added delivery channels created from chat and secured through encrypted credential forms.
+                </Typography>
+              </Box>
+              <Chip size="small" label={`${customMessagingChannels.length} custom`} sx={sectionCountChipSx} />
+            </Stack>
+            {customMessagingChannels.length > 0 ? (
+              <Alert severity="info">
+                Custom messaging channels send notifications to the endpoint
+                configured for that channel. Store tokens and webhook secrets
+                only through credential fields.
+              </Alert>
+            ) : null}
+            {customMessagingChannelsQ.error ? (
+              <Alert severity="error">
+                Failed to load custom messaging channels: {asErrorMessage(customMessagingChannelsQ.error)}
+              </Alert>
+            ) : customMessagingChannelsQ.isLoading ? (
+              <Typography variant="body2" sx={{ color: "text.secondary" }}>Loading custom channels...</Typography>
+            ) : customMessagingChannels.length === 0 ? (
+              <Alert severity="info">
+                Ask AgentArk in chat to add a messaging channel from provider docs, a webhook, or an internal notification API.
+              </Alert>
+            ) : (
+              <Grid2 container spacing={1.25} sx={{ alignItems: "stretch" }}>
+                {customMessagingChannels.map((channel) => {
+                  const fields = customMessagingCredentialFields(channel);
+                  const ready = !!channel.configured;
+                  const accent = integrationCardAccent(ready ? "enabled" : "disabled");
+                  return (
+                    <Grid2 key={channel.id} size={{ xs: 12, md: 6, xl: 4 }} sx={{ display: "flex" }}>
+                      <Box
+                        sx={{
+                          width: "100%",
+                          p: 1.5,
+                          borderRadius: "8px",
+                          border: `1px solid ${accent.border}`,
+                          background: accent.background
+                        }}
+                      >
+                        <Stack spacing={1}>
+                          <Stack direction="row" spacing={1} sx={{ justifyContent: "space-between", alignItems: "center" }}>
+                            <Stack direction="row" spacing={0.75} sx={{ alignItems: "center", minWidth: 0 }}>
+                              <ChannelIcon name={channel.name || channel.id} size={22} />
+                              <Typography variant="subtitle2" noWrap sx={{ fontWeight: 700 }}>
+                                {channel.name || channel.id}
+                              </Typography>
+                            </Stack>
+                            <Chip
+                              size="small"
+                              label={ready ? "Ready" : channel.requires_auth ? "Needs credentials" : "Disabled"}
+                              variant="outlined"
+                              sx={{ height: 20, fontSize: "0.68rem", fontWeight: 700, borderColor: accent.chipBorder, color: accent.chipColor }}
+                            />
+                          </Stack>
+                          <Typography
+                            variant="caption"
+                            sx={{
+                              color: "text.secondary",
+                              lineHeight: 1.45,
+                              display: "-webkit-box",
+                              WebkitLineClamp: 2,
+                              WebkitBoxOrient: "vertical",
+                              overflow: "hidden"
+                            }}
+                          >
+                            {channel.description || channel.runtime_channel_id}
+                          </Typography>
+                          {channel.last_test_message ? (
+                            <Typography variant="caption" sx={{ color: "text.secondary" }} noWrap>
+                              Last test: {channel.last_test_message}
+                            </Typography>
+                          ) : null}
+                          <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: "wrap", justifyContent: "flex-end" }}>
+                            <Chip
+                              size="small"
+                              label="User-added"
+                              variant="outlined"
+                              sx={{ height: 20, fontSize: "0.68rem", fontWeight: 700 }}
+                            />
+                            <Chip
+                              size="small"
+                              label={channel.runtime_channel_id}
+                              variant="outlined"
+                              sx={{ height: 20, fontSize: "0.68rem", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}
+                            />
+                            {channel.docs_url ? (
+                              <Button
+                                size="small"
+                                variant="text"
+                                sx={connectorCardActionButtonSx}
+                                onClick={() => window.open(channel.docs_url || "", "_blank", "noopener,noreferrer")}
+                              >
+                                Docs
+                              </Button>
+                            ) : null}
+                            {fields.length > 0 ? (
+                              <Button
+                                size="small"
+                                variant={ready ? "outlined" : "contained"}
+                                sx={connectorCardActionButtonSx}
+                                onClick={() => openCustomMessagingCredentials(channel)}
+                              >
+                                Credentials
+                              </Button>
+                            ) : null}
+                            <Button
+                              size="small"
+                              variant="outlined"
+                              sx={connectorCardActionButtonSx}
+                              disabled={!ready || testCustomMessagingChannelMutation.isPending}
+                              onClick={() => testCustomMessagingChannelMutation.mutate(channel.id)}
+                            >
+                              Test
+                            </Button>
+                            <CardActionsMenu
+                              ariaLabel={`${channel.name || channel.id} options`}
+                              actions={[
+                                {
+                                  label: "Delete",
+                                  tone: "error",
+                                  disabled: deleteCustomMessagingChannelMutation.isPending,
+                                  onClick: () => {
+                                    if (!window.confirm(`Delete custom messaging channel '${channel.name || channel.id}'?`)) return;
+                                    deleteCustomMessagingChannelMutation.mutate(channel.id);
+                                  }
+                                }
+                              ]}
+                            />
+                          </Stack>
+                        </Stack>
+                      </Box>
+                    </Grid2>
+                  );
+                })}
+              </Grid2>
+            )}
           </Stack>
         </Box>
       ) : null}
@@ -4192,7 +4466,7 @@ export function IntegrationsPanel({
                 <Typography variant="caption" sx={{
                   color: "text.secondary"
                 }}>
-                  Connect Google Workspace, GitHub, Jira, Sentry, and other built-in integrations here. Use the dedicated Webhooks & APIs page for custom sources.
+                  Connect Google Workspace, GitHub, Jira, Sentry, and other built-in integrations here.
                 </Typography>
               </Box>
               <Chip size="small" label={`${integrations.length} available`} sx={sectionCountChipSx} />
@@ -4469,6 +4743,8 @@ export function IntegrationsPanel({
               const id = str(server.id, "");
               const warnings = asStringList(server.warnings);
               const lastError = str(server.last_error, "");
+              const tools = asRecords(server.tools);
+              const resources = asRecords(server.resources);
               return (
                 <Grid2 key={id || str(server.name, Math.random().toString())} size={{ xs: 12, md: 6 }}>
                   <Box className="list-shell" sx={{ minHeight: 0 }}>
@@ -4515,6 +4791,31 @@ export function IntegrationsPanel({
                       {lastError ? <Alert severity="error">{lastError}</Alert> : null}
                       {warnings.length > 0 ? (
                         <Alert severity="warning">{warnings.slice(0, 2).join(" ")}</Alert>
+                      ) : null}
+                      {tools.length > 0 ? (
+                        <Box sx={{ border: "1px solid", borderColor: "divider", borderRadius: 1, p: 1 }}>
+                          <Typography variant="caption" sx={{ fontWeight: 700 }}>Reviewed tools</Typography>
+                          <Stack spacing={0.75} sx={{ mt: 0.75 }}>
+                            {tools.slice(0, 4).map((tool) => (
+                              <Box key={str(tool.name)} sx={{ minWidth: 0 }}>
+                                <Typography variant="caption" sx={{ fontWeight: 650 }}>{str(tool.name)}</Typography>
+                                <Typography variant="caption" sx={{ color: "text.secondary", display: "block", overflowWrap: "anywhere" }}>
+                                  {str(tool.description, "No description")}
+                                </Typography>
+                                <Typography component="pre" variant="caption" sx={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", m: 0, color: "text.secondary" }}>
+                                  {JSON.stringify(tool.input_schema ?? {}, null, 2).slice(0, 700)}
+                                </Typography>
+                              </Box>
+                            ))}
+                          </Stack>
+                        </Box>
+                      ) : null}
+                      {resources.length > 0 ? (
+                        <Stack direction="row" useFlexGap sx={{ flexWrap: "wrap", gap: 0.5 }}>
+                          {resources.slice(0, 8).map((resource) => (
+                            <Chip key={str(resource.uri)} size="small" variant="outlined" label={`Resource: ${str(resource.name, str(resource.uri))}`} />
+                          ))}
+                        </Stack>
                       ) : null}
                       <Stack direction="row" sx={{
                         justifyContent: "flex-end"
@@ -4699,6 +5000,72 @@ export function IntegrationsPanel({
           )}
         </Box>
       ) : null}
+      <Dialog
+        open={!!customMessagingCredentialTarget}
+        onClose={() => {
+          setCustomMessagingCredentialTarget(null);
+          setCustomMessagingCredentialValues({});
+        }}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>
+          {customMessagingCredentialTarget?.name || "Custom messaging channel"} Credentials
+        </DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={1.5}>
+            <Typography variant="body2" sx={{ color: "text.secondary" }}>
+              Values are stored encrypted and are not written to chat.
+            </Typography>
+            {customMessagingCredentialTarget?.auth_manifest?.warning ? (
+              <Alert severity="info">{customMessagingCredentialTarget.auth_manifest.warning}</Alert>
+            ) : null}
+            {customMessagingCredentialFields(customMessagingCredentialTarget).map((field) => {
+              const inputKind = authFieldInputKind(field);
+              return (
+                <TextField
+                  key={field.key}
+                  fullWidth
+                  size="small"
+                  label={field.label || field.key}
+                  value={customMessagingCredentialValues[field.key] || ""}
+                  type={inputKind === "password" ? "password" : "text"}
+                  multiline={inputKind === "textarea"}
+                  minRows={inputKind === "textarea" ? 4 : undefined}
+                  placeholder={field.placeholder || ""}
+                  helperText={field.help || undefined}
+                  required={field.required !== false}
+                  onChange={(event) =>
+                    setCustomMessagingCredentialValues((current) => ({
+                      ...current,
+                      [field.key]: event.target.value
+                    }))
+                  }
+                />
+              );
+            })}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button
+            onClick={() => {
+              setCustomMessagingCredentialTarget(null);
+              setCustomMessagingCredentialValues({});
+            }}
+            sx={dialogActionButtonSx}
+          >
+            Close
+          </Button>
+          <Button
+            variant="contained"
+            onClick={submitCustomMessagingCredentials}
+            disabled={saveCustomMessagingCredentialsMutation.isPending}
+            sx={dialogActionButtonSx}
+          >
+            {saveCustomMessagingCredentialsMutation.isPending ? "Saving..." : "Save credentials"}
+          </Button>
+        </DialogActions>
+      </Dialog>
       {showIntegrations ? (
       <Dialog open={telegramSetupOpen} onClose={() => setTelegramSetupOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>Telegram Setup</DialogTitle>
@@ -6403,14 +6770,19 @@ export function IntegrationsPanel({
               </Grid2>
               {mcpForm.transport_type === "http" ? (
                 <Grid2 size={{ xs: 12 }}>
-                  <TextField
-                    fullWidth
-                    size="small"
-                    label="HTTP URL"
-                    placeholder="https://example.com/mcp"
-                    value={mcpForm.url}
-                    onChange={(e) => setMcpForm((p) => ({ ...p, url: e.target.value }))}
-                  />
+                  <Stack spacing={1}>
+                    <TextField
+                      fullWidth
+                      size="small"
+                      label="HTTPS URL"
+                      placeholder="https://example.com/mcp"
+                      value={mcpForm.url}
+                      onChange={(e) => setMcpForm((p) => ({ ...p, url: e.target.value }))}
+                    />
+                    <Alert severity="warning">
+                      HTTP MCP servers must use public HTTPS. Private hosts, localhost, metadata endpoints, and redirects are rejected.
+                    </Alert>
+                  </Stack>
                 </Grid2>
               ) : (
                 <>
@@ -6617,9 +6989,21 @@ export function IntegrationsPanel({
         </DialogActions>
       </Dialog>
       ) : null}
+      <Dialog
+        open={moltbookOpen}
+        onClose={() => setMoltbookOpen(false)}
+        maxWidth="lg"
+        fullWidth
+        slotProps={{ paper: { sx: { borderRadius: "8px", border: "1px solid var(--surface-border)", background: "var(--surface-bg-elevated)", boxShadow: "0 28px 96px rgba(0,0,0,0.5)", maxHeight: "90vh" } } }}
+      >
+        <DialogTitle sx={{ pb: 0.5, display: "flex", alignItems: "center", gap: 1.5, borderBottom: "1px solid", borderColor: "divider" }}>
+          <Typography variant="h6" sx={{ flex: 1, fontWeight: 700 }}>Moltbook</Typography>
+          <Button size="small" variant="outlined" color="secondary" onClick={() => setMoltbookOpen(false)}>Close</Button>
+        </DialogTitle>
+        <DialogContent sx={{ p: 0, overflow: "auto" }}>
+          <MoltbookManager autoRefresh={autoRefresh} />
+        </DialogContent>
+      </Dialog>
     </Stack>
   );
 }
-
-
-

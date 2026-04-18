@@ -1,8 +1,0 @@
-{
-  "action_name": "flight-pricing-analyst",
-  "bundle_hash": "4fff1978fadc90c54796b38d6118c5c3938fa990377fe72276787bdf31c94152",
-  "publisher_did": "did:key:z6MktwS4jbR4hMa49jniuUJa1zs6Ds2YGjXqWPyvg6Ad9Dg1",
-  "signature": "0db0d2d5d00e5fed99ee19096da7c015b9a6f71c30ce3ea7621c4d09b06c1f1274070002d2d6bc5fb572b18999c34c3f26483d554425cf9ccc9543fe38339902",
-  "signed_at": "2026-03-29T09:22:22.555431300Z",
-  "manifest_version": 1
-}

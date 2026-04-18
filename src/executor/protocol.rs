@@ -104,6 +104,8 @@ pub struct AppDeployRequest {
     #[serde(default)]
     pub access_guard: Option<bool>,
     #[serde(default)]
+    pub access_password: Option<String>,
+    #[serde(default)]
     pub required_inputs: Vec<serde_json::Value>,
     #[serde(default)]
     pub config_values: BTreeMap<String, String>,

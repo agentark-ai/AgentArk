@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentark.local/schemas/agentark-companion-v1.schema.json",
+  "title": "AgentArk Companion Protocol v1",
+  "type": "object",
+  "required": ["type"],
+  "additionalProperties": true,
+  "properties": {
+    "type": {
+      "type": "string",
+      "enum": [
+        "hello",
+        "pairing_claim",
+        "pairing_claim_result",
+        "auth",
+        "auth_ok",
+        "auth_error",
+        "pulse",
+        "pulse_ok",
+        "capability_report",
+        "command_dispatch",
+        "command_result",
+        "command_result_ok",
+        "error"
+      ]
+    },
+    "protocol_version": {
+      "type": "string",
+      "const": "agentark-companion-v1"
+    },
+    "session_id": {
+      "type": "string"
+    },
+    "code": {
+      "type": "string"
+    },
+    "device_id": {
+      "type": "string"
+    },
+    "device_public_key": {
+      "type": "string"
+    },
+    "auth_transport": {
+      "type": "string",
+      "const": "authorization_header"
+    },
+    "state": {
+      "type": "string",
+      "enum": ["pairing", "paired", "online", "idle", "busy", "offline", "revoked", "error"]
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9_.:-]{1,96}$"
+      },
+      "uniqueItems": true
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "command": {
+      "$ref": "#/$defs/command"
+    },
+    "command_id": {
+      "type": "string"
+    },
+    "success": {
+      "type": "boolean"
+    },
+    "result_preview": {
+      "type": "string",
+      "maxLength": 2000
+    },
+    "error": {
+      "type": "string",
+      "maxLength": 1000
+    }
+  },
+  "$defs": {
+    "command": {
+      "type": "object",
+      "required": ["id", "device_id", "capability", "action", "requested_scopes", "risk", "status"],
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "device_id": {
+          "type": "string"
+        },
+        "capability": {
+          "type": "string"
+        },
+        "action": {
+          "type": "string"
+        },
+        "arguments": {
+          "type": ["object", "array", "string", "number", "boolean", "null"]
+        },
+        "requested_scopes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "resource_scope": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "risk": {
+          "type": "string",
+          "enum": ["low", "high"]
+        },
+        "status": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

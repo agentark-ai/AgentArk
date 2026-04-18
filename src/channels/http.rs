@@ -13,14 +13,15 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         Html, IntoResponse, Response,
     },
-    routing::{any, get, post},
+    routing::{any, delete, get, post},
     Json, Router,
 };
 use chrono::{Datelike, Timelike};
 use futures::{SinkExt, StreamExt};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
@@ -38,7 +39,9 @@ mod applications;
 mod auth;
 mod auth_profiles_control;
 mod browser_profiles_control;
+mod companion_control;
 mod custom_apis;
+mod custom_messaging_channels;
 mod extension_packs;
 mod gateway_control;
 mod gateway_ops_control;
@@ -49,6 +52,7 @@ mod moltbook;
 mod nodes_control;
 mod observability;
 mod plugins;
+mod security_control;
 mod sender_verification;
 mod sentinel_panel;
 mod suggestions;
@@ -124,6 +128,8 @@ const HEADER_CONTENT_SECURITY_POLICY: HeaderName =
     HeaderName::from_static("content-security-policy");
 const HEADER_STRICT_TRANSPORT_SECURITY: HeaderName =
     HeaderName::from_static("strict-transport-security");
+const CACHE_CONTROL_FRONTEND_HTML: &str = "no-store";
+const CACHE_CONTROL_FRONTEND_ASSET: &str = "public, max-age=31536000, immutable";
 static MISSING_API_KEY_WARNED: AtomicBool = AtomicBool::new(false);
 static CHAT_SUGGESTION_SCAN_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CODEX_OAUTH_RUNTIME: OnceLock<Arc<RwLock<CodexOAuthRuntimeState>>> = OnceLock::new();
@@ -138,6 +144,16 @@ pub(crate) enum HttpServerRole {
 #[derive(Debug, Clone, Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+fn error_response(status: StatusCode, error: impl ToString) -> Response {
+    (
+        status,
+        Json(ErrorResponse {
+            error: error.to_string(),
+        }),
+    )
+        .into_response()
 }
 
 #[derive(Debug, Clone)]
@@ -447,7 +463,7 @@ impl TieredRateLimiter {
             || path.starts_with("/mcp/servers")
         {
             &self.settings_limiter
-        } else if path.starts_with("/skills") {
+        } else if path.starts_with("/skills") || path.starts_with("/custom-messaging-channels") {
             &self.action_limiter
         } else {
             &self.default_limiter
@@ -705,11 +721,7 @@ async fn spawn_codex_oauth_probe() -> std::result::Result<(), String> {
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "OpenAI device code request failed ({}): {}",
-            status, body
-        ));
+        return Err(format!("OpenAI device code request failed ({})", status));
     }
 
     let body: serde_json::Value = resp
@@ -738,10 +750,7 @@ async fn spawn_codex_oauth_probe() -> std::result::Result<(), String> {
         .unwrap_or(5);
 
     if device_auth_id.is_empty() || user_code.is_empty() {
-        return Err(format!(
-            "OpenAI returned incomplete device code response: {}",
-            body
-        ));
+        return Err("OpenAI returned incomplete device code response".to_string());
     }
 
     {
@@ -847,11 +856,11 @@ async fn spawn_codex_oauth_probe() -> std::result::Result<(), String> {
                                     }
                                 }
                                 Ok(tr) => {
-                                    let body = tr.text().await.unwrap_or_default();
+                                    let status = tr.status();
                                     let mut state = runtime_bg.write().await;
                                     state.active = false;
                                     state.last_error =
-                                        Some(format!("Token exchange failed: {}", body));
+                                        Some(format!("Token exchange failed ({})", status));
                                     return;
                                 }
                                 Err(e) => {
@@ -873,10 +882,9 @@ async fn spawn_codex_oauth_probe() -> std::result::Result<(), String> {
                 }
                 Ok(resp) => {
                     let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
                     let mut state = runtime_bg.write().await;
                     state.active = false;
-                    state.last_error = Some(format!("Poll failed ({}): {}", status, body));
+                    state.last_error = Some(format!("Poll failed ({})", status));
                     return;
                 }
                 Err(e) => {
@@ -1691,6 +1699,11 @@ async fn handle_autonomy_quick_command(
                 .list_action_scope_hints()
                 .await
                 .unwrap_or_default();
+            let delegation_user_selected_model_slot_id = agent
+                .user_selected_model_slot_id
+                .read()
+                .ok()
+                .and_then(|guard| guard.clone());
             let trace = Arc::new(RwLock::new(crate::core::ExecutionTrace {
                 id: uuid::Uuid::new_v4().to_string(),
                 message: task.clone(),
@@ -1710,7 +1723,12 @@ async fn handle_autonomy_quick_command(
                         system_prompt: &system_prompt,
                         prompt_bundle: &active_prompt_bundle,
                         specialist_prompt_bundle: &active_specialist_prompt_bundle,
+                        configured_model_slots: &agent.config.model_pool.slots,
                         model_pool: &agent.model_pool,
+                        primary_model_id: &agent.primary_model_id,
+                        user_selected_model_slot_id: delegation_user_selected_model_slot_id
+                            .as_deref(),
+                        smart_routing: agent.config.model_pool.smart_routing,
                         primary_llm: &agent.llm,
                         specialists: &specialists,
                         memories: &empty_memories,
@@ -1912,11 +1930,7 @@ impl UpdateStatusResponse {
         }
     }
 
-    fn with_apply_support(
-        mut self,
-        apply_supported: bool,
-        apply_message: Option<String>,
-    ) -> Self {
+    fn with_apply_support(mut self, apply_supported: bool, apply_message: Option<String>) -> Self {
         self.apply_supported = apply_supported;
         self.apply_message = apply_message;
         self
@@ -2057,7 +2071,9 @@ pub struct ProfileResponse {
     pub tone: Option<String>,
     pub email_format: Option<String>,
     pub preferences: Option<String>,
+    pub priority_focus: Option<String>,
     pub onboarding_complete: bool,
+    pub personalization_dismissed: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -2679,6 +2695,14 @@ pub struct SettingsUpdate {
     pub observability: Option<observability::ObservabilitySettingsUpdate>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ProfileOnboardingUpdate {
+    pub preferred_name: String,
+    pub timezone: String,
+    pub tone: String,
+    pub priority_focus: String,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DataLifecycleSettingsUpdate {
     #[serde(default)]
@@ -2727,6 +2751,10 @@ pub struct DataLifecycleSettingsUpdate {
     pub experience_item_retention_days: Option<u64>,
     #[serde(default)]
     pub procedural_pattern_retention_days: Option<u64>,
+    #[serde(default)]
+    pub recall_event_retention_days: Option<u64>,
+    #[serde(default)]
+    pub recall_test_retention_days: Option<u64>,
     #[serde(default)]
     pub housekeeping_interval_secs: Option<u64>,
     #[serde(default)]
@@ -2914,7 +2942,6 @@ struct EvolutionCanarySummary {
 struct EvolutionSettingsResponse {
     self_evolve_enabled: bool,
     learning_enabled: bool,
-    learning_local_only: bool,
     learning_model_slot: Option<String>,
     learning_queue_cap: u64,
     learning_queue: crate::storage::LearningQueueCounts,
@@ -2943,7 +2970,6 @@ struct EvolutionSettingsUpdateRequest {
     deploy_guard_default: Option<bool>,
     self_evolve_enabled: Option<bool>,
     learning_enabled: Option<bool>,
-    learning_local_only: Option<bool>,
     learning_model_slot: Option<String>,
     learning_queue_cap: Option<u64>,
 }
@@ -2992,6 +3018,55 @@ struct PromptEvolutionInsights {
     summary: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Default)]
+struct PromptTelemetrySectionSummary {
+    section: String,
+    samples: usize,
+    avg_chars: f64,
+    p50_chars: usize,
+    p95_chars: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct PromptTelemetrySummary {
+    sample_count: usize,
+    p50_final_prompt_chars: usize,
+    p95_final_prompt_chars: usize,
+    p50_tool_schema_chars: usize,
+    p95_tool_schema_chars: usize,
+    p50_estimated_total_request_chars: usize,
+    p95_estimated_total_request_chars: usize,
+    avg_tool_count: f64,
+    success_samples: usize,
+    corrected_samples: usize,
+    top_sections: Vec<PromptTelemetrySectionSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct PromptOptimizationReviewEntry {
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    reviewed_at: Option<String>,
+}
+
+type PromptOptimizationReviewState = BTreeMap<String, PromptOptimizationReviewEntry>;
+
+#[derive(Debug, Clone, Serialize)]
+struct PromptOptimizationProposal {
+    id: String,
+    title: String,
+    summary: String,
+    evidence: Vec<String>,
+    expected_benefit: Vec<String>,
+    caveats: Vec<String>,
+    risk_level: String,
+    target_scope: String,
+    review_status: String,
+    reviewed_at: Option<String>,
+    reversible: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct EvolutionDevResponse {
     canary_state: Option<crate::core::self_evolve::strategy_runtime::CanaryRolloutState>,
@@ -3026,6 +3101,10 @@ struct EvolutionDevResponse {
     recent_classifier_prompt_runs: Vec<serde_json::Value>,
     recent_specialist_prompt_runs: Vec<serde_json::Value>,
     recent_experience_runs: Vec<serde_json::Value>,
+    prompt_canary_safety_events:
+        Vec<crate::core::self_evolve::strategy_runtime::PromptProfileCanarySafetyEvent>,
+    prompt_telemetry_summary: PromptTelemetrySummary,
+    prompt_optimization_opportunities: Vec<PromptOptimizationProposal>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3055,6 +3134,7 @@ const PROMPT_REPLAY_EVAL_SAMPLE_LIMIT: u64 = 5000;
 const EVOLUTION_DEV_DEFAULT_LIMIT: u64 = 250;
 const EVOLUTION_DEV_MAX_LIMIT: u64 = 500;
 const EVOLUTION_DEV_RECENT_RUN_RESPONSE_LIMIT: usize = 250;
+const PROMPT_OPTIMIZATION_REVIEW_STATE_KEY: &str = "prompt_optimization_review_state_v1";
 const CHAT_SUGGESTION_SCAN_INTERVAL_HOURS: i64 = 12;
 const CHAT_SUGGESTION_SCAN_DEFER_MINUTES: i64 = 30;
 const CHAT_SUGGESTION_SCAN_FETCH_LIMIT: u64 = 48;
@@ -3921,6 +4001,7 @@ pub async fn serve(
         .route("/logo.svg", get(serve_logo_svg))
         .route("/logo.png", get(serve_logo_png))
         .route("/logo.jpg", get(serve_logo_jpg))
+        .route("/favicon.png", get(serve_favicon_png))
         .route("/public/proxy/raw", get(public_proxy_raw))
         .route("/health", get(health))
         .route("/readiness", get(readiness))
@@ -3948,6 +4029,7 @@ pub async fn serve(
         .route("/webhook/teams", post(teams_webhook_handler))
         // OAuth callback (public - browser redirect from Google/Meta with no auth headers)
         .route("/oauth/callback", get(integrations::oauth_callback))
+        .route("/companion/ws", get(companion_control::companion_ws))
         // Deployed apps (public - these are user-facing apps, no auth required)
         .route("/apps/{app_id}", any(serve_app_root))
         .route("/apps/{app_id}/", any(serve_app_root))
@@ -3959,6 +4041,19 @@ pub async fn serve(
         .route("/metrics", get(metrics))
         .route("/chat", post(chat))
         .route("/chat/stream", post(chat_stream))
+        .route("/chat/credential-prompt", get(get_chat_credential_prompt))
+        .route(
+            "/chat/credential-prompt/submit",
+            post(submit_chat_credential_prompt),
+        )
+        .route(
+            "/chat/credential/raw-secret/submit",
+            post(submit_chat_raw_secret),
+        )
+        .route(
+            "/chat/credential/raw-secret/reuse-model-credential",
+            post(reuse_model_credential_for_chat),
+        )
         .route("/chat/clear", post(clear_chat))
         .route("/gateway/channels", get(gateway_control::get_channels))
         .route("/gateway/ops", get(gateway_ops_control::get_overview))
@@ -3988,6 +4083,34 @@ pub async fn serve(
             "/gateway/routing/simulate",
             post(gateway_control::simulate_routing),
         )
+        .route("/companion/presets", get(companion_control::get_presets))
+        .route("/companion/protocol", get(companion_control::get_protocol))
+        .route("/companion/devices", get(companion_control::list_devices))
+        .route(
+            "/companion/pairing-sessions",
+            post(companion_control::create_pairing_session),
+        )
+        .route(
+            "/companion/pairing-sessions/{id}/approve",
+            post(companion_control::approve_pairing_session),
+        )
+        .route(
+            "/companion/devices/{id}/commands",
+            get(companion_control::list_commands).post(companion_control::create_command),
+        )
+        .route(
+            "/companion/commands/{id}/approve",
+            post(companion_control::approve_command),
+        )
+        .route(
+            "/companion/devices/{id}/revoke",
+            post(companion_control::revoke_device),
+        )
+        .route(
+            "/companion/devices/{id}/tokens/rotate",
+            post(companion_control::rotate_token),
+        )
+        .route("/companion/audit", get(companion_control::get_audit))
         .route("/nodes", get(nodes_control::list_nodes))
         .route("/nodes", post(nodes_control::create_node))
         .route(
@@ -4023,6 +4146,23 @@ pub async fn serve(
         .route(
             "/browser/profiles/{id}/sessions",
             post(browser_profiles_control::record_session),
+        )
+        .route(
+            "/security/settings",
+            get(security_control::get_security_settings)
+                .put(security_control::update_security_settings),
+        )
+        .route(
+            "/security/abuse-reviews",
+            get(security_control::list_abuse_reviews),
+        )
+        .route(
+            "/security/abuse-reviews/{source_key_hash}/approve",
+            post(security_control::approve_abuse_review),
+        )
+        .route(
+            "/security/abuse-reviews/{source_key_hash}/reject",
+            post(security_control::reject_abuse_review),
         )
         .route("/auth/profiles", get(auth_profiles_control::list_profiles))
         .route(
@@ -4286,6 +4426,11 @@ pub async fn serve(
         )
         .route("/models/discover/{provider}", get(discover_provider_models))
         .route("/profile", get(get_profile))
+        .route("/profile/onboarding", post(update_profile_onboarding))
+        .route(
+            "/profile/onboarding/dismiss",
+            post(update_profile_onboarding_dismiss),
+        )
         .route("/restart", post(restart_server))
         .route("/update", post(update_server))
         .route("/trace", get(trace::get_trace))
@@ -4328,6 +4473,22 @@ pub async fn serve(
         .route(
             "/extension-packs/{id}/connect-url",
             get(extension_packs::get_extension_pack_connect_url),
+        )
+        .route(
+            "/extension-packs/{id}/runtime/install",
+            post(extension_packs::install_extension_pack_runtime),
+        )
+        .route(
+            "/extension-packs/{id}/runtime/verify",
+            post(extension_packs::verify_extension_pack_runtime),
+        )
+        .route(
+            "/extension-packs/{id}/runtime/update",
+            post(extension_packs::update_extension_pack_runtime),
+        )
+        .route(
+            "/extension-packs/{id}/runtime/uninstall",
+            post(extension_packs::uninstall_extension_pack_runtime),
         )
         .route(
             "/extension-packs/{id}/enabled",
@@ -4418,6 +4579,24 @@ pub async fn serve(
                 .delete(custom_apis::delete_custom_api),
         )
         .route("/custom-apis/{id}/test", post(custom_apis::test_custom_api))
+        .route(
+            "/custom-messaging-channels",
+            get(custom_messaging_channels::list_custom_messaging_channels)
+                .post(custom_messaging_channels::create_custom_messaging_channel),
+        )
+        .route(
+            "/custom-messaging-channels/{id}",
+            axum::routing::put(custom_messaging_channels::update_custom_messaging_channel)
+                .delete(custom_messaging_channels::delete_custom_messaging_channel),
+        )
+        .route(
+            "/custom-messaging-channels/{id}/credentials",
+            post(custom_messaging_channels::store_custom_messaging_channel_credentials),
+        )
+        .route(
+            "/custom-messaging-channels/{id}/test",
+            post(custom_messaging_channels::test_custom_messaging_channel),
+        )
         .route(
             "/sender-verification",
             get(sender_verification::get_sender_verification),
@@ -4517,6 +4696,7 @@ pub async fn serve(
         // Memory
         .route("/memory/stats", get(memory_stats))
         .route("/memory/facts", get(list_facts))
+        .route("/channels/available", get(list_available_channels))
         .route("/memory/preferences", get(list_user_preferences))
         .route("/memory/preferences", post(upsert_user_preference))
         .route(
@@ -4539,6 +4719,52 @@ pub async fn serve(
             "/memory/knowledge/{id}",
             axum::routing::delete(delete_knowledge_item),
         )
+        // ArkMemory operations
+        .route("/arkmemory/summary", get(arkmemory_summary))
+        .route("/arkmemory/queue", get(arkmemory_queue))
+        .route(
+            "/arkmemory/queue/{id}/approve",
+            post(arkmemory_approve_queue_item),
+        )
+        .route(
+            "/arkmemory/queue/{id}/reject",
+            post(arkmemory_reject_queue_item),
+        )
+        .route("/arkmemory/ledger", get(arkmemory_ledger))
+        .route(
+            "/arkmemory/ledger/{id}/rollback",
+            post(arkmemory_rollback_ledger_event),
+        )
+        .route("/arkmemory/health", get(arkmemory_health))
+        .route("/arkmemory/health/{id}/apply", post(arkmemory_apply_health))
+        .route("/arkmemory/sources/{memory_id}", get(arkmemory_sources))
+        .route("/arkmemory/tests", get(arkmemory_tests))
+        .route("/arkmemory/tests/run", post(arkmemory_run_tests))
+        .route("/arkmemory/cleanup", get(arkmemory_cleanup))
+        .route("/arkmemory/cleanup/apply", post(arkmemory_apply_cleanup))
+        // Legacy /arkrecall route aliases retained for old browser tabs.
+        .route("/arkrecall/summary", get(arkmemory_summary))
+        .route("/arkrecall/queue", get(arkmemory_queue))
+        .route(
+            "/arkrecall/queue/{id}/approve",
+            post(arkmemory_approve_queue_item),
+        )
+        .route(
+            "/arkrecall/queue/{id}/reject",
+            post(arkmemory_reject_queue_item),
+        )
+        .route("/arkrecall/ledger", get(arkmemory_ledger))
+        .route(
+            "/arkrecall/ledger/{id}/rollback",
+            post(arkmemory_rollback_ledger_event),
+        )
+        .route("/arkrecall/health", get(arkmemory_health))
+        .route("/arkrecall/health/{id}/apply", post(arkmemory_apply_health))
+        .route("/arkrecall/sources/{memory_id}", get(arkmemory_sources))
+        .route("/arkrecall/tests", get(arkmemory_tests))
+        .route("/arkrecall/tests/run", post(arkmemory_run_tests))
+        .route("/arkrecall/cleanup", get(arkmemory_cleanup))
+        .route("/arkrecall/cleanup/apply", post(arkmemory_apply_cleanup))
         // Code execution sandbox
         .route("/code/execute", post(execute_code))
         // Hook routes
@@ -4652,6 +4878,8 @@ pub async fn serve(
         .route("/browser/sessions/{id}/claim", post(browser_claim))
         .route("/browser/sessions/{id}/release", post(browser_release))
         .route("/browser/sessions/{id}/complete", post(browser_complete))
+        .route("/browser/sessions/{id}/stop", post(browser_stop))
+        .route("/browser/sessions/{id}", delete(browser_delete))
         .route("/browser/sessions/{id}/status", get(browser_session_status))
         // WhatsApp bridge proxy (so web UI can reach the sidecar)
         .route("/api/whatsapp-bridge/status", get(whatsapp_bridge_status))
@@ -5320,6 +5548,10 @@ async fn web_ui(
             state.cookie_secure_default || auth::is_https_forwarded(&headers),
         );
     }
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(CACHE_CONTROL_FRONTEND_HTML),
+    );
     response
 }
 
@@ -5366,6 +5598,10 @@ async fn web_ui_v2(
             state.cookie_secure_default || auth::is_https_forwarded(&headers),
         );
     }
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(CACHE_CONTROL_FRONTEND_HTML),
+    );
     response
 }
 
@@ -5857,6 +6093,19 @@ fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value> {
     // --- Settings & Models ---
     add("/settings", "GET", "Get settings", "Settings");
     add("/settings", "POST", "Update settings", "Settings");
+    add("/profile", "GET", "Get onboarding profile", "Settings");
+    add(
+        "/profile/onboarding",
+        "POST",
+        "Save first-run personalization answers",
+        "Settings",
+    );
+    add(
+        "/profile/onboarding/dismiss",
+        "POST",
+        "Dismiss first-run personalization prompt",
+        "Settings",
+    );
     add(
         "/settings/google-workspace/oauth-client",
         "GET",
@@ -6063,6 +6312,48 @@ fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value> {
     );
     add("/memory/facts", "GET", "List learned facts", "Memory");
     add(
+        "/channels/available",
+        "GET",
+        "List messaging channels from every registry source (bundled + custom + extension packs)",
+        "Channels",
+    );
+    add(
+        "/custom-messaging-channels",
+        "GET",
+        "List user-added custom messaging channels",
+        "Channels",
+    );
+    add(
+        "/custom-messaging-channels",
+        "POST",
+        "Create a user-added custom messaging channel",
+        "Channels",
+    );
+    add(
+        "/custom-messaging-channels/{id}",
+        "PUT",
+        "Update a user-added custom messaging channel",
+        "Channels",
+    );
+    add(
+        "/custom-messaging-channels/{id}",
+        "DELETE",
+        "Delete a user-added custom messaging channel and its stored credentials",
+        "Channels",
+    );
+    add(
+        "/custom-messaging-channels/{id}/credentials",
+        "POST",
+        "Store encrypted credentials for a custom messaging channel",
+        "Channels",
+    );
+    add(
+        "/custom-messaging-channels/{id}/test",
+        "POST",
+        "Send a test notification through a custom messaging channel",
+        "Channels",
+    );
+    add(
         "/memory/preferences",
         "GET",
         "List user preferences",
@@ -6120,6 +6411,47 @@ fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value> {
         "Delete knowledge base item",
         "Memory",
     );
+    for (path, method, description) in [
+        ("/arkmemory/summary", "GET", "ArkMemory operations summary"),
+        ("/arkmemory/queue", "GET", "List staged memory candidates"),
+        (
+            "/arkmemory/queue/{id}/approve",
+            "POST",
+            "Approve a staged memory candidate",
+        ),
+        (
+            "/arkmemory/queue/{id}/reject",
+            "POST",
+            "Reject a staged memory candidate",
+        ),
+        ("/arkmemory/ledger", "GET", "List memory ledger events"),
+        (
+            "/arkmemory/ledger/{id}/rollback",
+            "POST",
+            "Rollback a reversible memory ledger event",
+        ),
+        ("/arkmemory/health", "GET", "List memory health findings"),
+        (
+            "/arkmemory/health/{id}/apply",
+            "POST",
+            "Apply or acknowledge a memory health finding",
+        ),
+        (
+            "/arkmemory/sources/{memory_id}",
+            "GET",
+            "Show memory source and provenance records",
+        ),
+        ("/arkmemory/tests", "GET", "List memory checks"),
+        ("/arkmemory/tests/run", "POST", "Refresh memory checks"),
+        ("/arkmemory/cleanup", "GET", "List memory cleanup findings"),
+        (
+            "/arkmemory/cleanup/apply",
+            "POST",
+            "Apply or acknowledge memory cleanup findings",
+        ),
+    ] {
+        add(path, method, description, "ArkMemory");
+    }
 
     // --- Notifications ---
     add(
@@ -6214,6 +6546,24 @@ fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value> {
     // --- Security ---
     add("/security/status", "GET", "Security status", "Security");
     add("/security/logs", "GET", "Security logs", "Security");
+    add(
+        "/security/abuse-reviews",
+        "GET",
+        "List paused or pending abuse-review sources",
+        "Security",
+    );
+    add(
+        "/security/abuse-reviews/{source_key_hash}/approve",
+        "POST",
+        "Resume an abuse-review source",
+        "Security",
+    );
+    add(
+        "/security/abuse-reviews/{source_key_hash}/reject",
+        "POST",
+        "Pause an abuse-review source",
+        "Security",
+    );
     add(
         "/security/internal-service-tokens/rotate",
         "POST",
@@ -6648,7 +6998,10 @@ async fn serve_frontend_asset(Path(path): Path<String>) -> Response {
             if let Ok(bytes) = std::fs::read(&file_path) {
                 return (
                     StatusCode::OK,
-                    [(header::CONTENT_TYPE, mime_for_asset(&path))],
+                    [
+                        (header::CONTENT_TYPE, mime_for_asset(&path)),
+                        (header::CACHE_CONTROL, CACHE_CONTROL_FRONTEND_ASSET),
+                    ],
                     bytes,
                 )
                     .into_response();
@@ -6747,6 +7100,21 @@ async fn serve_logo_jpg() -> Response {
         }
     }
     StatusCode::NOT_FOUND.into_response()
+}
+
+/// Serve favicon PNG
+async fn serve_favicon_png() -> Response {
+    for path in &[
+        "assets/favicon.png",
+        "/app/assets/favicon.png",
+        "./assets/favicon.png",
+        "../assets/favicon.png",
+    ] {
+        if let Ok(bytes) = tokio::fs::read(path).await {
+            return ([(header::CONTENT_TYPE, "image/png")], bytes).into_response();
+        }
+    }
+    serve_logo_png().await
 }
 
 /// Serve SVG logo (animated)
@@ -8720,12 +9088,24 @@ fn extract_query_param(query: Option<&str>, key: &str) -> Option<String> {
     })
 }
 
-fn strip_query_param(query: Option<&str>, key: &str) -> Option<String> {
+fn extract_query_param_any(query: Option<&str>, keys: &[&str]) -> Option<String> {
+    query.and_then(|q| {
+        url::form_urlencoded::parse(q.as_bytes()).find_map(|(k, v)| {
+            if keys.iter().any(|candidate| k == *candidate) {
+                Some(v.into_owned())
+            } else {
+                None
+            }
+        })
+    })
+}
+
+fn strip_query_params(query: Option<&str>, keys: &[&str]) -> Option<String> {
     let query = query?;
     let mut serializer = url::form_urlencoded::Serializer::new(String::new());
     let mut has_pairs = false;
     for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
-        if k == key {
+        if keys.iter().any(|candidate| k == *candidate) {
             continue;
         }
         serializer.append_pair(&k, &v);
@@ -9097,9 +9477,17 @@ async fn serve_app_file_inner(
     }
 
     let access_guard_enabled = state.app_registry.access_guard_enabled(app_id).await;
+    if state.server_role == HttpServerRole::PublicApps && !access_guard_enabled {
+        return app_public_exposure_requires_guard_page(app_id);
+    }
     let cookie_name = format!("ark_app_{}", app_id);
     let grant_from_query = if access_guard_enabled {
         extract_query_param(uri.query(), "grant")
+    } else {
+        None
+    };
+    let password_from_query = if access_guard_enabled {
+        extract_query_param_any(uri.query(), &["password", "key"])
     } else {
         None
     };
@@ -9109,12 +9497,16 @@ async fn serve_app_file_inner(
         None
     };
     let key_from_header = if access_guard_enabled {
-        headers
-            .get("x-agentark-app-key")
-            .and_then(|value| value.to_str().ok())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string)
+        ["x-agentark-app-password", "x-agentark-app-key"]
+            .iter()
+            .find_map(|header_name| {
+                headers
+                    .get(*header_name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string)
+            })
     } else {
         None
     };
@@ -9143,13 +9535,21 @@ async fn serve_app_file_inner(
             Some(key) => state.app_registry.verify_key(app_id, key).await,
             None => false,
         };
+        let password_valid = match password_from_query.as_deref() {
+            Some(password) => state.app_registry.verify_key(app_id, password).await,
+            None => false,
+        };
 
-        if !query_valid && !cookie_valid && !header_valid {
+        if !query_valid && !cookie_valid && !header_valid && !password_valid {
             return app_access_denied_page(app_id);
         }
 
-        // First successful key entry: set cookie and redirect to clean URL.
-        if query_valid && !cookie_valid && !header_valid && method == Method::GET && !is_ws_request
+        // First successful password or bootstrap entry: set cookie and redirect to a clean URL.
+        if (query_valid || password_valid)
+            && !cookie_valid
+            && !header_valid
+            && method == Method::GET
+            && !is_ws_request
         {
             if let Some(session_token) = state.app_registry.create_access_session(app_id).await {
                 let request_proto = headers
@@ -9165,7 +9565,7 @@ async fn serve_app_file_inner(
                     "{}={}; Path=/apps/{}; HttpOnly; SameSite=Lax; Max-Age=604800{}",
                     cookie_name, session_token, app_id, secure_attr
                 );
-                let clean_query = strip_query_param(uri.query(), "grant");
+                let clean_query = strip_query_params(uri.query(), &["grant", "password", "key"]);
                 let clean_url = build_app_url(app_id, path, clean_query.as_deref());
                 return Response::builder()
                     .status(StatusCode::FOUND)
@@ -9181,7 +9581,7 @@ async fn serve_app_file_inner(
 
     state.app_registry.touch(app_id).await;
     let clean_query = if access_guard_enabled {
-        strip_query_param(uri.query(), "grant")
+        strip_query_params(uri.query(), &["grant", "password", "key"])
     } else {
         uri.query().map(|q| q.to_string())
     };
@@ -9630,11 +10030,11 @@ async fn serve_app_file_inner(
     }
 }
 
-/// Access denied page for apps with invalid/missing access key
+/// Access denied page for apps with invalid/missing access password.
 fn app_access_denied_page(app_id: &str) -> Response {
     let html = format!(
         r#"<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Access Key Required</title>
+<title>AgentArk App Guard</title>
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
 body{{display:flex;justify-content:center;align-items:center;min-height:100vh;font-family:system-ui,-apple-system,sans-serif;background:#0f0f1a;color:#e0e0e0}}
@@ -9647,10 +10047,10 @@ button{{margin-top:16px;width:100%;padding:12px;border-radius:8px;border:none;ba
 button:hover{{background:#6d28d9}}
 </style></head>
 <body><div class="card">
-<h2>Access Key Required</h2>
-<p>This app is protected. Enter the access key to continue.</p>
+<h2>Access Password Required</h2>
+<p>This app is protected. Enter the access password to continue.</p>
 <form method="GET" action="/apps/{app_id}/">
-<input type="text" name="key" placeholder="Enter access key" autofocus required>
+<input type="password" name="password" placeholder="Enter access password" autocomplete="current-password" autofocus required>
 <button type="submit">Unlock</button>
 </form>
 </div></body></html>"#,
@@ -9659,11 +10059,33 @@ button:hover{{background:#6d28d9}}
     Html(html).into_response()
 }
 
+fn app_public_exposure_requires_guard_page(app_id: &str) -> Response {
+    let html = format!(
+        r#"<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Public Access Disabled</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{display:flex;justify-content:center;align-items:center;min-height:100vh;font-family:system-ui,-apple-system,sans-serif;background:#0f0f1a;color:#e0e0e0}}
+.card{{background:#1a1a2e;border:1px solid #2a2a3e;border-radius:16px;padding:40px;max-width:420px;width:90%;text-align:center}}
+h2{{margin-bottom:8px;font-size:1.4em}}
+p{{color:#888;line-height:1.5}}
+</style></head>
+<body><div class="card">
+<h2>Public Access Disabled</h2>
+<p>App <strong>{app_id}</strong> cannot be served on a public origin until App Guard is enabled with an access password.</p>
+</div></body></html>"#,
+        app_id = app_id
+    );
+    (StatusCode::FORBIDDEN, Html(html)).into_response()
+}
+
 #[derive(Debug, Deserialize)]
 struct AppAccessGuardUpdateRequest {
     enabled: bool,
     #[serde(default)]
     regenerate_key: bool,
+    #[serde(default)]
+    access_password: Option<String>,
 }
 
 /// Disable an app and stop its runtime if it has one.
@@ -9742,12 +10164,22 @@ async fn update_app_access_guard(
 
     match state
         .app_registry
-        .set_access_guard(&app_id, request.enabled, request.regenerate_key)
+        .set_access_guard(
+            &app_id,
+            request.enabled,
+            request.access_password.as_deref(),
+            request.regenerate_key,
+        )
         .await
     {
         Ok(access_key) => {
             trigger_arkpulse_after_app_change(&state, "app_access_guard_update").await;
             let access_url = app_access_url_for_state(&state, &app_id, request.enabled).await;
+            let access_password = if request.enabled {
+                access_key.clone()
+            } else {
+                String::new()
+            };
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -9755,6 +10187,7 @@ async fn update_app_access_guard(
                     "app_id": app_id,
                     "access_guard_enabled": request.enabled,
                     "access_key": if request.enabled { access_key } else { String::new() },
+                    "access_password": access_password,
                     "access_url": access_url,
                 })),
             )
@@ -9763,6 +10196,11 @@ async fn update_app_access_guard(
         Err(e) => {
             let status = if e.to_string() == "App not found" {
                 StatusCode::NOT_FOUND
+            } else if e.to_string().contains("Access password")
+                || e.to_string()
+                    .contains("Public apps must keep App Guard enabled")
+            {
+                StatusCode::BAD_REQUEST
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };
@@ -10028,7 +10466,7 @@ async fn restart_app(State(state): State<AppState>, Path(app_id): Path<String>) 
                     "required_secrets": required_secret_keys.clone(),
                     "required_env": required_secret_keys,
                     "required_config": required_config_keys,
-                    "message": "Missing required inputs. Use /setsecret KEY=VALUE for sensitive values; provide config for non-sensitive values."
+                    "message": "Missing required inputs. Use the secure credential form in chat or Settings for sensitive values; provide config for non-sensitive values."
                 })),
             )
                 .into_response();
@@ -10071,6 +10509,10 @@ async fn restart_app(State(state): State<AppState>, Path(app_id): Path<String>) 
                             port,
                             access_key: access_key.clone(),
                             access_guard_enabled,
+                            expose_public: meta
+                                .get("expose_public")
+                                .and_then(|value| value.as_bool())
+                                .unwrap_or(false),
                             enabled: true,
                             last_accessed: None,
                         },
@@ -10109,6 +10551,8 @@ async fn restart_app(State(state): State<AppState>, Path(app_id): Path<String>) 
                     "title": title,
                     "url": app_url,
                     "access_url": app_access_url,
+                    "access_key": access_key,
+                    "access_password": access_key,
                     "access_guard_enabled": access_guard_enabled,
                     "port": port,
                     "runtime_preference": runtime_preference.as_str(),
@@ -10132,6 +10576,10 @@ async fn restart_app(State(state): State<AppState>, Path(app_id): Path<String>) 
                     is_static: true,
                     access_key: access_key.clone(),
                     access_guard_enabled,
+                    expose_public: meta
+                        .get("expose_public")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false),
                     enabled: true,
                     last_accessed: None,
                 },
@@ -10148,6 +10596,8 @@ async fn restart_app(State(state): State<AppState>, Path(app_id): Path<String>) 
             "title": title,
             "url": app_url,
             "access_url": app_access_url,
+            "access_key": access_key,
+            "access_password": access_key,
             "access_guard_enabled": access_guard_enabled,
             "runtime_preference": runtime_preference.as_str(),
         }))
@@ -12447,13 +12897,9 @@ async fn delete_watcher(
 /// List active browser automation sessions
 async fn browser_list_sessions(State(state): State<AppState>) -> Json<serde_json::Value> {
     let agent = state.agent.read().await;
-    let sessions: Vec<_> = agent
-        .browser_sessions
-        .list_sessions()
-        .into_iter()
-        .map(|(id, task, status)| serde_json::json!({ "id": id, "task": task, "status": status }))
-        .collect();
-    Json(serde_json::json!({ "sessions": sessions }))
+    let sessions = agent.browser_sessions.list_session_views().await;
+    let total = sessions.len();
+    Json(serde_json::json!({ "sessions": sessions, "total": total }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -12560,6 +13006,36 @@ async fn browser_complete(
     Json(body): Json<BrowserHandoffCompleteRequest>,
 ) -> Response {
     browser_respond(State(state), axum::extract::Path(id), Json(body)).await
+}
+
+async fn browser_stop(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let agent = state.agent.read().await;
+    match agent.browser_sessions.stop_session(&id).await {
+        Ok(view) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(view).unwrap_or_default()),
+        )
+            .into_response(),
+        Err(error) => browser_session_action_error_response(error),
+    }
+}
+
+async fn browser_delete(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let agent = state.agent.read().await;
+    match agent.browser_sessions.delete_session(&id).await {
+        Ok(deleted) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "deleted": deleted })),
+        )
+            .into_response(),
+        Err(error) => browser_session_action_error_response(error),
+    }
 }
 
 /// Get agent status
@@ -13543,19 +14019,194 @@ async fn trigger_pulse(State(state): State<AppState>) -> Json<serde_json::Value>
     Json(serde_json::json!({ "status": "triggered", "message": "ArkPulse check started" }))
 }
 
+async fn load_global_user_preference_value(
+    storage: &crate::storage::Storage,
+    key: &str,
+) -> Option<String> {
+    storage
+        .get_user_preference(key, None)
+        .await
+        .ok()
+        .flatten()
+        .map(|item| item.value)
+}
+
+async fn upsert_global_user_preference_with_memory_sync(
+    storage: &crate::storage::Storage,
+    key: &str,
+    value: &str,
+    source: &str,
+) -> Result<()> {
+    let item = storage
+        .upsert_user_preference(key, value, 0.96, Some(source), None)
+        .await?;
+    crate::core::learning::sync_user_preference_to_experience_item(
+        storage,
+        &item.key,
+        &item.value,
+        item.confidence as f64,
+        source,
+    )
+    .await?;
+    Ok(())
+}
+
 /// Get user profile (for checking onboarding status)
 async fn get_profile(State(state): State<AppState>) -> Json<ProfileResponse> {
-    let profile = state.user_profile.read().await;
+    let profile = state.user_profile.read().await.clone();
+    let storage = {
+        let agent = state.agent.read().await;
+        agent.storage.clone()
+    };
+    let preferred_name = load_global_user_preference_value(&storage, "user_name").await;
+    let priority_focus =
+        load_global_user_preference_value(&storage, "assistant_priority_focus").await;
+    let onboarding_complete = profile.onboarding_complete
+        || crate::core::Agent::onboarding_profile_ready(
+            &profile,
+            preferred_name.as_deref(),
+            priority_focus.as_deref(),
+        );
+    let personalization_dismissed = profile.personalization_dismissed && !onboarding_complete;
     Json(ProfileResponse {
-        name: profile.name.clone(),
+        name: preferred_name,
         location: profile.location.clone(),
         timezone: profile.timezone.clone(),
         language: profile.language.clone(),
         tone: profile.tone.clone(),
         email_format: profile.email_format.clone(),
-        preferences: profile.preferences.clone(),
-        onboarding_complete: profile.onboarding_complete,
+        preferences: priority_focus.clone(),
+        priority_focus,
+        onboarding_complete,
+        personalization_dismissed,
     })
+}
+
+async fn update_profile_onboarding(
+    State(state): State<AppState>,
+    Json(payload): Json<ProfileOnboardingUpdate>,
+) -> Response {
+    let preferred_name = payload.preferred_name.trim();
+    let timezone = payload.timezone.trim();
+    let tone = payload.tone.trim();
+    let priority_focus = payload.priority_focus.trim();
+    if preferred_name.is_empty()
+        || timezone.is_empty()
+        || tone.is_empty()
+        || priority_focus.is_empty()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Preferred name, timezone, response style, and priority focus are required."
+                    .to_string(),
+            }),
+        )
+            .into_response();
+    }
+    if timezone.parse::<chrono_tz::Tz>().is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Invalid timezone. Use an IANA name like America/New_York".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let (storage, encrypted_storage) = {
+        let agent = state.agent.read().await;
+        (agent.storage.clone(), agent.encrypted_storage.clone())
+    };
+    for (key, value) in [
+        ("user_name", preferred_name),
+        ("user_timezone", timezone),
+        ("preferred_tone", tone),
+        ("assistant_priority_focus", priority_focus),
+    ] {
+        if let Err(error) =
+            upsert_global_user_preference_with_memory_sync(&storage, key, value, "web_onboarding")
+                .await
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to persist onboarding memory: {}", error),
+                }),
+            )
+                .into_response();
+        }
+    }
+    let profile_bytes = {
+        let mut profile = state.user_profile.write().await;
+        profile.timezone = Some(timezone.to_string());
+        profile.tone = Some(tone.to_string());
+        profile.onboarding_complete = true;
+        profile.personalization_dismissed = false;
+        match serde_json::to_vec(&*profile) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to encode profile update: {}", error),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    };
+    if let Err(error) = encrypted_storage
+        .set_encrypted("user_profile", &profile_bytes)
+        .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to persist profile update: {}", error),
+            }),
+        )
+            .into_response();
+    }
+
+    get_profile(State(state)).await.into_response()
+}
+
+async fn update_profile_onboarding_dismiss(State(state): State<AppState>) -> Response {
+    let encrypted_storage = {
+        let agent = state.agent.read().await;
+        agent.encrypted_storage.clone()
+    };
+    let profile_bytes = {
+        let mut profile = state.user_profile.write().await;
+        profile.personalization_dismissed = true;
+        match serde_json::to_vec(&*profile) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to encode profile dismissal: {}", error),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    };
+    if let Err(error) = encrypted_storage
+        .set_encrypted("user_profile", &profile_bytes)
+        .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to persist profile dismissal: {}", error),
+            }),
+        )
+            .into_response();
+    }
+
+    get_profile(State(state)).await.into_response()
 }
 
 fn conversation_not_found_response() -> Response {
@@ -13614,6 +14265,33 @@ pub(super) fn build_direct_action_auth_context(
         current_turn_is_explicit_approval: false,
         agent_name: None,
         agent_access_scope: None,
+        capability_context_id: None,
+    }
+}
+
+async fn resolve_chat_request_conversation_id(
+    state: &AppState,
+    channel: &str,
+    conversation_id: Option<&str>,
+    project_id: Option<&str>,
+    message: &str,
+) -> std::result::Result<String, Response> {
+    let agent = state.agent.read().await;
+    match agent
+        .ensure_conversation_id_for_request(channel, conversation_id, project_id, message)
+        .await
+    {
+        Ok(conversation_id) => Ok(conversation_id),
+        Err(error) if error.to_string() == "Conversation not found" => {
+            Err(conversation_not_found_response())
+        }
+        Err(error) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to resolve conversation: {}", error),
+            }),
+        )
+            .into_response()),
     }
 }
 
@@ -13624,9 +14302,24 @@ async fn chat(
     ConnectInfo(_addr): ConnectInfo<SocketAddr>,
     Json(request): Json<ChatRequest>,
 ) -> Response {
+    let mut request = request;
     if let Some(response) = validate_chat_message_size(&request.message) {
         return response;
     }
+
+    let resolved_conversation_id = match resolve_chat_request_conversation_id(
+        &state,
+        &request.channel,
+        request.conversation_id.as_deref(),
+        request.project_id.as_deref(),
+        &request.message,
+    )
+    .await
+    {
+        Ok(conversation_id) => conversation_id,
+        Err(response) => return response,
+    };
+    request.conversation_id = Some(resolved_conversation_id);
 
     tracing::info!(
         "HTTP /chat request: channel={}, msg={}chars, conv_id={:?}, project={:?}",
@@ -13636,63 +14329,49 @@ async fn chat(
         request.project_id.as_deref().unwrap_or("-"),
     );
 
-    if let Some(conversation_id) = request
-        .conversation_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        let agent = state.agent.read().await;
-        match agent.storage.get_conversation(conversation_id).await {
-            Ok(Some(_)) => {}
-            Ok(None) => return conversation_not_found_response(),
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("Failed to load conversation: {}", error),
-                    }),
-                )
-                    .into_response();
-            }
-        }
-    }
-
-    // Two-tier secrets UX: allow "/setsecret KEY=VALUE" without engaging the LLM.
-    // This bypasses conversation history + traces, and stores the value encrypted in secrets.enc.
+    // Internal escape hatch only. The product UX is the secure credential form.
     if let Some((key, value)) = parse_set_secret_command(&request.message) {
-        let cid = request.conversation_id.clone();
-        let (config_dir, data_dir) = {
-            let agent = state.agent.read().await;
-            (agent.config_dir.clone(), agent.data_dir.clone())
-        };
-        if let Err(e) =
-            crate::core::secrets::store_user_secret(&config_dir, Some(&data_dir), &key, &value)
-        {
+        if !crate::core::secrets::setsecret_command_escape_hatch_enabled() {
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("Failed to store secret: {}", e),
+                StatusCode::OK,
+                Json(ChatResponse {
+                    response: crate::core::secrets::setsecret_command_disabled_response()
+                        .to_string(),
+                    proof_id: None,
+                    conversation_id: request.conversation_id.clone(),
+                    conversation_title: None,
+                    run_id: None,
+                    run_status: None,
+                    trace_id: None,
+                    total_tokens: 0,
+                    degradation: Vec::new(),
+                    attempted_models: Vec::new(),
+                    user_outcome: None,
                 }),
             )
                 .into_response();
         }
-
-        let followup = if let Some(ref cid_str) = cid {
+        let cid = request.conversation_id.clone();
+        let mut values = BTreeMap::new();
+        values.insert(key.clone(), value);
+        let response = {
             let agent = state.agent.read().await;
-            agent.on_secret_saved_followup(cid_str).await
-        } else {
-            None
+            match agent
+                .submit_chat_credential_values(cid.as_deref(), &values)
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: error.to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+            }
         };
-
-        let mut response = format!(
-            "Saved secret '{}' (stored encrypted). This value was not sent to the LLM.",
-            key
-        );
-        if let Some(f) = followup {
-            response.push_str("\n\n");
-            response.push_str(&f);
-        }
 
         return (
             StatusCode::OK,
@@ -13713,8 +14392,54 @@ async fn chat(
             .into_response();
     }
 
+    if let Some(response) = chat_secret_prompt_block_message(
+        &state,
+        request.conversation_id.as_deref(),
+        &request.message,
+    )
+    .await
+    {
+        return (
+            StatusCode::OK,
+            Json(ChatResponse {
+                response,
+                proof_id: None,
+                conversation_id: request.conversation_id.clone(),
+                conversation_title: None,
+                run_id: None,
+                run_status: None,
+                trace_id: None,
+                total_tokens: 0,
+                degradation: Vec::new(),
+                attempted_models: Vec::new(),
+                user_outcome: None,
+            }),
+        )
+            .into_response();
+    }
+
     // Human-in-the-loop shortcut: reuse currently configured model key without sending to the LLM.
     if let Some(key) = crate::core::secrets::parse_use_current_llm_key_command(&request.message) {
+        if !crate::core::secrets::secret_command_escape_hatch_enabled() {
+            return (
+                StatusCode::OK,
+                Json(ChatResponse {
+                    response: crate::core::secrets::setsecret_command_disabled_response()
+                        .to_string(),
+                    proof_id: None,
+                    conversation_id: request.conversation_id.clone(),
+                    conversation_title: None,
+                    run_id: None,
+                    run_status: None,
+                    trace_id: None,
+                    total_tokens: 0,
+                    degradation: Vec::new(),
+                    attempted_models: Vec::new(),
+                    user_outcome: None,
+                }),
+            )
+                .into_response();
+        }
         let cid = request.conversation_id.clone();
         let (config_dir, data_dir, llm_env) = {
             let agent = state.agent.read().await;
@@ -14767,9 +15492,8 @@ struct ChatStreamRunRequest {
 }
 
 fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) -> Response {
-    let (tx, rx) = tokio::sync::mpsc::channel::<
-        std::result::Result<Event, std::convert::Infallible>,
-    >(64);
+    let (tx, rx) =
+        tokio::sync::mpsc::channel::<std::result::Result<Event, std::convert::Infallible>>(64);
     // Per-request trace so concurrent requests cannot clobber each other.
     let trace_ref = Arc::new(RwLock::new(ExecutionTrace::default()));
     let agent_ref = state.agent.clone();
@@ -14987,7 +15711,8 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                 "title": "Request received",
                 "detail": "Preparing model call and tool plan...",
                 "step_type": "thinking",
-                "data": null
+                "data": null,
+                "conversation_id": conversation_id.clone(),
             })
             .to_string(),
         );
@@ -15654,9 +16379,24 @@ async fn chat_stream(
     ConnectInfo(_addr): ConnectInfo<SocketAddr>,
     Json(request): Json<ChatRequest>,
 ) -> Response {
+    let mut request = request;
     if let Some(response) = validate_chat_message_size(&request.message) {
         return response;
     }
+
+    let resolved_conversation_id = match resolve_chat_request_conversation_id(
+        &state,
+        &request.channel,
+        request.conversation_id.as_deref(),
+        request.project_id.as_deref(),
+        &request.message,
+    )
+    .await
+    {
+        Ok(conversation_id) => conversation_id,
+        Err(response) => return response,
+    };
+    request.conversation_id = Some(resolved_conversation_id);
 
     tracing::info!(
         "HTTP /chat/stream request: channel={}, msg={}chars, conv_id={:?}",
@@ -15665,66 +16405,51 @@ async fn chat_stream(
         request.conversation_id.as_deref().unwrap_or("-"),
     );
 
-    if let Some(conversation_id) = request
-        .conversation_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        let agent = state.agent.read().await;
-        match agent.storage.get_conversation(conversation_id).await {
-            Ok(Some(_)) => {}
-            Ok(None) => return conversation_not_found_response(),
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("Failed to load conversation: {}", error),
-                    }),
-                )
-                    .into_response();
-            }
-        }
-    }
-
-    // Two-tier secrets UX: allow "/setsecret KEY=VALUE" without engaging the LLM.
+    // Internal escape hatch only. The product UX is the secure credential form.
     if let Some((key, value)) = parse_set_secret_command(&request.message) {
-        let cid = request.conversation_id.clone();
-        let (config_dir, data_dir) = {
-            let agent = state.agent.read().await;
-            (agent.config_dir.clone(), agent.data_dir.clone())
-        };
-        let stored =
-            crate::core::secrets::store_user_secret(&config_dir, Some(&data_dir), &key, &value);
-        let followup = if stored.is_ok() {
-            if let Some(ref cid_str) = cid {
-                let agent = state.agent.read().await;
-                agent.on_secret_saved_followup(cid_str).await
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let mut content = format!(
-            "Saved secret '{}' (stored encrypted). This value was not sent to the LLM.",
-            key
-        );
-        if let Some(f) = followup {
-            content.push_str("\n\n");
-            content.push_str(&f);
+        if !crate::core::secrets::setsecret_command_escape_hatch_enabled() {
+            let payload = serde_json::json!({
+                "content": crate::core::secrets::setsecret_command_disabled_response(),
+                "conversation_id": request.conversation_id,
+            });
+            let (tx, rx) = tokio::sync::mpsc::channel::<
+                std::result::Result<Event, std::convert::Infallible>,
+            >(4);
+            crate::spawn_logged!("src/channels/http.rs:setsecret_disabled", async move {
+                let _ = tx
+                    .send(Ok(Event::default()
+                        .event("content")
+                        .data(payload.to_string())))
+                    .await;
+                let _ = tx.send(Ok(Event::default().event("done").data("{}"))).await;
+            });
+            return Sse::new(cap_sse_lifetime(
+                tokio_stream::wrappers::ReceiverStream::new(rx),
+            ))
+            .keep_alive(KeepAlive::default())
+            .into_response();
         }
-        let payload = match stored {
-            Ok(_) => serde_json::json!({
-                "content": content,
-                "conversation_id": cid,
-            }),
-            Err(e) => serde_json::json!({ "error": format!("Failed to store secret: {}", e) }),
+        let cid = request.conversation_id.clone();
+        let mut values = BTreeMap::new();
+        values.insert(key.clone(), value);
+        let payload = {
+            let agent = state.agent.read().await;
+            match agent
+                .submit_chat_credential_values(cid.as_deref(), &values)
+                .await
+            {
+                Ok(content) => serde_json::json!({
+                    "content": content,
+                    "conversation_id": cid,
+                }),
+                Err(error) => {
+                    serde_json::json!({ "error": error.to_string() })
+                }
+            }
         };
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<
-            std::result::Result<Event, std::convert::Infallible>,
-        >(4);
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<std::result::Result<Event, std::convert::Infallible>>(4);
         crate::spawn_logged!("src/channels/http.rs:15726", async move {
             let event_name = if payload.get("error").is_some() {
                 "error"
@@ -15739,13 +16464,68 @@ async fn chat_stream(
             let _ = tx.send(Ok(Event::default().event("done").data("{}"))).await;
         });
 
-        return Sse::new(cap_sse_lifetime(tokio_stream::wrappers::ReceiverStream::new(rx)))
-            .keep_alive(KeepAlive::default())
-            .into_response();
+        return Sse::new(cap_sse_lifetime(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ))
+        .keep_alive(KeepAlive::default())
+        .into_response();
+    }
+
+    if let Some(content) = chat_secret_prompt_block_message(
+        &state,
+        request.conversation_id.as_deref(),
+        &request.message,
+    )
+    .await
+    {
+        let payload = serde_json::json!({
+            "content": content,
+            "conversation_id": request.conversation_id,
+        });
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<std::result::Result<Event, std::convert::Infallible>>(4);
+        crate::spawn_logged!(
+            "src/channels/http.rs:chat_secret_prompt_guard",
+            async move {
+                let _ = tx
+                    .send(Ok(Event::default()
+                        .event("content")
+                        .data(payload.to_string())))
+                    .await;
+                let _ = tx.send(Ok(Event::default().event("done").data("{}"))).await;
+            }
+        );
+        return Sse::new(cap_sse_lifetime(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ))
+        .keep_alive(KeepAlive::default())
+        .into_response();
     }
 
     // Human-in-the-loop shortcut: reuse currently configured model key without sending to the LLM.
     if let Some(key) = crate::core::secrets::parse_use_current_llm_key_command(&request.message) {
+        if !crate::core::secrets::secret_command_escape_hatch_enabled() {
+            let payload = serde_json::json!({
+                "content": crate::core::secrets::setsecret_command_disabled_response(),
+                "conversation_id": request.conversation_id,
+            });
+            let (tx, rx) = tokio::sync::mpsc::channel::<
+                std::result::Result<Event, std::convert::Infallible>,
+            >(4);
+            crate::spawn_logged!("src/channels/http.rs:secret_command_disabled", async move {
+                let _ = tx
+                    .send(Ok(Event::default()
+                        .event("content")
+                        .data(payload.to_string())))
+                    .await;
+                let _ = tx.send(Ok(Event::default().event("done").data("{}"))).await;
+            });
+            return Sse::new(cap_sse_lifetime(
+                tokio_stream::wrappers::ReceiverStream::new(rx),
+            ))
+            .keep_alive(KeepAlive::default())
+            .into_response();
+        }
         let cid = request.conversation_id.clone();
         let (config_dir, data_dir, llm_env) = {
             let agent = state.agent.read().await;
@@ -15817,9 +16597,8 @@ async fn chat_stream(
             })
         };
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<
-            std::result::Result<Event, std::convert::Infallible>,
-        >(4);
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<std::result::Result<Event, std::convert::Infallible>>(4);
         crate::spawn_logged!("src/channels/http.rs:15821", async move {
             let event_name = if payload.get("error").is_some() {
                 "error"
@@ -15834,9 +16613,11 @@ async fn chat_stream(
             let _ = tx.send(Ok(Event::default().event("done").data("{}"))).await;
         });
 
-        return Sse::new(cap_sse_lifetime(tokio_stream::wrappers::ReceiverStream::new(rx)))
-            .keep_alive(KeepAlive::default())
-            .into_response();
+        return Sse::new(cap_sse_lifetime(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ))
+        .keep_alive(KeepAlive::default())
+        .into_response();
     }
 
     // Fast command path: push-notification controls without LLM roundtrip.
@@ -15850,9 +16631,8 @@ async fn chat_stream(
             Err(error) => serde_json::json!({ "error": error }),
         };
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<
-            std::result::Result<Event, std::convert::Infallible>,
-        >(4);
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<std::result::Result<Event, std::convert::Infallible>>(4);
         crate::spawn_logged!("src/channels/http.rs:15854", async move {
             let event_name = if payload.get("error").is_some() {
                 "error"
@@ -15867,9 +16647,11 @@ async fn chat_stream(
             let _ = tx.send(Ok(Event::default().event("done").data("{}"))).await;
         });
 
-        return Sse::new(cap_sse_lifetime(tokio_stream::wrappers::ReceiverStream::new(rx)))
-            .keep_alive(KeepAlive::default())
-            .into_response();
+        return Sse::new(cap_sse_lifetime(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ))
+        .keep_alive(KeepAlive::default())
+        .into_response();
     }
 
     // Fast command path: tunnel control without LLM roundtrip.
@@ -15883,9 +16665,8 @@ async fn chat_stream(
             Err(error) => serde_json::json!({ "error": error }),
         };
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<
-            std::result::Result<Event, std::convert::Infallible>,
-        >(4);
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<std::result::Result<Event, std::convert::Infallible>>(4);
         crate::spawn_logged!("src/channels/http.rs:15887", async move {
             let event_name = if payload.get("error").is_some() {
                 "error"
@@ -15900,9 +16681,11 @@ async fn chat_stream(
             let _ = tx.send(Ok(Event::default().event("done").data("{}"))).await;
         });
 
-        return Sse::new(cap_sse_lifetime(tokio_stream::wrappers::ReceiverStream::new(rx)))
-            .keep_alive(KeepAlive::default())
-            .into_response();
+        return Sse::new(cap_sse_lifetime(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ))
+        .keep_alive(KeepAlive::default())
+        .into_response();
     }
 
     // Fast command path: explicit autonomy helpers without LLM roundtrip.
@@ -15916,9 +16699,8 @@ async fn chat_stream(
             Err(error) => serde_json::json!({ "error": error }),
         };
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<
-            std::result::Result<Event, std::convert::Infallible>,
-        >(4);
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<std::result::Result<Event, std::convert::Infallible>>(4);
         crate::spawn_logged!("src/channels/http.rs:15920", async move {
             let event_name = if payload.get("error").is_some() {
                 "error"
@@ -15933,9 +16715,11 @@ async fn chat_stream(
             let _ = tx.send(Ok(Event::default().event("done").data("{}"))).await;
         });
 
-        return Sse::new(cap_sse_lifetime(tokio_stream::wrappers::ReceiverStream::new(rx)))
-            .keep_alive(KeepAlive::default())
-            .into_response();
+        return Sse::new(cap_sse_lifetime(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ))
+        .keep_alive(KeepAlive::default())
+        .into_response();
     }
 
     spawn_chat_stream_response(
@@ -16153,17 +16937,8 @@ fn watcher_background_session_id(watcher: &crate::core::watcher::Watcher) -> Opt
     crate::core::background_session_id_from_automation(&watcher.poll_arguments)
 }
 
-fn task_has_schedule(task: &Task) -> bool {
-    task.scheduled_for.is_some()
-        || task
-            .cron
-            .as_deref()
-            .map(|value| !value.trim().is_empty())
-            .unwrap_or(false)
-}
-
 fn task_is_reminder(task: &Task) -> bool {
-    task.action.eq_ignore_ascii_case("notify_user") && task_has_schedule(task)
+    crate::core::task_is_scheduled_reminder(task)
 }
 
 fn task_kind(task: &Task) -> &'static str {
@@ -16188,7 +16963,7 @@ fn task_kind_label(task: &Task) -> &'static str {
 }
 
 fn task_is_trivial_one_shot_reminder(task: &Task) -> bool {
-    task_is_reminder(task) && task.cron.is_none() && task.scheduled_for.is_some()
+    crate::core::task_is_one_shot_scheduled_reminder(task)
 }
 
 fn collect_background_session_counts(
@@ -19078,7 +19853,7 @@ fn choose_briefing_goal_candidate(tasks: &[Task]) -> Option<BriefingGoalCandidat
 }
 
 fn autonomy_background_disabled(settings: &AutonomySettings) -> bool {
-    settings.agent_paused || settings.autonomy_mode.eq_ignore_ascii_case("off")
+    crate::core::autonomy::autonomy_background_paused(settings)
 }
 
 async fn apply_autopilot_mode(
@@ -19994,6 +20769,32 @@ struct SecretsVaultDeleteRequest {
     password: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ChatCredentialPromptQuery {
+    conversation_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCredentialPromptSubmitRequest {
+    conversation_id: String,
+    values: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatRawSecretSubmitRequest {
+    #[serde(default)]
+    conversation_id: Option<String>,
+    key: String,
+    value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatReuseModelCredentialRequest {
+    #[serde(default)]
+    conversation_id: Option<String>,
+    key: String,
+}
+
 fn is_internal_secret_key(key: &str) -> bool {
     key.starts_with("integration_enabled:") || key.starts_with("action_envmap:")
 }
@@ -20040,6 +20841,109 @@ fn settings_secret_source_for_custom_key(key: &str) -> &'static str {
     }
 }
 
+fn titleize_secret_label(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    trimmed
+        .split(|ch: char| matches!(ch, '_' | '-' | ':' | '.'))
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| {
+            let lower = part.to_ascii_lowercase();
+            match lower.as_str() {
+                "api" => "API".to_string(),
+                "id" => "ID".to_string(),
+                "oauth" => "OAuth".to_string(),
+                "url" => "URL".to_string(),
+                "uri" => "URI".to_string(),
+                "cli" => "CLI".to_string(),
+                _ => {
+                    let mut chars = lower.chars();
+                    match chars.next() {
+                        Some(first) => {
+                            let mut out = String::new();
+                            out.extend(first.to_uppercase());
+                            out.push_str(chars.as_str());
+                            out
+                        }
+                        None => String::new(),
+                    }
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn parse_extension_pack_secret_key(key: &str) -> Option<(&str, &str)> {
+    let remainder = key.strip_prefix("extension_pack_secret:")?;
+    let (pack_id, connection_id) = remainder.split_once(':')?;
+    let pack_id = pack_id.trim();
+    let connection_id = connection_id.trim();
+    if pack_id.is_empty() || connection_id.is_empty() {
+        return None;
+    }
+    Some((pack_id, connection_id))
+}
+
+fn extension_pack_secret_display_key(pack_id: &str, connection_id: &str) -> String {
+    let pack_label = titleize_secret_label(pack_id);
+    let default_connection_id = format!("{}-default", pack_id);
+    if connection_id.eq_ignore_ascii_case(&default_connection_id) {
+        return format!("{} credentials", pack_label);
+    }
+    let connection_label = titleize_secret_label(connection_id);
+    if connection_label.is_empty() || connection_label.eq_ignore_ascii_case(&pack_label) {
+        format!("{} credentials", pack_label)
+    } else {
+        format!("{} credentials ({})", pack_label, connection_label)
+    }
+}
+
+fn extension_pack_secret_masked_value(value: &str) -> String {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(value) else {
+        return mask_secret_value(value);
+    };
+    let Some(obj) = parsed.as_object() else {
+        return mask_secret_value(value);
+    };
+    if obj.is_empty() {
+        return "No secrets saved".to_string();
+    }
+    if obj.len() == 1 {
+        let Some((field, field_value)) = obj.iter().next() else {
+            return mask_secret_value(value);
+        };
+        let Some(secret) = field_value.as_str() else {
+            return "1 secret field saved".to_string();
+        };
+        return format!("{}: {}", field, mask_secret_value(secret));
+    }
+    format!("{} secret fields saved", obj.len())
+}
+
+fn push_settings_secret_entry_with_display(
+    entries: &mut Vec<serde_json::Value>,
+    storage_key: String,
+    display_key: String,
+    masked: String,
+    source: &str,
+    source_label: Option<String>,
+    deletable: bool,
+    value_length: usize,
+) {
+    entries.push(serde_json::json!({
+        "storage_key": storage_key,
+        "key": display_key,
+        "masked": masked,
+        "length": value_length,
+        "source": source,
+        "source_label": source_label,
+        "deletable": deletable,
+    }));
+}
+
 fn is_configured_secret(value: &str) -> bool {
     !value.trim().is_empty() && value != "[ENCRYPTED]"
 }
@@ -20058,13 +20962,16 @@ fn push_settings_secret_entry(
     if value.trim().is_empty() {
         return;
     }
-    entries.push(serde_json::json!({
-        "key": key,
-        "masked": mask_secret_value(value),
-        "length": value.chars().count(),
-        "source": source,
-        "deletable": deletable,
-    }));
+    push_settings_secret_entry_with_display(
+        entries,
+        key.clone(),
+        key,
+        mask_secret_value(value),
+        source,
+        None,
+        deletable,
+        value.chars().count(),
+    );
 }
 
 fn collect_settings_secret_entries(
@@ -20253,13 +21160,27 @@ fn collect_settings_secret_entries(
         .collect();
     custom_entries.sort_by(|(left, _), (right, _)| left.cmp(right));
     for (key, value) in custom_entries {
-        push_settings_secret_entry(
-            &mut entries,
-            key.clone(),
-            value,
-            settings_secret_source_for_custom_key(key),
-            custom_settings_secret_is_deletable(key),
-        );
+        if let Some((pack_id, connection_id)) = parse_extension_pack_secret_key(key) {
+            let source_label = titleize_secret_label(pack_id);
+            push_settings_secret_entry_with_display(
+                &mut entries,
+                key.clone(),
+                extension_pack_secret_display_key(pack_id, connection_id),
+                extension_pack_secret_masked_value(value),
+                "extension-pack",
+                Some(source_label),
+                custom_settings_secret_is_deletable(key),
+                value.chars().count(),
+            );
+        } else {
+            push_settings_secret_entry(
+                &mut entries,
+                key.clone(),
+                value,
+                settings_secret_source_for_custom_key(key),
+                custom_settings_secret_is_deletable(key),
+            );
+        }
     }
 
     entries.sort_by_key(|row| {
@@ -20290,6 +21211,221 @@ fn require_master_password_for_secrets(
         .unlock(supplied)
         .map(|_| ())
         .map_err(|_| "Master password is incorrect.".to_string())
+}
+
+async fn chat_secret_prompt_block_message(
+    state: &AppState,
+    conversation_id: Option<&str>,
+    message: &str,
+) -> Option<String> {
+    let conversation_id = conversation_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let redaction = crate::security::redact_secret_input(message);
+    if !redaction.had_secret() {
+        return None;
+    }
+    let agent = state.agent.read().await;
+    if agent
+        .pending_chat_credential_prompt(conversation_id)
+        .await
+        .is_none()
+    {
+        return None;
+    }
+    Some(
+        "Never paste secrets, API keys, passwords, or sensitive data into normal chat. Use the secure credential form shown in this conversation.".to_string(),
+    )
+}
+
+async fn get_chat_credential_prompt(
+    State(state): State<AppState>,
+    Query(query): Query<ChatCredentialPromptQuery>,
+) -> Response {
+    let conversation_id = query.conversation_id.trim();
+    if conversation_id.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "conversation_id is required");
+    }
+    let agent = state.agent.read().await;
+    let prompt = agent.pending_chat_credential_prompt(conversation_id).await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "present": prompt.is_some(),
+            "prompt": prompt,
+        })),
+    )
+        .into_response()
+}
+
+async fn submit_chat_credential_prompt(
+    State(state): State<AppState>,
+    Json(request): Json<ChatCredentialPromptSubmitRequest>,
+) -> Response {
+    let conversation_id = request.conversation_id.trim();
+    if conversation_id.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "conversation_id is required");
+    }
+    if request.values.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "Provide at least one credential value",
+        );
+    }
+    let agent = state.agent.read().await;
+    if agent
+        .pending_chat_credential_prompt(conversation_id)
+        .await
+        .is_none()
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "No secure credential request is pending for this conversation",
+        );
+    }
+    match agent
+        .submit_chat_credential_values(Some(conversation_id), &request.values)
+        .await
+    {
+        Ok(followup) => {
+            let prompt = agent.pending_chat_credential_prompt(conversation_id).await;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "ok",
+                    "followup": followup,
+                    "present": prompt.is_some(),
+                    "prompt": prompt,
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => error_response(StatusCode::BAD_REQUEST, error),
+    }
+}
+
+async fn submit_chat_raw_secret(
+    State(state): State<AppState>,
+    Json(request): Json<ChatRawSecretSubmitRequest>,
+) -> Response {
+    let key = request.key.trim().to_string();
+    if !is_valid_user_secret_key(&key) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "Invalid key. Use letters, numbers, '_', '-', ':' or '.'.",
+        );
+    }
+    if is_internal_secret_key(&key) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "This key is reserved for internal settings.",
+        );
+    }
+
+    let value = request.value.trim().to_string();
+    if value.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "Enter the credential value before saving.",
+        );
+    }
+
+    let mut values = BTreeMap::new();
+    values.insert(key.clone(), value);
+    let agent = state.agent.read().await;
+    match agent
+        .submit_chat_credential_values(request.conversation_id.as_deref(), &values)
+        .await
+    {
+        Ok(followup) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ok",
+                "key": key,
+                "followup": followup,
+            })),
+        )
+            .into_response(),
+        Err(error) => error_response(StatusCode::BAD_REQUEST, error),
+    }
+}
+
+async fn reuse_model_credential_for_chat(
+    State(state): State<AppState>,
+    Json(request): Json<ChatReuseModelCredentialRequest>,
+) -> Response {
+    let key = request.key.trim().to_string();
+    if !is_valid_user_secret_key(&key) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "Invalid key. Use letters, numbers, '_', '-', ':' or '.'.",
+        );
+    }
+    if is_internal_secret_key(&key) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "This key is reserved for internal settings.",
+        );
+    }
+
+    let llm_env = {
+        let agent = state.agent.read().await;
+        agent.app_model_env_vars()
+    };
+    let Some(value) = llm_env
+        .get(&key)
+        .cloned()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        let mut available: Vec<String> = llm_env
+            .iter()
+            .filter_map(|(candidate, value)| {
+                if value.trim().is_empty() {
+                    None
+                } else if candidate.ends_with("_API_KEY")
+                    || candidate.ends_with("_BASE_URL")
+                    || candidate == "LLM_MODEL"
+                    || candidate == "LLM_PROVIDER"
+                {
+                    Some(candidate.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        available.sort();
+        let available_text = if available.is_empty() {
+            "none".to_string()
+        } else {
+            available.join(", ")
+        };
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Can't map '{}' from current model settings. Available model-backed keys: {}",
+                key, available_text
+            ),
+        );
+    };
+
+    let mut values = BTreeMap::new();
+    values.insert(key.clone(), value);
+    let agent = state.agent.read().await;
+    match agent
+        .submit_chat_credential_values(request.conversation_id.as_deref(), &values)
+        .await
+    {
+        Ok(followup) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ok",
+                "key": key,
+                "followup": followup,
+            })),
+        )
+            .into_response(),
+        Err(error) => error_response(StatusCode::BAD_REQUEST, error),
+    }
 }
 
 async fn list_settings_secrets(State(state): State<AppState>) -> Response {
@@ -20637,6 +21773,26 @@ fn compute_p95(mut values: Vec<i64>) -> Option<i64> {
     Some(values[idx])
 }
 
+fn compute_percentile_usize(mut values: Vec<usize>, percentile: f64) -> usize {
+    if values.is_empty() {
+        return 0;
+    }
+    values.sort_unstable();
+    let pct = percentile.clamp(0.0, 1.0);
+    let idx = (((values.len() as f64) * pct).ceil() as usize)
+        .saturating_sub(1)
+        .min(values.len().saturating_sub(1));
+    values[idx]
+}
+
+fn average_usize(values: &[usize]) -> f64 {
+    if values.is_empty() {
+        0.0
+    } else {
+        round4(values.iter().sum::<usize>() as f64 / values.len() as f64)
+    }
+}
+
 async fn load_evolution_canary_state(
     storage: &crate::storage::Storage,
 ) -> Option<crate::core::self_evolve::strategy_runtime::CanaryRolloutState> {
@@ -20796,17 +21952,6 @@ async fn load_learning_enabled(storage: &crate::storage::Storage) -> bool {
         .unwrap_or(true)
 }
 
-async fn load_learning_local_only(storage: &crate::storage::Storage) -> bool {
-    storage
-        .get(crate::core::learning::LEARNING_LOCAL_ONLY_KEY)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|raw| String::from_utf8(raw).ok())
-        .map(|s| !s.trim().eq_ignore_ascii_case("false"))
-        .unwrap_or(true)
-}
-
 async fn load_learning_model_slot(storage: &crate::storage::Storage) -> Option<String> {
     storage
         .get(crate::core::learning::LEARNING_MODEL_SLOT_KEY)
@@ -20828,6 +21973,63 @@ async fn load_learning_queue_cap(storage: &crate::storage::Storage) -> u64 {
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(64)
+}
+
+fn bool_setting_bytes(enabled: bool) -> &'static [u8] {
+    if enabled {
+        b"true"
+    } else {
+        b"false"
+    }
+}
+
+async fn store_bool_setting(
+    storage: &crate::storage::Storage,
+    key: &str,
+    enabled: bool,
+) -> std::result::Result<(), String> {
+    storage
+        .set(key, bool_setting_bytes(enabled))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn disable_canary_state_if_present(
+    storage: &crate::storage::Storage,
+    key: &str,
+) -> std::result::Result<(), String> {
+    let Some(raw) = storage.get(key).await.map_err(|error| error.to_string())? else {
+        return Ok(());
+    };
+    let mut state = serde_json::from_slice::<
+        crate::core::self_evolve::strategy_runtime::CanaryRolloutState,
+    >(&raw)
+    .map_err(|error| format!("Failed to parse canary state '{}': {}", key, error))?;
+    if !state.enabled {
+        return Ok(());
+    }
+    state.enabled = false;
+    let encoded = serde_json::to_vec(&state)
+        .map_err(|error| format!("Failed to encode canary state '{}': {}", key, error))?;
+    storage
+        .set(key, &encoded)
+        .await
+        .map_err(|error| format!("Failed to persist canary state '{}': {}", key, error))
+}
+
+async fn disable_all_evolution_canaries(
+    storage: &crate::storage::Storage,
+) -> std::result::Result<(), String> {
+    for key in [
+        crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_CANARY_STATE_KEY,
+        crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_CANARY_STATE_KEY,
+        crate::core::self_evolve::PROMPT_BUNDLE_CANARY_STATE_KEY,
+        crate::core::self_evolve::CLASSIFIER_PROMPT_BUNDLE_CANARY_STATE_KEY,
+        crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_CANARY_STATE_KEY,
+    ] {
+        disable_canary_state_if_present(storage, key).await?;
+    }
+    Ok(())
 }
 
 fn build_learning_candidate_summary(
@@ -21164,6 +22366,7 @@ fn build_experience_item_summary(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let metadata = item.metadata.as_object().cloned().unwrap_or_default();
     serde_json::json!({
         "id": item.id,
         "kind": item.kind,
@@ -21178,8 +22381,16 @@ fn build_experience_item_summary(
         "conversation_id": item.conversation_id,
         "updated_at": item.updated_at,
         "suggested_steps": suggested_steps,
-        "intent_key": item.metadata.get("intent_key").cloned().unwrap_or(serde_json::Value::Null),
-        "source": item.metadata.get("source").cloned().unwrap_or(serde_json::Value::Null),
+        "intent_key": metadata.get("intent_key").cloned().unwrap_or(serde_json::Value::Null),
+        "source": metadata.get("source").cloned().unwrap_or(serde_json::Value::Null),
+        "origin": metadata.get("origin").cloned().unwrap_or(serde_json::Value::Null),
+        "task_type": metadata.get("task_type").cloned().unwrap_or(serde_json::Value::Null),
+        "polarity": metadata.get("polarity").cloned().unwrap_or(serde_json::Value::Null),
+        "applicability": metadata.get("applicability").cloned().unwrap_or(serde_json::Value::Null),
+        "reflection_confidence": metadata
+            .get("reflection_confidence")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
     })
 }
 
@@ -21369,6 +22580,11 @@ fn build_experience_run_summary(run: &crate::storage::experience_run::Model) -> 
             .get("decision_episode")
             .cloned()
             .unwrap_or(serde_json::Value::Null),
+        "prompt_telemetry": run
+            .metadata
+            .get("prompt_telemetry")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
         "attempted_models": run
             .metadata
             .get("attempted_models")
@@ -21380,6 +22596,427 @@ fn build_experience_run_summary(run: &crate::storage::experience_run::Model) -> 
             .cloned()
             .unwrap_or(serde_json::Value::Null),
     })
+}
+
+fn prompt_telemetry_usize(value: Option<&serde_json::Value>) -> Option<usize> {
+    value.and_then(|entry| {
+        entry.as_u64().map(|value| value as usize).or_else(|| {
+            entry
+                .as_i64()
+                .filter(|value| *value >= 0)
+                .map(|value| value as usize)
+        })
+    })
+}
+
+fn prompt_telemetry_section_summary<'a>(
+    summary: &'a PromptTelemetrySummary,
+    section: &str,
+) -> Option<&'a PromptTelemetrySectionSummary> {
+    summary
+        .top_sections
+        .iter()
+        .find(|item| item.section == section)
+}
+
+fn aggregate_prompt_telemetry_summary(
+    runs: &[crate::storage::experience_run::Model],
+) -> PromptTelemetrySummary {
+    let mut final_prompt_chars = Vec::new();
+    let mut tool_schema_chars = Vec::new();
+    let mut estimated_total_request_chars = Vec::new();
+    let mut tool_counts = Vec::new();
+    let mut success_samples = 0usize;
+    let mut corrected_samples = 0usize;
+    let mut section_samples: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+
+    for run in runs {
+        let Some(prompt_telemetry) = run
+            .metadata
+            .get("prompt_telemetry")
+            .and_then(|value| value.as_object())
+        else {
+            continue;
+        };
+
+        if let Some(value) =
+            prompt_telemetry_usize(prompt_telemetry.get("final_system_prompt_chars"))
+        {
+            final_prompt_chars.push(value);
+        }
+        if let Some(value) = prompt_telemetry_usize(prompt_telemetry.get("tool_schema_chars")) {
+            tool_schema_chars.push(value);
+        }
+        if let Some(value) =
+            prompt_telemetry_usize(prompt_telemetry.get("estimated_total_request_chars"))
+        {
+            estimated_total_request_chars.push(value);
+        }
+        if let Some(value) = prompt_telemetry_usize(prompt_telemetry.get("tool_count")) {
+            tool_counts.push(value);
+        }
+        if run.success_state != "failed" {
+            success_samples = success_samples.saturating_add(1);
+        }
+        if run.correction_state == "corrected" {
+            corrected_samples = corrected_samples.saturating_add(1);
+        }
+        if let Some(sections) = prompt_telemetry
+            .get("sections")
+            .and_then(|value| value.as_object())
+        {
+            for (section, value) in sections {
+                if let Some(chars) = prompt_telemetry_usize(Some(value)) {
+                    section_samples
+                        .entry(section.clone())
+                        .or_default()
+                        .push(chars);
+                }
+            }
+        }
+    }
+
+    let sample_count = final_prompt_chars.len();
+    let mut top_sections = section_samples
+        .into_iter()
+        .map(|(section, values)| PromptTelemetrySectionSummary {
+            section,
+            samples: values.len(),
+            avg_chars: average_usize(&values),
+            p50_chars: compute_percentile_usize(values.clone(), 0.50),
+            p95_chars: compute_percentile_usize(values, 0.95),
+        })
+        .collect::<Vec<_>>();
+    top_sections.sort_by(|left, right| {
+        right
+            .p95_chars
+            .cmp(&left.p95_chars)
+            .then(right.samples.cmp(&left.samples))
+            .then(left.section.cmp(&right.section))
+    });
+    top_sections.truncate(12);
+
+    PromptTelemetrySummary {
+        sample_count,
+        p50_final_prompt_chars: compute_percentile_usize(final_prompt_chars.clone(), 0.50),
+        p95_final_prompt_chars: compute_percentile_usize(final_prompt_chars, 0.95),
+        p50_tool_schema_chars: compute_percentile_usize(tool_schema_chars.clone(), 0.50),
+        p95_tool_schema_chars: compute_percentile_usize(tool_schema_chars, 0.95),
+        p50_estimated_total_request_chars: compute_percentile_usize(
+            estimated_total_request_chars.clone(),
+            0.50,
+        ),
+        p95_estimated_total_request_chars: compute_percentile_usize(
+            estimated_total_request_chars,
+            0.95,
+        ),
+        avg_tool_count: average_usize(&tool_counts),
+        success_samples,
+        corrected_samples,
+        top_sections,
+    }
+}
+
+async fn load_prompt_optimization_review_state(
+    storage: &crate::storage::Storage,
+) -> PromptOptimizationReviewState {
+    match storage.get(PROMPT_OPTIMIZATION_REVIEW_STATE_KEY).await {
+        Ok(Some(raw)) => {
+            serde_json::from_slice::<PromptOptimizationReviewState>(&raw).unwrap_or_default()
+        }
+        _ => PromptOptimizationReviewState::default(),
+    }
+}
+
+async fn update_prompt_optimization_review_state(
+    storage: &crate::storage::Storage,
+    proposal_id: &str,
+    status: &str,
+) -> Result<()> {
+    let proposal_id = proposal_id.trim();
+    let status = status.trim();
+    if proposal_id.is_empty() || status.is_empty() {
+        return Ok(());
+    }
+
+    let mut state = load_prompt_optimization_review_state(storage).await;
+    state.insert(
+        proposal_id.to_string(),
+        PromptOptimizationReviewEntry {
+            status: status.to_string(),
+            reviewed_at: Some(chrono::Utc::now().to_rfc3339()),
+        },
+    );
+    let bytes = serde_json::to_vec(&state)?;
+    storage
+        .set(PROMPT_OPTIMIZATION_REVIEW_STATE_KEY, &bytes)
+        .await?;
+    Ok(())
+}
+
+async fn load_prompt_canary_safety_events(
+    storage: &crate::storage::Storage,
+) -> Vec<crate::core::self_evolve::strategy_runtime::PromptProfileCanarySafetyEvent> {
+    match storage
+        .get(crate::core::self_evolve::strategy_runtime::PROMPT_PROFILE_CANARY_SAFETY_EVENTS_KEY)
+        .await
+    {
+        Ok(Some(raw)) => serde_json::from_slice::<
+            Vec<crate::core::self_evolve::strategy_runtime::PromptProfileCanarySafetyEvent>,
+        >(&raw)
+        .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+async fn store_prompt_canary_safety_events(
+    storage: &crate::storage::Storage,
+    events: &[crate::core::self_evolve::strategy_runtime::PromptProfileCanarySafetyEvent],
+) -> Result<()> {
+    let bytes = serde_json::to_vec(events)?;
+    storage
+        .set(
+            crate::core::self_evolve::strategy_runtime::PROMPT_PROFILE_CANARY_SAFETY_EVENTS_KEY,
+            &bytes,
+        )
+        .await?;
+    Ok(())
+}
+
+fn prompt_canary_state_key_for_surface(surface: &str) -> Option<(&'static str, &'static str)> {
+    match surface.trim() {
+        "prompt" => Some((
+            crate::core::self_evolve::PROMPT_BUNDLE_CANARY_STATE_KEY,
+            "Prompt bundle",
+        )),
+        "classifier_prompt" => Some((
+            crate::core::self_evolve::CLASSIFIER_PROMPT_BUNDLE_CANARY_STATE_KEY,
+            "Classifier prompt bundle",
+        )),
+        "specialist_prompt" => Some((
+            crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_CANARY_STATE_KEY,
+            "Specialist prompt bundle",
+        )),
+        _ => None,
+    }
+}
+
+async fn update_prompt_canary_safety_review_status(
+    storage: &crate::storage::Storage,
+    event_id: &str,
+    review_status: &str,
+) -> Result<crate::core::self_evolve::strategy_runtime::PromptProfileCanarySafetyEvent> {
+    let event_id = event_id.trim();
+    if event_id.is_empty() {
+        anyhow::bail!("candidate_id is required for prompt canary safety review.");
+    }
+
+    let mut events = load_prompt_canary_safety_events(storage).await;
+    let Some(event) = events.iter_mut().find(|item| item.id == event_id) else {
+        anyhow::bail!("Prompt canary safety event not found.");
+    };
+    if event.review_status == "auto_reverted" {
+        anyhow::bail!("This canary was already reverted automatically.");
+    }
+    event.review_status = review_status.trim().to_string();
+    event.reviewed_at = Some(chrono::Utc::now().to_rfc3339());
+    let updated = event.clone();
+    store_prompt_canary_safety_events(storage, &events).await?;
+    Ok(updated)
+}
+
+async fn disable_prompt_canary_from_safety_event(
+    storage: &crate::storage::Storage,
+    event_id: &str,
+) -> Result<crate::core::self_evolve::strategy_runtime::PromptProfileCanarySafetyEvent> {
+    let events = load_prompt_canary_safety_events(storage).await;
+    let event = events
+        .iter()
+        .find(|item| item.id == event_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Prompt canary safety event not found."))?;
+    if event.review_status == "auto_reverted" {
+        anyhow::bail!("This canary was already reverted automatically.");
+    }
+
+    let (state_key, surface_label) = prompt_canary_state_key_for_surface(&event.surface)
+        .ok_or_else(|| anyhow::anyhow!("Unsupported prompt canary surface '{}'.", event.surface))?;
+    let mut state = load_canary_state_by_key(storage, state_key)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("No active {} canary state found.", surface_label))?;
+    if !state.enabled || state.candidate_version != event.candidate_version {
+        anyhow::bail!(
+            "No matching active {} canary is running for candidate '{}'.",
+            surface_label,
+            event.candidate_version
+        );
+    }
+    state.enabled = false;
+    let bytes = serde_json::to_vec(&state)?;
+    storage.set(state_key, &bytes).await?;
+
+    update_prompt_canary_safety_review_status(storage, event_id, "disabled_by_user").await
+}
+
+fn build_prompt_optimization_proposal(
+    review_state: &PromptOptimizationReviewState,
+    id: &str,
+    title: &str,
+    summary: &str,
+    evidence: Vec<String>,
+    expected_benefit: Vec<String>,
+    caveats: Vec<String>,
+    risk_level: &str,
+    target_scope: &str,
+) -> PromptOptimizationProposal {
+    let review_entry = review_state.get(id);
+    let review_status = review_entry
+        .map(|entry| entry.status.trim())
+        .filter(|status| !status.is_empty())
+        .unwrap_or("open")
+        .to_string();
+    let reviewed_at = review_entry.and_then(|entry| entry.reviewed_at.clone());
+
+    PromptOptimizationProposal {
+        id: id.to_string(),
+        title: title.to_string(),
+        summary: summary.to_string(),
+        evidence,
+        expected_benefit,
+        caveats,
+        risk_level: risk_level.to_string(),
+        target_scope: target_scope.to_string(),
+        review_status,
+        reviewed_at,
+        reversible: true,
+    }
+}
+
+fn build_prompt_optimization_opportunities(
+    summary: &PromptTelemetrySummary,
+    review_state: &PromptOptimizationReviewState,
+) -> Vec<PromptOptimizationProposal> {
+    if summary.sample_count < 6 {
+        return Vec::new();
+    }
+
+    let mut proposals = Vec::new();
+
+    if let Some(section) = prompt_telemetry_section_summary(summary, "runtime_access_summary")
+        .filter(|section| section.p95_chars >= 900)
+    {
+        proposals.push(build_prompt_optimization_proposal(
+            review_state,
+            "prompt-opt-runtime-summary-compact",
+            "Review compact runtime-access prose for non-runtime-heavy turns",
+            "Runtime access summary text is a meaningful prompt contributor. Review whether a compact profile should be available for turns that do not depend on the full runtime prose.",
+            vec![
+                format!("Observed {} prompt-telemetry samples.", summary.sample_count),
+                format!(
+                    "p95 runtime access summary size is {} chars.",
+                    section.p95_chars
+                ),
+                format!(
+                    "p95 final prompt size is {} chars.",
+                    summary.p95_final_prompt_chars
+                ),
+            ],
+            vec![
+                "Can reduce steady-state prompt size on routine turns.".to_string(),
+                "Keeps the change reviewable because it targets prompt/profile configuration rather than runtime code.".to_string(),
+            ],
+            vec![
+                "Over-compressing runtime access details can make the agent hesitate on environment-dependent turns.".to_string(),
+                "This should only ship behind manual review, canarying, and a reversible prompt/profile change.".to_string(),
+            ],
+            "low",
+            "prompt_profile",
+        ));
+    }
+
+    let action_catalog_section = prompt_telemetry_section_summary(summary, "action_catalog")
+        .filter(|section| section.p95_chars >= 2500 || summary.p95_tool_schema_chars >= 12_000);
+    if let Some(section) = action_catalog_section {
+        proposals.push(build_prompt_optimization_proposal(
+            review_state,
+            "prompt-opt-action-catalog-compact",
+            "Review compact tool parameter detail for high-schema turns",
+            "Tool exposure is one of the largest request contributors. Review whether parameter detail should degrade from full to compact in an explicit prompt/profile setting.",
+            vec![
+                format!("p95 action catalog size is {} chars.", section.p95_chars),
+                format!(
+                    "p95 serialized tool schema size is {} chars.",
+                    summary.p95_tool_schema_chars
+                ),
+                format!("Average exposed tool count is {:.2}.", summary.avg_tool_count),
+            ],
+            vec![
+                "Can reduce request size without removing tools outright.".to_string(),
+                "Creates a controlled path for later canary tests instead of runtime self-modification.".to_string(),
+            ],
+            vec![
+                "Too much compaction can make tool calls less precise, especially on rare or multi-step actions.".to_string(),
+                "Any change must preserve exact action availability and stay manually reviewable.".to_string(),
+            ],
+            "medium",
+            "prompt_profile",
+        ));
+    }
+
+    if let Some(section) = prompt_telemetry_section_summary(summary, "deployed_app_hint")
+        .filter(|section| section.p95_chars >= 700)
+    {
+        proposals.push(build_prompt_optimization_proposal(
+            review_state,
+            "prompt-opt-deployed-app-scope",
+            "Review scoped deployed-app injection for app-related turns",
+            "Deployed app hints are contributing measurable prompt weight. Review whether app inventory hints should be profile-scoped to app-focused turns instead of broadly injected.",
+            vec![
+                format!("p95 deployed app hint size is {} chars.", section.p95_chars),
+                format!("Observed {} samples with prompt telemetry.", summary.sample_count),
+            ],
+            vec![
+                "Reduces prompt growth as the managed app inventory expands.".to_string(),
+                "Keeps the decision transparent because the scope rule would be reviewed explicitly.".to_string(),
+            ],
+            vec![
+                "If scoped too aggressively, the agent can miss the app context on short follow-up turns.".to_string(),
+                "This should remain a reviewed prompt/profile policy, not a self-editing runtime rule.".to_string(),
+            ],
+            "medium",
+            "prompt_profile",
+        ));
+    }
+
+    if let Some(section) = prompt_telemetry_section_summary(summary, "document_excerpts")
+        .filter(|section| section.p95_chars >= 1500)
+    {
+        proposals.push(build_prompt_optimization_proposal(
+            review_state,
+            "prompt-opt-document-context-guard",
+            "Review document-context guardrails for oversized excerpt turns",
+            "Document excerpts are a major prompt contributor on some turns. Review whether a more compact document-context profile should be offered when the turn is not primarily document-driven.",
+            vec![
+                format!("p95 document excerpt size is {} chars.", section.p95_chars),
+                format!(
+                    "p95 estimated total request size is {} chars.",
+                    summary.p95_estimated_total_request_chars
+                ),
+            ],
+            vec![
+                "Can reduce large-request spikes on mixed-context turns.".to_string(),
+                "Creates evidence-backed guardrails before any future compaction policy is considered.".to_string(),
+            ],
+            vec![
+                "Document context is often the reason the turn succeeds; shrinking it in the wrong cases can make the agent feel lost.".to_string(),
+                "Document-centric turns should stay protected, with human review before any rollout.".to_string(),
+            ],
+            "high",
+            "prompt_profile",
+        ));
+    }
+
+    proposals
 }
 
 fn normalize_evolution_dev_limit(limit: Option<u64>) -> u64 {
@@ -21735,6 +23372,7 @@ async fn build_evolution_settings_response(
         });
     }
 
+    let learning_enabled = load_learning_enabled(storage).await;
     let self_evolve_enabled = storage
         .get(crate::core::self_evolve::strategy_runtime::SELF_EVOLVE_ENABLED_KEY)
         .await
@@ -21742,13 +23380,13 @@ async fn build_evolution_settings_response(
         .flatten()
         .and_then(|raw| String::from_utf8(raw).ok())
         .map(|s| !s.trim().eq_ignore_ascii_case("false"))
-        .unwrap_or(true);
+        .unwrap_or(true)
+        && learning_enabled;
     let learning_queue = storage.learning_queue_counts().await.unwrap_or_default();
 
     EvolutionSettingsResponse {
         self_evolve_enabled,
-        learning_enabled: load_learning_enabled(storage).await,
-        learning_local_only: load_learning_local_only(storage).await,
+        learning_enabled,
         learning_model_slot: load_learning_model_slot(storage).await,
         learning_queue_cap: load_learning_queue_cap(storage).await,
         learning_queue,
@@ -22344,6 +23982,13 @@ async fn build_evolution_dev_response(
         .into_iter()
         .map(|pattern| build_procedural_pattern_summary(&pattern))
         .collect::<Vec<_>>();
+    let prompt_telemetry_summary = aggregate_prompt_telemetry_summary(&recent_experience_run_rows);
+    let prompt_optimization_review_state = load_prompt_optimization_review_state(storage).await;
+    let prompt_canary_safety_events = load_prompt_canary_safety_events(storage).await;
+    let prompt_optimization_opportunities = build_prompt_optimization_opportunities(
+        &prompt_telemetry_summary,
+        &prompt_optimization_review_state,
+    );
     let prompt_metrics = aggregate_prompt_metrics(
         &recent_experience_run_rows,
         &prompt_tool_logs,
@@ -22482,6 +24127,9 @@ async fn build_evolution_dev_response(
         recent_classifier_prompt_runs,
         recent_specialist_prompt_runs,
         recent_experience_runs,
+        prompt_canary_safety_events,
+        prompt_telemetry_summary,
+        prompt_optimization_opportunities,
     }
 }
 
@@ -22501,18 +24149,13 @@ async fn update_evolution_settings(
         let agent = state.agent.read().await;
         agent.storage.clone()
     };
-    if let Some(enabled) = request.self_evolve_enabled {
-        let raw = if enabled {
-            b"true".as_slice()
-        } else {
-            b"false".as_slice()
-        };
-        if let Err(e) = storage
-            .set(
-                crate::core::self_evolve::strategy_runtime::SELF_EVOLVE_ENABLED_KEY,
-                raw,
-            )
-            .await
+    if let Some(enabled) = request.self_evolve_enabled.or(request.learning_enabled) {
+        if let Err(e) = store_bool_setting(
+            &storage,
+            crate::core::self_evolve::strategy_runtime::SELF_EVOLVE_ENABLED_KEY,
+            enabled,
+        )
+        .await
         {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -22522,38 +24165,12 @@ async fn update_evolution_settings(
             )
                 .into_response();
         }
-    }
-    if let Some(enabled) = request.deploy_guard_default {
-        let raw = if enabled {
-            b"true".as_slice()
-        } else {
-            b"false".as_slice()
-        };
-        if let Err(e) = storage
-            .set(
-                crate::core::self_evolve::strategy_runtime::APP_DEPLOY_ACCESS_GUARD_DEFAULT_KEY,
-                raw,
-            )
-            .await
-        {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("Failed to update evolution settings: {}", e),
-                }),
-            )
-                .into_response();
-        }
-    }
-    if let Some(enabled) = request.learning_enabled {
-        let raw = if enabled {
-            b"true".as_slice()
-        } else {
-            b"false".as_slice()
-        };
-        if let Err(e) = storage
-            .set(crate::core::learning::LEARNING_ENABLED_KEY, raw)
-            .await
+        if let Err(e) = store_bool_setting(
+            &storage,
+            crate::core::learning::LEARNING_ENABLED_KEY,
+            enabled,
+        )
+        .await
         {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -22563,21 +24180,30 @@ async fn update_evolution_settings(
             )
                 .into_response();
         }
+        if !enabled {
+            if let Err(e) = disable_all_evolution_canaries(&storage).await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to disable evolution canaries: {}", e),
+                    }),
+                )
+                    .into_response();
+            }
+        }
     }
-    if let Some(local_only) = request.learning_local_only {
-        let raw = if local_only {
-            b"true".as_slice()
-        } else {
-            b"false".as_slice()
-        };
-        if let Err(e) = storage
-            .set(crate::core::learning::LEARNING_LOCAL_ONLY_KEY, raw)
-            .await
+    if let Some(enabled) = request.deploy_guard_default {
+        if let Err(e) = store_bool_setting(
+            &storage,
+            crate::core::self_evolve::strategy_runtime::APP_DEPLOY_ACCESS_GUARD_DEFAULT_KEY,
+            enabled,
+        )
+        .await
         {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
-                    error: format!("Failed to update learning_local_only: {}", e),
+                    error: format!("Failed to update evolution settings: {}", e),
                 }),
             )
                 .into_response();
@@ -23365,8 +24991,36 @@ async fn run_evolution_dev_action(
                         }
                     };
                     let agent = state.agent.read().await;
-                    let verdict = match agent.runtime.create_action(name, content, false).await {
-                        Ok(verdict) => verdict,
+                    let semantic_review =
+                        crate::security::skill_review::review_skill_import_with_configured_model(
+                            &agent.llm,
+                            &agent.config_dir,
+                            "learning-candidate://workflow",
+                            name,
+                            content,
+                        )
+                        .await;
+                    if semantic_review.policy.blocked {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse {
+                                error: "Workflow candidate was blocked by semantic skill security policy."
+                                    .to_string(),
+                            }),
+                        )
+                            .into_response();
+                    }
+                    let review = match agent
+                        .runtime
+                        .install_semantically_reviewed_action(
+                            name,
+                            content,
+                            &semantic_review,
+                            false,
+                        )
+                        .await
+                    {
+                        Ok(review) => review,
                         Err(error) => {
                             return (
                                 StatusCode::BAD_REQUEST,
@@ -23380,7 +25034,7 @@ async fn run_evolution_dev_action(
                                 .into_response();
                         }
                     };
-                    if verdict.as_ref().is_some_and(|value| !value.allow_load) {
+                    if !review.allow_load {
                         return (
                             StatusCode::BAD_REQUEST,
                             Json(ErrorResponse {
@@ -23415,13 +25069,33 @@ async fn run_evolution_dev_action(
                     };
                     let evidence_markdown = build_skill_candidate_evidence_markdown(&candidate);
                     let agent = state.agent.read().await;
+                    let semantic_review =
+                        crate::security::skill_review::review_skill_import_with_configured_model(
+                            &agent.llm,
+                            &agent.config_dir,
+                            "learning-candidate://skill-patch",
+                            &skill_name,
+                            &content,
+                        )
+                        .await;
+                    if semantic_review.policy.blocked {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse {
+                                error: "Skill patch candidate was blocked by semantic skill security policy."
+                                    .to_string(),
+                            }),
+                        )
+                            .into_response();
+                    }
                     let result = match agent
                         .runtime
-                        .apply_skill_evolution_candidate(
+                        .apply_semantically_reviewed_skill_evolution_candidate(
                             &action,
                             &skill_name,
                             &content,
                             &evidence_markdown,
+                            &semantic_review,
                         )
                         .await
                     {
@@ -23690,11 +25364,144 @@ async fn run_evolution_dev_action(
             }
             format!("Rejected learning candidate '{}'.", candidate.title)
         }
+        "approve_prompt_optimization_proposal" => {
+            let Some(proposal_id) = request
+                .candidate_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "candidate_id is required for prompt optimization approvals."
+                            .to_string(),
+                    }),
+                )
+                    .into_response();
+            };
+            if let Err(error) =
+                update_prompt_optimization_review_state(&storage, proposal_id, "approved").await
+            {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to record prompt optimization approval: {}", error),
+                    }),
+                )
+                    .into_response();
+            }
+            format!(
+                "Recorded approval for prompt optimization proposal '{}'. No runtime prompt behavior changed.",
+                proposal_id
+            )
+        }
+        "reject_prompt_optimization_proposal" => {
+            let Some(proposal_id) = request
+                .candidate_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "candidate_id is required for prompt optimization rejections."
+                            .to_string(),
+                    }),
+                )
+                    .into_response();
+            };
+            if let Err(error) =
+                update_prompt_optimization_review_state(&storage, proposal_id, "rejected").await
+            {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to record prompt optimization rejection: {}", error),
+                    }),
+                )
+                    .into_response();
+            }
+            format!(
+                "Recorded rejection for prompt optimization proposal '{}'. Runtime prompt behavior remains unchanged.",
+                proposal_id
+            )
+        }
+        "disable_prompt_canary_candidate" => {
+            let Some(event_id) = request
+                .candidate_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "candidate_id is required for prompt canary disable actions."
+                            .to_string(),
+                    }),
+                )
+                    .into_response();
+            };
+            let event = match disable_prompt_canary_from_safety_event(&storage, event_id).await {
+                Ok(event) => event,
+                Err(error) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: error.to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+            };
+            format!(
+                "Disabled {} canary for candidate '{}'.",
+                event.surface_label, event.candidate_version
+            )
+        }
+        "keep_prompt_canary_candidate" => {
+            let Some(event_id) = request
+                .candidate_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "candidate_id is required to keep a prompt canary active."
+                            .to_string(),
+                    }),
+                )
+                    .into_response();
+            };
+            let event =
+                match update_prompt_canary_safety_review_status(&storage, event_id, "kept_active")
+                    .await
+                {
+                    Ok(event) => event,
+                    Err(error) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse {
+                                error: error.to_string(),
+                            }),
+                        )
+                            .into_response();
+                    }
+                };
+            format!(
+                "Recorded decision to keep {} canary '{}' active.",
+                event.surface_label, event.candidate_version
+            )
+        }
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
-                    error: "Unsupported action. Use disable_canary, promote_candidate, rollback_baseline, approve_learning_candidate, or reject_learning_candidate."
+                    error: "Unsupported action. Use disable_canary, promote_candidate, rollback_baseline, approve_learning_candidate, reject_learning_candidate, approve_prompt_optimization_proposal, reject_prompt_optimization_proposal, disable_prompt_canary_candidate, or keep_prompt_canary_candidate."
                         .to_string(),
                 }),
             )
@@ -23716,6 +25523,9 @@ async fn run_evolution_dev_action(
             "deploy_guard_default": evolution.deploy_guard_default,
             "canary_state": dev.canary_state.clone(),
             "last_result": dev.last_result.clone(),
+            "prompt_canary_safety_events": dev.prompt_canary_safety_events.clone(),
+            "prompt_telemetry_summary": dev.prompt_telemetry_summary.clone(),
+            "prompt_optimization_opportunities": dev.prompt_optimization_opportunities.clone(),
         }),
     )
     .await;
@@ -24986,6 +26796,18 @@ async fn update_settings(
         || settings.tone.is_some()
         || settings.email_format.is_some()
     {
+        let saved_user_name = deferred_storage
+            .get_user_preference("user_name", None)
+            .await
+            .ok()
+            .flatten()
+            .map(|item| item.value);
+        let saved_priority_focus = deferred_storage
+            .get_user_preference("assistant_priority_focus", None)
+            .await
+            .ok()
+            .flatten()
+            .map(|item| item.value);
         let mut profile = state.user_profile.write().await;
         if let Some(timezone) = &settings.timezone {
             if timezone.trim().is_empty() {
@@ -25015,6 +26837,13 @@ async fn update_settings(
                 Some(email_format.clone())
             };
         }
+        if crate::core::Agent::onboarding_profile_ready(
+            &profile,
+            saved_user_name.as_deref(),
+            saved_priority_focus.as_deref(),
+        ) {
+            profile.onboarding_complete = true;
+        }
         if let Ok(bytes) = serde_json::to_vec(&*profile) {
             deferred_profile_bytes = Some(bytes);
         }
@@ -25023,30 +26852,55 @@ async fn update_settings(
     let requested_daily_brief_channel = if let Some(channel) = settings.daily_brief_channel.as_ref()
     {
         let normalized = channel.trim().to_lowercase();
-        if !matches!(
-            normalized.as_str(),
-            "telegram"
-                | "whatsapp"
-                | "slack"
-                | "discord"
-                | "matrix"
-                | "teams"
-                | "google_chat"
-                | "signal"
-                | "imessage"
-                | "line"
-                | "wechat"
-                | "qq"
-                | "email"
-        ) {
+        let bundled = crate::channels::messaging_registry::BUNDLED_CHANNEL_IDS
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(&normalized));
+        let custom_or_pack = normalized
+            .starts_with(crate::custom_messaging_channels::CUSTOM_CHANNEL_ID_PREFIX)
+            || normalized
+                .starts_with(crate::channels::messaging_registry::EXTENSION_CHANNEL_ID_PREFIX);
+        if !bundled && !custom_or_pack {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
-                    error: "Daily brief channel must be one of telegram, whatsapp, slack, discord, matrix, teams, google_chat, signal, imessage, line, wechat, qq, or email"
+                    error: "Daily brief channel must be a bundled channel or a configured custom or extension-pack messaging channel"
                         .to_string(),
                 }),
             )
                 .into_response();
+        }
+        if custom_or_pack {
+            let agent = state.agent.read().await;
+            let config_manager = crate::core::config::SecureConfigManager::new_with_data_dir(
+                &agent.config_dir,
+                Some(&agent.data_dir),
+            )
+            .ok();
+            let packs_guard = agent.extension_packs.read().await;
+            let bundled_check: fn(&str) -> bool = |_| false;
+            let ctx = crate::channels::messaging_registry::ChannelQueryContext {
+                bundled_configured: &bundled_check,
+                extension_packs: &*packs_guard,
+                storage: &agent.storage,
+                config_dir: &agent.config_dir,
+                data_dir: &agent.data_dir,
+                config_manager: config_manager.as_ref(),
+            };
+            let ready = crate::channels::messaging_registry::MessagingChannelRegistry::new()
+                .lookup(&ctx, &normalized)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|descriptor| descriptor.configured);
+            if !ready {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "Custom daily brief channel is not ready yet".to_string(),
+                    }),
+                )
+                    .into_response();
+            }
         }
         normalized
     } else {
@@ -25157,6 +27011,12 @@ async fn update_settings(
         }
         if let Some(v) = update.procedural_pattern_retention_days {
             current.procedural_pattern_retention_days = v;
+        }
+        if let Some(v) = update.recall_event_retention_days {
+            current.recall_event_retention_days = v;
+        }
+        if let Some(v) = update.recall_test_retention_days {
+            current.recall_test_retention_days = v;
         }
         if let Some(v) = update.housekeeping_interval_secs {
             current.housekeeping_interval_secs = v;
@@ -30209,6 +32069,11 @@ fn access_scope_group_meta(
             "Attach the integration(s) this agent needs.",
             "elevated",
         ),
+        "extension_pack_ids" => (
+            "Extension packs",
+            "Attach the installed extension pack(s) this agent may use.",
+            "elevated",
+        ),
         "mcp_server_ids" => (
             "MCP servers",
             "Attach only the MCP servers this agent should use.",
@@ -30409,6 +32274,25 @@ async fn swarm_agent_builder_options(State(state): State<AppState>) -> Response 
             integration.enabled && builder_status_looks_usable(&integration.status)
         })
         .collect::<Vec<_>>();
+    let extension_packs = {
+        let registry = agent.extension_packs.read().await;
+        match registry.search_packs(None, Some("integration")).await {
+            Ok(result) => result
+                .installed
+                .into_iter()
+                .filter(|pack| pack.enabled && builder_status_looks_usable(&pack.status))
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to load extension packs: {}", error),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    };
     let channels: Vec<crate::core::GatewayChannelDescriptor> =
         match crate::core::load_gateway_channels(&agent.storage, &agent.config).await {
             Ok(payload) => payload
@@ -30465,6 +32349,7 @@ async fn swarm_agent_builder_options(State(state): State<AppState>) -> Response 
             "ssh_connections": ssh_connections,
             "custom_apis": custom_api_payload,
             "integrations": integrations,
+            "extension_packs": extension_packs,
             "channels": channel_payload,
         })),
     )
@@ -30640,6 +32525,21 @@ async fn swarm_agent_access_plan(
                 Some(detail.clone()),
             );
         }
+        if !hint.extension_pack_ids.is_empty() {
+            push_access_group(
+                &mut requested_groups,
+                "extension_pack_ids".to_string(),
+                "extension_pack_ids",
+                "exact",
+                "Extension packs".to_string(),
+                format!(
+                    "{} needs an installed extension pack binding.",
+                    action_plan.name
+                ),
+                hint.extension_pack_ids.clone(),
+                Some(detail.clone()),
+            );
+        }
         if hint.requires_ssh_connection {
             push_access_group(
                 &mut requested_groups,
@@ -30700,6 +32600,12 @@ async fn swarm_agent_access_plan(
             "Integrations",
             "exact",
             request.access_scope.integration_ids.clone(),
+        ),
+        (
+            "extension_pack_ids",
+            "Extension packs",
+            "exact",
+            request.access_scope.extension_pack_ids.clone(),
         ),
         (
             "ssh_connection_names",
@@ -33165,7 +35071,7 @@ User query: {}\n\nEvidence docs: {}\n\nEvidence facts: {}",
     let missing_signals = if evidence_docs.len() < 2 {
         vec![
             "Import source documents for this topic".to_string(),
-            "Ingest related emails or notes to improve recall".to_string(),
+            "Ingest related emails or notes to improve retrieval".to_string(),
         ]
     } else {
         vec![]
@@ -33599,9 +35505,8 @@ async fn notification_stream_endpoint(State(state): State<AppState>) -> Response
         agent.subscribe_notification_events()
     };
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<
-        std::result::Result<Event, std::convert::Infallible>,
-    >(32);
+    let (tx, rx) =
+        tokio::sync::mpsc::channel::<std::result::Result<Event, std::convert::Infallible>>(32);
     crate::spawn_logged!("src/channels/http.rs:33599", async move {
         let connected = serde_json::json!({
             "kind": "notifications.connected",
@@ -33669,9 +35574,11 @@ async fn notification_stream_endpoint(State(state): State<AppState>) -> Response
         }
     });
 
-    Sse::new(cap_sse_lifetime(tokio_stream::wrappers::ReceiverStream::new(rx)))
-        .keep_alive(KeepAlive::default())
-        .into_response()
+    Sse::new(cap_sse_lifetime(
+        tokio_stream::wrappers::ReceiverStream::new(rx),
+    ))
+    .keep_alive(KeepAlive::default())
+    .into_response()
 }
 
 async fn list_notifications_endpoint(
@@ -33876,6 +35783,7 @@ struct LlmAnalyticsBreakdownRow {
 struct OpenRouterModelPricing {
     prompt_per_token: f64,
     completion_per_token: f64,
+    request_per_request: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -33903,7 +35811,8 @@ pub fn estimate_cost_from_pricing_cache(
     let pricing = find_openrouter_pricing(model, &entry.prices)?;
     Some(
         input_tokens as f64 * pricing.prompt_per_token
-            + output_tokens as f64 * pricing.completion_per_token,
+            + output_tokens as f64 * pricing.completion_per_token
+            + pricing.request_per_request,
     )
 }
 
@@ -34000,6 +35909,10 @@ async fn fetch_openrouter_pricing(
             .get("completion")
             .or_else(|| pricing.get("output"))
             .and_then(parse_openrouter_price_value);
+        let request_price = pricing
+            .get("request")
+            .and_then(parse_openrouter_price_value)
+            .unwrap_or(0.0);
 
         let (Some(prompt_per_token), Some(completion_per_token)) = (prompt_price, completion_price)
         else {
@@ -34012,6 +35925,7 @@ async fn fetch_openrouter_pricing(
             OpenRouterModelPricing {
                 prompt_per_token,
                 completion_per_token,
+                request_per_request: request_price,
             },
         );
     }
@@ -34185,18 +36099,35 @@ fn estimate_cost_usd(
     if p == "ollama" {
         return Some(0.0);
     }
-    if p == "openrouter" || p == "openai-compatible" {
+    if p == "openrouter" {
         if let Some(pricing) = find_openrouter_pricing(model, openrouter_prices) {
             let prompt_tokens = prompt.max(0) as f64;
             let completion_tokens = completion.max(0) as f64;
             return Some(
                 prompt_tokens * pricing.prompt_per_token
-                    + completion_tokens * pricing.completion_per_token,
+                    + completion_tokens * pricing.completion_per_token
+                    + pricing.request_per_request,
             );
         }
     }
     // No hardcoded fallback — if pricing isn't in the cache, return None.
     None
+}
+
+fn resolve_usage_row_cost_usd(
+    row: &crate::storage::entities::llm_usage::Model,
+    provider: &str,
+    openrouter_prices: &HashMap<String, OpenRouterModelPricing>,
+) -> Option<f64> {
+    row.cost_usd.or_else(|| {
+        estimate_cost_usd(
+            provider,
+            &row.model,
+            row.prompt_tokens as i64,
+            row.completion_tokens as i64,
+            openrouter_prices,
+        )
+    })
 }
 
 fn analytics_purpose_kind(channel: &str, purpose: &str) -> &'static str {
@@ -34282,7 +36213,7 @@ async fn llm_analytics_endpoint(
 
     let has_openrouter_like_rows = rows.iter().any(|r| {
         let provider = r.provider.trim().to_ascii_lowercase();
-        provider == "openrouter" || provider == "openai-compatible"
+        (provider == "openrouter" || provider == "openai-compatible") && r.cost_usd.is_none()
     });
     let openrouter_prices = if has_openrouter_like_rows {
         get_openrouter_pricing_cached(openrouter_api_key.as_deref()).await
@@ -34319,7 +36250,7 @@ async fn llm_analytics_endpoint(
         let pt = r.prompt_tokens as i64;
         let ct = r.completion_tokens as i64;
         let tt = r.total_tokens as i64;
-        let cost = estimate_cost_usd(&provider, &r.model, pt, ct, &openrouter_prices);
+        let cost = resolve_usage_row_cost_usd(&r, &provider, &openrouter_prices);
 
         totals.prompt_tokens += pt;
         totals.completion_tokens += ct;
@@ -34996,6 +36927,67 @@ async fn search_document_endpoint(
     }
 }
 
+/// Merged list of messaging/notification channels from every registry source.
+/// Consumed by the frontend's notify-channel chooser so it can render custom
+/// (extension-pack-declared) channels alongside the 13 bundled ones. Each
+/// descriptor carries `configured: bool` so the UI can render
+/// "needs credentials" chips and kick off the inline credential prompt when
+/// the user picks an unconfigured pack channel.
+async fn list_available_channels(State(state): State<AppState>) -> Response {
+    use crate::channels::messaging_registry::{
+        BundledConfiguredCheck, ChannelQueryContext, MessagingChannelRegistry,
+    };
+
+    let agent = state.agent.read().await;
+    let config_manager = match crate::core::config::SecureConfigManager::new_with_data_dir(
+        &agent.config_dir,
+        Some(&agent.data_dir),
+    ) {
+        Ok(manager) => Some(manager),
+        Err(error) => {
+            tracing::debug!(
+                "list_available_channels: config manager unavailable: {}",
+                error
+            );
+            None
+        }
+    };
+    let packs_guard = agent.extension_packs.read().await;
+
+    struct AgentBundledCheck<'a>(&'a crate::core::Agent);
+    impl<'a> BundledConfiguredCheck for AgentBundledCheck<'a> {
+        fn is_configured(&self, channel_id: &str) -> bool {
+            self.0.notification_channel_is_configured(channel_id)
+        }
+    }
+    let bundled_check = AgentBundledCheck(&agent);
+    let ctx = ChannelQueryContext {
+        bundled_configured: &bundled_check,
+        extension_packs: &*packs_guard,
+        storage: &agent.storage,
+        config_dir: &agent.config_dir,
+        data_dir: &agent.data_dir,
+        config_manager: config_manager.as_ref(),
+    };
+    let registry = MessagingChannelRegistry::new();
+    match registry.list(&ctx).await {
+        Ok(descriptors) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "channels": descriptors,
+            })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
 // ==================== Memory Endpoints ====================
 
 async fn memory_stats(
@@ -35018,7 +37010,7 @@ async fn memory_stats(
         .unwrap_or(0);
     let knowledge_count = agent
         .storage
-        .count_knowledge_items(project_id)
+        .count_visible_knowledge_items(project_id)
         .await
         .unwrap_or(0);
     (
@@ -35397,13 +37389,13 @@ async fn list_knowledge_items(
     let agent = state.agent.read().await;
     match agent
         .storage
-        .list_knowledge_items(limit, offset, project_id)
+        .list_visible_knowledge_items(limit, offset, project_id)
         .await
     {
         Ok(items) => {
             let total = agent
                 .storage
-                .count_knowledge_items(project_id)
+                .count_visible_knowledge_items(project_id)
                 .await
                 .unwrap_or(0);
             (
@@ -35481,6 +37473,1168 @@ async fn delete_knowledge_item(State(state): State<AppState>, Path(id): Path<Str
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
                 error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+// ==================== ArkMemory Endpoints ====================
+
+const ARKMEMORY_MEMORY_CANDIDATE_TYPES: &[&str] = &["memory_deprecate", "memory_merge"];
+const ARKMEMORY_APPLYING_LEASE_TIMEOUT_SECS: i64 = 10 * 60;
+
+fn arkmemory_project_param(params: &HashMap<String, String>) -> Option<&str> {
+    params
+        .get("project_id")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn arkmemory_limit(params: &HashMap<String, String>, default_limit: u64) -> u64 {
+    params
+        .get("limit")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default_limit)
+        .clamp(1, 200)
+}
+
+fn arkmemory_offset(params: &HashMap<String, String>) -> u64 {
+    params
+        .get("offset")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+fn arkmemory_candidate_is_memory(candidate_type: &str) -> bool {
+    ARKMEMORY_MEMORY_CANDIDATE_TYPES.contains(&candidate_type)
+}
+
+fn arkmemory_item_is_memory(item: &crate::storage::experience_item::Model) -> bool {
+    matches!(item.kind.as_str(), "personal_fact" | "constraint")
+}
+
+fn arkmemory_item_visible_for_project(
+    item: &crate::storage::experience_item::Model,
+    project_id: Option<&str>,
+) -> bool {
+    match project_id.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(pid) => item.project_id.as_deref() == Some(pid) || item.project_id.is_none(),
+        None => item.project_id.is_none(),
+    }
+}
+
+#[derive(Default)]
+struct ArkMemoryEventContext {
+    scope: Option<String>,
+    project_id: Option<String>,
+    conversation_id: Option<String>,
+    source_ref: Option<String>,
+}
+
+impl ArkMemoryEventContext {
+    fn from_memory(item: &crate::storage::experience_item::Model) -> Self {
+        Self {
+            scope: Some(item.scope.clone()),
+            project_id: item.project_id.clone(),
+            conversation_id: item.conversation_id.clone(),
+            source_ref: Some(item.id.clone()),
+        }
+    }
+
+    fn from_candidate(candidate: &crate::storage::learning_candidate::Model) -> Self {
+        Self {
+            scope: None,
+            project_id: candidate.project_id.clone(),
+            conversation_id: candidate.conversation_id.clone(),
+            source_ref: Some(candidate.id.clone()),
+        }
+    }
+}
+
+fn arkmemory_candidate_is_stale_applying(
+    candidate: &crate::storage::learning_candidate::Model,
+) -> bool {
+    if candidate.approval_status != "applying" {
+        return false;
+    }
+    chrono::DateTime::parse_from_rfc3339(&candidate.updated_at)
+        .map(|updated_at| {
+            (chrono::Utc::now() - updated_at.with_timezone(&chrono::Utc)).num_seconds()
+                >= ARKMEMORY_APPLYING_LEASE_TIMEOUT_SECS
+        })
+        .unwrap_or(false)
+}
+
+fn arkmemory_memory_sources(item: &crate::storage::experience_item::Model) -> Vec<String> {
+    let mut sources = Vec::new();
+    let metadata = item.metadata.as_object();
+    if let Some(object) = metadata {
+        for key in ["source", "sources", "source_refs", "evidence_refs"] {
+            if let Some(value) = object.get(key) {
+                match value {
+                    serde_json::Value::String(raw) if !raw.trim().is_empty() => {
+                        sources.push(raw.trim().to_string());
+                    }
+                    serde_json::Value::Array(values) => {
+                        for entry in values {
+                            if let Some(raw) =
+                                entry.as_str().map(str::trim).filter(|v| !v.is_empty())
+                            {
+                                sources.push(raw.to_string());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    sources.sort();
+    sources.dedup();
+    sources
+}
+
+fn arkmemory_stable_event_id(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    format!("arkmemory-event-{}", hex::encode(hasher.finalize()))
+}
+
+fn arkmemory_candidate_payload(
+    candidate: &crate::storage::learning_candidate::Model,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": candidate.id,
+        "candidate_type": candidate.candidate_type,
+        "subject_key": candidate.subject_key,
+        "title": candidate.title,
+        "summary": candidate.summary,
+        "project_id": candidate.project_id,
+        "conversation_id": candidate.conversation_id,
+        "evidence_refs": candidate.evidence_refs,
+        "proposed_content": candidate.proposed_content,
+        "confidence": candidate.confidence,
+        "approval_status": candidate.approval_status,
+        "review_notes": candidate.review_notes,
+        "reviewed_at": candidate.reviewed_at,
+        "approved_ref": candidate.approved_ref,
+        "created_at": candidate.created_at,
+        "updated_at": candidate.updated_at,
+    })
+}
+
+async fn arkmemory_list_memory_candidates(
+    storage: &crate::storage::Storage,
+    project_id: Option<&str>,
+    limit: u64,
+) -> Result<Vec<crate::storage::learning_candidate::Model>> {
+    let fetch_limit = limit.saturating_mul(2).clamp(50, 200);
+    let rows = storage
+        .list_learning_candidates_for_review(
+            &["draft", "applying"],
+            ARKMEMORY_MEMORY_CANDIDATE_TYPES,
+            project_id,
+            fetch_limit,
+        )
+        .await?;
+    let mut visible = Vec::new();
+    for mut candidate in rows {
+        if candidate.approval_status == "draft" {
+            visible.push(candidate);
+        } else if arkmemory_candidate_is_stale_applying(&candidate) {
+            let reset = storage
+                .update_learning_candidate_review_if_status(
+                    &candidate.id,
+                    "applying",
+                    "draft",
+                    Some("Reset stale ArkMemory apply claim."),
+                    None,
+                )
+                .await?;
+            if reset {
+                candidate.approval_status = "draft".to_string();
+                candidate.review_notes = Some("Reset stale ArkMemory apply claim.".to_string());
+                candidate.updated_at = chrono::Utc::now().to_rfc3339();
+                visible.push(candidate);
+            }
+        }
+        if visible.len() >= limit as usize {
+            break;
+        }
+    }
+    Ok(visible)
+}
+
+async fn arkmemory_build_health_findings(
+    storage: &crate::storage::Storage,
+    project_id: Option<&str>,
+    limit: u64,
+) -> Result<Vec<serde_json::Value>> {
+    let memory_items = storage
+        .list_active_experience_items(&["personal_fact", "constraint"], project_id, None, limit)
+        .await?;
+    let mut findings = Vec::new();
+    for item in memory_items {
+        if item.embedding.is_none() {
+            findings.push(serde_json::json!({
+                "id": format!("embedding:{}", item.id),
+                "kind": "missing_embedding",
+                "severity": "warning",
+                "memory_id": item.id,
+                "title": item.title,
+                "detail": "This memory has no semantic vector yet, so retrieval and dedup quality can be lower until it is refreshed.",
+                "action": "refresh_on_next_write",
+                "created_at": item.updated_at,
+            }));
+        }
+        if item.confidence < 0.55 {
+            findings.push(serde_json::json!({
+                "id": format!("confidence:{}", item.id),
+                "kind": "low_confidence",
+                "severity": "review",
+                "memory_id": item.id,
+                "title": item.title,
+                "detail": "This memory is below the normal confidence floor and should be reviewed before it shapes future answers.",
+                "action": "review_memory",
+                "created_at": item.updated_at,
+            }));
+        }
+        if arkmemory_memory_sources(&item).is_empty() {
+            findings.push(serde_json::json!({
+                "id": format!("source:{}", item.id),
+                "kind": "missing_source",
+                "severity": "review",
+                "memory_id": item.id,
+                "title": item.title,
+                "detail": "This memory has no structured source references attached.",
+                "action": "review_provenance",
+                "created_at": item.updated_at,
+            }));
+        }
+        if findings.len() >= limit as usize {
+            break;
+        }
+    }
+    Ok(findings)
+}
+
+fn arkmemory_event_model_with_id(
+    id: String,
+    event_type: &str,
+    memory_id: Option<String>,
+    related_memory_id: Option<String>,
+    summary: impl Into<String>,
+    metadata: serde_json::Value,
+    context: ArkMemoryEventContext,
+) -> crate::storage::recall_event::Model {
+    let now = chrono::Utc::now().to_rfc3339();
+    crate::storage::recall_event::Model {
+        id,
+        event_type: event_type.to_string(),
+        memory_id,
+        related_memory_id,
+        scope: context.scope,
+        project_id: context.project_id,
+        conversation_id: context.conversation_id,
+        source_kind: Some("arkmemory".to_string()),
+        source_ref: context.source_ref,
+        actor: "arkmemory".to_string(),
+        summary: Some(summary.into()),
+        old_snapshot: serde_json::Value::Null,
+        new_snapshot: serde_json::Value::Null,
+        metadata,
+        risk_level: None,
+        confidence: None,
+        reversible: false,
+        reverted_at: None,
+        created_at: now.clone(),
+        updated_at: now,
+    }
+}
+
+fn arkmemory_event_model(
+    event_type: &str,
+    memory_id: Option<String>,
+    related_memory_id: Option<String>,
+    summary: impl Into<String>,
+    metadata: serde_json::Value,
+    context: ArkMemoryEventContext,
+) -> crate::storage::recall_event::Model {
+    arkmemory_event_model_with_id(
+        uuid::Uuid::new_v4().to_string(),
+        event_type,
+        memory_id,
+        related_memory_id,
+        summary,
+        metadata,
+        context,
+    )
+}
+
+async fn arkmemory_record_event(
+    storage: &crate::storage::Storage,
+    event_type: &str,
+    memory_id: Option<String>,
+    related_memory_id: Option<String>,
+    summary: impl Into<String>,
+    metadata: serde_json::Value,
+    context: ArkMemoryEventContext,
+) -> Result<()> {
+    let event = arkmemory_event_model(
+        event_type,
+        memory_id,
+        related_memory_id,
+        summary,
+        metadata,
+        context,
+    );
+    storage.insert_recall_event(&event).await
+}
+
+async fn arkmemory_record_event_once(
+    storage: &crate::storage::Storage,
+    event_id: String,
+    event_type: &str,
+    memory_id: Option<String>,
+    related_memory_id: Option<String>,
+    summary: impl Into<String>,
+    metadata: serde_json::Value,
+    context: ArkMemoryEventContext,
+) -> Result<()> {
+    let event = arkmemory_event_model_with_id(
+        event_id,
+        event_type,
+        memory_id,
+        related_memory_id,
+        summary,
+        metadata,
+        context,
+    );
+    storage.insert_recall_event(&event).await
+}
+
+async fn arkmemory_apply_memory_candidate(
+    storage: &crate::storage::Storage,
+    candidate_id: &str,
+    project_id: Option<&str>,
+) -> Result<String> {
+    let mut candidate = storage
+        .get_learning_candidate(candidate_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Memory queue item not found."))?;
+    if !arkmemory_candidate_is_memory(&candidate.candidate_type) {
+        anyhow::bail!("Memory queue item is not a memory operation.");
+    }
+    match project_id.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(pid) => {
+            if candidate.project_id.as_deref() != Some(pid) && candidate.project_id.is_some() {
+                anyhow::bail!("Memory queue item is outside the active project scope.");
+            }
+        }
+        None => {
+            if candidate.project_id.is_some() {
+                anyhow::bail!("Memory queue item is outside the global scope.");
+            }
+        }
+    }
+    if candidate.approval_status == "applying" && arkmemory_candidate_is_stale_applying(&candidate)
+    {
+        let reset = storage
+            .update_learning_candidate_review_if_status(
+                candidate_id,
+                "applying",
+                "draft",
+                Some("Reset stale ArkMemory apply claim."),
+                None,
+            )
+            .await?;
+        if !reset {
+            anyhow::bail!("Memory queue item is already being applied.");
+        }
+        candidate.approval_status = "draft".to_string();
+    }
+    if candidate.approval_status != "draft" {
+        anyhow::bail!("Memory queue item is no longer pending review.");
+    }
+    let claimed = storage
+        .update_learning_candidate_review_if_status(
+            candidate_id,
+            "draft",
+            "applying",
+            Some("Applying from ArkMemory."),
+            None,
+        )
+        .await?;
+    if !claimed {
+        anyhow::bail!("Memory queue item was already claimed by another review.");
+    }
+    let result = arkmemory_apply_claimed_memory_candidate(storage, &candidate).await;
+    match result {
+        Ok(approved_ref) => {
+            let finalized = storage
+                .update_learning_candidate_review_if_status(
+                    candidate_id,
+                    "applying",
+                    "approved",
+                    Some("Approved from ArkMemory."),
+                    Some(&approved_ref),
+                )
+                .await?;
+            if !finalized {
+                anyhow::bail!("Memory queue item changed while it was being applied.");
+            }
+            Ok(approved_ref)
+        }
+        Err(error) => {
+            let note = format!("Apply failed: {error:#}");
+            let _ = storage
+                .update_learning_candidate_review_if_status(
+                    candidate_id,
+                    "applying",
+                    "draft",
+                    Some(&note),
+                    None,
+                )
+                .await;
+            Err(error)
+        }
+    }
+}
+
+async fn arkmemory_apply_claimed_memory_candidate(
+    storage: &crate::storage::Storage,
+    candidate: &crate::storage::learning_candidate::Model,
+) -> Result<String> {
+    let approved_ref = match candidate.candidate_type.as_str() {
+        "memory_deprecate" => {
+            let item_id = candidate
+                .proposed_content
+                .get("item_id")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("Memory deprecation item is missing item_id."))?;
+            let item = storage
+                .get_experience_item(item_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Memory item not found."))?;
+            if !arkmemory_item_is_memory(&item) {
+                anyhow::bail!("Memory queue item points at a non-memory experience item.");
+            }
+            if !arkmemory_item_visible_for_project(&item, candidate.project_id.as_deref()) {
+                anyhow::bail!("Memory queue item is outside its project scope.");
+            }
+            let next_status = candidate
+                .proposed_content
+                .get("next_status")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| *value == "deprecated")
+                .unwrap_or("deprecated");
+            storage
+                .update_experience_item_status(item_id, next_status)
+                .await?;
+            arkmemory_record_event(
+                storage,
+                "queue_memory_deprecated",
+                Some(item_id.to_string()),
+                None,
+                format!("Approved memory deprecation for {}", item_id),
+                serde_json::json!({ "candidate_id": candidate.id.clone(), "next_status": next_status }),
+                ArkMemoryEventContext::from_memory(&item),
+            )
+            .await?;
+            item_id.to_string()
+        }
+        "memory_merge" => {
+            let target_item_id = candidate
+                .proposed_content
+                .get("target_item_id")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("Memory merge item is missing target_item_id."))?;
+            let source_item_id = candidate
+                .proposed_content
+                .get("source_item_id")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("Memory merge item is missing source_item_id."))?;
+            if target_item_id == source_item_id {
+                anyhow::bail!("Memory merge source and target must be different items.");
+            }
+            let target_item = storage
+                .get_experience_item(target_item_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Memory merge target item not found."))?;
+            let source_item = storage
+                .get_experience_item(source_item_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Memory merge source item not found."))?;
+            if !arkmemory_item_is_memory(&target_item) || !arkmemory_item_is_memory(&source_item) {
+                anyhow::bail!("Memory merge can only apply to memory experience items.");
+            }
+            if !arkmemory_item_visible_for_project(&target_item, candidate.project_id.as_deref())
+                || !arkmemory_item_visible_for_project(
+                    &source_item,
+                    candidate.project_id.as_deref(),
+                )
+            {
+                anyhow::bail!("Memory merge is outside its project scope.");
+            }
+            storage
+                .update_experience_item_status(source_item_id, "deprecated")
+                .await?;
+            let now = chrono::Utc::now().to_rfc3339();
+            storage
+                .upsert_experience_edge(&crate::storage::experience_edge::Model {
+                    id: format!("arkmemory-edge-{}", candidate.id),
+                    source_ref: target_item_id.to_string(),
+                    source_kind: "experience_item".to_string(),
+                    target_ref: source_item_id.to_string(),
+                    target_kind: "experience_item".to_string(),
+                    edge_type: "supersedes".to_string(),
+                    weight: 1.0,
+                    source_run_id: None,
+                    metadata: serde_json::json!({ "approved_via": "arkmemory", "candidate_id": candidate.id.clone() }),
+                    created_at: now.clone(),
+                    updated_at: now,
+                })
+                .await?;
+            arkmemory_record_event(
+                storage,
+                "queue_memory_merged",
+                Some(target_item_id.to_string()),
+                Some(source_item_id.to_string()),
+                format!("Approved memory merge into {}", target_item_id),
+                serde_json::json!({ "candidate_id": candidate.id.clone() }),
+                ArkMemoryEventContext::from_memory(&target_item),
+            )
+            .await?;
+            target_item_id.to_string()
+        }
+        _ => unreachable!(),
+    };
+    Ok(approved_ref)
+}
+
+async fn arkmemory_summary(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    let project_id = arkmemory_project_param(&params);
+    let agent = state.agent.read().await;
+    let storage = &agent.storage;
+    let facts = storage.count_facts(project_id).await.unwrap_or(0);
+    let preferences = storage
+        .count_user_preferences(project_id)
+        .await
+        .unwrap_or(0);
+    let user_data = storage
+        .count_user_data_items(project_id, None)
+        .await
+        .unwrap_or(0);
+    let knowledge = storage
+        .count_visible_knowledge_items(project_id)
+        .await
+        .unwrap_or(0);
+    let queue = arkmemory_list_memory_candidates(storage, project_id, 200)
+        .await
+        .map(|items| items.len())
+        .unwrap_or(0);
+    let ledger = storage.count_recall_events(project_id).await.unwrap_or(0);
+    let tests = storage.count_recall_tests(project_id).await.unwrap_or(0);
+    let health = arkmemory_build_health_findings(storage, project_id, 200)
+        .await
+        .map(|items| items.len())
+        .unwrap_or(0);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "current_memory": {
+                "facts": facts,
+                "preferences": preferences,
+                "user_data": user_data,
+                "knowledge": knowledge,
+            },
+            "queue": queue,
+            "ledger": ledger,
+            "health": health,
+            "tests": tests,
+        })),
+    )
+        .into_response()
+}
+
+async fn arkmemory_queue(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    let limit = arkmemory_limit(&params, 50);
+    let project_id = arkmemory_project_param(&params);
+    let agent = state.agent.read().await;
+    match arkmemory_list_memory_candidates(&agent.storage, project_id, limit).await {
+        Ok(items) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "items": items.iter().map(arkmemory_candidate_payload).collect::<Vec<_>>(),
+            })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn arkmemory_approve_queue_item(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    let project_id = arkmemory_project_param(&params);
+    let agent = state.agent.read().await;
+    match arkmemory_apply_memory_candidate(&agent.storage, &id, project_id).await {
+        Ok(approved_ref) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "approved": true, "approved_ref": approved_ref })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn arkmemory_reject_queue_item(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    let project_id = arkmemory_project_param(&params);
+    let agent = state.agent.read().await;
+    let storage = &agent.storage;
+    let result = async {
+        let candidate = storage
+            .get_learning_candidate(&id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Memory queue item not found."))?;
+        if !arkmemory_candidate_is_memory(&candidate.candidate_type) {
+            anyhow::bail!("Memory queue item is not a memory operation.");
+        }
+        match project_id.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(pid) => {
+                if candidate.project_id.as_deref() != Some(pid) && candidate.project_id.is_some() {
+                    anyhow::bail!("Memory queue item is outside the active project scope.");
+                }
+            }
+            None => {
+                if candidate.project_id.is_some() {
+                    anyhow::bail!("Memory queue item is outside the global scope.");
+                }
+            }
+        }
+        let rejected = storage
+            .update_learning_candidate_review_if_status(
+                &id,
+                "draft",
+                "rejected",
+                Some("Rejected from ArkMemory."),
+                None,
+            )
+            .await?;
+        if !rejected {
+            anyhow::bail!("Memory queue item is no longer pending review.");
+        }
+        arkmemory_record_event(
+            storage,
+            "queue_item_rejected",
+            None,
+            None,
+            format!("Rejected memory queue item {}", id),
+            serde_json::json!({ "candidate_id": id }),
+            ArkMemoryEventContext::from_candidate(&candidate),
+        )
+        .await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    match result {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "rejected": true })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn arkmemory_ledger(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    let project_id = arkmemory_project_param(&params);
+    let limit = arkmemory_limit(&params, 50);
+    let offset = arkmemory_offset(&params);
+    let agent = state.agent.read().await;
+    match agent
+        .storage
+        .list_recall_events(limit, offset, project_id)
+        .await
+    {
+        Ok(events) => {
+            let total = agent
+                .storage
+                .count_recall_events(project_id)
+                .await
+                .unwrap_or(0);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "events": events,
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn arkmemory_rollback_ledger_event(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    let project_id = arkmemory_project_param(&params);
+    let agent = state.agent.read().await;
+    let storage = &agent.storage;
+    let result = async {
+        let event = storage
+            .get_recall_event(&id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Memory ledger event not found."))?;
+        if !event.reversible || event.reverted_at.is_some() {
+            anyhow::bail!("Memory ledger event is not reversible.");
+        }
+        match project_id.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(pid) => {
+                if event.project_id.as_deref() != Some(pid) && event.project_id.is_some() {
+                    anyhow::bail!("Memory ledger event is outside the active project scope.");
+                }
+            }
+            None => {
+                if event.project_id.is_some() {
+                    anyhow::bail!("Memory ledger event is outside the global scope.");
+                }
+            }
+        }
+        let previous: crate::storage::experience_item::Model =
+            serde_json::from_value(event.old_snapshot.clone()).map_err(|_| {
+                anyhow::anyhow!("Memory ledger event has no restorable memory snapshot.")
+            })?;
+        if !arkmemory_item_is_memory(&previous)
+            || !arkmemory_item_visible_for_project(&previous, project_id)
+        {
+            anyhow::bail!("Memory ledger event cannot restore outside the active memory scope.");
+        }
+        let rollback_event = arkmemory_event_model(
+            "ledger_event_rolled_back",
+            Some(previous.id.clone()),
+            event.related_memory_id.clone(),
+            format!("Rolled back memory ledger event {}", id),
+            serde_json::json!({ "rolled_back_event_id": id.clone() }),
+            ArkMemoryEventContext::from_memory(&previous),
+        );
+        let marked = storage
+            .rollback_recall_event_with_memory_snapshot(&id, &previous, &rollback_event)
+            .await?;
+        if !marked {
+            anyhow::bail!("Memory ledger event was already rolled back.");
+        }
+        Ok::<String, anyhow::Error>(previous.id)
+    }
+    .await;
+    match result {
+        Ok(memory_id) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "rolled_back": true, "memory_id": memory_id })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn arkmemory_health(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    let project_id = arkmemory_project_param(&params);
+    let limit = arkmemory_limit(&params, 80);
+    let agent = state.agent.read().await;
+    match arkmemory_build_health_findings(&agent.storage, project_id, limit).await {
+        Ok(findings) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "findings": findings })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn arkmemory_apply_health(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    let project_id = arkmemory_project_param(&params);
+    let agent = state.agent.read().await;
+    let result = async {
+        let active_findings =
+            arkmemory_build_health_findings(&agent.storage, project_id, 200).await?;
+        let finding = active_findings
+            .iter()
+            .find(|finding| finding.get("id").and_then(|value| value.as_str()) == Some(id.as_str()))
+            .ok_or_else(|| anyhow::anyhow!("Memory health finding is no longer active."))?;
+        let memory_id = finding
+            .get("memory_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let context = if let Some(memory_id) = memory_id.as_deref() {
+            match agent.storage.get_experience_item(memory_id).await? {
+                Some(item) => {
+                    if !arkmemory_item_is_memory(&item)
+                        || !arkmemory_item_visible_for_project(&item, project_id)
+                    {
+                        anyhow::bail!("Memory health finding is outside the active memory scope.");
+                    }
+                    ArkMemoryEventContext::from_memory(&item)
+                }
+                None => ArkMemoryEventContext::default(),
+            }
+        } else {
+            ArkMemoryEventContext::default()
+        };
+        let project_part = project_id.unwrap_or("global");
+        let event_id =
+            arkmemory_stable_event_id(&["health_finding_acknowledged", project_part, id.as_str()]);
+        arkmemory_record_event_once(
+            &agent.storage,
+            event_id,
+            "health_finding_acknowledged",
+            memory_id,
+            None,
+            format!("Acknowledged memory health finding {}", id),
+            serde_json::json!({ "finding_id": id }),
+            context,
+        )
+        .await
+    }
+    .await;
+    match result {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "applied": true }))).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn arkmemory_sources(
+    State(state): State<AppState>,
+    Path(memory_id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    let project_id = arkmemory_project_param(&params);
+    let agent = state.agent.read().await;
+    let storage = &agent.storage;
+    let result = async {
+        let memory = storage
+            .get_experience_item(&memory_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Memory item not found."))?;
+        if !arkmemory_item_is_memory(&memory)
+            || !arkmemory_item_visible_for_project(&memory, project_id)
+        {
+            anyhow::bail!("Memory item is outside the active memory scope.");
+        }
+        let mut edges = Vec::new();
+        for edge in storage
+            .list_experience_edges_for_item(&memory_id, 100)
+            .await?
+        {
+            let related_item_id =
+                if edge.source_kind == "experience_item" && edge.source_ref != memory_id {
+                    Some(edge.source_ref.as_str())
+                } else if edge.target_kind == "experience_item" && edge.target_ref != memory_id {
+                    Some(edge.target_ref.as_str())
+                } else {
+                    None
+                };
+            let visible = match related_item_id {
+                Some(related_id) => match storage.get_experience_item(related_id).await? {
+                    Some(item) => {
+                        arkmemory_item_is_memory(&item)
+                            && arkmemory_item_visible_for_project(&item, project_id)
+                    }
+                    None => false,
+                },
+                None => true,
+            };
+            if visible {
+                edges.push(edge);
+            }
+        }
+        let events = storage
+            .list_recall_events_for_memory(&memory_id, 100, project_id)
+            .await?;
+        Ok::<serde_json::Value, anyhow::Error>(serde_json::json!({
+            "memory": memory,
+            "edges": edges,
+            "events": events,
+            "sources": arkmemory_memory_sources(&memory),
+        }))
+    }
+    .await;
+    match result {
+        Ok(payload) => (StatusCode::OK, Json(payload)).into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn arkmemory_tests(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    let project_id = arkmemory_project_param(&params);
+    let limit = arkmemory_limit(&params, 50);
+    let offset = arkmemory_offset(&params);
+    let agent = state.agent.read().await;
+    match agent
+        .storage
+        .list_recall_tests(limit, offset, project_id)
+        .await
+    {
+        Ok(tests) => {
+            let total = agent
+                .storage
+                .count_recall_tests(project_id)
+                .await
+                .unwrap_or(0);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "tests": tests,
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn arkmemory_run_tests(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    let project_id = arkmemory_project_param(&params);
+    let agent = state.agent.read().await;
+    let storage = &agent.storage;
+    let result = async {
+        let memories = storage
+            .list_active_experience_items(&["personal_fact", "constraint"], project_id, None, 25)
+            .await?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut generated = 0usize;
+        for memory in memories {
+            let test_id = format!("recall-test-{}", memory.id);
+            let test = crate::storage::recall_test::Model {
+                id: test_id.clone(),
+                memory_id: Some(memory.id.clone()),
+                scope: memory.scope.clone(),
+                project_id: memory.project_id.clone(),
+                conversation_id: memory.conversation_id.clone(),
+                prompt: "Return the current value of this stored memory.".to_string(),
+                expected_answer: memory.content.clone(),
+                status: "pending".to_string(),
+                last_answer: None,
+                last_run_at: Some(now.clone()),
+                metadata: serde_json::json!({ "generated_by": "arkmemory", "memory_kind": memory.kind }),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            };
+            storage.upsert_recall_test(&test).await?;
+            generated += 1;
+        }
+        arkmemory_record_event(
+            storage,
+            "recall_tests_refreshed",
+            None,
+            None,
+            format!("Refreshed {} memory checks", generated),
+            serde_json::json!({ "generated_or_refreshed": generated }),
+            ArkMemoryEventContext {
+                project_id: project_id.map(|value| value.to_string()),
+                ..ArkMemoryEventContext::default()
+            },
+        )
+        .await?;
+        Ok::<usize, anyhow::Error>(generated)
+    }
+    .await;
+    match result {
+        Ok(generated) => (
+            StatusCode::OK,
+            Json(
+                serde_json::json!({ "refreshed": generated, "generated_or_refreshed": generated }),
+            ),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn arkmemory_cleanup(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    let project_id = arkmemory_project_param(&params);
+    let limit = arkmemory_limit(&params, 80);
+    let agent = state.agent.read().await;
+    let result = async {
+        let events = agent
+            .storage
+            .list_reverted_recall_events(limit, project_id)
+            .await?
+            .into_iter()
+            .map(|event| {
+                let title = event
+                    .summary
+                    .clone()
+                    .unwrap_or_else(|| event.event_type.clone());
+                serde_json::json!({
+                    "id": format!("reverted-event:{}", event.id),
+                    "kind": "reverted_ledger_event",
+                    "title": title,
+                    "detail": "This ledger event has already been rolled back and can age out through retention.",
+                    "created_at": event.created_at,
+                    "memory_id": event.memory_id,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok::<Vec<serde_json::Value>, anyhow::Error>(events)
+    }
+    .await;
+    match result {
+        Ok(items) => (StatusCode::OK, Json(serde_json::json!({ "items": items }))).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn arkmemory_apply_cleanup(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    let project_id = arkmemory_project_param(&params);
+    let agent = state.agent.read().await;
+    let project_part = project_id.unwrap_or("global");
+    let event_id = arkmemory_stable_event_id(&["cleanup_review_acknowledged", project_part]);
+    let result = arkmemory_record_event_once(
+        &agent.storage,
+        event_id,
+        "cleanup_review_acknowledged",
+        None,
+        None,
+        "Acknowledged ArkMemory cleanup review",
+        serde_json::json!({ "cleanup": "retention_managed" }),
+        ArkMemoryEventContext {
+            project_id: project_id.map(|value| value.to_string()),
+            ..ArkMemoryEventContext::default()
+        },
+    )
+    .await;
+    match result {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "applied": true, "retention_managed": true })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
             }),
         )
             .into_response(),
@@ -37773,6 +40927,9 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("Push notifications paused until"));
+        assert!(payload["conversation_id"]
+            .as_str()
+            .is_some_and(|value| !value.trim().is_empty()));
 
         let agent = state.agent.read().await;
         assert!(agent.push_notifications_muted_until_ts().await.is_some());
@@ -37809,6 +40966,7 @@ mod tests {
         let text = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(text.contains("event: content"));
         assert!(text.contains("TEST_STREAM_SECRET"));
+        assert!(text.contains("\"conversation_id\":\""));
 
         let manager = crate::core::config::SecureConfigManager::new_with_data_dir(
             config_dir.path(),
@@ -38841,6 +41999,152 @@ const appWrapped = "/apps/demo-app/__agentark/http/fetch?url=https://api.github.
     }
 
     #[tokio::test]
+    async fn profile_onboarding_endpoint_persists_answers_and_marks_complete() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        let router = Router::new()
+            .route("/profile", get(get_profile))
+            .route("/profile/onboarding", post(update_profile_onboarding))
+            .with_state(state.clone());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/profile/onboarding")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "preferred_name": "Ava",
+                            "timezone": "America/New_York",
+                            "tone": "concise",
+                            "priority_focus": "Inbox triage and daily brief follow-up"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let status = response.status();
+        let body = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "unexpected response: {}", body);
+        assert_eq!(
+            body.get("name").and_then(|value| value.as_str()),
+            Some("Ava")
+        );
+        assert_eq!(
+            body.get("priority_focus").and_then(|value| value.as_str()),
+            Some("Inbox triage and daily brief follow-up")
+        );
+        assert_eq!(
+            body.get("onboarding_complete")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            body.get("personalization_dismissed")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
+
+        let profile = state.user_profile.read().await.clone();
+        assert_eq!(profile.timezone.as_deref(), Some("America/New_York"));
+        assert_eq!(profile.tone.as_deref(), Some("concise"));
+        assert!(profile.onboarding_complete);
+
+        let agent = state.agent.read().await;
+        let name_pref = agent
+            .storage
+            .get_user_preference("user_name", None)
+            .await
+            .expect("user_name lookup should succeed")
+            .expect("user_name should be stored");
+        assert_eq!(name_pref.value, "Ava");
+        let focus_pref = agent
+            .storage
+            .get_user_preference("assistant_priority_focus", None)
+            .await
+            .expect("priority focus lookup should succeed")
+            .expect("priority focus should be stored");
+        assert_eq!(focus_pref.value, "Inbox triage and daily brief follow-up");
+    }
+
+    #[tokio::test]
+    async fn profile_onboarding_dismiss_endpoint_hides_prompt_until_settings_are_used() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        let router = Router::new()
+            .route("/profile", get(get_profile))
+            .route(
+                "/profile/onboarding/dismiss",
+                post(update_profile_onboarding_dismiss),
+            )
+            .with_state(state.clone());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/profile/onboarding/dismiss")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let status = response.status();
+        let body = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "unexpected response: {}", body);
+        assert_eq!(
+            body.get("personalization_dismissed")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            body.get("onboarding_complete")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
+
+        let profile = state.user_profile.read().await.clone();
+        assert!(profile.personalization_dismissed);
+        assert!(!profile.onboarding_complete);
+    }
+
+    #[tokio::test]
+    async fn profile_onboarding_endpoint_rejects_invalid_timezone() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        let router = Router::new()
+            .route("/profile/onboarding", post(update_profile_onboarding))
+            .with_state(state);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/profile/onboarding")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "preferred_name": "Ava",
+                            "timezone": "Mars/Olympus_Mons",
+                            "tone": "concise",
+                            "priority_focus": "Inbox triage"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert!(body
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .contains("Invalid timezone"));
+    }
+
+    #[tokio::test]
     async fn gateway_channels_endpoint_returns_transport_inventory() {
         let (state, _config_dir, _data_dir) = build_test_state().await;
         {
@@ -39485,6 +42789,12 @@ const appWrapped = "/apps/demo-app/__agentark/http/fetch?url=https://api.github.
             consolidated: false,
             accepted_at: None,
             corrected_at: None,
+            heuristic_reflected: false,
+            heuristic_reflection_status: None,
+            heuristic_reflection_attempted_at: None,
+            heuristic_reflection_completed_at: None,
+            heuristic_lesson_id: None,
+            heuristic_reflection_error: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         }
@@ -39809,6 +43119,42 @@ const appWrapped = "/apps/demo-app/__agentark/http/fetch?url=https://api.github.
             .await
             .expect_err("openai-compatible slots should require an explicit base URL");
         assert!(error.contains("Base URL is required"));
+    }
+
+    #[test]
+    fn analytics_openrouter_estimate_includes_request_charge() {
+        let mut prices = HashMap::new();
+        prices.insert(
+            "openai/gpt-4".to_string(),
+            OpenRouterModelPricing {
+                prompt_per_token: 0.1,
+                completion_per_token: 0.2,
+                request_per_request: 0.3,
+            },
+        );
+
+        assert_eq!(
+            estimate_cost_usd("openrouter", "openai/gpt-4", 2, 3, &prices),
+            Some(1.1)
+        );
+    }
+
+    #[test]
+    fn analytics_openrouter_estimate_skips_generic_openai_compatible_rows() {
+        let mut prices = HashMap::new();
+        prices.insert(
+            "openai/gpt-4".to_string(),
+            OpenRouterModelPricing {
+                prompt_per_token: 0.1,
+                completion_per_token: 0.2,
+                request_per_request: 0.3,
+            },
+        );
+
+        assert_eq!(
+            estimate_cost_usd("openai-compatible", "openai/gpt-4", 2, 3, &prices),
+            None
+        );
     }
 
     #[tokio::test]

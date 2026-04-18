@@ -421,6 +421,50 @@ impl DeploymentMode {
     }
 }
 
+/// Runtime-configurable security guards.
+///
+/// Defaults deny private/local/metadata targets; administrators can opt in
+/// to specific internal hosts via `tool_args.host_whitelist`. The abuse
+/// tracker is no-auto-block by design: tripping the threshold requests
+/// admin approval rather than locking anyone out.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecurityConfig {
+    #[serde(default)]
+    pub tool_args: crate::security::tool_args_guard::ToolArgsGuardConfig,
+    #[serde(default)]
+    pub abuse_tracker: AbuseTrackerConfig,
+}
+
+/// Threshold configuration for the abuse approval loop.
+///
+/// `trips_threshold` = number of inbound-guard blocks tolerated inside
+/// `window_minutes` before the source is moved to pending-approval. Admin
+/// must explicitly approve or reject — no automatic timeouts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AbuseTrackerConfig {
+    #[serde(default = "default_abuse_trips_threshold")]
+    pub trips_threshold: u32,
+    #[serde(default = "default_abuse_window_minutes")]
+    pub window_minutes: u32,
+}
+
+impl Default for AbuseTrackerConfig {
+    fn default() -> Self {
+        Self {
+            trips_threshold: default_abuse_trips_threshold(),
+            window_minutes: default_abuse_window_minutes(),
+        }
+    }
+}
+
+fn default_abuse_trips_threshold() -> u32 {
+    5
+}
+
+fn default_abuse_window_minutes() -> u32 {
+    10
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PublicAppsConfig {
     /// Optional dedicated bind address for the public app listener.
@@ -535,6 +579,10 @@ pub struct AgentConfig {
     /// Controls what sensitive content may enter model prompts.
     #[serde(default)]
     pub model_privacy: ModelPrivacyConfig,
+    /// Runtime-configurable security guards (tool-argument whitelist,
+    /// abuse-tracker thresholds, etc.).
+    #[serde(default)]
+    pub security: SecurityConfig,
     /// Deployment/security posture for the control plane.
     #[serde(default)]
     pub deployment_mode: DeploymentMode,
@@ -586,6 +634,7 @@ impl Default for AgentConfig {
             tunnel: TunnelConfig::default(),
             observability: ObservabilityConfig::default(),
             model_privacy: ModelPrivacyConfig::default(),
+            security: SecurityConfig::default(),
             deployment_mode: DeploymentMode::default(),
             public_apps: PublicAppsConfig::default(),
             mcp: McpConfig::default(),

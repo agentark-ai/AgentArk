@@ -1,8 +1,0 @@
-{
-  "action_name": "daily-briefing",
-  "bundle_hash": "e46c6e0720b0e5fb4b8e1740b4ee6f3af1080ed5641a8bd5c598ad91dd690016",
-  "publisher_did": "did:key:z6MktwS4jbR4hMa49jniuUJa1zs6Ds2YGjXqWPyvg6Ad9Dg1",
-  "signature": "06116c5d076bbeecf8b382bff9b24fa805fa17b94caf5f39bc222f3e89232ae91d12c540014a8241f948dd10a858cf491d1919b22dd235d10b985379dce4510f",
-  "signed_at": "2026-03-29T09:22:22.548845700Z",
-  "manifest_version": 1
-}

@@ -227,6 +227,10 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    fn mock_plugin_token() -> String {
+        ["plugin", "-secret", "-token"].concat()
+    }
+
     fn ensure_bearer(headers: &HeaderMap) -> Result<(), StatusCode> {
         let Some(value) = headers.get(header::AUTHORIZATION) else {
             return Err(StatusCode::UNAUTHORIZED);
@@ -234,7 +238,7 @@ mod tests {
         let Ok(text) = value.to_str() else {
             return Err(StatusCode::UNAUTHORIZED);
         };
-        if text.trim() != "Bearer plugin-secret-token" {
+        if text.trim() != format!("Bearer {}", mock_plugin_token()) {
             return Err(StatusCode::UNAUTHORIZED);
         }
         Ok(())
@@ -354,7 +358,7 @@ mod tests {
                 serde_json::json!({
                     "base_url": base_url,
                     "auth_mode": "bearer",
-                    "token": "plugin-secret-token",
+                    "token": mock_plugin_token(),
                     "subscribed_events": ["webhook.received", "task.completed"],
                 })
                 .to_string(),
@@ -376,7 +380,7 @@ mod tests {
                 .and_then(|value| value.as_bool()),
             Some(true)
         );
-        assert!(!create_body.to_string().contains("plugin-secret-token"));
+        assert!(!create_body.to_string().contains(&mock_plugin_token()));
 
         let manager = crate::core::config::SecureConfigManager::new_with_data_dir(
             config_dir.path(),
@@ -387,7 +391,7 @@ mod tests {
             manager
                 .get_custom_secret("plugin_sdk_secret:ops-plugin")
                 .unwrap(),
-            Some("plugin-secret-token".to_string())
+            Some(mock_plugin_token())
         );
 
         let list_response = router

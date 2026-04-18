@@ -47,11 +47,18 @@ pub fn strip_release_tag_prefix(tag: &str) -> String {
 }
 
 pub fn image_repository(image_ref: &str) -> String {
-    let without_digest = image_ref.trim().split('@').next().unwrap_or(image_ref.trim());
+    let without_digest = image_ref
+        .trim()
+        .split('@')
+        .next()
+        .unwrap_or(image_ref.trim());
     let last_slash = without_digest.rfind('/');
     let last_colon = without_digest.rfind(':');
     if let Some(colon_idx) = last_colon {
-        if last_slash.map(|slash_idx| colon_idx > slash_idx).unwrap_or(true) {
+        if last_slash
+            .map(|slash_idx| colon_idx > slash_idx)
+            .unwrap_or(true)
+        {
             return without_digest[..colon_idx].to_string();
         }
     }
@@ -83,7 +90,10 @@ pub async fn fetch_latest_release_info(
     let payload = client
         .get(url)
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .header(reqwest::header::USER_AGENT, crate::branding::versioned_user_agent())
+        .header(
+            reqwest::header::USER_AGENT,
+            crate::branding::versioned_user_agent(),
+        )
         .send()
         .await
         .context("Failed to request the latest AgentArk release")?
@@ -101,7 +111,10 @@ pub async fn fetch_latest_release_info(
 
 fn parse_release_version(input: &str) -> Option<ParsedReleaseVersion> {
     let trimmed = strip_release_tag_prefix(input);
-    let core = trimmed.split_once('+').map(|(base, _)| base).unwrap_or(&trimmed);
+    let core = trimmed
+        .split_once('+')
+        .map(|(base, _)| base)
+        .unwrap_or(&trimmed);
     let (version_core, pre_release) = match core.split_once('-') {
         Some((base, pre)) if !pre.trim().is_empty() => (base, Some(pre.trim().to_string())),
         _ => (core, None),
@@ -180,7 +193,9 @@ mod tests {
 
     #[test]
     fn detects_ui_update_support_for_managed_images() {
-        assert!(ui_update_supported_image("ghcr.io/agentark-ai/agentark:latest"));
+        assert!(ui_update_supported_image(
+            "ghcr.io/agentark-ai/agentark:latest"
+        ));
         assert!(!ui_update_supported_image("agentark:dev"));
     }
 }

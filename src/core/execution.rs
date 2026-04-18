@@ -824,10 +824,17 @@ impl ExecutionRun {
         deadline_at: Option<String>,
     ) -> Self {
         let now = now_rfc3339();
+        let stable_request_id = request_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
         Self {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: stable_request_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             kind: kind.into(),
-            request_id,
+            request_id: stable_request_id,
             status: ExecutionRunStatus::Accepted,
             current_stage: ExecutionRunStatus::Accepted.as_str().to_string(),
             lease_owner: None,

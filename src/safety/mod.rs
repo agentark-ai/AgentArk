@@ -566,6 +566,7 @@ mod tests {
             current_turn_is_explicit_approval: false,
             agent_name: None,
             agent_access_scope: None,
+            capability_context_id: None,
         };
         assert!(direct_trusted_chat_overrides_safety(Some(&ctx)));
     }
@@ -584,6 +585,7 @@ mod tests {
             current_turn_is_explicit_approval: false,
             agent_name: None,
             agent_access_scope: None,
+            capability_context_id: None,
         };
         assert!(!direct_trusted_chat_overrides_safety(Some(&ctx)));
     }
@@ -614,6 +616,7 @@ mod tests {
             current_turn_is_explicit_approval: false,
             agent_name: None,
             agent_access_scope: None,
+            capability_context_id: None,
         };
 
         assert!(safety

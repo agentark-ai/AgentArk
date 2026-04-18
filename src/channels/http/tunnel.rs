@@ -1968,7 +1968,10 @@ async fn spawn_ngrok_tunnel(
                     "stderr",
                 );
             }
-            crate::spawn_logged!("src/channels/http/tunnel.rs:1971", spawn_ngrok_url_probe(tunnel_arc));
+            crate::spawn_logged!(
+                "src/channels/http/tunnel.rs:1971",
+                spawn_ngrok_url_probe(tunnel_arc)
+            );
             Ok(())
         }
         Err(e) => Err(format!("Failed to start ngrok tunnel: {}", e)),
@@ -2032,12 +2035,16 @@ async fn spawn_tailscale_tunnel(
                     "stderr",
                 );
             }
-            crate::spawn_logged!("src/channels/http/tunnel.rs:2035", spawn_tailscale_url_probe(
-                tunnel_arc,
-                TunnelProviderKind::TailscaleFunnel,
-                binary.to_string(),
-                (!config.auth_key.trim().is_empty()).then(|| config.auth_key.trim().to_string()),
-            ));
+            crate::spawn_logged!(
+                "src/channels/http/tunnel.rs:2035",
+                spawn_tailscale_url_probe(
+                    tunnel_arc,
+                    TunnelProviderKind::TailscaleFunnel,
+                    binary.to_string(),
+                    (!config.auth_key.trim().is_empty())
+                        .then(|| config.auth_key.trim().to_string()),
+                )
+            );
             Ok(())
         }
         Err(e) => Err(format!("Failed to start Tailscale Funnel: {}", e)),
@@ -2101,12 +2108,16 @@ async fn spawn_tailscale_private_access(
                     "stderr",
                 );
             }
-            crate::spawn_logged!("src/channels/http/tunnel.rs:2104", spawn_tailscale_url_probe(
-                tunnel_arc,
-                TunnelProviderKind::TailscalePrivate,
-                binary.to_string(),
-                (!config.auth_key.trim().is_empty()).then(|| config.auth_key.trim().to_string()),
-            ));
+            crate::spawn_logged!(
+                "src/channels/http/tunnel.rs:2104",
+                spawn_tailscale_url_probe(
+                    tunnel_arc,
+                    TunnelProviderKind::TailscalePrivate,
+                    binary.to_string(),
+                    (!config.auth_key.trim().is_empty())
+                        .then(|| config.auth_key.trim().to_string()),
+                )
+            );
             Ok(())
         }
         Err(e) => Err(format!("Failed to start Tailscale private access: {}", e)),
@@ -2220,6 +2231,30 @@ pub(super) async fn start_tunnel(
             return (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "error": "App not found" })),
+            )
+                .into_response();
+        }
+        if !state.app_registry.access_guard_enabled(app_id).await {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Public app exposure requires App Guard with an access password. Set one in Apps before starting public access."
+                })),
+            )
+                .into_response();
+        }
+        if state
+            .app_registry
+            .access_key(app_id)
+            .await
+            .map(|value| value.trim().is_empty())
+            .unwrap_or(true)
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Public app exposure requires a non-empty access password. Set one in Apps before starting public access."
+                })),
             )
                 .into_response();
         }

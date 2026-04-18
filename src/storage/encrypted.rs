@@ -10,6 +10,8 @@ use super::Storage;
 use crate::crypto::KeyManager;
 use anyhow::Result;
 use parking_lot::RwLock;
+#[cfg(test)]
+use sea_orm::entity::prelude::PgVector;
 use std::sync::Arc;
 
 /// Encrypted storage that wraps the base storage

@@ -1239,9 +1239,17 @@ impl ResearchClient {
         let (final_url, html) = self
             .fetch_html_with_safe_redirects(validated_url.clone())
             .await?;
-        // Fast-path: Lightpanda returns clean markdown (no HTML stripping needed)
+        // Fast-path: Lightpanda returns clean markdown. Still wrap it in the
+        // untrusted envelope: the remote server is attacker-controllable, and
+        // clean markdown can still carry embedded instructions.
+        let origin_label = source_host_label(final_url.as_str());
         match crate::integrations::lightpanda::fetch_markdown(final_url.as_str()).await {
-            Ok(markdown) => return Ok(markdown),
+            Ok(markdown) => {
+                return Ok(crate::security::sanitize_untrusted_output(
+                    &format!("web_page:{}", origin_label),
+                    &markdown,
+                ));
+            }
             Err(e) => {
                 tracing::debug!(
                     "Lightpanda unavailable for research fetch, falling back to reqwest: {}",
@@ -1253,7 +1261,7 @@ impl ResearchClient {
                         "Reading sources",
                         format!(
                             "Using direct fetch for {} after Lightpanda fallback ({}).",
-                            source_host_label(final_url.as_str()),
+                            origin_label,
                             summarize_error(&e)
                         ),
                         "running",
@@ -1263,8 +1271,12 @@ impl ResearchClient {
             }
         }
 
-        // Extract text content from HTML
-        Ok(self.extract_text_from_html(&html))
+        // HTML fallback: run structural neutralization (strip script/style/
+        // hidden elements/comments) and wrap.
+        Ok(crate::security::sanitize_untrusted_html(
+            &format!("web_page:{}", origin_label),
+            &html,
+        ))
     }
 
     async fn fetch_html_with_safe_redirects(
@@ -1300,7 +1312,9 @@ impl ResearchClient {
             }
             return Err(anyhow!("Failed to fetch URL: {}", response.status()));
         }
-        Err(anyhow!("Too many redirects while fetching research content"))
+        Err(anyhow!(
+            "Too many redirects while fetching research content"
+        ))
     }
 
     fn filter_search_results_for_query(
@@ -1584,80 +1598,6 @@ impl ResearchClient {
             source_index,
             supporting_source_indices: vec![source_index],
         })
-    }
-
-    /// Extract text content from HTML
-    fn extract_text_from_html(&self, html: &str) -> String {
-        // Insert block boundaries before stripping tags so paragraphs do not collapse.
-        let mut text = html
-            .replace("<br>", "\n")
-            .replace("<br/>", "\n")
-            .replace("<br />", "\n");
-        for block_tag in [
-            "</p>",
-            "</div>",
-            "</section>",
-            "</article>",
-            "</header>",
-            "</footer>",
-            "</main>",
-            "</aside>",
-            "</h1>",
-            "</h2>",
-            "</h3>",
-            "</h4>",
-            "</h5>",
-            "</h6>",
-            "</li>",
-            "</ul>",
-            "</ol>",
-            "</table>",
-            "</tr>",
-            "</td>",
-            "</th>",
-        ] {
-            text = text.replace(block_tag, &format!("{}\n", block_tag));
-        }
-
-        // Simple regex-free HTML stripping
-        // Remove script tags
-        while let Some(start) = text.find("<script") {
-            if let Some(end) = text[start..].find("</script>") {
-                text = format!("{}{}", &text[..start], &text[start + end + 9..]);
-            } else {
-                break;
-            }
-        }
-
-        // Remove style tags
-        while let Some(start) = text.find("<style") {
-            if let Some(end) = text[start..].find("</style>") {
-                text = format!("{}{}", &text[..start], &text[start + end + 8..]);
-            } else {
-                break;
-            }
-        }
-
-        // Remove all remaining HTML tags
-        let mut result = String::new();
-        let mut in_tag = false;
-
-        for c in text.chars() {
-            match c {
-                '<' => in_tag = true,
-                '>' => in_tag = false,
-                _ if !in_tag => result.push(c),
-                _ => {}
-            }
-        }
-
-        // Clean up whitespace
-        result
-            .lines()
-            .map(|l| l.trim())
-            .filter(|l| !l.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n")
     }
 
     /// Extract key points from content relevant to the query

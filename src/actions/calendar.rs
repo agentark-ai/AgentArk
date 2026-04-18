@@ -229,7 +229,7 @@ async fn fetch_events(config_dir: &Path, start: &str, end: &str) -> Result<Strin
 
     let mut output = format!("Found {} event(s):\n\n", events.len());
     for e in events {
-        let summary = e
+        let raw_summary = e
             .get("summary")
             .and_then(|v| v.as_str())
             .unwrap_or("(No title)");
@@ -243,10 +243,16 @@ async fn fetch_events(config_dir: &Path, start: &str, end: &str) -> Result<Strin
             .and_then(|s| s.get("dateTime").or_else(|| s.get("date")))
             .and_then(|v| v.as_str())
             .unwrap_or("?");
-        let location = e.get("location").and_then(|v| v.as_str()).unwrap_or("");
+        let raw_location = e.get("location").and_then(|v| v.as_str()).unwrap_or("");
 
+        // Event titles and locations are authored by meeting organizers —
+        // anyone who can send a calendar invite, including outside parties —
+        // so wrap them as untrusted data.
+        let summary = crate::security::sanitize_untrusted_output("calendar_event", raw_summary);
         output.push_str(&format!("- {} ({} to {})", summary, start_time, end_time));
-        if !location.is_empty() {
+        if !raw_location.is_empty() {
+            let location =
+                crate::security::sanitize_untrusted_output("calendar_location", raw_location);
             output.push_str(&format!(" @ {}", location));
         }
         output.push('\n');

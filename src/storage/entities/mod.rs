@@ -1,5 +1,6 @@
 //! SeaORM Entity definitions
 
+pub mod abuse_tracker_state;
 pub mod action;
 pub mod approval_log;
 pub mod arkpulse_event;
@@ -26,6 +27,8 @@ pub mod notification;
 pub mod operational_log;
 pub mod procedural_pattern;
 pub mod project;
+pub mod recall_event;
+pub mod recall_test;
 pub mod run_checkpoint;
 pub mod security_log;
 pub mod swarm_agent;

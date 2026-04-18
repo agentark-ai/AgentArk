@@ -207,7 +207,10 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
             experience_item::Entity,
             experience_edge::Entity,
             procedural_pattern::Entity,
-            learning_candidate::Entity
+            learning_candidate::Entity,
+            recall_event::Entity,
+            recall_test::Entity,
+            abuse_tracker_state::Entity
         ]
     );
 
@@ -218,7 +221,6 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
         "swarm_agents.access_scope column",
     )
     .await?;
-
     for (constraint_name, table, column, referenced_table, referenced_column, on_delete) in [
         (
             "fk_conversations_project_id",
@@ -828,6 +830,19 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
         "document chunk pgvector HNSW index",
     )
     .await?;
+    ensure_pgvector_hnsw_index(
+        db,
+        backend,
+        "experience_items",
+        "embedding",
+        "CREATE INDEX IF NOT EXISTS idx_experience_items_embedding_hnsw \
+         ON experience_items USING hnsw (embedding vector_cosine_ops) \
+         WHERE embedding IS NOT NULL \
+           AND status = 'active' \
+           AND kind IN ('personal_fact', 'constraint')",
+        "experience_items personal-fact pgvector HNSW partial index",
+    )
+    .await?;
     ensure_index(
         db,
         backend,
@@ -1374,6 +1389,20 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
         db,
         backend,
         Index::create()
+            .name("idx_experience_runs_heuristic_reflection")
+            .table(experience_run::Entity)
+            .col(experience_run::Column::Consolidated)
+            .col(experience_run::Column::HeuristicReflected)
+            .col(experience_run::Column::HeuristicReflectionStatus)
+            .col(experience_run::Column::UpdatedAt)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
             .name("idx_experience_items_scope_key")
             .table(experience_item::Entity)
             .col(experience_item::Column::Kind)
@@ -1550,6 +1579,91 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
             .col(learning_candidate::Column::ProjectId)
             .col(learning_candidate::Column::ApprovalStatus)
             .col(learning_candidate::Column::UpdatedAt)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_recall_events_memory_created")
+            .table(recall_event::Entity)
+            .col(recall_event::Column::MemoryId)
+            .col(recall_event::Column::CreatedAt)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_recall_events_related_created")
+            .table(recall_event::Entity)
+            .col(recall_event::Column::RelatedMemoryId)
+            .col(recall_event::Column::CreatedAt)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_recall_events_project_created")
+            .table(recall_event::Entity)
+            .col(recall_event::Column::ProjectId)
+            .col(recall_event::Column::CreatedAt)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_recall_events_type_created")
+            .table(recall_event::Entity)
+            .col(recall_event::Column::EventType)
+            .col(recall_event::Column::CreatedAt)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_recall_events_reverted_created")
+            .table(recall_event::Entity)
+            .col(recall_event::Column::RevertedAt)
+            .col(recall_event::Column::CreatedAt)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_recall_tests_memory")
+            .table(recall_test::Entity)
+            .col(recall_test::Column::MemoryId)
+            .col(recall_test::Column::UpdatedAt)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_recall_tests_scope")
+            .table(recall_test::Entity)
+            .col(recall_test::Column::Scope)
+            .col(recall_test::Column::ProjectId)
+            .col(recall_test::Column::UpdatedAt)
             .if_not_exists()
             .to_owned(),
     )

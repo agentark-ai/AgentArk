@@ -1,0 +1,75 @@
+# =============================================================================
+# AgentArk - Low-memory system override
+# =============================================================================
+#
+# Use this on machines with limited RAM (2-4 GB total) to reduce Postgres and
+# AgentArk memory usage.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.lowmem.yml up -d
+#
+# What this changes:
+#   - Postgres: shared_buffers=64MB, work_mem=2MB, max_connections=30,
+#     effective_cache_size=128MB, maintenance_work_mem=32MB
+#   - Postgres container: capped at 512MB (down from 1GB)
+#   - AgentArk services: connection pool reduced to 8 per service
+#   - AgentArk control: capped at 512MB (down from default)
+#   - AgentArk executor: capped at 512MB
+#
+# To revert, just run without the override:
+#   docker compose up -d
+#
+# =============================================================================
+
+services:
+  postgres:
+    command:
+      - postgres
+      - -c
+      - log_checkpoints=off
+      - -c
+      - shared_buffers=64MB
+      - -c
+      - work_mem=2MB
+      - -c
+      - max_connections=30
+      - -c
+      - effective_cache_size=128MB
+      - -c
+      - maintenance_work_mem=32MB
+      - -c
+      - wal_buffers=4MB
+      - -c
+      - checkpoint_completion_target=0.9
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.15"
+          memory: 128M
+
+  agentark-control:
+    environment:
+      - AGENTARK_DB_MAX_CONNECTIONS=8
+      - AGENTARK_DB_IDLE_TIMEOUT_SECS=120
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  agentark-executor:
+    environment:
+      - AGENTARK_DB_MAX_CONNECTIONS=8
+      - AGENTARK_DB_IDLE_TIMEOUT_SECS=120
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  agentark-workspace:
+    deploy:
+      resources:
+        limits:
+          memory: 256M

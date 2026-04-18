@@ -1,8 +1,0 @@
-{
-  "action_name": "invoice",
-  "bundle_hash": "abd0a8409d9dac8e15225c39dff825ed51fd8fbe6871e265383c69bdd32e087a",
-  "publisher_did": "did:key:z6MktwS4jbR4hMa49jniuUJa1zs6Ds2YGjXqWPyvg6Ad9Dg1",
-  "signature": "64f45c09168269250bbe6a584986dbd8e041d018c7ab13954e8ca1c448819b3d315bdcb0bef0c47aee371a2b5d0a4bd32fb831ab9de86c79f79964bcb9707003",
-  "signed_at": "2026-03-29T09:22:22.561273800Z",
-  "manifest_version": 1
-}

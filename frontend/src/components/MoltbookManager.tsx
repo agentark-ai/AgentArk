@@ -503,6 +503,7 @@ export function MoltbookManager({ autoRefresh }: { autoRefresh: boolean }) {
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [selectedRun, setSelectedRun] = useState<RunGroup | null>(null);
+  const [runPage, setRunPage] = useState(0);
   const [pollState, setPollState] = useState<{ baselineEventId: string; deadlineAt: number } | null>(null);
 
   const settingsQ = useQuery({
@@ -911,15 +912,7 @@ export function MoltbookManager({ autoRefresh }: { autoRefresh: boolean }) {
                 </Grid2>
               </Grid2>
 
-              <Box className="metadata-box">
-                <Typography variant="caption" sx={{ color: "text.secondary" }}>Current behavior</Typography>
-                <Typography variant="body2" sx={{ mt: 0.55 }}>{selectedMode.description}</Typography>
-                {showModelSelector ? (
-                  <Typography variant="caption" sx={{ color: "text.secondary", display: "block", mt: 0.75 }}>
-                    Model: {selectedModelOption.label}
-                  </Typography>
-                ) : null}
-              </Box>
+              {/* mode description is shown in the dropdown menu items */}
             </Stack>
           </Box>
         </Grid2>
@@ -981,97 +974,120 @@ export function MoltbookManager({ autoRefresh }: { autoRefresh: boolean }) {
         {runs.length === 0 ? (
           <Typography variant="body2" sx={{ color: "text.secondary" }}>No Moltbook runs yet.</Typography>
         ) : (
-          <Stack spacing={0} sx={{ borderTop: "1px solid rgba(255,255,255,0.08)" }}>
-            {runs.slice(0, 40).map((run, index) => {
-              const action = actionLabel(str(run.representative.action, "-"), asRecord(run.representative.details));
-              const timestamp = absoluteTs(run.representative.timestamp);
-              return (
-                <ButtonBase
-                  key={run.id}
-                  onClick={() => setSelectedRun(run)}
-                  sx={{
-                    width: "100%",
-                    textAlign: "left",
-                    justifyContent: "flex-start",
-                    alignItems: "stretch",
-                    px: 0,
-                    py: 1.15,
-                    borderTop: index === 0 ? "none" : "1px solid rgba(255,255,255,0.06)"
-                  }}
-                >
-                  <Stack spacing={0.55} sx={{ width: "100%", minWidth: 0 }}>
-                    <Stack
-                      direction={{ xs: "column", sm: "row" }}
-                      spacing={1}
-                      sx={{ justifyContent: "space-between", alignItems: { sm: "center" } }}
+          <>
+            <Stack spacing={0} sx={{ borderTop: "1px solid", borderColor: "divider" }}>
+              {(() => {
+                const pageSize = 20;
+                const pageCount = Math.max(1, Math.ceil(runs.length / pageSize));
+                const clampedPage = Math.min(runPage, pageCount - 1);
+                const pageRuns = runs.slice(clampedPage * pageSize, (clampedPage + 1) * pageSize);
+                return pageRuns.map((run) => {
+                  const action = actionLabel(str(run.representative.action, "-"), asRecord(run.representative.details));
+                  const timestamp = absoluteTs(run.representative.timestamp);
+                  const dotColor = run.level === "error" ? "rgba(255,100,100,0.85)" : run.level === "warning" ? "rgba(255,191,130,0.85)" : "rgba(74,210,157,0.85)";
+                  const { readCount, commentCount, upvoteCount, postCount, stepCount } = run.counts;
+                  return (
+                    <ButtonBase
+                      key={run.id}
+                      onClick={() => setSelectedRun(run)}
+                      sx={{
+                        width: "100%",
+                        textAlign: "left",
+                        justifyContent: "flex-start",
+                        px: 0,
+                        py: 0.7,
+                        borderBottom: "1px solid",
+                        borderColor: "divider",
+                        transition: "background 0.15s ease",
+                        "&:hover": { background: "rgba(57, 208, 255, 0.04)" },
+                        display: "block",
+                      }}
                     >
-                      <Stack direction="row" spacing={0.8} useFlexGap sx={{ flexWrap: "wrap", alignItems: "center", minWidth: 0 }}>
-                        <Typography variant="body2" sx={{ fontWeight: 500 }}>
-                          {action}
-                        </Typography>
-                        <Chip
-                          size="small"
-                          label={run.level}
-                          color={run.level === "error" ? "error" : run.level === "warning" ? "warning" : "success"}
-                        />
+                      <Stack direction="row" spacing={0.75} useFlexGap sx={{ alignItems: "center", justifyContent: "space-between" }}>
+                        <Stack direction="row" spacing={0.6} useFlexGap sx={{ alignItems: "center", minWidth: 0, flex: 1 }}>
+                          <Box component="span" sx={{ width: 6, height: 6, borderRadius: "50%", flexShrink: 0, bgcolor: dotColor }} />
+                          <Typography variant="caption" noWrap sx={{ fontWeight: 600, color: "text.primary" }}>{action}</Typography>
+                          <Typography variant="caption" sx={{ color: "text.secondary", whiteSpace: "nowrap" }}>
+                            {readCount > 0 ? `${readCount}r` : ""}{commentCount > 0 ? ` ${commentCount}c` : ""}{upvoteCount > 0 ? ` ${upvoteCount}l` : ""}{postCount > 0 ? ` ${postCount}p` : ""}
+                            {" · "}{stepCount}s{run.trigger ? ` · ${triggerLabel(run.trigger)}` : ""}
+                          </Typography>
+                        </Stack>
+                        <Typography variant="caption" sx={{ color: "text.secondary", whiteSpace: "nowrap", flexShrink: 0 }} title={timestamp.tip}>{timestamp.label}</Typography>
                       </Stack>
-                      <Typography variant="caption" sx={{ color: "text.secondary" }} title={timestamp.tip}>
-                        {timestamp.label}
-                      </Typography>
-                    </Stack>
-                    <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                      {run.summary}
-                    </Typography>
-                    <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                      {run.counts.readCount} read | {run.counts.commentCount} commented | {run.counts.upvoteCount} liked | {run.counts.postCount} posted
-                    </Typography>
-                    <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                      {run.trigger ? `${triggerLabel(run.trigger)} | ` : ""}{run.counts.stepCount} step{run.counts.stepCount === 1 ? "" : "s"} | Run {run.id.slice(0, 8)}
-                    </Typography>
-                  </Stack>
-                </ButtonBase>
-              );
-            })}
-          </Stack>
+                    </ButtonBase>
+                  );
+                });
+              })()}
+            </Stack>
+            {runs.length > 20 ? (
+              <Stack direction="row" spacing={0.75} sx={{ alignItems: "center", justifyContent: "space-between", mt: 1 }}>
+                <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                  {runs.length} run{runs.length === 1 ? "" : "s"}
+                </Typography>
+                <Stack direction="row" spacing={0.75} sx={{ alignItems: "center" }}>
+                  <Button size="small" variant="outlined" onClick={() => setRunPage((p) => Math.max(0, p - 1))} disabled={runPage <= 0}>Prev</Button>
+                  <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                    {Math.min(runPage, Math.ceil(runs.length / 20) - 1) + 1} of {Math.ceil(runs.length / 20)}
+                  </Typography>
+                  <Button size="small" variant="outlined" onClick={() => setRunPage((p) => Math.min(Math.ceil(runs.length / 20) - 1, p + 1))} disabled={runPage >= Math.ceil(runs.length / 20) - 1}>Next</Button>
+                </Stack>
+              </Stack>
+            ) : null}
+          </>
         )}
       </Box>
 
-      <Dialog open={selectedRun != null} onClose={() => setSelectedRun(null)} maxWidth="lg" fullWidth>
-        <DialogTitle>Moltbook Run</DialogTitle>
+      <Dialog
+        open={selectedRun != null}
+        onClose={() => setSelectedRun(null)}
+        maxWidth="lg"
+        fullWidth
+        slotProps={{ paper: { sx: { borderRadius: "8px", border: "1px solid var(--surface-border)", background: "var(--surface-bg-elevated)", boxShadow: "0 28px 96px rgba(0,0,0,0.5)" } } }}
+      >
+        <DialogTitle sx={{ pb: 0.5, display: "flex", alignItems: "center", gap: 1.5, borderBottom: "1px solid", borderColor: "divider" }}>
+          <Typography variant="h6" sx={{ flex: 1, fontWeight: 700 }}>Moltbook Run</Typography>
+          {selectedRun ? <Chip size="small" label={selectedRun.level} color={selectedRun.level === "error" ? "error" : selectedRun.level === "warning" ? "warning" : "success"} /> : null}
+        </DialogTitle>
         <DialogContent>
           {selectedRun ? (
-            <Stack spacing={1.5} sx={{ pt: 0.5 }}>
-              <Stack direction="row" spacing={1} useFlexGap sx={{ alignItems: "center", flexWrap: "wrap" }}>
-                <Typography variant="subtitle1">{actionLabel(str(selectedRun.representative.action, ""), asRecord(selectedRun.representative.details))}</Typography>
-                <Chip size="small" label={selectedRun.level} color={selectedRun.level === "error" ? "error" : selectedRun.level === "warning" ? "warning" : "success"} />
-              </Stack>
+            <Stack spacing={1.5} sx={{ pt: 1.5 }}>
+              <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>{actionLabel(str(selectedRun.representative.action, ""), asRecord(selectedRun.representative.details))}</Typography>
               <Typography variant="caption" sx={{ color: "text.secondary" }}>
                 <span title={absoluteTs(selectedRun.representative.timestamp).tip}>{absoluteTs(selectedRun.representative.timestamp).label}</span>
                 {" | "}Run: {selectedRun.id}
                 {" | "}{selectedRun.counts.stepCount} step{selectedRun.counts.stepCount === 1 ? "" : "s"}
               </Typography>
-              <Grid2 container spacing={1}>
-                <Grid2 size={{ xs: 6, md: 3 }}><Box className="metadata-box" sx={{ minHeight: 84 }}><Typography variant="caption" sx={{ color: "text.secondary" }}>Read</Typography><Typography variant="h6">{selectedRun.counts.readCount}</Typography></Box></Grid2>
-                <Grid2 size={{ xs: 6, md: 3 }}><Box className="metadata-box" sx={{ minHeight: 84 }}><Typography variant="caption" sx={{ color: "text.secondary" }}>Commented</Typography><Typography variant="h6">{selectedRun.counts.commentCount}</Typography></Box></Grid2>
-                <Grid2 size={{ xs: 6, md: 3 }}><Box className="metadata-box" sx={{ minHeight: 84 }}><Typography variant="caption" sx={{ color: "text.secondary" }}>Liked</Typography><Typography variant="h6">{selectedRun.counts.upvoteCount}</Typography></Box></Grid2>
-                <Grid2 size={{ xs: 6, md: 3 }}><Box className="metadata-box" sx={{ minHeight: 84 }}><Typography variant="caption" sx={{ color: "text.secondary" }}>Posted</Typography><Typography variant="h6">{selectedRun.counts.postCount}</Typography></Box></Grid2>
-              </Grid2>
+              <Box className="micro-surface" sx={{ p: 1.5 }}>
+                <Grid2 container spacing={1.5}>
+                  {[
+                    { label: "Read", value: selectedRun.counts.readCount },
+                    { label: "Commented", value: selectedRun.counts.commentCount },
+                    { label: "Liked", value: selectedRun.counts.upvoteCount },
+                    { label: "Posted", value: selectedRun.counts.postCount },
+                  ].map((stat) => (
+                    <Grid2 key={stat.label} size={{ xs: 6, md: 3 }}>
+                      <Typography variant="caption" sx={{ color: "text.secondary" }}>{stat.label}</Typography>
+                      <Typography variant="h6">{stat.value}</Typography>
+                    </Grid2>
+                  ))}
+                </Grid2>
+              </Box>
               {selectedRun.trigger ? <Alert severity="info">Trigger: {triggerLabel(selectedRun.trigger)}</Alert> : null}
               {selectedRun.summary ? <Alert severity={selectedRun.level === "error" ? "error" : selectedRun.level === "warning" ? "warning" : "success"}>{selectedRun.summary}</Alert> : null}
               {selectedRun.events.some((event) => collectLinks(asRecord(event.details)).length > 0) ? (
-                <Box className="metadata-box">
-                  <Typography variant="subtitle2">Links</Typography>
-                  <Stack spacing={0.75} sx={{ mt: 1 }}>
+                <Box className="micro-surface" sx={{ p: 1.5 }}>
+                  <Typography variant="subtitle2" sx={{ mb: 1 }}>Links</Typography>
+                  <Stack spacing={0.75}>
                     {selectedRun.events.flatMap((event) => collectLinks(asRecord(event.details))).map((link) => (
-                      <Box key={`${link.label}-${link.url}`} sx={{ border: "1px solid rgba(62,143,214,0.18)", borderRadius: 1, p: 1 }}>
+                      <Box key={`${link.label}-${link.url}`} sx={{ py: 0.5, borderBottom: "1px solid", borderColor: "divider" }}>
                         <Link href={link.url} target="_blank" rel="noreferrer" underline="hover">{link.label}</Link>
-                        <Typography variant="caption" sx={{ color: "text.secondary", display: "block", mt: 0.35, wordBreak: "break-all" }}>{link.url}</Typography>
+                        <Typography variant="caption" sx={{ color: "text.secondary", display: "block", mt: 0.25, wordBreak: "break-all" }}>{link.url}</Typography>
                       </Box>
                     ))}
                   </Stack>
                 </Box>
               ) : null}
-              <Accordion disableGutters defaultExpanded={false} sx={{ background: "rgba(10, 15, 28, 0.6)", boxShadow: "none", border: "1px solid rgba(62,143,214,0.18)", borderRadius: "8px !important", "&:before": { display: "none" } }}>
+              <Accordion disableGutters defaultExpanded={false}>
                 <AccordionSummary expandIcon={<ExpandMoreIcon />}>
                   <Stack direction="row" spacing={1} sx={{ alignItems: "center" }}>
                     <Typography variant="subtitle2">Run steps</Typography>
@@ -1079,24 +1095,25 @@ export function MoltbookManager({ autoRefresh }: { autoRefresh: boolean }) {
                   </Stack>
                 </AccordionSummary>
                 <AccordionDetails sx={{ pt: 0 }}>
-                  <Stack spacing={1}>
+                  <Stack spacing={0}>
                     {selectedRun.events.map((event, index) => {
                       const details = asRecord(event.details);
                       const summary = actionSummary(str(event.action, ""), details);
                       const reason = actionReason(str(event.action, ""), details);
                       const links = collectLinks(details);
                       const level = str(event.level, "").toLowerCase();
+                      const dotColor = level === "error" ? "rgba(255,100,100,0.85)" : level === "warning" || level === "warn" ? "rgba(255,191,130,0.85)" : "rgba(74,210,157,0.85)";
                       return (
-                        <Box key={`${selectedRun.id}-${str(event.id, String(index))}`} sx={{ py: 0.75 }}>
-                          <Stack direction="row" spacing={1} useFlexGap sx={{ alignItems: "center", flexWrap: "wrap" }}>
-                            <Chip size="small" label={level || "info"} color={level === "error" ? "error" : level === "warning" || level === "warn" ? "warning" : "success"} sx={{ height: 18, fontSize: "0.65rem" }} />
-                            <Typography variant="body2" sx={{ fontWeight: 500 }}>{index + 1}. {actionLabel(str(event.action, ""), details)}</Typography>
+                        <Box key={`${selectedRun.id}-${str(event.id, String(index))}`} sx={{ py: 0.85, borderBottom: "1px solid", borderColor: "divider" }}>
+                          <Stack direction="row" spacing={0.75} useFlexGap sx={{ alignItems: "center", flexWrap: "wrap" }}>
+                            <Box component="span" sx={{ width: 7, height: 7, borderRadius: "50%", flexShrink: 0, bgcolor: dotColor }} />
+                            <Typography variant="body2" sx={{ fontWeight: 600 }}>{index + 1}. {actionLabel(str(event.action, ""), details)}</Typography>
                             <Typography variant="caption" sx={{ color: "text.secondary" }}><span title={absoluteTs(event.timestamp).tip}>{absoluteTs(event.timestamp).label}</span></Typography>
                           </Stack>
-                          {summary ? <Typography variant="caption" sx={{ color: "text.secondary", mt: 0.25, display: "block" }}>{summary}</Typography> : null}
-                          {reason ? <Typography variant="caption" sx={{ color: "warning.main", mt: 0.25, display: "block" }}>Reason: {reason}</Typography> : null}
+                          {summary ? <Typography variant="caption" sx={{ color: "text.secondary", mt: 0.25, display: "block", pl: "15px" }}>{summary}</Typography> : null}
+                          {reason ? <Typography variant="caption" sx={{ color: "warning.main", mt: 0.25, display: "block", pl: "15px" }}>Reason: {reason}</Typography> : null}
                           {links.length ? (
-                            <Stack direction="row" spacing={1} useFlexGap sx={{ mt: 0.35, flexWrap: "wrap" }}>
+                            <Stack direction="row" spacing={1} useFlexGap sx={{ mt: 0.35, flexWrap: "wrap", pl: "15px" }}>
                               {links.map((link) => (
                                 <Link key={`${selectedRun.id}-${str(event.id, String(index))}-${link.url}`} href={link.url} target="_blank" rel="noreferrer" underline="hover" variant="caption" sx={{ wordBreak: "break-all" }}>
                                   {link.label}
@@ -1113,8 +1130,8 @@ export function MoltbookManager({ autoRefresh }: { autoRefresh: boolean }) {
             </Stack>
           ) : null}
         </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setSelectedRun(null)}>Close</Button>
+        <DialogActions sx={{ borderTop: "1px solid", borderColor: "divider", px: 2.5, py: 1.5 }}>
+          <Button variant="outlined" color="secondary" onClick={() => setSelectedRun(null)}>Close</Button>
         </DialogActions>
       </Dialog>
     </WorkspacePageShell>

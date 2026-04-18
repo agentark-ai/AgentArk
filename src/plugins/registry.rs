@@ -1,9 +1,12 @@
 use anyhow::{anyhow, Context, Result};
+use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
+use sha2::Digest;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use crate::actions::{ActionDef, ActionSource};
 use crate::runtime::{ActionRuntime, PluginBinding, SandboxMode};
@@ -16,6 +19,8 @@ const PLUGIN_SDK_VERSION: &str = "agentark-plugin/v1";
 const PLUGIN_LOG_HISTORY_LIMIT: usize = 200;
 const PLUGIN_MESSAGE_MAX_CHARS: usize = 600;
 const PLUGIN_REQUEST_TIMEOUT_SECS: u64 = 10;
+const PLUGIN_MANIFEST_MAX_BYTES: usize = 256 * 1024;
+const PLUGIN_MIN_CALL_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -73,6 +78,8 @@ pub struct PluginConfig {
     #[serde(default)]
     pub subscribed_events: Vec<String>,
     pub manifest: PluginManifest,
+    #[serde(default)]
+    pub manifest_hash: String,
     pub created_at: String,
     pub updated_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,6 +131,8 @@ pub struct PluginUpsertRequest {
     pub clear_token: Option<bool>,
     #[serde(default)]
     pub subscribed_events: Option<Vec<String>>,
+    #[serde(default)]
+    pub allow_manifest_update: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -147,12 +156,14 @@ pub struct PluginRegistry {
     data_dir: PathBuf,
     http_client: reqwest::Client,
     plugins: HashMap<String, PluginConfig>,
+    last_call_at: HashMap<String, Instant>,
 }
 
 impl PluginRegistry {
     pub fn new(storage: Storage, config_dir: PathBuf, data_dir: PathBuf) -> Self {
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(PLUGIN_REQUEST_TIMEOUT_SECS))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
@@ -161,6 +172,7 @@ impl PluginRegistry {
             data_dir,
             http_client,
             plugins: HashMap::new(),
+            last_call_at: HashMap::new(),
         }
     }
 
@@ -249,7 +261,7 @@ impl PluginRegistry {
                 .and_then(|item| item.auth_header.clone())
                 .filter(|_| request.auth_header.is_none())
         });
-        let base_url = normalize_base_url(&request.base_url)?;
+        let base_url = normalize_base_url(&request.base_url).await?;
         let stored_token = existing
             .as_ref()
             .and_then(|item| self.load_plugin_secret(&item.id).ok().flatten());
@@ -308,6 +320,17 @@ impl PluginRegistry {
                 return Err(error);
             }
         };
+        let manifest_hash = plugin_manifest_hash(&manifest)?;
+        if let Some(existing_plugin) = existing.as_ref() {
+            if !existing_plugin.manifest_hash.is_empty()
+                && existing_plugin.manifest_hash != manifest_hash
+                && !request.allow_manifest_update.unwrap_or(false)
+            {
+                anyhow::bail!(
+                    "Plugin manifest changed. Re-registration requires allow_manifest_update=true after reviewing the new manifest."
+                );
+            }
+        }
         let id = existing_id
             .clone()
             .filter(|value| !value.trim().is_empty())
@@ -355,6 +378,7 @@ impl PluginRegistry {
             auth_header,
             subscribed_events,
             manifest,
+            manifest_hash,
             created_at,
             updated_at: now_rfc3339(),
             last_synced_at: Some(now_rfc3339()),
@@ -451,8 +475,23 @@ impl PluginRegistry {
                 return Err(error);
             }
         };
+        let manifest_hash = plugin_manifest_hash(&manifest)?;
+        if !existing.manifest_hash.is_empty() && existing.manifest_hash != manifest_hash {
+            let detail = "Plugin manifest changed during refresh. Review and re-register before accepting new actions, capabilities, or events.".to_string();
+            self.set_plugin_last_error(id, Some(detail.clone())).await?;
+            self.append_log(
+                &existing,
+                "manifest",
+                "Manifest refresh",
+                "error",
+                Some(detail.clone()),
+            )
+            .await?;
+            anyhow::bail!("{}", detail);
+        }
         let mut next = existing.clone();
         next.manifest = manifest;
+        next.manifest_hash = manifest_hash;
         next.updated_at = now_rfc3339();
         next.last_synced_at = Some(now_rfc3339());
         next.last_error = None;
@@ -506,6 +545,7 @@ impl PluginRegistry {
             .find(|action| action.name == action_name)
             .cloned()
             .ok_or_else(|| anyhow!("Plugin action '{}' is not registered", action_name))?;
+        self.enforce_plugin_rate_limit(plugin_id).await;
         let token = self.load_plugin_secret(plugin_id)?;
         let request = match self
             .build_authorized_request(
@@ -620,6 +660,7 @@ impl PluginRegistry {
             .cloned()
             .collect::<Vec<_>>();
         for plugin in eligible {
+            self.enforce_plugin_rate_limit(&plugin.id).await;
             let mut event_payload = serde_json::Map::new();
             event_payload.insert(
                 "sdk_version".to_string(),
@@ -632,14 +673,15 @@ impl PluginRegistry {
             );
             event_payload.insert("event".to_string(), Value::String(event_name.to_string()));
             event_payload.insert("occurred_at".to_string(), Value::String(now_rfc3339()));
-            if let Some(object) = payload.as_object() {
+            let sanitized_payload = sanitize_plugin_event_payload(payload);
+            if let Some(object) = sanitized_payload.as_object() {
                 for (key, value) in object {
                     event_payload
                         .entry(key.clone())
                         .or_insert_with(|| value.clone());
                 }
             }
-            event_payload.insert("payload".to_string(), payload.clone());
+            event_payload.insert("payload".to_string(), sanitized_payload);
             let token = self.load_plugin_secret(&plugin.id)?;
             let response: Result<reqwest::Response> = match self
                 .build_authorized_request(
@@ -699,6 +741,17 @@ impl PluginRegistry {
             }
         }
         Ok(())
+    }
+
+    async fn enforce_plugin_rate_limit(&mut self, plugin_id: &str) {
+        if let Some(last_call_at) = self.last_call_at.get(plugin_id).copied() {
+            let elapsed = last_call_at.elapsed();
+            if elapsed < PLUGIN_MIN_CALL_INTERVAL {
+                tokio::time::sleep(PLUGIN_MIN_CALL_INTERVAL - elapsed).await;
+            }
+        }
+        self.last_call_at
+            .insert(plugin_id.to_string(), Instant::now());
     }
 
     pub async fn ping_plugin(&mut self, id: &str) -> Result<PluginTestResult> {
@@ -846,8 +899,10 @@ impl PluginRegistry {
         auth_profile_id: Option<&str>,
     ) -> Result<reqwest::RequestBuilder> {
         let mut parsed = reqwest::Url::parse(url).context("invalid plugin endpoint URL")?;
+        crate::core::net::validate_external_https_url(parsed.as_str()).await?;
         if let Some(overlay) = self.auth_profile_overlay(auth_profile_id).await? {
             overlay.apply_to_url(&mut parsed);
+            crate::core::net::validate_external_https_url(parsed.as_str()).await?;
             let request = self.http_client.request(method, parsed);
             return overlay.apply_to_request_builder(request);
         }
@@ -919,7 +974,7 @@ impl PluginRegistry {
             .await
             .context("failed to fetch plugin manifest")?;
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = read_response_text_limited(response, PLUGIN_MANIFEST_MAX_BYTES).await?;
         if !status.is_success() {
             anyhow::bail!(
                 "Plugin manifest request failed with {}: {}",
@@ -1034,14 +1089,17 @@ async fn register_plugin_actions(
         };
         let info = ActionDef {
             name,
-            description,
+            description: crate::security::sanitize_untrusted_output(
+                "plugin_manifest",
+                &description,
+            ),
             version: plugin.manifest.version.clone(),
             input_schema: if action.input_schema.is_null() {
                 serde_json::json!({})
             } else {
-                action.input_schema.clone()
+                crate::security::sanitize_input_schema(&action.input_schema)
             },
-            capabilities: action.capabilities.clone(),
+            capabilities: crate::security::canonical_capabilities(&action.capabilities, true)?,
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
@@ -1093,6 +1151,7 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<()> {
         anyhow::bail!("Plugin manifest name is required");
     }
     let mut names = HashSet::new();
+    crate::security::scan_untrusted_text(&manifest.description);
     for action in &manifest.actions {
         let normalized = sanitize_plugin_id(&action.name);
         if normalized.is_empty() {
@@ -1101,6 +1160,13 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<()> {
         if !names.insert(normalized) {
             anyhow::bail!("Duplicate plugin action '{}'", action.name);
         }
+        crate::security::canonical_capabilities(&action.capabilities, true).with_context(|| {
+            format!(
+                "Plugin action '{}' declares unsupported capabilities",
+                action.name
+            )
+        })?;
+        crate::security::sanitize_input_schema(&action.input_schema);
     }
     Ok(())
 }
@@ -1128,16 +1194,13 @@ fn normalize_subscribed_events(
         .collect::<Vec<_>>()
 }
 
-fn normalize_base_url(value: &str) -> Result<String> {
+async fn normalize_base_url(value: &str) -> Result<String> {
     let trimmed = value.trim().trim_end_matches('/');
     if trimmed.is_empty() {
         anyhow::bail!("Base URL is required");
     }
-    let parsed = reqwest::Url::parse(trimmed).context("invalid base URL")?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        anyhow::bail!("Plugin base URL must use http or https");
-    }
-    Ok(trimmed.to_string())
+    let parsed = crate::core::net::validate_external_https_url(trimmed).await?;
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
 }
 
 fn sanitize_plugin_id(raw: &str) -> String {
@@ -1202,7 +1265,7 @@ fn format_plugin_result(body: &str) -> String {
             .map(str::trim)
             .filter(|text| !text.is_empty())
         {
-            return crate::security::redact_secret_input(text).text;
+            return crate::security::sanitize_untrusted_output("plugin", text);
         }
         if let Some(text) = value
             .get("result")
@@ -1210,17 +1273,45 @@ fn format_plugin_result(body: &str) -> String {
             .map(str::trim)
             .filter(|text| !text.is_empty())
         {
-            return crate::security::redact_secret_input(text).text;
+            return crate::security::sanitize_untrusted_output("plugin", text);
         }
-        return clip_chars(
-            &crate::security::redact_secret_input(
-                &serde_json::to_string_pretty(&value).unwrap_or_else(|_| trimmed.to_string()),
-            )
-            .text,
-            2_000,
+        return crate::security::sanitize_untrusted_output(
+            "plugin",
+            &serde_json::to_string_pretty(&value).unwrap_or_else(|_| trimmed.to_string()),
         );
     }
-    clip_chars(&crate::security::redact_secret_input(trimmed).text, 2_000)
+    crate::security::sanitize_untrusted_output("plugin", trimmed)
+}
+
+fn plugin_manifest_hash(manifest: &PluginManifest) -> Result<String> {
+    let bytes = serde_json::to_vec(manifest)?;
+    Ok(hex::encode(sha2::Sha256::digest(&bytes)))
+}
+
+fn sanitize_plugin_event_payload(payload: &Value) -> Value {
+    crate::security::redact_json_secrets(payload)
+}
+
+async fn read_response_text_limited(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length as usize > max_bytes)
+    {
+        anyhow::bail!("Plugin response exceeded the maximum allowed size");
+    }
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("failed to read plugin response")?;
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() > max_bytes {
+            anyhow::bail!("Plugin response exceeded the maximum allowed size");
+        }
+    }
+    String::from_utf8(bytes).context("plugin response is not valid UTF-8")
 }
 
 async fn load_json<T>(storage: &Storage, key: &str) -> Result<T>

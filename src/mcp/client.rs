@@ -109,7 +109,10 @@ impl McpClient {
         let transport = match &config.transport {
             McpTransportConfig::Http { url } => {
                 let url = url::Url::parse(url).map_err(|e| anyhow!("Invalid MCP URL: {}", e))?;
-                let client = reqwest::Client::builder().timeout(timeout).build()?;
+                let client = reqwest::Client::builder()
+                    .timeout(timeout)
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()?;
                 McpTransport::Http(HttpTransport { url, client, auth })
             }
             McpTransportConfig::Stdio {
@@ -454,6 +457,7 @@ impl StdioTransport {
 
         let mut cmd = Command::new(&self.command);
         cmd.args(&self.args)
+            .env_clear()
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -474,7 +478,11 @@ impl StdioTransport {
                 let reader = tokio::io::BufReader::new(stderr);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "mcp_stdio_stderr", "{}", line);
+                    tracing::debug!(
+                        target: "mcp_stdio_stderr",
+                        "{}",
+                        crate::security::redact_secret_input(&line).text
+                    );
                 }
             });
         }

@@ -3,7 +3,9 @@
 use anyhow::{anyhow, Result};
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use crate::actions::ActionDef;
 use crate::core::config::{
@@ -76,9 +78,23 @@ struct McpServerState {
     client: tokio::sync::Mutex<McpClient>,
     tools: Vec<McpTool>,
     resources: Vec<McpResource>,
+    catalog_hash: String,
     warnings: Vec<String>,
     last_error: Option<String>,
     has_auth: bool,
+    last_call_at: Option<Instant>,
+}
+
+const MCP_MIN_CALL_INTERVAL: Duration = Duration::from_millis(500);
+
+async fn enforce_mcp_call_rate_limit(state: &mut McpServerState) {
+    if let Some(last_call_at) = state.last_call_at {
+        let elapsed = last_call_at.elapsed();
+        if elapsed < MCP_MIN_CALL_INTERVAL {
+            tokio::time::sleep(MCP_MIN_CALL_INTERVAL - elapsed).await;
+        }
+    }
+    state.last_call_at = Some(Instant::now());
 }
 
 impl McpRegistry {
@@ -164,6 +180,12 @@ impl McpRegistry {
         if !state.config.enabled {
             return Err(anyhow!("MCP server is disabled"));
         }
+        enforce_mcp_call_rate_limit(state).await;
+        let sanitized_arguments = crate::security::sanitize_outbound_json(
+            arguments,
+            &crate::security::OutboundPrivacyPolicy::default(),
+        )
+        .sanitized_value;
         if matches!(&state.config.transport, McpTransportConfig::Http { .. }) {
             if let Some(auth_profile_id) = state
                 .config
@@ -186,7 +208,17 @@ impl McpRegistry {
             }
         }
         let mut client = state.client.lock().await;
-        let result = client.call_tool(tool_name, arguments).await?;
+        let current_tools = filter_tools(
+            client.list_tools().await?,
+            &state.config.tool_allowlist,
+            &state.config.tool_blocklist,
+        );
+        if tool_catalog_hash(&current_tools, &state.resources)? != state.catalog_hash {
+            return Err(anyhow!(
+                "MCP tool catalog changed after registration; refresh and review this server before calling tools"
+            ));
+        }
+        let result = client.call_tool(tool_name, &sanitized_arguments).await?;
         if matches!(&state.config.transport, McpTransportConfig::Http { .. }) {
             if let Some(auth_profile_id) = state.config.auth_profile_id.as_deref() {
                 let _ = crate::core::auth_profiles::AuthProfileControlPlane::mark_used(
@@ -207,6 +239,8 @@ impl McpRegistry {
         if !state.config.enabled || !state.config.resources_enabled {
             return Err(anyhow!("MCP resources are disabled"));
         }
+        enforce_mcp_call_rate_limit(state).await;
+        validate_resource_uri(uri)?;
         if matches!(&state.config.transport, McpTransportConfig::Http { .. }) {
             if let Some(auth_profile_id) = state
                 .config
@@ -229,6 +263,15 @@ impl McpRegistry {
             }
         }
         let mut client = state.client.lock().await;
+        let current_resources = filter_resources(
+            client.list_resources().await?,
+            &state.config.resource_allowlist,
+        );
+        if tool_catalog_hash(&state.tools, &current_resources)? != state.catalog_hash {
+            return Err(anyhow!(
+                "MCP resource catalog changed after registration; refresh and review this server before reading resources"
+            ));
+        }
         let result = client.read_resource(uri).await?;
         if matches!(&state.config.transport, McpTransportConfig::Http { .. }) {
             if let Some(auth_profile_id) = state.config.auth_profile_id.as_deref() {
@@ -310,6 +353,9 @@ async fn build_server_state(
     let mut warnings = compute_mcp_warnings(server);
     warnings.extend(auth_warnings);
     let env = resolve_stdio_env(server, config, secrets);
+    if let McpTransportConfig::Http { url } = &server.transport {
+        crate::core::net::validate_external_https_url(url).await?;
+    }
 
     let mut client = McpClient::new(server, auth, env)?;
     let mut tools = Vec::new();
@@ -337,14 +383,17 @@ async fn build_server_state(
         .await?;
     }
 
+    let catalog_hash = tool_catalog_hash(&tools, &resources)?;
     Ok(McpServerState {
         config: server.clone(),
         client: tokio::sync::Mutex::new(client),
         tools,
         resources,
+        catalog_hash,
         warnings,
         last_error,
         has_auth,
+        last_call_at: None,
     })
 }
 
@@ -476,9 +525,24 @@ fn resolve_stdio_env(
     _config: &AgentConfig,
     secrets: &Secrets,
 ) -> HashMap<String, String> {
+    let allowed_keys: HashSet<String> = match &server.transport {
+        McpTransportConfig::Stdio { env_keys, .. } => env_keys
+            .iter()
+            .map(|key| key.trim())
+            .filter(|key| !key.is_empty())
+            .map(str::to_string)
+            .collect(),
+        McpTransportConfig::Http { .. } => return HashMap::new(),
+    };
+    if allowed_keys.is_empty() {
+        return HashMap::new();
+    }
     let mut env = secrets.mcp_env.get(&server.id).cloned().unwrap_or_default();
 
-    env.retain(|key, value| !key.trim().is_empty() && !value.trim().is_empty());
+    env.retain(|key, value| {
+        let trimmed_key = key.trim();
+        !trimmed_key.is_empty() && !value.trim().is_empty() && allowed_keys.contains(trimmed_key)
+    });
     env
 }
 
@@ -618,18 +682,62 @@ fn filter_tools(tools: Vec<McpTool>, allowlist: &[String], blocklist: &[String])
             // Otherwise, must be in allowlist
             allowed.contains(t.name.as_str())
         })
+        .map(|mut tool| {
+            tool.description = crate::security::sanitize_untrusted_output(
+                "mcp_tool_description",
+                &tool.description,
+            );
+            tool.input_schema = crate::security::sanitize_input_schema(&tool.input_schema);
+            tool
+        })
         .collect()
 }
 
 fn filter_resources(resources: Vec<McpResource>, allowlist: &[String]) -> Vec<McpResource> {
     if allowlist.is_empty() {
-        return resources;
+        return Vec::new();
     }
     let allowed: HashSet<&str> = allowlist.iter().map(|s| s.as_str()).collect();
     resources
         .into_iter()
-        .filter(|r| allowed.contains(r.uri.as_str()))
+        .filter(|r| allowed.contains(r.uri.as_str()) && validate_resource_uri(&r.uri).is_ok())
+        .map(|mut resource| {
+            resource.description = crate::security::sanitize_untrusted_output(
+                "mcp_resource_description",
+                &resource.description,
+            );
+            resource
+        })
         .collect()
+}
+
+fn validate_resource_uri(uri: &str) -> Result<()> {
+    let trimmed = uri.trim();
+    anyhow::ensure!(!trimmed.is_empty(), "MCP resource URI is empty");
+    let parsed = url::Url::parse(trimmed).map_err(|_| anyhow!("MCP resource URI is invalid"))?;
+    match parsed.scheme() {
+        "agentark" | "https" | "mcp" | "urn" => {}
+        other => anyhow::bail!("MCP resource URI scheme '{}' is not allowed", other),
+    }
+    anyhow::ensure!(
+        !parsed
+            .path_segments()
+            .is_some_and(|mut segments| segments.any(|segment| segment == "..")),
+        "MCP resource URI contains path traversal"
+    );
+    Ok(())
+}
+
+fn tool_catalog_hash(tools: &[McpTool], resources: &[McpResource]) -> Result<String> {
+    let canonical = serde_json::to_vec(&serde_json::json!({
+        "tools": tools,
+        "resources": resources,
+    }))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"agentark-mcp-tool-catalog-v1");
+    hasher.update([0]);
+    hasher.update(canonical);
+    Ok(hex::encode(hasher.finalize()))
 }
 
 async fn register_actions(
@@ -647,7 +755,9 @@ async fn register_actions(
         let action_name = unique_action_name(&server.id, "tool", &tool.name, &mut used_names);
         let def = ActionDef {
             name: action_name.clone(),
-            description: format!("MCP: {} - {}", server.name, tool.description),
+            description:
+                "MCP tool from a configured server. Review server tools in settings before use."
+                    .to_string(),
             version: "1.0.0".to_string(),
             input_schema: tool.input_schema.clone(),
             capabilities: vec!["network".to_string()],
@@ -692,7 +802,9 @@ async fn register_actions(
             unique_action_name(&server.id, "resource", &resource.name, &mut used_names);
         let def = ActionDef {
             name: action_name.clone(),
-            description: format!("MCP resource: {} - {}", server.name, resource.description),
+            description:
+                "MCP resource from a configured server. Review server resources in settings before use."
+                    .to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -743,27 +855,27 @@ fn mcp_safety_rule_action(
     _item_name: &str,
     _is_resource: bool,
 ) -> RuleAction {
-    // User explicitly connected this server — treat as trusted.
-    // All calls are logged for audit but don't require per-call approval.
-    RuleAction::LogAndAllow
+    RuleAction::RequireApproval
 }
 
 fn mcp_safety_rule_description(
     server: &McpServerConfig,
-    item_name: &str,
+    _item_name: &str,
     is_resource: bool,
 ) -> String {
-    let action = mcp_safety_rule_action(server, item_name, is_resource);
+    let action = mcp_safety_rule_action(server, _item_name, is_resource);
     let kind = if is_resource { "resource" } else { "tool" };
     match action {
-        RuleAction::LogAndAllow => format!(
-            "MCP {} is trusted and logged without approval: {}",
-            kind, item_name
-        ),
-        RuleAction::RequireApproval => format!("MCP {} requires approval: {}", kind, item_name),
-        RuleAction::Allow => format!("MCP {} is allowed: {}", kind, item_name),
-        RuleAction::Block { .. } => format!("MCP {} is blocked: {}", kind, item_name),
-        RuleAction::Delay { .. } => format!("MCP {} is delayed: {}", kind, item_name),
+        RuleAction::LogAndAllow => {
+            format!(
+                "Configured MCP {} is trusted and logged without approval.",
+                kind
+            )
+        }
+        RuleAction::RequireApproval => format!("Configured MCP {} requires approval.", kind),
+        RuleAction::Allow => format!("Configured MCP {} is allowed.", kind),
+        RuleAction::Block { .. } => format!("Configured MCP {} is blocked.", kind),
+        RuleAction::Delay { .. } => format!("Configured MCP {} is delayed.", kind),
     }
 }
 
@@ -773,12 +885,9 @@ fn unique_action_name(
     name: &str,
     used: &mut HashMap<String, usize>,
 ) -> String {
-    let base = format!(
-        "mcp_{}_{}_{}",
-        &server_id.chars().take(8).collect::<String>(),
-        kind,
-        normalize_segment(name)
-    );
+    let digest = Sha256::digest(server_id.as_bytes());
+    let server_tag = hex::encode(&digest[..6]);
+    let base = format!("mcp_{}_{}_{}", server_tag, kind, normalize_segment(name));
     let mut candidate = enforce_action_length(&base, name);
     if let Some(count) = used.get_mut(&candidate) {
         *count += 1;
@@ -841,10 +950,12 @@ fn format_mcp_result(result: &Value) -> String {
             parts.push(item.to_string());
         }
         let combined = parts.join("\n");
-        if is_error {
-            return format!("MCP Error:\n{}", combined);
-        }
-        return combined;
+        let formatted = if is_error {
+            format!("MCP Error:\n{}", combined)
+        } else {
+            combined
+        };
+        return crate::security::sanitize_untrusted_output("mcp", &formatted);
     }
 
     if let Some(contents) = result.get("contents").and_then(|v| v.as_array()) {
@@ -857,24 +968,28 @@ fn format_mcp_result(result: &Value) -> String {
             }
         }
         let combined = parts.join("\n");
-        if is_error {
-            return format!("MCP Error:\n{}", combined);
-        }
-        return combined;
+        let formatted = if is_error {
+            format!("MCP Error:\n{}", combined)
+        } else {
+            combined
+        };
+        return crate::security::sanitize_untrusted_output("mcp", &formatted);
     }
 
     if let Some(text) = result.get("text").and_then(|v| v.as_str()) {
-        return if is_error {
+        let formatted = if is_error {
             format!("MCP Error:\n{}", text)
         } else {
             text.to_string()
         };
+        return crate::security::sanitize_untrusted_output("mcp", &formatted);
     }
 
     let fallback = serde_json::to_string_pretty(result).unwrap_or_else(|_| result.to_string());
-    if is_error {
+    let formatted = if is_error {
         format!("MCP Error:\n{}", fallback)
     } else {
         fallback
-    }
+    };
+    crate::security::sanitize_untrusted_output("mcp", &formatted)
 }

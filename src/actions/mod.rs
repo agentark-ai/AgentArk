@@ -115,6 +115,8 @@ pub struct ActionAccessMetadata {
     pub permission_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub integration_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extension_pack_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub integration_features: BTreeMap<String, Vec<String>>,
     #[serde(default)]
@@ -201,6 +203,8 @@ pub struct ActionAuthorizationContext {
     pub agent_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_access_scope: Option<crate::core::swarm::AgentAccessScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_context_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -229,6 +233,16 @@ impl ActionAuthorizationDecision {
         Self {
             allowed: false,
             requires_explicit_approval: false,
+            reason: reason.into(),
+            matched_role: None,
+            rate_limit_key: None,
+        }
+    }
+
+    pub fn require_explicit_approval(reason: impl Into<String>) -> Self {
+        Self {
+            allowed: false,
+            requires_explicit_approval: true,
             reason: reason.into(),
             matched_role: None,
             rate_limit_key: None,

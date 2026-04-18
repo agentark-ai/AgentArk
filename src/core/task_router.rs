@@ -7,7 +7,7 @@
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -925,7 +925,11 @@ pub struct TaskRouterExecuteContext<'a> {
     pub system_prompt: &'a str,
     pub prompt_bundle: &'a crate::core::self_evolve::PromptBundleProfile,
     pub specialist_prompt_bundle: &'a crate::core::self_evolve::SpecialistPromptBundleProfile,
+    pub configured_model_slots: &'a [ModelSlot],
     pub model_pool: &'a HashMap<String, (ModelSlot, LlmClient)>,
+    pub primary_model_id: &'a str,
+    pub user_selected_model_slot_id: Option<&'a str>,
+    pub smart_routing: bool,
     pub primary_llm: &'a LlmClient,
     pub specialists: &'a Option<SpecialistRegistry>,
     pub memories: &'a [PromptMemory],
@@ -955,7 +959,11 @@ impl TaskRouter {
         let system_prompt = ctx.system_prompt;
         let prompt_bundle = ctx.prompt_bundle;
         let specialist_prompt_bundle = ctx.specialist_prompt_bundle;
+        let configured_model_slots = ctx.configured_model_slots;
         let model_pool = ctx.model_pool;
+        let primary_model_id = ctx.primary_model_id;
+        let user_selected_model_slot_id = ctx.user_selected_model_slot_id;
+        let smart_routing = ctx.smart_routing;
         let primary_llm = ctx.primary_llm;
         let specialists = ctx.specialists;
         let memories = ctx.memories;
@@ -1083,7 +1091,16 @@ impl TaskRouter {
                 });
             } else {
                 // Auto-spawn: select LLM from model pool
-                let llm = self.select_llm_for_spec(spec, &agent_type, model_pool, primary_llm);
+                let llm = self.select_llm_for_spec(
+                    spec,
+                    &agent_type,
+                    configured_model_slots,
+                    model_pool,
+                    primary_model_id,
+                    user_selected_model_slot_id,
+                    smart_routing,
+                    primary_llm,
+                );
                 let model_name = llm.model_name().to_string();
                 let auto_agent_name = cool_name_for_auto_agent(assignments.len(), &agent_type);
                 let agent_id = spec
@@ -1469,32 +1486,94 @@ impl TaskRouter {
         &self,
         spec: &SubAgentSpec,
         agent_type: &SubAgentType,
+        configured_model_slots: &[ModelSlot],
         model_pool: &HashMap<String, (ModelSlot, LlmClient)>,
+        primary_model_id: &str,
+        user_selected_model_slot_id: Option<&str>,
+        smart_routing: bool,
         primary_llm: &LlmClient,
     ) -> LlmClient {
-        // 1. Try explicit preferred role from routing decision
-        if let Some(role) = spec.resolve_model_role() {
-            for (slot, client) in model_pool.values() {
-                if slot.role == role && slot.enabled {
-                    return client.clone();
-                }
+        let requested_role = if !smart_routing {
+            ModelRole::Primary
+        } else {
+            spec.resolve_model_role()
+                .unwrap_or_else(|| match agent_type {
+                    SubAgentType::Coder => ModelRole::Code,
+                    SubAgentType::Researcher => ModelRole::Research,
+                    _ => ModelRole::Primary,
+                })
+        };
+
+        let mut ordered_slot_ids = Vec::new();
+        let mut seen = HashSet::new();
+        let mut push_slot_id = |slot_id: &str| {
+            let normalized = slot_id.trim();
+            if normalized.is_empty() {
+                return;
+            }
+            if seen.insert(normalized.to_string()) {
+                ordered_slot_ids.push(normalized.to_string());
+            }
+        };
+
+        if let Some(slot_id) = user_selected_model_slot_id {
+            if configured_model_slots.iter().any(|slot| slot.id == slot_id) {
+                push_slot_id(slot_id);
             }
         }
 
-        // 2. Auto-detect based on agent type
-        let auto_role = match agent_type {
-            SubAgentType::Coder => ModelRole::Code,
-            SubAgentType::Researcher => ModelRole::Research,
-            _ => ModelRole::Primary,
-        };
+        if requested_role == ModelRole::Primary {
+            if configured_model_slots
+                .iter()
+                .any(|slot| slot.id == primary_model_id)
+            {
+                push_slot_id(primary_model_id);
+            }
+            for slot in configured_model_slots {
+                if slot.role == ModelRole::Primary {
+                    push_slot_id(&slot.id);
+                }
+            }
+        } else {
+            for slot in configured_model_slots {
+                if slot.role == requested_role {
+                    push_slot_id(&slot.id);
+                }
+            }
+            if configured_model_slots
+                .iter()
+                .any(|slot| slot.id == primary_model_id)
+            {
+                push_slot_id(primary_model_id);
+            }
+        }
 
-        for (slot, client) in model_pool.values() {
-            if slot.role == auto_role && slot.enabled {
+        for slot in configured_model_slots {
+            if slot.role == ModelRole::Fallback {
+                push_slot_id(&slot.id);
+            }
+        }
+
+        for slot in configured_model_slots {
+            push_slot_id(&slot.id);
+        }
+
+        for slot_id in ordered_slot_ids {
+            let Some((slot, client)) = model_pool.get(&slot_id) else {
+                continue;
+            };
+            let has_runtime_credentials = match &slot.provider {
+                crate::core::LlmProvider::Ollama { .. } => true,
+                crate::core::LlmProvider::Anthropic { api_key, .. }
+                | crate::core::LlmProvider::OpenAI { api_key, .. } => {
+                    !api_key.trim().is_empty() && api_key != "[ENCRYPTED]"
+                }
+            };
+            if slot.enabled && has_runtime_credentials {
                 return client.clone();
             }
         }
 
-        // 3. Fallback to primary
         primary_llm.clone()
     }
 
@@ -1569,6 +1648,17 @@ impl TaskRouter {
                     .integration_ids
                     .iter()
                     .any(|value| value == integration_id)
+            })
+        {
+            return false;
+        }
+
+        if !hint.extension_pack_ids.is_empty()
+            && !hint.extension_pack_ids.iter().any(|pack_id| {
+                access_scope
+                    .extension_pack_ids
+                    .iter()
+                    .any(|value| value == pack_id)
             })
         {
             return false;
@@ -2878,6 +2968,33 @@ mod tests {
         }
     }
 
+    fn test_model_slot(id: &str, role: ModelRole, model: &str) -> ModelSlot {
+        ModelSlot {
+            id: id.to_string(),
+            label: id.to_string(),
+            role,
+            provider: crate::core::LlmProvider::Ollama {
+                base_url: "http://127.0.0.1:11434".to_string(),
+                model: model.to_string(),
+            },
+            enabled: true,
+            capability_tier: crate::core::config::ModelCapabilityTier::Balanced,
+            cost_tier: crate::core::config::ModelCostTier::Medium,
+            auto_escalate: true,
+            escalation_rank: 0,
+            health_scope: crate::core::config::ModelHealthScope::Provider,
+        }
+    }
+
+    fn build_model_pool(slots: &[ModelSlot]) -> HashMap<String, (ModelSlot, LlmClient)> {
+        let mut pool = HashMap::new();
+        for slot in slots.iter().cloned().rev() {
+            let client = LlmClient::new(&slot.provider).expect("test llm client");
+            pool.insert(slot.id.clone(), (slot, client));
+        }
+        pool
+    }
+
     #[test]
     fn summarize_delegation_status_returns_partial_when_some_paths_succeed() {
         let results = vec![
@@ -3011,6 +3128,73 @@ mod tests {
         assert!(rendered.contains("## Allowed Actions"));
         assert!(rendered.contains("Forge"));
         assert!(rendered.contains("file_write"));
+    }
+
+    #[test]
+    fn select_llm_for_spec_uses_primary_when_smart_routing_is_disabled() {
+        let router = TaskRouter::new(TaskRouterConfig::default());
+        let configured_slots = vec![
+            test_model_slot("primary", ModelRole::Primary, "primary-model"),
+            test_model_slot("code", ModelRole::Code, "code-model"),
+        ];
+        let model_pool = build_model_pool(&configured_slots);
+        let spec = SubAgentSpec {
+            agent_type: "coder".to_string(),
+            task: "Patch the backend".to_string(),
+            preferred_model_role: Some("code".to_string()),
+            depends_on: Vec::new(),
+            plan_step_id: None,
+        };
+
+        let selected = router.select_llm_for_spec(
+            &spec,
+            &SubAgentType::Coder,
+            &configured_slots,
+            &model_pool,
+            "primary",
+            None,
+            false,
+            model_pool
+                .get("primary")
+                .map(|(_, client)| client)
+                .expect("primary llm"),
+        );
+
+        assert_eq!(selected.model_name(), "primary-model");
+    }
+
+    #[test]
+    fn select_llm_for_spec_honors_user_selected_slot() {
+        let router = TaskRouter::new(TaskRouterConfig::default());
+        let configured_slots = vec![
+            test_model_slot("primary", ModelRole::Primary, "primary-model"),
+            test_model_slot("research", ModelRole::Research, "research-model"),
+            test_model_slot("fast", ModelRole::Fast, "fast-model"),
+        ];
+        let model_pool = build_model_pool(&configured_slots);
+        let spec = SubAgentSpec {
+            agent_type: "researcher".to_string(),
+            task: "Investigate the production issue".to_string(),
+            preferred_model_role: Some("research".to_string()),
+            depends_on: Vec::new(),
+            plan_step_id: None,
+        };
+
+        let selected = router.select_llm_for_spec(
+            &spec,
+            &SubAgentType::Researcher,
+            &configured_slots,
+            &model_pool,
+            "primary",
+            Some("fast"),
+            true,
+            model_pool
+                .get("primary")
+                .map(|(_, client)| client)
+                .expect("primary llm"),
+        );
+
+        assert_eq!(selected.model_name(), "fast-model");
     }
 
     #[test]

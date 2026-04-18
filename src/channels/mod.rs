@@ -7,6 +7,8 @@ pub mod http;
 pub mod imessage;
 pub mod line;
 pub mod matrix;
+pub mod messaging_dispatch;
+pub mod messaging_registry;
 pub(crate) mod outbound_rate_limit;
 pub mod qq;
 pub mod signal;

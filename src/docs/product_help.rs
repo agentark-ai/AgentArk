@@ -122,7 +122,70 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                 items: &[
                     "Release updates may replace system-owned files.",
                     "Release updates must not mutate user-owned data except through explicit user actions or future versioned migrations with backups.",
+                    "A normal rebuild or restart applies code-only fixes; do not use `docker compose down -v` unless the operator intentionally wants to discard runtime data or reset the database.",
                     "`docker compose down -v` is a reset operation because it removes the Docker volumes that hold user-owned data.",
+                ],
+            },
+        ],
+    },
+    BundledHelpDoc {
+        title: "Skill imports and semantic security review",
+        slug: "skill-imports-and-semantic-security-review",
+        tags: &[
+            "skills",
+            "skill_import",
+            "SKILL.md",
+            "security_review",
+            "capabilities",
+            "policy",
+            "semantic_review",
+        ],
+        summary: "Imported SKILL.md content is reviewed by the configured model for security capabilities, then a deterministic policy decides whether the skill can be installed or updated.",
+        sections: &[
+            BundledHelpSection {
+                label: "path",
+                items: &["Skills.", "Custom skill import and update flows."],
+            },
+            BundledHelpSection {
+                label: "review model",
+                items: &[
+                    "The configured model classifies what the skill wants to do into a stable security capability vocabulary.",
+                    "The model reports observed capabilities and evidence; it does not decide allow, warn, or block.",
+                    "The deterministic policy engine turns the capability list into matched rules, warnings, risk band, and block status.",
+                    "Unknown high-risk behavior is treated conservatively instead of being silently accepted.",
+                ],
+            },
+            BundledHelpSection {
+                label: "capability examples",
+                items: &[
+                    "Examples include environment reads, file reads or writes, network calls, shell execution, package install, lifecycle hooks, clipboard use, browser automation, encoded payloads, persistence changes, keystroke capture, screen/audio/camera capture, and secret requests.",
+                    "Capabilities can include targets when known, such as a network domain.",
+                    "Declared capabilities from manifests, plugins, packs, and runtime bindings should map into the same vocabulary where possible.",
+                ],
+            },
+            BundledHelpSection {
+                label: "install and update behavior",
+                items: &[
+                    "New skill imports run semantic review before signing and persistence.",
+                    "Skill updates run semantic review again before replacing an approved skill.",
+                    "A blocked semantic review prevents installation or update; an override flag must not be described as making a blocked skill safe.",
+                    "Skills changed on disk outside the reviewed API path must be re-imported or updated through the reviewed flow before they can run.",
+                ],
+            },
+            BundledHelpSection {
+                label: "operator review",
+                items: &[
+                    "The import response can show capabilities, matched rules, review model, and review summary.",
+                    "Review shell execution, network calls, file writes, persistence, lifecycle hooks, secret access, and capture capabilities before trusting a skill.",
+                    "A clean import review is not a permanent trust grant for future edits; modified skill content needs a fresh review.",
+                ],
+            },
+            BundledHelpSection {
+                label: "answer rules",
+                items: &[
+                    "Do not describe skill security as exact phrase or regex scanning.",
+                    "Explain the model-classifies and policy-decides split when users ask how a skill was judged.",
+                    "If a skill is blocked, tell the user which capabilities and policy rules caused the block rather than suggesting a volume reset.",
                 ],
             },
         ],
@@ -146,11 +209,13 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Mission Control / Chat: main operator workflow, overview, execution, approvals, and alerts.",
                     "Settings > Models: LLM/provider setup, API keys, model behavior, and the separate Embeddings tab.",
                     "Settings > Media: image and video provider keys plus default media providers.",
-                    "Settings > Integrations > Messaging Channels: Telegram, WhatsApp, Slack, Discord, Matrix, Teams, and Daily Brief delivery.",
+                    "Settings > Integrations > Messaging Channels: Telegram, WhatsApp, Slack, Discord, Matrix, Teams, custom messaging channels, and Daily Brief delivery.",
                     "Settings > Integrations > Prebuilt Connectors: Google Workspace, Gmail, Calendar, GitHub, Notion, Twilio, and other connectors.",
+                    "Settings > Integrations > Custom Integrations: user-added pack-based integrations installed from chat, from docs/OpenAPI/cURL, from uploads, or from local/remote bundles.",
+                    "Settings > Integrations > Companion Devices: paired iPhone, Android, desktop, home-server, Raspberry Pi, and custom devices with scoped grants and approvals.",
                     "Settings > Integrations > Webhooks & APIs: webhook and API-facing integration setup.",
                     "Settings > Integrations > Plugins: plugin-backed integrations.",
-                    "Settings > Knowledge > Memory: structured memory, reusable knowledge-base items, preferences, and user data.",
+                    "ArkMemory: structured memory, source attribution, reusable knowledge-base items, preferences, and user data.",
                     "Library > Documents: uploaded files and indexed document context.",
                     "Moltbook: API key setup, status, run-now controls, and activity logs.",
                     "Tasks: scheduled or one-off tasks, including Input needed runs.",
@@ -170,12 +235,14 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Main conversation happens in Chat.",
                     "Approvals go to Mission Control.",
                     "Google Workspace and other connectors are configured in Settings > Integrations > Prebuilt Connectors.",
-                    "Reusable notes or KB entries live in Settings > Knowledge > Memory > Knowledge.",
+                    "User-added pack-based integrations are managed in Settings > Integrations > Custom Integrations.",
+                    "Companion devices are managed in Settings > Integrations > Companion Devices.",
+                    "Reusable notes or KB entries live in ArkMemory > Current Memory > Knowledge.",
                     "Uploaded files live in Library > Documents.",
                     "Image or video generation providers live in Settings > Media.",
                     "Moltbook uses the top-level Moltbook page.",
                     "Scheduled work uses Tasks; condition-based monitoring uses Watchers.",
-                    "Self-learning history, impact, canary tests, review, and deploy-guard defaults use ArkEvolve.",
+                    "ArkEvolve history, impact, and review live in ArkEvolve; ArkSentinel and ArkEvolve switches live in Settings > Advanced.",
                     "Background learning and ArkSentinel proposals are inspected in ArkSentinel.",
                     "Behavior debugging uses Trace or Analytics.",
                     "Specialist agents and delegation use Agents.",
@@ -189,10 +256,89 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
     },
     BundledHelpDoc {
+        title: "Companion devices",
+        slug: "companion-devices",
+        tags: &[
+            "companion_devices",
+            "devices",
+            "iphone",
+            "android",
+            "desktop",
+            "raspberry_pi",
+            "iot",
+            "pairing",
+            "websocket",
+            "approvals",
+            "security",
+        ],
+        summary: "Settings > Integrations > Companion Devices pairs scoped devices such as iPhone, Android, desktops, home servers, Raspberry Pi, and custom agents without turning them into admin sessions.",
+        sections: &[
+            BundledHelpSection {
+                label: "path",
+                items: &["Settings > Integrations > Companion Devices."],
+            },
+            BundledHelpSection {
+                label: "what it is",
+                items: &[
+                    "Companion devices are paired execution surfaces with explicit capability grants.",
+                    "Supported presets include iPhone / iPad, Android phone, macOS / Windows / Linux desktop, home server / mini PC, Raspberry Pi / IoT, and Custom Device.",
+                    "Custom devices implement the `agentark-companion-v1` WebSocket protocol and use structured capability ids such as `custom.greenhouse_sensor`.",
+                    "Pairing establishes identity; grants define allowed capabilities; approvals allow a specific sensitive action to run now.",
+                ],
+            },
+            BundledHelpSection {
+                label: "security boundaries",
+                items: &[
+                    "A companion device is not a UI session, admin session, or API key.",
+                    "Device tokens are scoped to one device and stored by fingerprint on the AgentArk side.",
+                    "Production companion sockets use TLS; plaintext `ws://` is only for local development.",
+                    "Paired devices send tokens in WebSocket headers, not JSON message bodies.",
+                    "Pairing approval is bound to the claimed device identity before token issue.",
+                    "Bundled iOS and Android devices need verified platform attestation before high-risk grants can be approved.",
+                    "Custom and desktop devices without platform attestation need an explicit trusted-unattested override before high-risk grants can be approved.",
+                    "Requested command scopes must be a subset of both the paired device grant and the caller's current grant.",
+                    "Capability reports from a device may show availability but must not expand the approved grant automatically.",
+                    "High-risk capabilities such as system commands, files, screenshots, camera, microphone, photos, SMS, location, browser control, and Shortcuts-style actions require fresh approval.",
+                    "Command results from a companion are recorded as device-reported unless a future native verifier proves the OS action happened.",
+                ],
+            },
+            BundledHelpSection {
+                label: "setup flow",
+                items: &[
+                    "Choose a preset or Custom Device.",
+                    "Select capabilities before creating the pairing code.",
+                    "The companion connects to `/companion/ws`, claims the short-lived pairing session with a stable `device_public_key`, and retries the claim while approval is pending.",
+                    "Approve the claimed device identity in the UI.",
+                    "The device receives a one-time scoped token through the WebSocket claim result and should store it in the platform keychain or equivalent secret store.",
+                    "On later connections, the companion sends `Authorization: Bearer <token>` and `X-AgentArk-Companion-Device: <device_id>` WebSocket headers.",
+                    "Active devices send a pulse message for liveness; missed pulses are operational/security signals, not permission changes.",
+                ],
+            },
+            BundledHelpSection {
+                label: "commands",
+                items: &[
+                    "Companion commands are typed JSON actions with capability, action id, arguments, requested scopes, and resource scope.",
+                    "Do not dispatch raw natural-language strings to a companion device.",
+                    "If a user asks in natural language, infer structured intent first, validate it against schemas and grants, and ask for clarification when device or action selection is ambiguous.",
+                    "High-risk typed commands should create an approval request instead of dispatching directly.",
+                ],
+            },
+            BundledHelpSection {
+                label: "when answering users",
+                items: &[
+                    "If the user asks where to connect an iPhone or another device, lead with Settings > Integrations > Companion Devices.",
+                    "Explain that first-party source for iOS, Android, desktop/headless, and custom devices lives under `clients/companion`; packaging those native apps still requires the platform toolchain.",
+                    "If the user asks to add any custom device, explain the Custom Device preset and WebSocket protocol rather than suggesting a generic integration or plugin.",
+                    "If a device action is sensitive, mention fresh approval and scoped grants before describing execution.",
+                ],
+            },
+        ],
+    },
+    BundledHelpDoc {
         title: "Mission Control, chat, and approvals",
         slug: "mission-control-chat-and-approvals",
         tags: &["mission_control", "chat", "inbox", "approvals", "navigation"],
-        summary: "Chat is the main assistant surface. Mission Control is the daily overview for approvals, highlights, suggestions, and attention items.",
+        summary: "Chat is the main command surface. Mission Control is the daily overview for approvals, live work, highlights, suggestions, and attention items.",
         sections: &[
             BundledHelpSection {
                 label: "entry points",
@@ -207,7 +353,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                 items: &[
                     "Start in Chat when the user wants help right away.",
                     "Use Mission Control when the user wants a quick view of what is waiting, urgent, or suggested next.",
-                    "Return to Mission Control when the assistant is waiting for approval or has surfaced something that needs review.",
+                    "Return to Mission Control when AgentArk is waiting for approval or has surfaced something that needs review.",
                 ],
             },
             BundledHelpSection {
@@ -222,14 +368,14 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                 items: &[
                     "Tasks that need approval appear in Mission Control and in the related Tasks flow.",
                     "Completed runs appear in Trace and stop showing as pending in Mission Control.",
-                    "Where do I talk to the assistant maps to Chat.",
+                    "Where do I chat with AgentArk maps to Chat.",
                 ],
             },
         ],
     },
     BundledHelpDoc {
-        title: "Chat shortcuts and safe command phrases",
-        slug: "chat-shortcuts-and-safe-command-phrases",
+        title: "Chat shortcuts and safe actions",
+        slug: "chat-shortcuts-and-safe-actions",
         tags: &[
             "chat_shortcuts",
             "chat",
@@ -242,10 +388,10 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         summary: "These are optional high-frequency shortcuts, not the only valid phrasing. Normal natural-language requests should still route through the usual path.",
         sections: &[
             BundledHelpSection {
-                label: "secret save",
+                label: "credentials",
                 items: &[
-                    "Chat: `/setsecret KEY=VALUE`.",
-                    "These flows keep the value encrypted and out of normal LLM-visible arguments and traces.",
+                    "Use the secure credential form shown in chat or the credential fields in Settings.",
+                    "Credential flows keep values encrypted and out of normal model-visible arguments and traces.",
                 ],
             },
             BundledHelpSection {
@@ -460,6 +606,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         slug: "messaging-channels-and-daily-brief",
         tags: &[
             "channels",
+            "custom_messaging_channels",
             "telegram",
             "slack",
             "discord",
@@ -477,13 +624,19 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
             BundledHelpSection {
                 label: "channels",
-                items: &["Telegram.", "Slack.", "Discord.", "Matrix.", "Teams.", "WhatsApp."],
+                items: &[
+                    "Bundled channels include Telegram, Slack, Discord, Matrix, Teams, WhatsApp, Google Chat, Signal, iMessage, LINE, WeChat, QQ, and Email.",
+                    "Custom Messaging Channels are user-added outbound delivery channels for webhooks, internal notification services, or provider messaging APIs that are not bundled.",
+                    "Unconfigured custom messaging channels are not exposed to the agent's notification chooser until their required credentials are saved.",
+                ],
             },
             BundledHelpSection {
                 label: "setup",
                 items: &[
                     "Enable the channel you want.",
                     "Fill the required token, webhook, room, team, or recipient fields for that channel.",
+                    "For Custom Messaging Channels, ask in chat to add the channel from provider docs or an HTTP/webhook example; then complete the secure credential form in chat or in Settings.",
+                    "Never paste secrets into normal chat. Custom channel credentials belong in the inline secure credential prompt or the Settings credential form.",
                     "Save settings.",
                     "Check the status card until it changes from Not configured to a ready state.",
                 ],
@@ -494,12 +647,14 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "The Daily Brief section lives in the same Messaging Channels area.",
                     "Pick the time and delivery channel, then enable it only after that channel is ready.",
                     "If the chosen channel is not fully configured, __PRODUCT_NAME__ should warn that delivery is not ready.",
+                    "Custom Messaging Channels can be selected for delivery after they are configured and pass the registry readiness check.",
                 ],
             },
             BundledHelpSection {
                 label: "verify",
                 items: &[
                     "The channel card reads Ready to deliver instead of Needs target or Not configured.",
+                    "A Custom Messaging Channel appears under Custom Messaging Channels and shows Ready only after all required secret slots or auth profiles are ready.",
                     "A Daily Brief is only enabled after the selected delivery channel is ready.",
                     "A test run arrives in the selected channel once delivery is fully configured.",
                 ],
@@ -518,7 +673,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         title: "Prebuilt connectors and integration quickstarts",
         slug: "prebuilt-connectors-and-integration-quickstarts",
         tags: &["integrations", "connectors", "oauth", "setup", "status"],
-        summary: "Settings > Integrations > Prebuilt Connectors is the standard path for built-in service integrations such as Google Workspace, GitHub, Notion, Twilio, Moltbook, and others.",
+        summary: "Settings > Integrations > Prebuilt Connectors is the standard path for built-in service integrations such as Google Workspace, GitHub, Notion, Twilio, Moltbook, and others. User-added pack-based integrations live in the separate Custom Integrations panel.",
         sections: &[
             BundledHelpSection {
                 label: "path",
@@ -547,6 +702,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                 items: &[
                     "Gmail and Google Workspace have a dedicated bundled doc because provider-side setup is more detailed.",
                     "Moltbook has its own top-level page for ongoing runs even though the integration exists as a connector too.",
+                    "Use Custom Integrations instead of Prebuilt Connectors when the service is user-added, imported, or scaffolded as an extension pack.",
                     "Some connectors do not expose a strong background feed, so Watchers or Webhooks may be better for proactive behavior.",
                 ],
             },
@@ -563,6 +719,96 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "A secret can be saved while the dispatch toggle is still off.",
                     "An OAuth client can exist while the redirect or auth flow was never completed.",
                     "The wrong account, tenant, or workspace can be authorized.",
+                ],
+            },
+        ],
+    },
+    BundledHelpDoc {
+        title: "Custom integrations and extension packs",
+        slug: "custom-integrations-and-extension-packs",
+        tags: &[
+            "custom_integrations",
+            "extension_packs",
+            "packs",
+            "integrations",
+            "install",
+            "setup",
+            "credentials",
+            "secrets",
+            "openapi",
+            "curl",
+        ],
+        summary: "Settings > Integrations > Custom Integrations is the user-managed surface for pack-based integrations that are installed, imported, or scaffolded separately from built-in connectors.",
+        sections: &[
+            BundledHelpSection {
+                label: "path",
+                items: &["Settings > Integrations > Custom Integrations."],
+            },
+            BundledHelpSection {
+                label: "what belongs here",
+                items: &[
+                    "Use this panel for user-added integrations such as Linear, ClickUp, HubSpot, or internal APIs when they are not a built-in connector.",
+                    "Custom integrations are extension-pack based and are managed separately from Prebuilt Connectors.",
+                    "Once installed and enabled, pack features can become normal agent-usable actions instead of staying a one-off import.",
+                ],
+            },
+            BundledHelpSection {
+                label: "how to add one",
+                items: &[
+                    "Ask in chat to install the integration you want, or open Settings > Integrations > Custom Integrations and add it there.",
+                    "The panel supports link/path install, bundle upload, and scaffold/import flows from docs, OpenAPI, or cURL examples.",
+                    "If the service already exists as a bundled or catalog pack, install that pack first; otherwise scaffold a draft pack and review the generated bindings.",
+                ],
+            },
+            BundledHelpSection {
+                label: "connect and authenticate",
+                items: &[
+                    "After install, open the custom integration card and complete Setup or Connect.",
+                    "OAuth-based packs should open a browser sign-in flow; key- or basic-auth packs should use the secure credential form.",
+                    "Never paste secrets into normal chat. Use the secure credential form shown in the conversation or the credential fields in Settings.",
+                    "Secrets for custom integrations should be stored encrypted and associated with the integration connection rather than treated as plain chat content.",
+                ],
+            },
+            BundledHelpSection {
+                label: "manage and verify",
+                items: &[
+                    "Use the card actions or overflow menu to enable or disable the integration, test setup, review runtime status, open Setup again, inspect recent runs, or remove it.",
+                    "Normal hot-sync behavior should make a newly connected custom integration usable without restarting the app.",
+                    "If a specific pack or runtime still needs restart, __PRODUCT_NAME__ should say that clearly during setup.",
+                    "A healthy custom integration appears in Installed, shows a ready-like status, and can be used by the agent without repeating setup each time.",
+                ],
+            },
+            BundledHelpSection {
+                label: "security review",
+                items: &[
+                    "Pack manifests, plugin bindings, and custom integration actions should declare or derive machine capabilities that map into the shared security vocabulary.",
+                    "A single layer can look acceptable while its capabilities combine with another layer into a higher-risk path; cross-layer capability correlation can warn, require approval, or block.",
+                    "Review any pack that combines sensitive reads, shell or code execution, file writes, persistence, network delivery, or secret access.",
+                ],
+            },
+            BundledHelpSection {
+                label: "status meanings",
+                items: &[
+                    "Needs setup: the pack is installed but still missing credentials, OAuth completion, or another required connection step.",
+                    "Runtime missing: the pack declares a local CLI or runtime dependency that still needs install or verification.",
+                    "Disabled: the pack remains installed but its actions are paused until re-enabled.",
+                    "Draft or Needs attention: the pack exists but still needs review, correction, or a connection fix before depending on it.",
+                ],
+            },
+            BundledHelpSection {
+                label: "pitfalls",
+                items: &[
+                    "Different services can resolve to multiple install paths or auth architectures, so confirm the target when the request is ambiguous.",
+                    "A pack may install successfully while the credential or OAuth step is still incomplete.",
+                    "Unverified draft packs should be reviewed before using them in production workflows.",
+                    "The wrong workspace, tenant, or account can be connected even when the auth flow technically succeeds.",
+                ],
+            },
+            BundledHelpSection {
+                label: "answer rule",
+                items: &[
+                    "If the user asks how to add an unsupported service integration, answer with the Custom Integrations path first, then the install, connect, verify, and management flow.",
+                    "If the service is already built in, route to Prebuilt Connectors instead of describing it as a custom integration.",
                 ],
             },
         ],
@@ -698,11 +944,12 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                 label: "paths",
                 items: &[
                     "Library > Documents.",
-                    "Settings > Knowledge > Memory.",
-                    "Settings > Knowledge > Memory > Facts.",
-                    "Settings > Knowledge > Memory > Preferences.",
-                    "Settings > Knowledge > Memory > User Data.",
-                    "Settings > Knowledge > Memory > Knowledge.",
+                    "ArkMemory.",
+                    "ArkMemory > Current Memory.",
+                    "ArkMemory > Current Memory > Facts.",
+                    "ArkMemory > Current Memory > Preferences.",
+                    "ArkMemory > Current Memory > User Data.",
+                    "ArkMemory > Current Memory > Knowledge.",
                     "Settings > Knowledge > MCP Servers.",
                 ],
             },
@@ -722,7 +969,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                 items: &[
                     "Use Library > Documents for file upload and search.",
                     "Use `memory_lookup` when you need durable learned facts, operating constraints, lessons, or procedures during an active request.",
-                    "Use Settings > Knowledge > Memory > Knowledge for reusable KB entries, notes, or curated instructions.",
+                    "Use ArkMemory > Current Memory > Knowledge for reusable KB entries, notes, or curated instructions.",
                     "Use Facts, Preferences, and User Data when the question is about what __PRODUCT_NAME__ remembers.",
                     "Use Settings > Knowledge > MCP Servers when you want to add or manage external MCP-backed tools.",
                 ],
@@ -731,7 +978,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                 label: "verify",
                 items: &[
                     "Uploaded files appear in Library > Documents.",
-                    "Reusable knowledge items appear in Settings > Knowledge > Memory > Knowledge.",
+                    "Reusable knowledge items appear in ArkMemory > Current Memory > Knowledge.",
                     "Enabled MCP servers appear in the MCP list and expose their tools or resources.",
                 ],
             },
@@ -887,7 +1134,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                 items: &[
                     "Ask in Chat to build or deploy an app.",
                     "Use Apps to inspect existing deployed apps.",
-                    "Use ArkEvolve > Controls to control the default deploy-guard behavior for new app deploys.",
+                    "Use Settings > Advanced > App Deploy Defaults to control the default deploy-guard behavior for new app deploys.",
                 ],
             },
             BundledHelpSection {
@@ -902,10 +1149,10 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             BundledHelpSection {
                 label: "access guard",
                 items: &[
-                    "Access guard protects a deployed app with an access key.",
-                    "The default policy for new deploys can be changed in ArkEvolve > Controls.",
-                    "Existing apps can have guard enabled or disabled individually from the Apps page.",
-                    "If guard is enabled, visitors must provide the access key before viewing the app.",
+                    "Access guard protects a deployed app with an access password.",
+                    "The default policy for new deploys can be changed in Settings > Advanced > App Deploy Defaults.",
+                    "Existing apps can have guard enabled or disabled individually from the Apps page, but public apps must keep it enabled with an explicit access password.",
+                    "If guard is enabled, visitors must provide the access password before viewing the app.",
                 ],
             },
             BundledHelpSection {
@@ -968,9 +1215,9 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                 items: &[
                     "Start in Chat with the current runtime access summary and action catalog because they are request-scoped live clues.",
                     "Use Settings > Integrations > Messaging Channels and Settings > Integrations > Prebuilt Connectors for connected systems.",
-                    "Use Settings > Knowledge > Memory and Library > Documents for memory and indexed files.",
+                    "Use ArkMemory and Library > Documents for memory and indexed files.",
                     "Use Tasks, Watchers, Goals, Apps, Trace, Analytics, and ArkPulse for durable work and operational investigation.",
-                    "Use Settings > Security, Settings > Advanced, Settings > Observability, and ArkEvolve > Controls for approvals, runtime policy, export, and deploy-guard behavior.",
+                    "Use Settings > Security, Settings > Advanced, and Settings > Observability for approvals, runtime policy, export, and deploy defaults.",
                 ],
             },
             BundledHelpSection {
@@ -1003,7 +1250,15 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
     BundledHelpDoc {
         title: "Trace, analytics, and ArkPulse",
         slug: "trace-analytics-and-arkpulse",
-        tags: &["trace", "analytics", "arkpulse", "observability", "operations"],
+        tags: &[
+            "trace",
+            "analytics",
+            "arkpulse",
+            "observability",
+            "operations",
+            "telemetry",
+            "prompt_telemetry",
+        ],
         summary: "Trace, Analytics, and ArkPulse are separate top-level surfaces for execution history, aggregate metrics, and operational health.",
         sections: &[
             BundledHelpSection {
@@ -1019,9 +1274,18 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                 ],
             },
             BundledHelpSection {
+                label: "prompt telemetry in Trace",
+                items: &[
+                    "Recent primary-agent runs can include a `Prompt Telemetry` trace step.",
+                    "That step is where per-run prompt-size evidence lives: final system prompt chars, tracked section chars, tool count, tool schema chars, and estimated total request size.",
+                    "Use Trace for a single run when the question is what was sent to the model or which prompt section dominated that request.",
+                ],
+            },
+            BundledHelpSection {
                 label: "how to use them",
                 items: &[
                     "Open Trace when the user asks what the agent did or when a run needs debugging.",
+                    "Use trace, conversation, run, and task ids as operational references for correlation; they are not credentials or secrets by themselves.",
                     "Open Analytics when the user asks about usage, volume, model mix, or cost trends.",
                     "Open ArkPulse when the user asks whether the system is healthy or wants guided remediation for operational findings.",
                 ],
@@ -1047,6 +1311,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                 items: &[
                     "Analytics is not the right place for a single failed run; use Trace.",
                     "Trace is not the right place for long-term spend trends; use Analytics.",
+                    "Do not treat a redacted placeholder in an operational id field as a valid reference id; it means diagnostic redaction touched data that should be kept as an internal reference.",
                     "ArkPulse is a higher-level operational guide, not the raw event stream.",
                 ],
             },
@@ -1063,9 +1328,11 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             "canary",
             "background_learning",
             "sentinel",
+            "heuristics",
+            "erl",
             "settings",
         ],
-        summary: "ArkEvolve is the top-level page for local memory-driven learning, impact, canary tests, review, and self-evolve controls; ArkSentinel shows live Background learning status.",
+        summary: "ArkEvolve is the top-level page for local memory-driven learning, impact, canary tests, and review; Settings > Advanced holds ArkSentinel and ArkEvolve switches.",
         sections: &[
             BundledHelpSection {
                 label: "learning pipeline",
@@ -1073,6 +1340,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Completed or degraded runs are recorded as provisional experience runs.",
                     "If the user corrects the result within the correction window, that run can be marked corrected instead of clean success.",
                     "Consolidation turns accepted evidence into durable learned memory such as facts, operating constraints, lessons, and procedures.",
+                    "Heuristic reflection turns a completed run into a short transferable lesson so future prompts can reuse what mattered instead of replaying the whole trace.",
                     "Pattern induction turns repeated successful procedures into learned procedural patterns.",
                     "Candidate generation creates draft workflow, strategy, merge, or deprecation candidates for review.",
                     "Draft candidates are suggestions only until they are approved.",
@@ -1103,13 +1371,14 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "ArkEvolve > What helped summarizes measured impact from recent prompt, classifier, specialist, and routing changes.",
                     "ArkEvolve > Tests running shows canary rollout, baseline version, candidate version, and gate result for each evolvable surface.",
                     "ArkEvolve > Review lists draft learning candidates and keeps them as suggestions until approved.",
-                    "ArkEvolve > Controls includes self-evolve, learning, local-only learning, deploy-guard default, and developer-mode canary actions.",
+                    "ArkEvolve > Review also shows `Prompt cost signals` with aggregated prompt telemetry such as p95 final prompt size, p95 tool schema size, estimated request size, and largest prompt sections.",
+                    "ArkEvolve > Controls keeps developer-mode canary actions; Settings > Advanced holds ArkEvolve and ArkSentinel switches plus app deploy defaults.",
                 ],
             },
             BundledHelpSection {
                 label: "ArkSentinel",
                 items: &[
-                    "Background learning is the live operational status view for reflection pass, memory consolidation, experience consolidation, pattern induction, and candidate generation.",
+                    "Background learning is the live operational status view for heuristic reflection, experience consolidation, pattern induction, and candidate generation.",
                     "Each sub-category shows status, last started or completed times, summary text, and recent counts when available.",
                     "Use ArkSentinel > Background learning to inspect whether queued learning jobs are running and what changed recently.",
                 ],
@@ -1118,11 +1387,80 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                 label: "answer rules",
                 items: &[
                     "If the user asks how self-learning works, explain the pipeline first and then the current instance status.",
-                    "If the user asks whether it is enabled or what it has learned, point to ArkEvolve first, report current toggles and counts, then explain the meaning.",
+                    "If the user asks whether it is enabled or what it has learned, point to Settings > Advanced for switches and ArkEvolve for current counts, tests, and review.",
                     "If the user asks about background learning status or why it is not running, lead with the live ArkSentinel background learning state and per-job status first.",
+                    "If the user asks about prompt cost, prompt size, or where to inspect prompt telemetry, route them to Trace for the per-run `Prompt Telemetry` step and ArkEvolve > Review for aggregates and review-only suggestions.",
                     "Use live status rather than stale docs when debugging background learning.",
                     "Do not describe the current product as continuously retraining base model weights unless that deployment explicitly has a parameter-updating feature enabled.",
                     "Keep official product explanation separate from draft candidate content.",
+                ],
+            },
+        ],
+    },
+    BundledHelpDoc {
+        title: "Prompt telemetry and prompt cost review",
+        slug: "prompt-telemetry-and-prompt-cost-review",
+        tags: &[
+            "telemetry",
+            "prompt_telemetry",
+            "prompt_cost",
+            "tool_schema",
+            "observability",
+            "trace",
+            "evolution",
+            "canary",
+            "review",
+        ],
+        summary: "Prompt telemetry measures final prompt and tool-schema size without changing runtime prompt assembly. Use Trace for one run, ArkEvolve > Review for aggregates and review items, and observability export for numeric metrics when enabled.",
+        sections: &[
+            BundledHelpSection {
+                label: "where to inspect",
+                items: &[
+                    "Trace > Trace Detail for a single run.",
+                    "ArkEvolve > Review for prompt cost aggregates, largest sections, and review-only optimization proposals.",
+                    "Settings > Observability and the external observability backend for exported numeric prompt metrics when export is enabled.",
+                ],
+            },
+            BundledHelpSection {
+                label: "what it measures",
+                items: &[
+                    "Final system prompt chars after assembly.",
+                    "Prompt-section char counts for tracked sections.",
+                    "Tool count and serialized tool-schema chars.",
+                    "Estimated total request chars and token estimate.",
+                ],
+            },
+            BundledHelpSection {
+                label: "what it does not do",
+                items: &[
+                    "It does not automatically trim prompt sections or rewrite runtime assembly logic.",
+                    "Prompt optimization proposals in ArkEvolve > Review are suggestions only until explicitly approved, and approval currently records review state rather than changing runtime prompt behavior.",
+                    "Observability export is metrics-only; it should not export raw prompt text, raw tool schemas, or user content.",
+                ],
+            },
+            BundledHelpSection {
+                label: "canary safety",
+                items: &[
+                    "Prompt, classifier-prompt, and specialist-prompt canaries are watched against resolved experience runs.",
+                    "Clear measured regression can disable the canary automatically and raise a notification with the reason.",
+                    "Weaker negative signals remain review items in ArkEvolve > Review so the operator can choose `Disable canary` or `Keep active`.",
+                ],
+            },
+            BundledHelpSection {
+                label: "verify",
+                items: &[
+                    "A recent run shows a `Prompt Telemetry` step in Trace.",
+                    "ArkEvolve > Review shows prompt cost signals after enough runs exist.",
+                    "If observability export is enabled, prompt metrics appear as numeric attributes rather than raw prompt content.",
+                    "If canary safety triggers, the operator sees a notification and a prompt canary safety item in ArkEvolve > Review.",
+                ],
+            },
+            BundledHelpSection {
+                label: "answer rules",
+                items: &[
+                    "When the user asks where prompt telemetry lives, answer with the exact UI path first and then describe which surface is per-run versus aggregated.",
+                    "When the user asks whether telemetry changed runtime behavior, state clearly that measurement is separate from prompt mutation.",
+                    "Prefer live Trace, ArkEvolve, and observability state over stale assumptions when debugging cost or prompt-growth questions.",
                 ],
             },
         ],
@@ -1145,6 +1483,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                 items: &[
                     "Webhooks & APIs covers incoming webhook sources, webhook events, and imported custom APIs.",
                     "Plugins covers third-party plugin SDK integrations and their subscribed platform events.",
+                    "Custom Integrations covers user-added extension-pack integrations that the agent installs or scaffolds as reusable tools.",
                 ],
             },
             BundledHelpSection {
@@ -1178,6 +1517,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Plugins only receive the platform events you explicitly enable.",
                     "Webhooks are ingress; they create or trigger downstream work and are not the execution history themselves.",
                     "Imported custom APIs are distinct from prebuilt connectors even though they share the integration area.",
+                    "Pack-based Custom Integrations are also distinct from prebuilt connectors and from raw custom API imports.",
                 ],
             },
             BundledHelpSection {
@@ -1199,6 +1539,8 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             "secrets",
             "master_password",
             "sender_verification",
+            "alerts",
+            "notifications",
         ],
         summary: "Settings > Security covers master password, encrypted secrets, and security logs. Settings > Advanced covers lower-level expert controls.",
         sections: &[
@@ -1230,7 +1572,11 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                 label: "what to explain",
                 items: &[
                     "Secrets are stored encrypted and handled separately from normal model generation.",
+                    "Internal operational ids such as trace, conversation, run, task, and event ids are correlation references, not credential material.",
+                    "Redaction belongs on secret-bearing content and user-visible diagnostics, not on internal reference ids used for lookups or audit correlation.",
                     "Security logs are for audit and review, not just failures.",
+                    "A security alert can come from local Web UI chat as well as an external channel; the alert source label tells which surface triggered the guard.",
+                    "A local Web UI security alert does not by itself mean Slack, Teams, webhooks, or another external integration is connected.",
                     "Advanced settings should only be changed when the operator knows why the default is insufficient.",
                 ],
             },
@@ -1349,16 +1695,16 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         title: "__PRODUCT_NAME__ capabilities overview",
         slug: "capabilities-overview",
         tags: &["capabilities", "features", "overview", "general"],
-        summary: "__PRODUCT_NAME__ is a self-hosted personal AI assistant for daily life and work that combines private chat, durable memory, daily briefs, secure secrets, approvals, smart model routing, evolution, and optional power-user automation.",
+        summary: "__PRODUCT_NAME__ is a self-hosted personal AI OS for daily life and work that combines private chat, durable memory, tasks, agents, apps, integrations, companion devices, approvals, smart model routing, evolution, and audit trails.",
         sections: &[
             BundledHelpSection {
                 label: "core capabilities",
                 items: &[
-                    "Daily personal-assistant workflow across the web UI, CLI, Telegram, and WhatsApp for summaries, drafts, reminders, follow-up, research, and action requests.",
+                    "Personal AI OS workflow across the web UI, CLI, Telegram, WhatsApp, integrations, and companion devices for summaries, drafts, reminders, follow-up, research, app work, and action requests.",
                     "Mission Control for daily overview, approvals, highlights, suggestions, and attention items.",
                     "Memory and personal continuity through durable facts, preferences, user data, uploaded files, reusable knowledge-base items, and local embeddings by default.",
                     "Security and trust controls including encrypted secret handling, model-privacy controls, security logs, approvals, guarded execution, sender verification, and advanced admin settings.",
-                    "Smart model routing through Primary, Fast, Code, Research, and Fallback slots so routine personal-assistant work can use cheaper capable models while harder work can use stronger specialized models.",
+                    "Smart model routing through Primary, Fast, Code, Research, and Fallback slots so routine OS work can use cheaper capable models while harder work can use stronger specialized models.",
                     "Tasks, Watchers, and Goals for one-off tasks, recurring jobs, and condition-based monitoring.",
                     "Integrations and channels such as Google Workspace, Gmail, Calendar, GitHub, Notion, Twilio, Moltbook, webhooks, plugins, custom APIs, MCP servers, and others depending on configuration.",
                     "Research, browser automation, and documents through web search, deeper source-backed research, website interaction, document inspection, summarization, and grounded answers from indexed content.",
@@ -1382,7 +1728,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                 items: &[
                     "Secrets are stored encrypted and handled separately from normal model generation.",
                     "Approval, model-privacy, guarded-execution, sender-verification, and security-log surfaces exist for trust and auditability.",
-                    "The model pool lets users choose lower-cost fast models for normal personal-assistant traffic and keep stronger models for code, research, fallback, or difficult tasks.",
+                    "The model pool lets users choose lower-cost fast models for normal OS traffic and keep stronger models for code, research, fallback, or difficult tasks.",
                     "Settings > Models and Analytics help operators inspect the configured model mix and cost trends.",
                 ],
             },
@@ -1395,7 +1741,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Settings > Security for master password, logs, and secure handling controls.",
                     "Settings > Integrations > Messaging Channels for delivery channels and Daily Brief setup.",
                     "Settings > Integrations > Prebuilt Connectors for external services.",
-                    "Settings > Knowledge > Memory for structured memory and reusable knowledge items.",
+                    "ArkMemory for structured memory, provenance, review, and reusable knowledge items.",
                     "Library > Documents for uploaded files and indexed documents.",
                     "ArkEvolve for learning history, impact, canary tests, review, and self-evolve controls.",
                     "ArkSentinel > Background learning for live reflection, consolidation, pattern induction, and candidate generation status.",
@@ -1405,8 +1751,8 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             BundledHelpSection {
                 label: "answer rule",
                 items: &[
-                    "When the user asks what __PRODUCT_NAME__ can do, answer with a short product-specific Markdown list, not a generic AI assistant skill list.",
-                    "Include evolution, security/trust, model-cost routing, memory/documents, integrations/actions, automation/apps/research, and daily personal-assistant workflow when answering a broad capabilities question.",
+                    "When the user asks what __PRODUCT_NAME__ can do, answer with a short product-specific Markdown list, not a generic chatbot skill list.",
+                    "Include evolution, security/trust, model-cost routing, memory/documents, integrations/actions, automation/apps/research, and personal AI OS workflow when answering a broad capabilities question.",
                     "Mention live configured status separately from stable product capability so missing credentials are not confused with missing product features.",
                 ],
             },

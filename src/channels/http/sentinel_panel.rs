@@ -14,7 +14,8 @@ const MAX_SENTINEL_OBSERVATIONS: usize = 120;
 const MAX_SENTINEL_PROPOSALS: usize = 96;
 const SENTINEL_RETENTION_DAYS: i64 = 30;
 const SENTINEL_PROPOSAL_RECREATE_HOURS: i64 = 24;
-const BACKGROUND_LEARNING_JOB_KEYS: [(&str, &str); 3] = [
+const BACKGROUND_LEARNING_JOB_KEYS: [(&str, &str); 4] = [
+    ("reflection_pass", "Reflection pass"),
     ("experience_consolidation", "Experience consolidation"),
     ("pattern_induction", "Pattern induction"),
     ("candidate_generation", "Candidate generation"),
@@ -315,7 +316,8 @@ pub(crate) async fn load_background_learning_feed(
     settings: &AutonomySettings,
 ) -> BackgroundLearningFeed {
     let store = load_background_learning_store(storage).await;
-    build_background_learning_feed(settings, &store.jobs)
+    let learning_enabled = crate::core::learning::load_learning_enabled(storage).await;
+    build_background_learning_feed(settings, learning_enabled, &store.jobs)
 }
 
 pub(crate) struct BackgroundLearningJobUpdate {
@@ -417,10 +419,13 @@ pub(crate) async fn record_background_learning_job_result(
 
 fn build_background_learning_feed(
     settings: &AutonomySettings,
+    learning_enabled: bool,
     jobs: &[BackgroundLearningJobRecord],
 ) -> BackgroundLearningFeed {
     let jobs = normalize_background_learning_jobs(jobs.to_vec());
-    let effective_status = if settings.autonomy_mode.eq_ignore_ascii_case("off") {
+    let effective_status = if !learning_enabled {
+        "disabled"
+    } else if settings.autonomy_mode.eq_ignore_ascii_case("off") {
         "disabled"
     } else if settings.agent_paused {
         "paused"
@@ -474,27 +479,7 @@ fn build_background_learning_feed(
     }
 
     let summary = background_learning_summary_text(effective_status, changed, &changed_jobs);
-    let reflection_pass = BackgroundLearningJobRecord {
-        key: "reflection_pass".to_string(),
-        label: background_learning_label("reflection_pass"),
-        status: effective_status.to_string(),
-        last_started_at: started_at.clone(),
-        last_completed_at: completed_at.clone(),
-        summary: Some(summary.clone()),
-        changed,
-        runs: jobs.iter().map(|job| job.runs).max().unwrap_or(0),
-        last_error: jobs.iter().find_map(|job| job.last_error.clone()),
-        stats: serde_json::json!({
-            "changed_jobs": changed_jobs.len(),
-            "total_jobs": jobs.len(),
-            "running_jobs": jobs.iter().filter(|job| job.status == "running").count(),
-            "failed_jobs": jobs.iter().filter(|job| job.status == "failed").count(),
-            "completed_jobs": jobs.iter().filter(|job| job.status == "completed").count(),
-        }),
-    };
-
     let mut response_jobs = std::collections::BTreeMap::new();
-    response_jobs.insert(reflection_pass.key.clone(), reflection_pass);
     for job in jobs {
         response_jobs.insert(job.key.clone(), job);
     }

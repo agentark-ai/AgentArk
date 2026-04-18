@@ -7,9 +7,6 @@ import {
   CircularProgress,
   Divider,
   Stack,
-  Switch,
-  Tab,
-  Tabs,
   Typography,
 } from "@mui/material";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -29,16 +26,6 @@ const REFRESH_MS = 8000;
 const SENTINEL_SECTION_PAGE_SIZE = 4;
 
 type JsonRecord = Record<string, unknown>;
-
-type SentinelFormState = {
-  enabled: boolean;
-  watch_in_app: boolean;
-  watch_connected_services: boolean;
-  infer_new_automations: boolean;
-  confidence_threshold: string;
-  max_proposals_per_scan: string;
-  autonomy_mode: "off" | "assist" | "auto";
-};
 
 function asRecord(value: unknown): JsonRecord {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : {};
@@ -99,6 +86,20 @@ function proposalTone(status: string): "success" | "warning" | "error" | "defaul
   return "default";
 }
 
+function proposalDotColor(status: string): string {
+  const tone = proposalTone(status);
+  if (tone === "success") return "rgba(74,210,157,0.85)";
+  if (tone === "warning" || tone === "info") return "rgba(57,208,255,0.85)";
+  if (tone === "error") return "rgba(255,100,100,0.85)";
+  return "rgba(180,200,220,0.5)";
+}
+
+function observationDotColor(priority: number): string {
+  if (priority <= 1) return "rgba(255,100,100,0.85)";
+  if (priority === 2) return "rgba(57,208,255,0.85)";
+  return "rgba(74,210,157,0.85)";
+}
+
 function proposalActionLabel(proposal: SentinelProposal): string {
   return proposal.proposal_kind === "chat_suggestion_accept" ? "Launch" : "Run";
 }
@@ -107,30 +108,6 @@ function modeLabel(mode: "off" | "assist" | "auto"): string {
   if (mode === "off") return "Off";
   if (mode === "auto") return "Auto";
   return "Suggest first";
-}
-
-function modeChoiceDescription(mode: "off" | "assist" | "auto"): string {
-  if (mode === "off") return "No background suggestions or automatic help.";
-  if (mode === "auto") return "Handles lightweight routine help when it is confident enough.";
-  return "Prepares ideas and waits for you to approve them.";
-}
-
-function modeChoiceEyebrow(mode: "off" | "assist" | "auto"): string {
-  if (mode === "off") return "Quiet";
-  if (mode === "auto") return "Hands-on";
-  return "Balanced";
-}
-
-function modeChoiceSupport(mode: "off" | "assist" | "auto"): string {
-  if (mode === "off") return "ArkSentinel stays available, but it will not prepare or run follow-up help.";
-  if (mode === "auto") return "Low-risk routine help can run on its own when the confidence bar is met.";
-  return "ArkSentinel drafts the next step first and waits for your approval before anything runs.";
-}
-
-function modeChoiceAccent(mode: "off" | "assist" | "auto"): string {
-  if (mode === "off") return "rgba(148,163,184,0.78)";
-  if (mode === "auto") return "rgba(56,189,248,0.92)";
-  return "rgba(168,130,255,0.92)";
 }
 
 function proposalStatusLabel(status: string): string {
@@ -169,51 +146,6 @@ function priorityLabel(value: number): string {
   return "Low priority";
 }
 
-type SentinelBooleanSettingKey =
-  | "enabled"
-  | "watch_in_app"
-  | "watch_connected_services"
-  | "infer_new_automations";
-
-const SENTINEL_SIGNAL_OPTIONS: Array<{
-  key: SentinelBooleanSettingKey;
-  label: string;
-  description: string;
-}> = [
-  {
-    key: "enabled",
-    label: "Keep ArkSentinel available",
-    description: "Lets it stay ready in the background."
-  },
-  {
-    key: "watch_in_app",
-    label: "Pay attention inside AgentArk",
-    description: "Uses your in-app activity to spot useful follow-ups."
-  },
-  {
-    key: "watch_connected_services",
-    label: "Pay attention to connected apps",
-    description: "Uses signals from Gmail, Calendar, Slack, and other services once you connect them."
-  },
-  {
-    key: "infer_new_automations",
-    label: "Look for routines worth automating",
-    description: "Spots repeated work that could become a reminder, watcher, or reusable flow."
-  }
-];
-
-function blankForm(): SentinelFormState {
-  return {
-    enabled: true,
-    watch_in_app: true,
-    watch_connected_services: true,
-    infer_new_automations: true,
-    confidence_threshold: "0.72",
-    max_proposals_per_scan: "6",
-    autonomy_mode: "assist",
-  };
-}
-
 function backgroundTone(status: string): "success" | "warning" | "error" | "default" | "info" {
   const normalized = status.trim().toLowerCase();
   if (["completed", "updated", "changed", "ok", "success"].includes(normalized)) return "success";
@@ -246,9 +178,6 @@ export function SentinelPanel({
   navigateToView: (view: string, replace?: boolean) => void;
 }) {
   const queryClient = useQueryClient();
-  const [sentinelTab, setSentinelTab] = useState<"overview" | "settings">("overview");
-  const [form, setForm] = useState<SentinelFormState>(blankForm);
-  const [hydrated, setHydrated] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [run, setRun] = useState<SuggestionRunState | null>(null);
@@ -278,14 +207,6 @@ export function SentinelPanel({
     refetchInterval: runOpen && !!runTraceId && run?.status === "running" ? REFRESH_MS : false,
   });
 
-  const saveMutation = useMutation({
-    mutationFn: (payload: Record<string, unknown>) => api.updateSentinelSettings(payload),
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["sentinel-settings"] });
-      await queryClient.invalidateQueries({ queryKey: ["sentinel-feed"] });
-    },
-  });
-
   const approveMutation = useMutation({
     mutationFn: (id: string) => api.approveSentinelProposal(id),
     onSuccess: async () => {
@@ -307,22 +228,6 @@ export function SentinelPanel({
       await queryClient.invalidateQueries({ queryKey: ["sentinel-feed"] });
     },
   });
-
-  useEffect(() => {
-    if (hydrated || !settingsQ.data) return;
-    const settings = settingsQ.data.settings;
-    const rawMode = str(settingsQ.data.autonomy_mode, "assist").toLowerCase();
-    setForm({
-      enabled: Boolean(settings.enabled ?? true),
-      watch_in_app: Boolean(settings.watch_in_app ?? true),
-      watch_connected_services: Boolean(settings.watch_connected_services ?? true),
-      infer_new_automations: Boolean(settings.infer_new_automations ?? true),
-      confidence_threshold: String(num(settings.confidence_threshold, 0.72)),
-      max_proposals_per_scan: String(num(settings.max_proposals_per_scan, 6)),
-      autonomy_mode: rawMode === "off" || rawMode === "auto" ? rawMode : "assist",
-    });
-    setHydrated(true);
-  }, [hydrated, settingsQ.data]);
 
   useEffect(() => {
     if (!run?.traceId) return;
@@ -427,13 +332,16 @@ export function SentinelPanel({
   const backgroundLearning: SentinelBackgroundLearning | null = feed?.background_learning || null;
   const scan = feed?.scan;
   const stats = feed?.stats;
-  const autonomyDisabled = Boolean(settingsQ.data?.agent_paused) || str(settingsQ.data?.autonomy_mode, "assist").toLowerCase() === "off";
+  const configuredMode = str(settingsQ.data?.autonomy_mode, "assist").toLowerCase();
+  const currentAutonomyMode: "off" | "assist" | "auto" =
+    configuredMode === "off" || configuredMode === "auto" ? configuredMode : "assist";
+  const autonomyDisabled = Boolean(settingsQ.data?.agent_paused) || currentAutonomyMode === "off";
   const lastScanLabel = scan?.last_completed_at ? humanTs(scan.last_completed_at).label : "Waiting for the first check";
-  const currentModeLabel = modeLabel(form.autonomy_mode);
+  const currentModeLabel = settingsQ.data?.agent_paused ? "Paused" : modeLabel(currentAutonomyMode);
   const sentinelHeroHeadline =
     settingsQ.data?.agent_paused
       ? "ArkSentinel is paused."
-      : form.autonomy_mode === "off"
+      : currentAutonomyMode === "off"
         ? "ArkSentinel is turned off."
         : openProposals.length > 0
           ? `${openProposals.length} follow-up${openProposals.length === 1 ? "" : "s"} waiting for you.`
@@ -443,15 +351,15 @@ export function SentinelPanel({
   const sentinelHeroDetail =
     settingsQ.data?.agent_paused
       ? "Turn autonomy back on to resume background checks, suggestions, and learning."
-      : form.autonomy_mode === "off"
+      : currentAutonomyMode === "off"
         ? "ArkSentinel is not scanning for follow-ups while this mode is off."
         : openProposals.length > 0
           ? "Review the suggested next steps below or leave them for later."
-          : form.autonomy_mode === "auto"
+          : currentAutonomyMode === "auto"
             ? "ArkSentinel is scanning in the background and can handle lightweight routine work automatically."
             : "ArkSentinel is scanning in the background and will ask before it acts.";
   const heroTone =
-    settingsQ.data?.agent_paused || form.autonomy_mode === "off"
+    settingsQ.data?.agent_paused || currentAutonomyMode === "off"
       ? {
           border: "rgba(148, 163, 184, 0.24)",
           background: "linear-gradient(135deg, rgba(25, 29, 35, 0.96), rgba(15, 17, 21, 0.96))"
@@ -492,38 +400,13 @@ export function SentinelPanel({
     (autonomyDisabled
       ? "Learning is paused until background help is turned back on."
       : "ArkSentinel reviews recent activity to remember what worked, spot repeated patterns, and improve future suggestions.");
-  const configuredThreshold = settingsQ.data ? num(settingsQ.data.settings.confidence_threshold, 0.72) : 0.72;
-  const configuredMax = settingsQ.data ? num(settingsQ.data.settings.max_proposals_per_scan, 6) : 6;
-  const configuredMode = str(settingsQ.data?.autonomy_mode, "assist").toLowerCase();
-  const dirty =
-    hydrated &&
-    (form.enabled !== Boolean(settingsQ.data?.settings.enabled ?? true) ||
-      form.watch_in_app !== Boolean(settingsQ.data?.settings.watch_in_app ?? true) ||
-      form.watch_connected_services !== Boolean(settingsQ.data?.settings.watch_connected_services ?? true) ||
-      form.infer_new_automations !== Boolean(settingsQ.data?.settings.infer_new_automations ?? true) ||
-      Number(form.confidence_threshold) !== configuredThreshold ||
-      Number(form.max_proposals_per_scan) !== configuredMax ||
-      form.autonomy_mode !== (configuredMode === "off" || configuredMode === "auto" ? configuredMode : "assist"));
 
-  async function saveSettings() {
-    setError(null);
-    setSuccess(null);
-    const threshold = Number(form.confidence_threshold);
-    const maxProposals = Number(form.max_proposals_per_scan);
-    try {
-      await saveMutation.mutateAsync({
-        enabled: form.enabled,
-        watch_in_app: form.watch_in_app,
-        watch_connected_services: form.watch_connected_services,
-        infer_new_automations: form.infer_new_automations,
-        confidence_threshold: Number.isFinite(threshold) ? Math.min(1, Math.max(0.1, threshold)) : 0.72,
-        max_proposals_per_scan: Number.isFinite(maxProposals) ? Math.min(20, Math.max(1, Math.round(maxProposals))) : 6,
-        autonomy_mode: form.autonomy_mode,
-      });
-      setSuccess("ArkSentinel settings saved.");
-    } catch (saveError) {
-      setError(errMessage(saveError));
-    }
+  function openAdvancedSettings() {
+    const nextUrl = "/ui/settings?settings_tab=advanced";
+    const currentUrl = `${window.location.pathname}${window.location.search}`;
+    if (currentUrl === nextUrl) return;
+    window.history.pushState(null, "", nextUrl);
+    window.dispatchEvent(new PopStateEvent("popstate"));
   }
 
   async function runProposal(proposal: SentinelProposal) {
@@ -600,9 +483,9 @@ export function SentinelPanel({
     <>
       <WorkspacePageShell spacing={1.5}>
         <WorkspacePageHeader
-          eyebrow="Ark Core"
+          eyebrow="Ark Autonomy"
           title="ArkSentinel"
-          description="ArkSentinel reviews activity in your workspace and connected apps, spots follow-ups or routine work, and either suggests the next step or handles it based on your settings."
+          description="Unfinished work, repeated routines, pending follow-ups, and suggested next actions."
           actions={
             <Stack
               direction="row"
@@ -613,7 +496,7 @@ export function SentinelPanel({
                 alignItems: "flex-start"
               }}>
               <Chip
-                color={form.autonomy_mode === "auto" ? "success" : form.autonomy_mode === "assist" ? "info" : "default"}
+                color={autonomyDisabled ? "warning" : currentAutonomyMode === "auto" ? "success" : "info"}
                 label={currentModeLabel}
               />
               <Chip label={openProposals.length > 0 ? `${openProposals.length} waiting` : "Nothing waiting"} />
@@ -638,18 +521,6 @@ export function SentinelPanel({
           ))}
         </Box>
 
-        <Box className="list-shell" sx={{ p: 0.75 }}>
-          <Tabs
-            value={sentinelTab}
-            onChange={(_, next) => setSentinelTab(next as "overview" | "settings")}
-            className="workspace-page-subnav-tabs"
-          >
-            <Tab value="overview" label="Overview" />
-            <Tab value="settings" label="Settings" />
-          </Tabs>
-        </Box>
-
-        {sentinelTab === "overview" ? (
         <Stack spacing={1.5}>
           <Box className="list-shell">
             <Stack spacing={1}>
@@ -697,27 +568,26 @@ export function SentinelPanel({
                           sx={{
                             width: "100%",
                             textAlign: "left",
-                            borderRadius: "8px",
-                            border: selected ? "1px solid rgba(168,130,255,0.45)" : "1px solid rgba(255,255,255,0.08)",
-                            background: selected ? "rgba(168,130,255,0.08)" : "rgba(255,255,255,0.02)",
-                            justifyContent: "flex-start",
-                            alignItems: "stretch",
-                            px: 1.1,
-                            py: 0.95,
+                            px: 0,
+                            py: 1.15,
+                            borderBottom: "1px solid",
+                            borderColor: "divider",
+                            transition: "background 0.15s ease",
+                            "&:hover": { background: "rgba(57, 208, 255, 0.04)" },
+                            ...(selected && { background: "rgba(57, 208, 255, 0.06)" }),
                           }}
                         >
-                          <Stack spacing={0.75} sx={{ width: "100%", minWidth: 0 }}>
-                            <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ justifyContent: "space-between", alignItems: { sm: "center" } }}>
-                              <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: "wrap", alignItems: "center", minWidth: 0 }}>
-                                <Typography variant="subtitle2">{proposal.title}</Typography>
-                                <Chip size="small" color={proposalTone(proposal.status)} label={proposalStatusLabel(proposal.status)} />
-                                <Chip size="small" variant="outlined" label={proposal.source_label || sourceKindLabel(proposal.source_kind)} />
+                          <Stack sx={{ width: "100%", minWidth: 0 }}>
+                            <Stack direction="row" sx={{ justifyContent: "space-between", alignItems: "center" }}>
+                              <Stack direction="row" spacing={1} sx={{ alignItems: "center", minWidth: 0 }}>
+                                <Box sx={{ width: 7, height: 7, borderRadius: "50%", flexShrink: 0, background: proposalDotColor(proposal.status) }} />
+                                <Typography variant="body2" sx={{ fontWeight: 600 }}>{proposal.title}</Typography>
                               </Stack>
-                              <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                                Updated {humanTs(proposal.updated_at).label}
+                              <Typography variant="caption" sx={{ color: "text.secondary", flexShrink: 0, ml: 1 }}>
+                                {humanTs(proposal.updated_at).label}
                               </Typography>
                             </Stack>
-                            <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                            <Typography variant="caption" sx={{ color: "text.secondary", pl: "15px" }}>
                               {compactText(proposal.detail, 150)}
                             </Typography>
                           </Stack>
@@ -725,7 +595,7 @@ export function SentinelPanel({
                       );
                     })}
                     {selectedProposal ? (
-                      <Box className="action-row">
+                      <Box className="metadata-box">
                         <Stack spacing={0.9}>
                           <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ justifyContent: "space-between" }}>
                             <Stack
@@ -832,27 +702,26 @@ export function SentinelPanel({
                           sx={{
                             width: "100%",
                             textAlign: "left",
-                            borderRadius: "8px",
-                            border: selected ? "1px solid rgba(59,130,246,0.4)" : "1px solid rgba(255,255,255,0.08)",
-                            background: selected ? "rgba(59,130,246,0.08)" : "rgba(255,255,255,0.02)",
-                            justifyContent: "flex-start",
-                            alignItems: "stretch",
-                            px: 1.1,
-                            py: 0.95,
+                            px: 0,
+                            py: 1.15,
+                            borderBottom: "1px solid",
+                            borderColor: "divider",
+                            transition: "background 0.15s ease",
+                            "&:hover": { background: "rgba(57, 208, 255, 0.04)" },
+                            ...(selected && { background: "rgba(57, 208, 255, 0.06)" }),
                           }}
                         >
-                          <Stack spacing={0.75} sx={{ width: "100%", minWidth: 0 }}>
-                            <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ justifyContent: "space-between", alignItems: { sm: "center" } }}>
-                              <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: "wrap", alignItems: "center", minWidth: 0 }}>
-                                <Typography variant="subtitle2">{observation.title}</Typography>
-                                <Chip size="small" variant="outlined" label={observationKindLabel(observation.kind)} />
-                                <Chip size="small" variant="outlined" label={priorityLabel(observation.priority)} />
+                          <Stack sx={{ width: "100%", minWidth: 0 }}>
+                            <Stack direction="row" sx={{ justifyContent: "space-between", alignItems: "center" }}>
+                              <Stack direction="row" spacing={1} sx={{ alignItems: "center", minWidth: 0 }}>
+                                <Box sx={{ width: 7, height: 7, borderRadius: "50%", flexShrink: 0, background: observationDotColor(observation.priority) }} />
+                                <Typography variant="body2" sx={{ fontWeight: 600 }}>{observation.title}</Typography>
                               </Stack>
-                              <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                                Updated {humanTs(observation.updated_at).label}
+                              <Typography variant="caption" sx={{ color: "text.secondary", flexShrink: 0, ml: 1 }}>
+                                {humanTs(observation.updated_at).label}
                               </Typography>
                             </Stack>
-                            <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                            <Typography variant="caption" sx={{ color: "text.secondary", pl: "15px" }}>
                               {compactText(observation.detail, 150)}
                             </Typography>
                           </Stack>
@@ -860,7 +729,7 @@ export function SentinelPanel({
                       );
                     })}
                     {selectedObservation ? (
-                      <Box className="action-row">
+                      <Box className="metadata-box">
                         <Stack spacing={0.75}>
                           <Stack
                             direction="row"
@@ -913,218 +782,6 @@ export function SentinelPanel({
               </Stack>
             </Box>
         </Stack>
-        ) : null}
-
-        {sentinelTab === "settings" ? (
-        <Stack spacing={1.5}>
-          <Box className="list-shell">
-            <Stack spacing={1.25}>
-              <Stack spacing={0.35}>
-                <Typography variant="h6">Choose how hands-on ArkSentinel should be</Typography>
-                <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                  Pick the level of help you want. You can change this any time.
-                </Typography>
-              </Stack>
-              <Box
-                role="radiogroup"
-                aria-label="ArkSentinel autonomy mode"
-                sx={{
-                  display: "grid",
-                  gridTemplateColumns: { xs: "1fr", md: "repeat(3, minmax(0, 1fr))" },
-                  gap: 1.25
-                }}
-              >
-                {(["off", "assist", "auto"] as const).map((mode) => {
-                  const selected = form.autonomy_mode === mode;
-                  const accent = modeChoiceAccent(mode);
-                  return (
-                    <ButtonBase
-                      key={mode}
-                      role="radio"
-                      aria-checked={selected}
-                      onClick={() => setForm((current) => ({ ...current, autonomy_mode: mode }))}
-                      sx={{
-                        width: "100%",
-                        textAlign: "left",
-                        borderRadius: "8px",
-                        minHeight: 152,
-                        border: selected ? `1px solid ${accent}` : "1px solid rgba(255,255,255,0.08)",
-                        background: selected ? "rgba(255,255,255,0.04)" : "rgba(255,255,255,0.02)",
-                        boxShadow: selected
-                          ? "0 0 0 1px rgba(255,255,255,0.04) inset, 0 18px 40px rgba(0,0,0,0.22)"
-                          : "0 0 0 1px rgba(255,255,255,0.02) inset",
-                        px: 1.35,
-                        py: 1.25,
-                        alignItems: "stretch",
-                        justifyContent: "flex-start",
-                        transition: "border-color 180ms ease, background 180ms ease, box-shadow 180ms ease, transform 180ms ease",
-                        "&:hover": {
-                          borderColor: accent,
-                          background: "rgba(255,255,255,0.04)",
-                          transform: "translateY(-1px)"
-                        },
-                        "&:focus-visible": {
-                          outline: "2px solid rgba(255,255,255,0.18)",
-                          outlineOffset: 2
-                        }
-                      }}
-                    >
-                      <Stack spacing={1.1} sx={{ width: "100%", minWidth: 0 }}>
-                        <Stack
-                          direction="row"
-                          spacing={1}
-                          useFlexGap
-                          sx={{ alignItems: "flex-start", justifyContent: "space-between" }}
-                        >
-                          <Stack spacing={0.6} sx={{ minWidth: 0, pr: 1 }}>
-                            <Stack direction="row" spacing={0.75} useFlexGap sx={{ alignItems: "center", flexWrap: "wrap" }}>
-                              <Box
-                                sx={{
-                                  display: "inline-flex",
-                                  alignItems: "center",
-                                  justifyContent: "center",
-                                  minHeight: 22,
-                                  px: 0.9,
-                                  borderRadius: "999px",
-                                  background: selected ? accent.replace(/0\.\d+\)$/, "0.18)") : "rgba(255,255,255,0.05)",
-                                  color: selected ? "rgba(245,247,250,0.96)" : "rgba(188,198,212,0.8)",
-                                  fontSize: "0.68rem",
-                                  fontWeight: 700,
-                                  letterSpacing: 0,
-                                  textTransform: "uppercase"
-                                }}
-                              >
-                                {modeChoiceEyebrow(mode)}
-                              </Box>
-                              {mode === "assist" ? (
-                                <Chip
-                                  size="small"
-                                  label="Recommended"
-                                  sx={{
-                                    height: 22,
-                                    borderRadius: "999px",
-                                    background: "rgba(255,255,255,0.06)",
-                                    color: "rgba(220,228,239,0.88)",
-                                    border: "1px solid rgba(255,255,255,0.08)"
-                                  }}
-                                />
-                              ) : null}
-                            </Stack>
-                            <Typography variant="subtitle1" sx={{ fontWeight: 700, lineHeight: 1.2 }}>
-                              {modeLabel(mode)}
-                            </Typography>
-                          </Stack>
-                          <Box
-                            sx={{
-                              width: 22,
-                              height: 22,
-                              flexShrink: 0,
-                              borderRadius: "50%",
-                              border: selected ? `1px solid ${accent}` : "1px solid rgba(255,255,255,0.18)",
-                              background: selected ? accent.replace(/0\.\d+\)$/, "0.18)") : "rgba(255,255,255,0.02)",
-                              display: "flex",
-                              alignItems: "center",
-                              justifyContent: "center",
-                              mt: 0.1
-                            }}
-                          >
-                            <Box
-                              sx={{
-                                width: 10,
-                                height: 10,
-                                borderRadius: "50%",
-                                background: selected ? accent : "transparent",
-                                boxShadow: selected ? `0 0 10px ${accent.replace(/0\.\d+\)$/, "0.45)")}` : "none"
-                              }}
-                            />
-                          </Box>
-                        </Stack>
-                        <Typography variant="body2" sx={{ color: selected ? "rgba(236,240,246,0.92)" : "text.secondary", lineHeight: 1.55 }}>
-                          {modeChoiceDescription(mode)}
-                        </Typography>
-                        <Typography
-                          variant="caption"
-                          sx={{
-                            color: selected ? "rgba(210,220,232,0.82)" : "rgba(188,198,212,0.7)",
-                            lineHeight: 1.45
-                          }}
-                        >
-                          {modeChoiceSupport(mode)}
-                        </Typography>
-                      </Stack>
-                    </ButtonBase>
-                  );
-                })}
-              </Box>
-            </Stack>
-          </Box>
-
-          <Box className="list-shell">
-            <Stack spacing={1.25}>
-              <Stack spacing={0.35}>
-                <Typography variant="h6">Watch for these signals</Typography>
-                <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                  These switches decide where ArkSentinel learns from and what kinds of follow-up it can suggest.
-                </Typography>
-              </Stack>
-              <Stack spacing={0}>
-                {SENTINEL_SIGNAL_OPTIONS.map((item, index) => (
-                  <Box
-                    key={item.key}
-                    sx={{
-                      display: "grid",
-                      gridTemplateColumns: "minmax(0, 1fr) auto",
-                      gap: 1,
-                      alignItems: "center",
-                      py: 1,
-                      borderTop: index === 0 ? "none" : "1px solid rgba(255,255,255,0.06)"
-                    }}
-                  >
-                    <Stack spacing={0.25} sx={{ minWidth: 0 }}>
-                      <Typography variant="body2" sx={{ fontWeight: 600 }}>{item.label}</Typography>
-                      <Typography variant="caption" sx={{ color: "text.secondary", lineHeight: 1.45 }}>{item.description}</Typography>
-                    </Stack>
-                    <Switch
-                      checked={Boolean(form[item.key])}
-                      onChange={(event) => setForm((current) => ({ ...current, [item.key]: event.target.checked }))}
-                    />
-                  </Box>
-                ))}
-              </Stack>
-              <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: "wrap" }}>
-                <Chip size="small" variant="outlined" label={`Daily help limit ${settingsQ.data?.daily_run_limit ?? 40}`} />
-                <Chip size="small" variant="outlined" label={`${stats?.connected_services ?? 0} connected app${(stats?.connected_services ?? 0) === 1 ? "" : "s"}`} />
-                {settingsQ.data?.quiet_hours_start || settingsQ.data?.quiet_hours_end ? (
-                  <Chip size="small" variant="outlined" label={`Quiet hours ${settingsQ.data?.quiet_hours_start || "--:--"} - ${settingsQ.data?.quiet_hours_end || "--:--"}`} />
-                ) : null}
-              </Stack>
-              <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: "wrap" }}>
-                <Button variant="contained" disabled={!dirty || saveMutation.isPending} onClick={saveSettings}>
-                  {saveMutation.isPending ? "Saving..." : "Save"}
-                </Button>
-                <Button
-                  variant="outlined"
-                  disabled={!dirty}
-                  onClick={() =>
-                    settingsQ.data &&
-                    setForm({
-                      enabled: Boolean(settingsQ.data.settings.enabled ?? true),
-                      watch_in_app: Boolean(settingsQ.data.settings.watch_in_app ?? true),
-                      watch_connected_services: Boolean(settingsQ.data.settings.watch_connected_services ?? true),
-                      infer_new_automations: Boolean(settingsQ.data.settings.infer_new_automations ?? true),
-                      confidence_threshold: String(num(settingsQ.data.settings.confidence_threshold, 0.72)),
-                      max_proposals_per_scan: String(num(settingsQ.data.settings.max_proposals_per_scan, 6)),
-                      autonomy_mode: str(settingsQ.data.autonomy_mode, "assist").toLowerCase() === "off" ? "off" : str(settingsQ.data.autonomy_mode, "assist").toLowerCase() === "auto" ? "auto" : "assist",
-                    })
-                  }
-                >
-                  Reset
-                </Button>
-              </Stack>
-            </Stack>
-          </Box>
-        </Stack>
-        ) : null}
       </WorkspacePageShell>
       <SuggestionRunDialog
         run={run}

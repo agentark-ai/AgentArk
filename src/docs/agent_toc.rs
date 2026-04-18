@@ -9,7 +9,7 @@ pub(crate) const AGENT_DOC_TOC: &[AgentDocTocEntry] = &[
     AgentDocTocEntry {
         label: "Bundled product help",
         location: "src/docs/product_help.rs",
-        use_for: "user-facing setup, navigation, feature, Docker, memory, and integration guidance",
+        use_for: "user-facing setup, navigation, feature, Docker, memory, built-in connector, and custom integration guidance",
     },
     AgentDocTocEntry {
         label: "Product help retrieval",
@@ -32,9 +32,19 @@ pub(crate) const AGENT_DOC_TOC: &[AgentDocTocEntry] = &[
         use_for: "available tools, action definitions, schemas, permission behavior, and connector-backed capabilities",
     },
     AgentDocTocEntry {
+        label: "Companion devices",
+        location: "src/core/companion.rs; src/channels/http/companion_control.rs; frontend/src/components/CompanionDevicesPanel.tsx; clients/companion/; src/docs/product_help.rs",
+        use_for: "paired device setup, scoped grants, WebSocket protocol, typed companion commands, approval requirements, first-party native clients, and custom-device guidance",
+    },
+    AgentDocTocEntry {
         label: "HTTP API and web UI",
         location: "src/channels/http.rs; frontend/src/components/NativeWorkspace.tsx",
         use_for: "API routes, settings endpoints, local web UI behavior, and browser-visible workflows",
+    },
+    AgentDocTocEntry {
+        label: "Custom messaging channels",
+        location: "src/custom_messaging_channels/mod.rs; src/channels/messaging_registry.rs; src/channels/messaging_dispatch.rs; frontend/src/components/IntegrationsPanel.tsx",
+        use_for: "user-added outbound notification channels, secure credential forms, registry gating, and HTTP dispatch templates",
     },
     AgentDocTocEntry {
         label: "Memory and storage",
@@ -47,9 +57,14 @@ pub(crate) const AGENT_DOC_TOC: &[AgentDocTocEntry] = &[
         use_for: "experience items, prompt evolution, background learning, and self-improvement workflows",
     },
     AgentDocTocEntry {
+        label: "Prompt telemetry and canary safety",
+        location: "src/core/llm.rs; src/core/agent.rs; src/core/learning.rs; src/core/observability.rs; src/channels/http.rs; frontend/src/components/NativeWorkspace.tsx",
+        use_for: "final prompt and tool-schema telemetry, Trace prompt-telemetry steps, ArkEvolve review signals, observability export, and prompt-profile canary safety review flows",
+    },
+    AgentDocTocEntry {
         label: "Security and secrets",
-        location: "SECURITY.md; src/security/; src/crypto/",
-        use_for: "secret handling, encryption, API-token safety, approvals, and security expectations",
+        location: "SECURITY.md; src/security/; src/security/capabilities.rs; src/security/skill_review.rs; src/crypto/; src/docs/product_help.rs",
+        use_for: "secret handling, encryption, API-token safety, approvals, inbound guard behavior, security alerts, and security expectations",
     },
     AgentDocTocEntry {
         label: "Local run and Docker",
@@ -63,8 +78,8 @@ pub(crate) const AGENT_DOC_TOC: &[AgentDocTocEntry] = &[
     },
     AgentDocTocEntry {
         label: "Skill management",
-        location: "src/docs/product_help.rs",
-        use_for: "user-added skill import, editing, and product help about skill management",
+        location: "src/docs/product_help.rs; src/security/skill_review.rs; src/security/capabilities.rs; src/channels/http/actions.rs; src/runtime/mod.rs",
+        use_for: "user-added skill import, editing, semantic capability review, deterministic skill policy, and reviewed skill runtime loading",
     },
 ];
 
@@ -73,7 +88,7 @@ pub(crate) fn render_agent_doc_toc() -> String {
 
     let mut out = String::from(
         "## Agent Documentation Map\n\
-         - Start here as a table of contents for AgentArk's local knowledge.\n\
+         - Start here as a table of contents for AgentArk's local personal AI OS knowledge.\n\
          - This map is not the full documentation. When a task needs implementation details, inspect the referenced source or doc path first instead of relying on this summary.\n\
          - Use runtime inspection for current state such as containers, settings, tasks, traces, apps, and integrations.\n",
     );

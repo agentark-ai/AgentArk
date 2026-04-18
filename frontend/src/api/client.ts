@@ -8,14 +8,21 @@ import type {
   SkillSecretsUpdateRequest,
   SkillTestResponse,
   BriefingResponse,
+  CompanionAuditResponse,
+  CompanionCommandsResponse,
+  CompanionDevicesResponse,
+  CompanionPresetsResponse,
+  CompanionProtocolDocument,
   ExtensionPackConnectionView,
   ExtensionPackEventsResponse,
   ExtensionPackSearchResponse,
   ExtensionPackView,
   IntegrationItem,
+  CustomMessagingChannel,
   IntegrationSyncFeedItem,
   IntegrationSyncStatus,
   BrowserProfilesResponse,
+  BrowserSessionsResponse,
   GatewayChannelsResponse,
   GatewayOpsOverview,
   GatewayRoutingResponse,
@@ -716,6 +723,16 @@ export const api = {
     request<{ status: string }>(`/background-sessions/${encodeURIComponent(id)}`, {
       method: "DELETE"
     }),
+  getBrowserSessions: () => request<BrowserSessionsResponse>("/browser/sessions"),
+  stopBrowserSession: (id: string) =>
+    request(`/browser/sessions/${encodeURIComponent(id)}/stop`, {
+      method: "POST",
+      body: JSON.stringify({})
+    }),
+  deleteBrowserSession: (id: string) =>
+    request<{ deleted: boolean }>(`/browser/sessions/${encodeURIComponent(id)}`, {
+      method: "DELETE"
+    }),
   getNotifications: async () => {
     const raw = await request<unknown>("/notifications");
     if (Array.isArray(raw)) return raw as Notification[];
@@ -777,21 +794,21 @@ export const api = {
       `/extension-packs/${encodeURIComponent(id)}/events?limit=${encodeURIComponent(String(limit))}`
     ),
   installExtensionPack: (payload: Record<string, unknown>) =>
-    request<{ status: string; pack: ExtensionPackView }>("/extension-packs/install", {
+    request<{ status: string; pack: ExtensionPackView; warning?: string | null }>("/extension-packs/install", {
       method: "POST",
       body: JSON.stringify(payload)
     }),
   uploadExtensionPack: (formData: FormData) =>
-    requestForm<{ status: string; pack: ExtensionPackView }>("/extension-packs/upload", formData, {
+    requestForm<{ status: string; pack: ExtensionPackView; warning?: string | null }>("/extension-packs/upload", formData, {
       method: "POST"
     }),
   scaffoldExtensionPack: (payload: Record<string, unknown>) =>
-    request<{ status: string; pack: ExtensionPackView }>("/extension-packs/scaffold", {
+    request<{ status: string; pack: ExtensionPackView; warning?: string | null }>("/extension-packs/scaffold", {
       method: "POST",
       body: JSON.stringify(payload)
     }),
   upsertExtensionPackConnection: (id: string, payload: Record<string, unknown>) =>
-    request<{ status: string; connection: ExtensionPackConnectionView }>(
+    request<{ status: string; connection: ExtensionPackConnectionView; warning?: string | null }>(
       `/extension-packs/${encodeURIComponent(id)}/connections`,
       {
         method: "POST",
@@ -814,8 +831,40 @@ export const api = {
         body: JSON.stringify({})
       }
     ),
+  installExtensionPackRuntime: (id: string) =>
+    request<{ status: string; result: Record<string, unknown>; warning?: string | null }>(
+      `/extension-packs/${encodeURIComponent(id)}/runtime/install`,
+      {
+        method: "POST",
+        body: JSON.stringify({})
+      }
+    ),
+  verifyExtensionPackRuntime: (id: string) =>
+    request<{ status: string; result: Record<string, unknown>; warning?: string | null }>(
+      `/extension-packs/${encodeURIComponent(id)}/runtime/verify`,
+      {
+        method: "POST",
+        body: JSON.stringify({})
+      }
+    ),
+  updateExtensionPackRuntime: (id: string) =>
+    request<{ status: string; result: Record<string, unknown>; warning?: string | null }>(
+      `/extension-packs/${encodeURIComponent(id)}/runtime/update`,
+      {
+        method: "POST",
+        body: JSON.stringify({})
+      }
+    ),
+  uninstallExtensionPackRuntime: (id: string) =>
+    request<{ status: string; result: Record<string, unknown>; warning?: string | null }>(
+      `/extension-packs/${encodeURIComponent(id)}/runtime/uninstall`,
+      {
+        method: "POST",
+        body: JSON.stringify({})
+      }
+    ),
   setExtensionPackEnabled: (id: string, enabled: boolean) =>
-    request<{ status: string; pack: ExtensionPackView }>(
+    request<{ status: string; pack: ExtensionPackView; warning?: string | null }>(
       `/extension-packs/${encodeURIComponent(id)}/enabled`,
       {
         method: "POST",
@@ -828,7 +877,7 @@ export const api = {
       query.set("remove_connections", String(params.remove_connections));
     }
     const suffix = query.toString();
-    return request<{ status: string }>(
+    return request<{ status: string; warning?: string | null }>(
       `/extension-packs/${encodeURIComponent(id)}${suffix ? `?${suffix}` : ""}`,
       {
         method: "DELETE"
@@ -856,6 +905,30 @@ export const api = {
       body: JSON.stringify({})
     }),
   getChannels: () => request<GatewayChannelsResponse>("/gateway/channels"),
+  listCustomMessagingChannels: () =>
+    request<{ custom_messaging_channels: CustomMessagingChannel[]; count: number }>(
+      "/custom-messaging-channels"
+    ),
+  storeCustomMessagingChannelCredentials: (id: string, values: Record<string, string>) =>
+    request<{ status: string; custom_messaging_channel: CustomMessagingChannel }>(
+      `/custom-messaging-channels/${encodeURIComponent(id)}/credentials`,
+      {
+        method: "POST",
+        body: JSON.stringify({ values })
+      }
+    ),
+  testCustomMessagingChannel: (id: string) =>
+    request<{ status: string; result: { ok: boolean; channel_id: string; detail: string } }>(
+      `/custom-messaging-channels/${encodeURIComponent(id)}/test`,
+      {
+        method: "POST",
+        body: JSON.stringify({})
+      }
+    ),
+  deleteCustomMessagingChannel: (id: string) =>
+    request<{ status: string }>(`/custom-messaging-channels/${encodeURIComponent(id)}`, {
+      method: "DELETE"
+    }),
   getGatewayOpsOverview: () => request<GatewayOpsOverview>("/gateway/ops"),
   createChannelAccount: (payload: Record<string, unknown>) =>
     request<{ status: string; account?: Record<string, unknown>; message?: string }>("/gateway/channels/accounts", {
@@ -903,6 +976,61 @@ export const api = {
       body: JSON.stringify(payload)
     }),
   getNodes: () => request<NodesResponse>("/nodes"),
+  getCompanionPresets: () => request<CompanionPresetsResponse>("/companion/presets"),
+  getCompanionProtocol: () => request<CompanionProtocolDocument>("/companion/protocol"),
+  getCompanionDevices: () => request<CompanionDevicesResponse>("/companion/devices"),
+  createCompanionPairingSession: (payload: Record<string, unknown>) =>
+    request<{ status: string; session?: Record<string, unknown>; pairing_payload?: Record<string, unknown>; message?: string }>(
+      "/companion/pairing-sessions",
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      }
+    ),
+  approveCompanionPairingSession: (id: string) =>
+    request<{ status: string; session?: Record<string, unknown>; message?: string }>(
+      `/companion/pairing-sessions/${encodeURIComponent(id)}/approve`,
+      {
+        method: "POST",
+        body: JSON.stringify({})
+      }
+    ),
+  createCompanionCommand: (deviceId: string, payload: Record<string, unknown>) =>
+    request<{ status: string; command?: Record<string, unknown>; message?: string }>(
+      `/companion/devices/${encodeURIComponent(deviceId)}/commands`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      }
+    ),
+  getCompanionCommands: (deviceId: string) =>
+    request<CompanionCommandsResponse>(`/companion/devices/${encodeURIComponent(deviceId)}/commands`),
+  approveCompanionCommand: (commandId: string, payload: Record<string, unknown>) =>
+    request<{ status: string; command?: Record<string, unknown>; message?: string }>(
+      `/companion/commands/${encodeURIComponent(commandId)}/approve`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      }
+    ),
+  revokeCompanionDevice: (deviceId: string) =>
+    request<{ status: string; device?: Record<string, unknown>; message?: string }>(
+      `/companion/devices/${encodeURIComponent(deviceId)}/revoke`,
+      {
+        method: "POST",
+        body: JSON.stringify({})
+      }
+    ),
+  rotateCompanionToken: (deviceId: string, payload: Record<string, unknown>) =>
+    request<{ status: string; rotation?: { device?: Record<string, unknown>; device_token?: string }; message?: string }>(
+      `/companion/devices/${encodeURIComponent(deviceId)}/tokens/rotate`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      }
+    ),
+  getCompanionAudit: (limit = 100) =>
+    request<CompanionAuditResponse>(`/companion/audit?limit=${encodeURIComponent(String(limit))}`),
   createNode: (payload: Record<string, unknown>) =>
     request<{ status: string; node?: Record<string, unknown>; message?: string }>("/nodes", {
       method: "POST",

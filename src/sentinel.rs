@@ -43,6 +43,8 @@ static SCHEDULED_TASK_PERMITS: Lazy<Arc<Semaphore>> = Lazy::new(|| {
             .unwrap_or(4),
     ))
 });
+const AUTONOMY_PAUSE_NUDGE_TITLE: &str = "Autonomy still paused";
+const AUTONOMY_PAUSE_NUDGE_SOURCE: &str = "autonomy";
 static WATCHER_TRIGGER_PERMITS: Lazy<Arc<Semaphore>> = Lazy::new(|| {
     Arc::new(Semaphore::new(
         std::env::var("AGENTARK_WATCHER_TRIGGER_CONCURRENCY")
@@ -1021,7 +1023,7 @@ fn parse_access_key(access_url: &str) -> Option<String> {
         url::Url::parse(&format!("http://local{}", access_url)).ok()
     }?;
     parsed.query_pairs().find_map(|(k, v)| {
-        if k == "key" {
+        if k == "password" || k == "key" {
             Some(v.into_owned())
         } else {
             None
@@ -1043,7 +1045,7 @@ fn strip_access_key(access_url: &str) -> String {
     };
     let filtered: Vec<(String, String)> = parsed
         .query_pairs()
-        .filter(|(key, _)| key != "key" && key != "grant")
+        .filter(|(key, _)| key != "password" && key != "key" && key != "grant")
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
         .collect();
     if filtered.is_empty() {
@@ -1157,7 +1159,8 @@ fn parse_app_endpoints(raw: &[serde_json::Value], data_dir: &Path) -> Vec<AppEnd
                 id,
                 access_url,
                 access_key: row
-                    .get("access_key")
+                    .get("access_password")
+                    .or_else(|| row.get("access_key"))
                     .and_then(|v| v.as_str())
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
@@ -1867,14 +1870,14 @@ async fn run_runtime_hardening_checks(
             let traversal_url = format!("{}/apps/{}/{}", http_base, app.id, payload);
             if let Ok(resp) = http_client
                 .get(&traversal_url)
-                .header("x-agentark-app-key", key.clone())
+                .header("x-agentark-app-password", key.clone())
                 .send()
                 .await
             {
                 let status = resp.status();
                 if status.is_success() {
                     let body = resp.text().await.unwrap_or_default();
-                    if !body.to_lowercase().contains("access key required") {
+                    if !body.to_lowercase().contains("agentark app guard") {
                         push_finding!(
                             findings,
                             "critical",
@@ -2481,7 +2484,7 @@ async fn run_app_health_checks(
         let started = Instant::now();
         let mut root_request = http_client.get(&root_url);
         if let Some(key) = access_key.as_deref() {
-            root_request = root_request.header("x-agentark-app-key", key);
+            root_request = root_request.header("x-agentark-app-password", key);
         }
         match tokio::time::timeout(Duration::from_secs(5), root_request.send()).await {
             Ok(Ok(resp)) => {
@@ -2551,7 +2554,7 @@ async fn run_app_health_checks(
                 Duration::from_secs(4),
                 http_client
                     .get(&health_url)
-                    .header("x-agentark-app-key", key.clone())
+                    .header("x-agentark-app-password", key.clone())
                     .send(),
             )
             .await
@@ -2857,6 +2860,8 @@ pub struct SentinelConfig {
     pub integration_sync_interval: u64,
     /// How often to consolidate execution experiences into learned memory (seconds)
     pub experience_consolidation_interval: u64,
+    /// How often to reflect on consolidated execution runs and extract heuristics (seconds)
+    pub heuristic_reflection_interval: u64,
     /// How often to induce procedural patterns from learned procedures (seconds)
     pub pattern_induction_interval: u64,
     /// How often to generate approval-gated learning candidates (seconds)
@@ -2882,6 +2887,7 @@ impl Default for SentinelConfig {
             watcher_interval: 1,
             integration_sync_interval: 120,
             experience_consolidation_interval: 600,
+            heuristic_reflection_interval: 750,
             pattern_induction_interval: 900,
             candidate_generation_interval: 1200,
             approval_expiry_interval: 300,
@@ -2933,9 +2939,6 @@ pub fn start(
                     break;
                 }
                 record_loop_heartbeat(&agent, SENTINEL_SCHEDULER_HEARTBEAT_KEY).await;
-                if is_agent_autonomy_paused(&agent).await {
-                    continue;
-                }
                 run_scheduler(&agent).await;
             }
         })
@@ -3033,6 +3036,36 @@ pub fn start(
         let mut shutdown = shutdown_rx.clone();
         crate::spawn_logged!("src/sentinel.rs:3034", async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                config.heuristic_reflection_interval,
+            ));
+            interval.tick().await;
+            loop {
+                if !tick_or_shutdown(&mut interval, &mut shutdown).await {
+                    break;
+                }
+                if is_agent_autonomy_paused(&agent).await {
+                    continue;
+                }
+                run_with_busy_deferral(
+                    &agent,
+                    "reflection_pass",
+                    MAINTENANCE_DEFER_MINUTES,
+                    MAINTENANCE_MAX_DEFERS,
+                    || {
+                        let agent = agent.clone();
+                        async move { run_heuristic_reflection_job(&agent).await }
+                    },
+                )
+                .await;
+            }
+        })
+    });
+
+    handles.push({
+        let agent = agent.clone();
+        let mut shutdown = shutdown_rx.clone();
+        crate::spawn_logged!("src/sentinel.rs:3064", async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
                 config.pattern_induction_interval,
             ));
             interval.tick().await;
@@ -3061,7 +3094,7 @@ pub fn start(
     handles.push({
         let agent = agent.clone();
         let mut shutdown = shutdown_rx.clone();
-        crate::spawn_logged!("src/sentinel.rs:3064", async move {
+        crate::spawn_logged!("src/sentinel.rs:3094", async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(
                 config.candidate_generation_interval,
             ));
@@ -3310,7 +3343,7 @@ pub fn start(
     });
 
     tracing::info!(
-        "ArkSentinel started: scheduler={}s, watchers={}s, integration_sync={}s, experience_learning={}s, pattern_induction={}s, candidate_generation={}s, pulse={}s, auto_analysis={}s, container_reaper={}s",
+        "ArkSentinel started: scheduler={}s, watchers={}s, integration_sync={}s, experience_learning={}s, heuristic_reflection={}s, pattern_induction={}s, candidate_generation={}s, pulse={}s, auto_analysis={}s, container_reaper={}s",
         config.scheduler_interval,
         config.watcher_interval,
         if config.integration_sync_interval > 0 {
@@ -3319,6 +3352,7 @@ pub fn start(
             "off".to_string()
         },
         config.experience_consolidation_interval,
+        config.heuristic_reflection_interval,
         config.pattern_induction_interval,
         config.candidate_generation_interval,
         if config.pulse_interval > 0 {
@@ -3346,15 +3380,17 @@ pub fn start(
 // ═══════════════════════════════════════════════════════════════════════════
 
 async fn run_scheduler(agent: &SharedAgent) {
-    if is_agent_autonomy_paused(agent).await {
-        tracing::debug!("ArkSentinel: scheduler skipped (agent paused)");
-        return;
-    }
+    let autonomy_paused = is_agent_autonomy_paused(agent).await;
+    maybe_emit_autonomy_pause_nudge(agent, autonomy_paused).await;
 
     let due_tasks = {
         let agent = agent.read().await;
-        agent.take_due_tasks().await
+        agent.take_due_tasks(autonomy_paused).await
     };
+
+    if autonomy_paused && due_tasks.is_empty() {
+        tracing::debug!("ArkSentinel: scheduler paused for non-reminder tasks");
+    }
 
     if !due_tasks.is_empty() {
         tracing::info!("ArkSentinel: {} scheduled task(s) due", due_tasks.len());
@@ -3869,6 +3905,97 @@ async fn run_pattern_induction_job(agent: &SharedAgent) {
     }
 }
 
+async fn run_heuristic_reflection_job(agent: &SharedAgent) {
+    let started_at = chrono::Utc::now();
+    let shared_agent = agent.clone();
+    let storage = {
+        let agent = shared_agent.read().await;
+        agent.storage.clone()
+    };
+    let result = {
+        let agent = shared_agent.read().await;
+        agent.run_heuristic_reflection_pass().await
+    };
+    match result {
+        Ok(stats) if stats.changed() => {
+            let completed_at = chrono::Utc::now();
+            tracing::info!(
+                "ArkSentinel: heuristic reflection created {} and merged {} heuristic(s)",
+                stats.heuristics_created,
+                stats.heuristics_merged
+            );
+            persist_background_learning_job_result(
+                &storage,
+                background_learning_job_update(
+                    "reflection_pass",
+                    "completed",
+                    started_at,
+                    completed_at,
+                    stats.summary(),
+                    true,
+                    serde_json::json!({
+                        "runs_examined": stats.runs_examined,
+                        "heuristics_created": stats.heuristics_created,
+                        "heuristics_merged": stats.heuristics_merged,
+                        "skipped": stats.skipped,
+                        "failed": stats.failed,
+                    }),
+                ),
+            )
+            .await;
+        }
+        Ok(stats) => {
+            let completed_at = chrono::Utc::now();
+            persist_background_learning_job_result(
+                &storage,
+                background_learning_job_update(
+                    "reflection_pass",
+                    "completed",
+                    started_at,
+                    completed_at,
+                    stats.summary(),
+                    false,
+                    serde_json::json!({
+                        "runs_examined": stats.runs_examined,
+                        "heuristics_created": stats.heuristics_created,
+                        "heuristics_merged": stats.heuristics_merged,
+                        "skipped": stats.skipped,
+                        "failed": stats.failed,
+                    }),
+                ),
+            )
+            .await;
+        }
+        Err(error) => {
+            let completed_at = chrono::Utc::now();
+            let status = if error.to_string().contains("no_learning_model") {
+                "completed"
+            } else {
+                "failed"
+            };
+            persist_background_learning_job_result(
+                &storage,
+                background_learning_job_update(
+                    "reflection_pass",
+                    status,
+                    started_at,
+                    completed_at,
+                    if status == "completed" {
+                        "No learning model was available for heuristic reflection.".to_string()
+                    } else {
+                        format!("Heuristic reflection failed: {}", error)
+                    },
+                    false,
+                    serde_json::json!({
+                        "error": error.to_string(),
+                    }),
+                ),
+            )
+            .await;
+        }
+    }
+}
+
 async fn run_candidate_generation_job(agent: &SharedAgent) {
     let started_at = chrono::Utc::now();
     let (storage, data_dir) = {
@@ -4040,6 +4167,102 @@ async fn load_autonomy_settings_snapshot(
     crate::core::AutonomySettings::default()
 }
 
+async fn maybe_emit_autonomy_pause_nudge(agent: &SharedAgent, autonomy_paused: bool) {
+    let storage = {
+        let guard = agent.read().await;
+        guard.storage.clone()
+    };
+
+    if !autonomy_paused {
+        let _ = storage
+            .delete(crate::core::autonomy::AUTONOMY_PAUSED_SINCE_KEY)
+            .await;
+        let _ = storage
+            .delete(crate::core::autonomy::AUTONOMY_PAUSE_NUDGE_LAST_SENT_AT_KEY)
+            .await;
+        return;
+    }
+
+    let now_ts = chrono::Utc::now().timestamp();
+    let paused_since = match storage
+        .get(crate::core::autonomy::AUTONOMY_PAUSED_SINCE_KEY)
+        .await
+    {
+        Ok(Some(raw)) => String::from_utf8(raw)
+            .ok()
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .unwrap_or(0),
+        Ok(None) => 0,
+        Err(error) => {
+            tracing::debug!("Failed to read autonomy pause start: {}", error);
+            0
+        }
+    };
+
+    if paused_since <= 0 {
+        let now = now_ts.to_string();
+        if let Err(error) = storage
+            .set(
+                crate::core::autonomy::AUTONOMY_PAUSED_SINCE_KEY,
+                now.as_bytes(),
+            )
+            .await
+        {
+            tracing::debug!("Failed to persist autonomy pause start: {}", error);
+        }
+        return;
+    }
+
+    if now_ts - paused_since < crate::core::autonomy::AUTONOMY_PAUSE_NUDGE_INTERVAL_SECS {
+        return;
+    }
+
+    let last_sent_at = match storage
+        .get(crate::core::autonomy::AUTONOMY_PAUSE_NUDGE_LAST_SENT_AT_KEY)
+        .await
+    {
+        Ok(Some(raw)) => String::from_utf8(raw)
+            .ok()
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .unwrap_or(0),
+        Ok(None) => 0,
+        Err(error) => {
+            tracing::debug!("Failed to read autonomy pause nudge timestamp: {}", error);
+            0
+        }
+    };
+
+    if last_sent_at > 0
+        && (now_ts - last_sent_at) < crate::core::autonomy::AUTONOMY_PAUSE_NUDGE_INTERVAL_SECS
+    {
+        return;
+    }
+
+    let message = "Autonomy has been paused for at least 7 days. Consider enabling it again so AgentArk can resume ArkPulse health checks, watchers, background learning, suggestion scans, and proactive optimizations. Scheduled reminders still fire while autonomy is paused.";
+    {
+        let guard = agent.read().await;
+        guard
+            .emit_notification(
+                AUTONOMY_PAUSE_NUDGE_TITLE,
+                message,
+                "warning",
+                AUTONOMY_PAUSE_NUDGE_SOURCE,
+            )
+            .await;
+    }
+
+    let now = now_ts.to_string();
+    if let Err(error) = storage
+        .set(
+            crate::core::autonomy::AUTONOMY_PAUSE_NUDGE_LAST_SENT_AT_KEY,
+            now.as_bytes(),
+        )
+        .await
+    {
+        tracing::debug!("Failed to persist autonomy pause nudge timestamp: {}", error);
+    }
+}
+
 async fn load_arkpulse_security_thresholds(
     storage: &crate::storage::Storage,
 ) -> ArkPulseSecurityThresholds {
@@ -4058,7 +4281,7 @@ async fn is_agent_autonomy_paused(agent: &SharedAgent) -> bool {
         guard.storage.clone()
     };
     let settings = load_autonomy_settings_snapshot(&storage).await;
-    settings.agent_paused || settings.autonomy_mode.eq_ignore_ascii_case("off")
+    crate::core::autonomy::autonomy_background_paused(&settings)
 }
 
 fn is_security_incident(

@@ -14,6 +14,8 @@ pub struct AgentAccessScope {
     #[serde(default)]
     pub integration_ids: Vec<String>,
     #[serde(default)]
+    pub extension_pack_ids: Vec<String>,
+    #[serde(default)]
     pub channel_ids: Vec<String>,
     #[serde(default)]
     pub approved_permission_ids: Vec<String>,
@@ -25,6 +27,7 @@ impl AgentAccessScope {
         self.ssh_connection_names = normalize_string_list(&self.ssh_connection_names);
         self.custom_api_ids = normalize_string_list(&self.custom_api_ids);
         self.integration_ids = normalize_string_list(&self.integration_ids);
+        self.extension_pack_ids = normalize_string_list(&self.extension_pack_ids);
         self.channel_ids = normalize_string_list(&self.channel_ids);
         self.approved_permission_ids = normalize_string_list(&self.approved_permission_ids);
         self

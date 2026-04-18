@@ -526,23 +526,56 @@ impl russh::client::Handler for Handler {
 mod tests {
     use super::*;
 
-    const TEST_ED25519_PRIVATE_KEY: &str = r#"-----BEGIN OPENSSH PRIVATE KEY-----
-b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
-QyNTUxOQAAACDB7PJzXd4V6Qtm7RBCrQfenP+UuUk92v3nWse3CI6ASAAAAKC2qFxRtqhc
-UQAAAAtzc2gtZWQyNTUxOQAAACDB7PJzXd4V6Qtm7RBCrQfenP+UuUk92v3nWse3CI6ASA
-AAAEC6dCeN3Rct1cIuWYZ5+vtGDXmBAM75U1UZlf76Qi5HEsHs8nNd3hXpC2btEEKtB96c
-/5S5ST3a/edax7cIjoBIAAAAG2NvZGV4c2FuZGJveG9mZmxpbmVAZGViYW5rYQEC
------END OPENSSH PRIVATE KEY-----"#;
+    struct DeterministicTestRng {
+        state: u64,
+    }
 
-    const TEST_ECDSA_PRIVATE_KEY: &str = r#"-----BEGIN OPENSSH PRIVATE KEY-----
-b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAaAAAABNlY2RzYS
-1zaGEyLW5pc3RwMjU2AAAACG5pc3RwMjU2AAAAQQT7P/zwzqFj+pLe3pK15tyvd4Nqa1Ga
-4pkKzHYnCkL+mjEv5fZe32/lFlWA8tCTvIkDhKTRzPRf+viXFfQu8bZHAAAAuIArCvuAKw
-r7AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBPs//PDOoWP6kt7e
-krXm3K93g2prUZrimQrMdicKQv6aMS/l9l7fb+UWVYDy0JO8iQOEpNHM9F/6+JcV9C7xtk
-cAAAAgCRz4jFQ1vt+nLYhG9VajtcszkFC9/1asEeZ519bHgdsAAAAbY29kZXhzYW5kYm94
-b2ZmbGluZUBkZWJhbmthAQIDBAU=
------END OPENSSH PRIVATE KEY-----"#;
+    impl DeterministicTestRng {
+        fn new(seed: u64) -> Self {
+            Self { state: seed }
+        }
+
+        fn next_word(&mut self) -> u64 {
+            self.state = self.state.wrapping_add(0x9E3779B97F4A7C15);
+            let mut value = self.state;
+            value = (value ^ (value >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            value = (value ^ (value >> 27)).wrapping_mul(0x94D049BB133111EB);
+            value ^ (value >> 31)
+        }
+    }
+
+    impl russh::keys::ssh_key::rand_core::TryRng for DeterministicTestRng {
+        type Error = russh::keys::ssh_key::rand_core::Infallible;
+
+        fn try_next_u32(&mut self) -> std::result::Result<u32, Self::Error> {
+            Ok((self.next_word() >> 32) as u32)
+        }
+
+        fn try_next_u64(&mut self) -> std::result::Result<u64, Self::Error> {
+            Ok(self.next_word())
+        }
+
+        fn try_fill_bytes(&mut self, dst: &mut [u8]) -> std::result::Result<(), Self::Error> {
+            for chunk in dst.chunks_mut(8) {
+                let bytes = self.next_word().to_le_bytes();
+                chunk.copy_from_slice(&bytes[..chunk.len()]);
+            }
+            Ok(())
+        }
+    }
+
+    impl russh::keys::ssh_key::rand_core::TryCryptoRng for DeterministicTestRng {}
+
+    fn test_private_key_pem(
+        algorithm: russh::keys::ssh_key::Algorithm,
+        seed: u64,
+    ) -> String {
+        let mut rng = DeterministicTestRng::new(seed);
+        let key = russh::keys::ssh_key::PrivateKey::random(&mut rng, algorithm).unwrap();
+        key.to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .unwrap()
+            .to_string()
+    }
 
     #[test]
     fn filter_connections_by_allowlist_keeps_only_attached_names() {
@@ -614,12 +647,19 @@ b2ZmbGluZUBkZWJhbmthAQIDBAU=
 
     #[test]
     fn validate_private_key_pem_accepts_ed25519_keys() {
-        validate_private_key_pem("ed25519-key", TEST_ED25519_PRIVATE_KEY).unwrap();
+        let pem = test_private_key_pem(russh::keys::ssh_key::Algorithm::Ed25519, 0xED25519);
+        validate_private_key_pem("ed25519-key", &pem).unwrap();
     }
 
     #[test]
     fn validate_private_key_pem_accepts_ecdsa_keys() {
-        validate_private_key_pem("ecdsa-key", TEST_ECDSA_PRIVATE_KEY).unwrap();
+        let pem = test_private_key_pem(
+            russh::keys::ssh_key::Algorithm::Ecdsa {
+                curve: russh::keys::ssh_key::EcdsaCurve::NistP256,
+            },
+            0xEC_D5A,
+        );
+        validate_private_key_pem("ecdsa-key", &pem).unwrap();
     }
 
     #[test]

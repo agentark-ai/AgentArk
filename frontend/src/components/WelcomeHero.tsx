@@ -1,19 +1,16 @@
 import { Box, Button, Card, CardContent, Chip, Stack, Typography } from "@mui/material";
 import ChatRoundedIcon from "@mui/icons-material/ChatRounded";
 import AutoAwesomeRoundedIcon from "@mui/icons-material/AutoAwesomeRounded";
-import PauseCircleOutlineRoundedIcon from "@mui/icons-material/PauseCircleOutlineRounded";
-import PlayCircleOutlineRoundedIcon from "@mui/icons-material/PlayCircleOutlineRounded";
 import ListAltRoundedIcon from "@mui/icons-material/ListAltRounded";
 import { useEffect, useMemo, useState } from "react";
+import { PRODUCT_SHELL_TITLE, PRODUCT_TAGLINE } from "../brand";
 
 type Props = {
   onGoChat?: () => void;
   onRunBriefing?: () => void;
   onViewTasks?: () => void;
-  onTogglePause?: () => void;
   agentPaused?: boolean;
   briefingLoading?: boolean;
-  pauseLoading?: boolean;
   prompts?: string[];
   currentTaskDesc?: string;
 };
@@ -22,10 +19,8 @@ export function WelcomeHero({
   onGoChat,
   onRunBriefing,
   onViewTasks,
-  onTogglePause,
   agentPaused = false,
   briefingLoading = false,
-  pauseLoading = false,
   prompts,
   currentTaskDesc,
 }: Props) {
@@ -54,7 +49,7 @@ export function WelcomeHero({
   const activeObjective = currentTaskDesc?.trim()
     ? currentTaskDesc.trim()
     : agentPaused
-      ? "Background help is paused. Resume it when you want briefs, reminders, and automations to continue."
+      ? "Background help is paused. Scheduled reminders still fire while proactive work stays paused."
       : "No focus is pinned yet. Start with a question, a reminder, or your next daily brief.";
   const objectiveState = currentTaskDesc?.trim() ? "Active now" : agentPaused ? "Paused" : "Ready";
 
@@ -167,7 +162,7 @@ export function WelcomeHero({
                       variant="overline"
                       sx={{ color: "rgba(183, 188, 196, 0.68)", letterSpacing: 0, display: "block", lineHeight: 1 }}
                     >
-                      AgentArk | Secure Daily Assistant
+                      {PRODUCT_SHELL_TITLE}
                     </Typography>
                     <Typography
                       variant="h5"
@@ -178,19 +173,19 @@ export function WelcomeHero({
                         fontSize: { xs: "1.32rem", md: "1.52rem" },
                       }}
                     >
-                      Your secure daily AI assistant, ready before you ask.
+                      Private OS for memory, agents, apps, and automation.
                     </Typography>
                   </Box>
                 </Stack>
                 <Typography
                   variant="body2"
                   className="mission-card-copy"
-                  title="Private by default, useful every day: memory, daily briefings, safe actions, and deeper automation when you want it."
+                  title={PRODUCT_TAGLINE}
                   sx={{
                     color: "text.secondary"
                   }}
                 >
-                  Private by default, useful every day: memory, daily briefings, safe actions, and deeper automation when you want it.
+                  {PRODUCT_TAGLINE}
                 </Typography>
               </Stack>
 
@@ -200,9 +195,10 @@ export function WelcomeHero({
                 <Chip
                   size="small"
                   color={agentPaused ? "warning" : "success"}
-                  label={agentPaused ? "Background Help Paused" : "Background Help On"}
+                  label={agentPaused ? "Background OS Paused" : "Background OS On"}
                 />
-                <Chip size="small" label="Secure first" />
+                <Chip size="small" label="Private by default" />
+                <Chip size="small" label="Reviewable actions" />
               </Stack>
             </Box>
 
@@ -246,7 +242,7 @@ export function WelcomeHero({
                     ) : null}
                   </Box>
                   <Typography variant="caption" className="welcome-hero-command-caption">
-                    Rotates through useful assistant tasks from your routines, recent work, and unattended runs.
+                    Rotates through useful OS tasks from your routines, recent work, and unattended runs.
                   </Typography>
                 </Box>
               </Box>
@@ -288,17 +284,6 @@ export function WelcomeHero({
                 onClick={onViewTasks}
               >
                 Review Tasks
-              </Button>
-            ) : null}
-            {onTogglePause ? (
-              <Button
-                size="small"
-                variant="outlined"
-                startIcon={agentPaused ? <PlayCircleOutlineRoundedIcon /> : <PauseCircleOutlineRoundedIcon />}
-                onClick={onTogglePause}
-                disabled={pauseLoading}
-              >
-                {agentPaused ? "Resume Background Help" : "Pause Background Help"}
               </Button>
             ) : null}
           </Stack>

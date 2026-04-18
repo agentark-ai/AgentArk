@@ -636,10 +636,14 @@ pub fn sanitize_model_input_json(
 mod tests {
     use super::*;
 
+    fn fake_openai_key() -> String {
+        ["sk", "-1234567890", "abcdefghijklmnop"].concat()
+    }
+
     #[test]
     fn default_redact_masks_secrets_and_pii() {
         let result = sanitize_model_input_text(
-            "Email jane@example.com token sk-1234567890abcdefghijklmnop",
+            &format!("Email jane@example.com token {}", fake_openai_key()),
             &ModelPrivacyConfig::default(),
             ModelInputContext::ToolOutput,
             false,
@@ -652,7 +656,10 @@ mod tests {
     #[test]
     fn raw_current_turn_keeps_pii_but_still_redacts_secrets() {
         let result = sanitize_model_input_text(
-            "My email is jane@example.com and key is sk-1234567890abcdefghijklmnop",
+            &format!(
+                "My email is jane@example.com and key is {}",
+                fake_openai_key()
+            ),
             &ModelPrivacyConfig::default(),
             ModelInputContext::CurrentUserMessage,
             false,

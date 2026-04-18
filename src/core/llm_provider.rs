@@ -362,11 +362,9 @@ async fn refresh_codex_cli_auth_token(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
         return Err(anyhow!(
-            "OpenAI Subscription token refresh failed ({}): {}",
-            status,
-            body
+            "OpenAI Subscription token refresh failed ({})",
+            status
         ));
     }
 

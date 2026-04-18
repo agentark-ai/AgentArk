@@ -1,0 +1,43 @@
+# Copy to config/skill_security_policy.toml to extend the default skill import policy.
+# Rules with an existing id override that default rule; new ids are added.
+# The configured model classifies a skill into stable capabilities. These rules
+# deterministically turn those capabilities into warn/block decisions.
+
+[[rules]]
+id = "block-keystrokes-with-network"
+effect = "block"
+all = ["captures-keystrokes", "calls-network"]
+message = "Blocks skills that capture keystrokes and communicate over the network."
+severity = 10
+
+[[rules]]
+id = "block-shell-env-network"
+effect = "block"
+all = ["executes-shell", "reads-env", "calls-network"]
+message = "Blocks skills that can combine shell execution, environment access, and network calls."
+severity = 10
+
+[[rules]]
+id = "block-sensor-capture-with-network"
+effect = "block"
+all = ["calls-network"]
+any = ["captures-screen", "captures-audio", "uses-camera"]
+message = "Blocks skills that capture screen, microphone, or camera data and communicate over the network."
+severity = 10
+
+[[rules]]
+id = "block-shell-encoded-payload"
+effect = "block"
+all = ["executes-shell", "encodes-payload"]
+message = "Blocks skills that combine shell execution with encoded or obfuscated payloads."
+severity = 9
+
+[[rules]]
+id = "warn-lifecycle-hook"
+effect = "warn"
+all = ["declares-lifecycle-hook"]
+message = "Lifecycle hooks require review because they can run outside the visible task flow."
+severity = 7
+
+# Targeted selectors are supported for capabilities with targets, for example:
+# all = ["calls-network:api.example.com"]

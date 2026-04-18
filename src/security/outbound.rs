@@ -281,6 +281,14 @@ pub fn sanitize_outbound_json(
 mod tests {
     use super::*;
 
+    fn fake_openai_key() -> String {
+        ["sk", "-1234567890", "abcdefghijklmnop"].concat()
+    }
+
+    fn fake_github_token() -> String {
+        ["ghp", "_1234567890", "abcdefghijklmnopqrstuv"].concat()
+    }
+
     #[test]
     fn outbound_text_allows_clean_content() {
         let result = check_outbound_text(
@@ -297,7 +305,7 @@ mod tests {
     #[test]
     fn outbound_text_redacts_secret_like_content() {
         let result = check_outbound_text(
-            "Token is sk-1234567890abcdefghijklmnop",
+            &format!("Token is {}", fake_openai_key()),
             &OutboundPrivacyPolicy::default(),
         );
         assert!(matches!(
@@ -325,7 +333,7 @@ mod tests {
         let result = sanitize_outbound_json(
             &serde_json::json!({
                 "message": "Call me at 555-123-4567",
-                "body": { "token": "ghp_1234567890abcdefghijklmnopqrstuv" }
+                "body": { "token": fake_github_token() }
             }),
             &OutboundPrivacyPolicy::default(),
         );

@@ -40,7 +40,6 @@ import type {
 const REFRESH_MS = 8000;
 const ACTIVE_TASK_STALE_MS = 24 * 60 * 60 * 1000;
 type JsonRecord = Record<string, unknown>;
-type PausePhase = "idle" | "stopping" | "stopped" | "resuming" | "resumed";
 type AutomationObject = {
   id: string;
   kind: string;
@@ -320,10 +319,6 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
   const queryClient = useQueryClient();
   const autoRefresh = useUiStore((s) => s.autoRefresh);
   const interval = autoRefresh ? REFRESH_MS : false;
-  const [pauseDialogOpen, setPauseDialogOpen] = useState(false);
-  const [pausePhase, setPausePhase] = useState<PausePhase>("idle");
-  const [pauseError, setPauseError] = useState<string | null>(null);
-  const [pauseTarget, setPauseTarget] = useState<"pause" | "resume" | null>(null);
   const [inventoryOpen, setInventoryOpen] = useState(false);
   const [activityOpen, setActivityOpen] = useState(false);
   const [dailyBriefDialogOpen, setDailyBriefDialogOpen] = useState(false);
@@ -577,14 +572,8 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
     return asRecord(root.settings);
   }, [autonomySettingsQ.data]);
 
-  const agentPaused = Boolean(autonomySettings.agent_paused ?? false);
-  const pauseScopeItems = [
-    "Scheduled tasks",
-    "Watchers",
-    "ArkPulse runs",
-    "Autopilot/background analysis",
-    "Proactive outbound notifications",
-  ];
+  const autonomyMode = str(autonomySettings.autonomy_mode, "assist").toLowerCase();
+  const agentPaused = Boolean(autonomySettings.agent_paused ?? false) || autonomyMode === "off";
 
   // --- Mutations ---
   const approveMutation = useMutation({
@@ -651,37 +640,6 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
       setDailyBriefDialogOpen(true);
     },
   });
-  const pauseMutation = useMutation({
-    mutationFn: (nextPaused: boolean) =>
-      api.rawPost("/autonomy/settings", {
-        agent_paused: nextPaused,
-        pause_mode: "autonomous_only",
-      }),
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["autonomy-settings-dashboard"] });
-      await queryClient.invalidateQueries({ queryKey: ["autonomy-settings"] });
-      await queryClient.invalidateQueries({ queryKey: ["briefing"] });
-      await queryClient.invalidateQueries({ queryKey: ["tasks"] });
-      await queryClient.invalidateQueries({ queryKey: ["trace"] });
-    },
-  });
-
-  async function handleTogglePause() {
-    if (pauseMutation.isPending) return;
-    const nextPaused = !agentPaused;
-    setPauseDialogOpen(true);
-    setPauseError(null);
-    setPauseTarget(nextPaused ? "pause" : "resume");
-    setPausePhase(nextPaused ? "stopping" : "resuming");
-    try {
-      await pauseMutation.mutateAsync(nextPaused);
-      setPausePhase(nextPaused ? "stopped" : "resumed");
-    } catch (error) {
-      setPauseError(errMessage(error));
-      setPausePhase("idle");
-    }
-  }
-
   async function handleExecuteSuggestedAction(action: RecommendedAction) {
     const startedAt = new Date().toISOString();
     setSuggestionRun({
@@ -813,12 +771,8 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
               onGoChat={() => navigateToView("chat")}
               onRunBriefing={() => runBriefingMutation.mutate()}
               onViewTasks={() => navigateToView("tasks")}
-              onTogglePause={() => {
-                void handleTogglePause();
-              }}
               agentPaused={agentPaused}
               briefingLoading={runBriefingMutation.isPending}
-              pauseLoading={pauseMutation.isPending}
               prompts={heroPrompts}
               currentTaskDesc={currentTask}
             />
@@ -1559,82 +1513,6 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
         humanTs={humanTs}
         errMessage={errMessage}
       />
-      <Dialog
-        open={pauseDialogOpen}
-        onClose={() => {
-          if (pauseMutation.isPending) return;
-          setPauseDialogOpen(false);
-          setPauseError(null);
-          setPausePhase("idle");
-          setPauseTarget(null);
-        }}
-        maxWidth="sm"
-        fullWidth
-      >
-        <DialogTitle>
-          {pausePhase === "stopping" && "Pausing Agent"}
-          {pausePhase === "stopped" && "Agent Paused"}
-          {pausePhase === "resuming" && "Resuming Agent"}
-          {pausePhase === "resumed" && "Agent Resumed"}
-          {pausePhase === "idle" && (pauseTarget === "resume" ? "Resume Agent" : "Pause Agent")}
-        </DialogTitle>
-        <DialogContent dividers>
-          <Stack spacing={1.25}>
-            {pausePhase === "stopping" || pausePhase === "resuming" ? (
-              <Stack direction="row" spacing={1} sx={{
-                alignItems: "center"
-              }}>
-                <CircularProgress size={18} />
-                <Typography variant="body2">
-                  {pausePhase === "stopping"
-                    ? "stopping: disabling autonomous background activity..."
-                    : "resuming: re-enabling autonomous background activity..."}
-                </Typography>
-              </Stack>
-            ) : null}
-
-            {pausePhase === "stopped" || pausePhase === "resumed" ? (
-              <Chip
-                size="small"
-                color="success"
-                label={pausePhase === "stopped" ? "stopped" : "resumed"}
-                sx={{ width: "fit-content" }}
-              />
-            ) : null}
-
-            <Typography variant="body2" sx={{
-              color: "text.secondary"
-            }}>
-              {pauseTarget === "pause"
-                ? "When paused, these systems are suspended:"
-                : "On resume, these systems are active again:"}
-            </Typography>
-
-            <Stack spacing={0.5}>
-              {pauseScopeItems.map((item) => (
-                <Typography key={item} variant="body2">
-                  - {item}
-                </Typography>
-              ))}
-            </Stack>
-
-            {pauseError ? <Alert severity="error">{pauseError}</Alert> : null}
-          </Stack>
-        </DialogContent>
-        <DialogActions>
-          <Button
-            onClick={() => {
-              setPauseDialogOpen(false);
-              setPauseError(null);
-              setPausePhase("idle");
-              setPauseTarget(null);
-            }}
-            disabled={pauseMutation.isPending}
-          >
-            Close
-          </Button>
-        </DialogActions>
-      </Dialog>
     </Box>
   );
 }

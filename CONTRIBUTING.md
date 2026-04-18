@@ -17,6 +17,27 @@ Read these first:
 - Do not commit secrets, tokens, cookies, exported credentials, or local `.env` files.
 - Do not open public issues for suspected vulnerabilities. Use the private security reporting path described in [SECURITY.md](SECURITY.md).
 
+## Issue-First Policy
+
+All non-trivial pull requests must reference an issue that a maintainer has marked with the `approved` label. Pull requests that do not reference an approved issue are closed automatically by the `issue-first-gate` workflow.
+
+The goal is alignment before code: the issue is where we agree on what is being changed, why, and roughly how. This avoids wasted work on changes that would have been redesigned or declined in review, and keeps AI-assisted drive-by PRs from swamping the queue.
+
+Workflow:
+
+1. Open an issue using one of the templates in `.github/ISSUE_TEMPLATE/`. Describe the problem and the proposed direction in your own words.
+2. A maintainer discusses, accepts or redirects the approach, and adds the `approved` label to the issue when it is cleared to implement.
+3. Open a pull request whose body references the approved issue using `Fixes #123`, `Closes #123`, or `Refs #123`.
+4. Fill in the checklist in `.github/pull_request_template.md`.
+
+The gate is skipped automatically for:
+
+- PRs from `dependabot[bot]` and other maintainer-configured bots.
+- PRs authored by a user with `write` or higher permission on the repo.
+- PRs labeled `security` (so urgent security fixes are never blocked) or on branches matching `security/*`.
+
+Documentation-only PRs are **not** exempt. A real docs change deserves an issue too, and this removes the obvious "disguise slop as a typo fix" workaround.
+
 ## Development Setup
 
 ### Docker-first local run

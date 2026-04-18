@@ -159,7 +159,7 @@ case "${1:-start}" in
         ;;
     restart)
         echo -e "${YELLOW}Restarting AgentArk...${NC}"
-        docker compose restart
+        docker compose restart agentark-control agentark-workspace agentark-executor
         verify_lightpanda_runtime
         ;;
     logs)
