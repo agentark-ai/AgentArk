@@ -3,8 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const AUTONOMY_PAUSED_SINCE_KEY: &str = "autonomy_paused_since_v1";
-pub const AUTONOMY_PAUSE_NUDGE_LAST_SENT_AT_KEY: &str =
-    "autonomy_pause_nudge_last_sent_at_v1";
+pub const AUTONOMY_PAUSE_NUDGE_LAST_SENT_AT_KEY: &str = "autonomy_pause_nudge_last_sent_at_v1";
 pub const AUTONOMY_PAUSE_NUDGE_INTERVAL_SECS: i64 = 7 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

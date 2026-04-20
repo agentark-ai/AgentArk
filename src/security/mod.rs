@@ -150,6 +150,9 @@ static PRIVATE_KEY_BLOCK_PATTERN: Lazy<Regex> = Lazy::new(|| {
     )
     .unwrap()
 });
+static UUID_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$").unwrap()
+});
 static CERT_BLOCK_PATTERN: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?s)-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----").unwrap()
 });
@@ -216,9 +219,9 @@ fn opaque_token_shape_char(ch: char) -> bool {
 }
 
 fn opaque_token_has_secret_signal(value: &str) -> bool {
-    value.chars().any(|ch| {
-        ch.is_ascii_digit() || matches!(ch, '_' | '-' | '=' | '+')
-    })
+    value
+        .chars()
+        .any(|ch| ch.is_ascii_digit() || matches!(ch, '_' | '-' | '=' | '+'))
 }
 
 fn shannon_entropy_bits_per_char(value: &str) -> f64 {
@@ -240,11 +243,61 @@ fn shannon_entropy_bits_per_char(value: &str) -> f64 {
         .sum()
 }
 
+fn is_lowercase_word_segment(value: &str) -> bool {
+    value.len() >= 2 && value.chars().all(|ch| ch.is_ascii_lowercase())
+}
+
+fn is_safe_identifier_version_segment(value: &str) -> bool {
+    value
+        .strip_prefix('v')
+        .filter(|rest| !rest.is_empty() && rest.chars().all(|ch| ch.is_ascii_digit()))
+        .is_some()
+}
+
+fn is_uuid_hex_group(value: &str) -> bool {
+    matches!(value.len(), 4 | 8 | 12) && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn is_likely_identifier_slug(value: &str) -> bool {
+    let trimmed = value.trim();
+    if UUID_PATTERN.is_match(trimmed) {
+        return true;
+    }
+    if !trimmed.contains('_') && !trimmed.contains('-') {
+        return false;
+    }
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '-'))
+    {
+        return false;
+    }
+
+    let segments: Vec<&str> = trimmed
+        .split(['_', '-'])
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if segments.len() < 2 {
+        return false;
+    }
+    let word_segments = segments
+        .iter()
+        .filter(|segment| is_lowercase_word_segment(segment))
+        .count();
+    word_segments >= 2
+        && segments.iter().all(|segment| {
+            is_lowercase_word_segment(segment)
+                || is_safe_identifier_version_segment(segment)
+                || is_uuid_hex_group(segment)
+        })
+}
+
 fn is_opaque_token_shape(value: &str) -> bool {
     let trimmed = value.trim();
     trimmed.chars().count() >= OPAQUE_TOKEN_MIN_CHARS
         && !trimmed.chars().any(char::is_whitespace)
         && trimmed.chars().all(opaque_token_shape_char)
+        && !is_likely_identifier_slug(trimmed)
         && opaque_token_has_secret_signal(trimmed)
         && shannon_entropy_bits_per_char(trimmed) >= OPAQUE_TOKEN_ENTROPY_BITS_PER_CHAR
 }
@@ -505,10 +558,8 @@ mod tests {
     fn test_secret_redaction_masks_bare_and_inline_secrets() {
         let moltbook_key = fake_moltbook_key();
         let openai_key = fake_openai_key();
-        let result = redact_secret_input(&format!(
-            "Use {} and api_key={}",
-            moltbook_key, openai_key,
-        ));
+        let result =
+            redact_secret_input(&format!("Use {} and api_key={}", moltbook_key, openai_key,));
         assert!(result.had_secret());
         assert!(!result.text.contains(&moltbook_key));
         assert!(!result.text.contains(&openai_key));
@@ -531,6 +582,28 @@ mod tests {
         let result = redact_secret_input("I live in Madhyam, Kolkata and prefer concise answers.");
 
         assert!(!result.had_secret());
+    }
+
+    #[test]
+    fn test_secret_redaction_keeps_identifier_slugs_and_versions() {
+        for value in [
+            "memory_capture_events",
+            "routing-policy-default-v2",
+            "prompt-candidate-550e8400-e29b-41d4-a716-446655440000",
+        ] {
+            let result = redact_secret_input(value);
+            assert!(!result.had_secret(), "unexpected redaction for {value}");
+            assert_eq!(result.text, value);
+        }
+    }
+
+    #[test]
+    fn test_secret_redaction_keeps_sentence_with_internal_identifier() {
+        let message = "Inspect memory_capture_events and capture model health";
+        let result = redact_secret_input(message);
+
+        assert!(!result.had_secret());
+        assert_eq!(result.text, message);
     }
 
     #[test]

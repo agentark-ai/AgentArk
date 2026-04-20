@@ -123,18 +123,10 @@ export function AgentStatusBar({
             alignItems: "center"
           }}>
             <Box
-              sx={{
-                width: 10,
-                height: 10,
-                borderRadius: "50%",
+              className={pulse ? "status-dot status-dot--pulse" : "status-dot"}
+              style={{
                 backgroundColor: dotColor,
-                boxShadow: pulse ? `0 0 8px 2px ${dotColor}` : "none",
-                animation: pulse ? "pulse-dot 2s ease-in-out infinite" : "none",
-                flexShrink: 0,
-                "@keyframes pulse-dot": {
-                  "0%, 100%": { boxShadow: `0 0 4px 1px ${dotColor}` },
-                  "50%": { boxShadow: `0 0 10px 4px ${dotColor}` },
-                },
+                boxShadow: pulse ? `0 0 6px 1px ${dotColor}` : "none",
               }}
             />
             <Typography variant="subtitle2" sx={{ color: "rgba(244, 245, 247, 0.96)", fontWeight: 700 }}>

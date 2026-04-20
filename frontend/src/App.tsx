@@ -1599,25 +1599,12 @@ export default function App() {
               <Tooltip title={serverTooltip} arrow>
                 <Box
                   onClick={() => serverQ.refetch()}
-                  sx={{
-                    width: 10,
-                    height: 10,
-                    borderRadius: "50%",
-                    backgroundColor: serverDotColor,
+                  className={serverPulse ? "status-dot status-dot--pulse" : "status-dot"}
+                  style={{
+                    marginLeft: 6,
                     cursor: "pointer",
-                    ml: 0.75,
-                    boxShadow: serverPulse
-                      ? `0 0 6px 2px ${serverDotColor}`
-                      : "none",
-                    animation: serverPulse
-                      ? "pulse-dot 2s ease-in-out infinite"
-                      : "none",
-                    "@keyframes pulse-dot": {
-                      "0%, 100%": {
-                        boxShadow: `0 0 4px 1px ${serverDotColor}`,
-                      },
-                      "50%": { boxShadow: `0 0 8px 3px ${serverDotColor}` },
-                    },
+                    backgroundColor: serverDotColor,
+                    boxShadow: serverPulse ? `0 0 6px 1px ${serverDotColor}` : "none",
                   }}
                 />
               </Tooltip>

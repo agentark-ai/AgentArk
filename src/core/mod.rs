@@ -9,10 +9,10 @@ pub mod background_session;
 pub mod browser_profiles;
 pub mod browser_session;
 pub mod capability_router;
+pub mod companion;
 pub mod config;
 pub mod connect_flow;
 pub mod connector;
-pub mod companion;
 pub(crate) mod data_contract;
 pub mod data_lifecycle;
 pub(crate) mod document_search;
@@ -26,9 +26,9 @@ pub mod integration_sync;
 pub mod intent;
 pub mod learning;
 pub mod live_run;
-pub mod memory_dedup;
 mod llm;
 pub(crate) mod llm_provider;
+pub mod memory_dedup;
 pub mod model_failover;
 pub mod net;
 pub mod nodes;
@@ -56,9 +56,11 @@ pub mod watcher;
 pub(crate) use agent::chat_model_is_configured;
 pub(crate) use agent::queue_stream_event;
 pub(crate) use agent::AUTONOMY_SETTINGS_STORAGE_KEY;
+pub(crate) use agent::USER_SELECTED_MODEL_SLOT_KEY;
 pub use agent::{
-    Agent, ConversationMessage, ExecutionStep, ExecutionTrace, RequestExecutionHints,
-    RequestPlanConfirmationMode, SecurityEvents, SecuritySnapshot, StreamEvent, UserProfile,
+    Agent, ClarificationChoice, ConversationMessage, ExecutionStep, ExecutionTrace,
+    RequestExecutionHints, RequestPlanConfirmationMode, SecurityEvents, SecuritySnapshot,
+    StreamEvent, UserProfile,
 };
 pub use automation::{
     list_runs as list_automation_runs, list_supervisor_states as list_automation_supervisor_states,
@@ -78,9 +80,6 @@ pub use browser_profiles::{
     BrowserProfileLockRequest, BrowserProfileRecord, BrowserProfileSessionRecord,
     BrowserProfileTargetKind, BrowserProfileUpsert,
 };
-pub use config::{
-    AgentConfig, ModelCapabilityTier, ModelCostTier, ModelHealthScope, ModelRole, ModelSlot,
-};
 pub use companion::{
     companion_presets, presets_response as companion_presets_response,
     protocol_document as companion_protocol_document, CompanionAttestationClaim,
@@ -88,8 +87,11 @@ pub use companion::{
     CompanionControlPlane, CompanionDevice, CompanionDeviceAttestation, CompanionDeviceState,
     CompanionGrant, CompanionPairingClaim, CompanionPairingClaimResult, CompanionPairingSession,
     CompanionPairingSessionCreate, CompanionPairingStatus, CompanionPresetsResponse,
-    CompanionProtocolDocument, CompanionRiskLevel,
-    CompanionTokenRotationRequest, CompanionTokenRotationResult,
+    CompanionProtocolDocument, CompanionRiskLevel, CompanionTokenRotationRequest,
+    CompanionTokenRotationResult,
+};
+pub use config::{
+    AgentConfig, ModelCapabilityTier, ModelCostTier, ModelHealthScope, ModelRole, ModelSlot,
 };
 pub use embeddings::EmbeddingClient;
 pub use execution::{
@@ -132,5 +134,5 @@ pub use planner::{ExecutionPlan, PlanPromptMode, PlanStep, PlanStepStatus, PlanS
 pub use prompt_memory::PromptMemory;
 pub use request_shape::RequestShapeAssessment;
 pub(crate) use task::{one_shot_reminder_is_expired, one_shot_reminder_needs_delay_notice};
-pub(crate) use task::{task_is_one_shot_scheduled_reminder, task_is_scheduled_reminder};
 pub use task::{status_for_task_approval, Task, TaskApproval, TaskQueue, TaskStatus};
+pub(crate) use task::{task_is_one_shot_scheduled_reminder, task_is_scheduled_reminder};

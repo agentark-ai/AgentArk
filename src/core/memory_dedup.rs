@@ -465,11 +465,7 @@ async fn absorb_candidate_into_row(
     candidate_embedding: PgVector,
 ) -> Result<()> {
     let mut updated = canonical.clone();
-    let mut metadata = updated
-        .metadata
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
+    let mut metadata = updated.metadata.as_object().cloned().unwrap_or_default();
     let now_iso = chrono::Utc::now().to_rfc3339();
 
     let previous_value_text = embeddable_text_from_content(&canonical.content).to_string();

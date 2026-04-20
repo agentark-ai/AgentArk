@@ -138,8 +138,11 @@ pub(crate) async fn ensure_access_token_for_source(
         },
         GmailDeliverySource::Gmail => ensure_legacy_access_token(config_dir).await,
         GmailDeliverySource::GoogleWorkspace => {
-            crate::actions::google_workspace::ensure_access_token_for_bundles(config_dir, &["gmail"])
-                .await
+            crate::actions::google_workspace::ensure_access_token_for_bundles(
+                config_dir,
+                &["gmail"],
+            )
+            .await
         }
     }
 }
@@ -668,8 +671,7 @@ pub async fn gmail_reply(config_dir: &Path, args: &serde_json::Value) -> Result<
         args.html_body.as_deref(),
         None,
     )?;
-    let raw_b64 =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(message.formatted());
+    let raw_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(message.formatted());
     let mut body = serde_json::json!({
         "raw": raw_b64
     });

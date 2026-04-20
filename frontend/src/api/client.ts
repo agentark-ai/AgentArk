@@ -280,14 +280,49 @@ export async function initializeUiSession(): Promise<void> {
   await trySilentBootstrap();
 }
 
-export async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const doFetch = () =>
-    fetch(apiUrl(path), {
+type RequestOptions = RequestInit & {
+  timeoutMs?: number;
+};
+
+async function fetchWithOptionalTimeout(
+  path: string,
+  init?: RequestOptions,
+  json = true,
+): Promise<Response> {
+  const timeoutMs = init?.timeoutMs;
+  const fetchInit: RequestInit = { ...init };
+  delete (fetchInit as RequestOptions).timeoutMs;
+
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  let controller: AbortController | null = null;
+  if (timeoutMs && !fetchInit.signal) {
+    controller = new AbortController();
+    fetchInit.signal = controller.signal;
+    timeoutHandle = setTimeout(() => controller?.abort(), timeoutMs);
+  }
+
+  try {
+    return await fetch(apiUrl(path), {
       credentials: "include",
-      ...init
-      ,
-      headers: buildHeaders(init?.headers)
+      ...fetchInit,
+      headers: buildHeaders(fetchInit.headers, { json })
     });
+  } catch (error) {
+    if (controller && controller.signal.aborted) {
+      throw new Error(
+        `Request timed out after ${Math.max(1, Math.ceil(timeoutMs! / 1000))}s`,
+      );
+    }
+    throw error;
+  } finally {
+    if (timeoutHandle !== undefined) {
+      clearTimeout(timeoutHandle);
+    }
+  }
+}
+
+export async function request<T>(path: string, init?: RequestOptions): Promise<T> {
+  const doFetch = () => fetchWithOptionalTimeout(path, init);
   let res = await doFetch();
   if (!res.ok) {
     let text = extractErrorMessage(await res.text());
@@ -305,14 +340,16 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T;
 }
 
-export async function requestForm<T>(path: string, formData: FormData, init?: RequestInit): Promise<T> {
+export async function requestForm<T>(path: string, formData: FormData, init?: RequestOptions): Promise<T> {
   const doFetch = () =>
-    fetch(apiUrl(path), {
-      credentials: "include",
-      ...init,
-      headers: buildHeaders(init?.headers, { json: false }),
-      body: formData
-    });
+    fetchWithOptionalTimeout(
+      path,
+      {
+        ...init,
+        body: formData
+      },
+      false,
+    );
   let res = await doFetch();
   if (!res.ok) {
     let text = extractErrorMessage(await res.text());
@@ -649,27 +686,32 @@ async function streamRun(runId: string, sinceSeq = 0, handlers: ChatStreamHandle
 
 export const api = {
   rawGet: (path: string) => request<unknown>(path),
-  rawPost: (path: string, payload?: unknown) =>
+  rawPost: (path: string, payload?: unknown, init?: RequestOptions) =>
     request<unknown>(path, {
+      ...init,
       method: "POST",
       body: JSON.stringify(payload ?? {})
     }),
-  rawPut: (path: string, payload?: unknown) =>
+  rawPut: (path: string, payload?: unknown, init?: RequestOptions) =>
     request<unknown>(path, {
+      ...init,
       method: "PUT",
       body: JSON.stringify(payload ?? {})
     }),
-  rawPatch: (path: string, payload?: unknown) =>
+  rawPatch: (path: string, payload?: unknown, init?: RequestOptions) =>
     request<unknown>(path, {
+      ...init,
       method: "PATCH",
       body: JSON.stringify(payload ?? {})
     }),
-  rawDelete: (path: string) =>
+  rawDelete: (path: string, init?: RequestOptions) =>
     request<unknown>(path, {
+      ...init,
       method: "DELETE"
     }),
-  rawPostForm: (path: string, formData: FormData) =>
+  rawPostForm: (path: string, formData: FormData, init?: RequestOptions) =>
     requestForm<unknown>(path, formData, {
+      ...init,
       method: "POST"
     }),
   getStatus: () => request<StatusResponse>("/status"),

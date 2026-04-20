@@ -22,6 +22,7 @@ pub enum SwarmEvent {
 }
 
 /// Central message bus for inter-agent communication
+#[derive(Clone)]
 pub struct MessageBus {
     mailboxes: Arc<RwLock<HashMap<AgentId, mpsc::Sender<SwarmMessage>>>>,
     event_tx: broadcast::Sender<SwarmEvent>,

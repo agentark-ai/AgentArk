@@ -174,6 +174,7 @@ pub async fn run_service(config: ExecutorServiceConfig) -> Result<()> {
         )?;
     }
     let registry = AppRegistry::with_paths(config.config_dir.clone(), config.data_dir.clone());
+    let _boot_report = registry.reconcile_on_boot().await;
     registry.spawn_restore_from_disk(
         config.config_dir.clone(),
         config.data_dir.clone(),

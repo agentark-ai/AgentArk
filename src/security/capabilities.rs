@@ -289,18 +289,11 @@ pub fn capability_category(kind: &str) -> FindingCategory {
             FindingCategory::CredentialPattern
         }
         "captures-keystrokes" => FindingCategory::Keylogging,
-        "captures-screen"
-        | "captures-audio"
-        | "uses-camera"
-        | "reads-user-data"
-        | "reads-email"
-        | "reads-calendar"
-        | "reads-documents"
-        | "reads-memory"
-        | "reads-browser-data"
-        | "sends-external"
-        | "writes-external"
-        | "publishes-public" => FindingCategory::DataExfiltration,
+        "captures-screen" | "captures-audio" | "uses-camera" | "reads-user-data"
+        | "reads-email" | "reads-calendar" | "reads-documents" | "reads-memory"
+        | "reads-browser-data" | "sends-external" | "writes-external" | "publishes-public" => {
+            FindingCategory::DataExfiltration
+        }
         "encodes-payload" => FindingCategory::EncodedPayload,
         "installs-package" => FindingCategory::SupplyChain,
         "declares-lifecycle-hook" => FindingCategory::LifecycleHook,
@@ -610,13 +603,37 @@ fn push_permission_observations(
             push_observation(out, seen, layer, entity_id, "writes-file", None, evidence);
         }
         Permission::Shell => {
-            push_observation(out, seen, layer, entity_id, "executes-shell", None, evidence);
+            push_observation(
+                out,
+                seen,
+                layer,
+                entity_id,
+                "executes-shell",
+                None,
+                evidence,
+            );
         }
         Permission::Clipboard => {
-            push_observation(out, seen, layer, entity_id, "uses-clipboard", None, evidence);
+            push_observation(
+                out,
+                seen,
+                layer,
+                entity_id,
+                "uses-clipboard",
+                None,
+                evidence,
+            );
         }
         Permission::Scheduler => {
-            push_observation(out, seen, layer, entity_id, "schedules-task", None, evidence);
+            push_observation(
+                out,
+                seen,
+                layer,
+                entity_id,
+                "schedules-task",
+                None,
+                evidence,
+            );
         }
         Permission::Gmail => {
             push_observation(
@@ -628,11 +645,27 @@ fn push_permission_observations(
                 Some("gmail.googleapis.com"),
                 evidence,
             );
-            push_observation(out, seen, layer, entity_id, "uses-auth-profile", None, evidence);
+            push_observation(
+                out,
+                seen,
+                layer,
+                entity_id,
+                "uses-auth-profile",
+                None,
+                evidence,
+            );
             push_observation(out, seen, layer, entity_id, "sends-message", None, evidence);
         }
         Permission::CodeExecute => {
-            push_observation(out, seen, layer, entity_id, "code-execution", None, evidence);
+            push_observation(
+                out,
+                seen,
+                layer,
+                entity_id,
+                "code-execution",
+                None,
+                evidence,
+            );
         }
         Permission::LocalNetworkDiscovery => {
             push_observation(
@@ -763,13 +796,29 @@ fn push_structured_capability_observations(
                 Some("gmail.googleapis.com"),
                 &evidence,
             );
-            push_observation(out, seen, layer, entity_id, "uses-auth-profile", None, &evidence);
+            push_observation(
+                out,
+                seen,
+                layer,
+                entity_id,
+                "uses-auth-profile",
+                None,
+                &evidence,
+            );
             if matches!(
                 metadata.role,
                 crate::actions::PlannerActionRole::Delivery
                     | crate::actions::PlannerActionRole::Mutation
             ) {
-                push_observation(out, seen, layer, entity_id, "sends-message", None, &evidence);
+                push_observation(
+                    out,
+                    seen,
+                    layer,
+                    entity_id,
+                    "sends-message",
+                    None,
+                    &evidence,
+                );
                 push_observation(
                     out,
                     seen,
@@ -802,7 +851,15 @@ fn push_structured_capability_observations(
                 Some("googleapis.com"),
                 &evidence,
             );
-            push_observation(out, seen, layer, entity_id, "uses-auth-profile", None, &evidence);
+            push_observation(
+                out,
+                seen,
+                layer,
+                entity_id,
+                "uses-auth-profile",
+                None,
+                &evidence,
+            );
             match metadata.role {
                 crate::actions::PlannerActionRole::DataSource
                 | crate::actions::PlannerActionRole::Inspection => {
@@ -817,7 +874,15 @@ fn push_structured_capability_observations(
                     );
                 }
                 crate::actions::PlannerActionRole::Delivery => {
-                    push_observation(out, seen, layer, entity_id, "sends-message", None, &evidence);
+                    push_observation(
+                        out,
+                        seen,
+                        layer,
+                        entity_id,
+                        "sends-message",
+                        None,
+                        &evidence,
+                    );
                     push_observation(
                         out,
                         seen,
@@ -843,7 +908,15 @@ fn push_structured_capability_observations(
             }
         }
         "notify" => {
-            push_observation(out, seen, layer, entity_id, "sends-message", None, &evidence);
+            push_observation(
+                out,
+                seen,
+                layer,
+                entity_id,
+                "sends-message",
+                None,
+                &evidence,
+            );
         }
         "browser" | "browser-automation" => {
             push_observation(
@@ -872,7 +945,15 @@ fn push_structured_capability_observations(
             }
         }
         "local-network-discovery" => {
-            push_observation(out, seen, layer, entity_id, "local-network", None, &evidence);
+            push_observation(
+                out,
+                seen,
+                layer,
+                entity_id,
+                "local-network",
+                None,
+                &evidence,
+            );
             push_observation(
                 out,
                 seen,
@@ -884,17 +965,57 @@ fn push_structured_capability_observations(
             );
         }
         "messaging-send" => {
-            push_observation(out, seen, layer, entity_id, "sends-message", None, &evidence);
-            push_observation(out, seen, layer, entity_id, "sends-external", None, &evidence);
+            push_observation(
+                out,
+                seen,
+                layer,
+                entity_id,
+                "sends-message",
+                None,
+                &evidence,
+            );
+            push_observation(
+                out,
+                seen,
+                layer,
+                entity_id,
+                "sends-external",
+                None,
+                &evidence,
+            );
         }
         "broad-network" => {
-            push_observation(out, seen, layer, entity_id, "calls-network", None, &evidence);
+            push_observation(
+                out,
+                seen,
+                layer,
+                entity_id,
+                "calls-network",
+                None,
+                &evidence,
+            );
         }
         "requests-secrets" => {
-            push_observation(out, seen, layer, entity_id, "requests-secrets", None, &evidence);
+            push_observation(
+                out,
+                seen,
+                layer,
+                entity_id,
+                "requests-secrets",
+                None,
+                &evidence,
+            );
         }
         "reads-secrets" => {
-            push_observation(out, seen, layer, entity_id, "reads-secrets", None, &evidence);
+            push_observation(
+                out,
+                seen,
+                layer,
+                entity_id,
+                "reads-secrets",
+                None,
+                &evidence,
+            );
         }
         _ => {}
     }
@@ -925,12 +1046,7 @@ pub fn observations_from_action_def(
             &evidence,
         );
         push_structured_capability_observations(
-            &mut out,
-            &mut seen,
-            layer,
-            entity_id,
-            action,
-            trimmed,
+            &mut out, &mut seen, layer, entity_id, action, trimmed,
         );
     }
 
@@ -939,20 +1055,68 @@ pub fn observations_from_action_def(
         let evidence = format!("declared access permission '{}'", permission_id.trim());
         match normalize_capability_kind(permission_id).as_str() {
             "messaging-send" => {
-                push_observation(&mut out, &mut seen, layer, entity_id, "sends-message", None, &evidence);
-                push_observation(&mut out, &mut seen, layer, entity_id, "sends-external", None, &evidence);
+                push_observation(
+                    &mut out,
+                    &mut seen,
+                    layer,
+                    entity_id,
+                    "sends-message",
+                    None,
+                    &evidence,
+                );
+                push_observation(
+                    &mut out,
+                    &mut seen,
+                    layer,
+                    entity_id,
+                    "sends-external",
+                    None,
+                    &evidence,
+                );
             }
             "broad-network" => {
-                push_observation(&mut out, &mut seen, layer, entity_id, "calls-network", None, &evidence);
+                push_observation(
+                    &mut out,
+                    &mut seen,
+                    layer,
+                    entity_id,
+                    "calls-network",
+                    None,
+                    &evidence,
+                );
             }
             "auth-profile" | "uses-auth-profile" => {
-                push_observation(&mut out, &mut seen, layer, entity_id, "uses-auth-profile", None, &evidence);
+                push_observation(
+                    &mut out,
+                    &mut seen,
+                    layer,
+                    entity_id,
+                    "uses-auth-profile",
+                    None,
+                    &evidence,
+                );
             }
             "reads-secrets" => {
-                push_observation(&mut out, &mut seen, layer, entity_id, "reads-secrets", None, &evidence);
+                push_observation(
+                    &mut out,
+                    &mut seen,
+                    layer,
+                    entity_id,
+                    "reads-secrets",
+                    None,
+                    &evidence,
+                );
             }
             "requests-secrets" => {
-                push_observation(&mut out, &mut seen, layer, entity_id, "requests-secrets", None, &evidence);
+                push_observation(
+                    &mut out,
+                    &mut seen,
+                    layer,
+                    entity_id,
+                    "requests-secrets",
+                    None,
+                    &evidence,
+                );
             }
             _ => {}
         }
@@ -1080,20 +1244,15 @@ pub fn evaluate_cross_layer_capabilities(
 ) -> Option<CapabilityLayerReport> {
     let distinct_subjects = observations
         .iter()
-        .map(|observation| {
-            (
-                observation.layer.as_str(),
-                observation.entity_id.as_str(),
-            )
-        })
+        .map(|observation| (observation.layer.as_str(), observation.entity_id.as_str()))
         .collect::<HashSet<_>>();
     if distinct_subjects.len() < 2 {
         return None;
     }
 
-    let selector_subjects = observations
-        .iter()
-        .fold(HashMap::<String, HashSet<(String, String)>>::new(), |mut acc, observation| {
+    let selector_subjects = observations.iter().fold(
+        HashMap::<String, HashSet<(String, String)>>::new(),
+        |mut acc, observation| {
             acc.entry(normalize_capability_kind(&observation.kind))
                 .or_default()
                 .insert((observation.layer.clone(), observation.entity_id.clone()));
@@ -1112,7 +1271,8 @@ pub fn evaluate_cross_layer_capabilities(
                 .insert((observation.layer.clone(), observation.entity_id.clone()));
             }
             acc
-        });
+        },
+    );
 
     let selectors = observation_selector_set(&observations);
     let mut correlated_rules = Vec::new();
@@ -1274,11 +1434,9 @@ mod tests {
         let report = evaluate_cross_layer_capabilities(observations)
             .expect("approval report should be produced");
         assert!(!report.blocked);
-        assert!(report
-            .matched_rules
-            .iter()
-            .any(|rule| rule.id == "approve-sensitive-source-to-external-send"
-                && rule.effect == "approval"));
+        assert!(report.matched_rules.iter().any(|rule| rule.id
+            == "approve-sensitive-source-to-external-send"
+            && rule.effect == "approval"));
     }
 
     #[test]

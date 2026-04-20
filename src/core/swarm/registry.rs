@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 /// Registry of all agents in the swarm
+#[derive(Clone)]
 pub struct AgentRegistry {
     agents: Arc<RwLock<HashMap<AgentId, AgentInfo>>>,
 }

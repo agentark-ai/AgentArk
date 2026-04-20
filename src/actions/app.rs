@@ -1534,7 +1534,15 @@ async fn deploy_repo_bundle(
         .unwrap_or((None, false));
 
     emit_progress(&stream_tx, "Reading repo README and local manifests").await;
-    let service_plans = plan_repo_services(&repo_root, &repo_title, service_mode)?;
+    let service_plans = {
+        let repo_root = repo_root.clone();
+        let repo_title = repo_title.clone();
+        tokio::task::spawn_blocking(move || {
+            plan_repo_services(&repo_root, &repo_title, service_mode)
+        })
+        .await
+        .context("repo service planning task failed")??
+    };
     if service_plans.is_empty() {
         anyhow::bail!(
             "I cloned the repo, but I could not detect a runnable frontend/backend service from the README or local manifests."
@@ -1579,16 +1587,18 @@ async fn deploy_repo_bundle(
         )
         .await;
         let scope_root = match plan.copy_scope {
-            RepoCopyScope::RepositoryRoot => &repo_root,
+            RepoCopyScope::RepositoryRoot => repo_root.clone(),
             RepoCopyScope::ServiceRoot => {
                 if plan.relative_dir.is_empty() {
-                    &repo_root
+                    repo_root.clone()
                 } else {
-                    &repo_root.join(&plan.relative_dir)
+                    repo_root.join(&plan.relative_dir)
                 }
             }
         };
-        let files = collect_repo_files(scope_root)?;
+        let files = tokio::task::spawn_blocking(move || collect_repo_files(&scope_root))
+            .await
+            .context("repo file collection task failed")??;
         let mut service_args = serde_json::Map::new();
         service_args.insert("files".to_string(), serde_json::Value::Object(files));
         service_args.insert("title".to_string(), serde_json::json!(plan.title));
@@ -3705,6 +3715,16 @@ pub struct StoredAppRegistration {
     pub last_accessed: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+struct ExistingAppDeployTarget {
+    app_id: String,
+    title: String,
+    app_dir: PathBuf,
+    meta: Option<serde_json::Value>,
+    access_guard_enabled: bool,
+    access_key: Option<String>,
+    expose_public: bool,
+}
+
 #[derive(Debug, Clone)]
 struct RestoreAppCandidate {
     id: String,
@@ -3721,6 +3741,12 @@ struct RestoreAppCandidate {
     expose_public: bool,
     enabled: bool,
     last_accessed: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Default)]
+pub struct AppBootReconciliationReport {
+    pub valid_app_ids: HashSet<String>,
+    pub quarantined_app_ids: HashSet<String>,
 }
 
 impl AppRegistry {
@@ -3768,6 +3794,84 @@ impl AppRegistry {
                 .restore_from_disk(&config_dir, &data_dir, &llm_env)
                 .await;
         });
+    }
+
+    pub async fn reconcile_on_boot(&self) -> AppBootReconciliationReport {
+        let mut report = AppBootReconciliationReport::default();
+        let Some(data_dir) = self.data_dir.as_deref() else {
+            return report;
+        };
+        let apps_dir = data_dir.join("apps");
+        let Ok(mut entries) = tokio::fs::read_dir(&apps_dir).await else {
+            return report;
+        };
+
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            let app_id = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if app_id.is_empty() || app_id.eq_ignore_ascii_case("new") {
+                continue;
+            }
+
+            let meta_path = path.join(".app_meta.json");
+            let invalid_reason = match tokio::fs::read(&meta_path).await {
+                Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    Ok(meta) if meta.is_object() => {
+                        report.valid_app_ids.insert(app_id);
+                        continue;
+                    }
+                    Ok(_) => Some("metadata is not a JSON object".to_string()),
+                    Err(error) => Some(format!("metadata is corrupt: {}", error)),
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Some("metadata file is missing".to_string())
+                }
+                Err(error) => Some(format!("metadata could not be read: {}", error)),
+            };
+
+            let quarantine_root = data_dir.join("app_quarantine");
+            let quarantine_target = quarantine_root.join(format!(
+                "{}-{}-{}",
+                app_id,
+                chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
+                uuid::Uuid::new_v4().simple()
+            ));
+            let quarantine_result = async {
+                tokio::fs::create_dir_all(&quarantine_root).await?;
+                tokio::fs::rename(&path, &quarantine_target).await
+            }
+            .await;
+
+            match quarantine_result {
+                Ok(_) => tracing::warn!(
+                    app_id = %app_id,
+                    destination = %quarantine_target.display(),
+                    reason = %invalid_reason.as_deref().unwrap_or("unknown"),
+                    "app_quarantined"
+                ),
+                Err(error) => tracing::warn!(
+                    app_id = %app_id,
+                    path = %path.display(),
+                    reason = %invalid_reason.as_deref().unwrap_or("unknown"),
+                    error = %error,
+                    "app_quarantine_failed"
+                ),
+            }
+
+            self.purge_deleted_app_state(&app_id).await;
+            report.quarantined_app_ids.insert(app_id);
+        }
+
+        report
     }
 
     fn secure_config_paths(&self) -> Option<(&Path, &Path)> {
@@ -4331,7 +4435,9 @@ impl AppRegistry {
             if !enabled && app.expose_public {
                 anyhow::bail!("Public apps must keep App Guard enabled with an access password.");
             }
-            let explicit_secret = access_secret.map(str::trim).filter(|value| !value.is_empty());
+            let explicit_secret = access_secret
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
             let next_key = if enabled {
                 if let Some(secret) = explicit_secret {
                     secret.to_string()
@@ -4518,6 +4624,27 @@ impl AppRegistry {
             self.apps.write().await.remove(app_id);
         }
         Ok(())
+    }
+
+    /// Remove all registry/auth state for an app that the user has explicitly deleted
+    /// or that can no longer be served safely.
+    pub async fn purge_deleted_app_state(&self, app_id: &str) {
+        if let Err(error) = self.stop(app_id).await {
+            tracing::warn!(
+                "Failed to stop app '{}' while purging deleted app state: {}",
+                app_id,
+                error
+            );
+        }
+        self.apps.write().await.remove(app_id);
+        self.clear_access_tokens_for_app(app_id).await;
+        if let Err(error) = self.persist_access_key_secret(app_id, None).await {
+            tracing::warn!(
+                "Failed to clear persisted access key for deleted app '{}': {}",
+                app_id,
+                error
+            );
+        }
     }
 
     /// Find an available port in the range
@@ -4743,10 +4870,45 @@ impl AppRegistry {
                 }
 
                 let meta_path = path.join(".app_meta.json");
-                let meta: Option<serde_json::Value> = tokio::fs::read(&meta_path)
-                    .await
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+                let meta: Option<serde_json::Value> = match tokio::fs::read(&meta_path).await {
+                    Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        Ok(value) if value.is_object() => Some(value),
+                        Ok(_) => {
+                            tracing::warn!(
+                                app_id = %id,
+                                path = %meta_path.display(),
+                                "Skipping app restore because metadata is not a JSON object"
+                            );
+                            continue;
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                app_id = %id,
+                                path = %meta_path.display(),
+                                error = %error,
+                                "Skipping app restore because metadata is corrupt"
+                            );
+                            continue;
+                        }
+                    },
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        tracing::warn!(
+                            app_id = %id,
+                            path = %path.display(),
+                            "Skipping app restore because metadata is missing"
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            app_id = %id,
+                            path = %meta_path.display(),
+                            error = %error,
+                            "Skipping app restore because metadata could not be read"
+                        );
+                        continue;
+                    }
+                };
 
                 let title = meta
                     .as_ref()
@@ -5082,51 +5244,216 @@ pub async fn app_deploy(
     }
     let file_count = files.len();
 
+    let requested_app_id = arguments
+        .get("app_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    let existing_target = if let Some(app_id) = requested_app_id.as_deref() {
+        let existing_app = registry
+            .list()
+            .await
+            .into_iter()
+            .find(|app| app.get("id").and_then(|v| v.as_str()) == Some(app_id));
+        let app_dir = registry
+            .get_dir(app_id)
+            .await
+            .unwrap_or_else(|| data_dir.join("apps").join(app_id));
+        if existing_app.is_none() && !app_dir.exists() {
+            anyhow::bail!("No deployed app found for app_id '{}'", app_id);
+        }
+        let meta = tokio::fs::read(app_dir.join(".app_meta.json"))
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .filter(|value| value.is_object());
+        let title = existing_app
+            .as_ref()
+            .and_then(|app| app.get("title").and_then(|v| v.as_str()))
+            .or_else(|| {
+                meta.as_ref()
+                    .and_then(|value| value.get("title").and_then(|v| v.as_str()))
+            })
+            .unwrap_or("App")
+            .to_string();
+        let access_key = registry
+            .access_key(app_id)
+            .await
+            .filter(|value| !value.trim().is_empty());
+        let access_guard_enabled = existing_app
+            .as_ref()
+            .and_then(|app| app.get("access_guard_enabled").and_then(|v| v.as_bool()))
+            .or_else(|| {
+                meta.as_ref().and_then(|value| {
+                    value
+                        .get("access_guard_enabled")
+                        .and_then(|flag| flag.as_bool())
+                })
+            })
+            .unwrap_or(false);
+        let expose_public = existing_app
+            .as_ref()
+            .and_then(|app| app.get("expose_public").and_then(|v| v.as_bool()))
+            .or_else(|| {
+                meta.as_ref()
+                    .and_then(|value| value.get("expose_public").and_then(|v| v.as_bool()))
+            })
+            .unwrap_or(false);
+        Some(ExistingAppDeployTarget {
+            app_id: app_id.to_string(),
+            title,
+            app_dir,
+            meta,
+            access_guard_enabled,
+            access_key,
+            expose_public,
+        })
+    } else {
+        None
+    };
     let title = arguments
         .get("title")
         .and_then(|v| v.as_str())
+        .or_else(|| existing_target.as_ref().map(|target| target.title.as_str()))
         .unwrap_or("App");
     let mut entry_command = arguments
         .get("entry_command")
         .and_then(|v| v.as_str())
-        .map(|value| value.to_string());
+        .map(|value| value.to_string())
+        .or_else(|| {
+            existing_target.as_ref().and_then(|target| {
+                target
+                    .meta
+                    .as_ref()
+                    .and_then(|value| value.get("entry_command").and_then(|v| v.as_str()))
+                    .map(|value| value.to_string())
+            })
+        });
     let mut install_command = arguments
         .get("install_command")
         .and_then(|v| v.as_str())
-        .map(|value| value.to_string());
+        .map(|value| value.to_string())
+        .or_else(|| {
+            existing_target.as_ref().and_then(|target| {
+                target
+                    .meta
+                    .as_ref()
+                    .and_then(|value| value.get("install_command").and_then(|v| v.as_str()))
+                    .map(|value| value.to_string())
+            })
+        });
     let runtime_image = arguments
         .get("runtime_image")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let runtime_preference =
-        runtime_preference_from_opt(arguments.get("runtime_preference").and_then(|v| v.as_str()));
+        .map(|s| s.to_string())
+        .or_else(|| {
+            existing_target.as_ref().and_then(|target| {
+                target
+                    .meta
+                    .as_ref()
+                    .and_then(|value| value.get("runtime_image").and_then(|v| v.as_str()))
+                    .map(|value| value.to_string())
+            })
+        });
+    let runtime_preference = runtime_preference_from_opt(
+        arguments
+            .get("runtime_preference")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                existing_target.as_ref().and_then(|target| {
+                    target
+                        .meta
+                        .as_ref()
+                        .and_then(|value| value.get("runtime_preference").and_then(|v| v.as_str()))
+                })
+            }),
+    );
     let mut runtime_required = arguments
         .get("runtime_required")
         .and_then(|v| v.as_bool())
+        .or_else(|| {
+            existing_target.as_ref().and_then(|target| {
+                target
+                    .meta
+                    .as_ref()
+                    .and_then(|value| value.get("runtime_required").and_then(|v| v.as_bool()))
+            })
+        })
         .unwrap_or(false);
     let runtime_reason = arguments
         .get("runtime_reason")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(|value| value.to_string());
+        .map(|value| value.to_string())
+        .or_else(|| {
+            existing_target.as_ref().and_then(|target| {
+                target
+                    .meta
+                    .as_ref()
+                    .and_then(|value| value.get("runtime_reason").and_then(|v| v.as_str()))
+                    .map(|value| value.to_string())
+            })
+        });
     let expose_public = arguments
         .get("expose_public")
         .and_then(|v| v.as_bool())
+        .or_else(|| existing_target.as_ref().map(|target| target.expose_public))
         .unwrap_or(false);
-    let requested_access_guard_enabled = arguments
-        .get("access_guard")
-        .and_then(|v| v.as_bool())
+    let explicit_access_guard = arguments.get("access_guard").and_then(|v| v.as_bool());
+    let requested_access_guard_enabled = explicit_access_guard
+        .or_else(|| {
+            existing_target
+                .as_ref()
+                .map(|target| target.access_guard_enabled)
+        })
         .unwrap_or(false);
-    let access_secret = access_secret_from_arguments(arguments)?;
+    let mut access_secret = access_secret_from_arguments(arguments)?;
+    if access_secret.is_none() && explicit_access_guard.is_none() {
+        access_secret = existing_target
+            .as_ref()
+            .and_then(|target| target.access_key.clone())
+            .filter(|value| !value.trim().is_empty());
+    }
     let access_guard_enabled = requested_access_guard_enabled || access_secret.is_some();
     if expose_public && access_secret.is_none() {
         anyhow::bail!(
             "Public apps require an explicit access password. Provide access_password when expose_public=true."
         );
     }
-    let required_inputs = parse_required_inputs(arguments);
-    let config_values = parse_config_values(arguments);
+    let mut required_inputs = parse_required_inputs(arguments);
+    if required_inputs.is_empty() {
+        required_inputs = existing_target
+            .as_ref()
+            .and_then(|target| target.meta.as_ref())
+            .map(parse_required_inputs)
+            .unwrap_or_default();
+    }
+    let mut config_values = parse_config_values(arguments);
+    if config_values.is_empty() {
+        config_values = existing_target
+            .as_ref()
+            .and_then(|target| {
+                target
+                    .meta
+                    .as_ref()
+                    .and_then(|value| value.get("config_values").and_then(|v| v.as_object()))
+            })
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(key, value)| match value {
+                        serde_json::Value::String(text) => Some((key.clone(), text.clone())),
+                        serde_json::Value::Bool(flag) => Some((key.clone(), flag.to_string())),
+                        serde_json::Value::Number(number) => {
+                            Some((key.clone(), number.to_string()))
+                        }
+                        _ => None,
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+    }
     if entry_command.is_none() {
         runtime_required = false;
     } else if !runtime_required {
@@ -5140,18 +5467,35 @@ pub async fn app_deploy(
     }
     let is_static = entry_command.is_none();
 
-    // Generate app ID and optional access password.
-    let app_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+    let updating_existing = existing_target.is_some();
+    let app_id = existing_target
+        .as_ref()
+        .map(|target| target.app_id.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()[..8].to_string());
     let access_key = if access_guard_enabled {
         access_secret.unwrap_or_else(generate_access_key)
     } else {
         String::new()
     };
-    let app_dir = data_dir.join("apps").join(&app_id);
+    let app_dir = existing_target
+        .as_ref()
+        .map(|target| target.app_dir.clone())
+        .unwrap_or_else(|| data_dir.join("apps").join(&app_id));
+    if updating_existing {
+        registry.stop_runtime(&app_id).await?;
+        if tokio::fs::metadata(&app_dir).await.is_ok() {
+            tokio::fs::remove_dir_all(&app_dir).await?;
+        }
+    }
     tokio::fs::create_dir_all(&app_dir).await?;
 
     tracing::info!(
-        "Deploying app '{}' (id={}, static={})",
+        "{} app '{}' (id={}, static={})",
+        if updating_existing {
+            "Updating"
+        } else {
+            "Deploying"
+        },
         title,
         app_id,
         is_static
@@ -5159,7 +5503,12 @@ pub async fn app_deploy(
     emit_progress(
         &stream_tx,
         &format!(
-            "Deploying '{}' ({})",
+            "{} '{}' ({})",
+            if updating_existing {
+                "Updating"
+            } else {
+                "Deploying"
+            },
             title,
             if is_static { "static" } else { "dynamic" }
         ),
@@ -5243,6 +5592,16 @@ pub async fn app_deploy(
     };
 
     // Save metadata for restore on restart
+    let created_at = existing_target
+        .as_ref()
+        .and_then(|target| {
+            target
+                .meta
+                .as_ref()
+                .and_then(|value| value.get("created_at").and_then(|v| v.as_str()))
+        })
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
     let meta = serde_json::json!({
         "title": title,
         "entry_command": entry_command.clone(),
@@ -5265,7 +5624,8 @@ pub async fn app_deploy(
         "config_values": config_values.clone(),
         "access_guard_enabled": access_guard_enabled,
         "enabled": true,
-        "created_at": chrono::Utc::now().to_rfc3339(),
+        "created_at": created_at,
+        "updated_at": chrono::Utc::now().to_rfc3339(),
         "last_accessed": chrono::Utc::now().to_rfc3339(),
     });
     tokio::fs::write(
@@ -5301,6 +5661,7 @@ pub async fn app_deploy(
             "app_id": app_id,
             "url": url,
             "title": title,
+            "updated_existing": updating_existing,
             "runtime_preference": runtime_preference.as_str(),
             "expose_public": expose_public,
             "access_key": access_key,
@@ -5351,6 +5712,7 @@ pub async fn app_deploy(
             "app_id": app_id,
             "title": title,
             "url": format!("/apps/{}/", app_id),
+            "updated_existing": updating_existing,
             "runtime_preference": runtime_preference.as_str(),
             "expose_public": expose_public,
             "access_key": access_key,
@@ -5397,6 +5759,7 @@ pub async fn app_deploy(
             "app_id": app_id,
             "url": format!("/apps/{}/", app_id),
             "title": title,
+            "updated_existing": updating_existing,
             "runtime_preference": runtime_preference.as_str(),
             "expose_public": expose_public,
             "access_key": access_key,
@@ -5484,7 +5847,11 @@ pub async fn app_deploy(
     emit_progress(&stream_tx, "Waiting for server readiness").await;
     if let Err(wait_err) = wait_for_dynamic_runtime_ready(registry, &app_id, port, &stream_tx).await
     {
-        let _ = registry.stop(&app_id).await;
+        if updating_existing {
+            let _ = registry.stop_runtime(&app_id).await;
+        } else {
+            let _ = registry.stop(&app_id).await;
+        }
         let log_tail =
             read_local_runtime_log_tail(&app_dir_for_diagnostics, LOCAL_RUNTIME_LOG_TAIL_BYTES)
                 .await;
@@ -5506,6 +5873,7 @@ pub async fn app_deploy(
         "url": url,
         "port": port,
         "title": title,
+        "updated_existing": updating_existing,
         "runtime_preference": runtime_preference.as_str(),
         "expose_public": expose_public,
         "access_key": access_key,
@@ -5910,6 +6278,198 @@ $ npm run dev
         assert_eq!(
             row.get("runtime_mode").and_then(|v| v.as_str()),
             Some("disabled")
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_from_disk_skips_app_without_metadata() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let app_dir = data_dir.path().join("apps").join("demo");
+        tokio::fs::create_dir_all(&app_dir)
+            .await
+            .expect("app dir should exist");
+        tokio::fs::write(app_dir.join("index.html"), "<html>demo</html>")
+            .await
+            .expect("html should be written");
+
+        let registry = AppRegistry::new();
+        registry
+            .restore_from_disk(config_dir.path(), data_dir.path(), &HashMap::new())
+            .await;
+
+        assert!(
+            registry.list().await.is_empty(),
+            "apps without metadata should be ignored during restore"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_on_boot_quarantines_corrupt_app_metadata() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let app_dir = data_dir.path().join("apps").join("demo");
+        tokio::fs::create_dir_all(&app_dir)
+            .await
+            .expect("app dir should exist");
+        tokio::fs::write(app_dir.join(".app_meta.json"), "{not-json")
+            .await
+            .expect("corrupt metadata should be written");
+
+        let registry = AppRegistry::with_paths(
+            config_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+        let report = registry.reconcile_on_boot().await;
+
+        assert!(
+            report.quarantined_app_ids.contains("demo"),
+            "corrupt app should be quarantined on boot"
+        );
+        assert!(
+            !app_dir.exists(),
+            "corrupt app directory should leave the live apps directory"
+        );
+
+        let quarantine_root = data_dir.path().join("app_quarantine");
+        let mut entries = tokio::fs::read_dir(&quarantine_root)
+            .await
+            .expect("quarantine root should exist");
+        let mut moved_demo = false;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("demo-"))
+            {
+                moved_demo = true;
+                break;
+            }
+        }
+        assert!(
+            moved_demo,
+            "quarantine should contain the moved app directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn app_deploy_updates_existing_static_app_by_app_id() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let registry = AppRegistry::new();
+        let llm_env = HashMap::new();
+
+        let initial_result = app_deploy(
+            config_dir.path(),
+            data_dir.path(),
+            &serde_json::json!({
+                "title": "arXiv Live Feed",
+                "files": {
+                    "index.html": "<!doctype html><html><body class=\"dark\">dark</body></html>"
+                }
+            }),
+            &registry,
+            &llm_env,
+            None,
+        )
+        .await
+        .expect("initial deploy should succeed");
+        let initial_json: serde_json::Value =
+            serde_json::from_str(&initial_result).expect("initial deploy json");
+        let app_id = initial_json
+            .get("app_id")
+            .and_then(|value| value.as_str())
+            .expect("initial app id")
+            .to_string();
+        let app_dir = data_dir.path().join("apps").join(&app_id);
+        let initial_meta_raw = tokio::fs::read(app_dir.join(".app_meta.json"))
+            .await
+            .expect("initial meta should exist");
+        let initial_meta: serde_json::Value =
+            serde_json::from_slice(&initial_meta_raw).expect("initial meta json");
+        let created_at = initial_meta
+            .get("created_at")
+            .and_then(|value| value.as_str())
+            .expect("created_at should be recorded")
+            .to_string();
+
+        let updated_result = app_deploy(
+            config_dir.path(),
+            data_dir.path(),
+            &serde_json::json!({
+                "app_id": app_id,
+                "title": "arXiv Live Feed Light",
+                "files": {
+                    "index.html": "<!doctype html><html><body class=\"light\">light</body></html>"
+                }
+            }),
+            &registry,
+            &llm_env,
+            None,
+        )
+        .await
+        .expect("update deploy should succeed");
+        let updated_json: serde_json::Value =
+            serde_json::from_str(&updated_result).expect("update deploy json");
+
+        assert_eq!(
+            updated_json.get("app_id").and_then(|value| value.as_str()),
+            Some(app_id.as_str())
+        );
+        assert_eq!(
+            updated_json
+                .get("updated_existing")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            updated_json.get("title").and_then(|value| value.as_str()),
+            Some("arXiv Live Feed Light")
+        );
+
+        let apps = registry.list().await;
+        assert_eq!(
+            apps.len(),
+            1,
+            "updating in place should not create a second app"
+        );
+        let row = apps
+            .iter()
+            .find(|value| value.get("id").and_then(|entry| entry.as_str()) == Some(app_id.as_str()))
+            .expect("updated app should still be registered");
+        assert_eq!(
+            row.get("title").and_then(|value| value.as_str()),
+            Some("arXiv Live Feed Light")
+        );
+
+        let updated_html = tokio::fs::read_to_string(app_dir.join("index.html"))
+            .await
+            .expect("updated html should be readable");
+        assert!(updated_html.contains("light"));
+        assert!(!updated_html.contains("dark"));
+
+        let updated_meta_raw = tokio::fs::read(app_dir.join(".app_meta.json"))
+            .await
+            .expect("updated meta should exist");
+        let updated_meta: serde_json::Value =
+            serde_json::from_slice(&updated_meta_raw).expect("updated meta json");
+        assert_eq!(
+            updated_meta.get("title").and_then(|value| value.as_str()),
+            Some("arXiv Live Feed Light")
+        );
+        assert_eq!(
+            updated_meta
+                .get("created_at")
+                .and_then(|value| value.as_str()),
+            Some(created_at.as_str())
+        );
+        assert!(
+            updated_meta
+                .get("updated_at")
+                .and_then(|value| value.as_str())
+                .is_some(),
+            "updated deployments should stamp updated_at"
         );
     }
 }

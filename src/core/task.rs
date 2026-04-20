@@ -193,8 +193,7 @@ pub fn one_shot_reminder_needs_delay_notice(task: &Task, now: DateTime<Utc>) -> 
         && task_lateness(task, now)
             .map(|lateness| {
                 lateness > chrono::Duration::seconds(ONE_SHOT_REMINDER_DELAY_NOTICE_SECS)
-                    && lateness
-                        <= chrono::Duration::seconds(ONE_SHOT_REMINDER_MAX_LATENESS_SECS)
+                    && lateness <= chrono::Duration::seconds(ONE_SHOT_REMINDER_MAX_LATENESS_SECS)
             })
             .unwrap_or(false)
 }

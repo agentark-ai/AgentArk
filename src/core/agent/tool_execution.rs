@@ -16,6 +16,28 @@ fn build_executor_client() -> Option<crate::clients::ExecutorClient> {
     Some(client)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UserSafeToolFailure {
+    message: String,
+    failure_class: crate::core::FailureClass,
+    retryable: bool,
+    operational_outcome: &'static str,
+}
+
+fn present_user_safe_tool_failure(error: &anyhow::Error) -> Option<UserSafeToolFailure> {
+    match error.downcast_ref::<crate::runtime::ToolPathAccessError>() {
+        Some(crate::runtime::ToolPathAccessError::OutsideAllowedRoots { .. }) => {
+            Some(UserSafeToolFailure {
+                message: "The requested file path is not available in this runtime. It can only access files inside the workspace and configured data directories.".to_string(),
+                failure_class: crate::core::FailureClass::Validation,
+                retryable: true,
+                operational_outcome: "validation_error",
+            })
+        }
+        None => None,
+    }
+}
+
 #[derive(Default)]
 struct AppDeployProgressRelayState {
     announced_file_writes: bool,
@@ -1459,6 +1481,7 @@ impl Agent {
 
     /// Known app_deploy metadata keys — these are NOT file content.
     const KNOWN_METADATA_KEYS: &'static [&'static str] = &[
+        "app_id",
         "title",
         "repo_url",
         "repo_ref",
@@ -2363,7 +2386,11 @@ impl Agent {
         }
     }
 
-    fn score_deployed_app_match(query: &str, app_id: &str, title: &str) -> Option<(f32, String)> {
+    pub(super) fn score_deployed_app_match(
+        query: &str,
+        app_id: &str,
+        title: &str,
+    ) -> Option<(f32, String)> {
         let query = query.trim();
         if query.is_empty() {
             return None;
@@ -2403,7 +2430,7 @@ impl Agent {
         }
     }
 
-    fn rank_deployed_apps(
+    pub(super) fn rank_deployed_apps(
         query: &str,
         apps: &[serde_json::Value],
     ) -> Vec<(f32, String, serde_json::Value, String)> {
@@ -2437,7 +2464,7 @@ impl Agent {
         ranked_apps
     }
 
-    fn select_best_ranked_app<'a>(
+    pub(super) fn select_best_ranked_app<'a>(
         query: &str,
         ranked_apps: &'a [(f32, String, serde_json::Value, String)],
     ) -> Option<&'a (f32, String, serde_json::Value, String)> {
@@ -2449,8 +2476,18 @@ impl Agent {
             };
         }
 
-        ranked_apps.first().filter(|(score, _, _, _)| {
+        ranked_apps.first().filter(|(score, _, _, reason)| {
+            if matches!(reason.as_str(), "exact_id" | "exact_title") {
+                return true;
+            }
+
             let next_score = ranked_apps.get(1).map(|row| row.0).unwrap_or(0.0);
+            let close_competing_match = next_score >= 0.45
+                && ((*score - next_score) < 0.08
+                    || (*score >= 0.55 && (*score - next_score) < 0.12));
+            if close_competing_match {
+                return false;
+            }
             *score >= 0.55 || (*score >= 0.30 && (*score - next_score) >= 0.10)
         })
     }
@@ -9334,6 +9371,7 @@ Requirements:\n\
                             };
                         }
                     }
+                    let user_safe_failure = present_user_safe_tool_failure(&error);
                     let payload = serde_json::json!({
                         "handler": handler.id(),
                         "error": safe_truncate(&error_text, 260),
@@ -9342,7 +9380,10 @@ Requirements:\n\
                         event_type: "tool_call",
                         channel: env.request_channel,
                         success: false,
-                        outcome: "handler_error",
+                        outcome: user_safe_failure
+                            .as_ref()
+                            .map(|failure| failure.operational_outcome)
+                            .unwrap_or("handler_error"),
                         trace_id: env.trace_id,
                         conversation_id: env.conversation_id,
                         tool_name: Some(&call.name),
@@ -9359,10 +9400,15 @@ Requirements:\n\
                     .await;
                     self.record_self_tune_tool_outcome(&call.name, false, latency_ms)
                         .await;
-                    let content = format!(
-                        "Tool '{}' failed, but the request can continue: {}",
-                        call.name, error_text
-                    );
+                    let content = user_safe_failure
+                        .as_ref()
+                        .map(|failure| failure.message.clone())
+                        .unwrap_or_else(|| {
+                            format!(
+                                "Tool '{}' failed, but the request can continue: {}",
+                                call.name, error_text
+                            )
+                        });
                     if let Some(tx) = env.stream_tx {
                         queue_stream_event(
                             tx,
@@ -9382,8 +9428,16 @@ Requirements:\n\
                             name: call.name.clone(),
                             content,
                             status: crate::core::ToolOutcomeStatus::RecoverableError,
-                            failure_class: Some(crate::core::FailureClass::HandlerError),
-                            retryable: true,
+                            failure_class: Some(
+                                user_safe_failure
+                                    .as_ref()
+                                    .map(|failure| failure.failure_class.clone())
+                                    .unwrap_or(crate::core::FailureClass::HandlerError),
+                            ),
+                            retryable: user_safe_failure
+                                .as_ref()
+                                .map(|failure| failure.retryable)
+                                .unwrap_or(true),
                             side_effect_level: side_effect_level.to_string(),
                             error: Some(error_text),
                         },
@@ -10388,6 +10442,12 @@ Requirements:\n\
                         obj.insert("expose_public".to_string(), serde_json::json!(false));
                     }
                 }
+                let targeted_existing_app_id = resolved_args
+                    .get("app_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string);
                 let expose_public_requested = resolved_args
                     .get("expose_public")
                     .and_then(|v| v.as_bool())
@@ -10400,7 +10460,10 @@ Requirements:\n\
                     .get("replace_existing")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                if !replace_existing_requested && !allow_duplicate_requested {
+                if targeted_existing_app_id.is_none()
+                    && !replace_existing_requested
+                    && !allow_duplicate_requested
+                {
                     if let Some(duplicate_match) =
                         self.find_existing_duplicate_app(&resolved_args).await
                     {
@@ -10956,6 +11019,15 @@ Requirements:\n\
                                 continue;
                             }
                             if parsed.get("url").is_some() || parsed.get("app_id").is_some() {
+                                let updated_existing = parsed
+                                    .get("updated_existing")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                let action_verb = if updated_existing {
+                                    "updated"
+                                } else {
+                                    "deployed"
+                                };
                                 let title = parsed
                                     .get("title")
                                     .and_then(|v| v.as_str())
@@ -11143,12 +11215,13 @@ Requirements:\n\
                                             name: call.name.clone(),
                                             content: if skip_blocking_validation {
                                                 format!(
-                                                    "App deployed: {} ({}, local static deploy)",
-                                                    title, app_type
+                                                    "App {}: {} ({}, local static deploy)",
+                                                    action_verb, title, app_type
                                                 )
                                             } else if verified {
                                                 format!(
-                                                    "App deployed + validated: {} ({}) [{} attempt{}]",
+                                                    "App {} + validated: {} ({}) [{} attempt{}]",
+                                                    action_verb,
                                                     title,
                                                     app_type,
                                                     verify_attempts,
@@ -11156,8 +11229,8 @@ Requirements:\n\
                                                 )
                                             } else {
                                                 format!(
-                                                    "App deployed, validation incomplete: {} ({}) - {}",
-                                                    title, app_type, verify_detail
+                                                    "App {}, validation incomplete: {} ({}) - {}",
+                                                    action_verb, title, app_type, verify_detail
                                                 )
                                             },
                                         },
@@ -11167,20 +11240,21 @@ Requirements:\n\
                                 let mut app_message_lines: Vec<String> = Vec::new();
                                 if skip_blocking_validation {
                                     app_message_lines.push(format!(
-                                        "I have deployed **{}** ({} app), and it is ready locally.",
-                                        title, app_type
+                                        "I have {} **{}** ({} app), and it is ready locally.",
+                                        action_verb, title, app_type
                                     ));
                                 } else if verified {
                                     app_message_lines.push(format!(
-                                        "I have deployed **{}** ({} app), and I validated that it is running.",
-                                        title, app_type
+                                        "I have {} **{}** ({} app), and I validated that it is running.",
+                                        action_verb, title, app_type
                                     ));
                                 } else {
                                     app_message_lines.push(format!(
-                                        "I have deployed **{}** ({} app), but validation has not passed yet.",
-                                        title, app_type
+                                        "I have {} **{}** ({} app), but validation has not passed yet.",
+                                        action_verb, title, app_type
                                     ));
                                 }
+                                app_message_lines.push(format!("- App ID: `{}`", app_id));
 
                                 if verified {
                                     app_message_lines.push(format!(
@@ -12188,9 +12262,12 @@ Requirements:\n\
                                 .await
                             {
                                 Ok(search_out) => {
+                                    let browse_error = present_user_safe_tool_failure(&e)
+                                        .map(|failure| failure.message)
+                                        .unwrap_or_else(|| e.to_string());
                                     let healed = format!(
                                         "Browse failed ({})\n\nSelf-heal fallback: searched the web instead.\n{}",
-                                        e, search_out
+                                        browse_error, search_out
                                     );
                                     if let Some(ref tx) = stream_tx {
                                         queue_stream_event(
@@ -12215,7 +12292,9 @@ Requirements:\n\
                             }
                         }
                     }
-                    let formatted = format!("Error executing '{}': {}", call.name, e);
+                    let formatted = present_user_safe_tool_failure(&e)
+                        .map(|failure| failure.message)
+                        .unwrap_or_else(|| format!("Error executing '{}': {}", call.name, e));
                     if let Some(ref tx) = stream_tx {
                         queue_stream_event(
                             tx,
@@ -12243,6 +12322,7 @@ Requirements:\n\
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::path::PathBuf;
 
     fn call(id: &str, name: &str, arguments: serde_json::Value) -> crate::core::llm::ToolCall {
         crate::core::llm::ToolCall {
@@ -12268,6 +12348,28 @@ mod tests {
             verified: true,
         });
         (temp, safety)
+    }
+
+    #[test]
+    fn user_safe_tool_failure_hides_internal_paths_for_workspace_scope_errors() {
+        let error = anyhow::Error::new(crate::runtime::ToolPathAccessError::OutsideAllowedRoots {
+            attempted_path: PathBuf::from("/tmp"),
+            allowed_roots: vec![
+                PathBuf::from("/app/data"),
+                PathBuf::from("/workspace/agentark"),
+            ],
+        });
+
+        let presented = present_user_safe_tool_failure(&error).expect("user-safe failure");
+        assert_eq!(
+            presented.failure_class,
+            crate::core::FailureClass::Validation
+        );
+        assert!(presented.retryable);
+        assert!(presented.message.contains("workspace"));
+        assert!(!presented.message.contains("/tmp"));
+        assert!(!presented.message.contains("/app/data"));
+        assert!(!presented.message.contains("/workspace/agentark"));
     }
 
     #[test]
@@ -12306,6 +12408,35 @@ mod tests {
             Agent::tool_call_signature(&a),
             Agent::tool_call_signature(&b)
         );
+    }
+
+    #[test]
+    fn select_best_ranked_app_requires_confirmation_for_close_deployed_app_matches() {
+        let apps = vec![
+            json!({
+                "id": "becf46bb",
+                "title": "arXiv Live Feed"
+            }),
+            json!({
+                "id": "cad20c5e",
+                "title": "arXiv Live Papers"
+            }),
+            json!({
+                "id": "other1234",
+                "title": "Weather Dashboard"
+            }),
+        ];
+
+        let ambiguous_ranked = Agent::rank_deployed_apps("arxiv", &apps);
+        assert!(
+            Agent::select_best_ranked_app("arxiv", &ambiguous_ranked).is_none(),
+            "generic references should require confirmation when multiple deployed apps match closely"
+        );
+
+        let exact_ranked = Agent::rank_deployed_apps("becf46bb", &apps);
+        let exact_match = Agent::select_best_ranked_app("becf46bb", &exact_ranked)
+            .expect("exact app id should still resolve without clarification");
+        assert_eq!(exact_match.1, "becf46bb");
     }
 
     #[test]

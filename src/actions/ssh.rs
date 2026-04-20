@@ -566,10 +566,7 @@ mod tests {
 
     impl russh::keys::ssh_key::rand_core::TryCryptoRng for DeterministicTestRng {}
 
-    fn test_private_key_pem(
-        algorithm: russh::keys::ssh_key::Algorithm,
-        seed: u64,
-    ) -> String {
+    fn test_private_key_pem(algorithm: russh::keys::ssh_key::Algorithm, seed: u64) -> String {
         let mut rng = DeterministicTestRng::new(seed);
         let key = russh::keys::ssh_key::PrivateKey::random(&mut rng, algorithm).unwrap();
         key.to_openssh(russh::keys::ssh_key::LineEnding::LF)

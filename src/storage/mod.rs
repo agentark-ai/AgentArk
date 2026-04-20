@@ -334,7 +334,11 @@ fn experience_memory_write_lock_key(
         hasher.update(part.as_bytes());
     }
     let digest = hasher.finalize();
-    i64::from_be_bytes(digest[..8].try_into().expect("sha256 digest has 8 leading bytes"))
+    i64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("sha256 digest has 8 leading bytes"),
+    )
 }
 
 fn is_safe_db_identifier_part(value: &str) -> bool {
@@ -3672,7 +3676,9 @@ impl Storage {
             valid_from: Set(operation.valid_from.clone()),
             expires_at: Set(operation.expires_at.clone()),
             review_at: Set(operation.review_at.clone()),
-            rationale: Set(encrypt_optional_storage_string(operation.rationale.as_deref())?),
+            rationale: Set(encrypt_optional_storage_string(
+                operation.rationale.as_deref(),
+            )?),
             evidence_refs: Set(operation.evidence_refs.clone()),
             model_metadata: Set(operation.model_metadata.clone()),
             apply_metadata: Set(operation.apply_metadata.clone()),
@@ -3905,7 +3911,10 @@ impl Storage {
         Ok(())
     }
 
-    async fn get_experience_item_conn<C>(conn: &C, id: &str) -> Result<Option<experience_item::Model>>
+    async fn get_experience_item_conn<C>(
+        conn: &C,
+        id: &str,
+    ) -> Result<Option<experience_item::Model>>
     where
         C: ConnectionTrait,
     {
@@ -4041,10 +4050,7 @@ impl Storage {
         if scored.is_empty() {
             return Ok(Vec::new());
         }
-        let ids = scored
-            .iter()
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
+        let ids = scored.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
         let models = experience_item::Entity::find()
             .filter(experience_item::Column::Id.is_in(ids.clone()))
             .all(conn)
@@ -4159,10 +4165,7 @@ impl Storage {
             ),
             None => query.filter(recall_event::Column::ProjectId.is_null()),
         };
-        Ok(query
-            .limit(Self::db_limit(limit))
-            .all(&self.db)
-            .await?)
+        Ok(query.limit(Self::db_limit(limit)).all(&self.db).await?)
     }
 
     pub async fn count_recall_events(&self, project_id: Option<&str>) -> Result<u64> {
@@ -4780,12 +4783,14 @@ impl Storage {
     ) -> Result<Vec<memory_capture_event::Model>> {
         let mut query = memory_capture_event::Entity::find();
         if !statuses.is_empty() {
-            query = query.filter(memory_capture_event::Column::Status.is_in(
-                statuses
-                    .iter()
-                    .map(|status| (*status).to_string())
-                    .collect::<Vec<_>>(),
-            ));
+            query = query.filter(
+                memory_capture_event::Column::Status.is_in(
+                    statuses
+                        .iter()
+                        .map(|status| (*status).to_string())
+                        .collect::<Vec<_>>(),
+                ),
+            );
         }
         query = match project_id.map(str::trim).filter(|value| !value.is_empty()) {
             Some(pid) => query.filter(
@@ -4808,12 +4813,14 @@ impl Storage {
     ) -> Result<u64> {
         let mut query = memory_capture_event::Entity::find();
         if !statuses.is_empty() {
-            query = query.filter(memory_capture_event::Column::Status.is_in(
-                statuses
-                    .iter()
-                    .map(|status| (*status).to_string())
-                    .collect::<Vec<_>>(),
-            ));
+            query = query.filter(
+                memory_capture_event::Column::Status.is_in(
+                    statuses
+                        .iter()
+                        .map(|status| (*status).to_string())
+                        .collect::<Vec<_>>(),
+                ),
+            );
         }
         Ok(query.count(&self.db).await?)
     }
@@ -4867,10 +4874,7 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn get_memory_operation(
-        &self,
-        id: &str,
-    ) -> Result<Option<memory_operation::Model>> {
+    pub async fn get_memory_operation(&self, id: &str) -> Result<Option<memory_operation::Model>> {
         let Some(mut model) = memory_operation::Entity::find_by_id(id.to_string())
             .one(&self.db)
             .await?
@@ -4919,12 +4923,14 @@ impl Storage {
     ) -> Result<Vec<memory_operation::Model>> {
         let mut query = memory_operation::Entity::find();
         if !statuses.is_empty() {
-            query = query.filter(memory_operation::Column::Status.is_in(
-                statuses
-                    .iter()
-                    .map(|status| (*status).to_string())
-                    .collect::<Vec<_>>(),
-            ));
+            query = query.filter(
+                memory_operation::Column::Status.is_in(
+                    statuses
+                        .iter()
+                        .map(|status| (*status).to_string())
+                        .collect::<Vec<_>>(),
+                ),
+            );
         }
         query = match project_id.map(str::trim).filter(|value| !value.is_empty()) {
             Some(pid) => query.filter(
@@ -4951,12 +4957,14 @@ impl Storage {
     ) -> Result<u64> {
         let mut query = memory_operation::Entity::find();
         if !statuses.is_empty() {
-            query = query.filter(memory_operation::Column::Status.is_in(
-                statuses
-                    .iter()
-                    .map(|status| (*status).to_string())
-                    .collect::<Vec<_>>(),
-            ));
+            query = query.filter(
+                memory_operation::Column::Status.is_in(
+                    statuses
+                        .iter()
+                        .map(|status| (*status).to_string())
+                        .collect::<Vec<_>>(),
+                ),
+            );
         }
         Ok(query.count(&self.db).await?)
     }
@@ -5046,20 +5054,24 @@ impl Storage {
     ) -> Result<Vec<learning_candidate::Model>> {
         let mut query = learning_candidate::Entity::find();
         if !approval_statuses.is_empty() {
-            query = query.filter(learning_candidate::Column::ApprovalStatus.is_in(
-                approval_statuses
-                    .iter()
-                    .map(|status| (*status).to_string())
-                    .collect::<Vec<_>>(),
-            ));
+            query = query.filter(
+                learning_candidate::Column::ApprovalStatus.is_in(
+                    approval_statuses
+                        .iter()
+                        .map(|status| (*status).to_string())
+                        .collect::<Vec<_>>(),
+                ),
+            );
         }
         if !candidate_types.is_empty() {
-            query = query.filter(learning_candidate::Column::CandidateType.is_in(
-                candidate_types
-                    .iter()
-                    .map(|candidate_type| (*candidate_type).to_string())
-                    .collect::<Vec<_>>(),
-            ));
+            query = query.filter(
+                learning_candidate::Column::CandidateType.is_in(
+                    candidate_types
+                        .iter()
+                        .map(|candidate_type| (*candidate_type).to_string())
+                        .collect::<Vec<_>>(),
+                ),
+            );
         }
         query = match project_id.map(str::trim).filter(|value| !value.is_empty()) {
             Some(pid) => query.filter(
@@ -5110,12 +5122,14 @@ impl Storage {
         let mut query = learning_candidate::Entity::find()
             .filter(learning_candidate::Column::SubjectKey.eq(subject_key.to_string()));
         if !candidate_types.is_empty() {
-            query = query.filter(learning_candidate::Column::CandidateType.is_in(
-                candidate_types
-                    .iter()
-                    .map(|candidate_type| (*candidate_type).to_string())
-                    .collect::<Vec<_>>(),
-            ));
+            query = query.filter(
+                learning_candidate::Column::CandidateType.is_in(
+                    candidate_types
+                        .iter()
+                        .map(|candidate_type| (*candidate_type).to_string())
+                        .collect::<Vec<_>>(),
+                ),
+            );
         }
         query = match project_id.map(str::trim).filter(|value| !value.is_empty()) {
             Some(pid) => query.filter(
@@ -7654,7 +7668,12 @@ impl Storage {
 
     /// Insert a structured operational telemetry entry.
     pub async fn insert_operational_log(&self, log: &operational_log::Model) -> Result<()> {
-        let trace_id = match log.trace_id.as_deref().map(str::trim).filter(|id| !id.is_empty()) {
+        let trace_id = match log
+            .trace_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
             Some(id) => match execution_trace::Entity::find_by_id(id.to_string())
                 .one(&self.db)
                 .await
@@ -7797,6 +7816,32 @@ impl Storage {
 
         let mut rows = operational_log::Entity::find()
             .filter(operational_log::Column::TraceId.is_in(trace_ids.to_vec()))
+            .order_by_desc(operational_log::Column::CreatedAt)
+            .limit(Self::db_limit(limit))
+            .all(&self.db)
+            .await?;
+        for row in &mut rows {
+            row.outcome = decrypt_storage_string(&row.outcome);
+            row.arguments = decrypt_optional_storage_string(row.arguments.clone());
+            row.payload = decrypt_optional_storage_string(row.payload.clone());
+        }
+        Ok(rows)
+    }
+
+    /// List recent operational logs for a set of trace ids and one event type (newest first).
+    pub async fn list_operational_logs_for_trace_ids_by_event(
+        &self,
+        trace_ids: &[String],
+        event_type: &str,
+        limit: u64,
+    ) -> Result<Vec<operational_log::Model>> {
+        if trace_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut rows = operational_log::Entity::find()
+            .filter(operational_log::Column::TraceId.is_in(trace_ids.to_vec()))
+            .filter(operational_log::Column::EventType.eq(event_type.to_string()))
             .order_by_desc(operational_log::Column::CreatedAt)
             .limit(Self::db_limit(limit))
             .all(&self.db)

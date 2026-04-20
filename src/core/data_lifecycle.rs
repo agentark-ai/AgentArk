@@ -249,10 +249,8 @@ impl DataLifecycleSettings {
         self.procedural_pattern_retention_days = self
             .procedural_pattern_retention_days
             .min(MAX_RETENTION_DAYS);
-        self.recall_event_retention_days =
-            self.recall_event_retention_days.min(MAX_RETENTION_DAYS);
-        self.recall_test_retention_days =
-            self.recall_test_retention_days.min(MAX_RETENTION_DAYS);
+        self.recall_event_retention_days = self.recall_event_retention_days.min(MAX_RETENTION_DAYS);
+        self.recall_test_retention_days = self.recall_test_retention_days.min(MAX_RETENTION_DAYS);
         self.notification_cleanup_interval_secs = self
             .notification_cleanup_interval_secs
             .clamp(MIN_NOTIFICATION_INTERVAL_SECS, MAX_INTERVAL_SECS);

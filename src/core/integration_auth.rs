@@ -446,9 +446,9 @@ pub fn manifest_from_extension_pack(
             ],
         },
         ExtensionPackAuthMode::OAuth2External => match pack.auth.oauth2.as_ref() {
-            Some(oauth) => AuthMode::OAuth2AuthorizationCode(oauth_code_flow_from_pack(
-                &pack_id, oauth,
-            )),
+            Some(oauth) => {
+                AuthMode::OAuth2AuthorizationCode(oauth_code_flow_from_pack(&pack_id, oauth))
+            }
             None => AuthMode::Secrets {
                 fields: pack_secret_fields(&pack_id, required),
             },
@@ -464,7 +464,9 @@ pub fn manifest_from_extension_pack(
     };
     let after = match &mode {
         AuthMode::Secrets { .. } => PostSubmitAfter::CloseAndResume,
-        AuthMode::OAuth2AuthorizationCode(_) | AuthMode::Hybrid { .. } => PostSubmitAfter::LaunchOAuth,
+        AuthMode::OAuth2AuthorizationCode(_) | AuthMode::Hybrid { .. } => {
+            PostSubmitAfter::LaunchOAuth
+        }
         AuthMode::OAuth2DeviceCode(_) => PostSubmitAfter::LaunchOAuth,
     };
 
@@ -515,7 +517,10 @@ fn oauth_code_flow_from_pack(
         client_secret_source: if oauth.client_secret.trim().is_empty() {
             None
         } else {
-            Some(SecretSlot(namespaced_storage_target(pack_id, "client_secret")))
+            Some(SecretSlot(namespaced_storage_target(
+                pack_id,
+                "client_secret",
+            )))
         },
         token_storage: OAuthTokenStorage {
             access_token_key: namespaced_storage_target(pack_id, "access_token"),
@@ -555,7 +560,11 @@ fn humanise_secret_key(key: &str) -> String {
 mod tests {
     use super::*;
 
-    fn secrets_manifest(id: &str, field_key: &str, storage_targets: Vec<&str>) -> IntegrationAuthManifest {
+    fn secrets_manifest(
+        id: &str,
+        field_key: &str,
+        storage_targets: Vec<&str>,
+    ) -> IntegrationAuthManifest {
         IntegrationAuthManifest {
             integration_id: id.to_string(),
             display_name: id.to_string(),
@@ -630,11 +639,7 @@ mod tests {
 
     #[test]
     fn reverse_lookup_returns_none_for_unmapped_key() {
-        let pool = vec![secrets_manifest(
-            "github",
-            "token",
-            vec!["github_token"],
-        )];
+        let pool = vec![secrets_manifest("github", "token", vec!["github_token"])];
         let outcome = resolve_secret_key_among_manifests("RANDOM_KEY", &pool);
         assert_eq!(outcome, ReverseLookupOutcome::None);
     }

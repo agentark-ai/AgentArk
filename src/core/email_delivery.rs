@@ -66,10 +66,7 @@ struct ResolvedExternalEmailProvider {
 }
 
 fn normalize_identifier(value: &str) -> String {
-    value
-        .trim()
-        .to_ascii_lowercase()
-        .replace([' ', '-'], "_")
+    value.trim().to_ascii_lowercase().replace([' ', '-'], "_")
 }
 
 fn configured_secret(value: &str) -> bool {
@@ -186,13 +183,13 @@ pub fn normalize_email_backend_selection(
             )),
         };
     }
-    if available_backends.iter().any(|backend| backend == &provider) {
+    if available_backends
+        .iter()
+        .any(|backend| backend == &provider)
+    {
         Ok(provider)
     } else {
-        Err(anyhow!(
-            "Email provider '{}' is not ready yet.",
-            provider
-        ))
+        Err(anyhow!("Email provider '{}' is not ready yet.", provider))
     }
 }
 
@@ -230,9 +227,8 @@ pub fn render_notification_email(
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| Utc::now().to_rfc3339());
     let content = message_content_for_format(message, email_format);
-    let text_body = format!(
-        "{content}\n\nGenerated at: {generated_at}\nSent by AgentArk for {agent_name}"
-    );
+    let text_body =
+        format!("{content}\n\nGenerated at: {generated_at}\nSent by AgentArk for {agent_name}");
     let html_body = format!(
         concat!(
             "<!doctype html><html><head><meta charset=\"utf-8\"/>",
@@ -399,7 +395,10 @@ fn resolve_external_email_provider(config: &EmailConfig) -> Result<ResolvedExter
     match provider.kind {
         ExternalEmailProviderKind::Resend | ExternalEmailProviderKind::Postmark => {
             if !configured_secret(&provider.api_key) {
-                bail!("email.auth.api_key is required for {}", provider.provider_id);
+                bail!(
+                    "email.auth.api_key is required for {}",
+                    provider.provider_id
+                );
             }
         }
         ExternalEmailProviderKind::Ses => {
@@ -533,14 +532,13 @@ async fn send_postmark_email(
             .unwrap_or("https://api.postmarkapp.com"),
         provider.send_path.as_deref().unwrap_or("/email"),
     )?;
-    let header_name = provider
-        .auth_header_name
-        .as_deref()
-        .unwrap_or(if provider.auth_kind == EMAIL_AUTH_BEARER {
+    let header_name = provider.auth_header_name.as_deref().unwrap_or(
+        if provider.auth_kind == EMAIL_AUTH_BEARER {
             "Authorization"
         } else {
             "X-Postmark-Server-Token"
-        });
+        },
+    );
     let header_value = if provider.auth_kind == EMAIL_AUTH_BEARER {
         format!(
             "{} {}",
@@ -569,7 +567,11 @@ async fn send_postmark_email(
     } else {
         let status = request.status();
         let body = request.text().await.unwrap_or_default();
-        Err(anyhow!("Postmark send failed ({}): {}", status, body.trim()))
+        Err(anyhow!(
+            "Postmark send failed ({}): {}",
+            status,
+            body.trim()
+        ))
     }
 }
 
@@ -640,11 +642,7 @@ async fn send_ses_http_email(
         .join(";");
     let canonical_request = format!(
         "POST\n{}\n{}\n{}\n{}\n{}",
-        canonical_uri,
-        canonical_query,
-        canonical_headers_text,
-        signed_headers,
-        payload_hash
+        canonical_uri, canonical_query, canonical_headers_text, signed_headers, payload_hash
     );
     let credential_scope = format!(
         "{}/{}/{}/aws4_request",
@@ -705,7 +703,9 @@ async fn send_smtp_email(
     )?;
     let transport_builder = match provider.smtp_security.as_str() {
         "tls" => AsyncSmtpTransport::<Tokio1Executor>::relay(provider.smtp_host.trim())?,
-        "none" => AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(provider.smtp_host.trim()),
+        "none" => {
+            AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(provider.smtp_host.trim())
+        }
         _ => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(provider.smtp_host.trim())?,
     };
     let transport_builder = transport_builder.port(provider.smtp_port);
@@ -767,7 +767,9 @@ mod tests {
             Some("2026-04-18 09:30 IST"),
             Some("sections"),
         );
-        assert!(rendered.text_body.contains("Generated at: 2026-04-18 09:30 IST"));
+        assert!(rendered
+            .text_body
+            .contains("Generated at: 2026-04-18 09:30 IST"));
         assert!(rendered.html_body.contains("AgentArk"));
         assert!(rendered.html_body.contains("Line one"));
     }

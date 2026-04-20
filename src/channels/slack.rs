@@ -755,9 +755,9 @@ pub async fn handle_webhook_with_config(
     }
 
     let response = {
-        let agent = agent.read().await;
-        persist_destination(&agent, &conversation_context).await?;
-        let processed = agent
+        let agent_snapshot = Agent::snapshot(&agent).await;
+        persist_destination(&agent_snapshot, &conversation_context).await?;
+        let processed = agent_snapshot
             .process_message_with_meta(text, "slack", Some(&conversation_id), None)
             .await?;
         Agent::render_plain_channel_response(processed)

@@ -956,10 +956,7 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
         ),
         (
             "Knowledge",
-            &[
-                "ArkMemory",
-                "Settings > Knowledge > MCP Servers",
-            ],
+            &["ArkMemory", "Settings > Knowledge > MCP Servers"],
         ),
         (
             "Admin",

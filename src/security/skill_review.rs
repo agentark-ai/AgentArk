@@ -12,9 +12,8 @@ use std::path::Path;
 use crate::core::LlmClient;
 use crate::security::action_guard::{AnalysisFinding, FindingCategory, ThreatLevel};
 use crate::security::capabilities::{
-    canonical_capability_set, capability_category, capability_severity,
-    normalize_capability_kind, normalize_capability_selector, normalize_capability_target,
-    CAPABILITY_VOCABULARY,
+    canonical_capability_set, capability_category, capability_severity, normalize_capability_kind,
+    normalize_capability_selector, normalize_capability_target, CAPABILITY_VOCABULARY,
 };
 
 const MAX_SKILL_REVIEW_CHARS: usize = 32_000;
@@ -262,7 +261,10 @@ fn truncate_for_review(content: &str) -> String {
     if content.chars().count() <= MAX_SKILL_REVIEW_CHARS {
         return content.to_string();
     }
-    let mut out = content.chars().take(MAX_SKILL_REVIEW_CHARS).collect::<String>();
+    let mut out = content
+        .chars()
+        .take(MAX_SKILL_REVIEW_CHARS)
+        .collect::<String>();
     out.push_str("\n\n[TRUNCATED_FOR_SKILL_SECURITY_REVIEW]");
     out
 }
@@ -298,13 +300,9 @@ fn extract_json_object(text: &str) -> Option<serde_json::Value> {
         return Some(value);
     }
 
-    let start = trimmed.char_indices().find_map(|(idx, ch)| {
-        if ch == '{' {
-            Some(idx)
-        } else {
-            None
-        }
-    })?;
+    let start = trimmed
+        .char_indices()
+        .find_map(|(idx, ch)| if ch == '{' { Some(idx) } else { None })?;
     let end = trimmed.char_indices().rev().find_map(|(idx, ch)| {
         if ch == '}' {
             Some(idx + ch.len_utf8())
@@ -318,7 +316,9 @@ fn extract_json_object(text: &str) -> Option<serde_json::Value> {
     serde_json::from_str::<serde_json::Value>(&trimmed[start..end]).ok()
 }
 
-fn normalize_classification(mut classification: SemanticSkillClassification) -> SemanticSkillClassification {
+fn normalize_classification(
+    mut classification: SemanticSkillClassification,
+) -> SemanticSkillClassification {
     let known = canonical_capability_set();
     let mut seen = BTreeSet::new();
     let mut capabilities = Vec::new();

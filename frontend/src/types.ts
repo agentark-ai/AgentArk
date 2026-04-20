@@ -186,6 +186,7 @@ export type ArkPulseRemediationSpec =
   | { kind: "tunnel_start_verify" }
   | { kind: "tunnel_restart_verify" }
   | { kind: "app_restart"; app_id: string }
+  | { kind: "readonly_investigation"; topic: "memory_capture_health" }
   | { kind: "shell_command"; command: string };
 
 export type ArkPulseDoctorFinding = {

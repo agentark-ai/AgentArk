@@ -735,9 +735,9 @@ async fn handle_message_create_event(
     let content = message.content.clone();
 
     let reply = {
-        let agent = agent.read().await;
-        persist_destination(&agent, &context).await?;
-        let self_user_id = load_self_user_id(&agent).await;
+        let agent_snapshot = Agent::snapshot(&agent).await;
+        persist_destination(&agent_snapshot, &context).await?;
+        let self_user_id = load_self_user_id(&agent_snapshot).await;
         if let (Some(author), Some(self_user_id)) =
             (message.author.as_ref(), self_user_id.as_deref())
         {
@@ -745,7 +745,7 @@ async fn handle_message_create_event(
                 return Ok(());
             }
         }
-        agent
+        agent_snapshot
             .process_message_with_meta(&content, "discord", Some(&conversation_id), None)
             .await
             .map(Agent::render_plain_channel_response)?
@@ -755,9 +755,9 @@ async fn handle_message_create_event(
         return Ok(());
     }
 
-    let agent = agent.read().await;
-    send_message_to_destination(&agent, &context, &reply).await?;
-    save_runtime_state(&agent, &state).await?;
+    let agent_snapshot = Agent::snapshot(&agent).await;
+    send_message_to_destination(&agent_snapshot, &context, &reply).await?;
+    save_runtime_state(&agent_snapshot, &state).await?;
     Ok(())
 }
 

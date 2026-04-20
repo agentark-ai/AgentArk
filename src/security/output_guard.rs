@@ -81,7 +81,9 @@ pub struct MatchedOutputRule {
 #[derive(Debug, Clone, Serialize)]
 pub enum OutputVerdict {
     Allow,
-    Degraded { reason: String },
+    Degraded {
+        reason: String,
+    },
     Block {
         message: String,
         rule_id: String,
@@ -183,13 +185,9 @@ fn extract_json_object(text: &str) -> Option<serde_json::Value> {
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
         return Some(value);
     }
-    let start = trimmed.char_indices().find_map(|(idx, ch)| {
-        if ch == '{' {
-            Some(idx)
-        } else {
-            None
-        }
-    })?;
+    let start = trimmed
+        .char_indices()
+        .find_map(|(idx, ch)| if ch == '{' { Some(idx) } else { None })?;
     let end = trimmed.char_indices().rev().find_map(|(idx, ch)| {
         if ch == '}' {
             Some(idx + ch.len_utf8())

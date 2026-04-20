@@ -1415,8 +1415,8 @@ pub async fn handle_activity(
     persist_destination(&storage, config, destination.clone()).await?;
 
     let response = {
-        let guard = agent.read().await;
-        guard
+        let agent_snapshot = Agent::snapshot(agent).await;
+        agent_snapshot
             .process_message_with_meta(&text, "teams", Some(&conversation_id), None)
             .await
     };

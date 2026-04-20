@@ -891,6 +891,7 @@ pub struct AgentExecResult {
 }
 
 /// Configuration for the task router
+#[derive(Clone)]
 pub struct TaskRouterConfig {
     /// Max concurrent agents
     pub _max_concurrent: usize,
@@ -911,6 +912,7 @@ impl Default for TaskRouterConfig {
 }
 
 /// The unified task router — auto-spawns agents based on LLM routing decisions
+#[derive(Clone)]
 pub struct TaskRouter {
     config: TaskRouterConfig,
 }

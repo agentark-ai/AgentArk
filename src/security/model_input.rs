@@ -445,7 +445,7 @@ pub fn sanitize_model_input_text(
         };
     }
 
-    if approved_sensitive_passthrough && !secret_detected {
+    if approved_sensitive_passthrough {
         return ModelInputPrivacyTextResult {
             decision: if raw == sanitized {
                 ModelInputPrivacyDecision::Allow
@@ -740,6 +740,40 @@ mod tests {
         assert_eq!(result.decision, ModelInputPrivacyDecision::Allow);
         assert!(result.sanitized_text.contains("123 Main Street"));
         assert!(result.sanitized_text.contains("123-45-6789"));
+    }
+
+    #[test]
+    fn internal_helper_prompt_can_flow_identity_after_scoped_approval() {
+        let result = sanitize_model_input_text(
+            "User message:\nmy name is Example User",
+            &ModelPrivacyConfig::default(),
+            ModelInputContext::InternalHelperPrompt,
+            true,
+        );
+        assert_eq!(result.decision, ModelInputPrivacyDecision::Allow);
+        assert!(result.sanitized_text.contains("Example User"));
+        assert!(!result
+            .sanitized_text
+            .contains("[SENSITIVE_CONTEXT_WITHHELD"));
+    }
+
+    #[test]
+    fn internal_helper_prompt_keeps_identity_when_secret_is_redacted_after_approval() {
+        let result = sanitize_model_input_text(
+            &format!(
+                "Current user fact:\nmy name is Example User\n\nSecret assignment:\napi_key={}",
+                fake_openai_key()
+            ),
+            &ModelPrivacyConfig::default(),
+            ModelInputContext::InternalHelperPrompt,
+            true,
+        );
+        assert_eq!(result.decision, ModelInputPrivacyDecision::RedactedAllow);
+        assert!(result.sanitized_text.contains("Example User"));
+        assert!(result.sanitized_text.contains("[REDACTED_SECRET]"));
+        assert!(!result
+            .sanitized_text
+            .contains("[SENSITIVE_CONTEXT_WITHHELD"));
     }
 
     #[test]

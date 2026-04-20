@@ -222,7 +222,19 @@ body {
   filter: blur(70px);
   opacity: 0.18;
   pointer-events: none;
-  animation: drift 18s ease-in-out infinite alternate;
+}
+
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: block;
+  flex-shrink: 0;
+}
+
+.status-dot--pulse {
+  animation: pulse-dot 2s ease-in-out infinite;
+  will-change: transform, opacity;
 }
 
 .orb-a {
@@ -1454,12 +1466,13 @@ body {
 
 .chat-avatar-user {
   border-radius: 999px !important;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: linear-gradient(160deg, rgba(48, 48, 54, 0.98), rgba(28, 28, 32, 0.95)) !important;
-  color: rgba(242, 251, 255, 0.98);
+  border: 1px solid rgba(139, 92, 246, 0.22) !important;
+  background:
+    radial-gradient(circle at 32% 26%, rgba(255, 255, 255, 0.06), transparent 55%),
+    linear-gradient(160deg, #1a1630 0%, #0f0d20 100%) !important;
   box-shadow:
-    0 8px 18px rgba(0, 0, 0, 0.18),
-    0 0 0 1px rgba(255, 255, 255, 0.06);
+    0 2px 6px rgba(0, 0, 0, 0.30),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05);
 }
 
 .chat-avatar-user-icon {
@@ -1487,6 +1500,36 @@ body {
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.025));
   border-color: rgba(255, 255, 255, 0.1);
   box-shadow: none;
+}
+
+/* Keep user/agent response text selectable even inside dense flex/card layouts. */
+.chat-bubble,
+.chat-bubble *,
+.term-body,
+.term-content,
+.term-label,
+.term-detail,
+.activity-row-time,
+.activity-row-summary,
+.activity-payload-preview-text,
+.activity-payload-pre,
+.live-console-copy,
+.live-console-summary-value,
+.live-console-entry-title,
+.live-console-entry-detail,
+.live-console-entry-meta,
+.live-console-empty-copy {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.chat-bubble button,
+.chat-bubble [role="button"],
+.chat-bubble .MuiButtonBase-root,
+.chat-bubble input,
+.chat-bubble textarea {
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 .chat-markdown {
@@ -1524,7 +1567,10 @@ body {
 
 /* ── Paragraphs ── */
 .chat-markdown p {
-  margin: 0;
+  margin: 0 0 12px 0;
+}
+.chat-markdown p:last-child {
+  margin-bottom: 0;
 }
 
 /* ── Links ── */
@@ -5583,6 +5629,18 @@ body {
 
 .metric-bar-card-compact .metric-bar-card-title {
   font-size: 0.84rem !important;
+}
+
+@keyframes metric-meter-shimmer {
+  0% {
+    transform: translateX(-120%);
+  }
+  55% {
+    transform: translateX(120%);
+  }
+  100% {
+    transform: translateX(120%);
+  }
 }
 
 .metric-bar-card-compact .metric-bar-card-value {

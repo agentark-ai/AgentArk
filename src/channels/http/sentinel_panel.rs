@@ -737,7 +737,7 @@ Take the safest concrete next action now. Prefer summarizing, drafting a reply, 
 }
 
 async fn build_candidates(
-    agent: &Agent,
+    integration_ctx: &crate::core::integration_sync::IntegrationSyncContext,
     settings: &AutonomySettings,
 ) -> (
     Vec<SentinelObservation>,
@@ -752,13 +752,13 @@ async fn build_candidates(
     let mut connected_services = 0usize;
     let mut important_service_events = 0usize;
     if settings.sentinel.watch_connected_services {
-        let ctx = crate::core::integration_sync::context_from_agent(agent, None);
-        let statuses = crate::core::integration_sync::list_statuses(&ctx).await;
+        let statuses = crate::core::integration_sync::list_statuses(integration_ctx).await;
         connected_services = statuses
             .iter()
             .filter(|status| status.connected && status.supported)
             .count();
-        let feed_items = crate::core::integration_sync::list_feed_items(&ctx, None, 18).await;
+        let feed_items =
+            crate::core::integration_sync::list_feed_items(integration_ctx, None, 18).await;
         for item in feed_items.into_iter().filter(|entry| {
             entry.important || entry.importance >= settings.sentinel.confidence_threshold
         }) {
@@ -1062,9 +1062,14 @@ pub(crate) async fn run_sentinel_scan_tick(
     trigger: &str,
 ) -> serde_json::Value {
     let now = chrono::Utc::now();
-    let agent = shared.read().await;
-    let mut settings = super::load_autonomy_settings(&agent).await;
-    let storage = agent.storage.clone();
+    let (storage, integration_ctx) = {
+        let agent = shared.read().await;
+        (
+            agent.storage.clone(),
+            crate::core::integration_sync::context_from_agent(&agent, None),
+        )
+    };
+    let mut settings = super::load_autonomy_settings_from_storage(&storage).await;
 
     if settings.agent_paused
         || settings.autonomy_mode.eq_ignore_ascii_case("off")
@@ -1103,7 +1108,7 @@ pub(crate) async fn run_sentinel_scan_tick(
     refresh_snoozed_proposals(&mut proposals, now);
 
     let (candidate_observations, candidate_proposals, connected_services, important_service_events) =
-        build_candidates(&agent, &settings).await;
+        build_candidates(&integration_ctx, &settings).await;
     let mut created_observations = 0usize;
     let mut created_proposals = 0usize;
     let mut new_proposal_ids = Vec::new();
@@ -1157,15 +1162,23 @@ pub(crate) async fn run_sentinel_scan_tick(
         created_proposals += 1;
     }
 
-    let auto_executed = try_auto_execute_new_proposals(
-        &agent,
-        &mut settings,
-        &storage,
-        &mut proposals,
-        &new_proposal_ids,
-    )
-    .await;
-    let _ = super::save_autonomy_settings(&agent, &settings).await;
+    let mut agent_snapshot: Option<Agent> = None;
+    let auto_executed = if new_proposal_ids.is_empty() {
+        0
+    } else {
+        if agent_snapshot.is_none() {
+            agent_snapshot = Some(Agent::snapshot(&shared).await);
+        }
+        try_auto_execute_new_proposals(
+            agent_snapshot.as_ref().expect("agent snapshot"),
+            &mut settings,
+            &storage,
+            &mut proposals,
+            &new_proposal_ids,
+        )
+        .await
+    };
+    let _ = super::save_autonomy_settings_to_storage(&storage, &settings).await;
 
     observations = prune_observations(observations, now);
     proposals = prune_proposals(proposals, now);
@@ -1186,7 +1199,12 @@ pub(crate) async fn run_sentinel_scan_tick(
             created_proposals,
             if created_proposals == 1 { "" } else { "s" }
         );
-        agent
+        if agent_snapshot.is_none() {
+            agent_snapshot = Some(Agent::snapshot(&shared).await);
+        }
+        agent_snapshot
+            .as_ref()
+            .expect("agent snapshot")
             .emit_notification("Sentinel queued new work", &body, "info", "sentinel")
             .await;
     }
@@ -1205,8 +1223,8 @@ pub(crate) async fn run_sentinel_scan_tick(
 }
 
 pub(super) async fn get_sentinel_settings(State(state): State<AppState>) -> Response {
-    let agent = state.agent.read().await;
-    let settings = super::load_autonomy_settings(&agent).await;
+    let storage = { state.agent.read().await.storage.clone() };
+    let settings = super::load_autonomy_settings_from_storage(&storage).await;
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -1225,8 +1243,8 @@ pub(super) async fn update_sentinel_settings(
     State(state): State<AppState>,
     Json(request): Json<serde_json::Value>,
 ) -> Response {
-    let agent = state.agent.read().await;
-    let mut settings = super::load_autonomy_settings(&agent).await;
+    let storage = { state.agent.read().await.storage.clone() };
+    let mut settings = super::load_autonomy_settings_from_storage(&storage).await;
 
     if let Some(enabled) = request.get("enabled").and_then(|value| value.as_bool()) {
         settings.sentinel.enabled = enabled;
@@ -1271,7 +1289,7 @@ pub(super) async fn update_sentinel_settings(
         }
     }
 
-    match super::save_autonomy_settings(&agent, &settings).await {
+    match super::save_autonomy_settings_to_storage(&storage, &settings).await {
         Ok(_) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -1294,17 +1312,21 @@ pub(super) async fn update_sentinel_settings(
 }
 
 pub(super) async fn get_sentinel_feed(State(state): State<AppState>) -> Response {
-    let agent = state.agent.read().await;
-    let settings = super::load_autonomy_settings(&agent).await;
-    let storage = agent.storage.clone();
+    let (storage, ctx, trace_history) = {
+        let agent = state.agent.read().await;
+        (
+            agent.storage.clone(),
+            crate::core::integration_sync::context_from_agent(&agent, None),
+            agent.trace_history.clone(),
+        )
+    };
+    let settings = super::load_autonomy_settings_from_storage(&storage).await;
     let mut observations = load_observations(&storage).await;
     let mut proposals = load_proposals(&storage).await;
     let scan = load_scan_state(&storage).await;
-    let ctx = crate::core::integration_sync::context_from_agent(&agent, None);
     let statuses = crate::core::integration_sync::list_statuses(&ctx).await;
     let feed_items = crate::core::integration_sync::list_feed_items(&ctx, None, 18).await;
-    let recent_runs = agent
-        .trace_history
+    let recent_runs = trace_history
         .read()
         .await
         .iter()
@@ -1314,7 +1336,6 @@ pub(super) async fn get_sentinel_feed(State(state): State<AppState>) -> Response
             channel == "sentinel" || channel == "autonomy"
         })
         .count();
-    drop(agent);
 
     let now = chrono::Utc::now();
     refresh_snoozed_proposals(&mut proposals, now);
@@ -1424,10 +1445,10 @@ pub(super) async fn approve_sentinel_proposal(
             Err("Proposal is missing the chat suggestion id".to_string())
         }
     } else {
-        let agent = state.agent.read().await;
-        let mut settings = super::load_autonomy_settings(&agent).await;
+        let agent = Agent::snapshot(&state.agent).await;
+        let mut settings = super::load_autonomy_settings_from_storage(&storage).await;
         let outcome = execute_action_proposal(&agent, &mut settings, &proposal).await;
-        let _ = super::save_autonomy_settings(&agent, &settings).await;
+        let _ = super::save_autonomy_settings_to_storage(&storage, &settings).await;
         outcome
     };
 

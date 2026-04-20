@@ -67,6 +67,7 @@ import {
   Fragment,
   memo,
   isValidElement,
+  useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -498,6 +499,10 @@ function setDeveloperModeEnabled(next: boolean): void {
 }
 
 type JsonRecord = Record<string, unknown>;
+type ChatClarificationChoice = {
+  label: string;
+  submitText: string;
+};
 type PasswordDialogMode = "set" | "change" | "remove";
 type RowMenuAction = {
   label: string;
@@ -1905,6 +1910,20 @@ function asRecord(value: unknown): JsonRecord {
 function asRecords(value: unknown): JsonRecord[] {
   if (!Array.isArray(value)) return [];
   return value.filter(isRecord);
+}
+
+function clarificationChoices(value: unknown): ChatClarificationChoice[] {
+  return asRecords(value)
+    .map((choice) => {
+      const label = str(choice.label, "").trim();
+      const submitText = str(
+        choice.submit_text,
+        str(choice.submitText, ""),
+      ).trim();
+      if (!label || !submitText) return null;
+      return { label, submitText };
+    })
+    .filter((choice): choice is ChatClarificationChoice => choice !== null);
 }
 
 function pickRecords(value: unknown, ...keys: string[]): JsonRecord[] {
@@ -4688,6 +4707,13 @@ function parseArkPulseRemediationSpec(
     if (!appId) return null;
     return { kind: "app_restart", app_id: appId };
   }
+  if (kind === "readonly_investigation") {
+    const topic = str(row.topic, "").trim().toLowerCase();
+    if (topic === "memory_capture_health") {
+      return { kind: "readonly_investigation", topic: "memory_capture_health" };
+    }
+    return null;
+  }
   if (kind === "shell_command") {
     const command = str(row.command, "").trim();
     if (!command) return null;
@@ -4709,7 +4735,39 @@ function describeArkPulseRemediation(
   if (remediation.kind === "app_restart") {
     return `Restart app ${remediation.app_id} and re-check health`;
   }
+  if (remediation.kind === "readonly_investigation") {
+    return "Review failed memory captures and model health";
+  }
   return remediation.command.trim() || "-";
+}
+
+function isArkPulseReadonlyInvestigation(
+  remediation: ArkPulseRemediationSpec | null,
+): boolean {
+  return remediation?.kind === "readonly_investigation";
+}
+
+function arkPulseRunActionLabel(
+  remediation: ArkPulseRemediationSpec | null,
+): string {
+  return isArkPulseReadonlyInvestigation(remediation)
+    ? "Run diagnostic"
+    : "Run fix now";
+}
+
+function arkPulseRemediationFootnote(
+  typedRemediation: ArkPulseRemediationSpec | null,
+  canRunFix: boolean,
+): string {
+  if (!typedRemediation) {
+    return canRunFix
+      ? "Legacy event: ArkPulse is using the saved fix command fallback for this run."
+      : "This next step is advisory only. Copy it and run it manually.";
+  }
+  if (typedRemediation.kind === "readonly_investigation") {
+    return "Runs a read-only diagnostic from ArkPulse and returns a summary here.";
+  }
+  return "Runs directly from ArkPulse using the finding's typed remediation.";
 }
 
 function classifyLegacyRunnableArkPulseFixCommand(
@@ -9158,6 +9216,11 @@ type ChatStarterExample = {
   deepResearch?: boolean;
 };
 
+type ChatComposerPrefillRequest = {
+  text: string;
+  seq: number;
+};
+
 const CHAT_STARTER_CATEGORY_META: Record<
   ChatStarterCategoryId,
   { label: string; description: string }
@@ -9481,6 +9544,184 @@ const CHAT_STARTER_ADVANCED_EXAMPLES = CHAT_STARTER_EXAMPLES.filter(
 const CHAT_SECRET_WARNING =
   "Never paste secrets, API keys, passwords, or sensitive data into normal chat. Use the secure credential form shown in this conversation.";
 
+const ChatComposerInput = memo(function ChatComposerInput({
+  attachedFilesCount,
+  composerLocked,
+  deepResearchEnabled,
+  isStoppingStream,
+  isStreaming,
+  onAttachFiles,
+  onStopStreaming,
+  onSubmit,
+  onToggleDeepResearch,
+  placeholder,
+  prefillRequest,
+}: {
+  attachedFilesCount: number;
+  composerLocked: boolean;
+  deepResearchEnabled: boolean;
+  isStoppingStream: boolean;
+  isStreaming: boolean;
+  onAttachFiles: () => void;
+  onStopStreaming: () => void;
+  onSubmit: (draft: string) => Promise<boolean>;
+  onToggleDeepResearch: () => void;
+  placeholder: string;
+  prefillRequest: ChatComposerPrefillRequest | null;
+}) {
+  const [draft, setDraft] = useState("");
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const lastAppliedPrefillSeqRef = useRef<number | null>(null);
+
+  const resizeComposerTextarea = (el: HTMLTextAreaElement | null) => {
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 150)}px`;
+  };
+
+  useLayoutEffect(() => {
+    resizeComposerTextarea(textareaRef.current);
+  }, [draft]);
+
+  useEffect(() => {
+    if (!prefillRequest) return;
+    if (prefillRequest.seq === lastAppliedPrefillSeqRef.current) return;
+    setDraft(prefillRequest.text);
+    lastAppliedPrefillSeqRef.current = prefillRequest.seq;
+    if (typeof window === "undefined") return;
+    window.requestAnimationFrame(() => {
+      const el = textareaRef.current;
+      if (!el) return;
+      el.focus();
+      const end = prefillRequest.text.length;
+      try {
+        el.setSelectionRange(end, end);
+      } catch {
+        // Ignore selection errors on browsers that do not support it here.
+      }
+      resizeComposerTextarea(el);
+    });
+  }, [prefillRequest]);
+
+  const submitCurrentDraft = async () => {
+    if (
+      composerLocked ||
+      isStreaming ||
+      (!draft.trim() && attachedFilesCount === 0)
+    ) {
+      return;
+    }
+    const accepted = await onSubmit(draft);
+    if (!accepted) return;
+    setDraft("");
+    const el = textareaRef.current;
+    if (el) {
+      el.style.height = "auto";
+    }
+  };
+
+  return (
+    <>
+      <textarea
+        ref={textareaRef}
+        className="chat-composer-textarea"
+        placeholder={placeholder}
+        aria-label="Message"
+        value={draft}
+        onChange={(e) => {
+          setDraft(e.target.value);
+          resizeComposerTextarea(e.target);
+        }}
+        onKeyDown={(e) => {
+          if (
+            e.key === "Enter" &&
+            !e.shiftKey &&
+            !e.nativeEvent.isComposing
+          ) {
+            e.preventDefault();
+            void submitCurrentDraft();
+          }
+        }}
+        rows={1}
+        disabled={composerLocked}
+      />
+      <div className="chat-composer-actions">
+        <Tooltip
+          title={
+            deepResearchEnabled
+              ? "Deep research enabled - slower, source-backed"
+              : "Enable Deep research"
+          }
+        >
+          <FormControlLabel
+            control={
+              <Switch
+                size="small"
+                checked={deepResearchEnabled}
+                onChange={onToggleDeepResearch}
+                disabled={isStreaming || composerLocked}
+                sx={{
+                  "& .MuiSwitch-switchBase.Mui-checked": {
+                    color: "#f4f5f7",
+                  },
+                  "& .MuiSwitch-switchBase.Mui-checked + .MuiSwitch-track": {
+                    backgroundColor: "rgba(255, 255, 255, 0.28)",
+                  },
+                }}
+              />
+            }
+            label="Deep research"
+            slotProps={{
+              typography: {
+                sx: {
+                  fontSize: "0.66rem",
+                  fontWeight: 600,
+                  color: deepResearchEnabled
+                    ? "rgba(244,245,247,0.88)"
+                    : "text.secondary",
+                },
+              },
+            }}
+            sx={{ ml: 0, mr: 0.5 }}
+          />
+        </Tooltip>
+        <Tooltip title="Attach files">
+          <IconButton
+            size="small"
+            className="chat-composer-action-btn"
+            onClick={onAttachFiles}
+            disabled={isStreaming || composerLocked}
+          >
+            <AttachFileRoundedIcon fontSize="small" />
+          </IconButton>
+        </Tooltip>
+        {isStreaming ? (
+          <IconButton
+            size="small"
+            className="chat-composer-stop-btn"
+            disabled={isStoppingStream}
+            onClick={onStopStreaming}
+          >
+            <StopRoundedIcon fontSize="small" />
+          </IconButton>
+        ) : (
+          <IconButton
+            id="chat-send-btn"
+            size="small"
+            className="chat-composer-send-btn"
+            disabled={composerLocked || (!draft.trim() && attachedFilesCount === 0)}
+            onClick={() => {
+              void submitCurrentDraft();
+            }}
+          >
+            <ArrowUpwardRoundedIcon fontSize="small" />
+          </IconButton>
+        )}
+      </div>
+    </>
+  );
+});
+
 function ChatManager({
   autoRefresh,
   isActive,
@@ -9497,9 +9738,6 @@ function ChatManager({
   const queryClient = useQueryClient();
   const chatAutoRefresh = autoRefresh && isActive;
   const [conversationId, setConversationId] = useState<string | null>(null);
-  const [prompt, setPrompt] = useState("");
-  const [chatExecutionMode, setChatExecutionMode] =
-    useState<ChatExecutionMode>("auto");
   const [deepResearchEnabled, setDeepResearchEnabled] = useState(false);
   const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
   const [chatError, setChatError] = useState<string | null>(null);
@@ -9519,6 +9757,9 @@ function ChatManager({
     null,
   );
   const [streamingResponse, setStreamingResponse] = useState("");
+  const [streamingResponseChoices, setStreamingResponseChoices] = useState<
+    ChatClarificationChoice[]
+  >([]);
   const [streamingSteps, setStreamingSteps] = useState<JsonRecord[]>([]);
   const [executionPlan, setExecutionPlan] = useState<ExecutionPlanState | null>(
     null,
@@ -9579,6 +9820,8 @@ function ChatManager({
   const [messageTraceOpen, setMessageTraceOpen] = useState<
     Record<string, boolean>
   >({});
+  const [submittedClarificationChoices, setSubmittedClarificationChoices] =
+    useState<Record<string, boolean>>({});
   const [traceStepsById, setTraceStepsById] = useState<
     Record<string, JsonRecord[]>
   >({});
@@ -9602,11 +9845,12 @@ function ChatManager({
     useState<ChatPendingRunSnapshot | null>(() => loadChatPendingRunSnapshot());
   const [backgroundRunSnapshots, setBackgroundRunSnapshots] =
     useState<ChatPendingRunSnapshotMap>(() => loadChatBackgroundRunSnapshots());
+  const [composerPrefillRequest, setComposerPrefillRequest] =
+    useState<ChatComposerPrefillRequest | null>(null);
   const chatBackgroundRefresh =
     isStreaming ||
     pendingRunSnapshot !== null ||
     Object.keys(backgroundRunSnapshots).length > 0;
-  const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const dragDepthRef = useRef(0);
   const threadRef = useRef<HTMLDivElement | null>(null);
@@ -9638,6 +9882,12 @@ function ChatManager({
   const lastWorkspaceRestoreSeedRef = useRef("");
   const reattachedRunIdRef = useRef("");
   const conversationOffset = conversationPage * CHAT_CONVERSATIONS_PAGE_SIZE;
+  const queueComposerPrefill = (text: string) => {
+    setComposerPrefillRequest((prev) => ({
+      text,
+      seq: (prev?.seq ?? 0) + 1,
+    }));
+  };
   const canInlineConversationSidebar =
     viewportWidth >= CHAT_INLINE_CONVERSATIONS_MIN_WIDTH;
   const canInlineWorkspacePanel =
@@ -9779,6 +10029,8 @@ function ChatManager({
     (isStreamingForCurrentConversation ||
       hasPendingSnapshotForConversation ||
       recentlyTouchedEmptyConversation);
+  const shouldPreparePersistedThread =
+    !!conversationId && (isActive || shouldPollMessages);
   const messagesQ = useQuery({
     queryKey: ["chat-messages", conversationId],
     queryFn: () =>
@@ -9810,9 +10062,28 @@ function ChatManager({
     refetchIntervalInBackground: shouldPollMessages,
   });
 
-  const messages = conversationId
-    ? pickRecords(messagesQ.data, "messages")
-    : [];
+  const messages = useMemo(
+    () =>
+      shouldPreparePersistedThread
+        ? pickRecords(messagesQ.data, "messages")
+        : [],
+    [shouldPreparePersistedThread, messagesQ.data],
+  );
+  const previousUserPromptByIndex = useMemo(() => {
+    const map = new Map<number, string>();
+    let lastUserPrompt = "";
+    for (let i = 0; i < messages.length; i += 1) {
+      const m = asRecord(messages[i]);
+      const role = str(m.role, "").toLowerCase();
+      if (role === "user") {
+        map.set(i, "");
+        lastUserPrompt = stripAttachmentContextMarker(str(m.content, ""));
+      } else {
+        map.set(i, lastUserPrompt);
+      }
+    }
+    return map;
+  }, [messages]);
   const chatCredentialPromptPayload = asRecord(chatCredentialPromptQ.data);
   const chatCredentialPrompt = asRecord(chatCredentialPromptPayload.prompt);
   const chatCredentialPromptFields = pickRecords(chatCredentialPrompt, "fields");
@@ -9987,6 +10258,11 @@ function ChatManager({
 
   useEffect(() => {
     streamingResponseRef.current = streamingResponse;
+  }, [streamingResponse]);
+  useEffect(() => {
+    if (!streamingResponse.trim()) {
+      setStreamingResponseChoices([]);
+    }
   }, [streamingResponse]);
 
   useEffect(() => {
@@ -11671,7 +11947,7 @@ function ChatManager({
     setIsDragOverChat(false);
     setConversationId(null);
     setConversationPage(0);
-    setPrompt("");
+    queueComposerPrefill("");
     setDeepResearchEnabled(false);
     setAttachedFiles([]);
     setChatError(null);
@@ -14153,6 +14429,7 @@ function ChatManager({
     );
     setFailedUserMessage(null);
     setStreamingResponse(preservedResumeResponse);
+    setStreamingResponseChoices([]);
     setStreamingSteps(preservedResumeSteps);
     streamingStepsRef.current = preservedResumeSteps;
     if (isResumeMode && planOverride) {
@@ -14378,6 +14655,7 @@ function ChatManager({
                   latestStreamingResponse = text;
                   setStreamingResponse(text);
                 }
+                setStreamingResponseChoices(clarificationChoices(payload.choices));
                 absorbConversationId(payload);
               },
               onError: (messageText) => {
@@ -14489,6 +14767,7 @@ function ChatManager({
                   latestStreamingResponse = text;
                   setStreamingResponse(text);
                 }
+                setStreamingResponseChoices(clarificationChoices(payload.choices));
                 absorbConversationId(payload);
               },
               onError: (messageText) => {
@@ -14827,7 +15106,6 @@ function ChatManager({
       }
     };
 
-    setChatNotice("Reattaching to the live run...");
     void api
       .runStream(runId, 0, {
         signal: abortController.signal,
@@ -14875,6 +15153,7 @@ function ChatManager({
             latestStreamingResponse = text;
             setStreamingResponse(text);
           }
+          setStreamingResponseChoices(clarificationChoices(payload.choices));
           absorbRunPayload(payload);
         },
         onError: (messageText) => {
@@ -14908,7 +15187,6 @@ function ChatManager({
         },
         onDone: () => {
           runCompleted = true;
-          setChatNotice(null);
           clearPendingRunPresentation(
             trimTrailingHeartbeatSteps(streamingStepsRef.current),
           );
@@ -14952,7 +15230,6 @@ function ChatManager({
       })
       .finally(() => {
         if (!abortController.signal.aborted) {
-          setChatNotice(null);
           if (!runCompleted && !runInterrupted && !recoveredFromLatestRun) {
             void recoverFromLatestRun().then((recovered) => {
               if (recovered) return;
@@ -15134,14 +15411,14 @@ function ChatManager({
   const submitComposerMessage = async (
     messageText: string,
     files: File[] = [],
-  ) => {
+  ): Promise<boolean> => {
     const trimmed = messageText.trim();
     if (
       isStreaming ||
       composerLockedForPlanConfirmation ||
       (!trimmed && files.length === 0)
     )
-      return;
+      return false;
 
     if (isAwaitingPlanConfirmation) {
       const pausedTaskId = str(planConfirmation?.taskId, "").trim();
@@ -15163,14 +15440,68 @@ function ChatManager({
     }
 
     setChatError(null);
-    setPrompt("");
-    const ta = document.querySelector(
-      ".chat-composer-textarea",
-    ) as HTMLTextAreaElement | null;
-    if (ta) ta.style.height = "auto";
-    await runStreamingChat(trimmed, files, {
+    void runStreamingChat(trimmed, files, {
       deepResearch: deepResearchEnabled,
     });
+    return true;
+  };
+
+  useEffect(() => {
+    setSubmittedClarificationChoices({});
+  }, [conversationId]);
+
+  const submitClarificationChoice = async (
+    messageKey: string,
+    submitText: string,
+  ): Promise<void> => {
+    const trimmed = submitText.trim();
+    if (!trimmed || submittedClarificationChoices[messageKey]) return;
+    setSubmittedClarificationChoices((prev) => ({
+      ...prev,
+      [messageKey]: true,
+    }));
+    await submitComposerMessage(trimmed, []);
+  };
+
+  const renderClarificationChoiceGroup = (
+    messageKey: string,
+    choices: ChatClarificationChoice[],
+    forceDisabled = false,
+  ) => {
+    if (choices.length === 0) return null;
+    const disabled =
+      forceDisabled ||
+      isStreaming ||
+      Boolean(submittedClarificationChoices[messageKey]);
+    return (
+      <Stack
+        direction="row"
+        spacing={0.75}
+        useFlexGap
+        sx={{
+          flexWrap: "wrap",
+          mt: 1.25,
+        }}
+      >
+        {choices.map((choice, idx) => (
+          <Button
+            key={`${messageKey}-${choice.submitText}-${idx}`}
+            size="small"
+            variant="outlined"
+            disabled={disabled}
+            onClick={() => {
+              void submitClarificationChoice(messageKey, choice.submitText);
+            }}
+            sx={{
+              borderRadius: 1,
+              textTransform: "none",
+            }}
+          >
+            {choice.label}
+          </Button>
+        ))}
+      </Stack>
+    );
   };
 
   useEffect(() => {
@@ -15572,20 +15903,26 @@ function ChatManager({
   const renderUserAvatar = (extraClassName = "") => (
     <Avatar
       className={`chat-avatar chat-avatar-user${extraClassName ? ` ${extraClassName}` : ""}`}
-      sx={{
-        width: 44,
-        height: 44,
-        background:
-          "linear-gradient(135deg, #8B5CF6 0%, #6D28D9 55%, #4C1D95 100%)",
-        color: "#fff",
-        fontWeight: 600,
-        fontSize: "1.05rem",
-        letterSpacing: "0.01em",
-        border: "1px solid rgba(255,255,255,0.08)",
-        boxShadow: "0 6px 16px rgba(0,0,0,0.22), inset 0 1px 0 rgba(255,255,255,0.08)",
-      }}
+      sx={{ width: 34, height: 34 }}
     >
-      Y
+      <Box
+        component="svg"
+        viewBox="0 0 24 24"
+        sx={{ width: 20, height: 20, display: "block" }}
+        aria-hidden="true"
+      >
+        <defs>
+          <linearGradient id="user-icon-fill" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="#c4b5fd" />
+            <stop offset="100%" stopColor="#8b5cf6" />
+          </linearGradient>
+        </defs>
+        <circle cx="12" cy="8.5" r="3.6" fill="url(#user-icon-fill)" />
+        <path
+          d="M4.5 20.2c0-3.8 3.4-6.4 7.5-6.4s7.5 2.6 7.5 6.4v.3H4.5v-.3z"
+          fill="url(#user-icon-fill)"
+        />
+      </Box>
     </Avatar>
   );
   const renderProgressRows = (keyPrefix: string) =>
@@ -15632,14 +15969,79 @@ function ChatManager({
       return;
     setSelectedSnippetId(null);
   }, [selectedSnippetId, workspaceSnippetFiles]);
-  const openCodePreviewInWorkspace = (request: CodePreviewOpenRequest) => {
-    setWorkspaceOpen(true);
-    if (request.snippetId) {
-      setSelectedSnippetId(request.snippetId);
-      return;
-    }
-    setSelectedSnippetId(null);
-  };
+  // Keep this callback stable so messageRenderBundle memoization only busts
+  // when message data changes.
+  const openCodePreviewInWorkspace = useCallback(
+    (request: CodePreviewOpenRequest) => {
+      setWorkspaceOpen(true);
+      if (request.snippetId) {
+        setSelectedSnippetId(request.snippetId);
+        return;
+      }
+      setSelectedSnippetId(null);
+    },
+    [],
+  );
+  const messageRenderBundle = useMemo(() => {
+    let firstChoicesSeen = false;
+    return messages.map((raw, idx) => {
+      const message = asRecord(raw);
+      const role = str(message.role, "").toLowerCase();
+      const isUser = role === "user";
+      const isAssistant = role === "assistant";
+      const messageId = str(message.id, String(idx));
+      const tsRaw = str(message.timestamp, "");
+      const ts = tsRaw ? formatChatTimestamp(tsRaw) : null;
+      const content = str(message.content);
+      const renderedContent = isUser
+        ? stripAttachmentContextMarker(content)
+        : content;
+      const rawMessageChoices = isAssistant
+        ? clarificationChoices(message.choices)
+        : [];
+      // Only render choice buttons on the FIRST assistant message in the
+      // thread that carries choices — the original clarification. Choices
+      // attached to later assistant messages (e.g., via over-permissive
+      // trace_id persistence) are treated as stale and suppressed.
+      let messageChoices: ChatClarificationChoice[] = [];
+      if (rawMessageChoices.length > 0 && !firstChoicesSeen) {
+        messageChoices = rawMessageChoices;
+        firstChoicesSeen = true;
+      }
+      const researchReport = isAssistant
+        ? parseResearchReport(renderedContent)
+        : null;
+      const previousUserPrompt = previousUserPromptByIndex.get(idx) || "";
+      const traceId = str(message.trace_id, "").trim();
+      const hasTrace = !isUser && !!traceId;
+      const messageTotalTokens = !isUser ? num(message.total_tokens, 0) : 0;
+      const markdownNode =
+        !isUser && !researchReport
+          ? renderChatMarkdown(renderedContent, {
+              snippetNamespace: messageId,
+              onOpenSnippet: openCodePreviewInWorkspace,
+            })
+          : null;
+      return {
+        message,
+        idx,
+        messageId,
+        role,
+        isUser,
+        isAssistant,
+        tsRaw,
+        ts,
+        renderedContent,
+        messageChoices,
+        researchReport,
+        previousUserPrompt,
+        traceId,
+        hasTrace,
+        messageTotalTokens,
+        markdownNode,
+      };
+    });
+  }, [messages, previousUserPromptByIndex, openCodePreviewInWorkspace]);
   const latestAssistantTraceSteps = latestAssistantTraceId
     ? traceStepsById[latestAssistantTraceId] || []
     : [];
@@ -15753,36 +16155,12 @@ function ChatManager({
             ? "This run was interrupted. The approved plan and the last saved progress are preserved here."
             : "Preparing a structured execution outline.";
 
-  const resizeComposerTextarea = (el: HTMLTextAreaElement | null) => {
-    if (!el) return;
-    el.style.height = "auto";
-    el.style.height = `${Math.min(el.scrollHeight, 150)}px`;
-  };
-
   const applyStarterExample = (example: ChatStarterExample) => {
-    setPrompt(example.prompt);
+    queueComposerPrefill(example.prompt);
     setDeepResearchEnabled(Boolean(example.deepResearch));
     setChatError(null);
     setChatNotice(null);
-    if (typeof window !== "undefined") {
-      window.requestAnimationFrame(() => {
-        const el = composerTextareaRef.current;
-        if (!el) return;
-        el.focus();
-        const end = example.prompt.length;
-        try {
-          el.setSelectionRange(end, end);
-        } catch {
-          // Ignore selection errors on browsers that do not support it here.
-        }
-        resizeComposerTextarea(el);
-      });
-    }
   };
-
-  useLayoutEffect(() => {
-    resizeComposerTextarea(composerTextareaRef.current);
-  }, [prompt]);
 
   useEffect(() => {
     if (starterLibraryExpanded) return;
@@ -17784,50 +18162,34 @@ function ChatManager({
                 </Box>
               ) : (
                 <Stack spacing={1.5}>
-                  {messages.map((message, idx) => {
-                    const role = str(message.role, "").toLowerCase();
-                    const isUser = role === "user";
-                    const isAssistant = role === "assistant";
+                  {messageRenderBundle.map((bundle) => {
+                    const {
+                      message,
+                      idx,
+                      messageId,
+                      isUser,
+                      isAssistant,
+                      tsRaw,
+                      ts,
+                      renderedContent,
+                      messageChoices,
+                      researchReport,
+                      previousUserPrompt,
+                      traceId,
+                      hasTrace,
+                      messageTotalTokens,
+                      markdownNode,
+                    } = bundle;
                     const isPlanConfirmationMessage =
                       isAssistant &&
                       showPlanConfirmationCard &&
                       idx === planConfirmationMessageIndex;
-                    const messageId = str(message.id, String(idx));
-                    const tsRaw = str(message.timestamp, "");
-                    const ts = tsRaw ? formatChatTimestamp(tsRaw) : null;
-                    const content = str(message.content);
-                    const renderedContent = isUser
-                      ? stripAttachmentContextMarker(content)
-                      : content;
-                    const researchReport = isAssistant
-                      ? parseResearchReport(renderedContent)
-                      : null;
-                    const previousUserPrompt = !isUser
-                      ? (() => {
-                          for (let cursor = idx - 1; cursor >= 0; cursor -= 1) {
-                            const candidate = asRecord(messages[cursor]);
-                            if (
-                              str(candidate.role, "").toLowerCase() !== "user"
-                            )
-                              continue;
-                            return stripAttachmentContextMarker(
-                              str(candidate.content, ""),
-                            );
-                          }
-                          return "";
-                        })()
-                      : "";
-                    const traceId = str(message.trace_id, "").trim();
-                    const hasTrace = !isUser && !!traceId;
                     const traceLoading = hasTrace
                       ? Boolean(traceLoadingById[traceId])
                       : false;
                     const traceError = hasTrace
                       ? str(traceErrorById[traceId], "").trim()
                       : "";
-                    const messageTotalTokens = !isUser
-                      ? num(message.total_tokens, 0)
-                      : 0;
                     const rawTraceSteps = hasTrace
                       ? traceStepsById[traceId] || []
                       : [];
@@ -17968,11 +18330,15 @@ function ChatManager({
                                     traceId,
                                   })
                                 ) : (
-                                  renderChatMarkdown(renderedContent, {
-                                    snippetNamespace: messageId,
-                                    onOpenSnippet: openCodePreviewInWorkspace,
-                                  })
+                                  markdownNode
                                 )}
+                                {!isUser
+                                  ? renderClarificationChoiceGroup(
+                                      messageId,
+                                      messageChoices,
+                                      idx < messages.length - 1,
+                                    )
+                                  : null}
                               </>
                             )}
                           </Box>
@@ -18179,6 +18545,15 @@ function ChatManager({
                                 <span />
                               </div>
                             )}
+                            {visibleStreamingResponse.trim()
+                              ? renderClarificationChoiceGroup(
+                                  `streaming-clarification:${str(
+                                    pendingRunSnapshot?.runId,
+                                    visibleStreamingResponse.slice(0, 80),
+                                  )}`,
+                                  streamingResponseChoices,
+                                )
+                              : null}
                             <SwarmActivityPanel
                               runs={swarmActivityRuns}
                               expandedPayloads={expandedActivityPayloads}
@@ -18728,9 +19103,20 @@ function ChatManager({
                   </Stack>
                 </Box>
               ) : null}
-              <textarea
-                ref={composerTextareaRef}
-                className="chat-composer-textarea"
+              <ChatComposerInput
+                attachedFilesCount={attachedFiles.length}
+                composerLocked={composerLockedForPlanConfirmation}
+                deepResearchEnabled={deepResearchEnabled}
+                isStoppingStream={isStoppingStream}
+                isStreaming={isStreaming}
+                onAttachFiles={() => fileInputRef.current?.click()}
+                onStopStreaming={() => {
+                  void handleStopStreaming();
+                }}
+                onSubmit={(draft) => submitComposerMessage(draft, attachedFiles)}
+                onToggleDeepResearch={() =>
+                  setDeepResearchEnabled((prev) => !prev)
+                }
                 placeholder={
                   composerLockedForPlanConfirmation
                     ? `Preparing the ${planConfirmationDisplayLabel(planConfirmation?.source).toLowerCase()}...`
@@ -18738,168 +19124,8 @@ function ChatManager({
                       ? "Ask for changes to the plan, or press Start / Cancel."
                       : "Message (Enter to send, Shift+Enter for newline)"
                 }
-                aria-label="Message"
-                value={prompt}
-                onChange={(e) => {
-                  setPrompt(e.target.value);
-                  resizeComposerTextarea(e.target);
-                }}
-                onKeyDown={(e) => {
-                  if (
-                    e.key === "Enter" &&
-                    !e.shiftKey &&
-                    !e.nativeEvent.isComposing
-                  ) {
-                    e.preventDefault();
-                    if (
-                      isStreaming ||
-                      composerLockedForPlanConfirmation ||
-                      (!prompt.trim() && attachedFiles.length === 0)
-                    )
-                      return;
-                    void submitComposerMessage(prompt, attachedFiles);
-                  }
-                }}
-                rows={1}
-                disabled={composerLockedForPlanConfirmation}
+                prefillRequest={composerPrefillRequest}
               />
-              <div className="chat-composer-actions">
-                {false ? (
-                  <Stack
-                    direction="row"
-                    spacing={0.5}
-                    sx={{
-                      alignItems: "center",
-                      mr: 0.5,
-                    }}
-                  >
-                    {(
-                      [
-                        {
-                          value: "auto",
-                          label: "Auto",
-                          tip: "Promote tool, file, app, import, research, or repeatable work into a task.",
-                        },
-                        {
-                          value: "chat",
-                          label: "Ask",
-                          tip: "Keep this as a chat-only run.",
-                        },
-                        {
-                          value: "task",
-                          label: "Task",
-                          tip: "Always create a durable task and stream the live work.",
-                        },
-                      ] as Array<{
-                        value: ChatExecutionMode;
-                        label: string;
-                        tip: string;
-                      }>
-                    ).map((mode) => (
-                      <Tooltip key={mode.value} title={mode.tip}>
-                        <Chip
-                          size="small"
-                          clickable={!isStreaming}
-                          disabled={isStreaming}
-                          label={mode.label}
-                          variant={
-                            chatExecutionMode === mode.value
-                              ? "filled"
-                              : "outlined"
-                          }
-                          color={
-                            chatExecutionMode === mode.value
-                              ? "primary"
-                              : "default"
-                          }
-                          onClick={() => {
-                            if (!isStreaming) setChatExecutionMode(mode.value);
-                          }}
-                          sx={{ height: 24 }}
-                        />
-                      </Tooltip>
-                    ))}
-                  </Stack>
-                ) : null}
-                <Tooltip
-                  title={
-                    deepResearchEnabled
-                      ? "Deep research enabled - slower, source-backed"
-                      : "Enable Deep research"
-                  }
-                >
-                  <FormControlLabel
-                    control={
-                      <Switch
-                        size="small"
-                        checked={deepResearchEnabled}
-                        onChange={() => setDeepResearchEnabled((prev) => !prev)}
-                        disabled={
-                          isStreaming || composerLockedForPlanConfirmation
-                        }
-                        sx={{
-                          "& .MuiSwitch-switchBase.Mui-checked": {
-                            color: "#f4f5f7",
-                          },
-                          "& .MuiSwitch-switchBase.Mui-checked + .MuiSwitch-track":
-                            { backgroundColor: "rgba(255, 255, 255, 0.28)" },
-                        }}
-                      />
-                    }
-                    label="Deep research"
-                    slotProps={{
-                      typography: {
-                        sx: {
-                          fontSize: "0.66rem",
-                          fontWeight: 600,
-                          color: deepResearchEnabled
-                            ? "rgba(244,245,247,0.88)"
-                            : "text.secondary",
-                        },
-                      },
-                    }}
-                    sx={{ ml: 0, mr: 0.5 }}
-                  />
-                </Tooltip>
-                <Tooltip title="Attach files">
-                  <IconButton
-                    size="small"
-                    className="chat-composer-action-btn"
-                    onClick={() => fileInputRef.current?.click()}
-                    disabled={isStreaming || composerLockedForPlanConfirmation}
-                  >
-                    <AttachFileRoundedIcon fontSize="small" />
-                  </IconButton>
-                </Tooltip>
-                {isStreaming ? (
-                  <IconButton
-                    size="small"
-                    className="chat-composer-stop-btn"
-                    disabled={isStoppingStream}
-                    onClick={() => {
-                      void handleStopStreaming();
-                    }}
-                  >
-                    <StopRoundedIcon fontSize="small" />
-                  </IconButton>
-                ) : (
-                  <IconButton
-                    id="chat-send-btn"
-                    size="small"
-                    className="chat-composer-send-btn"
-                    disabled={
-                      composerLockedForPlanConfirmation ||
-                      (!prompt.trim() && attachedFiles.length === 0)
-                    }
-                    onClick={async () => {
-                      if (composerLockedForPlanConfirmation) return;
-                      await submitComposerMessage(prompt, attachedFiles);
-                    }}
-                  >
-                    <ArrowUpwardRoundedIcon fontSize="small" />
-                  </IconButton>
-                )}
-              </div>
             </Box>
           </Box>
         </Box>
@@ -28923,6 +29149,100 @@ function MemoryManager({
   );
 }
 
+function arkmemoryHistoryEventVisible(event: JsonRecord): boolean {
+  const type = str(event.event_type, "").trim();
+  return [
+    "memory_created",
+    "memory_updated",
+    "memory_status_changed",
+    "queue_memory_merged",
+    "ledger_event_rolled_back",
+    "queue_item_rejected",
+  ].includes(type);
+}
+
+function arkmemoryHistoryTypeLabel(event: JsonRecord): string {
+  const type = str(event.event_type, "").trim();
+  const next = asRecord(event.new_snapshot);
+  const old = asRecord(event.old_snapshot);
+  const nextStatus = str(next.status, "").trim().toLowerCase();
+  const oldStatus = str(old.status, "").trim().toLowerCase();
+  switch (type) {
+    case "memory_created":
+      return "Added";
+    case "memory_updated":
+      return "Updated";
+    case "memory_status_changed":
+      if (nextStatus === "deprecated" && oldStatus !== "deprecated") {
+        return "Archived";
+      }
+      return "Status";
+    case "queue_memory_merged":
+      return "Consolidated";
+    case "ledger_event_rolled_back":
+      return "Rollback";
+    case "queue_item_rejected":
+      return "Rejected";
+    default:
+      return "Change";
+  }
+}
+
+function arkmemoryHistoryMemoryTitle(event: JsonRecord): string {
+  const next = asRecord(event.new_snapshot);
+  const old = asRecord(event.old_snapshot);
+  return (
+    str(next.title, "").trim() ||
+    str(old.title, "").trim() ||
+    str(event.memory_id, "").trim() ||
+    str(event.related_memory_id, "").trim() ||
+    "Memory"
+  );
+}
+
+function arkmemoryHistoryTitle(event: JsonRecord): string {
+  const type = str(event.event_type, "").trim();
+  const memoryTitle = arkmemoryHistoryMemoryTitle(event);
+  const next = asRecord(event.new_snapshot);
+  const old = asRecord(event.old_snapshot);
+  const nextStatus = str(next.status, "").trim().toLowerCase();
+  const oldStatus = str(old.status, "").trim().toLowerCase();
+  switch (type) {
+    case "memory_created":
+      return `${memoryTitle} added to memory`;
+    case "memory_updated":
+      return `${memoryTitle} updated`;
+    case "memory_status_changed":
+      if (nextStatus === "deprecated" && oldStatus !== "deprecated") {
+        return `${memoryTitle} moved out of active memory`;
+      }
+      if (oldStatus && nextStatus && oldStatus !== nextStatus) {
+        return `${memoryTitle} status changed`;
+      }
+      return `${memoryTitle} changed`;
+    case "queue_memory_merged":
+      return "Memory consolidated";
+    case "ledger_event_rolled_back":
+      return `${memoryTitle} restored`;
+    case "queue_item_rejected":
+      return "Pending memory change rejected";
+    default:
+      return str(event.summary, memoryTitle);
+  }
+}
+
+function arkmemoryHistoryDetail(event: JsonRecord): string {
+  const summary = str(event.summary, "").trim();
+  if (summary) return summary;
+  return arkmemoryHistoryTitle(event);
+}
+
+function arkmemoryHistoryCanRestore(event: JsonRecord): boolean {
+  return (
+    toBool(event.reversible) && str(event.reverted_at, "").trim().length === 0
+  );
+}
+
 function ArkMemoryManager({
   autoRefresh,
   projects,
@@ -28935,27 +29255,15 @@ function ArkMemoryManager({
   onNavigateToView?: (view: string, replace?: boolean) => void;
 }) {
   const queryClient = useQueryClient();
-  const [memoryTab, setMemoryTab] = useState(0);
+  const [memoryTab, setMemoryTab] = useState<"current" | "queue" | "history">(
+    "current",
+  );
   const [notice, setNotice] = useState<string | null>(null);
-  const [sourceMemoryDraft, setSourceMemoryDraft] = useState("");
-  const [sourceMemoryId, setSourceMemoryId] = useState("");
-  const openMemoryEvidence = (memoryId: string) => {
-    const id = memoryId.trim();
-    if (!id) return;
-    setNotice(null);
-    setSourceMemoryDraft(id);
-    setSourceMemoryId(id);
-    setMemoryTab(4);
-  };
   const invalidateArkMemory = async () => {
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: ["arkmemory-summary"] }),
       queryClient.invalidateQueries({ queryKey: ["arkmemory-queue"] }),
       queryClient.invalidateQueries({ queryKey: ["arkmemory-ledger"] }),
-      queryClient.invalidateQueries({ queryKey: ["arkmemory-health"] }),
-      queryClient.invalidateQueries({ queryKey: ["arkmemory-sources"] }),
-      queryClient.invalidateQueries({ queryKey: ["arkmemory-tests"] }),
-      queryClient.invalidateQueries({ queryKey: ["arkmemory-cleanup"] }),
       queryClient.invalidateQueries({ queryKey: ["memory-stats"] }),
       queryClient.invalidateQueries({ queryKey: ["memory-facts"] }),
       queryClient.invalidateQueries({ queryKey: ["memory-preferences"] }),
@@ -28979,37 +29287,8 @@ function ArkMemoryManager({
   const ledgerQ = useQuery({
     queryKey: ["arkmemory-ledger", activeProjectId],
     queryFn: () =>
-      api.rawGet(withProjectScope("/arkmemory/ledger?limit=50", activeProjectId)),
+      api.rawGet(withProjectScope("/arkmemory/ledger?limit=80", activeProjectId)),
     refetchInterval: autoRefresh ? REFRESH_MS : false,
-  });
-  const healthQ = useQuery({
-    queryKey: ["arkmemory-health", activeProjectId],
-    queryFn: () =>
-      api.rawGet(withProjectScope("/arkmemory/health?limit=80", activeProjectId)),
-    refetchInterval: autoRefresh ? REFRESH_MS : false,
-  });
-  const testsQ = useQuery({
-    queryKey: ["arkmemory-tests", activeProjectId],
-    queryFn: () =>
-      api.rawGet(withProjectScope("/arkmemory/tests?limit=50", activeProjectId)),
-    refetchInterval: autoRefresh ? REFRESH_MS : false,
-  });
-  const cleanupQ = useQuery({
-    queryKey: ["arkmemory-cleanup", activeProjectId],
-    queryFn: () =>
-      api.rawGet(withProjectScope("/arkmemory/cleanup?limit=80", activeProjectId)),
-    refetchInterval: autoRefresh ? REFRESH_MS : false,
-  });
-  const sourcesQ = useQuery({
-    queryKey: ["arkmemory-sources", sourceMemoryId, activeProjectId],
-    queryFn: () =>
-      api.rawGet(
-        withProjectScope(
-          `/arkmemory/sources/${encodeURIComponent(sourceMemoryId)}`,
-          activeProjectId,
-        ),
-      ),
-    enabled: memoryTab === 4 && sourceMemoryId.trim().length > 0,
   });
 
   const approveQueueMutation = useMutation({
@@ -29047,36 +29326,7 @@ function ArkMemoryManager({
         ),
       ),
     onSuccess: async () => {
-      setNotice("Memory ledger event rolled back.");
-      await invalidateArkMemory();
-    },
-  });
-  const applyHealthMutation = useMutation({
-    mutationFn: (id: string) =>
-      api.rawPost(
-        withProjectScope(
-          `/arkmemory/health/${encodeURIComponent(id)}/apply`,
-          activeProjectId,
-        ),
-      ),
-    onSuccess: async () => {
-      setNotice("Memory health finding acknowledged.");
-      await invalidateArkMemory();
-    },
-  });
-  const runTestsMutation = useMutation({
-    mutationFn: () =>
-      api.rawPost(withProjectScope("/arkmemory/tests/run", activeProjectId)),
-    onSuccess: async () => {
-      setNotice("Memory checks refreshed.");
-      await invalidateArkMemory();
-    },
-  });
-  const applyCleanupMutation = useMutation({
-    mutationFn: () =>
-      api.rawPost(withProjectScope("/arkmemory/cleanup/apply", activeProjectId)),
-    onSuccess: async () => {
-      setNotice("Memory cleanup review acknowledged.");
+      setNotice("Memory restored from history.");
       await invalidateArkMemory();
     },
   });
@@ -29085,51 +29335,70 @@ function ArkMemoryManager({
   const currentMemory = asRecord(summary.current_memory);
   const queueItems = pickRecords(queueQ.data, "items");
   const ledgerEvents = pickRecords(ledgerQ.data, "events");
-  const healthFindings = pickRecords(healthQ.data, "findings");
-  const memoryChecks = pickRecords(testsQ.data, "tests");
-  const cleanupItems = pickRecords(cleanupQ.data, "items");
-  const sourcePayload = asRecord(sourcesQ.data);
-  const sourceMemory = asRecord(sourcePayload.memory);
-  const sourceEdges = pickRecords(sourcePayload, "edges");
-  const sourceEvents = pickRecords(sourcePayload, "events");
-  const sourceRefs = Array.isArray(sourcePayload.sources)
-    ? sourcePayload.sources.map((value) => String(value)).filter(Boolean)
-    : [];
+  const historyEvents = useMemo(
+    () => ledgerEvents.filter(arkmemoryHistoryEventVisible),
+    [ledgerEvents],
+  );
+  const historyRestoreByMemoryId = useMemo(() => {
+    const map = new Map<string, string>();
+    historyEvents.forEach((event) => {
+      const eventId = str(event.id, "").trim();
+      const memoryId = str(event.memory_id, "").trim();
+      const next = asRecord(event.new_snapshot);
+      const old = asRecord(event.old_snapshot);
+      const nextStatus = str(next.status, "").trim().toLowerCase();
+      const oldStatus = str(old.status, "").trim().toLowerCase();
+      if (
+        eventId &&
+        memoryId &&
+        arkmemoryHistoryCanRestore(event) &&
+        str(event.event_type, "").trim() === "memory_status_changed" &&
+        nextStatus === "deprecated" &&
+        oldStatus !== nextStatus
+      ) {
+        map.set(memoryId, eventId);
+      }
+    });
+    return map;
+  }, [historyEvents]);
+  const showQueueTab = queueItems.length > 0;
   const memoryTotal =
     num(currentMemory.facts) +
     num(currentMemory.preferences) +
     num(currentMemory.user_data) +
     num(currentMemory.knowledge);
+  useEffect(() => {
+    if (!showQueueTab && memoryTab === "queue") {
+      setMemoryTab("current");
+    }
+  }, [memoryTab, showQueueTab]);
   const busy =
     approveQueueMutation.isPending ||
     rejectQueueMutation.isPending ||
-    rollbackMutation.isPending ||
-    applyHealthMutation.isPending ||
-    runTestsMutation.isPending ||
-    applyCleanupMutation.isPending;
+    rollbackMutation.isPending;
   const firstError =
     summaryQ.error ||
     queueQ.error ||
     ledgerQ.error ||
-    healthQ.error ||
-    testsQ.error ||
-    cleanupQ.error ||
-    sourcesQ.error ||
     approveQueueMutation.error ||
     rejectQueueMutation.error ||
-    rollbackMutation.error ||
-    applyHealthMutation.error ||
-    runTestsMutation.error ||
-    applyCleanupMutation.error;
+    rollbackMutation.error;
+  const memoryTabValue =
+    memoryTab === "current" ? 0 : memoryTab === "queue" ? 1 : showQueueTab ? 2 : 1;
 
   const statItems = [
     { label: "Current Memory", value: memoryTotal, helper: "Stored items" },
-    { label: "Memory Queue", value: num(summary.queue), helper: "Review needed" },
-    { label: "Ledger", value: num(summary.ledger), helper: "Audited changes" },
-    { label: "Health", value: num(summary.health), helper: "Findings" },
-    { label: "Checks", value: num(summary.tests), helper: "Memory checks" },
+    ...(showQueueTab
+      ? [
+          {
+            label: "Pending Review",
+            value: queueItems.length,
+            helper: "Memory changes",
+          },
+        ]
+      : []),
+    { label: "History", value: historyEvents.length, helper: "Changes and rollbacks" },
   ];
-
   const emptyState = (copy: string) => (
     <Typography variant="body2" sx={{ color: "text.secondary" }}>
       {copy}
@@ -29141,7 +29410,7 @@ function ArkMemoryManager({
       <WorkspacePageHeader
         eyebrow="ArkCore"
         title="ArkMemory"
-        description="Current facts, preferences, user data, source history, pending memory changes, health findings, rollback records, and generated checks."
+        description="Current facts, preferences, user data, and knowledge."
       />
       {notice ? (
         <Alert severity="success" onClose={() => setNotice(null)}>
@@ -29163,8 +29432,18 @@ function ArkMemoryManager({
       </Box>
 
       <Tabs
-        value={memoryTab}
-        onChange={(_event, next) => setMemoryTab(next)}
+        value={memoryTabValue}
+        onChange={(_event, next) => {
+          if (next === 0) {
+            setMemoryTab("current");
+            return;
+          }
+          if (showQueueTab && next === 1) {
+            setMemoryTab("queue");
+            return;
+          }
+          setMemoryTab("history");
+        }}
         variant="scrollable"
         allowScrollButtonsMobile
         sx={{
@@ -29173,15 +29452,11 @@ function ArkMemoryManager({
         }}
       >
         <Tab label="Current Memory" />
-        <Tab label={`Memory Queue (${queueItems.length})`} />
-        <Tab label="Loom Log" />
-        <Tab label={`Health (${healthFindings.length})`} />
-        <Tab label="Evidence" />
-        <Tab label={`Checks (${memoryChecks.length})`} />
-        <Tab label={`Cleanup (${cleanupItems.length})`} />
+        {showQueueTab ? <Tab label={`Pending Review (${queueItems.length})`} /> : null}
+        <Tab label={`History (${historyEvents.length})`} />
       </Tabs>
 
-      {memoryTab === 0 ? (
+      {memoryTab === "current" ? (
         <MemoryManager
           autoRefresh={autoRefresh}
           projects={projects}
@@ -29189,499 +29464,255 @@ function ArkMemoryManager({
           showHeader={false}
           showScopeControls={false}
           onNavigateToView={onNavigateToView}
-          onViewMemoryEvidence={openMemoryEvidence}
         />
       ) : null}
 
-      {memoryTab === 1 ? (
+      {memoryTab === "queue" && showQueueTab ? (
         <Box className="list-shell">
           <Stack spacing={1.25}>
-            <Typography variant="h6">Memory Queue</Typography>
-            {queueItems.length === 0 ? (
-              emptyState("No staged memory changes need review.")
-            ) : (
-              <TableContainer className="table-shell">
-                <Table size="small">
-                  <TableHead>
-                    <TableRow>
-                      <TableCell>Candidate</TableCell>
-                      <TableCell>Type</TableCell>
-                      <TableCell>Confidence</TableCell>
-                      <TableCell>Updated</TableCell>
-                      <TableCell align="right">Review</TableCell>
-                    </TableRow>
-                  </TableHead>
-                  <TableBody>
-                    {queueItems.map((item, idx) => {
-                      const id = str(item.id, String(idx));
-                      const updated = humanTs(str(item.updated_at, "-"));
-                      return (
-                        <TableRow key={id}>
-                          <TableCell sx={{ maxWidth: 560 }}>
-                            <Stack spacing={0.35}>
-                              <Typography variant="body2" sx={{ fontWeight: 600 }}>
-                                {str(item.title, id)}
-                              </Typography>
-                              <Typography
-                                variant="caption"
-                                sx={{
-                                  color: "text.secondary",
-                                  display: "-webkit-box",
-                                  WebkitBoxOrient: "vertical",
-                                  WebkitLineClamp: 2,
-                                  overflow: "hidden",
-                                }}
-                              >
-                                {str(item.summary, "No summary recorded.")}
-                              </Typography>
-                            </Stack>
-                          </TableCell>
-                          <TableCell>{str(item.candidate_type)}</TableCell>
-                          <TableCell>{num(item.confidence, 0).toFixed(2)}</TableCell>
-                          <TableCell title={updated.tip}>{updated.label}</TableCell>
-                          <TableCell align="right">
-                            <Stack
-                              direction="row"
-                              spacing={0.75}
-                              sx={{ justifyContent: "flex-end" }}
-                            >
-                              <Button
-                                size="small"
-                                variant="contained"
-                                disabled={busy}
-                                onClick={() => approveQueueMutation.mutate(id)}
-                              >
-                                Apply
-                              </Button>
-                              <Button
-                                size="small"
-                                color="warning"
-                                disabled={busy}
-                                onClick={() => rejectQueueMutation.mutate(id)}
-                              >
-                                Reject
-                              </Button>
-                            </Stack>
-                          </TableCell>
-                        </TableRow>
-                      );
-                    })}
-                  </TableBody>
-                </Table>
-              </TableContainer>
-            )}
-          </Stack>
-        </Box>
-      ) : null}
-
-      {memoryTab === 2 ? (
-        <Box className="list-shell">
-          <Stack spacing={1.25}>
-            <Typography variant="h6">Reconciliation Log</Typography>
-            {ledgerEvents.length === 0 ? (
-              emptyState("No memory ledger events yet.")
-            ) : (
-              <TableContainer className="table-shell">
-                <Table size="small">
-                  <TableHead>
-                    <TableRow>
-                      <TableCell>Event</TableCell>
-                      <TableCell>Memory</TableCell>
-                      <TableCell>Actor</TableCell>
-                      <TableCell>Created</TableCell>
-                      <TableCell align="right">Ops</TableCell>
-                    </TableRow>
-                  </TableHead>
-                  <TableBody>
-                    {ledgerEvents.map((event, idx) => {
-                      const id = str(event.id, String(idx));
-                      const created = humanTs(str(event.created_at, "-"));
-                      const reversible = event.reversible === true;
-                      const reverted = str(event.reverted_at, "").trim().length > 0;
-                      return (
-                        <TableRow key={id}>
-                          <TableCell sx={{ maxWidth: 560 }}>
-                            <Stack spacing={0.35}>
-                              <Typography variant="body2" sx={{ fontWeight: 600 }}>
-                                {str(event.summary, str(event.event_type, id))}
-                              </Typography>
-                              <Typography
-                                variant="caption"
-                                sx={{ color: "text.secondary" }}
-                              >
-                                {str(event.event_type)}
-                              </Typography>
-                            </Stack>
-                          </TableCell>
-                          <TableCell sx={{ maxWidth: 220 }}>
-                            <Typography variant="caption" noWrap title={str(event.memory_id, "-")}>
-                              {str(event.memory_id, "-")}
+            <Typography variant="h6">Pending Review</Typography>
+            <TableContainer className="table-shell">
+              <Table size="small">
+                <TableHead>
+                  <TableRow>
+                    <TableCell>Candidate</TableCell>
+                    <TableCell>Type</TableCell>
+                    <TableCell>Confidence</TableCell>
+                    <TableCell>Updated</TableCell>
+                    <TableCell align="right">Review</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {queueItems.map((item, idx) => {
+                    const id = str(item.id, String(idx));
+                    const updated = humanTs(str(item.updated_at, "-"));
+                    return (
+                      <TableRow key={id}>
+                        <TableCell sx={{ maxWidth: 560 }}>
+                          <Stack spacing={0.35}>
+                            <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                              {str(item.title, id)}
                             </Typography>
-                          </TableCell>
-                          <TableCell>{str(event.actor, "-")}</TableCell>
-                          <TableCell title={created.tip}>{created.label}</TableCell>
-                          <TableCell align="right">
-                            <Stack
-                              direction="row"
-                              spacing={0.75}
-                              sx={{ justifyContent: "flex-end" }}
+                            <Typography
+                              variant="caption"
+                              sx={{
+                                color: "text.secondary",
+                                display: "-webkit-box",
+                                WebkitBoxOrient: "vertical",
+                                WebkitLineClamp: 2,
+                                overflow: "hidden",
+                              }}
                             >
-                              <Button
-                                size="small"
-                                variant="outlined"
-                                disabled={!str(event.memory_id, "").trim()}
-                                onClick={() => openMemoryEvidence(str(event.memory_id, ""))}
-                              >
-                                Evidence
-                              </Button>
-                              <Button
-                                size="small"
-                                variant="outlined"
-                                color="warning"
-                                disabled={busy || !reversible || reverted}
-                                onClick={() => rollbackMutation.mutate(id)}
-                              >
-                                {reverted ? "Rolled back" : "Rollback"}
-                              </Button>
-                            </Stack>
-                          </TableCell>
-                        </TableRow>
-                      );
-                    })}
-                  </TableBody>
-                </Table>
-              </TableContainer>
-            )}
-          </Stack>
-        </Box>
-      ) : null}
-
-      {memoryTab === 3 ? (
-        <Box className="list-shell">
-          <Stack spacing={1.25}>
-            <Typography variant="h6">Memory Health</Typography>
-            {healthFindings.length === 0 ? (
-              emptyState("No memory health findings for this scope.")
-            ) : (
-              <TableContainer className="table-shell">
-                <Table size="small">
-                  <TableHead>
-                    <TableRow>
-                      <TableCell>Finding</TableCell>
-                      <TableCell>Memory</TableCell>
-                      <TableCell>Severity</TableCell>
-                      <TableCell align="right">Action</TableCell>
-                    </TableRow>
-                  </TableHead>
-                  <TableBody>
-                    {healthFindings.map((finding, idx) => {
-                      const id = str(finding.id, String(idx));
-                      return (
-                        <TableRow key={id}>
-                          <TableCell sx={{ maxWidth: 620 }}>
-                            <Stack spacing={0.35}>
-                              <Typography variant="body2" sx={{ fontWeight: 600 }}>
-                                {str(finding.title, str(finding.kind, id))}
-                              </Typography>
-                              <Typography
-                                variant="caption"
-                                sx={{ color: "text.secondary" }}
-                              >
-                                {str(finding.detail, "Review this memory.")}
-                              </Typography>
-                            </Stack>
-                          </TableCell>
-                          <TableCell sx={{ maxWidth: 220 }}>
-                            <Typography variant="caption" noWrap title={str(finding.memory_id, "-")}>
-                              {str(finding.memory_id, "-")}
+                              {str(item.summary, "No summary recorded.")}
                             </Typography>
-                          </TableCell>
-                          <TableCell>
-                            <Chip size="small" variant="outlined" label={str(finding.severity)} />
-                          </TableCell>
-                          <TableCell align="right">
-                            <Stack
-                              direction="row"
-                              spacing={0.75}
-                              sx={{ justifyContent: "flex-end" }}
+                          </Stack>
+                        </TableCell>
+                        <TableCell>{str(item.candidate_type)}</TableCell>
+                        <TableCell>{num(item.confidence, 0).toFixed(2)}</TableCell>
+                        <TableCell title={updated.tip}>{updated.label}</TableCell>
+                        <TableCell align="right">
+                          <Stack
+                            direction="row"
+                            spacing={0.75}
+                            sx={{ justifyContent: "flex-end" }}
+                          >
+                            <Button
+                              size="small"
+                              variant="contained"
+                              disabled={busy}
+                              onClick={() => approveQueueMutation.mutate(id)}
                             >
-                              <Button
-                                size="small"
-                                variant="outlined"
-                                disabled={!str(finding.memory_id, "").trim()}
-                                onClick={() => openMemoryEvidence(str(finding.memory_id, ""))}
-                              >
-                                Evidence
-                              </Button>
-                              <Button
-                                size="small"
-                                variant="outlined"
-                                disabled={busy}
-                                onClick={() => applyHealthMutation.mutate(id)}
-                              >
-                                Acknowledge
-                              </Button>
-                            </Stack>
-                          </TableCell>
-                        </TableRow>
-                      );
-                    })}
-                  </TableBody>
-                </Table>
-              </TableContainer>
-            )}
+                              Apply
+                            </Button>
+                            <Button
+                              size="small"
+                              color="warning"
+                              disabled={busy}
+                              onClick={() => rejectQueueMutation.mutate(id)}
+                            >
+                              Reject
+                            </Button>
+                          </Stack>
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })}
+                </TableBody>
+              </Table>
+            </TableContainer>
           </Stack>
         </Box>
       ) : null}
 
-      {memoryTab === 4 ? (
+      {memoryTab === "history" ? (
         <Box className="list-shell">
           <Stack spacing={1.25}>
             <Stack spacing={0.35}>
-              <Typography variant="h6">Memory Evidence</Typography>
+              <Typography variant="h6">History</Typography>
               <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                Trace why a memory exists, what changed it, and which ledger
-                events can be reviewed or rolled back.
+                Changes, consolidations, and rollbacks. Open Advanced on an item
+                when you need technical detail or a restore action.
               </Typography>
             </Stack>
-            {!sourceMemoryId ? (
-              emptyState(
-                "Select Evidence from Current Memory, Loom Log, or Memory Health to inspect one memory.",
-              )
-            ) : sourcesQ.isLoading ? (
-              emptyState("Loading evidence...")
+            {historyEvents.length === 0 ? (
+              emptyState("No memory history yet.")
             ) : (
-              <Stack spacing={1.25}>
-                <Box className="metadata-box">
-                  <Stack spacing={0.75}>
-                    <Typography variant="subtitle2">
-                      {str(sourceMemory.title, sourceMemoryId)}
-                    </Typography>
-                    <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
-                      {str(sourceMemory.content, "No memory loaded.")}
-                    </Typography>
-                    <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: "wrap" }}>
-                      {sourceRefs.length ? (
-                        sourceRefs.slice(0, 20).map((source) => (
-                          <Chip key={source} size="small" variant="outlined" label={source} />
-                        ))
-                      ) : (
-                        <Chip size="small" variant="outlined" label="No structured evidence refs" />
-                      )}
-                    </Stack>
-                  </Stack>
-                </Box>
-                <Grid2 container spacing={1.25}>
-                  <Grid2 size={{ xs: 12, md: 6 }}>
-                    <Box className="metadata-box" sx={{ height: "100%" }}>
-                      <Stack spacing={0.75}>
-                        <Typography variant="subtitle2">Lineage</Typography>
-                        {sourceEdges.length === 0 ? (
-                          emptyState("No lineage edges recorded.")
-                        ) : (
-                          <Stack spacing={0.75}>
-                            {sourceEdges.slice(0, 20).map((edge, idx) => (
-                              <Box key={str(edge.id, String(idx))} className="console-line">
-                                <Typography variant="caption">
-                                  {str(edge.edge_type)}: {str(edge.source_ref)} to{" "}
-                                  {str(edge.target_ref)}
-                                </Typography>
-                              </Box>
-                            ))}
+              <Stack spacing={1}>
+                {historyEvents.map((event, idx) => {
+                  const id = str(event.id, `history-${idx}`);
+                  const created = humanTs(str(event.created_at, "-"));
+                  const type = str(event.event_type, "").trim();
+                  const relatedMemoryId = str(event.related_memory_id, "").trim();
+                  const revertedAt = str(event.reverted_at, "").trim();
+                  const directRestoreId = arkmemoryHistoryCanRestore(event) ? id : "";
+                  const linkedRestoreId =
+                    type === "queue_memory_merged" && relatedMemoryId
+                      ? (historyRestoreByMemoryId.get(relatedMemoryId) ?? "")
+                      : "";
+                  const restoreTargetId = directRestoreId || linkedRestoreId;
+                  const restoreLabel =
+                    type === "queue_memory_merged" && linkedRestoreId
+                      ? "Restore merged memory"
+                      : "Restore previous version";
+                  return (
+                    <Accordion
+                      key={id}
+                      disableGutters
+                      sx={{
+                        background: "transparent",
+                        border: "1px solid rgba(148, 163, 184, 0.16)",
+                        borderRadius: 1,
+                        overflow: "hidden",
+                        "&:before": { display: "none" },
+                      }}
+                    >
+                      <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+                        <Stack spacing={0.75} sx={{ width: "100%", minWidth: 0 }}>
+                          <Stack
+                            direction="row"
+                            spacing={0.75}
+                            useFlexGap
+                            sx={{ alignItems: "center", flexWrap: "wrap", pr: 1 }}
+                          >
+                            <Chip
+                              size="small"
+                              variant="outlined"
+                              label={arkmemoryHistoryTypeLabel(event)}
+                            />
+                            {revertedAt ? (
+                              <Chip
+                                size="small"
+                                variant="outlined"
+                                label="Restored"
+                              />
+                            ) : restoreTargetId ? (
+                              <Chip
+                                size="small"
+                                variant="outlined"
+                                label="Restorable"
+                              />
+                            ) : null}
+                            <Typography
+                              variant="caption"
+                              sx={{ color: "text.secondary" }}
+                            >
+                              {created.label}
+                            </Typography>
                           </Stack>
-                        )}
-                      </Stack>
-                    </Box>
-                  </Grid2>
-                  <Grid2 size={{ xs: 12, md: 6 }}>
-                    <Box className="metadata-box" sx={{ height: "100%" }}>
-                      <Stack spacing={0.75}>
-                        <Typography variant="subtitle2">Change History</Typography>
-                        {sourceEvents.length === 0 ? (
-                          emptyState("No ledger events recorded.")
-                        ) : (
-                          <Stack spacing={0.75}>
-                            {sourceEvents.slice(0, 20).map((event, idx) => (
-                              <Box key={str(event.id, String(idx))} className="console-line">
-                                <Typography variant="caption">
-                                  {humanTs(str(event.created_at, "-")).label}:{" "}
-                                  {str(event.summary, str(event.event_type))}
-                                </Typography>
-                              </Box>
-                            ))}
-                          </Stack>
-                        )}
-                      </Stack>
-                    </Box>
-                  </Grid2>
-                </Grid2>
-              </Stack>
-            )}
-            <Accordion disableGutters sx={{ background: "transparent" }}>
-              <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-                <Typography variant="subtitle2">Advanced lookup</Typography>
-              </AccordionSummary>
-              <AccordionDetails>
-                <Stack direction={{ xs: "column", sm: "row" }} spacing={1}>
-                  <TextField
-                    fullWidth
-                    size="small"
-                    label="Memory ID"
-                    helperText="Use this only when copying an internal memory ID from logs, API responses, or support notes."
-                    value={sourceMemoryDraft}
-                    onChange={(event) => setSourceMemoryDraft(event.target.value)}
-                  />
-                  <Button
-                    variant="contained"
-                    onClick={() => openMemoryEvidence(sourceMemoryDraft)}
-                    disabled={!sourceMemoryDraft.trim()}
-                    sx={{ whiteSpace: "nowrap", alignSelf: { sm: "flex-start" } }}
-                  >
-                    Load evidence
-                  </Button>
-                </Stack>
-              </AccordionDetails>
-            </Accordion>
-          </Stack>
-        </Box>
-      ) : null}
-
-      {memoryTab === 5 ? (
-        <Box className="list-shell">
-          <Stack spacing={1.25}>
-            <Stack
-              direction={{ xs: "column", sm: "row" }}
-              spacing={1}
-              sx={{ justifyContent: "space-between", alignItems: { xs: "stretch", sm: "center" } }}
-            >
-              <Typography variant="h6">Memory Checks</Typography>
-              <Button
-                size="small"
-                variant="contained"
-                disabled={runTestsMutation.isPending}
-                onClick={() => runTestsMutation.mutate()}
-              >
-                Refresh Checks
-              </Button>
-            </Stack>
-            {memoryChecks.length === 0 ? (
-              emptyState("No memory checks have been generated yet.")
-            ) : (
-              <TableContainer className="table-shell">
-                <Table size="small">
-                  <TableHead>
-                    <TableRow>
-                      <TableCell>Test</TableCell>
-                      <TableCell>Status</TableCell>
-                      <TableCell>Last Run</TableCell>
-                      <TableCell>Memory</TableCell>
-                    </TableRow>
-                  </TableHead>
-                  <TableBody>
-                    {memoryChecks.map((test, idx) => {
-                      const id = str(test.id, String(idx));
-                      const lastRun = humanTs(str(test.last_run_at || test.updated_at, "-"));
-                      return (
-                        <TableRow key={id}>
-                          <TableCell sx={{ maxWidth: 640 }}>
-                            <Stack spacing={0.35}>
-                              <Typography variant="body2" sx={{ fontWeight: 600 }}>
-                                {str(test.prompt, id)}
+                          <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                            {arkmemoryHistoryTitle(event)}
+                          </Typography>
+                          <Typography
+                            variant="caption"
+                            sx={{
+                              color: "text.secondary",
+                              display: "-webkit-box",
+                              WebkitBoxOrient: "vertical",
+                              WebkitLineClamp: 2,
+                              overflow: "hidden",
+                            }}
+                          >
+                            {arkmemoryHistoryDetail(event)}
+                          </Typography>
+                        </Stack>
+                      </AccordionSummary>
+                      <AccordionDetails>
+                        <Stack spacing={1}>
+                          <Box className="metadata-box">
+                            <Stack spacing={0.6}>
+                              <Typography
+                                variant="caption"
+                                sx={{ color: "text.secondary" }}
+                              >
+                                Event: {type || "-"}
                               </Typography>
                               <Typography
                                 variant="caption"
-                                sx={{
-                                  color: "text.secondary",
-                                  display: "-webkit-box",
-                                  WebkitBoxOrient: "vertical",
-                                  WebkitLineClamp: 2,
-                                  overflow: "hidden",
-                                }}
+                                sx={{ color: "text.secondary" }}
                               >
-                                {str(test.expected_answer, "-")}
+                                Memory: {str(event.memory_id, "-")}
+                              </Typography>
+                              {relatedMemoryId ? (
+                                <Typography
+                                  variant="caption"
+                                  sx={{ color: "text.secondary" }}
+                                >
+                                  Related memory: {relatedMemoryId}
+                                </Typography>
+                              ) : null}
+                              <Typography
+                                variant="caption"
+                                sx={{ color: "text.secondary" }}
+                              >
+                                Actor: {str(event.actor, "-")}
+                              </Typography>
+                              <Typography
+                                variant="caption"
+                                sx={{ color: "text.secondary" }}
+                              >
+                                Recorded: {created.tip}
                               </Typography>
                             </Stack>
-                          </TableCell>
-                          <TableCell>
-                            <Chip size="small" variant="outlined" label={str(test.status)} />
-                          </TableCell>
-                          <TableCell title={lastRun.tip}>{lastRun.label}</TableCell>
-                          <TableCell sx={{ maxWidth: 220 }}>
-                            <Typography variant="caption" noWrap title={str(test.memory_id, "-")}>
-                              {str(test.memory_id, "-")}
+                          </Box>
+                          <Stack
+                            direction={{ xs: "column", sm: "row" }}
+                            spacing={1}
+                            sx={{
+                              justifyContent: "space-between",
+                              alignItems: { xs: "stretch", sm: "center" },
+                            }}
+                          >
+                            <Typography
+                              variant="caption"
+                              sx={{ color: "text.secondary" }}
+                            >
+                              {restoreTargetId
+                                ? type === "queue_memory_merged" &&
+                                  linkedRestoreId
+                                  ? "Restores the archived source memory behind this consolidation."
+                                  : "Restores the previous memory snapshot recorded for this change."
+                                : "No restore action is available for this history item."}
                             </Typography>
-                          </TableCell>
-                        </TableRow>
-                      );
-                    })}
-                  </TableBody>
-                </Table>
-              </TableContainer>
-            )}
-          </Stack>
-        </Box>
-      ) : null}
-
-      {memoryTab === 6 ? (
-        <Box className="list-shell">
-          <Stack spacing={1.25}>
-            <Stack
-              direction={{ xs: "column", sm: "row" }}
-              spacing={1}
-              sx={{ justifyContent: "space-between", alignItems: { xs: "stretch", sm: "center" } }}
-            >
-              <Typography variant="h6">Cleanup</Typography>
-              <Button
-                size="small"
-                variant="outlined"
-                disabled={applyCleanupMutation.isPending}
-                onClick={() => applyCleanupMutation.mutate()}
-              >
-                Acknowledge Review
-              </Button>
-            </Stack>
-            {cleanupItems.length === 0 ? (
-              emptyState("No memory cleanup items are pending.")
-            ) : (
-              <TableContainer className="table-shell">
-                <Table size="small">
-                  <TableHead>
-                    <TableRow>
-                      <TableCell>Item</TableCell>
-                      <TableCell>Kind</TableCell>
-                      <TableCell>Created</TableCell>
-                      <TableCell>Memory</TableCell>
-                    </TableRow>
-                  </TableHead>
-                  <TableBody>
-                    {cleanupItems.map((item, idx) => {
-                      const id = str(item.id, String(idx));
-                      const created = humanTs(str(item.created_at, "-"));
-                      return (
-                        <TableRow key={id}>
-                          <TableCell sx={{ maxWidth: 620 }}>
-                            <Stack spacing={0.35}>
-                              <Typography variant="body2" sx={{ fontWeight: 600 }}>
-                                {str(item.title, id)}
-                              </Typography>
-                              <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                                {str(item.detail, "-")}
-                              </Typography>
-                            </Stack>
-                          </TableCell>
-                          <TableCell>{str(item.kind)}</TableCell>
-                          <TableCell title={created.tip}>{created.label}</TableCell>
-                          <TableCell sx={{ maxWidth: 220 }}>
-                            <Typography variant="caption" noWrap title={str(item.memory_id, "-")}>
-                              {str(item.memory_id, "-")}
-                            </Typography>
-                          </TableCell>
-                        </TableRow>
-                      );
-                    })}
-                  </TableBody>
-                </Table>
-              </TableContainer>
+                            <Button
+                              size="small"
+                              variant="outlined"
+                              color="warning"
+                              disabled={busy || !restoreTargetId}
+                              onClick={() =>
+                                restoreTargetId
+                                  ? rollbackMutation.mutate(restoreTargetId)
+                                  : undefined
+                              }
+                            >
+                              {restoreLabel}
+                            </Button>
+                          </Stack>
+                        </Stack>
+                      </AccordionDetails>
+                    </Accordion>
+                  );
+                })}
+              </Stack>
             )}
           </Stack>
         </Box>
@@ -34647,10 +34678,10 @@ function WatchersManager({ autoRefresh }: { autoRefresh: boolean }) {
 type EvolutionPageTab = "what" | "helped" | "tests" | "review";
 
 const EVOLUTION_PAGE_TABS: Array<{ value: EvolutionPageTab; label: string }> = [
-  { value: "what", label: "What changed" },
-  { value: "helped", label: "What helped" },
-  { value: "tests", label: "Tests running" },
-  { value: "review", label: "Review" },
+  { value: "what", label: "Recent changes" },
+  { value: "helped", label: "What improved" },
+  { value: "tests", label: "Experiments" },
+  { value: "review", label: "Needs approval" },
 ];
 
 function clampPercent(value: unknown): number {
@@ -35037,6 +35068,486 @@ function skillEvolutionMetricRows(
   ];
 }
 
+function evolutionSurfaceAudienceLabel(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "routing policy") return "Reply routing";
+  if (normalized === "main prompt bundle") return "Main replies";
+  if (normalized === "request classifier") return "Request understanding";
+  if (normalized === "specialist prompts") return "Specialist helpers";
+  return value || "Experiment";
+}
+
+function evolutionSurfaceSummary(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "routing policy")
+    return "Tests how often the assistant should answer directly versus handing work off.";
+  if (normalized === "main prompt bundle")
+    return "Tests a different set of reply instructions for the main assistant response.";
+  if (normalized === "request classifier")
+    return "Tests a different way to classify incoming requests before choosing a path.";
+  if (normalized === "specialist prompts")
+    return "Tests different instructions for helper specialists used during delegated work.";
+  return "Tests a candidate behavior against the current stable setup.";
+}
+
+function evolutionSurfaceBenefit(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "routing policy")
+    return "Can reduce unnecessary handoffs and keep simple requests faster.";
+  if (normalized === "main prompt bundle")
+    return "Can make replies clearer, more reliable, or less repetitive.";
+  if (normalized === "request classifier")
+    return "Can improve how quickly the assistant recognizes the right handling path.";
+  if (normalized === "specialist prompts")
+    return "Can make delegated specialist work more accurate and consistent.";
+  return "Can improve how future requests are handled if the candidate keeps performing well.";
+}
+
+function evolutionSurfaceStableSummary(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "routing policy")
+    return "Reply routing is using the current stable logic.";
+  if (normalized === "main prompt bundle")
+    return "Main replies are using the current stable prompt bundle.";
+  if (normalized === "request classifier")
+    return "Request understanding is using the current stable classifier.";
+  if (normalized === "specialist prompts")
+    return "Specialist helpers are using the current stable prompt bundle.";
+  return "This area is currently on the stable baseline.";
+}
+
+function evolutionExperimentStatusText(item: {
+  gate: string;
+  last: string;
+  enabled: boolean;
+}): string {
+  const gate = str(item.gate, "").trim();
+  const last = str(item.last, "").trim();
+  if (!item.enabled) return "No active experiment is running here.";
+  if (gate && gate !== "-") return `Current gate signal: ${gate}.`;
+  if (last && !/^no .* runs yet$/i.test(last)) return last;
+  return "This experiment is running against the current stable behavior.";
+}
+
+function promptProposalScopeLabel(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "prompt_profile") return "Main replies";
+  if (normalized === "classifier_prompt_profile") return "Request understanding";
+  if (normalized === "specialist_prompt_profile") return "Specialist helpers";
+  return humanizeStatusLabel(value || "prompt profile");
+}
+
+function promptCanaryActionSummary(row: JsonRecord): string {
+  const baselineSuccessRate = num(row.baseline_success_rate, 0) * 100;
+  const candidateSuccessRate = num(row.candidate_success_rate, 0) * 100;
+  const baselineSamples = num(row.baseline_samples, 0);
+  const candidateSamples = num(row.candidate_samples, 0);
+  return `Stable behavior is at ${baselineSuccessRate.toFixed(1)}% over ${baselineSamples.toLocaleString()} recent runs. The experiment is at ${candidateSuccessRate.toFixed(1)}% over ${candidateSamples.toLocaleString()} runs.`;
+}
+
+type EvolutionReviewEvidence = {
+  metrics: Array<{ label: string; value: string }>;
+  current: string[];
+  proposed: string[];
+  impact: string[];
+};
+
+function formatSignedPoints(value: number): string {
+  if (!Number.isFinite(value)) return "-";
+  return `${value >= 0 ? "+" : ""}${value.toFixed(1)} pts`;
+}
+
+function cleanEvidenceLines(lines: unknown[], limit = 3): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of lines) {
+    const line = str(raw, "").trim();
+    if (!line || seen.has(line)) continue;
+    seen.add(line);
+    out.push(line);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+function EvolutionReviewEvidenceStrip({
+  evidence,
+}: {
+  evidence: EvolutionReviewEvidence;
+}): JSX.Element | null {
+  const metrics = evidence.metrics
+    .filter((item) => str(item.label, "").trim() && str(item.value, "").trim())
+    .slice(0, 4);
+  const sections = [
+    { label: "Current", lines: cleanEvidenceLines(evidence.current, 3) },
+    { label: "Proposed", lines: cleanEvidenceLines(evidence.proposed, 3) },
+    { label: "Expected effect", lines: cleanEvidenceLines(evidence.impact, 3) },
+  ].filter((section) => section.lines.length > 0);
+  if (metrics.length === 0 && sections.length === 0) return null;
+  return (
+    <Box
+      sx={{
+        mt: 1,
+        pt: 1,
+        borderTop: "1px solid rgba(145,170,205,0.12)",
+      }}
+    >
+      {metrics.length > 0 ? (
+        <Box
+          sx={{
+            display: "grid",
+            gridTemplateColumns: {
+              xs: "1fr 1fr",
+              md: "repeat(4, minmax(0,1fr))",
+            },
+            gap: 1,
+            mb: sections.length > 0 ? 1 : 0,
+          }}
+        >
+          {metrics.map((item) => (
+            <Box key={`${item.label}-${item.value}`} sx={{ minWidth: 0 }}>
+              <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                {item.label}
+              </Typography>
+              <Typography variant="body2">{item.value}</Typography>
+            </Box>
+          ))}
+        </Box>
+      ) : null}
+      {sections.length > 0 ? (
+        <Box
+          sx={{
+            display: "grid",
+            gridTemplateColumns: {
+              xs: "1fr",
+              md: "repeat(auto-fit, minmax(0,1fr))",
+            },
+            gap: 1,
+          }}
+        >
+          {sections.map((section) => (
+            <Box key={section.label} sx={{ minWidth: 0 }}>
+              <Typography
+                variant="caption"
+                sx={{ color: "text.secondary", display: "block", mb: 0.35 }}
+              >
+                {section.label}
+              </Typography>
+              <Stack spacing={0.35}>
+                {section.lines.map((line, idx) => (
+                  <Typography
+                    key={`${section.label}-${idx}`}
+                    variant="caption"
+                    sx={{ color: "#d8edff", display: "block" }}
+                  >
+                    - {line}
+                  </Typography>
+                ))}
+              </Stack>
+            </Box>
+          ))}
+        </Box>
+      ) : null}
+    </Box>
+  );
+}
+
+function promptCanaryReviewEvidence(row: JsonRecord): EvolutionReviewEvidence {
+  const baselineSuccessRate = num(row.baseline_success_rate, 0) * 100;
+  const candidateSuccessRate = num(row.candidate_success_rate, 0) * 100;
+  const baselineSamples = num(row.baseline_samples, 0);
+  const candidateSamples = num(row.candidate_samples, 0);
+  const successDelta = candidateSuccessRate - baselineSuccessRate;
+  return {
+    metrics: [
+      { label: "Stable", value: `${baselineSuccessRate.toFixed(1)}%` },
+      { label: "Experiment", value: `${candidateSuccessRate.toFixed(1)}%` },
+      { label: "Gap", value: formatSignedPoints(successDelta) },
+      {
+        label: "Samples",
+        value: `${baselineSamples.toLocaleString()} / ${candidateSamples.toLocaleString()}`,
+      },
+    ],
+    current: [
+      `Stable version ${str(row.baseline_version, "-")} is carrying ${baselineSamples.toLocaleString()} recent runs.`,
+    ],
+    proposed: [
+      `Experiment version ${str(row.candidate_version, "-")} is still active on ${candidateSamples.toLocaleString()} runs.`,
+    ],
+    impact: [
+      successDelta < 0
+        ? `The experiment is currently down ${Math.abs(successDelta).toFixed(1)} points versus stable.`
+        : `The experiment is currently up ${successDelta.toFixed(1)} points versus stable.`,
+      `Wins versus losses: ${num(row.wins, 0).toLocaleString()} / ${num(row.losses, 0).toLocaleString()}.`,
+      num(row.regression_p_value, Number.NaN) >= 0
+        ? `Regression check p-value: ${num(row.regression_p_value, 0).toFixed(4)}.`
+        : "",
+    ],
+  };
+}
+
+function promptOptimizationReviewEvidence(
+  row: JsonRecord,
+): EvolutionReviewEvidence {
+  const preview = asRecord(row.change_preview);
+  const current = stringList(preview.before);
+  const proposed = stringList(preview.after);
+  const impact = stringList(preview.impact_estimate);
+  const targetArea = promptProposalScopeLabel(str(row.target_scope, "prompt_profile"));
+  const riskLevel = str(row.risk_level, "default");
+  const reviewStatus = str(row.review_status, "open");
+  return {
+    metrics: [
+      { label: "Area", value: targetArea },
+      { label: "Risk", value: `${riskLevel || "unknown"} risk` },
+      {
+        label: "Decision",
+        value:
+          reviewStatus === "open"
+            ? "Needs decision"
+            : humanizeStatusLabel(reviewStatus),
+      },
+    ],
+    current:
+      current.length > 0
+        ? current
+        : stringList(row.evidence).slice(0, 2),
+    proposed:
+      proposed.length > 0
+        ? proposed
+        : stringList(row.expected_benefit).slice(0, 2),
+    impact:
+      impact.length > 0
+        ? impact
+        : [
+            ...stringList(row.expected_benefit).slice(0, 2),
+            ...stringList(row.caveats).slice(0, 1),
+          ],
+  };
+}
+
+function skillReviewEvidence(row: JsonRecord): EvolutionReviewEvidence {
+  const diffPreview = asRecord(row.diff_preview);
+  const baseline = asRecord(row.impact_baseline);
+  const evidence = asRecord(row.evidence);
+  const added = stringList(diffPreview.added);
+  const removed = stringList(diffPreview.removed);
+  const failureReasons = stringList(evidence.recent_failure_reasons);
+  const selectedExamples = stringList(evidence.selected_failure_examples);
+  return {
+    metrics: [
+      {
+        label: "Confidence",
+        value: `${ratioPercent(row.confidence).toFixed(0)}%`,
+      },
+      {
+        label: "Matched runs",
+        value: num(baseline.matched_runs, 0).toLocaleString(),
+      },
+      {
+        label: "Baseline success",
+        value: percentageLabel(baseline.success_rate, 1) || "-",
+      },
+      {
+        label: "Baseline failure",
+        value: percentageLabel(baseline.failure_rate, 1) || "-",
+      },
+    ],
+    current:
+      removed.length > 0
+        ? removed.slice(0, 2).map((line) => `Replace: ${line}`)
+        : failureReasons.slice(0, 2).map((line) => `Current failure: ${line}`),
+    proposed:
+      added.length > 0
+        ? added.slice(0, 2)
+        : cleanEvidenceLines([
+            str(row.diff_summary, ""),
+            str(row.summary, ""),
+          ]),
+    impact: cleanEvidenceLines([
+      `Targets ${num(baseline.matched_runs, 0).toLocaleString()} matched runs with ${percentageLabel(baseline.failure_rate, 1) || "-"} failure and ${percentageLabel(baseline.tool_error_rate, 1) || "-"} tool errors.`,
+      ...failureReasons.slice(0, 1).map((line) => `Focus area: ${line}`),
+      ...selectedExamples.slice(0, 1).map((line) => `Recent mismatch: ${line}`),
+    ]),
+  };
+}
+
+function learningCandidateReviewEvidence(
+  row: JsonRecord,
+  context: {
+    strategyBaselineVersion: string;
+    patternById: Map<string, JsonRecord>;
+    itemById: Map<string, JsonRecord>;
+  },
+): EvolutionReviewEvidence {
+  const type = str(row.candidate_type, "");
+  const preview = asRecord(row.proposed_content_preview);
+  const confidence = `${ratioPercent(row.confidence).toFixed(0)}%`;
+  if (type === "strategy") {
+    const pattern = context.patternById.get(str(row.pattern_id, ""));
+    const defaultGuidance = stringList(preview.default_guidance);
+    const taskGuidance = stringList(preview.task_guidance);
+    const toolSequence = stringList(asRecord(pattern).tool_sequence);
+    return {
+      metrics: [
+        { label: "Confidence", value: confidence },
+        {
+          label: "Pattern runs",
+          value: num(asRecord(pattern).sample_count, 0).toLocaleString(),
+        },
+        {
+          label: "Pattern success",
+          value: percentageLabel(asRecord(pattern).success_rate, 1) || "-",
+        },
+        {
+          label: "Candidate",
+          value: str(preview.strategy_version, "-"),
+        },
+      ],
+      current: cleanEvidenceLines([
+        context.strategyBaselineVersion
+          ? `Matching requests still use stable strategy ${context.strategyBaselineVersion}.`
+          : "Matching requests still use the current stable strategy.",
+        pattern
+          ? `Observed pattern ${str(pattern.title, "pattern")} succeeded on ${num(asRecord(pattern).sample_count, 0).toLocaleString()} runs.`
+          : "",
+      ]),
+      proposed: cleanEvidenceLines([
+        preview.strategy_version
+          ? `Approve strategy version ${str(preview.strategy_version, "-")}.`
+          : "",
+        ...defaultGuidance.slice(0, 1),
+        ...taskGuidance.slice(0, 2),
+      ]),
+      impact: cleanEvidenceLines([
+        toolSequence.length > 0
+          ? `Would steer matching work toward ${toolSequence.join(" -> ")}.`
+          : "",
+        `Confidence ${confidence} from repeated pattern evidence.`,
+      ]),
+    };
+  }
+  if (
+    type === "memory_add" ||
+    type === "memory_update" ||
+    type === "memory_retract"
+  ) {
+    const operationType = str(preview.operation_type, type);
+    const semanticKey = str(preview.semantic_key, str(row.subject_key, "memory"));
+    const valuePreview = str(preview.value_preview, "");
+    const scope = humanizeStatusLabel(str(preview.scope, "global"));
+    const durability = humanizeStatusLabel(str(preview.durability, ""));
+    const sensitive = toBool(preview.looks_sensitive);
+    const sensitiveReason = str(preview.sensitive_reason, "");
+    return {
+      metrics: [
+        { label: "Confidence", value: confidence },
+        { label: "Kind", value: humanizeStatusLabel(str(preview.memory_kind, "memory")) },
+        { label: "Scope", value: scope },
+        {
+          label: "Duration",
+          value: durability || "-",
+        },
+      ],
+      current: [
+        operationType === "memory_add"
+          ? `Future turns do not yet store ${semanticKey} as reusable memory.`
+          : operationType === "memory_update"
+            ? `Future turns still use the current saved value for ${semanticKey}.`
+            : `Future turns still treat ${semanticKey} as active memory.`,
+      ],
+      proposed: cleanEvidenceLines([
+        operationType === "memory_retract"
+          ? `Retract saved memory ${semanticKey}.`
+          : valuePreview
+            ? `${humanizeStatusLabel(operationType)} ${semanticKey}: ${valuePreview}`
+            : `${humanizeStatusLabel(operationType)} ${semanticKey}.`,
+        `Apply at ${scope}${durability ? ` with ${durability} duration` : ""}.`,
+      ]),
+      impact: cleanEvidenceLines([
+        operationType === "memory_add"
+          ? "Future replies can use this fact automatically."
+          : operationType === "memory_update"
+            ? "Future replies will rely on the updated value instead of the older one."
+            : "Future replies will stop leaning on the retracted memory.",
+        sensitive
+          ? `Value stays masked because it looks sensitive${sensitiveReason ? `: ${sensitiveReason}` : "."}`
+          : `Confidence ${confidence}.`,
+      ]),
+    };
+  }
+  if (type === "memory_deprecate") {
+    const item = context.itemById.get(str(preview.item_id, ""));
+    const nextStatus = humanizeStatusLabel(str(preview.next_status, "deprecated"));
+    return {
+      metrics: [
+        { label: "Confidence", value: confidence },
+        {
+          label: "Support",
+          value: num(asRecord(item).support_count, 0).toLocaleString(),
+        },
+        {
+          label: "Contradictions",
+          value: num(asRecord(item).contradiction_count, 0).toLocaleString(),
+        },
+      ],
+      current: cleanEvidenceLines([
+        item
+          ? `${str(item.title, "This learned item")} is still active.`
+          : "This learned item is still active.",
+        item
+          ? `Support versus contradictions: ${num(asRecord(item).support_count, 0).toLocaleString()} / ${num(asRecord(item).contradiction_count, 0).toLocaleString()}.`
+          : "",
+      ]),
+      proposed: [
+        `Set this learned item to ${nextStatus}.`,
+      ],
+      impact: [
+        "Stops stale guidance from influencing future turns.",
+      ],
+    };
+  }
+  if (type === "memory_merge") {
+    const target = context.itemById.get(str(preview.target_item_id, ""));
+    const source = context.itemById.get(str(preview.source_item_id, ""));
+    return {
+      metrics: [
+        { label: "Confidence", value: confidence },
+        { label: "Target", value: str(asRecord(target).title, "Kept item") },
+        { label: "Duplicate", value: str(asRecord(source).title, "Merged item") },
+      ],
+      current: cleanEvidenceLines([
+        target && source
+          ? `${str(asRecord(target).title, "Target item")} and ${str(asRecord(source).title, "source item")} are both still active.`
+          : "Two overlapping memories are still active separately.",
+      ]),
+      proposed: cleanEvidenceLines([
+        target
+          ? `Keep ${str(asRecord(target).title, "the stronger memory")} as the surviving record.`
+          : "Keep the stronger memory as the surviving record.",
+        source
+          ? `Deprecate duplicate memory ${str(asRecord(source).title, "the duplicate")}.`
+          : "Deprecate the duplicate memory.",
+      ]),
+      impact: cleanEvidenceLines([
+        "Reduces duplicate recall and conflicting memory retrieval.",
+        str(preview.reason, "") === "duplicate_content"
+          ? "The merge is based on overlapping content, not surface wording."
+          : "",
+      ]),
+    };
+  }
+  return {
+    metrics: [{ label: "Confidence", value: confidence }],
+    current: cleanEvidenceLines([str(row.summary, ""), str(row.preview, "")]),
+    proposed: cleanEvidenceLines([str(row.preview, ""), str(row.title, "")]),
+    impact: cleanEvidenceLines([
+      `Confidence ${confidence}.`,
+      "ArkEvolve will measure impact after approval if this change goes live.",
+    ]),
+  };
+}
+
 function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
   const queryClient = useQueryClient();
   const [tab, setTab] = useState<EvolutionPageTab>("what");
@@ -35109,6 +35620,7 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
   const evolution = asRecord(evolutionQ.data);
   const evolutionDev = asRecord(evolutionDevQ.data);
   const canary = asRecord(evolution.canary);
+  const strategyCanary = asRecord(evolution.strategy_canary);
   const promptCanary = asRecord(evolution.prompt_canary);
   const classifierCanary = asRecord(evolution.classifier_prompt_canary);
   const specialistCanary = asRecord(evolution.specialist_prompt_canary);
@@ -35116,13 +35628,6 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
   const promptInsights = asRecord(evolutionDev.prompt_insights);
   const classifierInsights = asRecord(evolutionDev.classifier_prompt_insights);
   const specialistInsights = asRecord(evolutionDev.specialist_prompt_insights);
-  const promptLastResult = asRecord(evolutionDev.prompt_last_result);
-  const classifierLastResult = asRecord(
-    evolutionDev.classifier_prompt_last_result,
-  );
-  const specialistLastResult = asRecord(
-    evolutionDev.specialist_prompt_last_result,
-  );
   const strategyMetrics = pickRecords(evolutionDev, "strategy_metrics");
   const promptMetrics = pickRecords(evolutionDev, "prompt_metrics");
   const classifierMetrics = pickRecords(
@@ -35149,6 +35654,7 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
     "top_sections",
   );
   const learningCandidates = pickRecords(evolutionDev, "learning_candidates");
+  const learningPatterns = pickRecords(evolutionDev, "learning_patterns");
   const learningItems = pickRecords(evolutionDev, "learning_items");
   const skillEvolutions = pickRecords(evolutionDev, "skill_evolutions");
   const recentExperienceRuns = pickRecords(
@@ -35208,7 +35714,12 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
 
   const tests = [
     {
+      key: "routing",
       name: "Routing policy",
+      audienceLabel: evolutionSurfaceAudienceLabel("Routing policy"),
+      summary: evolutionSurfaceSummary("Routing policy"),
+      benefit: evolutionSurfaceBenefit("Routing policy"),
+      stableSummary: evolutionSurfaceStableSummary("Routing policy"),
       enabled: toBool(canary.enabled),
       rollout: clampPercent(canary.rollout_percent),
       baseline: str(canary.baseline_version, "routing-policy-default-v1"),
@@ -35220,7 +35731,12 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
       ),
     },
     {
+      key: "prompt",
       name: "Main prompt bundle",
+      audienceLabel: evolutionSurfaceAudienceLabel("Main prompt bundle"),
+      summary: evolutionSurfaceSummary("Main prompt bundle"),
+      benefit: evolutionSurfaceBenefit("Main prompt bundle"),
+      stableSummary: evolutionSurfaceStableSummary("Main prompt bundle"),
       enabled: toBool(promptCanary.enabled),
       rollout: clampPercent(promptCanary.rollout_percent),
       baseline: str(promptCanary.baseline_version, "-"),
@@ -35232,7 +35748,12 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
       ),
     },
     {
+      key: "classifier",
       name: "Request classifier",
+      audienceLabel: evolutionSurfaceAudienceLabel("Request classifier"),
+      summary: evolutionSurfaceSummary("Request classifier"),
+      benefit: evolutionSurfaceBenefit("Request classifier"),
+      stableSummary: evolutionSurfaceStableSummary("Request classifier"),
       enabled: toBool(classifierCanary.enabled),
       rollout: clampPercent(classifierCanary.rollout_percent),
       baseline: str(classifierCanary.baseline_version, "-"),
@@ -35244,7 +35765,12 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
       ),
     },
     {
+      key: "specialist",
       name: "Specialist prompts",
+      audienceLabel: evolutionSurfaceAudienceLabel("Specialist prompts"),
+      summary: evolutionSurfaceSummary("Specialist prompts"),
+      benefit: evolutionSurfaceBenefit("Specialist prompts"),
+      stableSummary: evolutionSurfaceStableSummary("Specialist prompts"),
       enabled: toBool(specialistCanary.enabled),
       rollout: clampPercent(specialistCanary.rollout_percent),
       baseline: str(specialistCanary.baseline_version, "-"),
@@ -35256,7 +35782,9 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
       ),
     },
   ];
-  const activeTests = tests.filter((item) => item.enabled).length;
+  const activeExperimentItems = tests.filter((item) => item.enabled);
+  const stableExperimentItems = tests.filter((item) => !item.enabled);
+  const activeTests = activeExperimentItems.length;
   const maxRollout = tests.reduce(
     (acc, item) => Math.max(acc, item.rollout),
     0,
@@ -35286,11 +35814,61 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
       .map((row): JsonRecord => ({ ...row, surface: "Specialist" })),
   ];
   const metricChartRows = metricRows.slice(0, 10);
-  const classifierFocusCases = pickRecords(classifierLastResult, "focus_cases");
   const evidenceCards = useMemo(
     () => buildEvolutionEvidenceCards(recentExperienceRuns),
     [recentExperienceRuns],
   );
+  const learningPatternById = useMemo(() => {
+    const next = new Map<string, JsonRecord>();
+    for (const row of learningPatterns) {
+      const id = str(row.id, "");
+      if (!id) continue;
+      next.set(id, row);
+    }
+    return next;
+  }, [learningPatterns]);
+  const learningItemById = useMemo(() => {
+    const next = new Map<string, JsonRecord>();
+    for (const row of learningItems) {
+      const id = str(row.id, "");
+      if (!id) continue;
+      next.set(id, row);
+    }
+    return next;
+  }, [learningItems]);
+  const openPromptCanarySafetyEvents = promptCanarySafetyEvents.filter((row) => {
+    const reviewStatus = str(row.review_status, str(row.status, "open"))
+      .trim()
+      .toLowerCase();
+    return reviewStatus === "open" || reviewStatus === "review_recommended";
+  });
+  const openPromptOptimizationOpportunities = promptOptimizationOpportunities.filter(
+    (row) => {
+      const reviewStatus = str(row.review_status, "open").trim().toLowerCase();
+      return reviewStatus !== "approved" && reviewStatus !== "rejected";
+    },
+  );
+  const visiblePromptCanarySafetyEvents = showSuperseded
+    ? promptCanarySafetyEvents
+    : openPromptCanarySafetyEvents;
+  const visiblePromptOptimizationOpportunities = showSuperseded
+    ? promptOptimizationOpportunities
+    : openPromptOptimizationOpportunities;
+  const openNonSkillLearningCandidates = nonSkillLearningCandidates.filter((row) => {
+    const status = str(row.approval_status, "draft").trim().toLowerCase();
+    return !status || status === "draft" || status === "open";
+  });
+  const visibleNonSkillLearningCandidates = showSuperseded
+    ? nonSkillLearningCandidates
+    : openNonSkillLearningCandidates;
+  const needsApprovalCount =
+    skillReviewItems.length +
+    openNonSkillLearningCandidates.length +
+    openPromptCanarySafetyEvents.length +
+    openPromptOptimizationOpportunities.length;
+  const promotedChangeCount =
+    lineageRows.filter((row) => toBool(row.promoted)).length +
+    skillHelpedItems.length;
   const metricChartOption = {
     backgroundColor: "transparent",
     animationDuration: 350,
@@ -35403,7 +35981,7 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
       <WorkspacePageHeader
         eyebrow="Agent"
         title="ArkEvolve"
-        description="Learned changes, measured improvements, active tests, rollout status, and review items before anything becomes permanent."
+        description="ArkEvolve learns from repeated runs, tests low-risk improvements, and asks before lasting changes become permanent."
         actions={
           <Stack
             direction="row"
@@ -35431,7 +36009,9 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
               size="small"
               color={activeTests > 0 ? "warning" : "default"}
               label={
-                statusLoading ? "Tests loading" : `${activeTests} active tests`
+                statusLoading
+                  ? "Experiments loading"
+                  : `${activeTests} active experiment${activeTests === 1 ? "" : "s"}`
               }
             />
           </Stack>
@@ -35442,38 +36022,46 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
       <EvolutionStatStrip
         items={[
           {
-            label: "Self-evolve",
+            label: "Improvement mode",
             value: toBool(evolution.self_evolve_enabled) ? "On" : "Off",
-            helper: "Background learning and reviewed improvements",
+            helper: "Learns in the background and asks before lasting changes",
             tone: toBool(evolution.self_evolve_enabled) ? "good" : "default",
           },
           {
-            label: "Tests",
+            label: "Experiments",
             value: activeTests,
-            helper: `${maxRollout.toFixed(0)}% max rollout`,
+            helper:
+              activeTests > 0
+                ? `${maxRollout.toFixed(0)}% of recent traffic in test`
+                : "No active rollout",
             tone: activeTests > 0 ? "warn" : "info",
           },
           {
-            label: "Review queue",
-            value: num(learningQueue.draft_candidates, 0),
-            helper: `${num(learningQueue.pending_consolidation, 0)} waiting consolidation`,
-            tone:
-              num(learningQueue.draft_candidates, 0) > 0 ? "warn" : "default",
+            label: "Needs approval",
+            value: needsApprovalCount,
+            helper:
+              needsApprovalCount > 0
+                ? "Meaningful changes are waiting on you"
+                : "Nothing is waiting on you",
+            tone: needsApprovalCount > 0 ? "warn" : "default",
           },
           {
-            label: "Patterns learned",
+            label: "Reusable lessons",
             value: num(learningQueue.active_patterns, 0),
-            helper: `${reflectedHeuristics.length} reflected heuristics saved`,
+            helper: `${reflectedHeuristics.length} saved for future requests`,
             tone: "info",
           },
           {
-            label: "Skills improved",
-            value: skillHelpedItems.length,
-            helper: `${approvedSkillEvolutions.length} observed after approval`,
+            label: "Confirmed changes",
+            value: promotedChangeCount,
+            helper:
+              promotedChangeCount > 0
+                ? "Measured improvements that stuck"
+                : "No permanent improvements yet",
             tone:
-              skillHelpedItems.length > 0
+              promotedChangeCount > 0
                 ? "good"
-                : skillReviewItems.length > 0
+                : needsApprovalCount > 0
                   ? "warn"
                   : "default",
           },
@@ -36587,486 +37175,476 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
         </Grid2>
       ) : null}
       {tab === "tests" ? (
-        <Grid2 container spacing={1.5}>
-          {tests.map((item) => (
-            <Grid2 key={item.name} size={{ xs: 12, lg: 6 }}>
-              <Box className="list-shell" sx={{ p: 1.6, minHeight: "100%" }}>
-                <Stack spacing={1.1}>
-                  <Stack
-                    direction="row"
-                    spacing={1}
-                    sx={{
-                      justifyContent: "space-between",
-                      alignItems: "center",
-                    }}
-                  >
-                    <Box sx={{ minWidth: 0 }}>
-                      <Typography
-                        variant="h6"
-                        sx={{ color: "#e8f4ff", fontWeight: 700 }}
-                      >
-                        {item.name}
-                      </Typography>
-                      <Typography
-                        variant="body2"
-                        noWrap
-                        title={item.last}
-                        sx={{
-                          color: "text.secondary",
-                        }}
-                      >
-                        {item.last}
-                      </Typography>
-                    </Box>
-                    <Chip
-                      size="small"
-                      color={item.enabled ? "warning" : "default"}
-                      label={item.enabled ? "Testing" : "Baseline"}
-                    />
-                  </Stack>
-                  <EvolutionRolloutBar
-                    label="Candidate rollout"
-                    percent={item.rollout}
-                  />
-                  <Box
-                    sx={{
-                      display: "grid",
-                      gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" },
-                      gap: 1,
-                    }}
-                  >
-                    <Box>
-                      <Typography
-                        variant="caption"
-                        sx={{
-                          color: "text.secondary",
-                        }}
-                      >
-                        Current baseline
-                      </Typography>
-                      <Typography variant="body2" noWrap title={item.baseline}>
-                        {item.baseline}
-                      </Typography>
-                    </Box>
-                    <Box>
-                      <Typography
-                        variant="caption"
-                        sx={{
-                          color: "text.secondary",
-                        }}
-                      >
-                        Candidate
-                      </Typography>
-                      <Typography variant="body2" noWrap title={item.candidate}>
-                        {item.candidate}
-                      </Typography>
-                    </Box>
+        <Stack spacing={1.5}>
+          {activeExperimentItems.length === 0 ? (
+            <Box className="list-shell" sx={{ p: 1.75 }}>
+              <Stack spacing={1.2}>
+                <Stack
+                  direction={{ xs: "column", sm: "row" }}
+                  spacing={1}
+                  sx={{
+                    justifyContent: "space-between",
+                    alignItems: { xs: "flex-start", sm: "center" },
+                  }}
+                >
+                  <Box>
+                    <Typography
+                      variant="h6"
+                      sx={{ color: "#e8f4ff", fontWeight: 700 }}
+                    >
+                      No active experiments
+                    </Typography>
+                    <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                      ArkEvolve is using the current stable behavior across reply
+                      routing, main replies, request understanding, and
+                      specialist helpers.
+                    </Typography>
                   </Box>
-                  <Alert
-                    severity={item.enabled ? "warning" : "info"}
-                    sx={{ borderRadius: 1 }}
-                  >
-                    Gate result: {item.gate}
-                  </Alert>
+                  <Chip size="small" label="Stable" />
                 </Stack>
-              </Box>
-            </Grid2>
-          ))}
-        </Grid2>
-      ) : null}
-      {tab === "review" ? (
-        <Box className="list-shell" sx={{ p: 1.6 }}>
-          <Stack
-            direction={{ xs: "column", md: "row" }}
-            spacing={1}
-            sx={{
-              justifyContent: "space-between",
-              alignItems: { xs: "flex-start", md: "center" },
-              mb: 1,
-            }}
-          >
-            <Box>
-              <Typography
-                variant="h6"
-                sx={{ color: "#e8f4ff", fontWeight: 700 }}
-              >
-                Needs review
-              </Typography>
-              <Typography
-                variant="body2"
-                sx={{
-                  color: "text.secondary",
-                }}
-              >
-                Draft learning candidates stay suggestions until approved.
-              </Typography>
+                <Alert severity="info" sx={{ borderRadius: 1 }}>
+                  When ArkEvolve starts testing a new improvement, this page will
+                  explain what is changing, why it could help, how much traffic
+                  is included, and what decision is still pending.
+                </Alert>
+              </Stack>
             </Box>
-            <FormControlLabel
-              control={
-                <Switch
-                  checked={showSuperseded}
-                  onChange={(event) => setShowSuperseded(event.target.checked)}
-                />
-              }
-              label="Show old drafts"
-            />
-          </Stack>
-          {detailLoading ? (
-            <Stack
-              direction="row"
-              spacing={1}
-              sx={{
-                alignItems: "center",
-              }}
-            >
-              <CircularProgress size={16} />
-              <Typography
-                variant="body2"
-                sx={{
-                  color: "text.secondary",
-                }}
-              >
-                Loading review queue...
-              </Typography>
-            </Stack>
-          ) : detailError ? (
-            <Alert severity="warning" sx={{ borderRadius: 1 }}>
-              Review queue is unavailable: {detailError}
-            </Alert>
-          ) : skillReviewItems.length === 0 &&
-            nonSkillLearningCandidates.length === 0 &&
-            promptCanarySafetyEvents.length === 0 &&
-            promptOptimizationOpportunities.length === 0 ? (
-            <Typography
-              variant="body2"
-              sx={{
-                color: "text.secondary",
-              }}
-            >
-              No review items are waiting.
-            </Typography>
           ) : (
-            <Stack spacing={1.5}>
-              {promptCanarySafetyEvents.length > 0 ? (
-                <Box>
-                  <Typography
-                    variant="subtitle2"
-                    sx={{ color: "#e8f4ff", mb: 1 }}
-                  >
-                    Prompt canary safety
-                  </Typography>
-                  <Alert severity="info" sx={{ borderRadius: 1, mb: 1 }}>
-                    Clear measured regressions auto-revert. Negative but mixed
-                    signals stay review-only until you disable the canary or
-                    explicitly keep it active.
-                  </Alert>
-                  <Stack spacing={1}>
-                    {promptCanarySafetyEvents.slice(0, 8).map((row, idx) => {
-                      const eventId = str(row.id, "");
-                      const status = str(row.status, "review_recommended");
-                      const reviewStatus = str(
-                        row.review_status,
-                        status || "open",
-                      );
-                      const reviewedAt = str(row.reviewed_at, "");
-                      const createdAt = str(row.created_at, "");
-                      const baselineVersion = str(row.baseline_version, "");
-                      const candidateVersion = str(row.candidate_version, "");
-                      const baselineSamples = num(row.baseline_samples, 0);
-                      const candidateSamples = num(row.candidate_samples, 0);
-                      const baselineSuccessRate =
-                        num(row.baseline_success_rate, 0) * 100;
-                      const candidateSuccessRate =
-                        num(row.candidate_success_rate, 0) * 100;
-                      const successDelta = num(row.success_delta, 0) * 100;
-                      const canReview =
-                        developerModeEnabled &&
-                        status === "review_recommended" &&
-                        reviewStatus === "open" &&
-                        !!eventId;
-                      return (
-                        <Box
-                          key={`prompt-canary-safety-${eventId || idx}`}
-                          sx={{
-                            p: 1.25,
-                            border: "1px solid rgba(145,170,205,0.12)",
-                            borderRadius: 1,
-                          }}
-                        >
-                          <Stack
-                            direction={{ xs: "column", md: "row" }}
-                            spacing={1}
-                            sx={{
-                              justifyContent: "space-between",
-                              alignItems: { xs: "flex-start", md: "center" },
-                            }}
-                          >
-                            <Box sx={{ minWidth: 0 }}>
-                              <Stack
-                                direction="row"
-                                spacing={0.75}
-                                useFlexGap
-                                sx={{
-                                  alignItems: "center",
-                                  flexWrap: "wrap",
-                                  mb: 0.45,
-                                }}
-                              >
-                                <Typography
-                                  variant="body2"
-                                  sx={{ color: "#e8f4ff", fontWeight: 600 }}
-                                >
-                                  {str(row.title, "Prompt canary safety")}
-                                </Typography>
-                                <Chip
-                                  size="small"
-                                  color={promptCanarySafetyStatusColor(status)}
-                                  label={humanizeStatusLabel(status)}
-                                />
-                                <Chip
-                                  size="small"
-                                  variant="outlined"
-                                  color={promptCanarySafetyStatusColor(
-                                    reviewStatus,
-                                  )}
-                                  label={humanizeStatusLabel(reviewStatus)}
-                                />
-                              </Stack>
-                              <Typography variant="body2">
-                                {str(
-                                  row.summary,
-                                  "Prompt canary safety signal recorded.",
-                                )}
-                              </Typography>
-                              <Typography
-                                variant="caption"
-                                sx={{
-                                  color: "text.secondary",
-                                  display: "block",
-                                  mt: 0.75,
-                                }}
-                              >
-                                Baseline {baselineVersion || "-"}:{" "}
-                                {baselineSuccessRate.toFixed(1)}% over{" "}
-                                {baselineSamples.toLocaleString()} runs. Candidate{" "}
-                                {candidateVersion || "-"}:{" "}
-                                {candidateSuccessRate.toFixed(1)}% over{" "}
-                                {candidateSamples.toLocaleString()} runs. Delta{" "}
-                                {successDelta.toFixed(1)} pts.
-                              </Typography>
-                              {reviewedAt ? (
-                                <Typography
-                                  variant="caption"
-                                  sx={{
-                                    color: "text.secondary",
-                                    display: "block",
-                                    mt: 0.35,
-                                  }}
-                                >
-                                  Reviewed{" "}
-                                  {formatTimestampForHumans(reviewedAt).label}
-                                </Typography>
-                              ) : createdAt ? (
-                                <Typography
-                                  variant="caption"
-                                  sx={{
-                                    color: "text.secondary",
-                                    display: "block",
-                                    mt: 0.35,
-                                  }}
-                                >
-                                  Recorded{" "}
-                                  {formatTimestampForHumans(createdAt).label}
-                                </Typography>
-                              ) : null}
-                            </Box>
-                            {canReview ? (
-                              <Stack
-                                direction="row"
-                                spacing={0.75}
-                                sx={{ flexShrink: 0 }}
-                              >
-                                <Button
-                                  size="small"
-                                  variant="contained"
-                                  disabled={runEvolutionActionMutation.isPending}
-                                  onClick={() =>
-                                    void runEvolutionAction(
-                                      {
-                                        action: "disable_prompt_canary_candidate",
-                                        candidate_id: eventId,
-                                      },
-                                      "Prompt canary disabled.",
-                                      "Disable this canary rollout now?",
-                                    )
-                                  }
-                                >
-                                  Disable canary
-                                </Button>
-                                <Button
-                                  size="small"
-                                  color="inherit"
-                                  disabled={runEvolutionActionMutation.isPending}
-                                  onClick={() =>
-                                    void runEvolutionAction(
-                                      {
-                                        action: "keep_prompt_canary_candidate",
-                                        candidate_id: eventId,
-                                      },
-                                      "Recorded decision to keep canary active.",
-                                    )
-                                  }
-                                >
-                                  Keep active
-                                </Button>
-                              </Stack>
-                            ) : (!developerModeEnabled &&
-                                status === "review_recommended" &&
-                                reviewStatus === "open") ? (
-                              <Typography
-                                variant="caption"
-                                sx={{ color: "text.secondary" }}
-                              >
-                                Developer mode required
-                              </Typography>
-                            ) : null}
-                          </Stack>
-                        </Box>
-                      );
-                    })}
-                  </Stack>
-                </Box>
-              ) : null}
-              {num(promptTelemetrySummary.sample_count, 0) > 0 ||
-              promptOptimizationOpportunities.length > 0 ? (
-                <Box>
-                  <Typography
-                    variant="subtitle2"
-                    sx={{ color: "#e8f4ff", mb: 1 }}
-                  >
-                    Prompt cost signals
-                  </Typography>
-                  <Alert severity="info" sx={{ borderRadius: 1, mb: 1 }}>
-                    These are review suggestions only. Approve or reject records
-                    review state and does not change runtime prompt assembly.
-                  </Alert>
-                  <Box
-                    sx={{
-                      display: "grid",
-                      gridTemplateColumns: {
-                        xs: "1fr 1fr",
-                        lg: "repeat(5, minmax(0,1fr))",
-                      },
-                      gap: 1,
-                      mb: 1,
-                    }}
-                  >
-                    <Box
-                      sx={{
-                        p: 1,
-                        border: "1px solid rgba(145,170,205,0.12)",
-                        borderRadius: 1,
-                      }}
-                    >
-                      <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                        Samples
-                      </Typography>
-                      <Typography variant="body2">
-                        {num(promptTelemetrySummary.sample_count, 0).toLocaleString()}
-                      </Typography>
-                    </Box>
-                    <Box
-                      sx={{
-                        p: 1,
-                        border: "1px solid rgba(145,170,205,0.12)",
-                        borderRadius: 1,
-                      }}
-                    >
-                      <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                        p95 final prompt
-                      </Typography>
-                      <Typography variant="body2">
-                        {charsLabel(promptTelemetrySummary.p95_final_prompt_chars)}
-                      </Typography>
-                    </Box>
-                    <Box
-                      sx={{
-                        p: 1,
-                        border: "1px solid rgba(145,170,205,0.12)",
-                        borderRadius: 1,
-                      }}
-                    >
-                      <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                        p95 tool schema
-                      </Typography>
-                      <Typography variant="body2">
-                        {charsLabel(promptTelemetrySummary.p95_tool_schema_chars)}
-                      </Typography>
-                    </Box>
-                    <Box
-                      sx={{
-                        p: 1,
-                        border: "1px solid rgba(145,170,205,0.12)",
-                        borderRadius: 1,
-                      }}
-                    >
-                      <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                        p95 request size
-                      </Typography>
-                      <Typography variant="body2">
-                        {charsLabel(
-                          promptTelemetrySummary.p95_estimated_total_request_chars,
-                        )}
-                      </Typography>
-                    </Box>
-                    <Box
-                      sx={{
-                        p: 1,
-                        border: "1px solid rgba(145,170,205,0.12)",
-                        borderRadius: 1,
-                      }}
-                    >
-                      <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                        Avg tools
-                      </Typography>
-                      <Typography variant="body2">
-                        {num(promptTelemetrySummary.avg_tool_count, -1) >= 0
-                          ? num(promptTelemetrySummary.avg_tool_count, 0).toFixed(2)
-                          : "-"}
-                      </Typography>
-                    </Box>
-                  </Box>
-                  {promptTelemetrySections.length > 0 ? (
-                    <Box sx={{ mb: 1 }}>
-                      <Typography
-                        variant="caption"
+            <Grid2 container spacing={1.5}>
+              {activeExperimentItems.map((item) => (
+                <Grid2 key={item.key} size={{ xs: 12, lg: 6 }}>
+                  <Box className="list-shell" sx={{ p: 1.6, minHeight: "100%" }}>
+                    <Stack spacing={1.15}>
+                      <Stack
+                        direction={{ xs: "column", sm: "row" }}
+                        spacing={1}
                         sx={{
-                          color: "text.secondary",
-                          display: "block",
-                          mb: 0.45,
+                          justifyContent: "space-between",
+                          alignItems: { xs: "flex-start", sm: "center" },
                         }}
                       >
-                        Largest prompt sections
-                      </Typography>
-                      <Stack spacing={0.45}>
-                        {promptTelemetrySections.slice(0, 6).map((row, idx) => (
+                        <Box sx={{ minWidth: 0 }}>
                           <Typography
-                            key={`prompt-section-${str(row.section, idx.toString())}`}
+                            variant="h6"
+                            sx={{ color: "#e8f4ff", fontWeight: 700 }}
+                          >
+                            {item.audienceLabel}
+                          </Typography>
+                          <Typography
+                            variant="body2"
+                            sx={{ color: "text.secondary", mt: 0.35 }}
+                          >
+                            {item.summary}
+                          </Typography>
+                        </Box>
+                        <Chip size="small" color="warning" label="Testing" />
+                      </Stack>
+                      <EvolutionRolloutBar
+                        label="Recent traffic in this experiment"
+                        percent={item.rollout}
+                      />
+                      <Box
+                        sx={{
+                          display: "grid",
+                          gridTemplateColumns: { xs: "1fr", md: "repeat(2, minmax(0,1fr))" },
+                          gap: 1,
+                        }}
+                      >
+                        <Box>
+                          <Typography
                             variant="caption"
                             sx={{ color: "text.secondary", display: "block" }}
                           >
-                            {str(row.section, "section")}: p95{" "}
-                            {charsLabel(row.p95_chars)}, p50{" "}
-                            {charsLabel(row.p50_chars)}, avg{" "}
-                            {charsLabel(row.avg_chars)}
+                            Why this is being tested
                           </Typography>
-                        ))}
-                      </Stack>
+                          <Typography variant="body2">{item.benefit}</Typography>
+                        </Box>
+                        <Box>
+                          <Typography
+                            variant="caption"
+                            sx={{ color: "text.secondary", display: "block" }}
+                          >
+                            Current status
+                          </Typography>
+                          <Typography variant="body2">
+                            {evolutionExperimentStatusText(item)}
+                          </Typography>
+                        </Box>
+                      </Box>
+                      <Accordion disableGutters className="chat-workspace-section">
+                        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+                          <Typography variant="body2">Technical details</Typography>
+                        </AccordionSummary>
+                        <AccordionDetails sx={{ pt: 0 }}>
+                          <Stack spacing={1}>
+                            <Typography
+                              variant="caption"
+                              sx={{ color: "text.secondary", display: "block" }}
+                            >
+                              Internal surface: {item.name}
+                            </Typography>
+                            <Box
+                              sx={{
+                                display: "grid",
+                                gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" },
+                                gap: 1,
+                              }}
+                            >
+                              <Box>
+                                <Typography
+                                  variant="caption"
+                                  sx={{ color: "text.secondary", display: "block" }}
+                                >
+                                  Current baseline
+                                </Typography>
+                                <Typography variant="body2" title={item.baseline}>
+                                  {item.baseline}
+                                </Typography>
+                              </Box>
+                              <Box>
+                                <Typography
+                                  variant="caption"
+                                  sx={{ color: "text.secondary", display: "block" }}
+                                >
+                                  Candidate
+                                </Typography>
+                                <Typography variant="body2" title={item.candidate}>
+                                  {item.candidate}
+                                </Typography>
+                              </Box>
+                            </Box>
+                            <Alert severity="info" sx={{ borderRadius: 1 }}>
+                              Gate result: {item.gate === "-" ? "No gate result yet." : item.gate}
+                            </Alert>
+                          </Stack>
+                        </AccordionDetails>
+                      </Accordion>
+                    </Stack>
+                  </Box>
+                </Grid2>
+              ))}
+            </Grid2>
+          )}
+          {developerModeEnabled && stableExperimentItems.length > 0 ? (
+            <Accordion disableGutters className="chat-workspace-section">
+              <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+                <Typography variant="body2">
+                  Stable surfaces and baselines
+                </Typography>
+              </AccordionSummary>
+              <AccordionDetails sx={{ pt: 0 }}>
+                <Stack spacing={1}>
+                  {stableExperimentItems.map((item) => (
+                    <Box
+                      key={`stable-${item.key}`}
+                      sx={{
+                        p: 1,
+                        border: "1px solid rgba(145,170,205,0.12)",
+                        borderRadius: 1,
+                      }}
+                    >
+                      <Typography
+                        variant="body2"
+                        sx={{ color: "#e8f4ff", fontWeight: 600 }}
+                      >
+                        {item.audienceLabel}
+                      </Typography>
+                      <Typography
+                        variant="caption"
+                        sx={{ color: "text.secondary", display: "block", mt: 0.35 }}
+                      >
+                        {item.stableSummary}
+                      </Typography>
+                      <Typography
+                        variant="caption"
+                        sx={{ color: "text.secondary", display: "block", mt: 0.35 }}
+                      >
+                        Baseline: {item.baseline}
+                      </Typography>
                     </Box>
-                  ) : null}
-                  {promptOptimizationOpportunities.length > 0 ? (
+                  ))}
+                </Stack>
+              </AccordionDetails>
+            </Accordion>
+          ) : null}
+        </Stack>
+      ) : null}
+      {tab === "review" ? (
+        <Stack spacing={1.5}>
+          <Box className="list-shell" sx={{ p: 1.6 }}>
+            <Stack
+              direction={{ xs: "column", md: "row" }}
+              spacing={1}
+              sx={{
+                justifyContent: "space-between",
+                alignItems: { xs: "flex-start", md: "center" },
+                mb: 1,
+              }}
+            >
+              <Box>
+                <Typography
+                  variant="h6"
+                  sx={{ color: "#e8f4ff", fontWeight: 700 }}
+                >
+                  Needs approval
+                </Typography>
+                <Typography
+                  variant="body2"
+                  sx={{
+                    color: "text.secondary",
+                  }}
+                >
+                  ArkEvolve keeps meaningful changes as suggestions until you
+                  decide.
+                </Typography>
+              </Box>
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={showSuperseded}
+                    onChange={(event) => setShowSuperseded(event.target.checked)}
+                  />
+                }
+                label="Show older suggestions"
+              />
+            </Stack>
+            {detailLoading ? (
+              <Stack
+                direction="row"
+                spacing={1}
+                sx={{
+                  alignItems: "center",
+                }}
+              >
+                <CircularProgress size={16} />
+                <Typography
+                  variant="body2"
+                  sx={{
+                    color: "text.secondary",
+                  }}
+                >
+                  Loading approval queue...
+                </Typography>
+              </Stack>
+            ) : detailError ? (
+              <Alert severity="warning" sx={{ borderRadius: 1 }}>
+                Approval details are unavailable: {detailError}
+              </Alert>
+            ) : skillReviewItems.length === 0 &&
+              visibleNonSkillLearningCandidates.length === 0 &&
+              visiblePromptCanarySafetyEvents.length === 0 &&
+              visiblePromptOptimizationOpportunities.length === 0 ? (
+              <Typography
+                variant="body2"
+                sx={{
+                  color: "text.secondary",
+                }}
+              >
+                Nothing is waiting on you right now.
+              </Typography>
+            ) : (
+              <Stack spacing={1.5}>
+                {visiblePromptCanarySafetyEvents.length > 0 ? (
+                  <Box>
+                    <Typography
+                      variant="subtitle2"
+                      sx={{ color: "#e8f4ff", mb: 1 }}
+                    >
+                      Experiment decisions
+                    </Typography>
                     <Stack spacing={1}>
-                      {promptOptimizationOpportunities.map((row, idx) => {
+                      {visiblePromptCanarySafetyEvents.slice(0, 8).map((row, idx) => {
+                        const eventId = str(row.id, "");
+                        const status = str(row.status, "review_recommended");
+                        const reviewStatus = str(
+                          row.review_status,
+                          status || "open",
+                        );
+                        const reviewedAt = str(row.reviewed_at, "");
+                        const createdAt = str(row.created_at, "");
+                        const baselineVersion = str(row.baseline_version, "");
+                        const candidateVersion = str(row.candidate_version, "");
+                        const baselineSamples = num(row.baseline_samples, 0);
+                        const candidateSamples = num(row.candidate_samples, 0);
+                        const baselineSuccessRate =
+                          num(row.baseline_success_rate, 0) * 100;
+                        const candidateSuccessRate =
+                          num(row.candidate_success_rate, 0) * 100;
+                        const successDelta = num(row.success_delta, 0) * 100;
+                        const reviewEvidence = promptCanaryReviewEvidence(row);
+                        const canReview =
+                          status === "review_recommended" &&
+                          reviewStatus === "open" &&
+                          !!eventId;
+                        return (
+                          <Box
+                            key={`prompt-canary-safety-${eventId || idx}`}
+                            sx={{
+                              p: 1.25,
+                              border: "1px solid rgba(145,170,205,0.12)",
+                              borderRadius: 1,
+                            }}
+                          >
+                            <Stack
+                              direction={{ xs: "column", md: "row" }}
+                              spacing={1}
+                              sx={{
+                                justifyContent: "space-between",
+                                alignItems: { xs: "flex-start", md: "center" },
+                              }}
+                            >
+                              <Box sx={{ minWidth: 0 }}>
+                                <Stack
+                                  direction="row"
+                                  spacing={0.75}
+                                  useFlexGap
+                                  sx={{
+                                    alignItems: "center",
+                                    flexWrap: "wrap",
+                                    mb: 0.45,
+                                  }}
+                                >
+                                  <Typography
+                                    variant="body2"
+                                    sx={{ color: "#e8f4ff", fontWeight: 600 }}
+                                  >
+                                    {str(row.title, "Experiment needs attention")}
+                                  </Typography>
+                                  <Chip
+                                    size="small"
+                                    color={promptCanarySafetyStatusColor(
+                                      reviewStatus,
+                                    )}
+                                    label={
+                                      reviewStatus === "open"
+                                        ? "Needs decision"
+                                        : humanizeStatusLabel(reviewStatus)
+                                    }
+                                  />
+                                </Stack>
+                                <Typography variant="body2">
+                                  {str(
+                                    row.summary,
+                                    "Recent traffic suggests this experiment needs a human decision.",
+                                  )}
+                                </Typography>
+                                <Typography
+                                  variant="caption"
+                                  sx={{
+                                    color: "text.secondary",
+                                    display: "block",
+                                    mt: 0.55,
+                                  }}
+                                >
+                                  {promptCanaryActionSummary(row)}
+                                </Typography>
+                                {reviewedAt ? (
+                                  <Typography
+                                    variant="caption"
+                                    sx={{
+                                      color: "text.secondary",
+                                      display: "block",
+                                      mt: 0.35,
+                                    }}
+                                  >
+                                    Reviewed {formatTimestampForHumans(reviewedAt).label}
+                                  </Typography>
+                                ) : createdAt ? (
+                                  <Typography
+                                    variant="caption"
+                                    sx={{
+                                      color: "text.secondary",
+                                      display: "block",
+                                      mt: 0.35,
+                                    }}
+                                  >
+                                    Recorded {formatTimestampForHumans(createdAt).label}
+                                  </Typography>
+                                ) : null}
+                              </Box>
+                              {canReview ? (
+                                <Stack
+                                  direction="row"
+                                  spacing={0.75}
+                                  sx={{ flexShrink: 0 }}
+                                >
+                                  <Button
+                                    size="small"
+                                    variant="contained"
+                                    disabled={runEvolutionActionMutation.isPending}
+                                    onClick={() =>
+                                      void runEvolutionAction(
+                                        {
+                                          action: "disable_prompt_canary_candidate",
+                                          candidate_id: eventId,
+                                        },
+                                        "Experiment stopped.",
+                                        "Stop this experiment now?",
+                                      )
+                                    }
+                                  >
+                                    Stop test
+                                  </Button>
+                                  <Button
+                                    size="small"
+                                    color="inherit"
+                                    disabled={runEvolutionActionMutation.isPending}
+                                    onClick={() =>
+                                      void runEvolutionAction(
+                                        {
+                                          action: "keep_prompt_canary_candidate",
+                                          candidate_id: eventId,
+                                        },
+                                        "Recorded decision to keep the experiment active.",
+                                      )
+                                    }
+                                  >
+                                    Keep testing
+                                  </Button>
+                                </Stack>
+                              ) : null}
+                            </Stack>
+                            <EvolutionReviewEvidenceStrip evidence={reviewEvidence} />
+                            <Accordion disableGutters className="chat-workspace-section" sx={{ mt: 1 }}>
+                              <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+                                <Typography variant="body2">Technical details</Typography>
+                              </AccordionSummary>
+                              <AccordionDetails sx={{ pt: 0 }}>
+                                <Stack spacing={0.45}>
+                                  <Typography variant="caption" sx={{ color: "text.secondary", display: "block" }}>
+                                    Stable version: {baselineVersion || "-"}
+                                  </Typography>
+                                  <Typography variant="caption" sx={{ color: "text.secondary", display: "block" }}>
+                                    Experiment version: {candidateVersion || "-"}
+                                  </Typography>
+                                  <Typography variant="caption" sx={{ color: "text.secondary", display: "block" }}>
+                                    Stable behavior: {baselineSuccessRate.toFixed(1)}% over {baselineSamples.toLocaleString()} runs
+                                  </Typography>
+                                  <Typography variant="caption" sx={{ color: "text.secondary", display: "block" }}>
+                                    Experiment: {candidateSuccessRate.toFixed(1)}% over {candidateSamples.toLocaleString()} runs
+                                  </Typography>
+                                  <Typography variant="caption" sx={{ color: "text.secondary", display: "block" }}>
+                                    Success delta: {successDelta.toFixed(1)} pts
+                                  </Typography>
+                                </Stack>
+                              </AccordionDetails>
+                            </Accordion>
+                          </Box>
+                        );
+                      })}
+                    </Stack>
+                  </Box>
+                ) : null}
+                {visiblePromptOptimizationOpportunities.length > 0 ? (
+                  <Box>
+                    <Typography
+                      variant="subtitle2"
+                      sx={{ color: "#e8f4ff", mb: 1 }}
+                    >
+                      Suggested improvements
+                    </Typography>
+                    <Stack spacing={1}>
+                      {visiblePromptOptimizationOpportunities.map((row, idx) => {
                         const proposalId = str(row.id, "");
                         const reviewStatus = str(row.review_status, "open");
                         const riskLevel = str(row.risk_level, "default");
@@ -37074,6 +37652,12 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
                         const expectedBenefit = stringList(row.expected_benefit);
                         const caveats = stringList(row.caveats);
                         const reviewedAt = str(row.reviewed_at, "");
+                        const reviewEvidence =
+                          promptOptimizationReviewEvidence(row);
+                        const canApprove =
+                          !!proposalId &&
+                          reviewStatus !== "approved" &&
+                          reviewStatus !== "rejected";
                         return (
                           <Box
                             key={`prompt-proposal-${proposalId || idx}`}
@@ -37106,12 +37690,16 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
                                     variant="body2"
                                     sx={{ color: "#e8f4ff", fontWeight: 600 }}
                                   >
-                                    {str(row.title, "Prompt optimization review")}
+                                    {str(row.title, "Suggested improvement")}
                                   </Typography>
                                   <Chip
                                     size="small"
                                     color={promptProposalStatusColor(reviewStatus)}
-                                    label={reviewStatus}
+                                    label={
+                                      reviewStatus === "open"
+                                        ? "Needs decision"
+                                        : humanizeStatusLabel(reviewStatus)
+                                    }
                                   />
                                   <Chip
                                     size="small"
@@ -37119,250 +37707,50 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
                                     color={promptProposalRiskColor(riskLevel)}
                                     label={`${riskLevel || "unknown"} risk`}
                                   />
-                                  <Chip
-                                    size="small"
-                                    variant="outlined"
-                                    label={str(row.target_scope, "prompt_profile")}
-                                  />
                                 </Stack>
                                 <Typography variant="body2">
                                   {str(
                                     row.summary,
-                                    "Review prompt telemetry evidence before changing prompt profiles.",
+                                    "ArkEvolve found a reviewable prompt improvement.",
                                   )}
                                 </Typography>
+                                {expectedBenefit[0] ? (
+                                  <Typography
+                                    variant="caption"
+                                    sx={{
+                                      color: "text.secondary",
+                                      display: "block",
+                                      mt: 0.55,
+                                    }}
+                                  >
+                                    Expected benefit: {expectedBenefit[0]}
+                                  </Typography>
+                                ) : null}
+                                {caveats[0] ? (
+                                  <Typography
+                                    variant="caption"
+                                    sx={{
+                                      color: "text.secondary",
+                                      display: "block",
+                                      mt: 0.35,
+                                    }}
+                                  >
+                                    Main tradeoff: {caveats[0]}
+                                  </Typography>
+                                ) : null}
                                 {reviewedAt ? (
                                   <Typography
                                     variant="caption"
-                                    sx={{ color: "text.secondary", display: "block", mt: 0.45 }}
+                                    sx={{
+                                      color: "text.secondary",
+                                      display: "block",
+                                      mt: 0.35,
+                                    }}
                                   >
                                     Reviewed {formatTimestampForHumans(reviewedAt).label}
                                   </Typography>
                                 ) : null}
                               </Box>
-                              {developerModeEnabled ? (
-                                <Stack
-                                  direction="row"
-                                  spacing={0.75}
-                                  sx={{ flexShrink: 0 }}
-                                >
-                                  <Button
-                                    size="small"
-                                    variant="contained"
-                                    disabled={
-                                      runEvolutionActionMutation.isPending ||
-                                      reviewStatus === "approved" ||
-                                      !proposalId
-                                    }
-                                    onClick={() =>
-                                      void runEvolutionAction(
-                                        {
-                                          action:
-                                            "approve_prompt_optimization_proposal",
-                                          candidate_id: proposalId,
-                                        },
-                                        "Prompt optimization proposal approved.",
-                                      )
-                                    }
-                                  >
-                                    Approve
-                                  </Button>
-                                  <Button
-                                    size="small"
-                                    color="inherit"
-                                    disabled={
-                                      runEvolutionActionMutation.isPending ||
-                                      reviewStatus === "rejected" ||
-                                      !proposalId
-                                    }
-                                    onClick={() =>
-                                      void runEvolutionAction(
-                                        {
-                                          action:
-                                            "reject_prompt_optimization_proposal",
-                                          candidate_id: proposalId,
-                                        },
-                                        "Prompt optimization proposal rejected.",
-                                      )
-                                    }
-                                  >
-                                    Reject
-                                  </Button>
-                                </Stack>
-                              ) : (
-                                <Typography
-                                  variant="caption"
-                                  sx={{ color: "text.secondary" }}
-                                >
-                                  Developer mode required
-                                </Typography>
-                              )}
-                            </Stack>
-                            {evidence.length > 0 ? (
-                              <Box sx={{ mt: 1 }}>
-                                <Typography
-                                  variant="caption"
-                                  sx={{
-                                    color: "text.secondary",
-                                    display: "block",
-                                    mb: 0.35,
-                                  }}
-                                >
-                                  Evidence
-                                </Typography>
-                                <Stack spacing={0.35}>
-                                  {evidence.map((line, lineIdx) => (
-                                    <Typography
-                                      key={`${proposalId}-evidence-${lineIdx}`}
-                                      variant="caption"
-                                      sx={{ color: "text.secondary", display: "block" }}
-                                    >
-                                      {line}
-                                    </Typography>
-                                  ))}
-                                </Stack>
-                              </Box>
-                            ) : null}
-                            {expectedBenefit.length > 0 ? (
-                              <Box sx={{ mt: 1 }}>
-                                <Typography
-                                  variant="caption"
-                                  sx={{
-                                    color: "text.secondary",
-                                    display: "block",
-                                    mb: 0.35,
-                                  }}
-                                >
-                                  Expected benefit
-                                </Typography>
-                                <Stack spacing={0.35}>
-                                  {expectedBenefit.map((line, lineIdx) => (
-                                    <Typography
-                                      key={`${proposalId}-benefit-${lineIdx}`}
-                                      variant="caption"
-                                      sx={{ color: "text.secondary", display: "block" }}
-                                    >
-                                      {line}
-                                    </Typography>
-                                  ))}
-                                </Stack>
-                              </Box>
-                            ) : null}
-                            {caveats.length > 0 ? (
-                              <Alert severity="warning" sx={{ mt: 1, borderRadius: 1 }}>
-                                <Stack spacing={0.35}>
-                                  {caveats.map((line, lineIdx) => (
-                                    <Typography
-                                      key={`${proposalId}-caveat-${lineIdx}`}
-                                      variant="caption"
-                                      sx={{ display: "block" }}
-                                    >
-                                      {line}
-                                    </Typography>
-                                  ))}
-                                </Stack>
-                              </Alert>
-                            ) : null}
-                          </Box>
-                        );
-                      })}
-                    </Stack>
-                  ) : (
-                    <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                      Prompt telemetry is available. No optimization proposals
-                      are currently above the review threshold.
-                    </Typography>
-                  )}
-                </Box>
-              ) : null}
-              {skillReviewItems.length > 0 ? (
-                <Box>
-                  <Typography
-                    variant="subtitle2"
-                    sx={{ color: "#e8f4ff", mb: 1 }}
-                  >
-                    Skill evolution candidates
-                  </Typography>
-                  <Stack spacing={1}>
-                    {skillReviewItems.map((row, idx) => {
-                      const candidateId = str(row.id, "");
-                      const status = str(row.approval_status, "draft");
-                      const evidence = asRecord(row.evidence);
-                      const diffPreview = asRecord(row.diff_preview);
-                      const added = stringList(diffPreview.added);
-                      const removed = stringList(diffPreview.removed);
-                      const headings = stringList(diffPreview.headings);
-                      const baseline = asRecord(row.impact_baseline);
-                      const failureReasons = stringList(
-                        evidence.recent_failure_reasons,
-                      );
-                      const selectedExamples = stringList(
-                        evidence.selected_failure_examples,
-                      );
-                      return (
-                        <Box
-                          key={`skill-review-${candidateId || idx}`}
-                          sx={{
-                            p: 1.25,
-                            border: "1px solid rgba(145,170,205,0.12)",
-                            borderRadius: 1,
-                          }}
-                        >
-                          <Stack
-                            direction={{ xs: "column", md: "row" }}
-                            spacing={1}
-                            sx={{
-                              justifyContent: "space-between",
-                              alignItems: { xs: "flex-start", md: "center" },
-                            }}
-                          >
-                            <Box sx={{ minWidth: 0 }}>
-                              <Stack
-                                direction="row"
-                                spacing={0.75}
-                                useFlexGap
-                                sx={{
-                                  alignItems: "center",
-                                  flexWrap: "wrap",
-                                  mb: 0.45,
-                                }}
-                              >
-                                <Typography
-                                  variant="body2"
-                                  sx={{ color: "#e8f4ff", fontWeight: 600 }}
-                                >
-                                  {canonicalSkillIdentifier(
-                                    str(
-                                      row.skill_name,
-                                      str(row.title, "Skill candidate"),
-                                    ),
-                                  )}
-                                </Typography>
-                                <Chip
-                                  size="small"
-                                  label={skillEvolutionActionLabel(
-                                    str(row.action, ""),
-                                  )}
-                                />
-                                <Chip
-                                  size="small"
-                                  color={skillEvolutionChipColor(status)}
-                                  label={status}
-                                />
-                                <Chip
-                                  size="small"
-                                  variant="outlined"
-                                  label={`${ratioPercent(row.confidence).toFixed(0)}% confidence`}
-                                />
-                              </Stack>
-                              <Typography variant="body2">
-                                {str(
-                                  row.diff_summary,
-                                  str(row.summary, "Reviewable skill change"),
-                                )}
-                              </Typography>
-                            </Box>
-                            {developerModeEnabled ? (
                               <Stack
                                 direction="row"
                                 spacing={0.75}
@@ -37372,17 +37760,16 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
                                   size="small"
                                   variant="contained"
                                   disabled={
-                                    runEvolutionActionMutation.isPending ||
-                                    status === "approved" ||
-                                    !candidateId
+                                    runEvolutionActionMutation.isPending || !canApprove
                                   }
                                   onClick={() =>
                                     void runEvolutionAction(
                                       {
-                                        action: "approve_learning_candidate",
-                                        candidate_id: candidateId,
+                                        action:
+                                          "approve_prompt_optimization_proposal",
+                                        candidate_id: proposalId,
                                       },
-                                      "Learning candidate approved.",
+                                      "Suggestion approved.",
                                     )
                                   }
                                 >
@@ -37392,9 +37779,234 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
                                   size="small"
                                   color="inherit"
                                   disabled={
-                                    runEvolutionActionMutation.isPending ||
-                                    status === "rejected" ||
-                                    !candidateId
+                                    runEvolutionActionMutation.isPending || !canApprove
+                                  }
+                                  onClick={() =>
+                                    void runEvolutionAction(
+                                      {
+                                        action:
+                                          "reject_prompt_optimization_proposal",
+                                        candidate_id: proposalId,
+                                      },
+                                      "Suggestion rejected.",
+                                    )
+                                  }
+                                >
+                                  Reject
+                                </Button>
+                              </Stack>
+                            </Stack>
+                            <EvolutionReviewEvidenceStrip evidence={reviewEvidence} />
+                            <Accordion disableGutters className="chat-workspace-section" sx={{ mt: 1 }}>
+                              <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+                                <Typography variant="body2">Technical details</Typography>
+                              </AccordionSummary>
+                              <AccordionDetails sx={{ pt: 0 }}>
+                                <Stack spacing={1}>
+                                  <Typography
+                                    variant="caption"
+                                    sx={{ color: "text.secondary", display: "block" }}
+                                  >
+                                    Target area: {promptProposalScopeLabel(str(row.target_scope, "prompt_profile"))}
+                                  </Typography>
+                                  {evidence.length > 0 ? (
+                                    <Box>
+                                      <Typography
+                                        variant="caption"
+                                        sx={{ color: "text.secondary", display: "block", mb: 0.35 }}
+                                      >
+                                        Evidence
+                                      </Typography>
+                                      <Stack spacing={0.35}>
+                                        {evidence.map((line, lineIdx) => (
+                                          <Typography
+                                            key={`${proposalId}-evidence-${lineIdx}`}
+                                            variant="caption"
+                                            sx={{ color: "text.secondary", display: "block" }}
+                                          >
+                                            {line}
+                                          </Typography>
+                                        ))}
+                                      </Stack>
+                                    </Box>
+                                  ) : null}
+                                  {expectedBenefit.length > 1 ? (
+                                    <Box>
+                                      <Typography
+                                        variant="caption"
+                                        sx={{ color: "text.secondary", display: "block", mb: 0.35 }}
+                                      >
+                                        More expected benefits
+                                      </Typography>
+                                      <Stack spacing={0.35}>
+                                        {expectedBenefit.slice(1).map((line, lineIdx) => (
+                                          <Typography
+                                            key={`${proposalId}-benefit-${lineIdx}`}
+                                            variant="caption"
+                                            sx={{ color: "text.secondary", display: "block" }}
+                                          >
+                                            {line}
+                                          </Typography>
+                                        ))}
+                                      </Stack>
+                                    </Box>
+                                  ) : null}
+                                  {caveats.length > 0 ? (
+                                    <Alert severity="warning" sx={{ borderRadius: 1 }}>
+                                      <Stack spacing={0.35}>
+                                        {caveats.map((line, lineIdx) => (
+                                          <Typography
+                                            key={`${proposalId}-caveat-${lineIdx}`}
+                                            variant="caption"
+                                            sx={{ display: "block" }}
+                                          >
+                                            {line}
+                                          </Typography>
+                                        ))}
+                                      </Stack>
+                                    </Alert>
+                                  ) : null}
+                                </Stack>
+                              </AccordionDetails>
+                            </Accordion>
+                          </Box>
+                        );
+                      })}
+                    </Stack>
+                  </Box>
+                ) : null}
+                {skillReviewItems.length > 0 ? (
+                  <Box>
+                    <Typography
+                      variant="subtitle2"
+                      sx={{ color: "#e8f4ff", mb: 1 }}
+                    >
+                      Skill changes
+                    </Typography>
+                    <Stack spacing={1}>
+                      {skillReviewItems.map((row, idx) => {
+                        const candidateId = str(row.id, "");
+                        const status = str(row.approval_status, "draft");
+                        const evidence = asRecord(row.evidence);
+                        const diffPreview = asRecord(row.diff_preview);
+                        const added = stringList(diffPreview.added);
+                        const removed = stringList(diffPreview.removed);
+                        const headings = stringList(diffPreview.headings);
+                        const baseline = asRecord(row.impact_baseline);
+                        const failureReasons = stringList(
+                          evidence.recent_failure_reasons,
+                        );
+                        const selectedExamples = stringList(
+                          evidence.selected_failure_examples,
+                        );
+                        const reviewEvidence = skillReviewEvidence(row);
+                        const canApprove =
+                          !!candidateId &&
+                          status !== "approved" &&
+                          status !== "rejected";
+                        return (
+                          <Box
+                            key={`skill-review-${candidateId || idx}`}
+                            sx={{
+                              p: 1.25,
+                              border: "1px solid rgba(145,170,205,0.12)",
+                              borderRadius: 1,
+                            }}
+                          >
+                            <Stack
+                              direction={{ xs: "column", md: "row" }}
+                              spacing={1}
+                              sx={{
+                                justifyContent: "space-between",
+                                alignItems: { xs: "flex-start", md: "center" },
+                              }}
+                            >
+                              <Box sx={{ minWidth: 0 }}>
+                                <Stack
+                                  direction="row"
+                                  spacing={0.75}
+                                  useFlexGap
+                                  sx={{
+                                    alignItems: "center",
+                                    flexWrap: "wrap",
+                                    mb: 0.45,
+                                  }}
+                                >
+                                  <Typography
+                                    variant="body2"
+                                    sx={{ color: "#e8f4ff", fontWeight: 600 }}
+                                  >
+                                    {canonicalSkillIdentifier(
+                                      str(
+                                        row.skill_name,
+                                        str(row.title, "Skill candidate"),
+                                      ),
+                                    )}
+                                  </Typography>
+                                  <Chip
+                                    size="small"
+                                    label={skillEvolutionActionLabel(
+                                      str(row.action, ""),
+                                    )}
+                                  />
+                                  <Chip
+                                    size="small"
+                                    color={skillEvolutionChipColor(status)}
+                                    label={
+                                      status === "draft"
+                                        ? "Needs decision"
+                                        : humanizeStatusLabel(status)
+                                    }
+                                  />
+                                  <Chip
+                                    size="small"
+                                    variant="outlined"
+                                    label={`${ratioPercent(row.confidence).toFixed(0)}% confidence`}
+                                  />
+                                </Stack>
+                                <Typography variant="body2">
+                                  {str(
+                                    row.diff_summary,
+                                    str(row.summary, "Reviewable skill change"),
+                                  )}
+                                </Typography>
+                                <Typography
+                                  variant="caption"
+                                  sx={{ color: "text.secondary", display: "block", mt: 0.55 }}
+                                >
+                                  Based on {num(baseline.matched_runs, 0)} matched runs with{" "}
+                                  {percentageLabel(baseline.success_rate, 1) || "-"} success and{" "}
+                                  {percentageLabel(baseline.failure_rate, 1) || "-"} failure.
+                                </Typography>
+                              </Box>
+                              <Stack
+                                direction="row"
+                                spacing={0.75}
+                                sx={{ flexShrink: 0 }}
+                              >
+                                <Button
+                                  size="small"
+                                  variant="contained"
+                                  disabled={
+                                    runEvolutionActionMutation.isPending || !canApprove
+                                  }
+                                  onClick={() =>
+                                    void runEvolutionAction(
+                                      {
+                                        action: "approve_learning_candidate",
+                                        candidate_id: candidateId,
+                                      },
+                                      "Skill change approved.",
+                                    )
+                                  }
+                                >
+                                  Approve
+                                </Button>
+                                <Button
+                                  size="small"
+                                  color="inherit"
+                                  disabled={
+                                    runEvolutionActionMutation.isPending || !canApprove
                                   }
                                   onClick={() =>
                                     void runEvolutionAction(
@@ -37402,355 +38014,512 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
                                         action: "reject_learning_candidate",
                                         candidate_id: candidateId,
                                       },
-                                      "Learning candidate rejected.",
+                                      "Skill change rejected.",
                                     )
                                   }
                                 >
                                   Reject
                                 </Button>
                               </Stack>
-                            ) : (
-                              <Typography
-                                variant="caption"
-                                sx={{ color: "text.secondary" }}
-                              >
-                                Developer mode required
-                              </Typography>
-                            )}
-                          </Stack>
-                          <Box
-                            sx={{
-                              mt: 1,
-                              display: "grid",
-                              gridTemplateColumns: {
-                                xs: "1fr",
-                                md: "repeat(4, minmax(0,1fr))",
-                              },
-                              gap: 1,
-                            }}
-                          >
-                            <Box>
-                              <Typography
-                                variant="caption"
-                                sx={{ color: "text.secondary" }}
-                              >
-                                Matched runs
-                              </Typography>
-                              <Typography variant="body2">
-                                {num(baseline.matched_runs, 0)}
-                              </Typography>
-                            </Box>
-                            <Box>
-                              <Typography
-                                variant="caption"
-                                sx={{ color: "text.secondary" }}
-                              >
-                                Success
-                              </Typography>
-                              <Typography variant="body2">
-                                {percentageLabel(baseline.success_rate, 1) ||
-                                  "-"}
-                              </Typography>
-                            </Box>
-                            <Box>
-                              <Typography
-                                variant="caption"
-                                sx={{ color: "text.secondary" }}
-                              >
-                                Failure
-                              </Typography>
-                              <Typography variant="body2">
-                                {percentageLabel(baseline.failure_rate, 1) ||
-                                  "-"}
-                              </Typography>
-                            </Box>
-                            <Box>
-                              <Typography
-                                variant="caption"
-                                sx={{ color: "text.secondary" }}
-                              >
-                                Tool errors
-                              </Typography>
-                              <Typography variant="body2">
-                                {percentageLabel(baseline.tool_error_rate, 1) ||
-                                  "-"}
-                              </Typography>
-                            </Box>
-                          </Box>
-                          {headings.length > 0 ? (
-                            <Stack
-                              direction="row"
-                              spacing={0.75}
-                              useFlexGap
-                              sx={{ flexWrap: "wrap", mt: 1 }}
-                            >
-                              {headings.map((heading) => (
-                                <Chip
-                                  key={`${candidateId}-${heading}`}
-                                  size="small"
-                                  variant="outlined"
-                                  label={heading}
-                                />
-                              ))}
                             </Stack>
-                          ) : null}
-                          <Box
-                            sx={{
-                              mt: 1,
-                              display: "grid",
-                              gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" },
-                              gap: 1,
-                            }}
-                          >
-                            <Box>
-                              <Typography
-                                variant="caption"
-                                sx={{
-                                  color: "text.secondary",
-                                  display: "block",
-                                  mb: 0.35,
-                                }}
-                              >
-                                Added / changed
-                              </Typography>
-                              {added.length === 0 ? (
-                                <Typography
-                                  variant="body2"
-                                  sx={{ color: "text.secondary" }}
+                            <EvolutionReviewEvidenceStrip evidence={reviewEvidence} />
+                            <Accordion disableGutters className="chat-workspace-section" sx={{ mt: 1 }}>
+                              <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+                                <Typography variant="body2">Technical details</Typography>
+                              </AccordionSummary>
+                              <AccordionDetails sx={{ pt: 0 }}>
+                                <Box
+                                  sx={{
+                                    display: "grid",
+                                    gridTemplateColumns: {
+                                      xs: "1fr",
+                                      md: "repeat(4, minmax(0,1fr))",
+                                    },
+                                    gap: 1,
+                                  }}
                                 >
-                                  No added lines recorded.
-                                </Typography>
-                              ) : (
-                                <Stack spacing={0.45}>
-                                  {added.slice(0, 5).map((line, lineIdx) => (
+                                  <Box>
+                                    <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                                      Matched runs
+                                    </Typography>
+                                    <Typography variant="body2">
+                                      {num(baseline.matched_runs, 0)}
+                                    </Typography>
+                                  </Box>
+                                  <Box>
+                                    <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                                      Success
+                                    </Typography>
+                                    <Typography variant="body2">
+                                      {percentageLabel(baseline.success_rate, 1) || "-"}
+                                    </Typography>
+                                  </Box>
+                                  <Box>
+                                    <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                                      Failure
+                                    </Typography>
+                                    <Typography variant="body2">
+                                      {percentageLabel(baseline.failure_rate, 1) || "-"}
+                                    </Typography>
+                                  </Box>
+                                  <Box>
+                                    <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                                      Tool errors
+                                    </Typography>
+                                    <Typography variant="body2">
+                                      {percentageLabel(baseline.tool_error_rate, 1) || "-"}
+                                    </Typography>
+                                  </Box>
+                                </Box>
+                                {headings.length > 0 ? (
+                                  <Stack
+                                    direction="row"
+                                    spacing={0.75}
+                                    useFlexGap
+                                    sx={{ flexWrap: "wrap", mt: 1 }}
+                                  >
+                                    {headings.map((heading) => (
+                                      <Chip
+                                        key={`${candidateId}-${heading}`}
+                                        size="small"
+                                        variant="outlined"
+                                        label={heading}
+                                      />
+                                    ))}
+                                  </Stack>
+                                ) : null}
+                                <Box
+                                  sx={{
+                                    mt: 1,
+                                    display: "grid",
+                                    gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" },
+                                    gap: 1,
+                                  }}
+                                >
+                                  <Box>
                                     <Typography
-                                      key={`${candidateId}-added-${lineIdx}`}
                                       variant="caption"
                                       sx={{
-                                        color: "#d8edff",
+                                        color: "text.secondary",
                                         display: "block",
+                                        mb: 0.35,
                                       }}
                                     >
-                                      + {line}
+                                      Added / changed
                                     </Typography>
-                                  ))}
-                                </Stack>
-                              )}
-                            </Box>
-                            <Box>
-                              <Typography
-                                variant="caption"
-                                sx={{
-                                  color: "text.secondary",
-                                  display: "block",
-                                  mb: 0.35,
-                                }}
-                              >
-                                Removed / replaced
-                              </Typography>
-                              {removed.length === 0 ? (
-                                <Typography
-                                  variant="body2"
-                                  sx={{ color: "text.secondary" }}
-                                >
-                                  No removed lines recorded.
-                                </Typography>
-                              ) : (
-                                <Stack spacing={0.45}>
-                                  {removed.slice(0, 5).map((line, lineIdx) => (
+                                    {added.length === 0 ? (
+                                      <Typography
+                                        variant="body2"
+                                        sx={{ color: "text.secondary" }}
+                                      >
+                                        No added lines recorded.
+                                      </Typography>
+                                    ) : (
+                                      <Stack spacing={0.45}>
+                                        {added.slice(0, 5).map((line, lineIdx) => (
+                                          <Typography
+                                            key={`${candidateId}-added-${lineIdx}`}
+                                            variant="caption"
+                                            sx={{
+                                              color: "#d8edff",
+                                              display: "block",
+                                            }}
+                                          >
+                                            + {line}
+                                          </Typography>
+                                        ))}
+                                      </Stack>
+                                    )}
+                                  </Box>
+                                  <Box>
                                     <Typography
-                                      key={`${candidateId}-removed-${lineIdx}`}
                                       variant="caption"
                                       sx={{
-                                        color: "#fdb4c0",
+                                        color: "text.secondary",
                                         display: "block",
+                                        mb: 0.35,
                                       }}
                                     >
-                                      - {line}
+                                      Removed / replaced
                                     </Typography>
-                                  ))}
-                                </Stack>
-                              )}
-                            </Box>
+                                    {removed.length === 0 ? (
+                                      <Typography
+                                        variant="body2"
+                                        sx={{ color: "text.secondary" }}
+                                      >
+                                        No removed lines recorded.
+                                      </Typography>
+                                    ) : (
+                                      <Stack spacing={0.45}>
+                                        {removed.slice(0, 5).map((line, lineIdx) => (
+                                          <Typography
+                                            key={`${candidateId}-removed-${lineIdx}`}
+                                            variant="caption"
+                                            sx={{
+                                              color: "#fdb4c0",
+                                              display: "block",
+                                            }}
+                                          >
+                                            - {line}
+                                          </Typography>
+                                        ))}
+                                      </Stack>
+                                    )}
+                                  </Box>
+                                </Box>
+                                {failureReasons.length > 0 ||
+                                selectedExamples.length > 0 ? (
+                                  <Box sx={{ mt: 1 }}>
+                                    <Typography
+                                      variant="caption"
+                                      sx={{
+                                        color: "text.secondary",
+                                        display: "block",
+                                        mb: 0.35,
+                                      }}
+                                    >
+                                      Evidence
+                                    </Typography>
+                                    <Stack spacing={0.45}>
+                                      {failureReasons
+                                        .slice(0, 3)
+                                        .map((line, lineIdx) => (
+                                          <Typography
+                                            key={`${candidateId}-failure-${lineIdx}`}
+                                            variant="caption"
+                                            sx={{
+                                              color: "text.secondary",
+                                              display: "block",
+                                            }}
+                                          >
+                                            Failure: {line}
+                                          </Typography>
+                                        ))}
+                                      {selectedExamples
+                                        .slice(0, 2)
+                                        .map((line, lineIdx) => (
+                                          <Typography
+                                            key={`${candidateId}-selected-${lineIdx}`}
+                                            variant="caption"
+                                            sx={{
+                                              color: "text.secondary",
+                                              display: "block",
+                                            }}
+                                          >
+                                            Mismatch: {line}
+                                          </Typography>
+                                        ))}
+                                    </Stack>
+                                  </Box>
+                                ) : null}
+                              </AccordionDetails>
+                            </Accordion>
                           </Box>
-                          {failureReasons.length > 0 ||
-                          selectedExamples.length > 0 ? (
-                            <Box sx={{ mt: 1 }}>
-                              <Typography
-                                variant="caption"
-                                sx={{
-                                  color: "text.secondary",
-                                  display: "block",
-                                  mb: 0.35,
-                                }}
-                              >
-                                Evidence
-                              </Typography>
-                              <Stack spacing={0.45}>
-                                {failureReasons
-                                  .slice(0, 3)
-                                  .map((line, lineIdx) => (
-                                    <Typography
-                                      key={`${candidateId}-failure-${lineIdx}`}
-                                      variant="caption"
-                                      sx={{
-                                        color: "text.secondary",
-                                        display: "block",
-                                      }}
-                                    >
-                                      Failure: {line}
-                                    </Typography>
-                                  ))}
-                                {selectedExamples
-                                  .slice(0, 2)
-                                  .map((line, lineIdx) => (
-                                    <Typography
-                                      key={`${candidateId}-selected-${lineIdx}`}
-                                      variant="caption"
-                                      sx={{
-                                        color: "text.secondary",
-                                        display: "block",
-                                      }}
-                                    >
-                                      Mismatch: {line}
-                                    </Typography>
-                                  ))}
-                              </Stack>
-                            </Box>
-                          ) : null}
-                        </Box>
-                      );
-                    })}
-                  </Stack>
-                </Box>
-              ) : null}
-              {nonSkillLearningCandidates.length > 0 ? (
-                <TableContainer className="table-shell">
-                  <Table size="small">
-                    <TableHead>
-                      <TableRow>
-                        <TableCell>Suggestion</TableCell>
-                        <TableCell>Why</TableCell>
-                        <TableCell align="right">Confidence</TableCell>
-                        <TableCell>Status</TableCell>
-                        <TableCell align="right">Action</TableCell>
-                      </TableRow>
-                    </TableHead>
-                    <TableBody>
-                      {nonSkillLearningCandidates.map((row, idx) => {
+                        );
+                      })}
+                    </Stack>
+                  </Box>
+                ) : null}
+                {visibleNonSkillLearningCandidates.length > 0 ? (
+                  <Box>
+                    <Typography
+                      variant="subtitle2"
+                      sx={{ color: "#e8f4ff", mb: 1 }}
+                    >
+                      Other suggestions
+                    </Typography>
+                    <Stack spacing={1}>
+                      {visibleNonSkillLearningCandidates.map((row, idx) => {
                         const candidateId = str(row.id, "");
                         const status = str(row.approval_status, "draft");
+                        const reviewEvidence = learningCandidateReviewEvidence(
+                          row,
+                          {
+                            strategyBaselineVersion: str(
+                              strategyCanary.baseline_version,
+                              "",
+                            ),
+                            patternById: learningPatternById,
+                            itemById: learningItemById,
+                          },
+                        );
+                        const canApprove =
+                          !!candidateId &&
+                          status !== "approved" &&
+                          status !== "rejected";
                         return (
-                          <TableRow
-                            key={`${candidateId || "candidate"}-${idx}`}
+                          <Box
+                            key={`learning-candidate-${candidateId || idx}`}
+                            sx={{
+                              p: 1.25,
+                              border: "1px solid rgba(145,170,205,0.12)",
+                              borderRadius: 1,
+                            }}
                           >
-                            <TableCell sx={{ maxWidth: 260 }}>
-                              <Typography variant="body2">
-                                {str(row.title, str(row.proposed_name, "-"))}
-                              </Typography>
-                              <Typography
-                                variant="caption"
-                                sx={{
-                                  color: "text.secondary",
-                                }}
-                              >
-                                {canonicalSkillIdentifier(
-                                  str(row.candidate_type, "-"),
-                                )}
-                              </Typography>
-                            </TableCell>
-                            <TableCell sx={{ maxWidth: 540 }}>
-                              <Typography variant="body2">
-                                {str(row.summary, str(row.preview, "-"))}
-                              </Typography>
-                            </TableCell>
-                            <TableCell align="right">
-                              {ratioPercent(row.confidence).toFixed(0)}%
-                            </TableCell>
-                            <TableCell>
-                              <Chip
-                                size="small"
-                                color={
-                                  status === "approved"
-                                    ? "success"
-                                    : status === "draft"
-                                      ? "warning"
-                                      : "default"
-                                }
-                                label={status}
-                              />
-                            </TableCell>
-                            <TableCell align="right">
-                              {developerModeEnabled ? (
+                            <Stack
+                              direction={{ xs: "column", md: "row" }}
+                              spacing={1}
+                              sx={{
+                                justifyContent: "space-between",
+                                alignItems: { xs: "flex-start", md: "center" },
+                              }}
+                            >
+                              <Box sx={{ minWidth: 0 }}>
                                 <Stack
                                   direction="row"
                                   spacing={0.75}
+                                  useFlexGap
                                   sx={{
-                                    justifyContent: "flex-end",
+                                    alignItems: "center",
+                                    flexWrap: "wrap",
+                                    mb: 0.45,
                                   }}
                                 >
-                                  <Button
-                                    size="small"
-                                    variant="contained"
-                                    disabled={
-                                      runEvolutionActionMutation.isPending ||
-                                      status === "approved" ||
-                                      !candidateId
-                                    }
-                                    onClick={() =>
-                                      void runEvolutionAction(
-                                        {
-                                          action: "approve_learning_candidate",
-                                          candidate_id: candidateId,
-                                        },
-                                        "Learning candidate approved.",
-                                      )
-                                    }
+                                  <Typography
+                                    variant="body2"
+                                    sx={{ color: "#e8f4ff", fontWeight: 600 }}
                                   >
-                                    Approve
-                                  </Button>
-                                  <Button
+                                    {str(row.title, str(row.proposed_name, "Suggestion"))}
+                                  </Typography>
+                                  <Chip
                                     size="small"
-                                    color="inherit"
-                                    disabled={
-                                      runEvolutionActionMutation.isPending ||
-                                      status === "rejected" ||
-                                      !candidateId
+                                    label={humanizeStatusLabel(str(row.candidate_type, "candidate"))}
+                                  />
+                                  <Chip
+                                    size="small"
+                                    color={
+                                      status === "approved"
+                                        ? "success"
+                                        : status === "draft"
+                                          ? "warning"
+                                          : "default"
                                     }
-                                    onClick={() =>
-                                      void runEvolutionAction(
-                                        {
-                                          action: "reject_learning_candidate",
-                                          candidate_id: candidateId,
-                                        },
-                                        "Learning candidate rejected.",
-                                      )
+                                    label={
+                                      status === "draft"
+                                        ? "Needs decision"
+                                        : humanizeStatusLabel(status)
                                     }
-                                  >
-                                    Reject
-                                  </Button>
+                                  />
+                                  <Chip
+                                    size="small"
+                                    variant="outlined"
+                                    label={`${ratioPercent(row.confidence).toFixed(0)}% confidence`}
+                                  />
                                 </Stack>
-                              ) : (
-                                <Typography
-                                  variant="caption"
-                                  sx={{
-                                    color: "text.secondary",
-                                  }}
-                                >
-                                  Developer mode required
+                                <Typography variant="body2">
+                                  {str(row.summary, str(row.preview, "-"))}
                                 </Typography>
-                              )}
-                            </TableCell>
-                          </TableRow>
+                              </Box>
+                              <Stack
+                                direction="row"
+                                spacing={0.75}
+                                sx={{ flexShrink: 0 }}
+                              >
+                                <Button
+                                  size="small"
+                                  variant="contained"
+                                  disabled={
+                                    runEvolutionActionMutation.isPending || !canApprove
+                                  }
+                                  onClick={() =>
+                                    void runEvolutionAction(
+                                      {
+                                        action: "approve_learning_candidate",
+                                        candidate_id: candidateId,
+                                      },
+                                      "Suggestion approved.",
+                                    )
+                                  }
+                                >
+                                  Approve
+                                </Button>
+                                <Button
+                                  size="small"
+                                  color="inherit"
+                                  disabled={
+                                    runEvolutionActionMutation.isPending || !canApprove
+                                  }
+                                  onClick={() =>
+                                    void runEvolutionAction(
+                                      {
+                                        action: "reject_learning_candidate",
+                                        candidate_id: candidateId,
+                                      },
+                                      "Suggestion rejected.",
+                                    )
+                                  }
+                                >
+                                  Reject
+                                </Button>
+                              </Stack>
+                            </Stack>
+                            <EvolutionReviewEvidenceStrip evidence={reviewEvidence} />
+                            <Accordion disableGutters className="chat-workspace-section" sx={{ mt: 1 }}>
+                              <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+                                <Typography variant="body2">Technical details</Typography>
+                              </AccordionSummary>
+                              <AccordionDetails sx={{ pt: 0 }}>
+                                <Stack spacing={0.45}>
+                                  <Typography
+                                    variant="caption"
+                                    sx={{ color: "text.secondary", display: "block" }}
+                                  >
+                                    Type: {canonicalSkillIdentifier(str(row.candidate_type, "-"))}
+                                  </Typography>
+                                  <Typography
+                                    variant="caption"
+                                    sx={{ color: "text.secondary", display: "block" }}
+                                  >
+                                    Confidence: {ratioPercent(row.confidence).toFixed(0)}%
+                                  </Typography>
+                                  <Typography
+                                    variant="caption"
+                                    sx={{ color: "text.secondary", display: "block" }}
+                                  >
+                                    Status: {humanizeStatusLabel(status)}
+                                  </Typography>
+                                </Stack>
+                              </AccordionDetails>
+                            </Accordion>
+                          </Box>
                         );
                       })}
-                    </TableBody>
-                  </Table>
-                </TableContainer>
-              ) : null}
-            </Stack>
-          )}
-        </Box>
+                    </Stack>
+                  </Box>
+                ) : null}
+              </Stack>
+            )}
+          </Box>
+          {(num(promptTelemetrySummary.sample_count, 0) > 0 ||
+            promptTelemetrySections.length > 0) ? (
+            <Accordion disableGutters className="chat-workspace-section">
+              <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+                <Typography variant="body2">
+                  Technical evidence from recent prompt traffic
+                </Typography>
+              </AccordionSummary>
+              <AccordionDetails sx={{ pt: 0 }}>
+                <Alert severity="info" sx={{ borderRadius: 1, mb: 1 }}>
+                  These metrics explain why ArkEvolve generated some review
+                  suggestions. They are technical evidence, not required reading
+                  before you approve or reject.
+                </Alert>
+                <Box
+                  sx={{
+                    display: "grid",
+                    gridTemplateColumns: {
+                      xs: "1fr 1fr",
+                      lg: "repeat(5, minmax(0,1fr))",
+                    },
+                    gap: 1,
+                    mb: promptTelemetrySections.length > 0 ? 1 : 0,
+                  }}
+                >
+                  <Box
+                    sx={{
+                      p: 1,
+                      border: "1px solid rgba(145,170,205,0.12)",
+                      borderRadius: 1,
+                    }}
+                  >
+                    <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                      Samples
+                    </Typography>
+                    <Typography variant="body2">
+                      {num(promptTelemetrySummary.sample_count, 0).toLocaleString()}
+                    </Typography>
+                  </Box>
+                  <Box
+                    sx={{
+                      p: 1,
+                      border: "1px solid rgba(145,170,205,0.12)",
+                      borderRadius: 1,
+                    }}
+                  >
+                    <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                      p95 final prompt
+                    </Typography>
+                    <Typography variant="body2">
+                      {charsLabel(promptTelemetrySummary.p95_final_prompt_chars)}
+                    </Typography>
+                  </Box>
+                  <Box
+                    sx={{
+                      p: 1,
+                      border: "1px solid rgba(145,170,205,0.12)",
+                      borderRadius: 1,
+                    }}
+                  >
+                    <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                      p95 tool schema
+                    </Typography>
+                    <Typography variant="body2">
+                      {charsLabel(promptTelemetrySummary.p95_tool_schema_chars)}
+                    </Typography>
+                  </Box>
+                  <Box
+                    sx={{
+                      p: 1,
+                      border: "1px solid rgba(145,170,205,0.12)",
+                      borderRadius: 1,
+                    }}
+                  >
+                    <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                      p95 request size
+                    </Typography>
+                    <Typography variant="body2">
+                      {charsLabel(
+                        promptTelemetrySummary.p95_estimated_total_request_chars,
+                      )}
+                    </Typography>
+                  </Box>
+                  <Box
+                    sx={{
+                      p: 1,
+                      border: "1px solid rgba(145,170,205,0.12)",
+                      borderRadius: 1,
+                    }}
+                  >
+                    <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                      Avg tools
+                    </Typography>
+                    <Typography variant="body2">
+                      {num(promptTelemetrySummary.avg_tool_count, -1) >= 0
+                        ? num(promptTelemetrySummary.avg_tool_count, 0).toFixed(2)
+                        : "-"}
+                    </Typography>
+                  </Box>
+                </Box>
+                {promptTelemetrySections.length > 0 ? (
+                  <Box>
+                    <Typography
+                      variant="caption"
+                      sx={{
+                        color: "text.secondary",
+                        display: "block",
+                        mb: 0.45,
+                      }}
+                    >
+                      Largest prompt sections
+                    </Typography>
+                    <Stack spacing={0.45}>
+                      {promptTelemetrySections.slice(0, 6).map((row, idx) => (
+                        <Typography
+                          key={`prompt-section-${str(row.section, idx.toString())}`}
+                          variant="caption"
+                          sx={{ color: "text.secondary", display: "block" }}
+                        >
+                          {str(row.section, "section")}: p95 {charsLabel(row.p95_chars)},
+                          {" "}p50 {charsLabel(row.p50_chars)}, avg {charsLabel(row.avg_chars)}
+                        </Typography>
+                      ))}
+                    </Stack>
+                  </Box>
+                ) : null}
+              </AccordionDetails>
+            </Accordion>
+          ) : null}
+        </Stack>
       ) : null}
     </WorkspacePageShell>
   );
@@ -37838,6 +38607,8 @@ function SettingsManager({
   const [autonomyPauseDialogOpen, setAutonomyPauseDialogOpen] = useState(false);
   const [selfEvolveDisableDialogOpen, setSelfEvolveDisableDialogOpen] =
     useState(false);
+  const [sentinelDisableDialogOpen, setSentinelDisableDialogOpen] =
+    useState(false);
   const [
     rotateInternalCredentialsDialogOpen,
     setRotateInternalCredentialsDialogOpen,
@@ -37880,6 +38651,8 @@ function SettingsManager({
   const [developerModeEnabled, setDeveloperModeEnabledState] = useState(
     getDeveloperModeEnabled,
   );
+  const [savedDeveloperModeEnabled, setSavedDeveloperModeEnabledState] =
+    useState(getDeveloperModeEnabled);
   const [trustPresetId, setTrustPresetId] = useState(
     TRUST_APPROVAL_PRESETS[0]?.id ?? "run_terminal_command",
   );
@@ -37933,8 +38706,11 @@ function SettingsManager({
   }, [tab]);
 
   useEffect(() => {
-    const refreshDeveloperMode = () =>
-      setDeveloperModeEnabledState(getDeveloperModeEnabled());
+    const refreshDeveloperMode = () => {
+      const next = getDeveloperModeEnabled();
+      setDeveloperModeEnabledState(next);
+      setSavedDeveloperModeEnabledState(next);
+    };
     window.addEventListener(
       DEVELOPER_MODE_EVENT,
       refreshDeveloperMode as EventListener,
@@ -38383,8 +39159,11 @@ function SettingsManager({
     }
   }
 
-  const effectiveDirty =
+  const settingsFormDirty =
     dirty && snapshotSettingsForm(form) !== savedFormSnapshot;
+  const developerModeDirty =
+    developerModeEnabled !== savedDeveloperModeEnabled;
+  const effectiveDirty = settingsFormDirty || developerModeDirty;
 
   function setField<K extends keyof typeof form>(
     key: K,
@@ -39402,6 +40181,25 @@ function SettingsManager({
     },
   });
 
+  async function handleSaveSettings() {
+    setError(null);
+    setSuccess(null);
+    try {
+      if (settingsFormDirty) {
+        await saveMutation.mutateAsync();
+      }
+      if (developerModeDirty) {
+        setDeveloperModeEnabled(developerModeEnabled);
+        setSavedDeveloperModeEnabledState(developerModeEnabled);
+        if (!settingsFormDirty) {
+          setSuccess("Saved settings.");
+        }
+      }
+    } catch (e) {
+      setError(errMessage(e));
+    }
+  }
+
   const runMoltbookMutation = useMutation({
     mutationFn: () => api.rawPost("/moltbook/run", {}),
     onSuccess: async () => {
@@ -39539,6 +40337,10 @@ function SettingsManager({
     openedBrowser: boolean;
   } | null>(null);
   const [codexAuthBusy, setCodexAuthBusy] = useState(false);
+  const [modelConnectionTestResult, setModelConnectionTestResult] = useState<{
+    ok: boolean;
+    message: string;
+  } | null>(null);
   const [modelForm, setModelForm] = useState({
     label: "",
     role: "primary",
@@ -39613,6 +40415,45 @@ function SettingsManager({
     modelCanReuseExistingKey &&
     modelForm.provider !== "ollama" &&
     modelForm.provider !== "openai-subscription";
+  const modelCanReuseSavedKeyForTest =
+    !!modelEditingId &&
+    modelEditingHasApiKey &&
+    modelCanReuseExistingKey &&
+    !modelClearSavedKeyPending;
+  const modelProviderRequiresBaseUrl =
+    modelForm.provider === "ollama" ||
+    modelForm.provider === "openai-compatible";
+  const modelProviderRequiresApiKey = [
+    "anthropic",
+    "openai",
+    "openrouter",
+    "huggingface",
+  ].includes(modelForm.provider);
+  const canTestModelConnection =
+    !!modelForm.label.trim() &&
+    !!modelForm.provider.trim() &&
+    !!modelForm.model.trim() &&
+    (!modelProviderRequiresBaseUrl || !!modelForm.base_url.trim()) &&
+    (!modelProviderRequiresApiKey ||
+      !!modelPendingApiKey ||
+      modelCanReuseSavedKeyForTest);
+  const modelTestConnectionHint = !modelForm.label.trim()
+    ? "Enter a label before testing."
+    : !modelForm.provider.trim()
+    ? "Choose a provider to test."
+    : !modelForm.model.trim()
+      ? "Enter a model ID to test."
+      : modelProviderRequiresBaseUrl && !modelForm.base_url.trim()
+        ? modelForm.provider === "ollama"
+          ? "Enter the Ollama base URL before testing."
+          : "Enter the base URL before testing."
+        : modelProviderRequiresApiKey &&
+            !modelPendingApiKey &&
+            !modelCanReuseSavedKeyForTest
+          ? modelEditingId
+            ? "Enter a replacement API key before testing this draft."
+            : "Enter an API key before testing."
+          : "";
 
   useEffect(() => {
     const prevProvider = previousModelProviderRef.current;
@@ -39657,6 +40498,20 @@ function SettingsManager({
         : { ...p, base_url: next, model: nextModel };
     });
   }, [modelForm.provider]);
+
+  useEffect(() => {
+    setModelConnectionTestResult(null);
+  }, [
+    modelEditingId,
+    modelForm.label,
+    modelForm.role,
+    modelForm.provider,
+    modelForm.model,
+    modelForm.base_url,
+    modelForm.api_key,
+    modelForm.enabled,
+    modelClearApiKey,
+  ]);
 
   const discoverModelsQ = useQuery({
     queryKey: [
@@ -39757,6 +40612,7 @@ function SettingsManager({
     setModelEditingId(null);
     setModelAdvancedOpen(false);
     setModelConnectivityWarning(null);
+    setModelConnectionTestResult(null);
     setModelEditingHasApiKey(false);
     setModelEditingOriginalScope({ provider: "", base_url: "" });
     setModelClearApiKey(false);
@@ -39780,6 +40636,7 @@ function SettingsManager({
     setModelEditingId(str(slot.id, ""));
     setModelAdvancedOpen(false);
     setModelConnectivityWarning(null);
+    setModelConnectionTestResult(null);
     setModelEditingHasApiKey(toBool(slot.has_api_key));
     setModelEditingOriginalScope({
       provider,
@@ -39873,77 +40730,87 @@ function SettingsManager({
     }
   }
 
-  const saveModelMutation = useMutation({
+  function buildModelRequestPayload() {
+    const provider = modelForm.provider;
+    const baseUrl = modelForm.base_url.trim();
+    if (!provider.trim()) throw new Error("Provider is required.");
+    const normalizedBaseUrl =
+      provider === "openai-subscription" ? "" : baseUrl;
+    const payload: Record<string, unknown> = {
+      label: modelForm.label.trim(),
+      role: modelForm.role,
+      provider,
+      model: modelForm.model.trim(),
+      base_url: normalizedBaseUrl || null,
+      api_key: modelPendingApiKey || null,
+      clear_api_key:
+        !!modelEditingId && modelClearApiKey && !modelPendingApiKey,
+      enabled: modelForm.enabled,
+    };
+
+    if (!payload.label || !payload.model)
+      throw new Error("Label and model are required.");
+
+    return payload;
+  }
+
+  const testModelConnectionMutation = useMutation({
     mutationFn: async () => {
-      const provider = modelForm.provider;
-      const baseUrl = modelForm.base_url.trim();
-      if (!provider.trim()) throw new Error("Provider is required.");
-      const normalizedBaseUrl =
-        provider === "openai-subscription" ? "" : baseUrl;
-      const payload: Record<string, unknown> = {
-        label: modelForm.label.trim(),
-        role: modelForm.role,
-        provider,
-        model: modelForm.model.trim(),
-        base_url: normalizedBaseUrl || null,
-        api_key: modelPendingApiKey || null,
-        clear_api_key:
-          !!modelEditingId && modelClearApiKey && !modelPendingApiKey,
-        enabled: modelForm.enabled,
-      };
-
-      if (!payload.label || !payload.model)
-        throw new Error("Label and model are required.");
-
-      if (modelEditingId) {
-        const response = asRecord(
-          await api.rawPut(
-            `/models/${encodeURIComponent(modelEditingId)}`,
-            payload,
-          ),
-        );
-        const connectivityRaw = response.connectivity;
-        const hasConnectivity =
-          connectivityRaw !== undefined && connectivityRaw !== null;
-        const connectivity = asRecord(connectivityRaw);
-        return {
-          connectivityOk: hasConnectivity ? toBool(connectivity.ok) : true,
-          connectivityError: hasConnectivity
-            ? str(connectivity.error, "").trim()
-            : "",
-        };
-      }
-      const response = asRecord(await api.rawPost("/models", payload));
-      const connectivityRaw = response.connectivity;
-      const hasConnectivity =
-        connectivityRaw !== undefined && connectivityRaw !== null;
-      const connectivity = asRecord(connectivityRaw);
+      const payload = buildModelRequestPayload();
+      const response = asRecord(
+        await api.rawPost(
+          "/models/test",
+          {
+            id: modelEditingId,
+            ...payload,
+          },
+          { timeoutMs: 15000 },
+        ),
+      );
       return {
-        connectivityOk: hasConnectivity ? toBool(connectivity.ok) : true,
-        connectivityError: hasConnectivity
-          ? str(connectivity.error, "").trim()
-          : "",
+        ok: toBool(response.ok),
+        error: str(response.error, "").trim(),
       };
     },
-    onSuccess: async (result: {
-      connectivityOk: boolean;
-      connectivityError: string;
-    }) => {
+    onSuccess: (result: { ok: boolean; error: string }) => {
+      setModelConnectionTestResult(
+        result.ok
+          ? {
+              ok: true,
+              message: "Connection check passed.",
+            }
+          : {
+              ok: false,
+              message: result.error || "Connection check failed.",
+            },
+      );
+    },
+    onError: (e) => {
+      setModelConnectionTestResult({
+        ok: false,
+        message: errMessage(e),
+      });
+    },
+  });
+
+  const saveModelMutation = useMutation({
+    mutationFn: async () => {
+      const payload = buildModelRequestPayload();
+
+      if (modelEditingId) {
+        await api.rawPut(`/models/${encodeURIComponent(modelEditingId)}`, payload, {
+          timeoutMs: 15000,
+        });
+        return;
+      }
+      await api.rawPost("/models", payload, { timeoutMs: 15000 });
+    },
+    onSuccess: async () => {
       const wasEdit = !!modelEditingId;
       setModelDialogOpen(false);
-      if (!result.connectivityOk) {
-        setModelConnectivityWarning(
-          `Model saved, but connection test failed: ${result.connectivityError || "could not reach provider"}. Runs may fail until fixed.`,
-        );
-        setSuccess(
-          wasEdit
-            ? "Model updated (connectivity issue detected)."
-            : "Model added (connectivity issue detected).",
-        );
-      } else {
-        setModelConnectivityWarning(null);
-        setSuccess(wasEdit ? "Model updated." : "Model added.");
-      }
+      setModelConnectionTestResult(null);
+      setModelConnectivityWarning(null);
+      setSuccess(wasEdit ? "Model updated." : "Model added.");
       await queryClient.invalidateQueries({ queryKey: ["models"] });
       await queryClient.invalidateQueries({ queryKey: ["settings"] });
     },
@@ -39972,7 +40839,9 @@ function SettingsManager({
     mutationFn: async (slot: JsonRecord) => {
       const id = str(slot.id, "").trim();
       try {
-        await api.rawDelete(`/models/${encodeURIComponent(id)}`);
+        await api.rawDelete(`/models/${encodeURIComponent(id)}`, {
+          timeoutMs: 15000,
+        });
         return { alreadyRemoved: false };
       } catch (e) {
         const message = errMessage(e);
@@ -40004,7 +40873,9 @@ function SettingsManager({
         base_url: str(slot.base_url, "") || null,
         enabled: !toBool(slot.enabled),
       };
-      return await api.rawPut(`/models/${encodeURIComponent(id)}`, payload);
+      return await api.rawPut(`/models/${encodeURIComponent(id)}`, payload, {
+        timeoutMs: 15000,
+      });
     },
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["models"] });
@@ -42210,6 +43081,11 @@ function SettingsManager({
     setSelfEvolveDisableDialogOpen(false);
   }
 
+  function closeSentinelDisableDialog() {
+    if (settingsSentinelMutation.isPending) return;
+    setSentinelDisableDialogOpen(false);
+  }
+
   async function updateSettingsEvolution(
     payload: JsonRecord,
     message: string,
@@ -42239,6 +43115,18 @@ function SettingsManager({
     } catch {
       // handled by mutation onError
       return false;
+    }
+  }
+
+  async function submitSentinelDisableDialog() {
+    const changed = await updateSettingsSentinel(
+      { enabled: false },
+      settingsAutonomyPaused
+        ? "ArkSentinel turned off. It will stay off after autonomy resumes until you turn it back on."
+        : "ArkSentinel turned off. Follow-up scanning and routine suggestions are paused until you turn it back on.",
+    );
+    if (changed) {
+      setSentinelDisableDialogOpen(false);
     }
   }
 
@@ -43293,14 +44181,8 @@ function SettingsManager({
                       <Button
                         size="small"
                         variant="contained"
-                        onClick={async () => {
-                          setError(null);
-                          setSuccess(null);
-                          try {
-                            await saveMutation.mutateAsync();
-                          } catch (e) {
-                            setError(errMessage(e));
-                          }
+                        onClick={() => {
+                          void handleSaveSettings();
                         }}
                         disabled={saveMutation.isPending || !effectiveDirty}
                       >
@@ -44661,6 +45543,25 @@ function SettingsManager({
                         }
                         label="Enabled"
                       />
+                      {modelConnectionTestResult ? (
+                        <Alert
+                          severity={
+                            modelConnectionTestResult.ok ? "success" : "warning"
+                          }
+                        >
+                          {modelConnectionTestResult.message}
+                        </Alert>
+                      ) : null}
+                      {modelTestConnectionHint ? (
+                        <Typography
+                          variant="caption"
+                          sx={{
+                            color: "text.secondary",
+                          }}
+                        >
+                          {modelTestConnectionHint}
+                        </Typography>
+                      ) : null}
                       <Stack
                         direction="row"
                         spacing={1}
@@ -44672,19 +45573,44 @@ function SettingsManager({
                           Cancel
                         </Button>
                         <Button
+                          variant="outlined"
+                          onClick={async () => {
+                            setError(null);
+                            setModelConnectionTestResult(null);
+                            try {
+                              await testModelConnectionMutation.mutateAsync();
+                            } catch (e) {
+                              setError(errMessage(e));
+                            }
+                          }}
+                          disabled={
+                            !canTestModelConnection ||
+                            saveModelMutation.isPending ||
+                            testModelConnectionMutation.isPending
+                          }
+                        >
+                          {testModelConnectionMutation.isPending
+                            ? "Testing..."
+                            : "Test Connection"}
+                        </Button>
+                        <Button
                           variant="contained"
                           onClick={async () => {
                             setError(null);
                             setModelConnectivityWarning(null);
+                            setModelConnectionTestResult(null);
                             try {
                               await saveModelMutation.mutateAsync();
                             } catch (e) {
                               setError(errMessage(e));
                             }
                           }}
-                          disabled={saveModelMutation.isPending}
+                          disabled={
+                            saveModelMutation.isPending ||
+                            testModelConnectionMutation.isPending
+                          }
                         >
-                          Save
+                          {saveModelMutation.isPending ? "Saving..." : "Save"}
                         </Button>
                       </Stack>
                     </Stack>
@@ -46265,7 +47191,7 @@ function SettingsManager({
                           color: "text.secondary",
                         }}
                       >
-                        Enables raw SKILL.md editing. Keep off for
+                        Enables raw SKILL.md editing after you save. Keep off for
                         beginner-friendly forms.
                       </Typography>
                     </Stack>
@@ -46275,14 +47201,9 @@ function SettingsManager({
                           checked={developerModeEnabled}
                           onChange={(e) => {
                             const next = e.target.checked;
-                            setDeveloperModeEnabled(next);
                             setDeveloperModeEnabledState(next);
                             setError(null);
-                            setSuccess(
-                              next
-                                ? "Developer mode enabled."
-                                : "Developer mode disabled.",
-                            );
+                            setSuccess(null);
                           }}
                         />
                       }
@@ -46521,7 +47442,16 @@ function SettingsManager({
                           control={
                             <Switch
                               checked={enabled}
-                              onChange={(event) =>
+                              onChange={(event) => {
+                                if (
+                                  item.key === "enabled" &&
+                                  !event.target.checked
+                                ) {
+                                  setError(null);
+                                  setSuccess(null);
+                                  setSentinelDisableDialogOpen(true);
+                                  return;
+                                }
                                 void updateSettingsSentinel(
                                   {
                                     [item.key]: event.target.checked,
@@ -46529,8 +47459,8 @@ function SettingsManager({
                                   event.target.checked
                                     ? item.enabledMessage
                                     : item.disabledMessage,
-                                )
-                              }
+                                );
+                              }}
                               disabled={
                                 settingsSentinelQ.isLoading ||
                                 !!settingsSentinelQ.error ||
@@ -48946,7 +49876,7 @@ function SettingsManager({
               >
                 {selectedPulseFindings.length === 0
                   ? "This run did not return any actionable issues."
-                  : "Work from top to bottom. Each item includes the cause, the recommended remediation, and the safest next action available here."}
+                  : "Work from top to bottom. Each item includes the cause, the recommended next step, and the safest action available here."}
               </Typography>
             </Stack>
             {selectedPulseFindings.length === 0 ? (
@@ -49013,6 +49943,9 @@ function SettingsManager({
                   const fix = displayRemediation
                     ? describeArkPulseRemediation(displayRemediation)
                     : getArkPulseFixText(fr);
+                  const useMonospaceFix =
+                    displayRemediation?.kind === "shell_command" ||
+                    (!displayRemediation && rawFixCommand.length > 0);
                   const canCopyFix =
                     fix.trim().length > 0 && fix.trim() !== "-";
                   const canRunFix = runnableRemediation != null;
@@ -49108,8 +50041,12 @@ function SettingsManager({
                               variant="body2"
                               sx={{
                                 mt: 0.6,
-                                fontFamily:
-                                  "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                                ...(useMonospaceFix
+                                  ? {
+                                      fontFamily:
+                                        "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                                    }
+                                  : {}),
                                 whiteSpace: "pre-wrap",
                                 overflowWrap: "anywhere",
                                 color: "rgba(245, 247, 250, 0.92)",
@@ -49145,7 +50082,7 @@ function SettingsManager({
                                 }
                               }}
                             >
-                              Copy remediation
+                              Copy next step
                             </Button>
                             <Button
                               size="small"
@@ -49182,7 +50119,9 @@ function SettingsManager({
                                 }
                               }}
                             >
-                              {fixBusy ? "Running..." : "Run fix now"}
+                              {fixBusy
+                                ? "Running..."
+                                : arkPulseRunActionLabel(displayRemediation)}
                             </Button>
                           </Stack>
                           <Typography
@@ -49192,11 +50131,10 @@ function SettingsManager({
                               lineHeight: 1.45,
                             }}
                           >
-                            {typedRemediation
-                              ? "Runs directly from ArkPulse using the finding's typed remediation."
-                              : canRunFix
-                                ? "Legacy event: ArkPulse is using the saved fix command fallback for this run."
-                                : "This remediation is advisory only. Copy and run manually."}
+                            {arkPulseRemediationFootnote(
+                              typedRemediation,
+                              canRunFix,
+                            )}
                           </Typography>
                         </Stack>
                       </Box>
@@ -49504,7 +50442,7 @@ function SettingsManager({
               ))}
             </Grid2>
 
-            {developerModeEnabled ? (
+            {savedDeveloperModeEnabled ? (
               <Accordion
                 disableGutters
                 sx={{
@@ -50398,6 +51336,53 @@ function SettingsManager({
         </DialogActions>
       </Dialog>
       <Dialog
+        open={sentinelDisableDialogOpen}
+        onClose={closeSentinelDisableDialog}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>Turn off ArkSentinel?</DialogTitle>
+        <DialogContent>
+          <Stack spacing={1.2} sx={{ mt: 0.5 }}>
+            <Alert severity="warning">
+              This stops ArkSentinel follow-up scanning in the background.
+            </Alert>
+            <Typography variant="body2" sx={{ color: "text.secondary" }}>
+              While ArkSentinel is off:
+            </Typography>
+            <Typography variant="body2">
+              1. New follow-up suggestions from in-app and connected-app activity
+              stop.
+            </Typography>
+            <Typography variant="body2">
+              2. Routine-detection proposals stop appearing.
+            </Typography>
+            <Typography variant="body2" sx={{ color: "text.secondary" }}>
+              3. Existing preferences stay saved, but ArkSentinel stays off until
+              you turn it back on.
+            </Typography>
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button
+            onClick={closeSentinelDisableDialog}
+            disabled={settingsSentinelMutation.isPending}
+          >
+            Cancel
+          </Button>
+          <Button
+            variant="contained"
+            color="warning"
+            onClick={submitSentinelDisableDialog}
+            disabled={settingsSentinelMutation.isPending}
+          >
+            {settingsSentinelMutation.isPending
+              ? "Turning off..."
+              : "Turn off ArkSentinel"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+      <Dialog
         open={rotateInternalCredentialsDialogOpen}
         onClose={closeRotateInternalCredentialsDialog}
         maxWidth="sm"
@@ -50747,44 +51732,77 @@ function AnalyticsManager({ autoRefresh }: { autoRefresh: boolean }) {
   const tokensValue = compactNumber(num(totals?.total_tokens, 0));
   const policyMetricsOption = {
     backgroundColor: "transparent",
-    animationDuration: 400,
-    grid: { left: 56, right: 58, top: 24, bottom: 88 },
+    animationDuration: 700,
+    animationEasing: "cubicOut",
+    grid: { left: 56, right: 58, top: 28, bottom: 76 },
     legend: {
-      bottom: 12,
-      textStyle: { color: "#a9c4df" },
+      bottom: 10,
+      icon: "roundRect",
+      itemWidth: 10,
+      itemHeight: 10,
+      itemGap: 20,
+      textStyle: { color: "#a9c4df", fontSize: 11, fontWeight: 500 },
     },
     tooltip: {
       trigger: "axis",
-      backgroundColor: "rgba(6,14,28,0.95)",
-      borderColor: "rgba(84,198,255,0.25)",
-      textStyle: { color: "#d8edff" },
+      axisPointer: {
+        type: "shadow",
+        shadowStyle: { color: "rgba(84, 198, 255, 0.06)" },
+      },
+      backgroundColor: "rgba(6, 14, 28, 0.92)",
+      borderColor: "rgba(84, 198, 255, 0.35)",
+      borderWidth: 1,
+      padding: [8, 12],
+      textStyle: { color: "#d8edff", fontSize: 12 },
     },
     xAxis: {
       type: "category",
       data: policyChartLabels,
       axisLabel: {
         color: "#8fb2d1",
+        fontSize: 11,
         rotate: 0,
         lineHeight: 14,
       },
-      axisLine: { lineStyle: { color: "rgba(108,156,212,0.25)" } },
+      axisLine: { lineStyle: { color: "rgba(108, 156, 212, 0.18)" } },
+      axisTick: { show: false },
     },
     yAxis: [
       {
         type: "value",
         name: "Success/Error %",
+        nameTextStyle: {
+          color: "#6c8fae",
+          fontSize: 10,
+          padding: [0, 0, 6, 0],
+        },
         min: 0,
         max: 100,
         axisLabel: {
-          color: "#8fb2d1",
+          color: "#6c8fae",
+          fontSize: 10,
           formatter: "{value}%",
         },
-        splitLine: { lineStyle: { color: "rgba(108,156,212,0.12)" } },
+        axisLine: { show: false },
+        axisTick: { show: false },
+        splitLine: {
+          lineStyle: {
+            color: "rgba(108, 156, 212, 0.08)",
+            type: "dashed",
+          },
+        },
       },
       {
         type: "value",
         name: "p95 ms",
-        axisLabel: { color: "#8fb2d1" },
+        nameTextStyle: {
+          color: "#6c8fae",
+          fontSize: 10,
+          padding: [0, 0, 6, 0],
+        },
+        axisLabel: { color: "#6c8fae", fontSize: 10 },
+        axisLine: { show: false },
+        axisTick: { show: false },
         splitLine: { show: false },
       },
     ],
@@ -50792,30 +51810,105 @@ function AnalyticsManager({ autoRefresh }: { autoRefresh: boolean }) {
       {
         name: "Success",
         type: "bar",
+        barMaxWidth: 28,
+        barGap: "20%",
         data: policyMetricsRows.map((row) =>
           Number((num(row.success_rate, 0) * 100).toFixed(1)),
         ),
-        itemStyle: { color: "#14f195", borderRadius: [6, 6, 0, 0] },
+        itemStyle: {
+          borderRadius: [10, 10, 0, 0],
+          color: {
+            type: "linear",
+            x: 0,
+            y: 0,
+            x2: 0,
+            y2: 1,
+            colorStops: [
+              { offset: 0, color: "rgba(47, 255, 186, 0.95)" },
+              { offset: 0.5, color: "rgba(20, 241, 149, 0.72)" },
+              { offset: 1, color: "rgba(20, 241, 149, 0.10)" },
+            ],
+          },
+          shadowColor: "rgba(20, 241, 149, 0.35)",
+          shadowBlur: 14,
+        },
+        emphasis: {
+          itemStyle: {
+            shadowBlur: 22,
+            shadowColor: "rgba(47, 255, 186, 0.55)",
+          },
+        },
       },
       {
         name: "Errors",
         type: "bar",
+        barMaxWidth: 28,
+        barGap: "20%",
         data: policyMetricsRows.map((row) =>
           Number((num(row.error_rate, 0) * 100).toFixed(1)),
         ),
-        itemStyle: { color: "#ff7b72", borderRadius: [6, 6, 0, 0] },
+        itemStyle: {
+          borderRadius: [10, 10, 0, 0],
+          color: {
+            type: "linear",
+            x: 0,
+            y: 0,
+            x2: 0,
+            y2: 1,
+            colorStops: [
+              { offset: 0, color: "rgba(255, 138, 128, 0.95)" },
+              { offset: 0.5, color: "rgba(255, 110, 96, 0.72)" },
+              { offset: 1, color: "rgba(255, 110, 96, 0.10)" },
+            ],
+          },
+          shadowColor: "rgba(255, 110, 96, 0.32)",
+          shadowBlur: 14,
+        },
+        emphasis: {
+          itemStyle: {
+            shadowBlur: 22,
+            shadowColor: "rgba(255, 138, 128, 0.55)",
+          },
+        },
       },
       {
         name: "p95 latency",
         type: "line",
         yAxisIndex: 1,
         smooth: true,
-        symbolSize: 8,
+        symbol: "circle",
+        symbolSize: 10,
+        showSymbol: true,
+        z: 5,
         data: policyMetricsRows.map((row) =>
           row.p95_latency_ms == null ? null : num(row.p95_latency_ms, 0),
         ),
-        lineStyle: { color: "#2fd4ff", width: 2.5 },
-        itemStyle: { color: "#2fd4ff" },
+        lineStyle: {
+          color: "#2fd4ff",
+          width: 2.5,
+          shadowColor: "rgba(47, 212, 255, 0.55)",
+          shadowBlur: 10,
+        },
+        itemStyle: {
+          color: "#2fd4ff",
+          borderColor: "#e8f4ff",
+          borderWidth: 2,
+          shadowColor: "rgba(47, 212, 255, 0.7)",
+          shadowBlur: 12,
+        },
+        areaStyle: {
+          color: {
+            type: "linear",
+            x: 0,
+            y: 0,
+            x2: 0,
+            y2: 1,
+            colorStops: [
+              { offset: 0, color: "rgba(47, 212, 255, 0.22)" },
+              { offset: 1, color: "rgba(47, 212, 255, 0)" },
+            ],
+          },
+        },
       },
     ],
   };

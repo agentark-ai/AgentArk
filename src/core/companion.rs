@@ -145,8 +145,13 @@ fn normalize_resources(values: BTreeMap<String, Vec<String>>) -> BTreeMap<String
 }
 
 fn scope_subset(requested: &[String], allowed: &[String]) -> bool {
-    let allowed = allowed.iter().map(|value| value.as_str()).collect::<BTreeSet<_>>();
-    requested.iter().all(|scope| allowed.contains(scope.as_str()))
+    let allowed = allowed
+        .iter()
+        .map(|value| value.as_str())
+        .collect::<BTreeSet<_>>();
+    requested
+        .iter()
+        .all(|scope| allowed.contains(scope.as_str()))
 }
 
 fn resource_subset(
@@ -662,7 +667,10 @@ impl CompanionControlPlane {
     }
 
     async fn read_index(&self, key: &str) -> Result<Vec<String>> {
-        Ok(self.read_json::<Vec<String>>(key).await?.unwrap_or_default())
+        Ok(self
+            .read_json::<Vec<String>>(key)
+            .await?
+            .unwrap_or_default())
     }
 
     async fn write_index(&self, key: &str, ids: &[String]) -> Result<()> {
@@ -1069,7 +1077,9 @@ impl CompanionControlPlane {
                 for (key, value) in claim.metadata {
                     let key = key.trim();
                     if !key.is_empty() {
-                        session.metadata.insert(key.to_string(), value.trim().to_string());
+                        session
+                            .metadata
+                            .insert(key.to_string(), value.trim().to_string());
                     }
                 }
                 self.write_json(&pairing_key(&session.id), &session).await?;
@@ -1105,7 +1115,8 @@ impl CompanionControlPlane {
                 })
             }
             CompanionPairingStatus::Approved => {
-                if session.claimed_device_public_key.as_deref() != Some(incoming_public_key.as_str())
+                if session.claimed_device_public_key.as_deref()
+                    != Some(incoming_public_key.as_str())
                 {
                     self.record_pairing_claim_denial(
                         &mut session,
@@ -1258,7 +1269,9 @@ impl CompanionControlPlane {
         for (key, value) in metadata {
             let key = key.trim();
             if !key.is_empty() {
-                device.metadata.insert(key.to_string(), value.trim().to_string());
+                device
+                    .metadata
+                    .insert(key.to_string(), value.trim().to_string());
             }
         }
         self.write_device(&device).await?;
@@ -1356,7 +1369,11 @@ impl CompanionControlPlane {
             Some(&grant.id),
             command.actor.as_deref(),
             "ui",
-            if high_risk { "approval_required" } else { "allow" },
+            if high_risk {
+                "approval_required"
+            } else {
+                "allow"
+            },
             if high_risk {
                 "High-risk companion command is waiting for fresh approval."
             } else {
@@ -1421,7 +1438,8 @@ impl CompanionControlPlane {
             .await?;
             anyhow::bail!("requested scopes exceed caller grant");
         }
-        if !requested_resources.is_empty() && !resource_subset(requested_resources, &grant.resources)
+        if !requested_resources.is_empty()
+            && !resource_subset(requested_resources, &grant.resources)
         {
             self.audit(
                 "resource_scope_denied",
@@ -1493,10 +1511,7 @@ impl CompanionControlPlane {
         Ok(command)
     }
 
-    pub async fn dispatch_next_command(
-        &self,
-        device_id: &str,
-    ) -> Result<Option<CompanionCommand>> {
+    pub async fn dispatch_next_command(&self, device_id: &str) -> Result<Option<CompanionCommand>> {
         let device = self
             .get_device(device_id)
             .await?
@@ -1511,7 +1526,8 @@ impl CompanionControlPlane {
             if !scope_subset(&command.requested_scopes, &device.token_capabilities) {
                 command.status = CompanionCommandStatus::Denied;
                 command.completed_at = Some(now_rfc3339());
-                command.error = Some("Command no longer fits active device token scope.".to_string());
+                command.error =
+                    Some("Command no longer fits active device token scope.".to_string());
                 self.write_command(&command).await?;
                 self.audit(
                     "command_scope_stale",
@@ -1559,7 +1575,10 @@ impl CompanionControlPlane {
             .get_command(command_id)
             .await?
             .ok_or_else(|| anyhow!("command not found"))?;
-        anyhow::ensure!(command.device_id == device_id, "command belongs to another device");
+        anyhow::ensure!(
+            command.device_id == device_id,
+            "command belongs to another device"
+        );
         command.status = if success {
             CompanionCommandStatus::Succeeded
         } else {
@@ -1728,7 +1747,11 @@ impl CompanionControlPlane {
     pub async fn list_audit_events(&self, limit: usize) -> Result<Vec<CompanionAuditEvent>> {
         let ids = self.read_index(AUDIT_INDEX_KEY).await?;
         let mut out = Vec::new();
-        for id in ids.into_iter().rev().take(limit.max(1).min(MAX_AUDIT_EVENTS)) {
+        for id in ids
+            .into_iter()
+            .rev()
+            .take(limit.max(1).min(MAX_AUDIT_EVENTS))
+        {
             if let Some(event) = self.read_json(&audit_key(&id)).await? {
                 out.push(event);
             }
@@ -1808,24 +1831,132 @@ fn capability_risk(id: &str) -> CompanionRiskLevel {
 
 pub fn capability_catalog() -> Vec<CompanionCapabilityDescriptor> {
     vec![
-        cap("approval_prompt", "Approval prompts", "Receive and answer AgentArk approval prompts.", CompanionRiskLevel::Low, &[]),
-        cap("notifications", "Notifications", "Receive device notifications from AgentArk.", CompanionRiskLevel::Low, &[]),
-        cap("camera", "Camera", "Capture images after explicit approval.", CompanionRiskLevel::High, &["media"]),
-        cap("microphone", "Microphone", "Capture audio after explicit approval.", CompanionRiskLevel::High, &["media"]),
-        cap("photos", "Photos", "Read or contribute selected photo-library assets.", CompanionRiskLevel::High, &["media"]),
-        cap("location", "Location", "Share current device location after explicit approval.", CompanionRiskLevel::High, &["location"]),
-        cap("sms", "SMS", "Send SMS through the paired phone after explicit approval.", CompanionRiskLevel::High, &["recipient"]),
-        cap("whatsapp_handoff", "WhatsApp handoff", "Prepare or send WhatsApp messages through the paired device.", CompanionRiskLevel::High, &["recipient"]),
-        cap("shortcuts_run", "Shortcuts actions", "Run Shortcuts-style actions after explicit approval.", CompanionRiskLevel::High, &["shortcut"]),
-        cap("screen_capture", "Screen capture", "Capture a screenshot after explicit approval.", CompanionRiskLevel::High, &["screen"]),
-        cap("screen_recording", "Screen recording", "Record screen content after explicit approval.", CompanionRiskLevel::High, &["screen"]),
-        cap("browser_control", "Browser control", "Control browser sessions on the companion device.", CompanionRiskLevel::High, &["profile", "origin"]),
-        cap("file_read", "File read", "Read scoped files from the companion device.", CompanionRiskLevel::High, &["path"]),
-        cap("file_write", "File write", "Write scoped files on the companion device.", CompanionRiskLevel::High, &["path"]),
-        cap("system_run", "Local commands", "Run typed local commands on the companion device.", CompanionRiskLevel::High, &["command"]),
-        cap("lan_access", "LAN access", "Reach LAN-only services near the companion device.", CompanionRiskLevel::High, &["host"]),
-        cap("sensor_read", "Sensor read", "Read custom sensors exposed by the companion device.", CompanionRiskLevel::Low, &["sensor"]),
-        cap("smart_home", "Smart home", "Control smart-home devices through a local companion.", CompanionRiskLevel::High, &["device"]),
+        cap(
+            "approval_prompt",
+            "Approval prompts",
+            "Receive and answer AgentArk approval prompts.",
+            CompanionRiskLevel::Low,
+            &[],
+        ),
+        cap(
+            "notifications",
+            "Notifications",
+            "Receive device notifications from AgentArk.",
+            CompanionRiskLevel::Low,
+            &[],
+        ),
+        cap(
+            "camera",
+            "Camera",
+            "Capture images after explicit approval.",
+            CompanionRiskLevel::High,
+            &["media"],
+        ),
+        cap(
+            "microphone",
+            "Microphone",
+            "Capture audio after explicit approval.",
+            CompanionRiskLevel::High,
+            &["media"],
+        ),
+        cap(
+            "photos",
+            "Photos",
+            "Read or contribute selected photo-library assets.",
+            CompanionRiskLevel::High,
+            &["media"],
+        ),
+        cap(
+            "location",
+            "Location",
+            "Share current device location after explicit approval.",
+            CompanionRiskLevel::High,
+            &["location"],
+        ),
+        cap(
+            "sms",
+            "SMS",
+            "Send SMS through the paired phone after explicit approval.",
+            CompanionRiskLevel::High,
+            &["recipient"],
+        ),
+        cap(
+            "whatsapp_handoff",
+            "WhatsApp handoff",
+            "Prepare or send WhatsApp messages through the paired device.",
+            CompanionRiskLevel::High,
+            &["recipient"],
+        ),
+        cap(
+            "shortcuts_run",
+            "Shortcuts actions",
+            "Run Shortcuts-style actions after explicit approval.",
+            CompanionRiskLevel::High,
+            &["shortcut"],
+        ),
+        cap(
+            "screen_capture",
+            "Screen capture",
+            "Capture a screenshot after explicit approval.",
+            CompanionRiskLevel::High,
+            &["screen"],
+        ),
+        cap(
+            "screen_recording",
+            "Screen recording",
+            "Record screen content after explicit approval.",
+            CompanionRiskLevel::High,
+            &["screen"],
+        ),
+        cap(
+            "browser_control",
+            "Browser control",
+            "Control browser sessions on the companion device.",
+            CompanionRiskLevel::High,
+            &["profile", "origin"],
+        ),
+        cap(
+            "file_read",
+            "File read",
+            "Read scoped files from the companion device.",
+            CompanionRiskLevel::High,
+            &["path"],
+        ),
+        cap(
+            "file_write",
+            "File write",
+            "Write scoped files on the companion device.",
+            CompanionRiskLevel::High,
+            &["path"],
+        ),
+        cap(
+            "system_run",
+            "Local commands",
+            "Run typed local commands on the companion device.",
+            CompanionRiskLevel::High,
+            &["command"],
+        ),
+        cap(
+            "lan_access",
+            "LAN access",
+            "Reach LAN-only services near the companion device.",
+            CompanionRiskLevel::High,
+            &["host"],
+        ),
+        cap(
+            "sensor_read",
+            "Sensor read",
+            "Read custom sensors exposed by the companion device.",
+            CompanionRiskLevel::Low,
+            &["sensor"],
+        ),
+        cap(
+            "smart_home",
+            "Smart home",
+            "Control smart-home devices through a local companion.",
+            CompanionRiskLevel::High,
+            &["device"],
+        ),
     ]
 }
 
@@ -1841,7 +1972,10 @@ fn cap(
         label: label.to_string(),
         description: description.to_string(),
         risk,
-        resource_kinds: resource_kinds.iter().map(|value| value.to_string()).collect(),
+        resource_kinds: resource_kinds
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
     }
 }
 

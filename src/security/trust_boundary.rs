@@ -128,7 +128,12 @@ fn is_hidden_element(el: &scraper::ElementRef<'_>) -> bool {
     if let Some(style) = v.attr("style") {
         let lowered = style.to_ascii_lowercase();
         let cleaned: String = lowered.chars().filter(|ch| !ch.is_whitespace()).collect();
-        let tokens = ["display:none", "visibility:hidden", "opacity:0", "font-size:0"];
+        let tokens = [
+            "display:none",
+            "visibility:hidden",
+            "opacity:0",
+            "font-size:0",
+        ];
         if tokens.iter().any(|token| cleaned.contains(token)) {
             return true;
         }

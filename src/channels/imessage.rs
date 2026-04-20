@@ -241,13 +241,13 @@ pub async fn handle_webhook(
     });
 
     let reply = {
-        let agent = agent.read().await;
+        let agent_snapshot = Agent::snapshot(&agent).await;
         if let Some(sender_id) = event
             .sender_id
             .clone()
             .filter(|value| !value.trim().is_empty())
         {
-            let verification = sender_verification::load_settings(&agent.storage).await?;
+            let verification = sender_verification::load_settings(&agent_snapshot.storage).await?;
             let identity = SenderIdentity {
                 channel: SenderChannel::IMessage,
                 sender_id: sender_id.clone(),
@@ -258,7 +258,7 @@ pub async fn handle_webhook(
                 message_preview: Some(text.clone()),
             };
             match sender_verification::evaluate_sender_with_rules(
-                &agent.storage,
+                &agent_snapshot.storage,
                 &identity,
                 verification.imessage.policy,
                 &verification.imessage.allowed_senders,
@@ -268,7 +268,7 @@ pub async fn handle_webhook(
                 SenderTrustDecision::Allowed => {}
                 SenderTrustDecision::NeedsApproval { created_new, .. } => {
                     if created_new {
-                        agent
+                        agent_snapshot
                             .notify_preferred_channel(
                                 "A new iMessage sender needs approval before AgentArk will reply. Open Settings -> Messaging Channels -> Sender Trust to review it.",
                             )
@@ -278,8 +278,8 @@ pub async fn handle_webhook(
                 }
             }
         }
-        persist_destination(&agent, &destination).await?;
-        agent
+        persist_destination(&agent_snapshot, &destination).await?;
+        agent_snapshot
             .process_message_with_meta(&text, "imessage", Some(&conversation_id), None)
             .await
             .map(Agent::render_plain_channel_response)?
@@ -287,9 +287,9 @@ pub async fn handle_webhook(
     if reply.trim().is_empty() {
         return Ok("ignored".to_string());
     }
-    let agent = agent.read().await;
     send_to_destination(&config, &destination, &reply).await?;
-    persist_destination(&agent, &destination).await?;
+    let agent_snapshot = Agent::snapshot(&agent).await;
+    persist_destination(&agent_snapshot, &destination).await?;
     Ok("ok".to_string())
 }
 

@@ -380,21 +380,23 @@ async fn available_completion_channels(state: &AppState) -> Result<HashSet<Strin
         email_backends.push(crate::core::email_delivery::EMAIL_PROVIDER_GMAIL.to_string());
     }
     if has_workspace_gmail {
-        email_backends.push(crate::core::email_delivery::EMAIL_PROVIDER_GOOGLE_WORKSPACE.to_string());
+        email_backends
+            .push(crate::core::email_delivery::EMAIL_PROVIDER_GOOGLE_WORKSPACE.to_string());
     }
     if crate::core::email_delivery::external_email_delivery_is_ready(&config.email) {
         if let Some(provider_id) =
             crate::core::email_delivery::external_email_provider_id(&config.email)
         {
-            if !email_backends.iter().any(|existing| existing == &provider_id) {
+            if !email_backends
+                .iter()
+                .any(|existing| existing == &provider_id)
+            {
                 email_backends.push(provider_id);
             }
         }
     }
-    if crate::core::email_delivery::email_channel_is_ready(
-        &config.email.provider,
-        &email_backends,
-    ) {
+    if crate::core::email_delivery::email_channel_is_ready(&config.email.provider, &email_backends)
+    {
         channels.insert("email".to_string());
     }
 

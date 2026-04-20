@@ -61,6 +61,7 @@ pub struct SwarmStatusResponse {
 }
 
 /// The swarm manager -- owns registry, bus, and specialist instances
+#[derive(Clone)]
 pub struct SwarmManager {
     pub registry: AgentRegistry,
     pub bus: MessageBus,

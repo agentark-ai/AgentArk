@@ -205,8 +205,8 @@ async fn process_whatsapp_prompt(
     prompt: &str,
     conversation_id: &str,
 ) -> String {
-    let guard = agent.read().await;
-    match guard
+    let agent_snapshot = Agent::snapshot(agent).await;
+    match agent_snapshot
         .process_message_with_meta(prompt, "whatsapp", Some(conversation_id), None)
         .await
     {
@@ -1399,8 +1399,8 @@ pub async fn handle_webhook_with_config(
 
     // ---- Process via agent ----
     let response = {
-        let agent_read = agent.read().await;
-        match agent_read
+        let agent_snapshot = Agent::snapshot(&agent).await;
+        match agent_snapshot
             .process_message_with_meta(&text, "whatsapp", Some(&conversation_id), None)
             .await
         {

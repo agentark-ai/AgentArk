@@ -701,7 +701,8 @@ impl BrowserSessionManager {
             false
         };
 
-        self.close_sidecar_best_effort(&removed_sidecar_session_id).await;
+        self.close_sidecar_best_effort(&removed_sidecar_session_id)
+            .await;
         delete_persisted_browser_session(self.storage.as_ref(), session_id).await;
         Ok(!removed_sidecar_session_id.is_empty() || existed_in_storage)
     }
@@ -785,7 +786,8 @@ impl BrowserSessionManager {
         }
 
         let conversation_id = conversation_id?;
-        self.latest_live_session_for_conversation(conversation_id).await
+        self.latest_live_session_for_conversation(conversation_id)
+            .await
     }
 
     pub fn active_count(&self) -> usize {
@@ -871,10 +873,7 @@ impl BrowserSessionManager {
         Some(sidecar_session_id)
     }
 
-    async fn latest_live_session_for_conversation(
-        &self,
-        conversation_id: &str,
-    ) -> Option<String> {
+    async fn latest_live_session_for_conversation(&self, conversation_id: &str) -> Option<String> {
         let managed_session_id = self
             .latest_managed_live_session_for_conversation(Some(conversation_id))
             .await?;
@@ -2113,7 +2112,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_browser_tool_session_id_prefers_conversation_live_session_over_bad_requested_id() {
+    async fn resolve_browser_tool_session_id_prefers_conversation_live_session_over_bad_requested_id(
+    ) {
         let manager = test_manager();
         manager.sessions.insert(
             "managed-1".to_string(),

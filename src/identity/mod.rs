@@ -54,6 +54,7 @@ pub struct CredentialProof {
 }
 
 /// Manages the agent's identity, keys, and credentials
+#[derive(Clone)]
 pub struct IdentityManager {
     /// The agent's DID
     did: DecentralizedId,

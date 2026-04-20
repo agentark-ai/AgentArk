@@ -962,8 +962,7 @@ impl ActionGuard {
         let Some(root) = value.as_mapping() else {
             return Vec::new();
         };
-        let Some(raw_permissions) =
-            root.get(serde_yaml::Value::String("permissions".to_string()))
+        let Some(raw_permissions) = root.get(serde_yaml::Value::String("permissions".to_string()))
         else {
             return Vec::new();
         };
@@ -1074,10 +1073,7 @@ impl ActionGuard {
         InjectionScanResult {
             detected: true,
             risk_score: self.injection_block_threshold,
-            matched_patterns: vec![
-                "semantic-review-unavailable".to_string(),
-                reason.into(),
-            ],
+            matched_patterns: vec!["semantic-review-unavailable".to_string(), reason.into()],
             should_block: true,
         }
     }
@@ -1089,7 +1085,12 @@ impl ActionGuard {
         let mut labels = Vec::new();
         for capability in &review.capabilities {
             let mut label = capability.kind.trim().to_string();
-            if let Some(target) = capability.target.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(target) = capability
+                .target
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 label.push(':');
                 label.push_str(target);
             }
@@ -1115,7 +1116,11 @@ impl ActionGuard {
     }
 
     /// Classify action content semantically into a stable risk vocabulary.
-    pub async fn scan_for_injection(&self, action_name: &str, content: &str) -> InjectionScanResult {
+    pub async fn scan_for_injection(
+        &self,
+        action_name: &str,
+        content: &str,
+    ) -> InjectionScanResult {
         let Some(reviewer) = self.semantic_reviewer.as_ref() else {
             return self.semantic_review_unavailable_result("no-configured-semantic-reviewer");
         };
@@ -1374,7 +1379,10 @@ mod tests {
     async fn test_semantic_review_requires_configured_reviewer() {
         let guard = make_guard();
         let result = guard
-            .scan_for_injection("research", "# Research Action\nSearch for AI news and summarize.")
+            .scan_for_injection(
+                "research",
+                "# Research Action\nSearch for AI news and summarize.",
+            )
             .await;
         assert!(result.detected);
         assert!(result.should_block);
@@ -1419,7 +1427,9 @@ mod tests {
         };
         let result = guard.semantic_review_result_from_policy(review);
         assert!(result.should_block);
-        assert!(result.matched_patterns.contains(&"unknown-high-risk".to_string()));
+        assert!(result
+            .matched_patterns
+            .contains(&"unknown-high-risk".to_string()));
         assert!(result
             .matched_patterns
             .contains(&"policy:block-unknown-high-risk".to_string()));

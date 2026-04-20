@@ -242,6 +242,17 @@ Rules:\n\
             .map(|s| Self::sanitize_operational_text(s, max_chars))
     }
 
+    // Internal version labels are structured identifiers, not user-provided
+    // free text. Running them through secret redaction can corrupt the labels
+    // and make ArkEvolve telemetry unreadable.
+    fn normalize_optional_version_label(raw: Option<&str>, max_chars: usize) -> Option<String> {
+        raw.map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| safe_truncate(value, max_chars))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+
     // Operational reference IDs are not secrets. Redacting them can corrupt FK
     // lookups and persistence because UUID-like values can resemble opaque tokens.
     fn normalize_optional_reference_id(raw: Option<&str>, max_chars: usize) -> Option<String> {
@@ -250,6 +261,55 @@ Rules:\n\
             .map(|value| safe_truncate(value, max_chars))
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
+    }
+
+    fn operational_payload_preserves_identifier(key: &str) -> bool {
+        matches!(
+            key,
+            "strategy_version"
+                | "policy_version"
+                | "prompt_version"
+                | "classifier_prompt_version"
+                | "specialist_prompt_version"
+        )
+    }
+
+    fn sanitize_operational_payload_value(
+        key: Option<&str>,
+        value: &serde_json::Value,
+    ) -> serde_json::Value {
+        match value {
+            serde_json::Value::String(text) => {
+                let sanitized = if key.is_some_and(Self::operational_payload_preserves_identifier) {
+                    safe_truncate(text.trim(), 128)
+                } else {
+                    Self::sanitize_operational_text(text, 320)
+                };
+                serde_json::Value::String(sanitized)
+            }
+            serde_json::Value::Array(items) => serde_json::Value::Array(
+                items
+                    .iter()
+                    .map(|item| Self::sanitize_operational_payload_value(None, item))
+                    .collect(),
+            ),
+            serde_json::Value::Object(map) => {
+                let mut next = serde_json::Map::with_capacity(map.len());
+                for (child_key, child_value) in map {
+                    next.insert(
+                        child_key.clone(),
+                        Self::sanitize_operational_payload_value(Some(child_key), child_value),
+                    );
+                }
+                serde_json::Value::Object(next)
+            }
+            other => other.clone(),
+        }
+    }
+
+    fn sanitize_operational_payload_json(value: &serde_json::Value) -> Option<String> {
+        let sanitized = Self::sanitize_operational_payload_value(None, value);
+        serde_json::to_string(&sanitized).ok()
     }
 
     pub(crate) async fn log_operational_event(&self, event: OperationalEvent<'_>) {
@@ -285,9 +345,7 @@ Rules:\n\
                 }
                 payload = serde_json::Value::Object(object);
             }
-            serde_json::to_string(&payload)
-                .ok()
-                .map(|s| Self::sanitize_operational_text(&s, 2000))
+            Self::sanitize_operational_payload_json(&payload)
         });
         let model = crate::storage::entities::operational_log::Model {
             id: uuid::Uuid::new_v4().to_string(),
@@ -302,9 +360,9 @@ Rules:\n\
             latency_ms: event.latency_ms.map(|v| v as i64),
             arguments: args_text,
             payload: payload_text,
-            strategy_version: Self::normalize_optional_diagnostic_text(event.strategy_version, 128),
-            policy_version: Self::normalize_optional_diagnostic_text(event.policy_version, 128),
-            prompt_version: Self::normalize_optional_diagnostic_text(event.prompt_version, 128),
+            strategy_version: Self::normalize_optional_version_label(event.strategy_version, 128),
+            policy_version: Self::normalize_optional_version_label(event.policy_version, 128),
+            prompt_version: Self::normalize_optional_version_label(event.prompt_version, 128),
             model_slot: Self::normalize_optional_diagnostic_text(event.model_slot, 128),
         };
         if let Err(e) = self.storage.insert_operational_log(&model).await {
@@ -833,6 +891,31 @@ mod tests {
     fn operational_diagnostic_text_still_redacts_secret_like_values() {
         let fake_key = ["sk", "-1234567890", "abcdefghijklmnop"].concat();
         let sanitized = Agent::sanitize_operational_text(&format!("api_key={fake_key}"), 128);
+        assert!(sanitized.contains("[REDACTED_API_KEY]"));
+        assert!(!sanitized.contains(&fake_key));
+    }
+
+    #[test]
+    fn operational_version_labels_are_not_secret_redacted() {
+        let version = "system_prompt_v2+prompt-bundle-default-v1";
+        assert_eq!(
+            Agent::normalize_optional_version_label(Some(version), 128).as_deref(),
+            Some(version)
+        );
+    }
+
+    #[test]
+    fn operational_payload_preserves_versions_but_redacts_secret_like_text() {
+        let fake_key = ["sk", "-1234567890", "abcdefghijklmnop"].concat();
+        let payload = serde_json::json!({
+            "classifier_prompt_version": "classifier_prompt_v1+classifier-prompt-bundle-default-v1",
+            "specialist_prompt_version": "specialist_prompt_v1+specialist-prompt-bundle-default-v1",
+            "diagnostic": format!("api_key={fake_key}")
+        });
+        let sanitized = Agent::sanitize_operational_payload_json(&payload).expect("payload");
+
+        assert!(sanitized.contains("classifier_prompt_v1+classifier-prompt-bundle-default-v1"));
+        assert!(sanitized.contains("specialist_prompt_v1+specialist-prompt-bundle-default-v1"));
         assert!(sanitized.contains("[REDACTED_API_KEY]"));
         assert!(!sanitized.contains(&fake_key));
     }

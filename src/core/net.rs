@@ -91,7 +91,9 @@ pub fn validate_no_userinfo(url: &reqwest::Url) -> Result<()> {
 pub async fn validate_external_https_url(raw: &str) -> Result<reqwest::Url> {
     let url = reqwest::Url::parse(raw).map_err(|error| anyhow!("Invalid URL: {}", error))?;
     if url.scheme() != "https" {
-        return Err(anyhow!("Only HTTPS URLs are supported for external extensions"));
+        return Err(anyhow!(
+            "Only HTTPS URLs are supported for external extensions"
+        ));
     }
     validate_no_userinfo(&url)?;
     validate_public_url_host(&url).await?;
@@ -104,7 +106,9 @@ pub async fn validate_public_url_host(url: &reqwest::Url) -> Result<()> {
         .ok_or_else(|| anyhow!("URL must include a host"))?;
     let port = url.port_or_known_default().unwrap_or(443);
     if port == 8990 {
-        return Err(anyhow!("AgentArk control ports are not valid external extension endpoints"));
+        return Err(anyhow!(
+            "AgentArk control ports are not valid external extension endpoints"
+        ));
     }
     match host {
         url::Host::Domain(domain) => {

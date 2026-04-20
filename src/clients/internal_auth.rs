@@ -1,5 +1,5 @@
-use anyhow::{Context, Result, anyhow};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::Rng;
 use serde::Serialize;
 use std::fs::OpenOptions;
@@ -311,8 +311,8 @@ fn generate_internal_service_token(service: InternalServiceKind) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        InternalServiceKind, load_or_create_internal_service_token,
-        read_persisted_internal_service_token, rotate_internal_service_token,
+        load_or_create_internal_service_token, read_persisted_internal_service_token,
+        rotate_internal_service_token, InternalServiceKind,
     };
 
     #[test]

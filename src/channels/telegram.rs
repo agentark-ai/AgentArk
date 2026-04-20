@@ -117,8 +117,8 @@ async fn process_telegram_prompt(
     prompt: &str,
     conversation_id: &str,
 ) -> String {
-    let guard = agent.read().await;
-    match guard
+    let agent_snapshot = Agent::snapshot(agent).await;
+    match agent_snapshot
         .process_message_with_meta(prompt, "telegram", Some(conversation_id), None)
         .await
     {

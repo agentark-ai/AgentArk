@@ -76,6 +76,7 @@ pub struct HookRunReport {
 }
 
 /// Hook manager
+#[derive(Clone)]
 pub struct HookManager {
     hooks: Vec<Hook>,
     client: reqwest::Client,

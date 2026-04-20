@@ -280,10 +280,9 @@ pub fn descriptor_for_pack_manifest(
     let send_spec = auth_manifest
         .as_ref()
         .map(extension_pack_secret_aliases_for_manifest)
-        .map(|aliases| crate::channels::messaging_dispatch::rewrite_send_spec_secret_refs(
-            &spec.send,
-            &aliases,
-        ))
+        .map(|aliases| {
+            crate::channels::messaging_dispatch::rewrite_send_spec_secret_refs(&spec.send, &aliases)
+        })
         .unwrap_or_else(|| spec.send.clone());
 
     Some(ChannelDescriptor {
@@ -452,7 +451,10 @@ impl MessagingChannelRegistry {
         ctx: &ChannelQueryContext<'_>,
     ) -> Result<Vec<ChannelDescriptor>> {
         let all = self.list(ctx).await?;
-        Ok(all.into_iter().filter(|descriptor| descriptor.configured).collect())
+        Ok(all
+            .into_iter()
+            .filter(|descriptor| descriptor.configured)
+            .collect())
     }
 
     /// Ids of every channel (configured or not). Convenience over
@@ -473,8 +475,8 @@ impl MessagingChannelRegistry {
 mod tests {
     use super::*;
     use crate::extension_packs::{
-        ExtensionPackAuthSpec, ExtensionPackManifest, ExtensionPackOAuth2Spec,
-        HttpSendMethod, MessagingChannelSpec, MessagingSendSpec,
+        ExtensionPackAuthSpec, ExtensionPackManifest, ExtensionPackOAuth2Spec, HttpSendMethod,
+        MessagingChannelSpec, MessagingSendSpec,
     };
 
     fn pack_with_channel(id: &str, required_secrets: &[&str]) -> ExtensionPackManifest {
@@ -504,8 +506,8 @@ mod tests {
     #[test]
     fn descriptor_id_is_namespaced_to_avoid_bundled_collision() {
         let manifest = pack_with_channel("slack", &["token"]);
-        let descriptor = descriptor_for_pack_manifest(&manifest, None)
-            .expect("pack declares a channel");
+        let descriptor =
+            descriptor_for_pack_manifest(&manifest, None).expect("pack declares a channel");
         assert!(
             descriptor.id.starts_with(EXTENSION_CHANNEL_ID_PREFIX),
             "pack channel id must be namespaced; got {}",
@@ -531,16 +533,16 @@ mod tests {
         let mut manifest = pack_with_channel("ping", &[]);
         manifest.auth.mode = ExtensionPackAuthMode::None;
         manifest.auth.required_secrets.clear();
-        let descriptor = descriptor_for_pack_manifest(&manifest, None)
-            .expect("pack declares a channel");
+        let descriptor =
+            descriptor_for_pack_manifest(&manifest, None).expect("pack declares a channel");
         assert!(descriptor.configured);
     }
 
     #[test]
     fn pack_with_required_secrets_is_unconfigured_without_manager() {
         let manifest = pack_with_channel("secret_channel", &["token"]);
-        let descriptor = descriptor_for_pack_manifest(&manifest, None)
-            .expect("pack declares a channel");
+        let descriptor =
+            descriptor_for_pack_manifest(&manifest, None).expect("pack declares a channel");
         assert!(!descriptor.configured);
     }
 
@@ -555,8 +557,8 @@ mod tests {
             token_url: "https://oauth/token".to_string(),
             ..ExtensionPackOAuth2Spec::default()
         });
-        let descriptor = descriptor_for_pack_manifest(&manifest, None)
-            .expect("pack declares a channel");
+        let descriptor =
+            descriptor_for_pack_manifest(&manifest, None).expect("pack declares a channel");
         assert!(descriptor.auth_manifest.is_some());
     }
 }

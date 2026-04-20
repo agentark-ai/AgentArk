@@ -3,7 +3,7 @@
 use crate::{
     actions::{
         ActionAuthorizationContext, ActionCallerPrincipal, ActionDef, ActionExecutionSurface,
-        PlannerActionRole, PlannerIntegrationClass, PlannerSideEffectLevel,
+        PlannerActionRole, PlannerCostTier, PlannerIntegrationClass, PlannerSideEffectLevel,
     },
     identity::IdentityManager,
     proofs::ProofEngine,
@@ -87,7 +87,7 @@ const CONVERSATION_RECENT_ARTIFACT_LIMIT: usize = 8;
 const BACKGROUND_SESSION_IDLE_CONSOLIDATION_AFTER_MINS: i64 = 10;
 const BACKGROUND_SESSION_CONSOLIDATION_COOLDOWN_MINS: i64 = 30;
 const CONVERSATION_LAST_DEPLOYED_APP_KEY_PREFIX: &str = "conversation_last_deployed_app_v1:";
-const USER_SELECTED_MODEL_SLOT_KEY: &str = "user_selected_model_slot_v1";
+pub(crate) const USER_SELECTED_MODEL_SLOT_KEY: &str = "user_selected_model_slot_v1";
 const APP_FOLLOWUP_CONTEXT_MAX_AGE_SECS: i64 = 24 * 60 * 60;
 const PROFILE_NUDGE_LAST_ASKED_KEY: &str = "profile_nudge_last_asked_at_v1";
 const PROFILE_NUDGE_INTERVAL_DAYS: i64 = 7;
@@ -103,10 +103,23 @@ const AMBIENT_INTENT_FALLBACK_RECHECK_HOURS: i64 = 24;
 const USER_LEARNED_MEMORY_CAPTURE_SOURCE: &str = "user_lifecycle_memory_capture";
 const USER_LEARNED_MEMORY_RETRACTION_SOURCE: &str = "user_lifecycle_memory_retraction";
 const USER_FACT_MEMORY_CAPTURE_LOCAL_TIMEOUT_MS: u64 = 6_000;
-const USER_FACT_MEMORY_CAPTURE_REMOTE_TIMEOUT_MS: u64 = 20_000;
+const USER_FACT_MEMORY_CAPTURE_REMOTE_TIMEOUT_MS: u64 = 45_000;
 const USER_FACT_MEMORY_CAPTURE_MAX_CANDIDATES: usize = 2;
+const USER_FACT_MEMORY_CAPTURE_EMPTY_ESCALATION_MAX_CANDIDATES: usize = 2;
+const USER_FACT_MEMORY_CAPTURE_EMPTY_VERDICT_MIN_CONFIDENCE: f32 = 0.70;
+const USER_FACT_MEMORY_CAPTURE_ALLOW_SENSITIVE_CONTEXT: bool = true;
 const USER_MEMORY_OPERATION_AUTO_APPLY_CONFIDENCE: f64 = 0.80;
-const MEMORY_OPERATION_CANDIDATE_TYPES: &[&str] = &["memory_add", "memory_update", "memory_retract"];
+const SAVED_USER_FACT_PROMPT_KINDS: &[&str] = &[
+    "identity",
+    "preference",
+    "location",
+    "workflow",
+    "constraint",
+    "personal_fact",
+    "other",
+];
+const MEMORY_OPERATION_CANDIDATE_TYPES: &[&str] =
+    &["memory_add", "memory_update", "memory_retract"];
 const SELF_MEMORY_LOOKUP_MAX_ITEMS: usize = 3;
 const INITIAL_TOOL_FOLLOWUP_BUDGET: usize = 6;
 const MAX_TOOL_FOLLOWUP_BUDGET_CAP: usize = 18;
@@ -1054,12 +1067,61 @@ struct SkillImportOutcome {
     missing_required_envs: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ClarificationChoice {
+    pub label: String,
+    pub submit_text: String,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ActionSelectionAssessment {
     needed_actions: Vec<String>,
     should_clarify: bool,
     clarification_question: Option<String>,
+    choices: Vec<ClarificationChoice>,
     reasoning: String,
+}
+
+#[derive(Debug, Clone)]
+struct DeployedAppReferenceCandidate {
+    app_id: String,
+    title: String,
+    score: f32,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DeployedAppReferenceResolution {
+    matched: Option<ConversationArtifactContext>,
+    ambiguous_candidates: Vec<DeployedAppReferenceCandidate>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum CreationSurfaceKind {
+    #[default]
+    None,
+    Workspace,
+    App,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CreationSurfaceAssessment {
+    surface: CreationSurfaceKind,
+    reasoning: String,
+}
+
+impl CreationSurfaceKind {
+    fn from_payload_label(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "workspace" | "files" | "files_only" | "workspace_only" | "code" | "file_bundle" => {
+                Self::Workspace
+            }
+            "app" | "isolated_app" | "deployed_app" | "running_app" => Self::App,
+            "ambiguous" | "unclear" | "clarify" | "both" => Self::Ambiguous,
+            _ => Self::None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1548,6 +1610,26 @@ fn normalize_user_fact_key(raw: &str) -> Option<String> {
         return None;
     }
     Some(key)
+}
+
+fn learned_memory_key_to_user_preference_key(raw_key: &str) -> Option<String> {
+    let normalized = normalize_user_fact_key(raw_key)?;
+    if matches!(
+        normalized.as_str(),
+        "user_name"
+            | "user_timezone"
+            | "preferred_tone"
+            | "assistant_priority_focus"
+            | "user_email"
+            | "user_phone"
+            | "user_address"
+    ) || normalized.starts_with("likes_")
+        || normalized.starts_with("dislikes_")
+        || normalized.starts_with("rule_")
+    {
+        return Some(normalized);
+    }
+    None
 }
 
 fn normalize_user_memory_text(raw: &str, max_chars: usize) -> Option<String> {
@@ -2284,6 +2366,18 @@ enum UserMemoryCapturePayloadError {
     IncompleteShape,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserMemoryCapturePayloadDisposition {
+    Exact,
+    ShapeRecovered,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ParsedUserMemoryCapturePayload {
+    payload: serde_json::Value,
+    disposition: UserMemoryCapturePayloadDisposition,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct UserMemoryCaptureAttemptRecord {
     slot_id: String,
@@ -2309,20 +2403,209 @@ struct UserMemoryCaptureRunOutcome {
     terminal_error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct UserMemoryCaptureEmptyVerdict {
+    has_durable_memory: bool,
+    confidence: f32,
+    reason: String,
+}
+
+#[derive(Debug, Clone)]
+struct UserMemoryCaptureFocusedRecovery {
+    payload: serde_json::Value,
+    selected_slot_id: String,
+    selected_slot_label: String,
+    selected_provider: String,
+    selected_model: String,
+    selected_stage: String,
+}
+
+fn coerce_user_memory_capture_array_field(
+    value: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    match value {
+        None | Some(serde_json::Value::Null) => Some(serde_json::Value::Array(Vec::new())),
+        Some(serde_json::Value::Array(items)) => Some(serde_json::Value::Array(items.clone())),
+        Some(field @ serde_json::Value::Object(_)) => {
+            Some(serde_json::Value::Array(vec![field.clone()]))
+        }
+        _ => None,
+    }
+}
+
+fn user_memory_capture_item_looks_like_retraction(item: &serde_json::Value) -> bool {
+    let Some(object) = item.as_object() else {
+        return false;
+    };
+    object.get("key").and_then(|value| value.as_str()).is_some() && object.get("value").is_none()
+}
+
+fn user_memory_capture_item_looks_like_memory(item: &serde_json::Value) -> bool {
+    let Some(object) = item.as_object() else {
+        return false;
+    };
+    object.get("key").and_then(|value| value.as_str()).is_some()
+        && object
+            .get("value")
+            .and_then(|value| value.as_str())
+            .is_some()
+}
+
+fn user_memory_capture_field_matches_kind(
+    canonical_field: &str,
+    _field_name: &str,
+    value: &serde_json::Value,
+) -> bool {
+    let structural_match = match value {
+        serde_json::Value::Array(items) if items.is_empty() => false,
+        serde_json::Value::Array(items) => match canonical_field {
+            "memories" => items.iter().all(user_memory_capture_item_looks_like_memory),
+            "retractions" => items
+                .iter()
+                .all(user_memory_capture_item_looks_like_retraction),
+            _ => false,
+        },
+        serde_json::Value::Object(_) => match canonical_field {
+            "memories" => user_memory_capture_item_looks_like_memory(value),
+            "retractions" => user_memory_capture_item_looks_like_retraction(value),
+            _ => false,
+        },
+        _ => false,
+    };
+    if structural_match {
+        return true;
+    }
+    false
+}
+
+fn recover_user_memory_capture_arrayish_field<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    canonical_field: &str,
+) -> Option<&'a serde_json::Value> {
+    if let Some(value) = object.get(canonical_field) {
+        return Some(value);
+    }
+
+    let mut matched = None;
+    for (field_name, value) in object {
+        if !matches!(
+            value,
+            serde_json::Value::Null | serde_json::Value::Array(_) | serde_json::Value::Object(_)
+        ) {
+            continue;
+        }
+        if user_memory_capture_field_matches_kind(canonical_field, field_name, value) {
+            if matched.is_some() {
+                return None;
+            }
+            matched = Some(value);
+        }
+    }
+    matched
+}
+
+fn recover_user_memory_capture_payload_shape(
+    payload: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let object = payload.as_object()?;
+    let recovered_memories = recover_user_memory_capture_arrayish_field(object, "memories");
+    let recovered_retractions = recover_user_memory_capture_arrayish_field(object, "retractions");
+    let has_known_memory_shape = object.is_empty()
+        || object.contains_key("memories")
+        || object.contains_key("retractions")
+        || recovered_memories.is_some()
+        || recovered_retractions.is_some();
+    if !has_known_memory_shape {
+        return None;
+    }
+    let memories = coerce_user_memory_capture_array_field(recovered_memories)?;
+    let retractions = coerce_user_memory_capture_array_field(recovered_retractions)?;
+    let mut recovered = object.clone();
+    recovered.insert("memories".to_string(), memories);
+    recovered.insert("retractions".to_string(), retractions);
+    Some(serde_json::Value::Object(recovered))
+}
+
 fn parse_user_memory_capture_payload(
     raw: &str,
-) -> Result<serde_json::Value, UserMemoryCapturePayloadError> {
+) -> Result<ParsedUserMemoryCapturePayload, UserMemoryCapturePayloadError> {
     let Some(payload) = extract_json_object_from_text(raw) else {
         return Err(UserMemoryCapturePayloadError::Unparseable);
     };
-    if !user_memory_capture_payload_has_required_shape(&payload) {
-        return Err(UserMemoryCapturePayloadError::IncompleteShape);
+    if user_memory_capture_payload_has_required_shape(&payload) {
+        return Ok(ParsedUserMemoryCapturePayload {
+            payload,
+            disposition: UserMemoryCapturePayloadDisposition::Exact,
+        });
     }
-    Ok(payload)
+    let Some(payload) = recover_user_memory_capture_payload_shape(&payload) else {
+        return Err(UserMemoryCapturePayloadError::IncompleteShape);
+    };
+    Ok(ParsedUserMemoryCapturePayload {
+        payload,
+        disposition: UserMemoryCapturePayloadDisposition::ShapeRecovered,
+    })
 }
 
 fn user_memory_capture_response_preview(raw: &str, max_chars: usize) -> String {
     safe_truncate(&crate::security::redact_secret_input(raw).text, max_chars)
+}
+
+fn user_memory_capture_payload_ok_outcome(
+    parsed: &ParsedUserMemoryCapturePayload,
+    is_empty_decision: bool,
+) -> &'static str {
+    match (is_empty_decision, parsed.disposition) {
+        (false, UserMemoryCapturePayloadDisposition::Exact) => "ok",
+        (false, UserMemoryCapturePayloadDisposition::ShapeRecovered) => "ok_shape_recovered",
+        (true, UserMemoryCapturePayloadDisposition::Exact) => "empty_decision",
+        (true, UserMemoryCapturePayloadDisposition::ShapeRecovered) => {
+            "empty_decision_shape_recovered"
+        }
+    }
+}
+
+fn user_memory_capture_attempts_all_transport_failed(
+    attempts: &[UserMemoryCaptureAttemptRecord],
+) -> bool {
+    !attempts.is_empty()
+        && attempts
+            .iter()
+            .all(|attempt| attempt.outcome == "transport_failed")
+}
+
+fn user_memory_capture_attempts_timed_out(attempts: &[UserMemoryCaptureAttemptRecord]) -> bool {
+    attempts.iter().any(|attempt| {
+        attempt.outcome == "transport_failed"
+            && attempt
+                .error
+                .as_deref()
+                .map(|error| error.contains("kind=timeout"))
+                .unwrap_or(false)
+    })
+}
+
+fn user_memory_capture_terminal_error(
+    attempts: &[UserMemoryCaptureAttemptRecord],
+    attempted_candidates: usize,
+    timeout_ms: u64,
+) -> String {
+    if user_memory_capture_attempts_all_transport_failed(attempts) {
+        if user_memory_capture_attempts_timed_out(attempts) {
+            return format!(
+                "Memory capture timed out after {}ms across {} candidate(s).",
+                timeout_ms, attempted_candidates
+            );
+        }
+        return format!(
+            "Memory capture transport failed across {} candidate(s).",
+            attempted_candidates
+        );
+    }
+    format!(
+        "Memory capture failed to produce schema-compliant JSON after {} candidate(s).",
+        attempted_candidates
+    )
 }
 
 fn log_user_memory_capture_payload_error(
@@ -2363,6 +2646,83 @@ fn build_user_memory_capture_repair_prompt(
         invalid_response_preview = invalid_response_preview,
         original_prompt = original_prompt
     )
+}
+
+fn build_user_memory_capture_empty_retry_prompt(
+    original_prompt: &str,
+    previous_response_preview: &str,
+    response_shape: &str,
+) -> String {
+    format!(
+        "The previous memory extraction produced no durable memory operations or returned an underspecified payload.\n\nRequired JSON shape:\n{response_shape}\n\nPrevious response preview:\n{previous_response_preview}\n\nRe-evaluate the source semantically. Determine whether the user supplied any durable self-information, preferences, workflow constraints, current-state facts worth carrying forward, or retractions. Mixed-intent turns, greetings, questions, and extra context do not cancel durable memory content stated in the same turn. Return JSON only, and always include both `memories` and `retractions` arrays even when one or both are empty.\n\nSource extraction task:\n{original_prompt}",
+        response_shape = response_shape,
+        previous_response_preview = previous_response_preview,
+        original_prompt = original_prompt
+    )
+}
+
+fn build_user_memory_capture_empty_verdict_prompt(
+    original_prompt: &str,
+    previous_response_preview: &str,
+) -> String {
+    format!(
+        "The previous user-memory extraction ended in an empty decision.\n\nPrevious empty extraction preview:\n{previous_response_preview}\n\nReturn JSON only with this shape:\n{{\"has_durable_memory\":false,\"confidence\":0.0,\"reason\":\"brief rationale\"}}\n\nRules:\n- Set has_durable_memory=true only when the source contains durable user information worth retaining beyond this turn.\n- Durable user information includes identity, stable preferences, operating rules, workflow constraints, meaningful current-state facts, relationships, goals, or explicit retractions.\n- Decide from meaning and context. Do not use fixed phrases, literal wording checks, regular expressions, or keyword lists.\n- Mixed-intent turns still count: a self-statement remains durable even if the same message also asks a question, greets the assistant, or continues with another request.\n- Set has_durable_memory=false only when you are confident the source truly contains nothing worth storing.\n- confidence must be between 0.0 and 1.0.\n- reason should briefly describe the durable meaning you found, or why the turn truly contains nothing durable.\n\nSource extraction task:\n{original_prompt}",
+        previous_response_preview = previous_response_preview,
+        original_prompt = original_prompt
+    )
+}
+
+fn build_user_memory_capture_focused_recovery_prompt(
+    original_prompt: &str,
+    previous_response_preview: &str,
+    review_reason: &str,
+    response_shape: &str,
+) -> String {
+    format!(
+        "A semantic review concluded that the previous empty extraction likely missed durable user memory.\n\nReview reason:\n{review_reason}\n\nPrevious empty extraction preview:\n{previous_response_preview}\n\nRequired JSON shape:\n{response_shape}\n\nRecover the missed durable memory operations from meaning. Decide semantically from the user message, dialogue, and saved facts. Do not use fixed phrases, exact wording checks, regular expressions, or keyword rules. If the source contains durable self-information, preferences, workflow constraints, meaningful current-state facts, or retractions, emit them. Return JSON only, and keep both `memories` and `retractions` arrays present. Only return empty arrays if you are genuinely confident there is still nothing durable to store.\n\nSource extraction task:\n{original_prompt}",
+        review_reason = review_reason,
+        previous_response_preview = previous_response_preview,
+        response_shape = response_shape,
+        original_prompt = original_prompt
+    )
+}
+
+fn parse_user_memory_capture_empty_verdict(raw: &str) -> Option<UserMemoryCaptureEmptyVerdict> {
+    let payload = extract_json_object_from_text(raw)?;
+    let has_durable_memory = payload
+        .get("has_durable_memory")
+        .and_then(|value| value.as_bool())
+        .or_else(|| {
+            payload
+                .get("missed_durable_memory")
+                .and_then(|value| value.as_bool())
+        })?;
+    let confidence = payload
+        .get("confidence")
+        .or_else(|| payload.get("score"))
+        .and_then(|value| value.as_f64())
+        .unwrap_or_else(|| {
+            if has_durable_memory {
+                USER_FACT_MEMORY_CAPTURE_EMPTY_VERDICT_MIN_CONFIDENCE as f64
+            } else {
+                1.0
+            }
+        })
+        .clamp(0.0, 1.0) as f32;
+    let reason = payload
+        .get("reason")
+        .or_else(|| payload.get("reasoning"))
+        .or_else(|| payload.get("rationale"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| safe_truncate(value, 180))
+        .unwrap_or_default();
+    Some(UserMemoryCaptureEmptyVerdict {
+        has_durable_memory,
+        confidence,
+        reason,
+    })
 }
 
 fn learned_user_memory_scope_ids<'a>(
@@ -2499,14 +2859,20 @@ fn user_memory_operation_semantic_key(
             memory_kind.trim(),
             durability.trim(),
             scope.trim(),
-            if scope_explicit { "explicit" } else { "implicit" },
+            if scope_explicit {
+                "explicit"
+            } else {
+                "implicit"
+            },
             project_id.unwrap_or_default().trim(),
             conversation_id.unwrap_or_default().trim(),
         ])
     )
 }
 
-fn user_memory_operation_subject_key(operation: &crate::storage::memory_operation::Model) -> String {
+fn user_memory_operation_subject_key(
+    operation: &crate::storage::memory_operation::Model,
+) -> String {
     operation
         .model_metadata
         .get("semantic_key")
@@ -3345,6 +3711,36 @@ fn canonical_preferred_action_name(
         .map(|action| action.name.clone())
 }
 
+fn clarification_choice(label: &str, submit_text: impl Into<String>) -> ClarificationChoice {
+    ClarificationChoice {
+        label: safe_truncate(label.trim(), 80),
+        submit_text: safe_truncate(submit_text.into().trim(), 220),
+    }
+}
+
+fn parse_clarification_choices_payload(payload: &serde_json::Value) -> Vec<ClarificationChoice> {
+    payload
+        .get("choices")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| {
+            let label = value
+                .get("label")
+                .and_then(|field| field.as_str())
+                .map(str::trim)
+                .filter(|field| !field.is_empty())?;
+            let submit_text = value
+                .get("submit_text")
+                .or_else(|| value.get("submitText"))
+                .and_then(|field| field.as_str())
+                .map(str::trim)
+                .filter(|field| !field.is_empty())?;
+            Some(clarification_choice(label, submit_text))
+        })
+        .collect()
+}
+
 fn parse_action_selection_assessment_payload(
     payload: &serde_json::Value,
     all_actions: &[crate::actions::ActionDef],
@@ -3392,13 +3788,46 @@ fn parse_action_selection_assessment_payload(
         .filter(|value| !value.is_empty())
         .map(|value| safe_truncate(value, 220))
         .unwrap_or_else(|| "No additional action-selection reasoning provided.".to_string());
+    let choices = parse_clarification_choices_payload(payload);
 
     ActionSelectionAssessment {
         needed_actions,
         should_clarify,
         clarification_question,
+        choices,
         reasoning,
     }
+}
+
+fn parse_creation_surface_assessment_payload(
+    payload: &serde_json::Value,
+) -> Option<CreationSurfaceAssessment> {
+    let surface = payload
+        .get("surface")
+        .or_else(|| payload.get("execution_surface"))
+        .or_else(|| payload.get("build_surface"))
+        .and_then(|value| value.as_str())
+        .map(CreationSurfaceKind::from_payload_label)
+        .unwrap_or_default();
+    let applies = payload
+        .get("applies")
+        .or_else(|| payload.get("relevant"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(surface != CreationSurfaceKind::None);
+    if !applies || surface == CreationSurfaceKind::None {
+        return None;
+    }
+
+    let reasoning = payload
+        .get("reasoning")
+        .or_else(|| payload.get("reason"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| safe_truncate(value, 220))
+        .unwrap_or_else(|| "No creation-surface reasoning provided.".to_string());
+
+    Some(CreationSurfaceAssessment { surface, reasoning })
 }
 
 fn augment_preferred_action_names_for_direct_execution(
@@ -3583,6 +4012,65 @@ fn action_is_public_freshness_grounding_action(action: &ActionDef) -> bool {
         )
 }
 
+fn action_is_public_freshness_research_action(action: &ActionDef) -> bool {
+    action_is_public_freshness_grounding_action(action)
+        && (action_has_capability(action, "research")
+            || matches!(action.planner_metadata().cost, PlannerCostTier::High))
+}
+
+fn public_freshness_action_sort_key(action: &ActionDef) -> (usize, usize, usize, String) {
+    let metadata = action.planner_metadata();
+    let integration_rank = match metadata.integration_class {
+        PlannerIntegrationClass::Search => 0,
+        PlannerIntegrationClass::Network => 1,
+        _ => 10,
+    };
+    let research_rank = usize::from(action_is_public_freshness_research_action(action));
+    let cost_rank = match metadata.cost {
+        PlannerCostTier::Low => 0,
+        PlannerCostTier::Medium => 1,
+        PlannerCostTier::High => 2,
+    };
+    (
+        integration_rank,
+        research_rank,
+        cost_rank,
+        action.name.to_ascii_lowercase(),
+    )
+}
+
+fn public_freshness_action_shortlist(
+    selected: &[ActionDef],
+    all_actions: &[ActionDef],
+    prefer_public_research: bool,
+) -> Vec<ActionDef> {
+    let mut filtered = Vec::new();
+    let mut seen = HashSet::new();
+    for action in selected.iter().chain(all_actions.iter()) {
+        if action_is_public_freshness_grounding_action(action)
+            && seen.insert(action.name.to_ascii_lowercase())
+        {
+            filtered.push(action.clone());
+        }
+    }
+
+    if filtered.is_empty() {
+        return filtered;
+    }
+
+    if !prefer_public_research
+        && filtered
+            .iter()
+            .any(|action| !action_is_public_freshness_research_action(action))
+    {
+        filtered.retain(|action| !action_is_public_freshness_research_action(action));
+    }
+
+    filtered.sort_by_key(public_freshness_action_sort_key);
+    filtered.truncate(MAX_SHORTLISTED_ACTIONS);
+    filtered
+}
+
 fn action_is_read_only_knowledge_action(action: &ActionDef) -> bool {
     let metadata = action.planner_metadata();
     if metadata.requires_auth
@@ -3634,7 +4122,12 @@ fn any_named_actions_match_catalog_predicate(
 
 fn should_limit_actions_to_public_freshness_grounding(
     request_shape: Option<&RequestShapeAssessment>,
+    creation_surface: Option<&CreationSurfaceAssessment>,
 ) -> bool {
+    if creation_surface.is_some_and(|surface| surface.surface != CreationSurfaceKind::None) {
+        return false;
+    }
+
     request_shape
         .map(|shape| shape.public_freshness_required && shape.is_conversation_like())
         .unwrap_or(false)
@@ -3710,7 +4203,11 @@ fn user_facing_flow_kind_uses_full_action_catalog(flow_kind: &str) -> bool {
 fn should_expose_full_action_catalog_for_turn(
     flow_kind: &str,
     request_hints: &RequestExecutionHints,
+    simple_request: bool,
 ) -> bool {
+    if simple_request {
+        return false;
+    }
     if !user_facing_flow_kind_uses_full_action_catalog(flow_kind) {
         return false;
     }
@@ -3801,7 +4298,7 @@ fn request_shape_represents_generic_execution(
         && !request_shape_targets_execution_surface(
             Some(shape),
             "schedule_task",
-            &["task"],
+            &[],
             &["scheduled"],
         )
         && !request_shape_targets_execution_surface(
@@ -3810,6 +4307,51 @@ fn request_shape_represents_generic_execution(
             &["watcher"],
             &["watch_until"],
         )
+}
+
+const MIN_CONVERSATION_ONLY_REQUEST_SHAPE_CONFIDENCE: f32 = 0.70;
+
+fn request_shape_is_conversation_only(request_shape: Option<&RequestShapeAssessment>) -> bool {
+    request_shape
+        .map(|shape| {
+            shape.confidence >= MIN_CONVERSATION_ONLY_REQUEST_SHAPE_CONFIDENCE
+                && shape.shape_is("conversation")
+                && shape.execution_mode_is("none")
+                && !shape.should_confirm
+                && shape.preferred_actions.is_empty()
+                && shape.integration_id.is_none()
+                && !shape.product_help
+                && shape.help_topics.is_empty()
+                && !shape.public_freshness_required
+                && !shape.workspace_modification_request
+        })
+        .unwrap_or(false)
+}
+
+fn should_run_self_memory_lookup_classifier(
+    request_shape: Option<&RequestShapeAssessment>,
+) -> bool {
+    request_shape
+        .map(|shape| {
+            !shape.is_execution_request()
+                && !request_shape_is_conversation_only(Some(shape))
+                && !shape.product_help
+                && !shape.public_freshness_required
+                && !shape.workspace_modification_request
+                && !shape.is_integration_request()
+                && shape.preferred_actions.is_empty()
+                && (shape.shape_is("inspection") || shape.shape_is("unknown"))
+        })
+        .unwrap_or(true)
+}
+
+fn should_run_action_selection_classifier(_request_shape: Option<&RequestShapeAssessment>) -> bool {
+    // Keep the semantic action selector available even when the request-shape
+    // classifier leans "conversation-only". That shape is a hint, not a hard
+    // gate: misclassifying imperative build/deploy/edit requests as chat would
+    // otherwise suppress the only recovery path that can still select the
+    // correct execution surface from the live action catalog.
+    true
 }
 
 fn request_shape_indicates_workspace_modification(
@@ -3828,6 +4370,170 @@ fn request_shape_indicates_workspace_modification(
         .unwrap_or(false)
 }
 
+#[derive(Debug, Clone)]
+struct SurfaceIntentScore {
+    action_name: String,
+    score: f32,
+}
+
+fn best_surface_intent_score(
+    message: &str,
+    all_actions: &[crate::actions::ActionDef],
+    predicate: fn(&crate::actions::ActionDef) -> bool,
+) -> Option<SurfaceIntentScore> {
+    all_actions
+        .iter()
+        .filter(|action| predicate(action))
+        .map(|action| SurfaceIntentScore {
+            action_name: action.name.clone(),
+            score: action_intent_score(message, action),
+        })
+        .max_by(|left, right| {
+            left.score
+                .partial_cmp(&right.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| right.action_name.cmp(&left.action_name))
+        })
+}
+
+fn action_selection_targets_surface(
+    selection: &ActionSelectionAssessment,
+    all_actions: &[crate::actions::ActionDef],
+    predicate: fn(&crate::actions::ActionDef) -> bool,
+) -> bool {
+    selection.needed_actions.iter().any(|selected_name| {
+        all_actions
+            .iter()
+            .any(|action| action.name.eq_ignore_ascii_case(selected_name) && predicate(action))
+    })
+}
+
+fn maybe_synthesize_creation_surface_clarification(
+    message: &str,
+    request_shape: Option<&RequestShapeAssessment>,
+    all_actions: &[crate::actions::ActionDef],
+    action_selection: Option<&ActionSelectionAssessment>,
+    creation_surface: Option<&CreationSurfaceAssessment>,
+    direct_user_interactive: bool,
+    use_recent_artifact_context: bool,
+) -> Option<ActionSelectionAssessment> {
+    if !direct_user_interactive
+        || use_recent_artifact_context
+        || action_selection.is_some_and(|selection| selection.should_clarify)
+    {
+        return None;
+    }
+
+    if let Some(shape) = request_shape {
+        if shape.is_integration_request()
+            || shape.shape_is("calendar_event")
+            || shape.execution_mode_is("scheduled")
+            || shape.execution_mode_is("watch_until")
+            || shape.product_help
+        {
+            return None;
+        }
+    }
+
+    if !all_actions.iter().any(action_supports_app_mutation)
+        || !all_actions.iter().any(action_supports_workspace_mutation)
+    {
+        return None;
+    }
+
+    let best_app = best_surface_intent_score(message, all_actions, action_supports_app_mutation)?;
+    let best_workspace =
+        best_surface_intent_score(message, all_actions, action_supports_workspace_mutation)?;
+
+    let selected_app_surface = action_selection.is_some_and(|selection| {
+        action_selection_targets_surface(selection, all_actions, action_supports_app_mutation)
+    });
+    let selected_workspace_surface = action_selection.is_some_and(|selection| {
+        action_selection_targets_surface(selection, all_actions, action_supports_workspace_mutation)
+    });
+
+    if selected_app_surface ^ selected_workspace_surface {
+        return None;
+    }
+
+    if let Some(surface) = creation_surface {
+        if surface.surface == CreationSurfaceKind::Ambiguous {
+            return Some(ActionSelectionAssessment {
+                needed_actions: Vec::new(),
+                should_clarify: true,
+                clarification_question: Some(
+                    "Do you want me to only build the files in the workspace, or should I build and run/deploy it as an isolated AgentArk app?"
+                        .to_string(),
+                ),
+                choices: vec![
+                    clarification_choice(
+                        "Workspace only",
+                        "Only build the files in the workspace.",
+                    ),
+                    clarification_choice(
+                        "Build and deploy",
+                        "Build and deploy it as an isolated AgentArk app.",
+                    ),
+                ],
+                reasoning: format!(
+                    "Creation-surface classifier marked this request as ambiguous. {}",
+                    safe_truncate(&surface.reasoning, 160)
+                ),
+            });
+        }
+        if matches!(
+            surface.surface,
+            CreationSurfaceKind::Workspace | CreationSurfaceKind::App
+        ) {
+            return None;
+        }
+    }
+
+    let app_surface_plausible = best_app.score >= 0.08;
+    let workspace_surface_plausible = best_workspace.score >= 0.08;
+    let app_like_request =
+        request_shape.is_some_and(|shape| shape.shape_is("app")) || app_surface_plausible;
+    let build_like_request = request_shape
+        .is_some_and(|shape| shape.workspace_modification_request)
+        || workspace_surface_plausible;
+    let both_surfaces_viable = app_surface_plausible && workspace_surface_plausible;
+    let surface_margin = (best_app.score - best_workspace.score).abs();
+    let shape_marks_both_surfaces = request_shape
+        .is_some_and(|shape| shape.shape_is("app") && shape.workspace_modification_request);
+    let ambiguous_surface =
+        shape_marks_both_surfaces || (both_surfaces_viable && surface_margin < 0.16);
+
+    if !app_like_request || !build_like_request || !ambiguous_surface {
+        return None;
+    }
+
+    Some(ActionSelectionAssessment {
+        needed_actions: Vec::new(),
+        should_clarify: true,
+        clarification_question: Some(
+            "Do you want me to only build the files in the workspace, or should I build and run/deploy it as an isolated AgentArk app?"
+                .to_string(),
+        ),
+        choices: vec![
+            clarification_choice(
+                "Workspace only",
+                "Only build the files in the workspace.",
+            ),
+            clarification_choice(
+                "Build and deploy",
+                "Build and deploy it as an isolated AgentArk app.",
+            ),
+        ],
+        reasoning: format!(
+            "Execution surface is ambiguous for this creation request: best app action {} scored {:.2}, best workspace action {} scored {:.2}.",
+            best_app.action_name,
+            best_app.score,
+            best_workspace.action_name,
+            best_workspace.score
+        ),
+    })
+}
+
 fn push_action_name_in_order(
     ordered_names: &mut Vec<String>,
     seen_names: &mut HashSet<String>,
@@ -3843,33 +4549,91 @@ fn push_action_name_in_order(
     }
 }
 
-#[cfg(test)]
+fn action_is_simple_interactive_recovery_candidate(action: &crate::actions::ActionDef) -> bool {
+    let metadata = action.planner_metadata();
+    if metadata.requires_auth {
+        return false;
+    }
+
+    match metadata.role {
+        PlannerActionRole::Mutation => {
+            matches!(
+                metadata.integration_class,
+                PlannerIntegrationClass::App | PlannerIntegrationClass::Filesystem
+            ) && !matches!(metadata.cost, PlannerCostTier::High)
+        }
+        PlannerActionRole::Inspection => {
+            matches!(
+                metadata.integration_class,
+                PlannerIntegrationClass::App | PlannerIntegrationClass::Filesystem
+            ) && matches!(metadata.cost, PlannerCostTier::Low)
+        }
+        PlannerActionRole::Orchestration => matches!(metadata.cost, PlannerCostTier::Low),
+        PlannerActionRole::DataSource => {
+            matches!(metadata.integration_class, PlannerIntegrationClass::Search)
+                && !matches!(metadata.cost, PlannerCostTier::High)
+        }
+        _ => false,
+    }
+}
+
+fn simple_interactive_recovery_sort_key(
+    action: &crate::actions::ActionDef,
+) -> (usize, usize, String) {
+    let metadata = action.planner_metadata();
+    let domain_rank = match (metadata.role, metadata.integration_class) {
+        (PlannerActionRole::Mutation, PlannerIntegrationClass::App) => 0,
+        (PlannerActionRole::Mutation, PlannerIntegrationClass::Filesystem) => 1,
+        (PlannerActionRole::Inspection, PlannerIntegrationClass::App) => 2,
+        (PlannerActionRole::Inspection, PlannerIntegrationClass::Filesystem) => 3,
+        (PlannerActionRole::Orchestration, _) => 4,
+        (PlannerActionRole::DataSource, PlannerIntegrationClass::Search) => 5,
+        _ => 10,
+    };
+    let cost_rank = match metadata.cost {
+        PlannerCostTier::Low => 0,
+        PlannerCostTier::Medium => 1,
+        PlannerCostTier::High => 2,
+    };
+    (domain_rank, cost_rank, action.name.to_ascii_lowercase())
+}
+
+fn simple_interactive_recovery_action_shortlist(
+    selected: &[crate::actions::ActionDef],
+    all_actions: &[crate::actions::ActionDef],
+) -> Vec<crate::actions::ActionDef> {
+    let mut filtered = Vec::new();
+    let mut seen = HashSet::new();
+    for action in selected.iter().chain(all_actions.iter()) {
+        if action_is_simple_interactive_recovery_candidate(action)
+            && seen.insert(action.name.to_ascii_lowercase())
+        {
+            filtered.push(action.clone());
+        }
+    }
+
+    filtered.sort_by_key(simple_interactive_recovery_sort_key);
+    filtered.truncate(MAX_SHORTLISTED_ACTIONS);
+    filtered
+}
+
 fn limit_actions_for_simple_request(
     selected: &mut Vec<crate::actions::ActionDef>,
     all_actions: &[crate::actions::ActionDef],
     public_freshness_required: bool,
     prefer_public_research: bool,
+    direct_user_interactive: bool,
 ) -> &'static str {
     if !public_freshness_required {
+        if direct_user_interactive {
+            *selected = simple_interactive_recovery_action_shortlist(selected, all_actions);
+            return "simple_interactive_recovery";
+        }
         selected.clear();
         return "simple_chat";
     }
 
-    let web_search_available = all_actions
-        .iter()
-        .any(|action| action.name.eq_ignore_ascii_case("web_search"));
-    let allow_research = prefer_public_research || !web_search_available;
-    let mut filtered = Vec::new();
-    let mut seen = HashSet::new();
-    for action in selected.iter().chain(all_actions.iter()) {
-        let allowed = action.name.eq_ignore_ascii_case("web_search")
-            || (allow_research && action.name.eq_ignore_ascii_case("research"));
-        if allowed && seen.insert(action.name.clone()) {
-            filtered.push(action.clone());
-        }
-    }
-    filtered.truncate(MAX_SHORTLISTED_ACTIONS);
-    *selected = filtered;
+    *selected = public_freshness_action_shortlist(selected, all_actions, prefer_public_research);
     "simple_freshness"
 }
 
@@ -5677,6 +6441,59 @@ fn build_user_facing_tool_fallback_response(
     }
 }
 
+fn maybe_build_output_guard_block_response(
+    rule_id: &str,
+    batch: &tool_execution::ToolExecutionBatch,
+) -> Option<String> {
+    if rule_id != "block-internal-context-leak" || batch.outputs.is_empty() {
+        return None;
+    }
+
+    if !batch
+        .outputs
+        .iter()
+        .enumerate()
+        .any(|(index, _)| tool_batch_output_failed(batch, index))
+    {
+        return None;
+    }
+
+    let mut successful_summaries = Vec::new();
+    let mut seen = HashSet::new();
+    for (index, output) in batch.outputs.iter().enumerate() {
+        if !tool_batch_output_succeeded(batch, index) {
+            continue;
+        }
+        let summary = if output.name == "web_search" {
+            summarize_rendered_search_results_compact(&output.content)
+                .or_else(|| summarize_tool_output_for_user(&output.name, &output.content))
+        } else {
+            summarize_tool_output_for_user(&output.name, &output.content)
+        };
+        if let Some(summary) = summary {
+            let trimmed = summary.trim();
+            if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+                successful_summaries.push(trimmed.to_string());
+            }
+        }
+        if successful_summaries.len() >= 3 {
+            break;
+        }
+    }
+
+    let mut sections = vec![
+        "I hit a tool error while working on this request, so I left out the internal runtime details."
+            .to_string(),
+    ];
+    if successful_summaries.is_empty() {
+        sections.push("Please retry the request.".to_string());
+    } else {
+        sections.extend(successful_summaries);
+    }
+
+    Some(sanitize_final_user_response(&sections.join("\n\n")))
+}
+
 fn build_simple_fast_path_tool_response(batch: &tool_execution::ToolExecutionBatch) -> String {
     if batch.outputs.len() == 1 {
         if let Some(output) = batch.outputs.first() {
@@ -6462,6 +7279,87 @@ fn normalize_recent_app_artifact_url(url: &str, app_id: &str) -> String {
     trimmed.to_string()
 }
 
+fn build_app_artifact_context_from_deployed_app(
+    app: &serde_json::Value,
+) -> Option<ConversationArtifactContext> {
+    let app_id = app
+        .get("id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let title = app
+        .get("title")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("App");
+    let url = app
+        .get("url")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    Some(ConversationArtifactContext {
+        artifact_type: "app".to_string(),
+        artifact_id: app_id.to_string(),
+        title: title.to_string(),
+        summary: "Matched deployed app from the app registry".to_string(),
+        url: normalize_recent_app_artifact_url(url, app_id),
+        related_actions: vec![
+            "app_inspect".to_string(),
+            "file_read".to_string(),
+            "file_write".to_string(),
+            "app_restart".to_string(),
+        ],
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+fn resolve_deployed_app_reference_from_message(
+    message: &str,
+    deployed_apps: &[serde_json::Value],
+) -> DeployedAppReferenceResolution {
+    if message.trim().is_empty() || deployed_apps.is_empty() {
+        return DeployedAppReferenceResolution::default();
+    }
+
+    let ranked_apps = Agent::rank_deployed_apps(message, deployed_apps);
+    if let Some((_, _, app, _)) = Agent::select_best_ranked_app(message, &ranked_apps) {
+        return DeployedAppReferenceResolution {
+            matched: build_app_artifact_context_from_deployed_app(app),
+            ambiguous_candidates: Vec::new(),
+        };
+    }
+
+    let ambiguous_candidates = ranked_apps
+        .iter()
+        .take(3)
+        .filter(|(score, _, _, _)| *score >= 0.45)
+        .filter_map(|(score, app_id, app, reason)| {
+            let title = app
+                .get("title")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            Some(DeployedAppReferenceCandidate {
+                app_id: app_id.clone(),
+                title: title.to_string(),
+                score: *score,
+                reason: reason.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let ambiguous_candidates = if ambiguous_candidates.len() >= 2 {
+        ambiguous_candidates
+    } else {
+        Vec::new()
+    };
+
+    DeployedAppReferenceResolution {
+        matched: None,
+        ambiguous_candidates,
+    }
+}
+
 fn recover_recent_app_artifact_from_history(
     conversation_history: &[ConversationMessage],
     deployed_apps: &[serde_json::Value],
@@ -6564,25 +7462,113 @@ fn recover_recent_app_artifact_from_history(
 fn build_verified_app_deploy_summary(batch: &tool_execution::ToolExecutionBatch) -> Option<String> {
     let mut title: Option<String> = None;
     let mut kind: Option<&'static str> = None;
+    let mut app_id: Option<String> = None;
     let mut local_url: Option<String> = None;
     let mut public_url: Option<String> = None;
     let mut access_password: Option<String> = None;
     let mut access_guard_enabled = false;
     let mut validation_passed = false;
+    let mut updated_existing = false;
+    let mut runtime_delegated = false;
+    let mut waiting_for_inputs = false;
 
     for output in &batch.outputs {
         if output.name != "app_deploy" {
             continue;
         }
         let content = output.content.replace("\r\n", "\n");
+        if let Some(value) = parse_tool_output_json(&content) {
+            let status = value
+                .get("status")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if matches!(status, Some("deployed")) {
+                validation_passed = true;
+            }
+            if matches!(status, Some("needs_secrets")) {
+                waiting_for_inputs = true;
+            }
+            updated_existing |= value
+                .get("updated_existing")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            runtime_delegated |= value
+                .get("runtime_delegated")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if title.is_none() {
+                title = value
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string);
+            }
+            if kind.is_none() {
+                kind = value.get("type").and_then(|v| v.as_str()).map(|value| {
+                    if value.eq_ignore_ascii_case("dynamic") {
+                        "Dynamic app"
+                    } else if value.eq_ignore_ascii_case("static") {
+                        "Static app"
+                    } else {
+                        "App"
+                    }
+                });
+            }
+            if app_id.is_none() {
+                app_id = value
+                    .get("app_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string);
+            }
+            if local_url.is_none() {
+                local_url = value
+                    .get("local_access_url")
+                    .or_else(|| value.get("local_url"))
+                    .or_else(|| value.get("access_url"))
+                    .or_else(|| value.get("url"))
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string);
+            }
+            if public_url.is_none() {
+                public_url = value
+                    .get("public_url")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string);
+            }
+            access_guard_enabled |= value
+                .get("access_guard_enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if access_password.is_none() {
+                access_password = value
+                    .get("access_password")
+                    .or_else(|| value.get("access_key"))
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string);
+            }
+        }
         let lower = content.to_ascii_lowercase();
         if lower.contains("deployment validation: passed")
             || lower.contains("validated that it is running")
             || lower.contains("app deployed + validated:")
+            || lower.contains("app updated + validated:")
             || lower.contains("deployment validation: skipped (local static app)")
             || lower.contains("it is ready locally.")
         {
             validation_passed = true;
+        }
+        if lower.contains("i have updated **") || lower.contains("app updated") {
+            updated_existing = true;
         }
         if title.is_none() {
             title = extract_app_deploy_title(&content);
@@ -6605,6 +7591,11 @@ fn build_verified_app_deploy_summary(batch: &tool_execution::ToolExecutionBatch)
                 public_url = extract_first_markdown_link_url(line_trimmed);
             } else if line_lower.starts_with("- access guard: enabled") {
                 access_guard_enabled = true;
+            } else if app_id.is_none() && line_lower.starts_with("- app id:") {
+                app_id = line_trimmed
+                    .split_once(':')
+                    .map(|(_, value)| value.trim().trim_matches('`').to_string())
+                    .filter(|value| !value.is_empty());
             } else if access_password.is_none()
                 && (line_lower.starts_with("- access password:")
                     || line_lower.starts_with("- access key:"))
@@ -6617,16 +7608,39 @@ fn build_verified_app_deploy_summary(batch: &tool_execution::ToolExecutionBatch)
         }
     }
 
-    if !validation_passed {
+    if !validation_passed && !waiting_for_inputs {
         return None;
     }
 
     let title_label = title.unwrap_or_else(|| "App".to_string());
-    let mut lines = vec![format!("{} ready: {}.", kind.unwrap_or("App"), title_label)];
+    let mut lines = vec![if waiting_for_inputs {
+        format!("{} created: {}.", kind.unwrap_or("App"), title_label)
+    } else {
+        format!(
+            "{} {}: {}.",
+            kind.unwrap_or("App"),
+            if updated_existing {
+                "updated"
+            } else if runtime_delegated {
+                "deployed"
+            } else {
+                "ready"
+            },
+            title_label
+        )
+    }];
     // Always use local URL as the primary link — tunnel URLs are ephemeral
     // and break after container restarts.
     if let Some(local_url) = local_url.as_ref() {
         lines.push(format!("- Open: [Open app]({})", local_url));
+    }
+    if let Some(app_id) = app_id.as_ref() {
+        lines.push(format!("- App ID: `{}`", app_id));
+    }
+    if waiting_for_inputs {
+        lines.push("- Waiting for required inputs before start.".to_string());
+    } else if runtime_delegated {
+        lines.push("- Runtime: startup delegated to the executor.".to_string());
     }
     if access_guard_enabled {
         lines.push("- Guard: enabled.".to_string());
@@ -6663,6 +7677,12 @@ fn build_verified_existing_app_update_summary(
         .and_then(|v| v.as_str())
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("the app");
+    let app_id = restarted_app
+        .get("app_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
     let kind = restarted_app
         .get("type")
         .and_then(|v| v.as_str())
@@ -6700,6 +7720,9 @@ fn build_verified_existing_app_update_summary(
     let mut lines = vec![format!("{} updated: {}.", kind, title)];
     if let Some(local_url) = local_url.as_ref() {
         lines.push(format!("- Open: [Open app]({})", local_url));
+    }
+    if let Some(app_id) = app_id.as_ref() {
+        lines.push(format!("- App ID: `{}`", app_id));
     }
     if access_guard_enabled {
         lines.push("- Guard: enabled.".to_string());
@@ -7557,6 +8580,97 @@ fn repair_app_deploy_tool_call_from_recent_writes(
         name: call.name.clone(),
         arguments: serde_json::Value::Object(repaired),
     })
+}
+
+enum ExistingAppDeployRetargetPlan {
+    NotNeeded,
+    Retargeted(Vec<crate::core::llm::ToolCall>),
+    InspectRedirect { query: String },
+}
+
+fn plan_existing_app_deploy_retarget(
+    execution_intent: bool,
+    app_deploy_intent: bool,
+    existing_app_repair_redirect_attempts: usize,
+    existing_app_repair_already_attempted: bool,
+    recent_artifact_prompt_context: Option<&ConversationArtifactContext>,
+    tool_calls: &[crate::core::llm::ToolCall],
+) -> ExistingAppDeployRetargetPlan {
+    if !execution_intent
+        || app_deploy_intent
+        || existing_app_repair_redirect_attempts >= 2
+        || existing_app_repair_already_attempted
+    {
+        return ExistingAppDeployRetargetPlan::NotNeeded;
+    }
+
+    let Some(artifact_ctx) =
+        recent_artifact_prompt_context.filter(|ctx| ctx.artifact_type.eq_ignore_ascii_case("app"))
+    else {
+        return ExistingAppDeployRetargetPlan::NotNeeded;
+    };
+
+    let needs_retarget = tool_calls.iter().any(|call| {
+        call.name == "app_deploy"
+            && call
+                .arguments
+                .get("app_id")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+    });
+    if !needs_retarget {
+        return ExistingAppDeployRetargetPlan::NotNeeded;
+    }
+
+    let mut retargeted_tool_calls = tool_calls.to_vec();
+    let mut retargeted_existing_app = false;
+    let mut saw_repo_deploy = false;
+    for call in &mut retargeted_tool_calls {
+        if call.name != "app_deploy" {
+            continue;
+        }
+        if call
+            .arguments
+            .get("repo_url")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some()
+        {
+            saw_repo_deploy = true;
+            continue;
+        }
+        let Some(arguments) = call.arguments.as_object_mut() else {
+            continue;
+        };
+        if arguments
+            .get("app_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+        {
+            arguments.insert(
+                "app_id".to_string(),
+                serde_json::json!(artifact_ctx.artifact_id),
+            );
+            retargeted_existing_app = true;
+        }
+    }
+
+    if retargeted_existing_app && !saw_repo_deploy {
+        ExistingAppDeployRetargetPlan::Retargeted(retargeted_tool_calls)
+    } else {
+        ExistingAppDeployRetargetPlan::InspectRedirect {
+            query: if artifact_ctx.title.trim().is_empty() {
+                artifact_ctx.artifact_id.clone()
+            } else {
+                artifact_ctx.title.clone()
+            },
+        }
+    }
 }
 
 struct GeneratedAppDeployStagingPlan {
@@ -9487,6 +10601,66 @@ fn should_apply_recent_artifact_context(
     false
 }
 
+fn maybe_synthesize_deployed_app_reference_clarification(
+    request_shape: Option<&RequestShapeAssessment>,
+    recent_artifact_prompt_context: Option<&ConversationArtifactContext>,
+    candidates: &[DeployedAppReferenceCandidate],
+) -> Option<ActionSelectionAssessment> {
+    if recent_artifact_prompt_context.is_some() || candidates.len() < 2 {
+        return None;
+    }
+
+    let Some(shape) = request_shape else {
+        return None;
+    };
+    if request_shape_is_conversation_only(Some(shape))
+        || shape.product_help
+        || shape.public_freshness_required
+        || (!shape.is_execution_request()
+            && !shape.workspace_modification_request
+            && shape.preferred_actions.is_empty())
+    {
+        return None;
+    }
+
+    let app_list = candidates
+        .iter()
+        .take(3)
+        .map(|candidate| format!("{} (`{}`)", candidate.title, candidate.app_id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(ActionSelectionAssessment {
+        needed_actions: Vec::new(),
+        should_clarify: true,
+        clarification_question: Some(format!(
+            "I found more than one deployed app that could match: {}. Which app do you want me to update? Reply with the title or app id.",
+            app_list
+        )),
+        choices: candidates
+            .iter()
+            .take(3)
+            .map(|candidate| {
+                clarification_choice(
+                    &format!("{} ({})", candidate.title, candidate.app_id),
+                    candidate.app_id.clone(),
+                )
+            })
+            .collect(),
+        reasoning: format!(
+            "Multiple deployed apps matched the request closely: {}.",
+            candidates
+                .iter()
+                .take(3)
+                .map(|candidate| format!(
+                    "{}:{} ({:.2}, {})",
+                    candidate.title, candidate.app_id, candidate.score, candidate.reason
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    })
+}
+
 /// Query complexity classification
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -9709,6 +10883,7 @@ pub struct ProcessedMessage {
     pub run_status: Option<String>,
     pub trace_id: Option<String>,
     pub total_tokens: i64,
+    pub choices: Vec<ClarificationChoice>,
     pub degradation: Vec<crate::core::DegradationNote>,
     pub attempted_models: Vec<crate::core::ModelAttemptRecord>,
     pub user_outcome: Option<crate::core::UserFacingOutcome>,
@@ -9873,6 +11048,7 @@ fn llm_attempt_candidates_for_role(
 }
 
 /// The main Agent struct - orchestrates all subsystems
+#[derive(Clone)]
 pub struct Agent {
     /// Unique agent ID within the swarm
     pub _agent_id: AgentId,
@@ -9887,10 +11063,10 @@ pub struct Agent {
     pub identity: IdentityManager,
 
     /// Safety policy engine
-    pub safety: SafetyEngine,
+    pub safety: Arc<SafetyEngine>,
 
     /// Execution proof generator
-    pub proofs: ProofEngine,
+    pub proofs: Arc<ProofEngine>,
 
     /// Action runtime (WASM + Docker sandbox)
     pub runtime: Arc<ActionRuntime>,
@@ -9975,7 +11151,7 @@ pub struct Agent {
     pub trace_history: Arc<RwLock<Vec<ExecutionTrace>>>,
 
     /// External service integrations (Calendar, WhatsApp, etc.)
-    pub integrations: crate::integrations::IntegrationManager,
+    pub integrations: Arc<crate::integrations::IntegrationManager>,
 
     /// Extension hook manager for pre/post processing hooks
     pub hooks: crate::hooks::HookManager,
@@ -10143,6 +11319,111 @@ impl UserMemoryCaptureWorker {
             primary_model_id: agent.primary_model_id.clone(),
             user_selected_model_slot_id: agent.user_selected_model_slot_id.clone(),
         }
+    }
+
+    async fn sync_runtime_profile_from_user_preference(&self, preference_key: &str, value: &str) {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+
+        let maybe_profile_bytes = {
+            let mut profile = self.user_profile.write().await;
+            let mut changed = false;
+            match preference_key {
+                "user_timezone" => {
+                    if trimmed.parse::<chrono_tz::Tz>().is_err() {
+                        tracing::warn!(
+                            preference_key = preference_key,
+                            value = trimmed,
+                            "Skipping runtime profile sync for invalid timezone value"
+                        );
+                    } else if profile.timezone.as_deref() != Some(trimmed) {
+                        profile.timezone = Some(trimmed.to_string());
+                        changed = true;
+                    }
+                }
+                "preferred_tone" => {
+                    if profile.tone.as_deref() != Some(trimmed) {
+                        profile.tone = Some(trimmed.to_string());
+                        changed = true;
+                    }
+                }
+                _ => {}
+            }
+            if changed {
+                match serde_json::to_vec(&*profile) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) => {
+                        tracing::warn!(
+                            error = ?error,
+                            preference_key = preference_key,
+                            "Failed to serialize user profile after preference sync"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        };
+
+        if let Some(profile_bytes) = maybe_profile_bytes {
+            if let Err(error) = self
+                .encrypted_storage
+                .set_encrypted("user_profile", &profile_bytes)
+                .await
+            {
+                tracing::warn!(
+                    error = ?error,
+                    preference_key = preference_key,
+                    "Failed to persist runtime profile after preference sync"
+                );
+            }
+        }
+    }
+
+    async fn sync_applied_memory_to_user_preferences(
+        &self,
+        operation: &crate::storage::memory_operation::Model,
+        key: &str,
+        value: &str,
+    ) {
+        if operation.scope != "global"
+            || operation.project_id.is_some()
+            || operation.conversation_id.is_some()
+            || operation.looks_sensitive
+        {
+            return;
+        }
+
+        let Some(preference_key) = learned_memory_key_to_user_preference_key(key) else {
+            return;
+        };
+
+        let confidence = operation.confidence.clamp(0.0, 1.0) as f32;
+        if let Err(error) = self
+            .storage
+            .upsert_user_preference(
+                &preference_key,
+                value,
+                confidence,
+                Some(USER_LEARNED_MEMORY_CAPTURE_SOURCE),
+                None,
+            )
+            .await
+        {
+            tracing::warn!(
+                error = ?error,
+                preference_key = preference_key,
+                memory_operation_id = %operation.id,
+                "Failed to sync applied learned memory into user preferences"
+            );
+            return;
+        }
+
+        self.sync_runtime_profile_from_user_preference(&preference_key, value)
+            .await;
     }
 
     async fn capture_user_memory_hints(
@@ -10918,7 +12199,8 @@ impl UserMemoryCaptureWorker {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
             {
-                if let Some(mut prior_operation) = self.storage.get_memory_operation(operation_id).await?
+                if let Some(mut prior_operation) =
+                    self.storage.get_memory_operation(operation_id).await?
                 {
                     if prior_operation.status == "queued_review" {
                         prior_operation.status = "superseded".to_string();
@@ -11002,6 +12284,8 @@ impl UserMemoryCaptureWorker {
                         .ok_or_else(|| {
                             anyhow::anyhow!("Memory operation did not persist a memory item.")
                         })?;
+                    self.sync_applied_memory_to_user_preferences(operation, key, value)
+                        .await;
                     Ok::<String, anyhow::Error>(memory_id)
                 }
                 "retract" => {
@@ -11184,10 +12468,10 @@ impl UserMemoryCaptureWorker {
         let mut learned_items = self
             .storage
             .list_active_experience_items(
-                &["constraint", "personal_fact"],
+                SAVED_USER_FACT_PROMPT_KINDS,
                 project_id,
                 conversation_id,
-                12,
+                20,
             )
             .await
             .unwrap_or_default();
@@ -11874,6 +13158,28 @@ impl UserMemoryCaptureWorker {
         candidate: &LlmAttemptCandidate,
         timeout_ms: u64,
     ) -> Result<super::llm::LlmResponse> {
+        self.run_user_memory_capture_json_candidate(
+            channel,
+            conversation_id,
+            request_kind,
+            "You extract lifecycle-aware user memory as strict JSON. Output JSON only.",
+            prompt,
+            candidate,
+            timeout_ms,
+        )
+        .await
+    }
+
+    async fn run_user_memory_capture_json_candidate(
+        &self,
+        channel: &str,
+        conversation_id: Option<&str>,
+        request_kind: &str,
+        system_prompt: &str,
+        prompt: &str,
+        candidate: &LlmAttemptCandidate,
+        timeout_ms: u64,
+    ) -> Result<super::llm::LlmResponse> {
         let request = super::ExecutionRequest {
             kind: request_kind.to_string(),
             channel: Some(channel.to_string()),
@@ -11882,7 +13188,7 @@ impl UserMemoryCaptureWorker {
             preferred_model_role: Some(
                 Agent::model_role_label(&effective_model_role_for_selection(
                     &self.config,
-                    &ModelRole::Fast,
+                    &candidate.role,
                 ))
                 .to_string(),
             ),
@@ -11891,33 +13197,271 @@ impl UserMemoryCaptureWorker {
         };
         let memories: [PromptMemory; 0] = [];
         let actions: [crate::actions::ActionDef; 0] = [];
-        match super::execute_supervised_transport_chat(
-            &self.execution_supervisor,
-            &candidate.client,
-            &request,
-            "You extract lifecycle-aware user memory as strict JSON. Output JSON only.",
-            prompt,
-            &memories,
-            &actions,
-            Some(timeout_ms.max(1)),
-        )
-        .await
+        let response = if let Some(timeout_ms) = Some(timeout_ms.max(1)).filter(|value| *value > 0)
         {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(timeout_ms),
+                candidate.client.chat_for_helper_request(
+                    system_prompt,
+                    prompt,
+                    &memories,
+                    &actions,
+                    &crate::security::ModelPrivacyConfig::default(),
+                    USER_FACT_MEMORY_CAPTURE_ALLOW_SENSITIVE_CONTEXT,
+                ),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    return Err(anyhow::anyhow!(
+                        "supervised_chat_failed(kind=timeout, request_kind={}, model={}): request timed out after {}ms",
+                        request.kind,
+                        candidate.client.model_name(),
+                        timeout_ms
+                    ));
+                }
+            }
+        } else {
+            candidate
+                .client
+                .chat_for_helper_request(
+                    system_prompt,
+                    prompt,
+                    &memories,
+                    &actions,
+                    &crate::security::ModelPrivacyConfig::default(),
+                    USER_FACT_MEMORY_CAPTURE_ALLOW_SENSITIVE_CONTEXT,
+                )
+                .await
+        };
+        match response {
             Ok(resp) => {
-                self.record_llm_usage(channel, "user_fact_memory_capture", &resp)
-                    .await;
+                self.record_llm_usage(channel, request_kind, &resp).await;
                 Ok(resp)
             }
             Err(error) => {
+                let failure_kind = self
+                    .execution_supervisor
+                    .classify_failure(&error.to_string());
                 tracing::debug!(
                     "User memory capture attempt failed on {} [{}]: {}",
                     candidate.slot_label,
                     candidate.client.model_name(),
                     error
                 );
-                Err(error)
+                Err(anyhow::anyhow!(
+                    "supervised_chat_failed(kind={}, request_kind={}, model={}): {}",
+                    failure_kind.as_str(),
+                    request.kind,
+                    candidate.client.model_name(),
+                    error
+                ))
             }
         }
+    }
+
+    fn user_memory_capture_empty_escalation_candidates(
+        &self,
+        original_candidate: &LlmAttemptCandidate,
+    ) -> Vec<LlmAttemptCandidate> {
+        let mut ordered = Vec::new();
+        let mut seen = HashSet::new();
+
+        for candidate in self.llm_candidates_for_role(&ModelRole::Primary) {
+            if seen.insert(candidate.slot_id.clone()) {
+                ordered.push(candidate);
+            }
+            if ordered.len() >= USER_FACT_MEMORY_CAPTURE_EMPTY_ESCALATION_MAX_CANDIDATES.max(1) {
+                return ordered;
+            }
+        }
+
+        if seen.insert(original_candidate.slot_id.clone()) {
+            ordered.push(original_candidate.clone());
+        }
+        if ordered.is_empty() {
+            ordered.push(original_candidate.clone());
+        }
+        ordered.truncate(USER_FACT_MEMORY_CAPTURE_EMPTY_ESCALATION_MAX_CANDIDATES.max(1));
+        ordered
+    }
+
+    async fn recover_terminal_empty_user_memory_capture_payload(
+        &self,
+        channel: &str,
+        conversation_id: Option<&str>,
+        original_prompt: &str,
+        response_shape: &str,
+        previous_response_preview: &str,
+        original_candidate: &LlmAttemptCandidate,
+        attempts: &mut Vec<UserMemoryCaptureAttemptRecord>,
+        timeout_ms: u64,
+    ) -> Option<UserMemoryCaptureFocusedRecovery> {
+        let verdict_prompt = build_user_memory_capture_empty_verdict_prompt(
+            original_prompt,
+            previous_response_preview,
+        );
+
+        for candidate in self.user_memory_capture_empty_escalation_candidates(original_candidate) {
+            let role = Agent::model_role_label(&candidate.role).to_string();
+            let verdict = match self
+                .run_user_memory_capture_json_candidate(
+                    channel,
+                    conversation_id,
+                    "user_fact_memory_capture_empty_verdict",
+                    "You decide whether an empty user-memory extraction missed durable user memory. Return only the requested JSON.",
+                    &verdict_prompt,
+                    &candidate,
+                    timeout_ms,
+                )
+                .await
+            {
+                Ok(resp) => resp,
+                Err(error) => {
+                    attempts.push(UserMemoryCaptureAttemptRecord {
+                        slot_id: candidate.slot_id.clone(),
+                        slot_label: candidate.slot_label.clone(),
+                        role: role.clone(),
+                        provider: None,
+                        model: None,
+                        stage: "empty_verdict".to_string(),
+                        request_kind: "user_fact_memory_capture_empty_verdict".to_string(),
+                        outcome: "transport_failed".to_string(),
+                        error: Some(safe_truncate(&error.to_string(), 240)),
+                    });
+                    continue;
+                }
+            };
+
+            let Some(parsed_verdict) = parse_user_memory_capture_empty_verdict(&verdict.content)
+            else {
+                attempts.push(UserMemoryCaptureAttemptRecord {
+                    slot_id: candidate.slot_id.clone(),
+                    slot_label: candidate.slot_label.clone(),
+                    role: role.clone(),
+                    provider: Some(verdict.provider.clone()),
+                    model: Some(verdict.model.clone()),
+                    stage: "empty_verdict".to_string(),
+                    request_kind: "user_fact_memory_capture_empty_verdict".to_string(),
+                    outcome: "invalid_verdict".to_string(),
+                    error: Some("invalid_verdict".to_string()),
+                });
+                continue;
+            };
+
+            let durable_detected = parsed_verdict.has_durable_memory
+                && parsed_verdict.confidence
+                    >= USER_FACT_MEMORY_CAPTURE_EMPTY_VERDICT_MIN_CONFIDENCE;
+            attempts.push(UserMemoryCaptureAttemptRecord {
+                slot_id: candidate.slot_id.clone(),
+                slot_label: candidate.slot_label.clone(),
+                role: role.clone(),
+                provider: Some(verdict.provider.clone()),
+                model: Some(verdict.model.clone()),
+                stage: "empty_verdict".to_string(),
+                request_kind: "user_fact_memory_capture_empty_verdict".to_string(),
+                outcome: if durable_detected {
+                    "durable_memory_detected".to_string()
+                } else if parsed_verdict.has_durable_memory {
+                    "durable_memory_low_confidence".to_string()
+                } else {
+                    "confirmed_empty".to_string()
+                },
+                error: None,
+            });
+            if !durable_detected {
+                continue;
+            }
+
+            let focused_recovery_prompt = build_user_memory_capture_focused_recovery_prompt(
+                original_prompt,
+                previous_response_preview,
+                &parsed_verdict.reason,
+                response_shape,
+            );
+            let focused_recovery = match self
+                .run_memory_capture_llm_candidate(
+                    channel,
+                    conversation_id,
+                    "user_fact_memory_capture_focused_recovery",
+                    &focused_recovery_prompt,
+                    &candidate,
+                    timeout_ms,
+                )
+                .await
+            {
+                Ok(resp) => resp,
+                Err(error) => {
+                    attempts.push(UserMemoryCaptureAttemptRecord {
+                        slot_id: candidate.slot_id.clone(),
+                        slot_label: candidate.slot_label.clone(),
+                        role: role.clone(),
+                        provider: None,
+                        model: None,
+                        stage: "focused_recovery".to_string(),
+                        request_kind: "user_fact_memory_capture_focused_recovery".to_string(),
+                        outcome: "transport_failed".to_string(),
+                        error: Some(safe_truncate(&error.to_string(), 240)),
+                    });
+                    continue;
+                }
+            };
+
+            match parse_user_memory_capture_payload(&focused_recovery.content) {
+                Ok(parsed) => {
+                    let is_empty_decision =
+                        user_memory_capture_payload_is_empty_decision(&parsed.payload);
+                    attempts.push(UserMemoryCaptureAttemptRecord {
+                        slot_id: candidate.slot_id.clone(),
+                        slot_label: candidate.slot_label.clone(),
+                        role: role.clone(),
+                        provider: Some(focused_recovery.provider.clone()),
+                        model: Some(focused_recovery.model.clone()),
+                        stage: "focused_recovery".to_string(),
+                        request_kind: "user_fact_memory_capture_focused_recovery".to_string(),
+                        outcome: user_memory_capture_payload_ok_outcome(&parsed, is_empty_decision)
+                            .to_string(),
+                        error: None,
+                    });
+                    if !is_empty_decision {
+                        return Some(UserMemoryCaptureFocusedRecovery {
+                            payload: parsed.payload,
+                            selected_slot_id: candidate.slot_id.clone(),
+                            selected_slot_label: candidate.slot_label.clone(),
+                            selected_provider: focused_recovery.provider.clone(),
+                            selected_model: focused_recovery.model.clone(),
+                            selected_stage: "focused_recovery".to_string(),
+                        });
+                    }
+                }
+                Err(error) => {
+                    let outcome = match error {
+                        UserMemoryCapturePayloadError::Unparseable => "unparseable",
+                        UserMemoryCapturePayloadError::IncompleteShape => "incomplete_shape",
+                    };
+                    attempts.push(UserMemoryCaptureAttemptRecord {
+                        slot_id: candidate.slot_id.clone(),
+                        slot_label: candidate.slot_label.clone(),
+                        role: role.clone(),
+                        provider: Some(focused_recovery.provider.clone()),
+                        model: Some(focused_recovery.model.clone()),
+                        stage: "focused_recovery".to_string(),
+                        request_kind: "user_fact_memory_capture_focused_recovery".to_string(),
+                        outcome: outcome.to_string(),
+                        error: Some(outcome.to_string()),
+                    });
+                    log_user_memory_capture_payload_error(
+                        "memory capture focused recovery",
+                        conversation_id,
+                        &focused_recovery.content,
+                        error,
+                    );
+                }
+            }
+        }
+
+        None
     }
 
     async fn run_memory_capture_with_schema_recovery(
@@ -11980,7 +13524,9 @@ impl UserMemoryCaptureWorker {
             };
 
             match parse_user_memory_capture_payload(&resp.content) {
-                Ok(payload) => {
+                Ok(parsed) => {
+                    let is_empty_decision =
+                        user_memory_capture_payload_is_empty_decision(&parsed.payload);
                     attempts.push(UserMemoryCaptureAttemptRecord {
                         slot_id: candidate.slot_id.clone(),
                         slot_label: candidate.slot_label.clone(),
@@ -11989,19 +13535,179 @@ impl UserMemoryCaptureWorker {
                         model: Some(resp.model.clone()),
                         stage: "extract".to_string(),
                         request_kind: "user_fact_memory_capture".to_string(),
-                        outcome: "ok".to_string(),
+                        outcome: user_memory_capture_payload_ok_outcome(&parsed, is_empty_decision)
+                            .to_string(),
                         error: None,
                     });
-                    return UserMemoryCaptureRunOutcome {
-                        payload: Some(payload),
-                        attempts,
-                        selected_slot_id: Some(candidate.slot_id.clone()),
-                        selected_slot_label: Some(candidate.slot_label.clone()),
-                        selected_provider: Some(resp.provider.clone()),
-                        selected_model: Some(resp.model.clone()),
-                        selected_stage: Some("extract".to_string()),
-                        terminal_error: None,
+                    if !is_empty_decision {
+                        return UserMemoryCaptureRunOutcome {
+                            payload: Some(parsed.payload),
+                            attempts,
+                            selected_slot_id: Some(candidate.slot_id.clone()),
+                            selected_slot_label: Some(candidate.slot_label.clone()),
+                            selected_provider: Some(resp.provider.clone()),
+                            selected_model: Some(resp.model.clone()),
+                            selected_stage: Some("extract".to_string()),
+                            terminal_error: None,
+                        };
+                    }
+
+                    let empty_retry_prompt = build_user_memory_capture_empty_retry_prompt(
+                        original_prompt,
+                        &user_memory_capture_response_preview(&resp.content, 240),
+                        response_shape,
+                    );
+                    let original_empty_payload = parsed.payload;
+                    let empty_retry = match self
+                        .run_memory_capture_llm_candidate(
+                            channel,
+                            conversation_id,
+                            "user_fact_memory_capture_empty_retry",
+                            &empty_retry_prompt,
+                            candidate,
+                            timeout_ms,
+                        )
+                        .await
+                    {
+                        Ok(resp) => resp,
+                        Err(error) => {
+                            attempts.push(UserMemoryCaptureAttemptRecord {
+                                slot_id: candidate.slot_id.clone(),
+                                slot_label: candidate.slot_label.clone(),
+                                role: role.clone(),
+                                provider: None,
+                                model: None,
+                                stage: "empty_retry".to_string(),
+                                request_kind: "user_fact_memory_capture_empty_retry".to_string(),
+                                outcome: "transport_failed".to_string(),
+                                error: Some(safe_truncate(&error.to_string(), 240)),
+                            });
+                            if idx + 1 < limited_candidates.len() {
+                                continue;
+                            }
+                            return UserMemoryCaptureRunOutcome {
+                                payload: Some(original_empty_payload),
+                                attempts,
+                                selected_slot_id: Some(candidate.slot_id.clone()),
+                                selected_slot_label: Some(candidate.slot_label.clone()),
+                                selected_provider: Some(resp.provider.clone()),
+                                selected_model: Some(resp.model.clone()),
+                                selected_stage: Some("extract".to_string()),
+                                terminal_error: None,
+                            };
+                        }
                     };
+
+                    match parse_user_memory_capture_payload(&empty_retry.content) {
+                        Ok(retried) => {
+                            let retried_is_empty =
+                                user_memory_capture_payload_is_empty_decision(&retried.payload);
+                            let retry_next = retried_is_empty && idx + 1 < limited_candidates.len();
+                            attempts.push(UserMemoryCaptureAttemptRecord {
+                                slot_id: candidate.slot_id.clone(),
+                                slot_label: candidate.slot_label.clone(),
+                                role: role.clone(),
+                                provider: Some(empty_retry.provider.clone()),
+                                model: Some(empty_retry.model.clone()),
+                                stage: "empty_retry".to_string(),
+                                request_kind: "user_fact_memory_capture_empty_retry".to_string(),
+                                outcome: if retry_next {
+                                    "empty_decision_retry_next".to_string()
+                                } else {
+                                    user_memory_capture_payload_ok_outcome(
+                                        &retried,
+                                        retried_is_empty,
+                                    )
+                                    .to_string()
+                                },
+                                error: None,
+                            });
+                            if retry_next {
+                                tracing::debug!(
+                                    "memory capture empty retry still returned an empty decision for conversation {:?}; trying the next configured capture model",
+                                    conversation_id
+                                );
+                                continue;
+                            }
+                            if retried_is_empty {
+                                if let Some(recovered) = self
+                                    .recover_terminal_empty_user_memory_capture_payload(
+                                        channel,
+                                        conversation_id,
+                                        original_prompt,
+                                        response_shape,
+                                        &user_memory_capture_response_preview(
+                                            &empty_retry.content,
+                                            240,
+                                        ),
+                                        candidate,
+                                        &mut attempts,
+                                        timeout_ms,
+                                    )
+                                    .await
+                                {
+                                    return UserMemoryCaptureRunOutcome {
+                                        payload: Some(recovered.payload),
+                                        attempts,
+                                        selected_slot_id: Some(recovered.selected_slot_id),
+                                        selected_slot_label: Some(recovered.selected_slot_label),
+                                        selected_provider: Some(recovered.selected_provider),
+                                        selected_model: Some(recovered.selected_model),
+                                        selected_stage: Some(recovered.selected_stage),
+                                        terminal_error: None,
+                                    };
+                                }
+                            }
+                            return UserMemoryCaptureRunOutcome {
+                                payload: Some(retried.payload),
+                                attempts,
+                                selected_slot_id: Some(candidate.slot_id.clone()),
+                                selected_slot_label: Some(candidate.slot_label.clone()),
+                                selected_provider: Some(empty_retry.provider.clone()),
+                                selected_model: Some(empty_retry.model.clone()),
+                                selected_stage: Some("empty_retry".to_string()),
+                                terminal_error: None,
+                            };
+                        }
+                        Err(error) => {
+                            let outcome = match error {
+                                UserMemoryCapturePayloadError::Unparseable => "unparseable",
+                                UserMemoryCapturePayloadError::IncompleteShape => {
+                                    "incomplete_shape"
+                                }
+                            };
+                            attempts.push(UserMemoryCaptureAttemptRecord {
+                                slot_id: candidate.slot_id.clone(),
+                                slot_label: candidate.slot_label.clone(),
+                                role: role.clone(),
+                                provider: Some(empty_retry.provider.clone()),
+                                model: Some(empty_retry.model.clone()),
+                                stage: "empty_retry".to_string(),
+                                request_kind: "user_fact_memory_capture_empty_retry".to_string(),
+                                outcome: outcome.to_string(),
+                                error: Some(outcome.to_string()),
+                            });
+                            log_user_memory_capture_payload_error(
+                                "memory capture empty retry",
+                                conversation_id,
+                                &empty_retry.content,
+                                error,
+                            );
+                            if idx + 1 < limited_candidates.len() {
+                                continue;
+                            }
+                            return UserMemoryCaptureRunOutcome {
+                                payload: Some(original_empty_payload),
+                                attempts,
+                                selected_slot_id: Some(candidate.slot_id.clone()),
+                                selected_slot_label: Some(candidate.slot_label.clone()),
+                                selected_provider: Some(resp.provider.clone()),
+                                selected_model: Some(resp.model.clone()),
+                                selected_stage: Some("extract".to_string()),
+                                terminal_error: None,
+                            };
+                        }
+                    }
                 }
                 Err(error) => {
                     let outcome = match error {
@@ -12063,9 +13769,9 @@ impl UserMemoryCaptureWorker {
             };
 
             match parse_user_memory_capture_payload(&repaired.content) {
-                Ok(payload) => {
-                    let empty_retry = idx + 1 < limited_candidates.len()
-                        && user_memory_capture_payload_is_empty_decision(&payload);
+                Ok(parsed) => {
+                    let is_empty_decision =
+                        user_memory_capture_payload_is_empty_decision(&parsed.payload);
                     attempts.push(UserMemoryCaptureAttemptRecord {
                         slot_id: candidate.slot_id.clone(),
                         slot_label: candidate.slot_label.clone(),
@@ -12074,32 +13780,183 @@ impl UserMemoryCaptureWorker {
                         model: Some(repaired.model.clone()),
                         stage: "schema_repair".to_string(),
                         request_kind: "user_fact_memory_capture_schema_repair".to_string(),
-                        outcome: if empty_retry {
-                            "empty_decision_retry_next".to_string()
-                        } else {
-                            "ok".to_string()
-                        },
+                        outcome: user_memory_capture_payload_ok_outcome(&parsed, is_empty_decision)
+                            .to_string(),
                         error: None,
                     });
-                    if idx + 1 < limited_candidates.len()
-                        && user_memory_capture_payload_is_empty_decision(&payload)
-                    {
-                        tracing::debug!(
-                            "memory capture schema repair recovered an empty decision for conversation {:?}; trying the next configured capture model",
-                            conversation_id
-                        );
-                        continue;
+                    if !is_empty_decision {
+                        return UserMemoryCaptureRunOutcome {
+                            payload: Some(parsed.payload),
+                            attempts,
+                            selected_slot_id: Some(candidate.slot_id.clone()),
+                            selected_slot_label: Some(candidate.slot_label.clone()),
+                            selected_provider: Some(repaired.provider.clone()),
+                            selected_model: Some(repaired.model.clone()),
+                            selected_stage: Some("schema_repair".to_string()),
+                            terminal_error: None,
+                        };
                     }
-                    return UserMemoryCaptureRunOutcome {
-                        payload: Some(payload),
-                        attempts,
-                        selected_slot_id: Some(candidate.slot_id.clone()),
-                        selected_slot_label: Some(candidate.slot_label.clone()),
-                        selected_provider: Some(repaired.provider.clone()),
-                        selected_model: Some(repaired.model.clone()),
-                        selected_stage: Some("schema_repair".to_string()),
-                        terminal_error: None,
+
+                    let empty_retry_prompt = build_user_memory_capture_empty_retry_prompt(
+                        original_prompt,
+                        &user_memory_capture_response_preview(&repaired.content, 240),
+                        response_shape,
+                    );
+                    let original_empty_payload = parsed.payload;
+                    let empty_retry = match self
+                        .run_memory_capture_llm_candidate(
+                            channel,
+                            conversation_id,
+                            "user_fact_memory_capture_empty_retry",
+                            &empty_retry_prompt,
+                            candidate,
+                            timeout_ms,
+                        )
+                        .await
+                    {
+                        Ok(resp) => resp,
+                        Err(error) => {
+                            attempts.push(UserMemoryCaptureAttemptRecord {
+                                slot_id: candidate.slot_id.clone(),
+                                slot_label: candidate.slot_label.clone(),
+                                role: role.clone(),
+                                provider: None,
+                                model: None,
+                                stage: "empty_retry".to_string(),
+                                request_kind: "user_fact_memory_capture_empty_retry".to_string(),
+                                outcome: "transport_failed".to_string(),
+                                error: Some(safe_truncate(&error.to_string(), 240)),
+                            });
+                            if idx + 1 < limited_candidates.len() {
+                                continue;
+                            }
+                            return UserMemoryCaptureRunOutcome {
+                                payload: Some(original_empty_payload),
+                                attempts,
+                                selected_slot_id: Some(candidate.slot_id.clone()),
+                                selected_slot_label: Some(candidate.slot_label.clone()),
+                                selected_provider: Some(repaired.provider.clone()),
+                                selected_model: Some(repaired.model.clone()),
+                                selected_stage: Some("schema_repair".to_string()),
+                                terminal_error: None,
+                            };
+                        }
                     };
+
+                    match parse_user_memory_capture_payload(&empty_retry.content) {
+                        Ok(retried) => {
+                            let retried_is_empty =
+                                user_memory_capture_payload_is_empty_decision(&retried.payload);
+                            let retry_next = retried_is_empty && idx + 1 < limited_candidates.len();
+                            attempts.push(UserMemoryCaptureAttemptRecord {
+                                slot_id: candidate.slot_id.clone(),
+                                slot_label: candidate.slot_label.clone(),
+                                role: role.clone(),
+                                provider: Some(empty_retry.provider.clone()),
+                                model: Some(empty_retry.model.clone()),
+                                stage: "empty_retry".to_string(),
+                                request_kind: "user_fact_memory_capture_empty_retry".to_string(),
+                                outcome: if retry_next {
+                                    "empty_decision_retry_next".to_string()
+                                } else {
+                                    user_memory_capture_payload_ok_outcome(
+                                        &retried,
+                                        retried_is_empty,
+                                    )
+                                    .to_string()
+                                },
+                                error: None,
+                            });
+                            if retry_next {
+                                tracing::debug!(
+                                    "memory capture empty retry still returned an empty decision for conversation {:?}; trying the next configured capture model",
+                                    conversation_id
+                                );
+                                continue;
+                            }
+                            if retried_is_empty {
+                                if let Some(recovered) = self
+                                    .recover_terminal_empty_user_memory_capture_payload(
+                                        channel,
+                                        conversation_id,
+                                        original_prompt,
+                                        response_shape,
+                                        &user_memory_capture_response_preview(
+                                            &empty_retry.content,
+                                            240,
+                                        ),
+                                        candidate,
+                                        &mut attempts,
+                                        timeout_ms,
+                                    )
+                                    .await
+                                {
+                                    return UserMemoryCaptureRunOutcome {
+                                        payload: Some(recovered.payload),
+                                        attempts,
+                                        selected_slot_id: Some(recovered.selected_slot_id),
+                                        selected_slot_label: Some(recovered.selected_slot_label),
+                                        selected_provider: Some(recovered.selected_provider),
+                                        selected_model: Some(recovered.selected_model),
+                                        selected_stage: Some(recovered.selected_stage),
+                                        terminal_error: None,
+                                    };
+                                }
+                            }
+                            return UserMemoryCaptureRunOutcome {
+                                payload: Some(retried.payload),
+                                attempts,
+                                selected_slot_id: Some(candidate.slot_id.clone()),
+                                selected_slot_label: Some(candidate.slot_label.clone()),
+                                selected_provider: Some(empty_retry.provider.clone()),
+                                selected_model: Some(empty_retry.model.clone()),
+                                selected_stage: Some("empty_retry".to_string()),
+                                terminal_error: None,
+                            };
+                        }
+                        Err(error) => {
+                            let outcome = match error {
+                                UserMemoryCapturePayloadError::Unparseable => "unparseable",
+                                UserMemoryCapturePayloadError::IncompleteShape => {
+                                    "incomplete_shape"
+                                }
+                            };
+                            attempts.push(UserMemoryCaptureAttemptRecord {
+                                slot_id: candidate.slot_id.clone(),
+                                slot_label: candidate.slot_label.clone(),
+                                role: role.clone(),
+                                provider: Some(empty_retry.provider.clone()),
+                                model: Some(empty_retry.model.clone()),
+                                stage: "empty_retry".to_string(),
+                                request_kind: "user_fact_memory_capture_empty_retry".to_string(),
+                                outcome: outcome.to_string(),
+                                error: Some(outcome.to_string()),
+                            });
+                            log_user_memory_capture_payload_error(
+                                "memory capture empty retry",
+                                conversation_id,
+                                &empty_retry.content,
+                                error,
+                            );
+                            if idx + 1 < limited_candidates.len() {
+                                tracing::debug!(
+                                    "memory capture schema repair recovered an empty decision for conversation {:?}; trying the next configured capture model",
+                                    conversation_id
+                                );
+                                continue;
+                            }
+                            return UserMemoryCaptureRunOutcome {
+                                payload: Some(original_empty_payload),
+                                attempts,
+                                selected_slot_id: Some(candidate.slot_id.clone()),
+                                selected_slot_label: Some(candidate.slot_label.clone()),
+                                selected_provider: Some(repaired.provider.clone()),
+                                selected_model: Some(repaired.model.clone()),
+                                selected_stage: Some("schema_repair".to_string()),
+                                terminal_error: None,
+                            };
+                        }
+                    }
                 }
                 Err(error) => {
                     let outcome = match error {
@@ -12127,12 +13984,23 @@ impl UserMemoryCaptureWorker {
             }
         }
 
+        let terminal_error =
+            user_memory_capture_terminal_error(&attempts, attempted_candidates, timeout_ms);
         if attempted_candidates > 0 {
-            tracing::warn!(
-                "memory capture failed to produce schema-compliant JSON for conversation {:?} after {} candidate(s)",
-                conversation_id,
-                attempted_candidates
-            );
+            if user_memory_capture_attempts_all_transport_failed(&attempts) {
+                tracing::warn!(
+                    "memory capture transport failed for conversation {:?} after {} candidate(s): {}",
+                    conversation_id,
+                    attempted_candidates,
+                    terminal_error
+                );
+            } else {
+                tracing::warn!(
+                    "memory capture failed to produce schema-compliant JSON for conversation {:?} after {} candidate(s)",
+                    conversation_id,
+                    attempted_candidates
+                );
+            }
         }
         UserMemoryCaptureRunOutcome {
             payload: None,
@@ -12142,10 +14010,7 @@ impl UserMemoryCaptureWorker {
             selected_provider: None,
             selected_model: None,
             selected_stage: None,
-            terminal_error: Some(format!(
-                "Memory capture failed to produce schema-compliant JSON after {} candidate(s).",
-                attempted_candidates
-            )),
+            terminal_error: Some(terminal_error),
         }
     }
 
@@ -12708,6 +14573,7 @@ struct MessageProcessingContext {
     token_tx: Option<tokio::sync::mpsc::Sender<StreamEvent>>,
     request_hints: RequestExecutionHints,
     user_message_already_recorded: bool,
+    skip_inbound_security_precheck: bool,
 }
 
 enum InboundSecurityPrecheck {
@@ -12722,6 +14588,7 @@ impl MessageProcessingContext {
             token_tx: None,
             request_hints,
             user_message_already_recorded: false,
+            skip_inbound_security_precheck: false,
         }
     }
 
@@ -12735,6 +14602,7 @@ impl MessageProcessingContext {
             token_tx: Some(token_tx),
             request_hints,
             user_message_already_recorded: false,
+            skip_inbound_security_precheck: false,
         }
     }
 
@@ -12748,7 +14616,13 @@ impl MessageProcessingContext {
             token_tx: Some(token_tx),
             request_hints,
             user_message_already_recorded: true,
+            skip_inbound_security_precheck: true,
         }
+    }
+
+    fn with_inbound_security_precheck_skipped(mut self) -> Self {
+        self.skip_inbound_security_precheck = true;
+        self
     }
 }
 
@@ -14353,6 +16227,10 @@ async fn apply_execution_plan_revision(
 }
 
 impl Agent {
+    pub async fn snapshot(shared: &Arc<RwLock<Self>>) -> Self {
+        shared.read().await.clone()
+    }
+
     /// Initialize the agent with all subsystems.
     /// If `unified_key` is provided (from master password), it is used for ALL encryption.
     /// Otherwise falls back to legacy auto-generated keyfiles.
@@ -14448,10 +16326,14 @@ impl Agent {
         let identity = IdentityManager::load_or_create(data_dir).await?;
 
         // Initialize safety engine
-        let safety = SafetyEngine::new(config_dir)?;
+        let safety = Arc::new(SafetyEngine::new(config_dir)?);
 
         // Initialize proof system
-        let proofs = ProofEngine::new(data_dir, identity.signing_key(), key_manager.clone())?;
+        let proofs = Arc::new(ProofEngine::new(
+            data_dir,
+            identity.signing_key(),
+            key_manager.clone(),
+        )?);
 
         // Initialize action runtime
         let mut runtime = ActionRuntime::new(config_dir, data_dir).await?;
@@ -14870,7 +16752,7 @@ impl Agent {
         }
 
         // Initialize integration manager
-        let integrations = crate::integrations::IntegrationManager::new(config_dir);
+        let integrations = Arc::new(crate::integrations::IntegrationManager::new(config_dir));
 
         // Configure media generation providers from saved config
         if !config.media_gen.provider_api_keys.is_empty() {
@@ -14929,6 +16811,56 @@ impl Agent {
         safety.set_auto_approved(&config.auto_approve);
         runtime.set_auto_approved_actions(&config.auto_approve);
         runtime.set_tool_args_guard_config(config.security.tool_args.clone());
+
+        let app_registry = {
+            let reg = crate::actions::app::AppRegistry::with_paths(
+                config_dir.to_path_buf(),
+                data_dir.to_path_buf(),
+            );
+            let boot_report = reg.reconcile_on_boot().await;
+            match crate::sentinel::find_stale_app_references_in_pulse_events(
+                &storage,
+                &boot_report.valid_app_ids,
+            )
+            .await
+            {
+                Ok(stale_report) => {
+                    if !stale_report.event_ids.is_empty() {
+                        if let Err(error) = storage
+                            .delete_arkpulse_events_by_ids(&stale_report.event_ids)
+                            .await
+                        {
+                            tracing::warn!(
+                                "Failed to delete stale ArkPulse app events during startup: {}",
+                                error
+                            );
+                        }
+                    }
+                    let mut deleted_app_ids = boot_report.quarantined_app_ids.clone();
+                    deleted_app_ids.extend(stale_report.missing_app_ids);
+                    for app_id in deleted_app_ids {
+                        reg.purge_deleted_app_state(&app_id).await;
+                        if let Err(error) = storage.delete_app_notifications(&app_id, None).await {
+                            tracing::warn!(
+                                "Failed to delete stale app notifications during startup (app={}): {}",
+                                app_id,
+                                error
+                            );
+                        }
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    "Failed to reconcile stale ArkPulse app references during startup: {}",
+                    error
+                ),
+            }
+            reg.spawn_restore_from_disk(
+                config_dir.to_path_buf(),
+                data_dir.to_path_buf(),
+                app_llm_env.clone(),
+            );
+            reg
+        };
 
         let agent = Self {
             _agent_id: AgentId::new(),
@@ -14990,18 +16922,7 @@ impl Agent {
             notification_events,
             live_runs: Arc::new(crate::core::LiveRunRegistry::new(Some(storage.clone()))),
             startup_issues: Arc::new(RwLock::new(startup_issues)),
-            app_registry: {
-                let reg = crate::actions::app::AppRegistry::with_paths(
-                    config_dir.to_path_buf(),
-                    data_dir.to_path_buf(),
-                );
-                reg.spawn_restore_from_disk(
-                    config_dir.to_path_buf(),
-                    data_dir.to_path_buf(),
-                    app_llm_env.clone(),
-                );
-                reg
-            },
+            app_registry,
         };
 
         if let Err(error) = agent.repair_unrecoverable_approval_tasks().await {
@@ -18008,9 +19929,7 @@ impl Agent {
             backends.push(crate::core::email_delivery::EMAIL_PROVIDER_GMAIL.to_string());
         }
         if self.workspace_gmail_notification_is_configured() {
-            backends.push(
-                crate::core::email_delivery::EMAIL_PROVIDER_GOOGLE_WORKSPACE.to_string(),
-            );
+            backends.push(crate::core::email_delivery::EMAIL_PROVIDER_GOOGLE_WORKSPACE.to_string());
         }
         if crate::core::email_delivery::external_email_delivery_is_ready(&self.config.email) {
             if let Some(provider_id) =
@@ -18084,7 +20003,9 @@ impl Agent {
                 self.config.email.from_address.as_deref(),
             )
             .map_err(|error| error.to_string())?
-            .ok_or_else(|| "email.from_address is required for external email delivery".to_string()),
+            .ok_or_else(|| {
+                "email.from_address is required for external email delivery".to_string()
+            }),
         }
     }
 
@@ -20276,6 +22197,12 @@ impl Agent {
                 "\n\nExplicit request options:\n- deep_research: true\n- meaning: the user explicitly requested the slower multi-source research mode; prefer the `research` action unless the request clearly needs another execution surface. It is okay to ask one short clarifying question if the research scope is unclear.\n",
             );
         }
+        request_message.push_str(
+            "\n\nExecution-surface ambiguity policy:\n- For software creation or substantial build requests, do not assume that \"build\" means the user wants a deployed or running app.\n- If the request could reasonably mean either \"produce or update files in the workspace\" or \"run/deploy it as an isolated app\", set should_confirm=true and ask a short disambiguation question.\n",
+        );
+        request_message.push_str(
+            "\nFreshness-for-build policy:\n- If a software creation or substantial build request also needs current/public data, treat the freshness requirement as a dependency of the build task rather than the final answer.\n- Do not classify such a request as a search-only or capability-summary turn just because public data lookup is needed.\n",
+        );
 
         let request_shape_prompt = crate::core::self_evolve::classifier_prompt_evolution::render_request_shape_classifier_system_prompt(
             &self.active_classifier_prompt_bundle_for_message(message).await,
@@ -20473,6 +22400,12 @@ Return ONLY JSON with this exact shape:\n\
 {\"needed_actions\":[\"exact_action_name\"],\"should_clarify\":false,\"clarification_question\":null,\"reasoning\":\"brief\"}\n\
 Use only exact action names from the provided catalog. User-added skills are normal actions: select them from their name, description, capabilities, and schema even when the user does not name the skill. For purely conversational requests with no execution needed, set `needed_actions` to [] and `should_clarify` to false. If execution is requested but no catalog action is a close semantic match, or if multiple competing actions are plausible alternatives for the same role and none is clearly best, set `needed_actions` to [] and `should_clarify` to true with one short question. If multiple actions are complementary steps in one chain, include them together. Do not use hardcoded keyword or phrase rules; ground the decision in catalog metadata.",
         );
+        selector_prompt.push_str(
+            "\nExecution-surface ambiguity policy:\nIf the request is to create or substantially build software artifacts and the catalog supports both a workspace-build path (file/code/workspace mutation) and an app-hosting path (build/run/deploy as an isolated app), but the user did not clearly choose one surface, do not guess. Return `needed_actions: []`, `should_clarify: true`, and ask whether they want files only in the workspace or a running/deployed app.\n",
+        );
+        selector_prompt.push_str(
+            "\nFreshness-for-build policy:\nIf the user asks to create or substantially build software and also needs current/public data, treat the data lookup as a supporting step inside the build workflow. Do not satisfy the request with only search results, capability summaries, or research handoff when the actual deliverable is software.\n",
+        );
 
         let mut llm_candidates = self.llm_candidates_for_role(&ModelRole::Fast);
         if llm_candidates.is_empty() {
@@ -20511,6 +22444,76 @@ Use only exact action names from the provided catalog. User-added skills are nor
         } else {
             Some(assessment)
         }
+    }
+
+    async fn assess_creation_surface_with_llm(
+        &self,
+        channel: &str,
+        message: &str,
+        request_shape: Option<&RequestShapeAssessment>,
+        direct_user_interactive: bool,
+        use_recent_artifact_context: bool,
+        all_actions: &[crate::actions::ActionDef],
+    ) -> Option<CreationSurfaceAssessment> {
+        let trimmed = message.trim();
+        if trimmed.is_empty()
+            || !direct_user_interactive
+            || use_recent_artifact_context
+            || !all_actions.iter().any(action_supports_app_mutation)
+            || !all_actions.iter().any(action_supports_workspace_mutation)
+        {
+            return None;
+        }
+
+        if let Some(shape) = request_shape {
+            if shape.is_integration_request()
+                || shape.shape_is("calendar_event")
+                || shape.execution_mode_is("scheduled")
+                || shape.execution_mode_is("watch_until")
+                || shape.product_help
+            {
+                return None;
+            }
+        }
+
+        let request_payload = serde_json::json!({
+            "user_request": trimmed,
+            "request_shape": request_shape,
+            "surfaces_available": {
+                "workspace_files": true,
+                "isolated_app": true,
+            },
+            "recent_artifact_context": use_recent_artifact_context,
+        });
+        let prompt = "You classify whether a direct user request to create or substantially build software needs a workspace-vs-isolated-app clarification.\n\
+Return ONLY JSON with this exact shape:\n\
+{\"applies\":false,\"surface\":\"none\",\"reasoning\":\"brief\"}\n\
+Use one of these exact `surface` values: `none`, `workspace`, `app`, `ambiguous`.\n\
+- `workspace`: the user clearly wants files, code, or artifacts built in the workspace only.\n\
+- `app`: the user clearly wants a running or deployed isolated app, or clearly wants to replace or rebuild an existing app.\n\
+- `ambiguous`: both workspace files and an isolated running app are plausible readings, and the user did not choose one.\n\
+- `none`: this is not a software-creation/build request where the distinction matters.\n\
+If the request also needs current or public data, that freshness requirement is supporting context for the build task and does not by itself change the surface classification.\n\
+Reason from the request's meaning and the provided context. Do not depend on brittle exact phrase rules.";
+
+        let empty_actions: Vec<crate::actions::ActionDef> = Vec::new();
+        let resp = self
+            .supervised_internal_chat(
+                channel,
+                "creation_surface_selector",
+                "creation_surface_selector",
+                &ModelRole::Fast,
+                vec![],
+                prompt,
+                &serde_json::to_string_pretty(&request_payload).ok()?,
+                &[],
+                &empty_actions,
+                700,
+                2,
+            )
+            .await?;
+        let payload = extract_json_object_from_text(&resp.content)?;
+        parse_creation_surface_assessment_payload(&payload)
     }
 
     async fn tool_plan_missing_detail_clarification(
@@ -21118,6 +23121,27 @@ Do not use fixed phrase or keyword rules; reason from the semantics of the reque
                 _timestamp: Self::parse_message_timestamp(&msg.timestamp),
             })
             .collect()
+    }
+
+    async fn recent_trusted_assistant_message_for_inbound_guard(
+        &self,
+        conversation_id: &str,
+        current_message: &str,
+    ) -> Option<String> {
+        if conversation_id.trim().is_empty()
+            || !Self::message_is_contextual_followup_candidate(current_message)
+        {
+            return None;
+        }
+
+        self.recent_messages_for_intent_gating(conversation_id, current_message)
+            .await
+            .into_iter()
+            .rev()
+            .find(|message| message.role == "assistant")
+            .map(|message| crate::security::normalize_for_analysis(&message.content))
+            .map(|message| safe_truncate(&message, 600))
+            .filter(|message| !message.trim().is_empty())
     }
 
     async fn classify_explicit_approval_signal(
@@ -22034,6 +24058,7 @@ Do not use fixed phrase or keyword rules; reason from the semantics of the reque
             ),
             trace_id: None,
             total_tokens: 0,
+            choices: Vec::new(),
             degradation,
             attempted_models: user_outcome.attempted_models.clone(),
             user_outcome: Some(user_outcome),
@@ -23119,6 +25144,12 @@ Do not use fixed phrase or keyword rules; reason from the semantics of the reque
         // Intent-based inbound guard. The classifier sees the already-redacted
         // storage form, then normalization removes unicode obfuscation controls.
         let normalized_for_guard = crate::security::normalize_for_analysis(classification_message);
+        let trusted_prior_assistant_message = self
+            .recent_trusted_assistant_message_for_inbound_guard(
+                conversation_key,
+                stored_user_message,
+            )
+            .await;
         let inbound_policy = crate::security::intent_classifier::default_policy();
         let inbound_candidates = self.llm_candidates_for_role(&ModelRole::Fast);
         let inbound_verdict = if let Some(candidate) = inbound_candidates.first() {
@@ -23126,6 +25157,7 @@ Do not use fixed phrase or keyword rules; reason from the semantics of the reque
                 &candidate.client,
                 &inbound_policy,
                 &normalized_for_guard,
+                trusted_prior_assistant_message.as_deref(),
             )
             .await
         } else {
@@ -23133,6 +25165,7 @@ Do not use fixed phrase or keyword rules; reason from the semantics of the reque
                 &self.llm,
                 &inbound_policy,
                 &normalized_for_guard,
+                trusted_prior_assistant_message.as_deref(),
             )
             .await
         };
@@ -23232,6 +25265,7 @@ Do not use fixed phrase or keyword rules; reason from the semantics of the reque
             token_tx,
             mut request_hints,
             user_message_already_recorded,
+            skip_inbound_security_precheck,
         } = context;
         let mut token_tx = token_tx;
         let start_time = chrono::Utc::now();
@@ -23270,20 +25304,24 @@ Do not use fixed phrase or keyword rules; reason from the semantics of the reque
             );
         }
         let message_storage = secret_redaction.text.clone();
-        let inbound_unchecked_reason = match self
-            .run_inbound_security_precheck(
-                &message_storage,
-                &message_storage,
-                channel,
-                &conversation_key,
-                is_new_conversation,
-                project_id,
-                user_message_already_recorded,
-            )
-            .await?
-        {
-            InboundSecurityPrecheck::Respond(processed) => return Ok(processed),
-            InboundSecurityPrecheck::Continue { unchecked_reason } => unchecked_reason,
+        let inbound_unchecked_reason = if skip_inbound_security_precheck {
+            None
+        } else {
+            match self
+                .run_inbound_security_precheck(
+                    &message_storage,
+                    &message_storage,
+                    channel,
+                    &conversation_key,
+                    is_new_conversation,
+                    project_id,
+                    user_message_already_recorded,
+                )
+                .await?
+            {
+                InboundSecurityPrecheck::Respond(processed) => return Ok(processed),
+                InboundSecurityPrecheck::Continue { unchecked_reason } => unchecked_reason,
+            }
         };
 
         // Internal escape hatch only. The product UX is the secure credential form.
@@ -24048,6 +26086,7 @@ Do not use fixed phrase or keyword rules; reason from the semantics of the reque
             flow_kind,
             user_message_already_recorded
         );
+        let mut deferred_user_memory_capture_message_id: Option<String> = None;
 
         if self
             .classify_user_correction_signal_with_llm(channel, message, Some(&conversation_key))
@@ -24142,13 +26181,7 @@ Do not use fixed phrase or keyword rules; reason from the semantics of the reque
             {
                 tracing::warn!("Failed to persist user message early: {}", e);
             }
-            self.spawn_user_memory_capture(
-                message,
-                channel,
-                Some(&conversation_key),
-                project_id,
-                Some(&user_msg.id),
-            );
+            deferred_user_memory_capture_message_id = Some(user_msg.id.clone());
         }
 
         if let Some(resolution) = pending_action_resolution.clone() {
@@ -24168,6 +26201,17 @@ Do not use fixed phrase or keyword rules; reason from the semantics of the reque
                             .load_pending_resilience_followup(&conversation_key)
                             .await
                         else {
+                            if let Some(source_message_id) =
+                                deferred_user_memory_capture_message_id.as_deref()
+                            {
+                                self.spawn_user_memory_capture(
+                                    message,
+                                    channel,
+                                    Some(&conversation_key),
+                                    project_id,
+                                    Some(source_message_id),
+                                );
+                            }
                             return self
                                 .persist_immediate_exchange(
                                     message,
@@ -24187,6 +26231,17 @@ Do not use fixed phrase or keyword rules; reason from the semantics of the reque
                             &pending_followup,
                             message,
                         ) else {
+                            if let Some(source_message_id) =
+                                deferred_user_memory_capture_message_id.as_deref()
+                            {
+                                self.spawn_user_memory_capture(
+                                    message,
+                                    channel,
+                                    Some(&conversation_key),
+                                    project_id,
+                                    Some(source_message_id),
+                                );
+                            }
                             return self
                                 .persist_immediate_exchange(
                                     message,
@@ -24219,23 +26274,49 @@ Do not use fixed phrase or keyword rules; reason from the semantics of the reque
                                 duration_ms: None,
                             });
                         }
-                        return Box::pin(self.process_message_internal(
-                            &resume_message,
-                            channel,
-                            Some(&conversation_key),
-                            project_id,
-                            MessageProcessingContext {
-                                trace_override: Some(trace_ref.clone()),
-                                token_tx: token_tx.clone(),
-                                request_hints,
-                                user_message_already_recorded: true,
-                            },
-                        ))
+                        if let Some(source_message_id) =
+                            deferred_user_memory_capture_message_id.as_deref()
+                        {
+                            self.spawn_user_memory_capture(
+                                message,
+                                channel,
+                                Some(&conversation_key),
+                                project_id,
+                                Some(source_message_id),
+                            );
+                        }
+                        return Box::pin(
+                            self.process_message_internal(
+                                &resume_message,
+                                channel,
+                                Some(&conversation_key),
+                                project_id,
+                                MessageProcessingContext {
+                                    trace_override: Some(trace_ref.clone()),
+                                    token_tx: token_tx.clone(),
+                                    request_hints,
+                                    user_message_already_recorded: true,
+                                    skip_inbound_security_precheck: false,
+                                }
+                                .with_inbound_security_precheck_skipped(),
+                            ),
+                        )
                         .await;
                     }
                     PendingConversationActionDecision::Reject => {
                         self.clear_pending_resilience_followup(&conversation_key)
                             .await;
+                        if let Some(source_message_id) =
+                            deferred_user_memory_capture_message_id.as_deref()
+                        {
+                            self.spawn_user_memory_capture(
+                                message,
+                                channel,
+                                Some(&conversation_key),
+                                project_id,
+                                Some(source_message_id),
+                            );
+                        }
                         return self
                             .persist_immediate_exchange(
                                 message,
@@ -24565,6 +26646,8 @@ Do not use fixed phrase or keyword rules; reason from the semantics of the reque
             .as_ref()
             .map(Self::background_session_artifact_context)
             .or_else(|| Self::select_recent_artifact_for_message(&recent_artifacts, message));
+        let mut ambiguous_deployed_app_reference_candidates: Vec<DeployedAppReferenceCandidate> =
+            Vec::new();
         // If no artifact context exists, check if the user mentions a deployed app by name
         // and synthesize one so the full app-context pipeline activates.
         if recent_artifact.is_none() {
@@ -24586,61 +26669,24 @@ Do not use fixed phrase or keyword rules; reason from the semantics of the reque
                 .await;
                 recent_artifact = Some(recovered);
             } else {
-                let msg_lower = message.to_ascii_lowercase();
-                for app in &deployed_apps {
-                    let id = app.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                    let title = app.get("title").and_then(|v| v.as_str()).unwrap_or("");
-                    if id.is_empty() || title.is_empty() {
-                        continue;
-                    }
-                    if msg_lower.contains(&title.to_ascii_lowercase()) {
-                        tracing::info!(
-                            "Auto-matched deployed app '{}' (id={}) from user message",
-                            title,
-                            id
-                        );
-                        let local_url = format!("http://localhost:8990/apps/{}/", id);
-                        let public_base: Option<String> = self
-                            .storage
-                            .get("public_base_url")
-                            .await
-                            .ok()
-                            .flatten()
-                            .and_then(|bytes| String::from_utf8(bytes).ok())
-                            .filter(|s| !s.trim().is_empty());
-                        let url_summary = if let Some(base) = public_base {
-                            format!(
-                                "Local: {} | Public: {}/apps/{}/",
-                                local_url,
-                                base.trim_end_matches('/'),
-                                id
-                            )
-                        } else {
-                            local_url.clone()
-                        };
-                        self.persist_last_deployed_app_context(
-                            &conversation_key,
-                            id,
-                            title,
-                            &local_url,
-                        )
-                        .await;
-                        recent_artifact = Some(ConversationArtifactContext {
-                            artifact_type: "app".to_string(),
-                            artifact_id: id.to_string(),
-                            title: title.to_string(),
-                            summary: String::new(),
-                            url: url_summary,
-                            related_actions: vec![
-                                "app_inspect".to_string(),
-                                "app_restart".to_string(),
-                                "file_read".to_string(),
-                                "file_write".to_string(),
-                            ],
-                            updated_at: chrono::Utc::now().to_rfc3339(),
-                        });
-                        break;
-                    }
+                let app_reference_resolution =
+                    resolve_deployed_app_reference_from_message(message, &deployed_apps);
+                ambiguous_deployed_app_reference_candidates =
+                    app_reference_resolution.ambiguous_candidates;
+                if let Some(matched) = app_reference_resolution.matched {
+                    tracing::info!(
+                        "Semantically matched deployed app '{}' (id={}) from user message",
+                        matched.title,
+                        matched.artifact_id
+                    );
+                    self.persist_last_deployed_app_context(
+                        &conversation_key,
+                        &matched.artifact_id,
+                        &matched.title,
+                        &matched.url,
+                    )
+                    .await;
+                    recent_artifact = Some(matched);
                 }
             }
         }
@@ -24712,11 +26758,30 @@ Do not use fixed phrase or keyword rules; reason from the semantics of the reque
             generic_execution_intent,
         );
         let mut simple_request = matches!(request_profile, ChatRequestProfile::Simple);
+        let conversation_only_request = request_shape_is_conversation_only(request_shape.as_ref());
+        if conversation_only_request {
+            simple_request = true;
+            generic_execution_intent = false;
+            workspace_modification_request = false;
+            if let Some(shape) = request_shape.as_ref() {
+                let mut trace = trace_ref.write().await;
+                trace.steps.push(ExecutionStep {
+                    icon: "[chat]".to_string(),
+                    title: "Conversation-Only Routing".to_string(),
+                    detail: "Request shape is conversational with no execution, freshness, product-help, or workspace signal; skipping extra semantic classifiers."
+                        .to_string(),
+                    step_type: "info".to_string(),
+                    data: Some(format!(
+                        "shape={} | execution_mode={} | confidence={:.2}",
+                        shape.shape, shape.execution_mode, shape.confidence
+                    )),
+                    timestamp: chrono::Utc::now(),
+                    duration_ms: None,
+                });
+            }
+        }
         let skip_request_shape_classifier = false;
-        if !request_shape
-            .as_ref()
-            .is_some_and(RequestShapeAssessment::is_execution_request)
-        {
+        if should_run_self_memory_lookup_classifier(request_shape.as_ref()) {
             if let Some(processed) = self
                 .maybe_handle_self_memory_lookup(
                     channel,
@@ -24729,6 +26794,16 @@ Do not use fixed phrase or keyword rules; reason from the semantics of the reque
                 )
                 .await
             {
+                if let Some(source_message_id) = deferred_user_memory_capture_message_id.as_deref()
+                {
+                    self.spawn_user_memory_capture(
+                        message,
+                        channel,
+                        Some(&conversation_key),
+                        project_id,
+                        Some(source_message_id),
+                    );
+                }
                 return Ok(processed);
             }
         }
@@ -24812,6 +26887,7 @@ Do not use fixed phrase or keyword rules; reason from the semantics of the reque
                 run_status: Some(run_status.as_str().to_string()),
                 trace_id: None,
                 total_tokens: 0,
+                choices: Vec::new(),
                 degradation: Vec::new(),
                 attempted_models: Vec::new(),
                 user_outcome: Some(user_outcome),
@@ -24978,7 +27054,7 @@ This conversation recently produced or modified an artifact.\n",
                 let app_root = format!("/app/data/apps/{}", artifact_ctx.artifact_id);
                 system_prompt.push_str(&format!("Deployed app workspace root: `{}`.\n", app_root));
                 system_prompt.push_str(
-                    "When the user wants to debug or fix this app, do not ask whether the app exists. Prefer `app_inspect` first if you need metadata or file inventory, then use `file_read` and `file_write` on that app root. After changing a deployed app, prefer `app_restart` to apply the update, then validate it with the safest available direct check such as logs, refreshed data, a screenshot tool, or `http_get` when available. If one validation tool is blocked, switch to another instead of retrying the blocked tool. Only prefer editing this existing deployed app when the user is clearly asking to fix, debug, or change it. Do not use `app_deploy` for a fix/debug follow-up on an existing deployed app unless the user explicitly asks to rebuild, replace, or redeploy it from scratch. If the user asks to build, create, deploy, or spin up an app without explicitly targeting this existing one, treat that as a fresh deployment instead. When you materially repurpose an existing app, include the new title in `app_restart` so the Apps list and links stay accurate.\n\
+                    "When the user wants to debug or fix this app, do not ask whether the app exists. Prefer `app_inspect` first if you need metadata or file inventory, then use `file_read` and `file_write` on that app root. After changing a deployed app, prefer `app_restart` to apply the update, then validate it with the safest available direct check such as logs, refreshed data, a screenshot tool, or `http_get` when available. If one validation tool is blocked, switch to another instead of retrying the blocked tool. Only prefer editing this existing deployed app when the user is clearly asking to fix, debug, or change it. When you need to redeploy a replacement bundle for this same app, reuse its stable `app_id` by passing that id into `app_deploy` so the existing app is updated in place instead of creating a new app entry. If the user asks to build, create, deploy, or spin up an app without explicitly targeting this existing one, treat that as a fresh deployment instead. When you materially repurpose an existing app, include the new title in `app_restart` so the Apps list and links stay accurate.\n\
 When linking the user to this app, always use the full URL from the Artifact URL field above (e.g. http://localhost:8990/apps/...). Never use a bare relative path like /apps/.../ — always provide a clickable absolute URL.\n",
                 );
                 system_prompt.push_str(
@@ -25155,7 +27231,7 @@ When linking the user to this app, always use the full URL from the Artifact URL
             && request_shape_targets_execution_surface(
                 request_shape.as_ref(),
                 "schedule_task",
-                &["task"],
+                &[],
                 &["scheduled"],
             );
         let mut watch_intent = semantic_shape_allows_execution
@@ -25263,15 +27339,109 @@ When linking the user to this app, always use the full URL from the Artifact URL
             &mut preferred_action_names,
             &mut preferred_action_set,
         );
-        let action_selection_assessment = self
-            .assess_action_selection_with_llm(
+        let direct_user_interactive = request_hints.direct_user_intent
+            && matches!(
+                request_hints.execution_surface,
+                ActionExecutionSurface::Chat | ActionExecutionSurface::Api
+            );
+        let mut action_selection_assessment =
+            if should_run_action_selection_classifier(request_shape.as_ref()) {
+                self.assess_action_selection_with_llm(
+                    channel,
+                    &action_routing_query,
+                    request_shape.as_ref(),
+                    recent_artifact_prompt_context,
+                    &all_actions,
+                )
+                .await
+            } else {
+                None
+            };
+        let creation_surface_assessment = if action_selection_assessment
+            .as_ref()
+            .is_some_and(|selection| selection.should_clarify)
+            || (app_deploy_intent && !workspace_modification_request)
+        {
+            None
+        } else {
+            self.assess_creation_surface_with_llm(
                 channel,
-                &action_routing_query,
+                message,
                 request_shape.as_ref(),
-                recent_artifact_prompt_context,
+                direct_user_interactive,
+                use_recent_artifact_context,
                 &all_actions,
             )
-            .await;
+            .await
+        };
+        if let Some(surface) = creation_surface_assessment.as_ref() {
+            if surface.surface != CreationSurfaceKind::None {
+                semantic_shape_allows_execution = true;
+                generic_execution_intent = true;
+                simple_request = false;
+            }
+
+            match surface.surface {
+                CreationSurfaceKind::Workspace => {
+                    workspace_modification_request = true;
+                    if let Some(best_workspace) = best_surface_intent_score(
+                        message,
+                        &all_actions,
+                        action_supports_workspace_mutation,
+                    ) {
+                        push_action_name_in_order(
+                            &mut preferred_action_names,
+                            &mut preferred_action_set,
+                            &best_workspace.action_name,
+                        );
+                    }
+                }
+                CreationSurfaceKind::App => {
+                    app_deploy_intent = true;
+                    if let Some(best_app) = best_surface_intent_score(
+                        message,
+                        &all_actions,
+                        action_supports_app_mutation,
+                    ) {
+                        push_action_name_in_order(
+                            &mut preferred_action_names,
+                            &mut preferred_action_set,
+                            &best_app.action_name,
+                        );
+                    }
+                }
+                CreationSurfaceKind::Ambiguous | CreationSurfaceKind::None => {}
+            }
+
+            if (generic_execution_intent || workspace_modification_request)
+                && all_actions
+                    .iter()
+                    .any(|action| action.name.eq_ignore_ascii_case("capability_resolve"))
+            {
+                push_action_name_in_order(
+                    &mut preferred_action_names,
+                    &mut preferred_action_set,
+                    "capability_resolve",
+                );
+            }
+        }
+        if let Some(clarification) = maybe_synthesize_creation_surface_clarification(
+            message,
+            request_shape.as_ref(),
+            &all_actions,
+            action_selection_assessment.as_ref(),
+            creation_surface_assessment.as_ref(),
+            direct_user_interactive,
+            use_recent_artifact_context,
+        ) {
+            action_selection_assessment = Some(clarification);
+        } else if let Some(clarification) = maybe_synthesize_deployed_app_reference_clarification(
+            request_shape.as_ref(),
+            recent_artifact_prompt_context,
+            &ambiguous_deployed_app_reference_candidates,
+        ) {
+            action_selection_assessment = Some(clarification);
+        }
         let mut selected_action_names = Vec::new();
         let mut selected_action_set = HashSet::new();
         if let Some(selection) = action_selection_assessment.as_ref() {
@@ -25356,6 +27526,7 @@ When linking the user to this app, always use the full URL from the Artifact URL
                     "needed_actions": selection.needed_actions.clone(),
                     "should_clarify": selection.should_clarify,
                     "clarification_question": selection.clarification_question.clone(),
+                    "choices": selection.choices.clone(),
                     "reasoning": safe_truncate(&selection.reasoning, 300),
                 })),
                 strategy_version: strategy_version.as_deref(),
@@ -25382,21 +27553,28 @@ When linking the user to this app, always use the full URL from the Artifact URL
             workspace_modification_request,
             MAX_SHORTLISTED_ACTIONS,
         );
-        let restricted_to_public_grounding =
-            if should_limit_actions_to_public_freshness_grounding(request_shape.as_ref()) {
-                restrict_actions_to_public_freshness_grounding(&mut available_actions, &all_actions)
-            } else {
-                false
-            };
+        let restricted_to_public_grounding = if should_limit_actions_to_public_freshness_grounding(
+            request_shape.as_ref(),
+            creation_surface_assessment.as_ref(),
+        ) {
+            restrict_actions_to_public_freshness_grounding(&mut available_actions, &all_actions)
+        } else {
+            false
+        };
         let mut tool_shortlist_profile = if let Some(plan) = request_hints.plan_override.as_ref() {
             limit_actions_for_confirmed_plan(&mut available_actions, &all_actions, plan)
-        } else if simple_request && public_freshness_required {
-            if restrict_actions_to_public_freshness_grounding(&mut available_actions, &all_actions)
-            {
-                "simple_freshness"
-            } else {
-                "simple_chat"
-            }
+        } else if simple_request {
+            limit_actions_for_simple_request(
+                &mut available_actions,
+                &all_actions,
+                public_freshness_required,
+                prefer_public_research,
+                request_hints.direct_user_intent
+                    && matches!(
+                        request_hints.execution_surface,
+                        ActionExecutionSurface::Chat | ActionExecutionSurface::Api
+                    ),
+            )
         } else if restricted_to_public_grounding {
             "freshness_guardrail"
         } else if !selected_action_names.is_empty() {
@@ -25406,7 +27584,7 @@ When linking the user to this app, always use the full URL from the Artifact URL
         } else {
             "default"
         };
-        if should_expose_full_action_catalog_for_turn(&flow_kind, &request_hints) {
+        if should_expose_full_action_catalog_for_turn(&flow_kind, &request_hints, simple_request) {
             expose_full_action_catalog(&mut available_actions, &all_actions);
             tool_shortlist_profile = "interactive_full_catalog";
         }
@@ -25608,7 +27786,7 @@ When linking the user to this app, always use the full URL from the Artifact URL
             if !app_summaries.is_empty() {
                 let deployed_app_section_start = system_prompt.len();
                 system_prompt.push_str(&format!(
-                    "\n- Deployed apps you manage: {}. When the user mentions an app by name, use `app_inspect` immediately — do NOT ask for a repo link or tech stack.\n",
+                    "\n- Deployed apps you manage: {}. When the user refers to an existing app by name, nickname, or description, use `app_inspect` or target its stable `app_id` instead of acting like it is a brand-new app. If more than one deployed app plausibly matches, ask a short confirmation before mutating anything. Do NOT ask for a repo link or tech stack just to locate an already deployed app.\n",
                     app_summaries.join(", ")
                 ));
                 track_prompt_section(
@@ -25815,6 +27993,7 @@ When linking the user to this app, always use the full URL from the Artifact URL
             );
             (decision, "shape_classifier_structural_fallback")
         };
+        let mut action_selection_clarification_choices = Vec::new();
         if let Some(selection) = action_selection_assessment
             .as_ref()
             .filter(|selection| selection.should_clarify)
@@ -25825,6 +28004,7 @@ When linking the user to this app, always use the full URL from the Artifact URL
                     selection.clarification_question.clone().or_else(|| {
                         Some("Which skill or action should I use for this request?".to_string())
                     });
+                action_selection_clarification_choices = selection.choices.clone();
             }
             routing_decision.reasoning = format!(
                 "{} | Action selector requested clarification: {}",
@@ -26239,6 +28419,7 @@ When linking the user to this app, always use the full URL from the Artifact URL
 
         let mut forced_service_outage_reason: Option<String> = None;
         let mut preview_plan_requested_for_tool_loop = false;
+        let mut response_choices: Vec<ClarificationChoice> = Vec::new();
         let mut llm_result = if let Some(capability_response) = capability_fast_path_response {
             {
                 let mut trace = trace_ref.write().await;
@@ -26261,6 +28442,9 @@ When linking the user to this app, always use the full URL from the Artifact URL
                 model: "".to_string(),
             }
         } else if needs_clarification {
+            let use_action_selection_choices = research_report_followup_confirmation.is_none()
+                && request_shape_confirmation.is_none()
+                && !action_selection_clarification_choices.is_empty();
             let clarification = research_report_followup_confirmation
                 .or_else(|| {
                     request_shape_confirmation.and_then(|shape| shape.confirmation_question.clone())
@@ -26270,6 +28454,9 @@ When linking the user to this app, always use the full URL from the Artifact URL
                     "I can do that. Do you want me to execute it now or first show a plan?"
                         .to_string()
                 });
+            if use_action_selection_choices {
+                response_choices = action_selection_clarification_choices.clone();
+            }
 
             {
                 let mut trace = trace_ref.write().await;
@@ -27273,6 +29460,17 @@ When linking the user to this app, always use the full URL from the Artifact URL
                             )
                             .await;
                             let total_tokens = trace_ref.read().await.total_tokens;
+                            if let Some(source_message_id) =
+                                deferred_user_memory_capture_message_id.as_deref()
+                            {
+                                self.spawn_user_memory_capture(
+                                    message,
+                                    channel,
+                                    Some(&conversation_key),
+                                    project_id,
+                                    Some(source_message_id),
+                                );
+                            }
                             return Ok(ProcessedMessage {
                                 response,
                                 conversation_id: Some(conversation_key.clone()),
@@ -27281,6 +29479,7 @@ When linking the user to this app, always use the full URL from the Artifact URL
                                 run_status: Some(run_status_text),
                                 trace_id: Some(trace_id.clone()),
                                 total_tokens,
+                                choices: Vec::new(),
                                 degradation: degradation_notes.clone(),
                                 attempted_models: attempted_models.clone(),
                                 user_outcome: Some(failure_outcome.user_outcome),
@@ -29416,65 +31615,102 @@ Do NOT omit the required source fields. Do NOT ask the user for JSON. Emit the t
                     }];
                 }
             }
-            if execution_intent
-                && !app_deploy_intent
-                && existing_app_repair_redirect_attempts < 2
-                && !existing_app_repair_already_attempted
-                && recent_artifact_prompt_context
-                    .as_ref()
-                    .map(|ctx| ctx.artifact_type.eq_ignore_ascii_case("app"))
-                    .unwrap_or(false)
-                && tool_calls.iter().any(|call| call.name == "app_deploy")
-            {
-                existing_app_repair_redirect_attempts += 1;
-                if let Some(artifact_ctx) = recent_artifact_prompt_context.as_ref() {
-                    let inspect_query = if artifact_ctx.title.trim().is_empty() {
-                        artifact_ctx.artifact_id.clone()
-                    } else {
-                        artifact_ctx.title.clone()
-                    };
-                    let redirected_tool_names = tool_calls
-                        .iter()
-                        .map(|call| call.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    {
-                        let mut trace = trace_ref.write().await;
-                        trace.steps.push(ExecutionStep {
-                            icon: "[fix]".to_string(),
-                            title: "Blocked Fresh Deploy Detour".to_string(),
-                            detail: format!(
-                                "Existing-app repair request detoured into {}. Redirecting back to app_inspect instead of creating a fresh deploy.",
-                                redirected_tool_names
-                            ),
-                            step_type: "warning".to_string(),
-                            data: Some(format!(
-                                "attempt={} | app_id={}",
-                                existing_app_repair_redirect_attempts,
-                                artifact_ctx.artifact_id
-                            )),
-                            timestamp: chrono::Utc::now(),
-                            duration_ms: None,
-                        });
+            match plan_existing_app_deploy_retarget(
+                execution_intent,
+                app_deploy_intent,
+                existing_app_repair_redirect_attempts,
+                existing_app_repair_already_attempted,
+                recent_artifact_prompt_context,
+                &tool_calls,
+            ) {
+                ExistingAppDeployRetargetPlan::NotNeeded => {}
+                ExistingAppDeployRetargetPlan::Retargeted(retargeted_tool_calls) => {
+                    existing_app_repair_redirect_attempts += 1;
+                    if let Some(artifact_ctx) = recent_artifact_prompt_context.as_ref() {
+                        let redirected_tool_names = tool_calls
+                            .iter()
+                            .map(|call| call.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        {
+                            let mut trace = trace_ref.write().await;
+                            trace.steps.push(ExecutionStep {
+                                icon: "[fix]".to_string(),
+                                title: "Retargeting Existing App Deploy".to_string(),
+                                detail: format!(
+                                    "Existing-app repair request detoured into {}. Reusing app_id {} for an in-place redeploy.",
+                                    redirected_tool_names,
+                                    artifact_ctx.artifact_id
+                                ),
+                                step_type: "warning".to_string(),
+                                data: Some(format!(
+                                    "attempt={} | app_id={}",
+                                    existing_app_repair_redirect_attempts,
+                                    artifact_ctx.artifact_id
+                                )),
+                                timestamp: chrono::Utc::now(),
+                                duration_ms: None,
+                            });
+                        }
+                        if let Some(tx) = token_tx.as_ref() {
+                            queue_stream_event(tx, StreamEvent::ToolProgress {
+                                name: "app_deploy".to_string(),
+                                content: "Existing app repair detected. Reusing the current app id for an in-place redeploy."
+                                    .to_string(),
+                                payload: None,
+                            });
+                        }
+                        tool_calls = retargeted_tool_calls;
                     }
-                    if let Some(tx) = token_tx.as_ref() {
-                        queue_stream_event(tx, StreamEvent::ToolProgress {
+                }
+                ExistingAppDeployRetargetPlan::InspectRedirect {
+                    query: inspect_query,
+                } => {
+                    existing_app_repair_redirect_attempts += 1;
+                    if let Some(artifact_ctx) = recent_artifact_prompt_context.as_ref() {
+                        let redirected_tool_names = tool_calls
+                            .iter()
+                            .map(|call| call.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        {
+                            let mut trace = trace_ref.write().await;
+                            trace.steps.push(ExecutionStep {
+                                icon: "[fix]".to_string(),
+                                title: "Blocked Fresh Deploy Detour".to_string(),
+                                detail: format!(
+                                    "Existing-app repair request detoured into {}. Redirecting back to app_inspect instead of creating a fresh deploy.",
+                                    redirected_tool_names
+                                ),
+                                step_type: "warning".to_string(),
+                                data: Some(format!(
+                                    "attempt={} | app_id={}",
+                                    existing_app_repair_redirect_attempts,
+                                    artifact_ctx.artifact_id
+                                )),
+                                timestamp: chrono::Utc::now(),
+                                duration_ms: None,
+                            });
+                        }
+                        if let Some(tx) = token_tx.as_ref() {
+                            queue_stream_event(tx, StreamEvent::ToolProgress {
+                                name: "app_inspect".to_string(),
+                                content: "Existing app repair detected. Staying in the inspect/edit/restart path instead of creating a fresh deploy."
+                                    .to_string(),
+                                payload: None,
+                            });
+                        }
+                        tool_calls = vec![crate::core::llm::ToolCall {
+                            id: format!("repair-app-inspect-{}", tool_turn + 1),
                             name: "app_inspect".to_string(),
-                            content: "Existing app repair detected. Staying in the inspect/edit/restart path instead of creating a fresh deploy."
-                                .to_string(),
-                            payload: None,
-                        });
+                            arguments: serde_json::json!({
+                                "query": inspect_query,
+                                "include_files": true,
+                                "include_logs": true,
+                                "limit": 1
+                            }),
+                        }];
                     }
-                    tool_calls = vec![crate::core::llm::ToolCall {
-                        id: format!("repair-app-inspect-{}", tool_turn + 1),
-                        name: "app_inspect".to_string(),
-                        arguments: serde_json::json!({
-                            "query": inspect_query,
-                            "include_files": true,
-                            "include_logs": true,
-                            "limit": 1
-                        }),
-                    }];
                 }
             }
             if app_deploy_intent
@@ -32468,7 +34704,55 @@ Do not ask for JSON. Do not claim deployment is unavailable unless `app_deploy` 
                         severity,
                         "output guard blocked assistant response"
                     );
-                    response = safe_reply;
+                    if let Some(rebuilt_response) =
+                        maybe_build_output_guard_block_response(&rule_id, &cumulative_tool_batch)
+                    {
+                        let rebuilt_verdict = if let Some(candidate) = guard_candidates.first() {
+                            crate::security::output_guard::guard_output(
+                                &candidate.client,
+                                &guard_policy,
+                                &rebuilt_response,
+                                external_content_present,
+                            )
+                            .await
+                        } else {
+                            crate::security::output_guard::guard_output(
+                                &self.llm,
+                                &guard_policy,
+                                &rebuilt_response,
+                                external_content_present,
+                            )
+                            .await
+                        };
+                        match rebuilt_verdict {
+                            crate::security::output_guard::OutputVerdict::Allow => {
+                                response = rebuilt_response;
+                            }
+                            crate::security::output_guard::OutputVerdict::Degraded { reason } => {
+                                tracing::warn!(
+                                    target: "security.output",
+                                    reason = %reason,
+                                    "output guard degraded while rechecking rebuilt fallback response"
+                                );
+                                response = rebuilt_response;
+                            }
+                            crate::security::output_guard::OutputVerdict::Block {
+                                message: rebuilt_safe_reply,
+                                rule_id: rebuilt_rule_id,
+                                severity: rebuilt_severity,
+                            } => {
+                                tracing::warn!(
+                                    target: "security.output",
+                                    rule_id = %rebuilt_rule_id,
+                                    severity = rebuilt_severity,
+                                    "output guard blocked rebuilt fallback response"
+                                );
+                                response = rebuilt_safe_reply;
+                            }
+                        }
+                    } else {
+                        response = safe_reply;
+                    }
                 }
                 crate::security::output_guard::OutputVerdict::Degraded { reason } => {
                     tracing::warn!(
@@ -32680,6 +34964,15 @@ Do not ask for JSON. Do not claim deployment is unavailable unless `app_deploy` 
                 }
             }
         }
+        if let Some(source_message_id) = deferred_user_memory_capture_message_id.as_deref() {
+            self.spawn_user_memory_capture(
+                message,
+                channel,
+                Some(&conversation_key),
+                project_id,
+                Some(source_message_id),
+            );
+        }
         self.sync_background_session_after_response(&conversation_key, message, &response)
             .await;
 
@@ -32760,6 +35053,7 @@ Do not ask for JSON. Do not claim deployment is unavailable unless `app_deploy` 
             run_status: Some(terminal_run_status.as_str().to_string()),
             trace_id: Some(trace_id),
             total_tokens,
+            choices: response_choices,
             degradation: degradation_notes,
             attempted_models,
             user_outcome: Some(user_outcome),
@@ -33328,7 +35622,7 @@ Do not ask for JSON. Do not claim deployment is unavailable unless `app_deploy` 
         let mut learned_items = self
             .storage
             .list_active_experience_items(
-                &["constraint", "personal_fact"],
+                SAVED_USER_FACT_PROMPT_KINDS,
                 project_id,
                 conversation_id,
                 20,
@@ -35245,6 +37539,7 @@ Do not ask for JSON. Do not claim deployment is unavailable unless `app_deploy` 
             run_status: Some(run_status.as_str().to_string()),
             trace_id: None,
             total_tokens: 0,
+            choices: Vec::new(),
             degradation: Vec::new(),
             attempted_models: Vec::new(),
             user_outcome: Some(user_outcome),
@@ -39139,6 +41434,7 @@ Do not ask for JSON. Do not claim deployment is unavailable unless `app_deploy` 
                             ..RequestExecutionHints::default()
                         },
                         user_message_already_recorded: true,
+                        skip_inbound_security_precheck: false,
                     },
                 )
                 .await?;
@@ -39204,7 +41500,9 @@ Do not ask for JSON. Do not claim deployment is unavailable unless `app_deploy` 
                             ..RequestExecutionHints::default()
                         },
                         user_message_already_recorded: true,
-                    },
+                        skip_inbound_security_precheck: false,
+                    }
+                    .with_inbound_security_precheck_skipped(),
                 )
                 .await?;
             return Ok(processed.response);
@@ -45010,7 +47308,10 @@ Use every distinct event/date the user requested and no extras. Prefer the faile
             "qq" => crate::channels::qq::send_message(self, &safe_message)
                 .await
                 .is_ok(),
-            "email" => self.send_email_notification_reported(&safe_message).await.is_ok(),
+            "email" => self
+                .send_email_notification_reported(&safe_message)
+                .await
+                .is_ok(),
             "web" => {
                 // Web notifications are already stored in DB
                 true
@@ -45641,6 +47942,28 @@ mod tests {
         .expect("clarification should build a resume prompt");
         assert!(resume_message.contains("missing clarification needed"));
         assert!(resume_message.contains("Use the repo named core-api on branch main."));
+    }
+
+    #[test]
+    fn message_processing_context_skip_helper_marks_internal_followups() {
+        let context = MessageProcessingContext::non_streaming(RequestExecutionHints::default())
+            .with_inbound_security_precheck_skipped();
+
+        assert!(context.skip_inbound_security_precheck);
+        assert!(!context.user_message_already_recorded);
+    }
+
+    #[test]
+    fn resume_streaming_context_skips_inbound_security_precheck() {
+        let (token_tx, _token_rx) = tokio::sync::mpsc::channel(1);
+        let context = MessageProcessingContext::resume_streaming(
+            Arc::new(RwLock::new(ExecutionTrace::default())),
+            token_tx,
+            RequestExecutionHints::default(),
+        );
+
+        assert!(context.user_message_already_recorded);
+        assert!(context.skip_inbound_security_precheck);
     }
 
     #[test]
@@ -47918,10 +50241,17 @@ Verify: `officecli --version`
     }
 
     #[test]
-    fn user_memory_capture_payload_parser_rejects_empty_object_shape() {
-        let parsed = parse_user_memory_capture_payload("{}");
+    fn user_memory_capture_payload_parser_recovers_empty_object_shape() {
+        let parsed =
+            parse_user_memory_capture_payload("{}").expect("empty object should recover to arrays");
 
-        assert_eq!(parsed, Err(UserMemoryCapturePayloadError::IncompleteShape));
+        assert_eq!(
+            parsed.disposition,
+            UserMemoryCapturePayloadDisposition::ShapeRecovered
+        );
+        assert!(user_memory_capture_payload_is_empty_decision(
+            &parsed.payload
+        ));
     }
 
     #[test]
@@ -47937,10 +50267,265 @@ Verify: `officecli --version`
             parse_user_memory_capture_payload("prefix {\"memories\":[],\"retractions\":[]} suffix")
                 .expect("embedded schema-compliant capture payload should parse");
 
-        assert!(parsed.get("memories").is_some_and(|value| value.is_array()));
+        assert_eq!(
+            parsed.disposition,
+            UserMemoryCapturePayloadDisposition::Exact
+        );
         assert!(parsed
+            .payload
+            .get("memories")
+            .is_some_and(|value| value.is_array()));
+        assert!(parsed
+            .payload
             .get("retractions")
             .is_some_and(|value| value.is_array()));
+    }
+
+    #[test]
+    fn user_memory_capture_payload_parser_wraps_singleton_objects_when_shape_is_recoverable() {
+        let parsed = parse_user_memory_capture_payload(
+            r#"{"memories":{"key":"preferred_name","value":"Example User"},"retractions":null}"#,
+        )
+        .expect("singleton objects should recover into arrays");
+
+        assert_eq!(
+            parsed.disposition,
+            UserMemoryCapturePayloadDisposition::ShapeRecovered
+        );
+        assert_eq!(
+            parsed
+                .payload
+                .get("memories")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(1)
+        );
+        assert!(parsed
+            .payload
+            .get("retractions")
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| items.is_empty()));
+    }
+
+    #[test]
+    fn user_memory_capture_payload_parser_recovers_legacy_memory_field_names() {
+        let parsed = parse_user_memory_capture_payload(
+            r#"{"extracted_memories":[{"key":"preferred_name","value":"Example User"}],"retractions":[]}"#,
+        )
+        .expect("legacy memory field should recover into canonical payload");
+
+        assert_eq!(
+            parsed.disposition,
+            UserMemoryCapturePayloadDisposition::ShapeRecovered
+        );
+        assert_eq!(
+            parsed
+                .payload
+                .get("memories")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            parsed
+                .payload
+                .get("memories")
+                .and_then(|value| value.as_array())
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("key"))
+                .and_then(|value| value.as_str()),
+            Some("preferred_name")
+        );
+    }
+
+    #[test]
+    fn user_memory_capture_payload_parser_rejects_unrelated_status_objects() {
+        let parsed = parse_user_memory_capture_payload(
+            r#"{"lifecycle_aware_memory":{},"status":"extraction_skipped","reason":"input_redacted_for_privacy_and_safety"}"#,
+        );
+
+        assert_eq!(parsed, Err(UserMemoryCapturePayloadError::IncompleteShape));
+    }
+
+    #[test]
+    fn user_memory_capture_payload_parser_rejects_status_objects_with_empty_memory_aliases() {
+        let parsed = parse_user_memory_capture_payload(
+            r#"{"user_memories":[],"lifecycle_phase":"unknown","metadata":{"input_status":"redacted","extraction_status":"no_user_content"}} "#,
+        );
+
+        assert_eq!(parsed, Err(UserMemoryCapturePayloadError::IncompleteShape));
+    }
+
+    #[test]
+    fn user_memory_capture_payload_parser_recovers_structural_memory_aliases_without_name_heuristics(
+    ) {
+        let parsed = parse_user_memory_capture_payload(
+            r#"{"facts":[{"key":"user_name","value":"Example User"}],"retractions":[]}"#,
+        )
+        .expect("structural memory aliases should recover");
+
+        assert_eq!(
+            parsed.disposition,
+            UserMemoryCapturePayloadDisposition::ShapeRecovered
+        );
+        assert_eq!(
+            parsed
+                .payload
+                .get("memories")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            parsed
+                .payload
+                .get("memories")
+                .and_then(|value| value.as_array())
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("key"))
+                .and_then(|value| value.as_str()),
+            Some("user_name")
+        );
+    }
+
+    #[test]
+    fn learned_memory_key_to_user_preference_key_accepts_canonical_internal_keys() {
+        assert_eq!(
+            learned_memory_key_to_user_preference_key("user_name"),
+            Some("user_name".to_string())
+        );
+        assert_eq!(
+            learned_memory_key_to_user_preference_key("preferred_tone"),
+            Some("preferred_tone".to_string())
+        );
+        assert_eq!(
+            learned_memory_key_to_user_preference_key("likes_editor_theme"),
+            Some("likes_editor_theme".to_string())
+        );
+        assert_eq!(
+            learned_memory_key_to_user_preference_key(
+                "rule_require_explicit_approval_before_side_effects"
+            ),
+            Some("rule_require_explicit_approval_before_side_effects".to_string())
+        );
+    }
+
+    #[test]
+    fn learned_memory_key_to_user_preference_key_rejects_noncanonical_aliases() {
+        assert_eq!(learned_memory_key_to_user_preference_key("name"), None);
+        assert_eq!(
+            learned_memory_key_to_user_preference_key("preferred_name"),
+            None
+        );
+        assert_eq!(
+            learned_memory_key_to_user_preference_key("favorite_color"),
+            None
+        );
+    }
+
+    #[test]
+    fn user_memory_capture_payload_parser_rejects_invalid_field_types() {
+        let parsed = parse_user_memory_capture_payload(r#"{"memories":"nope","retractions":[]}"#);
+
+        assert_eq!(parsed, Err(UserMemoryCapturePayloadError::IncompleteShape));
+    }
+
+    #[test]
+    fn user_memory_capture_empty_verdict_parser_accepts_semantic_verdict() {
+        let verdict = parse_user_memory_capture_empty_verdict(
+            r#"prefix {"has_durable_memory":true,"confidence":0.82,"reason":"The user disclosed a stable self-identifier."} suffix"#,
+        )
+        .expect("semantic verdict should parse");
+
+        assert!(verdict.has_durable_memory);
+        assert_eq!(verdict.confidence, 0.82);
+        assert_eq!(
+            verdict.reason,
+            "The user disclosed a stable self-identifier."
+        );
+    }
+
+    #[test]
+    fn user_memory_capture_empty_verdict_parser_clamps_confidence_and_requires_boolean_flag() {
+        let verdict = parse_user_memory_capture_empty_verdict(
+            r#"{"has_durable_memory":false,"confidence":9.0,"reason":"No durable user state appears in the turn."}"#,
+        )
+        .expect("verdict with large confidence should clamp");
+
+        assert!(!verdict.has_durable_memory);
+        assert_eq!(verdict.confidence, 1.0);
+        assert_eq!(verdict.reason, "No durable user state appears in the turn.");
+        assert!(parse_user_memory_capture_empty_verdict(
+            r#"{"confidence":0.9,"reason":"missing flag"}"#
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn user_memory_capture_empty_verdict_parser_accepts_missed_memory_shape() {
+        let verdict = parse_user_memory_capture_empty_verdict(
+            r#"{"missed_durable_memory":true,"reasoning":"The user disclosed a stable self-identifier."}"#,
+        )
+        .expect("semantic missed-memory verdict should parse");
+
+        assert!(verdict.has_durable_memory);
+        assert_eq!(
+            verdict.confidence,
+            USER_FACT_MEMORY_CAPTURE_EMPTY_VERDICT_MIN_CONFIDENCE
+        );
+        assert_eq!(
+            verdict.reason,
+            "The user disclosed a stable self-identifier."
+        );
+    }
+
+    #[test]
+    fn user_memory_capture_terminal_error_reports_timeout_when_all_attempts_timed_out() {
+        let attempts = vec![UserMemoryCaptureAttemptRecord {
+            slot_id: "primary".to_string(),
+            slot_label: "qwen/qwen3.6-plus".to_string(),
+            role: "Primary".to_string(),
+            provider: None,
+            model: None,
+            stage: "extract".to_string(),
+            request_kind: "user_fact_memory_capture".to_string(),
+            outcome: "transport_failed".to_string(),
+            error: Some(
+                "supervised_chat_failed(kind=timeout, request_kind=user_fact_memory_capture, model=qwen/qwen3.6-plus): request timed out after 45000ms"
+                    .to_string(),
+            ),
+        }];
+
+        assert!(user_memory_capture_attempts_all_transport_failed(&attempts));
+        assert!(user_memory_capture_attempts_timed_out(&attempts));
+        assert_eq!(
+            user_memory_capture_terminal_error(&attempts, 1, 45_000),
+            "Memory capture timed out after 45000ms across 1 candidate(s)."
+        );
+    }
+
+    #[test]
+    fn user_memory_capture_terminal_error_preserves_schema_failure_label_for_parse_errors() {
+        let attempts = vec![UserMemoryCaptureAttemptRecord {
+            slot_id: "primary".to_string(),
+            slot_label: "qwen/qwen3.6-plus".to_string(),
+            role: "Primary".to_string(),
+            provider: Some("openrouter".to_string()),
+            model: Some("qwen/qwen3.6-plus".to_string()),
+            stage: "extract".to_string(),
+            request_kind: "user_fact_memory_capture".to_string(),
+            outcome: "unparseable".to_string(),
+            error: Some("unparseable".to_string()),
+        }];
+
+        assert!(!user_memory_capture_attempts_all_transport_failed(
+            &attempts
+        ));
+        assert!(!user_memory_capture_attempts_timed_out(&attempts));
+        assert_eq!(
+            user_memory_capture_terminal_error(&attempts, 1, 45_000),
+            "Memory capture failed to produce schema-compliant JSON after 1 candidate(s)."
+        );
     }
 
     #[test]
@@ -49249,7 +51834,7 @@ Research report: India AI research capacity | 4 sources";
         assert!(response.contains("[Open app](http://localhost:8990/apps/demo/)"));
         // Public URL is no longer included in chat (tunnel URLs are ephemeral)
         assert!(!response.contains("[Open public app]"));
-        assert!(response.contains("Access key: `ak_demo123`"));
+        assert!(response.contains("Access password: `ak_demo123`"));
         assert!(response.contains("Guard: enabled."));
         assert!(!response.to_ascii_lowercase().contains("current diagnosis"));
         assert!(!response.to_ascii_lowercase().contains("likely root cause"));
@@ -49279,8 +51864,67 @@ Research report: India AI research capacity | 4 sources";
 
         assert!(response.contains("Dynamic app ready: Daily AI Highlights."));
         assert!(response.contains("[Open app](http://localhost:8990/apps/highlights/)"));
-        assert!(response.contains("Access key: `ak_highlights`"));
+        assert!(response.contains("Access password: `ak_highlights`"));
         assert!(!response.to_ascii_lowercase().contains("blocked by policy"));
+    }
+
+    #[test]
+    fn app_deploy_success_override_parses_static_json_output() {
+        let batch = crate::core::agent::tool_execution::ToolExecutionBatch {
+            outputs: vec![crate::core::agent::tool_execution::ToolCallOutput {
+                name: "app_deploy".to_string(),
+                content: serde_json::json!({
+                    "status": "deployed",
+                    "type": "static",
+                    "app_id": "static123",
+                    "url": "/apps/static123/",
+                    "title": "ArXiv Paper Watch",
+                    "updated_existing": false,
+                    "access_guard_enabled": false
+                })
+                .to_string(),
+            }],
+            outcomes: vec![],
+        };
+
+        let response = maybe_override_with_app_deploy_success_response("", &batch)
+            .expect("static deploy json should produce a success summary");
+
+        assert!(response.contains("Static app ready: ArXiv Paper Watch."));
+        assert!(response.contains("[Open app](/apps/static123/)"));
+        assert!(response.contains("App ID: `static123`"));
+    }
+
+    #[test]
+    fn app_deploy_success_override_parses_delegated_dynamic_json_output() {
+        let batch = crate::core::agent::tool_execution::ToolExecutionBatch {
+            outputs: vec![crate::core::agent::tool_execution::ToolCallOutput {
+                name: "app_deploy".to_string(),
+                content: serde_json::json!({
+                    "status": "deployed",
+                    "type": "dynamic",
+                    "runtime": "delegated",
+                    "runtime_delegated": true,
+                    "app_id": "dyn12345",
+                    "url": "/apps/dyn12345/",
+                    "title": "ArXiv Paper Tracker",
+                    "updated_existing": false,
+                    "access_guard_enabled": true,
+                    "access_password": "ak_demo123"
+                })
+                .to_string(),
+            }],
+            outcomes: vec![],
+        };
+
+        let response = maybe_override_with_app_deploy_success_response("", &batch)
+            .expect("delegated dynamic deploy json should produce a success summary");
+
+        assert!(response.contains("Dynamic app deployed: ArXiv Paper Tracker."));
+        assert!(response.contains("[Open app](/apps/dyn12345/)"));
+        assert!(response.contains("App ID: `dyn12345`"));
+        assert!(response.contains("Runtime: startup delegated to the executor."));
+        assert!(response.contains("Access password: `ak_demo123`"));
     }
 
     #[test]
@@ -49334,6 +51978,90 @@ Research report: India AI research capacity | 4 sources";
         assert!(!response
             .to_ascii_lowercase()
             .contains("important limitation"));
+    }
+
+    #[test]
+    fn deployed_app_reference_resolution_marks_close_matches_ambiguous() {
+        let apps = vec![
+            serde_json::json!({
+                "id": "becf46bb",
+                "title": "arXiv Live Feed",
+                "url": "http://localhost:8990/apps/becf46bb/"
+            }),
+            serde_json::json!({
+                "id": "cad20c5e",
+                "title": "arXiv Live Papers",
+                "url": "http://localhost:8990/apps/cad20c5e/"
+            }),
+            serde_json::json!({
+                "id": "other1234",
+                "title": "Budget Dashboard",
+                "url": "http://localhost:8990/apps/other1234/"
+            }),
+        ];
+
+        let resolution = resolve_deployed_app_reference_from_message("my arxiv app", &apps);
+        assert!(resolution.matched.is_none());
+        assert_eq!(resolution.ambiguous_candidates.len(), 2);
+        assert_eq!(resolution.ambiguous_candidates[0].app_id, "becf46bb");
+        assert_eq!(resolution.ambiguous_candidates[1].app_id, "cad20c5e");
+    }
+
+    #[test]
+    fn deployed_app_reference_resolution_prefers_exact_app_id_match() {
+        let apps = vec![
+            serde_json::json!({
+                "id": "becf46bb",
+                "title": "arXiv Live Feed",
+                "url": "http://localhost:8990/apps/becf46bb/"
+            }),
+            serde_json::json!({
+                "id": "cad20c5e",
+                "title": "arXiv Live Papers",
+                "url": "http://localhost:8990/apps/cad20c5e/"
+            }),
+        ];
+
+        let resolution = resolve_deployed_app_reference_from_message("becf46bb", &apps);
+        let matched = resolution
+            .matched
+            .expect("exact app id should resolve to a unique deployed app");
+        assert_eq!(matched.artifact_id, "becf46bb");
+        assert_eq!(matched.title, "arXiv Live Feed");
+        assert!(resolution.ambiguous_candidates.is_empty());
+    }
+
+    #[test]
+    fn deployed_app_reference_clarification_exposes_candidate_choices() {
+        let shape = RequestShapeAssessment {
+            shape: "app".to_string(),
+            execution_mode: "immediate".to_string(),
+            workspace_modification_request: true,
+            ..Default::default()
+        };
+        let candidates = vec![
+            DeployedAppReferenceCandidate {
+                app_id: "becf46bb".to_string(),
+                title: "arXiv Live Feed".to_string(),
+                score: 0.82,
+                reason: "Title similarity".to_string(),
+            },
+            DeployedAppReferenceCandidate {
+                app_id: "cad20c5e".to_string(),
+                title: "arXiv Live Papers".to_string(),
+                score: 0.79,
+                reason: "Title similarity".to_string(),
+            },
+        ];
+
+        let clarification =
+            maybe_synthesize_deployed_app_reference_clarification(Some(&shape), None, &candidates)
+                .expect("deployed app clarification");
+
+        assert!(clarification.should_clarify);
+        assert_eq!(clarification.choices.len(), 2);
+        assert_eq!(clarification.choices[0].label, "arXiv Live Feed (becf46bb)");
+        assert_eq!(clarification.choices[1].submit_text, "cad20c5e");
     }
 
     #[test]
@@ -49812,6 +52540,100 @@ Research report: India AI research capacity | 4 sources";
     }
 
     #[test]
+    fn plan_existing_app_deploy_retarget_injects_recent_app_id_for_generated_redeploy() {
+        let recent_artifact = ConversationArtifactContext {
+            artifact_type: "app".to_string(),
+            artifact_id: "becf46bb".to_string(),
+            title: "arXiv Live Feed".to_string(),
+            summary: String::new(),
+            url: "http://localhost:8990/apps/becf46bb/".to_string(),
+            related_actions: vec![],
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let tool_calls = vec![crate::core::llm::ToolCall {
+            id: "deploy-1".to_string(),
+            name: "app_deploy".to_string(),
+            arguments: serde_json::json!({
+                "title": "arXiv Live Feed",
+                "files": {
+                    "index.html": "<html>updated</html>"
+                }
+            }),
+        }];
+
+        let plan = plan_existing_app_deploy_retarget(
+            true,
+            false,
+            0,
+            false,
+            Some(&recent_artifact),
+            &tool_calls,
+        );
+        let ExistingAppDeployRetargetPlan::Retargeted(retargeted_calls) = plan else {
+            panic!("expected an in-place retarget plan");
+        };
+        assert_eq!(retargeted_calls.len(), 1);
+        assert_eq!(
+            retargeted_calls[0]
+                .arguments
+                .get("app_id")
+                .and_then(|value| value.as_str()),
+            Some("becf46bb")
+        );
+    }
+
+    #[test]
+    fn plan_existing_app_deploy_retarget_falls_back_to_inspect_for_repo_deploys() {
+        let recent_artifact = ConversationArtifactContext {
+            artifact_type: "app".to_string(),
+            artifact_id: "becf46bb".to_string(),
+            title: "arXiv Live Feed".to_string(),
+            summary: String::new(),
+            url: "http://localhost:8990/apps/becf46bb/".to_string(),
+            related_actions: vec![],
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let tool_calls = vec![crate::core::llm::ToolCall {
+            id: "deploy-1".to_string(),
+            name: "app_deploy".to_string(),
+            arguments: serde_json::json!({
+                "title": "arXiv Live Feed",
+                "repo_url": "https://github.com/example/arxiv-feed"
+            }),
+        }];
+
+        let plan = plan_existing_app_deploy_retarget(
+            true,
+            false,
+            0,
+            false,
+            Some(&recent_artifact),
+            &tool_calls,
+        );
+        let ExistingAppDeployRetargetPlan::InspectRedirect { query } = plan else {
+            panic!("repo deploy detours should fall back to inspect");
+        };
+        assert_eq!(query, "arXiv Live Feed");
+    }
+
+    #[test]
+    fn plan_existing_app_deploy_retarget_skips_without_recent_app_context() {
+        let tool_calls = vec![crate::core::llm::ToolCall {
+            id: "deploy-1".to_string(),
+            name: "app_deploy".to_string(),
+            arguments: serde_json::json!({
+                "title": "arXiv Live Feed",
+                "files": {
+                    "index.html": "<html>updated</html>"
+                }
+            }),
+        }];
+
+        let plan = plan_existing_app_deploy_retarget(true, false, 0, false, None, &tool_calls);
+        assert!(matches!(plan, ExistingAppDeployRetargetPlan::NotNeeded));
+    }
+
+    #[test]
     fn partial_app_build_fallback_returns_clean_interim_status() {
         let batch = crate::core::agent::tool_execution::ToolExecutionBatch {
             outputs: vec![
@@ -50019,6 +52841,119 @@ Research report: India AI research capacity | 4 sources";
         assert!(response.contains("I summarized the gathered tool evidence"));
         assert!(response.contains("Code Execute completed successfully: OpenCV ready"));
         assert!(!response.contains("raw script dump"));
+    }
+
+    #[test]
+    fn output_guard_block_response_uses_safe_tool_summary_for_internal_context_leak() {
+        let batch = crate::core::agent::tool_execution::ToolExecutionBatch {
+            outputs: vec![
+                crate::core::agent::tool_execution::ToolCallOutput {
+                    name: "file_read".to_string(),
+                    content: "Tool 'file_read' failed: /app is a directory (os error 21)".to_string(),
+                },
+                crate::core::agent::tool_execution::ToolCallOutput {
+                    name: "web_search".to_string(),
+                    content: "Search results for: arxiv API javascript fetch latest papers\n1. arXiv API User's Manual - https://info.arxiv.org/help/api/user-manual.html\n2. arxiv - PyPI - https://pypi.org/project/arxiv/".to_string(),
+                },
+            ],
+            outcomes: vec![
+                crate::core::ToolOutcome {
+                    name: "file_read".to_string(),
+                    content: "Tool 'file_read' failed: /app is a directory (os error 21)".to_string(),
+                    status: crate::core::ToolOutcomeStatus::RecoverableError,
+                    failure_class: Some(crate::core::FailureClass::ToolError),
+                    retryable: true,
+                    side_effect_level: "read".to_string(),
+                    error: Some("/app is a directory".to_string()),
+                },
+                crate::core::ToolOutcome {
+                    name: "web_search".to_string(),
+                    content: String::new(),
+                    status: crate::core::ToolOutcomeStatus::Success,
+                    failure_class: None,
+                    retryable: false,
+                    side_effect_level: "read".to_string(),
+                    error: None,
+                },
+            ],
+        };
+
+        let response =
+            maybe_build_output_guard_block_response("block-internal-context-leak", &batch)
+                .expect("fallback response");
+
+        assert!(response.contains("I hit a tool error while working on this request"));
+        assert!(response.contains("Web search gathered 2 fresh results"));
+        assert!(response.contains("arxiv API javascript fetch latest papers"));
+        assert!(!response.contains("/app"));
+        assert!(!response.contains("os error 21"));
+    }
+
+    #[test]
+    fn output_guard_block_response_returns_retry_note_when_all_outputs_failed() {
+        let batch = crate::core::agent::tool_execution::ToolExecutionBatch {
+            outputs: vec![crate::core::agent::tool_execution::ToolCallOutput {
+                name: "file_read".to_string(),
+                content:
+                    "Tool 'file_read' failed: /var/task: No such file or directory (os error 2)"
+                        .to_string(),
+            }],
+            outcomes: vec![crate::core::ToolOutcome {
+                name: "file_read".to_string(),
+                content:
+                    "Tool 'file_read' failed: /var/task: No such file or directory (os error 2)"
+                        .to_string(),
+                status: crate::core::ToolOutcomeStatus::RecoverableError,
+                failure_class: Some(crate::core::FailureClass::ToolError),
+                retryable: true,
+                side_effect_level: "read".to_string(),
+                error: Some("/var/task missing".to_string()),
+            }],
+        };
+
+        let response =
+            maybe_build_output_guard_block_response("block-internal-context-leak", &batch)
+                .expect("retry fallback");
+
+        assert!(response.contains("I hit a tool error while working on this request"));
+        assert!(response.contains("Please retry the request."));
+        assert!(!response.contains("/var/task"));
+    }
+
+    #[test]
+    fn output_guard_block_response_returns_none_when_no_failed_outputs_exist() {
+        let response = maybe_build_output_guard_block_response(
+            "block-internal-context-leak",
+            &crate::core::agent::tool_execution::ToolExecutionBatch::default(),
+        );
+
+        assert!(response.is_none());
+    }
+
+    #[test]
+    fn output_guard_block_response_returns_none_for_non_internal_context_rules() {
+        let response = maybe_build_output_guard_block_response(
+            "block-system-prompt-leak",
+            &failed_test_tool_batch(
+                "file_read",
+                "Tool 'file_read' failed: /app is a directory (os error 21)",
+            ),
+        );
+
+        assert!(response.is_none());
+    }
+
+    #[test]
+    fn output_guard_block_response_returns_none_for_internal_context_block_without_failures() {
+        let response = maybe_build_output_guard_block_response(
+            "block-internal-context-leak",
+            &successful_test_tool_batch(
+                "web_search",
+                "Search results for: agentark\n1. AgentArk docs - https://example.com",
+            ),
+        );
+
+        assert!(response.is_none());
     }
 
     #[test]
@@ -51603,6 +54538,164 @@ Research report: India AI research capacity | 4 sources";
     }
 
     #[test]
+    fn ambiguous_creation_surface_requests_clarification() {
+        let all_actions = vec![
+            action(
+                "app_deploy",
+                "Build, run, and deploy an isolated application.",
+            ),
+            action(
+                "file_write",
+                "Build or update files in the workspace for a software project.",
+            ),
+            action("web_search", "Search the web"),
+        ];
+        let shape = RequestShapeAssessment {
+            shape: "app".to_string(),
+            execution_mode: "immediate".to_string(),
+            workspace_modification_request: true,
+            ..Default::default()
+        };
+
+        let clarification = maybe_synthesize_creation_surface_clarification(
+            "Build a static HTML page that refreshes every 10 seconds and shows the latest papers.",
+            Some(&shape),
+            &all_actions,
+            None,
+            None,
+            true,
+            false,
+        )
+        .expect("creation surface clarification");
+
+        assert!(clarification.should_clarify);
+        assert!(clarification
+            .clarification_question
+            .as_deref()
+            .unwrap_or_default()
+            .contains("workspace"));
+        assert_eq!(clarification.choices.len(), 2);
+        assert_eq!(clarification.choices[0].label, "Workspace only");
+        assert_eq!(
+            clarification.choices[1].submit_text,
+            "Build and deploy it as an isolated AgentArk app."
+        );
+    }
+
+    #[test]
+    fn ambiguous_creation_surface_classifier_requests_clarification_without_request_shape() {
+        let all_actions = vec![
+            action(
+                "app_deploy",
+                "Build, run, and deploy an isolated application.",
+            ),
+            action(
+                "file_write",
+                "Build or update files in the workspace for a software project.",
+            ),
+        ];
+        let creation_surface = CreationSurfaceAssessment {
+            surface: CreationSurfaceKind::Ambiguous,
+            reasoning: "The request asks to build a new software artifact without choosing files-only or isolated app execution.".to_string(),
+        };
+
+        let clarification = maybe_synthesize_creation_surface_clarification(
+            "Build a static HTML page that refreshes every 10 seconds and shows the latest papers.",
+            None,
+            &all_actions,
+            None,
+            Some(&creation_surface),
+            true,
+            false,
+        )
+        .expect("creation surface clarification");
+
+        assert!(clarification.should_clarify);
+        assert!(clarification
+            .clarification_question
+            .as_deref()
+            .unwrap_or_default()
+            .contains("isolated AgentArk app"));
+        assert_eq!(clarification.choices.len(), 2);
+    }
+
+    #[test]
+    fn explicit_workspace_surface_selection_skips_creation_clarification() {
+        let all_actions = vec![
+            action(
+                "app_deploy",
+                "Build, run, and deploy an isolated application.",
+            ),
+            action(
+                "file_write",
+                "Build or update files in the workspace for a software project.",
+            ),
+        ];
+        let shape = RequestShapeAssessment {
+            shape: "app".to_string(),
+            execution_mode: "immediate".to_string(),
+            workspace_modification_request: true,
+            ..Default::default()
+        };
+        let selection = ActionSelectionAssessment {
+            needed_actions: vec!["file_write".to_string()],
+            should_clarify: false,
+            clarification_question: None,
+            choices: Vec::new(),
+            reasoning: "The request clearly asks for files only.".to_string(),
+        };
+
+        assert!(maybe_synthesize_creation_surface_clarification(
+            "Create the project files only in the workspace. Do not run anything yet.",
+            Some(&shape),
+            &all_actions,
+            Some(&selection),
+            None,
+            true,
+            false,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn explicit_app_surface_selection_skips_creation_clarification() {
+        let all_actions = vec![
+            action(
+                "app_deploy",
+                "Build, run, and deploy an isolated application.",
+            ),
+            action(
+                "file_write",
+                "Build or update files in the workspace for a software project.",
+            ),
+        ];
+        let shape = RequestShapeAssessment {
+            shape: "app".to_string(),
+            execution_mode: "immediate".to_string(),
+            workspace_modification_request: true,
+            ..Default::default()
+        };
+        let selection = ActionSelectionAssessment {
+            needed_actions: vec!["app_deploy".to_string()],
+            should_clarify: false,
+            clarification_question: None,
+            choices: Vec::new(),
+            reasoning: "The request clearly asks for a running deployed app.".to_string(),
+        };
+
+        assert!(maybe_synthesize_creation_surface_clarification(
+            "Build and deploy this as a running app.",
+            Some(&shape),
+            &all_actions,
+            Some(&selection),
+            None,
+            true,
+            false,
+        )
+        .is_none());
+    }
+
+    #[test]
     fn freshness_guardrail_only_limits_conversation_like_live_requests() {
         let live_question = RequestShapeAssessment {
             shape: "inspection".to_string(),
@@ -51617,12 +54710,34 @@ Research report: India AI research capacity | 4 sources";
             ..Default::default()
         };
 
-        assert!(should_limit_actions_to_public_freshness_grounding(Some(
-            &live_question
-        )));
-        assert!(!should_limit_actions_to_public_freshness_grounding(Some(
-            &live_task
-        )));
+        assert!(should_limit_actions_to_public_freshness_grounding(
+            Some(&live_question),
+            None,
+        ));
+        assert!(!should_limit_actions_to_public_freshness_grounding(
+            Some(&live_task),
+            None,
+        ));
+    }
+
+    #[test]
+    fn freshness_guardrail_stands_down_for_creation_surface_execution() {
+        let live_question = RequestShapeAssessment {
+            shape: "conversation".to_string(),
+            execution_mode: "none".to_string(),
+            public_freshness_required: true,
+            ..Default::default()
+        };
+        let creation_surface = CreationSurfaceAssessment {
+            surface: CreationSurfaceKind::Workspace,
+            reasoning: "This is a software creation request that also needs current data."
+                .to_string(),
+        };
+
+        assert!(!should_limit_actions_to_public_freshness_grounding(
+            Some(&live_question),
+            Some(&creation_surface),
+        ));
     }
 
     #[test]
@@ -51689,32 +54804,42 @@ Research report: India AI research capacity | 4 sources";
     }
 
     #[test]
-    fn user_facing_chat_flows_use_full_action_catalog() {
+    fn user_facing_chat_flows_use_full_action_catalog_for_non_simple_turns() {
         let mut direct_chat = RequestExecutionHints::default();
         direct_chat.execution_surface = ActionExecutionSurface::Chat;
         direct_chat.direct_user_intent = true;
 
         assert!(should_expose_full_action_catalog_for_turn(
             "web_chat",
-            &direct_chat
+            &direct_chat,
+            false
         ));
         assert!(should_expose_full_action_catalog_for_turn(
             "cli_chat",
-            &direct_chat
+            &direct_chat,
+            false
         ));
         assert!(should_expose_full_action_catalog_for_turn(
             "external_chat",
-            &direct_chat
+            &direct_chat,
+            false
+        ));
+        assert!(!should_expose_full_action_catalog_for_turn(
+            "web_chat",
+            &direct_chat,
+            true
         ));
 
         let default_hints = RequestExecutionHints::default();
         assert!(!should_expose_full_action_catalog_for_turn(
             "external_chat",
-            &default_hints
+            &default_hints,
+            false
         ));
         assert!(!should_expose_full_action_catalog_for_turn(
             "chat",
-            &default_hints
+            &default_hints,
+            false
         ));
         let trusted_hints = RequestExecutionHints {
             caller_principal: Some(ActionCallerPrincipal::local_admin("test")),
@@ -51722,23 +54847,33 @@ Research report: India AI research capacity | 4 sources";
         };
         assert!(should_expose_full_action_catalog_for_turn(
             "external_chat",
-            &trusted_hints
+            &trusted_hints,
+            false
         ));
         assert!(should_expose_full_action_catalog_for_turn(
             "chat",
-            &trusted_hints
+            &trusted_hints,
+            false
+        ));
+        assert!(!should_expose_full_action_catalog_for_turn(
+            "chat",
+            &trusted_hints,
+            true
         ));
         assert!(!should_expose_full_action_catalog_for_turn(
             "autonomy",
-            &trusted_hints
+            &trusted_hints,
+            false
         ));
         assert!(!should_expose_full_action_catalog_for_turn(
             "background",
-            &trusted_hints
+            &trusted_hints,
+            false
         ));
         assert!(!should_expose_full_action_catalog_for_turn(
             "autonomy",
-            &direct_chat
+            &direct_chat,
+            false
         ));
     }
 
@@ -51837,6 +54972,107 @@ Research report: India AI research capacity | 4 sources";
     }
 
     #[test]
+    fn conversation_only_request_shape_still_runs_action_selector_for_recovery() {
+        let conversation_shape = RequestShapeAssessment {
+            shape: "conversation".to_string(),
+            execution_mode: "none".to_string(),
+            confidence: 0.93,
+            ..Default::default()
+        };
+
+        assert!(request_shape_is_conversation_only(Some(
+            &conversation_shape
+        )));
+        assert!(!should_run_self_memory_lookup_classifier(Some(
+            &conversation_shape
+        )));
+        assert!(should_run_action_selection_classifier(Some(
+            &conversation_shape
+        )));
+    }
+
+    #[test]
+    fn non_conversation_only_request_keeps_semantic_classifiers() {
+        let low_confidence_conversation = RequestShapeAssessment {
+            shape: "conversation".to_string(),
+            execution_mode: "none".to_string(),
+            confidence: 0.42,
+            ..Default::default()
+        };
+        let inspection_shape = RequestShapeAssessment {
+            shape: "inspection".to_string(),
+            execution_mode: "none".to_string(),
+            confidence: 0.91,
+            ..Default::default()
+        };
+        let unknown_shape = RequestShapeAssessment {
+            shape: "unknown".to_string(),
+            execution_mode: "none".to_string(),
+            confidence: 0.63,
+            ..Default::default()
+        };
+        let product_help_shape = RequestShapeAssessment {
+            shape: "conversation".to_string(),
+            execution_mode: "none".to_string(),
+            confidence: 0.92,
+            product_help: true,
+            help_topics: vec!["deploy".to_string()],
+            ..Default::default()
+        };
+        let preferred_action_shape = RequestShapeAssessment {
+            shape: "conversation".to_string(),
+            execution_mode: "none".to_string(),
+            confidence: 0.94,
+            preferred_actions: vec!["research".to_string()],
+            ..Default::default()
+        };
+
+        assert!(!request_shape_is_conversation_only(Some(
+            &low_confidence_conversation
+        )));
+        assert!(!should_run_self_memory_lookup_classifier(Some(
+            &low_confidence_conversation
+        )));
+        assert!(should_run_action_selection_classifier(Some(
+            &low_confidence_conversation
+        )));
+
+        assert!(!request_shape_is_conversation_only(Some(&inspection_shape)));
+        assert!(should_run_self_memory_lookup_classifier(Some(
+            &inspection_shape
+        )));
+        assert!(should_run_action_selection_classifier(Some(
+            &inspection_shape
+        )));
+
+        assert!(!request_shape_is_conversation_only(Some(&unknown_shape)));
+        assert!(should_run_self_memory_lookup_classifier(Some(
+            &unknown_shape
+        )));
+        assert!(should_run_action_selection_classifier(Some(&unknown_shape)));
+
+        assert!(!request_shape_is_conversation_only(Some(
+            &product_help_shape
+        )));
+        assert!(!should_run_self_memory_lookup_classifier(Some(
+            &product_help_shape
+        )));
+        assert!(should_run_action_selection_classifier(Some(
+            &product_help_shape
+        )));
+
+        assert!(!request_shape_is_conversation_only(Some(
+            &preferred_action_shape
+        )));
+        assert!(!should_run_self_memory_lookup_classifier(Some(
+            &preferred_action_shape
+        )));
+        assert!(should_run_action_selection_classifier(Some(
+            &preferred_action_shape
+        )));
+    }
+
+    #[test]
     fn simple_request_tool_shortlist_clears_general_chat_tools() {
         let mut selected = vec![
             action("web_search", "Search the web"),
@@ -51848,10 +55084,43 @@ Research report: India AI research capacity | 4 sources";
             action("app_deploy", "Deploy an app"),
         ];
 
-        let profile = limit_actions_for_simple_request(&mut selected, &all_actions, false, false);
+        let profile =
+            limit_actions_for_simple_request(&mut selected, &all_actions, false, false, false);
 
         assert_eq!(profile, "simple_chat");
         assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn simple_interactive_recovery_shortlist_keeps_metadata_matched_execution_tools() {
+        let mut selected = vec![action("schedule_task", "Schedule work")];
+        let all_actions = vec![
+            action("schedule_task", "Schedule work"),
+            action("app_deploy", "Deploy an app"),
+            action("file_write", "Write files"),
+            action("file_read", "Read files"),
+            action("web_search", "Search the web"),
+            action("research", "Research the web deeply"),
+            action("code_execute", "Run arbitrary code"),
+        ];
+
+        let profile =
+            limit_actions_for_simple_request(&mut selected, &all_actions, false, false, true);
+
+        assert_eq!(profile, "simple_interactive_recovery");
+        assert_eq!(
+            selected
+                .iter()
+                .map(|action| action.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "app_deploy",
+                "file_write",
+                "file_read",
+                "schedule_task",
+                "web_search",
+            ]
+        );
     }
 
     #[test]
@@ -51863,8 +55132,13 @@ Research report: India AI research capacity | 4 sources";
         ];
 
         let mut default_selected = vec![action("app_deploy", "Deploy an app")];
-        let default_profile =
-            limit_actions_for_simple_request(&mut default_selected, &all_actions, true, false);
+        let default_profile = limit_actions_for_simple_request(
+            &mut default_selected,
+            &all_actions,
+            true,
+            false,
+            false,
+        );
         assert_eq!(default_profile, "simple_freshness");
         assert_eq!(
             default_selected
@@ -51875,8 +55149,13 @@ Research report: India AI research capacity | 4 sources";
         );
 
         let mut research_selected = vec![action("app_deploy", "Deploy an app")];
-        let research_profile =
-            limit_actions_for_simple_request(&mut research_selected, &all_actions, true, true);
+        let research_profile = limit_actions_for_simple_request(
+            &mut research_selected,
+            &all_actions,
+            true,
+            true,
+            false,
+        );
         assert_eq!(research_profile, "simple_freshness");
         assert_eq!(
             research_selected
@@ -51884,6 +55163,82 @@ Research report: India AI research capacity | 4 sources";
                 .map(|action| action.name.as_str())
                 .collect::<Vec<_>>(),
             vec!["web_search", "research"]
+        );
+    }
+
+    #[test]
+    fn simple_freshness_tool_shortlist_uses_public_freshness_metadata_not_fixed_names() {
+        let all_actions = vec![
+            action_with_capabilities(
+                "custom_public_search",
+                "Search a public knowledge source.",
+                &["search"],
+            ),
+            action_with_capabilities(
+                "custom_public_research",
+                "Deep public research over multiple sources.",
+                &["research"],
+            ),
+            action("app_deploy", "Deploy an app"),
+        ];
+
+        let mut default_selected = vec![action("app_deploy", "Deploy an app")];
+        let default_profile = limit_actions_for_simple_request(
+            &mut default_selected,
+            &all_actions,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(default_profile, "simple_freshness");
+        assert_eq!(
+            default_selected
+                .iter()
+                .map(|action| action.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["custom_public_search"]
+        );
+
+        let mut research_selected = vec![action("app_deploy", "Deploy an app")];
+        let research_profile = limit_actions_for_simple_request(
+            &mut research_selected,
+            &all_actions,
+            true,
+            true,
+            false,
+        );
+        assert_eq!(research_profile, "simple_freshness");
+        assert_eq!(
+            research_selected
+                .iter()
+                .map(|action| action.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["custom_public_search", "custom_public_research"]
+        );
+    }
+
+    #[test]
+    fn simple_freshness_tool_shortlist_keeps_research_when_no_faster_grounding_exists() {
+        let all_actions = vec![
+            action_with_capabilities(
+                "custom_public_research",
+                "Deep public research over multiple sources.",
+                &["research"],
+            ),
+            action("app_deploy", "Deploy an app"),
+        ];
+        let mut selected = vec![action("app_deploy", "Deploy an app")];
+
+        let profile =
+            limit_actions_for_simple_request(&mut selected, &all_actions, true, false, false);
+
+        assert_eq!(profile, "simple_freshness");
+        assert_eq!(
+            selected
+                .iter()
+                .map(|action| action.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["custom_public_research"]
         );
     }
 

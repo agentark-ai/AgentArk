@@ -80,7 +80,10 @@ pub async fn dispatch_pack_channel_with_overlay(
         .content_type
         .clone()
         .unwrap_or_else(|| "application/json".to_string());
-    let json_body = content_type.trim().to_ascii_lowercase().starts_with("application/json");
+    let json_body = content_type
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("application/json");
 
     let rendered_url = render_template(
         &send_spec.url_template,
@@ -93,8 +96,7 @@ pub async fn dispatch_pack_channel_with_overlay(
         // escaping would mangle urls, so we switch it off on the url path.
         TemplateEscape::None,
     )?;
-    let mut url =
-        reqwest::Url::parse(&rendered_url).context("Rendered channel URL is invalid")?;
+    let mut url = reqwest::Url::parse(&rendered_url).context("Rendered channel URL is invalid")?;
     if let Some(overlay) = auth_overlay {
         overlay.apply_to_url(&mut url);
     }
@@ -213,7 +215,11 @@ fn contains_opaque_literal_secret(raw: &str) -> bool {
     }) {
         let token = token.trim_matches('.');
         if token.chars().count() >= 20
-            && token.chars().filter(|ch| ch.is_ascii_alphanumeric()).count() >= 16
+            && token
+                .chars()
+                .filter(|ch| ch.is_ascii_alphanumeric())
+                .count()
+                >= 16
             && shannon_entropy_bits_per_char(token) >= 3.5
         {
             return true;
@@ -243,7 +249,10 @@ fn shannon_entropy_bits_per_char(value: &str) -> f64 {
 pub fn validate_channel_url_static(url: &reqwest::Url) -> Result<()> {
     match url.scheme() {
         "http" | "https" => {}
-        other => bail!("Unsupported channel URL scheme '{}'. Use http or https.", other),
+        other => bail!(
+            "Unsupported channel URL scheme '{}'. Use http or https.",
+            other
+        ),
     }
     let host = url
         .host_str()
@@ -303,7 +312,12 @@ fn channel_ip_is_public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(addr) => {
             let [a, b, c, d] = addr.octets();
-            if a == 0 || a == 10 || a == 127 || a >= 224 || (a == 255 && b == 255 && c == 255 && d == 255) {
+            if a == 0
+                || a == 10
+                || a == 127
+                || a >= 224
+                || (a == 255 && b == 255 && c == 255 && d == 255)
+            {
                 return false;
             }
             if a == 100 && (64..=127).contains(&b) {
@@ -431,10 +445,7 @@ fn rewrite_auth_binding_secret_refs(
     }
 }
 
-fn map_secret_key(
-    key: &str,
-    mapping: &std::collections::BTreeMap<String, String>,
-) -> String {
+fn map_secret_key(key: &str, mapping: &std::collections::BTreeMap<String, String>) -> String {
     let trimmed = key.trim();
     mapping
         .get(trimmed)
@@ -505,7 +516,10 @@ fn push_unique(out: &mut Vec<String>, value: &str) {
     }
 }
 
-fn apply_content_type(builder: reqwest::RequestBuilder, content_type: &str) -> reqwest::RequestBuilder {
+fn apply_content_type(
+    builder: reqwest::RequestBuilder,
+    content_type: &str,
+) -> reqwest::RequestBuilder {
     builder.header(reqwest::header::CONTENT_TYPE, content_type)
 }
 
@@ -548,12 +562,7 @@ fn apply_auth_binding(
             name,
             value_template,
         } => {
-            let value = render_template(
-                value_template,
-                inputs,
-                secrets,
-                TemplateEscape::None,
-            )?;
+            let value = render_template(value_template, inputs, secrets, TemplateEscape::None)?;
             Ok(builder.header(name.trim(), value))
         }
         AuthTransportBinding::Basic {
@@ -568,12 +577,7 @@ fn apply_auth_binding(
             name,
             value_template,
         } => {
-            let value = render_template(
-                value_template,
-                inputs,
-                secrets,
-                TemplateEscape::None,
-            )?;
+            let value = render_template(value_template, inputs, secrets, TemplateEscape::None)?;
             Ok(builder.query(&[(name.trim(), value.as_str())]))
         }
     }
@@ -836,12 +840,12 @@ mod tests {
             text: "a \"quoted\" thing",
             ..DispatchInputs::default()
         };
-        let plain = render_template("{{text}}", &inputs, &cfg, TemplateEscape::None)
-            .expect("render");
+        let plain =
+            render_template("{{text}}", &inputs, &cfg, TemplateEscape::None).expect("render");
         assert!(plain.contains('"'));
 
-        let escaped = render_template("{{safe:text}}", &inputs, &cfg, TemplateEscape::None)
-            .expect("render");
+        let escaped =
+            render_template("{{safe:text}}", &inputs, &cfg, TemplateEscape::None).expect("render");
         assert!(!escaped.contains('"'));
         assert!(escaped.contains("\\\""));
     }

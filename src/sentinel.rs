@@ -33,6 +33,7 @@ const MAINTENANCE_DEFER_MINUTES: i64 = 10;
 const MAINTENANCE_MAX_DEFERS: u32 = 3;
 const PULSE_DEFER_MINUTES: i64 = 5;
 const PULSE_MAX_DEFERS: u32 = 3;
+const SENTINEL_STARTUP_SETTLE_SECS: u64 = 120;
 const PULSE_STARTUP_SETTLE_SECS: u64 = 60;
 const AUTO_ANALYSIS_STAGGER_SECS: u64 = 5 * 60;
 static PULSE_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -100,6 +101,70 @@ struct PulseRunGuard;
 impl Drop for PulseRunGuard {
     fn drop(&mut self) {
         PULSE_RUNNING.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pulse_target_app_id_extracts_supported_target_forms() {
+        assert_eq!(
+            pulse_target_app_id("app:cad20c5e").as_deref(),
+            Some("cad20c5e")
+        );
+        assert_eq!(
+            pulse_target_app_id("/apps/cad20c5e/health").as_deref(),
+            Some("cad20c5e")
+        );
+        assert_eq!(
+            pulse_target_app_id("http://127.0.0.1:8990/api/apps/cad20c5e/restart").as_deref(),
+            Some("cad20c5e")
+        );
+        assert_eq!(pulse_target_app_id("/health"), None);
+    }
+
+    #[test]
+    fn pulse_event_app_ids_collect_snapshot_and_doctor_refs() {
+        let event = PulseEvent {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            status: "error".to_string(),
+            message: "stale app".to_string(),
+            summary: String::new(),
+            flags: vec![],
+            overdue_tasks: 0,
+            failed_tasks: 0,
+            details: PulseDetails {
+                deployed_apps: vec![AppPulseInfo {
+                    id: "cad20c5e".to_string(),
+                    title: "arXiv".to_string(),
+                    is_static: true,
+                    process_alive: false,
+                    requests_since_last_check: 0,
+                    idle_hours: 0,
+                }],
+                doctor_findings: vec![DoctorFinding {
+                    severity: "high".to_string(),
+                    category: "app".to_string(),
+                    target: "/apps/becf46bb/".to_string(),
+                    title: "Restart app".to_string(),
+                    evidence: String::new(),
+                    root_cause: String::new(),
+                    fix_command: "POST /api/apps/becf46bb/restart".to_string(),
+                    remediation: Some(DoctorRemediationSpec::AppRestart {
+                        app_id: "becf46bb".to_string(),
+                    }),
+                    user_actionable: true,
+                }],
+                ..PulseDetails::default()
+            },
+        };
+
+        let ids = pulse_event_app_ids(&event);
+        assert!(ids.contains("cad20c5e"));
+        assert!(ids.contains("becf46bb"));
+        assert_eq!(ids.len(), 2);
     }
 }
 
@@ -258,6 +323,22 @@ async fn run_with_busy_deferral<F, Fut>(
     }
 }
 
+async fn run_loop_with_timeout<F>(label: &str, future: F)
+where
+    F: Future<Output = ()>,
+{
+    if tokio::time::timeout(Duration::from_secs(*SENTINEL_JOB_TIMEOUT_SECS), future)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            "ArkSentinel: {} loop timed out after {}s",
+            label,
+            *SENTINEL_JOB_TIMEOUT_SECS
+        );
+    }
+}
+
 /// A single ArkPulse event for the UI log
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PulseEvent {
@@ -367,12 +448,25 @@ const KNOWLEDGE_DOCUMENT_CHUNK_WARN_THRESHOLD: u64 = 25_000;
 const KNOWLEDGE_DOCUMENT_CHUNK_HIGH_THRESHOLD: u64 = 100_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorReadonlyInvestigationTopic {
+    MemoryCaptureHealth,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DoctorRemediationSpec {
     TunnelStartVerify,
     TunnelRestartVerify,
-    AppRestart { app_id: String },
-    ShellCommand { command: String },
+    AppRestart {
+        app_id: String,
+    },
+    ShellCommand {
+        command: String,
+    },
+    ReadonlyInvestigation {
+        topic: DoctorReadonlyInvestigationTopic,
+    },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -734,6 +828,172 @@ fn prune_pulse_events(mut events: Vec<PulseEvent>) -> Vec<PulseEvent> {
         events.drain(0..events.len() - MAX_PULSE_EVENTS);
     }
     events
+}
+
+fn pulse_path_references_app(path: &str, app_id: &str) -> bool {
+    let segments: Vec<&str> = path
+        .trim()
+        .trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    match segments.as_slice() {
+        ["apps", id, ..] => *id == app_id,
+        ["api", "apps", id, ..] => *id == app_id,
+        _ => false,
+    }
+}
+
+fn pulse_target_app_id(target: &str) -> Option<String> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(id) = trimmed.strip_prefix("app:") {
+        let id = id.trim();
+        return (!id.is_empty()).then(|| id.to_string());
+    }
+    if let Ok(url) = url::Url::parse(trimmed) {
+        return match url
+            .path()
+            .trim()
+            .trim_matches('/')
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            ["apps", id, ..] => Some((*id).to_string()),
+            ["api", "apps", id, ..] => Some((*id).to_string()),
+            _ => None,
+        };
+    }
+    match trimmed
+        .trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        ["apps", id, ..] => Some((*id).to_string()),
+        ["api", "apps", id, ..] => Some((*id).to_string()),
+        _ => None,
+    }
+}
+
+fn pulse_target_references_app(target: &str, app_id: &str) -> bool {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if let Some(id) = trimmed.strip_prefix("app:") {
+        return id == app_id;
+    }
+    if let Ok(url) = url::Url::parse(trimmed) {
+        return pulse_path_references_app(url.path(), app_id);
+    }
+    pulse_path_references_app(trimmed, app_id)
+}
+
+fn doctor_finding_references_app(finding: &DoctorFinding, app_id: &str) -> bool {
+    matches!(
+        finding.remediation.as_ref(),
+        Some(DoctorRemediationSpec::AppRestart { app_id: target_app_id }) if target_app_id == app_id
+    ) || pulse_target_references_app(&finding.target, app_id)
+}
+
+fn doctor_finding_app_ids(finding: &DoctorFinding) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    if let Some(DoctorRemediationSpec::AppRestart { app_id }) = finding.remediation.as_ref() {
+        let trimmed = app_id.trim();
+        if !trimmed.is_empty() {
+            ids.insert(trimmed.to_string());
+        }
+    }
+    if let Some(target_app_id) = pulse_target_app_id(&finding.target) {
+        ids.insert(target_app_id);
+    }
+    ids
+}
+
+fn pulse_event_app_ids(event: &PulseEvent) -> HashSet<String> {
+    let mut ids = event
+        .details
+        .deployed_apps
+        .iter()
+        .map(|app| app.id.trim())
+        .filter(|app_id| !app_id.is_empty())
+        .map(|app_id| app_id.to_string())
+        .collect::<HashSet<_>>();
+    for finding in &event.details.doctor_findings {
+        ids.extend(doctor_finding_app_ids(finding));
+    }
+    ids
+}
+
+fn pulse_event_references_app(event: &PulseEvent, app_id: &str) -> bool {
+    pulse_event_app_ids(event).contains(app_id)
+        || event
+            .details
+            .doctor_findings
+            .iter()
+            .any(|finding| doctor_finding_references_app(finding, app_id))
+}
+
+#[derive(Debug, Default)]
+pub struct StalePulseAppReferenceReport {
+    pub event_ids: Vec<String>,
+    pub missing_app_ids: HashSet<String>,
+}
+
+pub async fn delete_app_referenced_pulse_events(
+    storage: &crate::storage::Storage,
+    app_id: &str,
+) -> anyhow::Result<u64> {
+    let trimmed = app_id.trim();
+    if trimmed.is_empty() {
+        return Ok(0);
+    }
+    let rows = storage
+        .list_arkpulse_events(MAX_PULSE_EVENTS as u64)
+        .await?;
+    let matching_ids = rows
+        .into_iter()
+        .filter_map(|row| {
+            let event = pulse_event_from_row(row.clone())?;
+            pulse_event_references_app(&event, trimmed).then_some(row.id)
+        })
+        .collect::<Vec<_>>();
+    storage.delete_arkpulse_events_by_ids(&matching_ids).await
+}
+
+pub async fn find_stale_app_references_in_pulse_events(
+    storage: &crate::storage::Storage,
+    live_app_ids: &HashSet<String>,
+) -> anyhow::Result<StalePulseAppReferenceReport> {
+    let rows = storage
+        .list_arkpulse_events(MAX_PULSE_EVENTS as u64)
+        .await?;
+    let mut report = StalePulseAppReferenceReport::default();
+    for row in rows {
+        let Some(event) = pulse_event_from_row(row.clone()) else {
+            continue;
+        };
+        let referenced_app_ids = pulse_event_app_ids(&event);
+        if referenced_app_ids.is_empty() {
+            continue;
+        }
+        let missing_app_ids = referenced_app_ids
+            .into_iter()
+            .filter(|app_id| !live_app_ids.contains(app_id))
+            .collect::<HashSet<_>>();
+        if missing_app_ids.is_empty() {
+            continue;
+        }
+        report.event_ids.push(row.id);
+        report.missing_app_ids.extend(missing_app_ids);
+    }
+    Ok(report)
 }
 
 #[derive(Debug, Clone)]
@@ -2352,7 +2612,10 @@ async fn run_data_safety_checks(
                 "Failed memory captures detected",
                 format!("{} memory capture event(s) are in failed state", count),
                 "Some user facts may be missing from ArkMemory until the capture pipeline is reviewed.",
-                "Inspect memory_capture_events and capture model health".to_string(),
+                "Review failed memory captures and model health".to_string(),
+                DoctorRemediationSpec::ReadonlyInvestigation {
+                    topic: DoctorReadonlyInvestigationTopic::MemoryCaptureHealth,
+                },
             );
         }
         Ok(_) => {}
@@ -3082,14 +3345,23 @@ pub fn start(
         let agent = agent.clone();
         let mut shutdown = shutdown_rx.clone();
         crate::spawn_logged!("src/sentinel.rs:2928", async move {
+            if !sleep_or_shutdown(
+                std::time::Duration::from_secs(SENTINEL_STARTUP_SETTLE_SECS),
+                &mut shutdown,
+            )
+            .await
+            {
+                return;
+            }
             let mut interval =
                 tokio::time::interval(std::time::Duration::from_secs(config.scheduler_interval));
+            interval.tick().await;
             loop {
                 if !tick_or_shutdown(&mut interval, &mut shutdown).await {
                     break;
                 }
                 record_loop_heartbeat(&agent, SENTINEL_SCHEDULER_HEARTBEAT_KEY).await;
-                run_scheduler(&agent).await;
+                run_loop_with_timeout("scheduler", run_scheduler(&agent)).await;
             }
         })
     });
@@ -3099,6 +3371,14 @@ pub fn start(
         let agent = agent.clone();
         let mut shutdown = shutdown_rx.clone();
         crate::spawn_logged!("src/sentinel.rs:2948", async move {
+            if !sleep_or_shutdown(
+                std::time::Duration::from_secs(SENTINEL_STARTUP_SETTLE_SECS),
+                &mut shutdown,
+            )
+            .await
+            {
+                return;
+            }
             let max_sleep = Duration::from_secs(config.watcher_interval.max(1));
             loop {
                 record_loop_heartbeat(&agent, SENTINEL_WATCHER_HEARTBEAT_KEY).await;
@@ -3108,7 +3388,7 @@ pub fn start(
                 };
                 let autonomy_paused = is_agent_autonomy_paused(&agent).await;
                 if !autonomy_paused {
-                    run_watchers(&agent).await;
+                    run_loop_with_timeout("watchers", run_watchers(&agent)).await;
                 }
                 let sleep_for = if autonomy_paused {
                     max_sleep.min(Duration::from_secs(60))
@@ -3555,10 +3835,8 @@ async fn run_scheduler(agent: &SharedAgent) {
     let autonomy_paused = is_agent_autonomy_paused(agent).await;
     maybe_emit_autonomy_pause_nudge(agent, autonomy_paused).await;
 
-    let due_tasks = {
-        let agent = agent.read().await;
-        agent.take_due_tasks(autonomy_paused).await
-    };
+    let agent_snapshot = Agent::snapshot(agent).await;
+    let due_tasks = agent_snapshot.take_due_tasks(autonomy_paused).await;
 
     if autonomy_paused && due_tasks.is_empty() {
         tracing::debug!("ArkSentinel: scheduler paused for non-reminder tasks");
@@ -3648,6 +3926,7 @@ async fn run_watchers(agent: &SharedAgent) {
         tracing::debug!("ArkSentinel: watchers skipped (agent paused)");
         return;
     }
+    let agent_snapshot = Agent::snapshot(agent).await;
     let (watcher_manager, background_sessions, runtime, notification_store) = {
         let agent_guard = agent.read().await;
         (
@@ -3682,8 +3961,7 @@ async fn run_watchers(agent: &SharedAgent) {
         .await;
         if !w.notify_channel.is_empty() {
             if !w.notify_channel.eq_ignore_ascii_case("web") {
-                let agent = agent.read().await;
-                let outcome = agent
+                let outcome = agent_snapshot
                     .try_send_notification_reported(&w.notify_channel, &msg)
                     .await;
                 persist_watcher_notification_attempt(
@@ -3697,8 +3975,7 @@ async fn run_watchers(agent: &SharedAgent) {
                 .await;
             }
         } else {
-            let agent = agent.read().await;
-            for outcome in agent.notify_preferred_channel_reported(&msg).await {
+            for outcome in agent_snapshot.notify_preferred_channel_reported(&msg).await {
                 if outcome.channel.eq_ignore_ascii_case("web") {
                     continue;
                 }
@@ -3713,8 +3990,7 @@ async fn run_watchers(agent: &SharedAgent) {
                 .await;
             }
         }
-        let agent = agent.read().await;
-        agent
+        agent_snapshot
             .sync_watcher_supervisor_state(w, Some("timed_out"), None)
             .await;
     }
@@ -3803,8 +4079,7 @@ async fn run_watchers(agent: &SharedAgent) {
                         }
                     }
                 } else {
-                    let agent = agent.read().await;
-                    match agent
+                    match agent_snapshot
                         .evaluate_watcher_condition(
                             &watcher.description,
                             &watcher.condition,
@@ -3844,11 +4119,8 @@ async fn run_watchers(agent: &SharedAgent) {
                         .mark_triggered(watcher.id, trigger_result.clone())
                         .await;
 
-                    let followup_worker = {
-                        let agent_guard = agent.read().await;
-                        agent_guard.watcher_followup_worker()
-                    };
-                    let agent = Arc::clone(agent);
+                    let followup_worker = agent_snapshot.watcher_followup_worker();
+                    let followup_agent = agent_snapshot.clone();
                     let permits = Arc::clone(&WATCHER_TRIGGER_PERMITS);
                     crate::spawn_logged!("src/sentinel.rs:3645", async move {
                         let Ok(_permit) = permits.acquire_owned().await else {
@@ -3860,8 +4132,7 @@ async fn run_watchers(agent: &SharedAgent) {
                                 let prepared = followup_worker
                                     .prepare_watcher_followup(&watcher, &trigger_result)
                                     .await;
-                                let agent_guard = agent.read().await;
-                                agent_guard
+                                followup_agent
                                     .handle_watcher_trigger_supervised(
                                         watcher,
                                         trigger_result,
@@ -4079,15 +4350,9 @@ async fn run_pattern_induction_job(agent: &SharedAgent) {
 
 async fn run_heuristic_reflection_job(agent: &SharedAgent) {
     let started_at = chrono::Utc::now();
-    let shared_agent = agent.clone();
-    let storage = {
-        let agent = shared_agent.read().await;
-        agent.storage.clone()
-    };
-    let result = {
-        let agent = shared_agent.read().await;
-        agent.run_heuristic_reflection_pass().await
-    };
+    let agent_snapshot = Agent::snapshot(agent).await;
+    let storage = agent_snapshot.storage.clone();
+    let result = agent_snapshot.run_heuristic_reflection_pass().await;
     match result {
         Ok(stats) if stats.changed() => {
             let completed_at = chrono::Utc::now();

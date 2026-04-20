@@ -531,12 +531,15 @@ start_health_watchdog() {
 
     local url=${AGENTARK_SELF_WATCHDOG_URL:-$(default_health_watchdog_url)}
     local interval=${AGENTARK_SELF_WATCHDOG_INTERVAL_SECS:-15}
-    local timeout=${AGENTARK_SELF_WATCHDOG_TIMEOUT_SECS:-5}
-    local max_failures=${AGENTARK_SELF_WATCHDOG_MAX_FAILURES:-3}
-    local initial_delay=${AGENTARK_SELF_WATCHDOG_INITIAL_DELAY_SECS:-30}
+    local timeout=${AGENTARK_SELF_WATCHDOG_TIMEOUT_SECS:-10}
+    local max_failures=${AGENTARK_SELF_WATCHDOG_MAX_FAILURES:-6}
+    local initial_delay=${AGENTARK_SELF_WATCHDOG_INITIAL_DELAY_SECS:-90}
+    local startup_grace=${AGENTARK_SELF_WATCHDOG_STARTUP_GRACE_SECS:-180}
 
     (
         failures=0
+        armed=0
+        startup_deadline=$(( $(date +%s) + startup_grace ))
         sleep "$initial_delay"
         while true; do
             if ! kill -0 "$MAIN_PID" >/dev/null 2>&1; then
@@ -545,7 +548,22 @@ start_health_watchdog() {
 
             if python3 -c "import urllib.request; urllib.request.urlopen('${url}', timeout=${timeout})" >/dev/null 2>&1; then
                 failures=0
+                if [ "$armed" -eq 0 ]; then
+                    armed=1
+                    echo -e "${GREEN}Health watchdog: armed after first successful probe for ${url}.${NC}"
+                fi
             else
+                if [ "$armed" -eq 0 ]; then
+                    now=$(date +%s)
+                    if [ "$now" -lt "$startup_deadline" ]; then
+                        remaining=$(( startup_deadline - now ))
+                        echo -e "${YELLOW}Health watchdog: startup probe failed for ${url}; waiting up to ${remaining}s for first healthy response before counting failures.${NC}"
+                        sleep "$interval"
+                        continue
+                    fi
+                    armed=1
+                    echo -e "${YELLOW}Health watchdog: startup grace expired without a successful probe for ${url}; counting failures now.${NC}"
+                fi
                 failures=$((failures + 1))
                 echo -e "${YELLOW}Health watchdog: local probe failed (${failures}/${max_failures}) for ${url}.${NC}"
             fi

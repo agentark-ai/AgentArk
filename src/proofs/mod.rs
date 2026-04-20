@@ -217,14 +217,14 @@ impl ProofEngine {
 
     /// Save trace to disk
     fn save_trace(&self) -> Result<()> {
-        let content = {
+        let serialized = {
             let trace = self
                 .trace
                 .lock()
                 .map_err(|e| anyhow::anyhow!("Trace lock poisoned: {}", e))?;
-            serde_json::to_string_pretty(&*trace)?
+            serde_json::to_vec(&*trace)?
         };
-        let encrypted = self.trace_encryption_key.encrypt(content.as_bytes())?;
+        let encrypted = self.trace_encryption_key.encrypt(&serialized)?;
         let encrypted_path = self.data_dir.join("execution_trace.enc");
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::task::block_in_place(|| -> Result<()> {

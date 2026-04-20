@@ -117,6 +117,7 @@ const SERVER_BUSY_TASK_WINDOW_SECS: i64 = 20 * 60;
 const MAX_CHAT_MESSAGE_BYTES: usize = 100_000;
 const MAX_HTTP_BODY_BYTES: usize = 2 * 1024 * 1024;
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const CONFIG_MUTATION_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const UI_SESSION_TTL_SECS: i64 = 24 * 60 * 60;
 const UI_SESSION_MAX_TRACKED: usize = 4096;
 const RELEASE_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -154,6 +155,173 @@ fn error_response(status: StatusCode, error: impl ToString) -> Response {
         }),
     )
         .into_response()
+}
+
+async fn acquire_agent_write_for_config_mutation(
+    state: &AppState,
+    operation: &'static str,
+) -> std::result::Result<tokio::sync::OwnedRwLockWriteGuard<Agent>, Response> {
+    match tokio::time::timeout(
+        CONFIG_MUTATION_LOCK_TIMEOUT,
+        state.agent.clone().write_owned(),
+    )
+    .await
+    {
+        Ok(guard) => Ok(guard),
+        Err(_) => Err(error_response(
+            StatusCode::CONFLICT,
+            format!(
+                "Agent is busy with another active run. Retry {} after the current run finishes.",
+                operation
+            ),
+        )),
+    }
+}
+
+async fn save_agent_config_snapshot(
+    config: crate::core::AgentConfig,
+    config_dir: PathBuf,
+    data_dir: PathBuf,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || config.save(&config_dir, Some(data_dir.as_path())))
+        .await
+        .map_err(|error| anyhow::anyhow!("Failed to join config save worker: {}", error))?
+}
+
+async fn load_saved_model_slot_api_key(
+    config_dir: PathBuf,
+    data_dir: PathBuf,
+    previous_slot_id: String,
+    requested_id: String,
+    role: String,
+    label: String,
+) -> Option<String> {
+    match tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+        let secure = crate::core::config::SecureConfigManager::new_with_data_dir(
+            &config_dir,
+            Some(data_dir.as_path()),
+        )?;
+        let secrets = secure.load_secrets()?;
+        Ok(secrets
+            .model_pool_keys
+            .get(previous_slot_id.trim())
+            .cloned()
+            .or_else(|| secrets.model_pool_keys.get(requested_id.trim()).cloned())
+            .or_else(|| secrets.model_pool_keys.get(role.trim()).cloned())
+            .or_else(|| secrets.model_pool_keys.get(label.trim()).cloned()))
+    })
+    .await
+    {
+        Ok(Ok(key)) => key,
+        Ok(Err(error)) => {
+            tracing::warn!("Failed to recover saved model slot key: {}", error);
+            None
+        }
+        Err(error) => {
+            tracing::warn!("Model slot key recovery worker failed: {}", error);
+            None
+        }
+    }
+}
+
+async fn resolve_requested_model_slot_api_key(
+    state: &AppState,
+    requested_id: &str,
+    request: &ModelSlotRequest,
+) -> std::result::Result<Option<String>, Response> {
+    let (
+        previous_slot_id_for_lookup,
+        config_dir_for_lookup,
+        data_dir_for_lookup,
+        can_reuse_existing_key,
+        existing_key_hint,
+    ) = {
+        let agent = state.agent.read().await;
+
+        let slot_idx = resolve_model_slot_index(&agent.config.model_pool.slots, requested_id);
+        let Some(idx) = slot_idx else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "Model slot not found".to_string(),
+                }),
+            )
+                .into_response());
+        };
+
+        let current_slot = agent.config.model_pool.slots[idx].clone();
+        let can_reuse_existing_key = match can_reuse_model_slot_api_key(&current_slot, request) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(
+                    (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response()
+                );
+            }
+        };
+        let existing_key_hint = match &current_slot.provider {
+            LlmProvider::Anthropic { api_key, .. } => Some(api_key.clone()),
+            LlmProvider::OpenAI { api_key, .. } => Some(api_key.clone()),
+            _ => None,
+        };
+
+        (
+            current_slot.id.trim().to_string(),
+            agent.config_dir.clone(),
+            agent.data_dir.clone(),
+            can_reuse_existing_key,
+            existing_key_hint,
+        )
+    };
+
+    if !can_reuse_existing_key {
+        return Ok(None);
+    }
+
+    let existing_key = if matches!(
+        existing_key_hint.as_deref(),
+        None | Some("") | Some("[ENCRYPTED]")
+    ) {
+        load_saved_model_slot_api_key(
+            config_dir_for_lookup,
+            data_dir_for_lookup,
+            previous_slot_id_for_lookup,
+            requested_id.to_string(),
+            request.role.clone(),
+            request.label.clone(),
+        )
+        .await
+        .or(existing_key_hint)
+    } else {
+        existing_key_hint
+    };
+
+    Ok(existing_key)
+}
+
+async fn remove_saved_model_slot_api_keys(
+    config_dir: PathBuf,
+    data_dir: PathBuf,
+    resolved_slot_id: String,
+    requested_id: String,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let manager = crate::core::config::SecureConfigManager::new_with_data_dir(
+            &config_dir,
+            Some(data_dir.as_path()),
+        )?;
+        manager.update_secrets(|secrets| {
+            if !resolved_slot_id.is_empty() {
+                secrets.model_pool_keys.remove(&resolved_slot_id);
+            }
+            if !requested_id.is_empty() && requested_id != resolved_slot_id {
+                secrets.model_pool_keys.remove(&requested_id);
+            }
+            Ok(())
+        })?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("Failed to join model-key cleanup worker: {}", error))?
 }
 
 #[derive(Debug, Clone)]
@@ -1851,6 +2019,8 @@ pub struct ChatResponse {
     pub trace_id: Option<String>,
     pub total_tokens: i64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<crate::core::ClarificationChoice>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub degradation: Vec<crate::core::DegradationNote>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attempted_models: Vec<crate::core::ModelAttemptRecord>,
@@ -2513,6 +2683,13 @@ pub struct ModelSlotRequest {
     pub enabled: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ModelConnectionTestRequest {
+    pub id: Option<String>,
+    #[serde(flatten)]
+    pub request: ModelSlotRequest,
+}
+
 /// Settings update request (for POST)
 #[derive(Debug, Deserialize)]
 pub struct SettingsUpdate {
@@ -3152,6 +3329,13 @@ struct PromptOptimizationReviewEntry {
 
 type PromptOptimizationReviewState = BTreeMap<String, PromptOptimizationReviewEntry>;
 
+#[derive(Debug, Clone, Serialize, Default)]
+struct EvolutionChangePreview {
+    before: Vec<String>,
+    after: Vec<String>,
+    impact_estimate: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct PromptOptimizationProposal {
     id: String,
@@ -3165,6 +3349,7 @@ struct PromptOptimizationProposal {
     review_status: String,
     reviewed_at: Option<String>,
     reversible: bool,
+    change_preview: EvolutionChangePreview,
 }
 
 #[derive(Debug, Serialize)]
@@ -3462,6 +3647,61 @@ async fn load_autonomy_settings_from_storage(
         .flatten()
         .and_then(|raw| serde_json::from_slice::<AutonomySettings>(&raw).ok())
         .unwrap_or_default()
+}
+
+async fn save_autonomy_settings_to_storage(
+    storage: &crate::storage::Storage,
+    settings: &AutonomySettings,
+) -> std::result::Result<(), String> {
+    let raw = serde_json::to_vec(settings).map_err(|e| e.to_string())?;
+    storage
+        .set(crate::core::AUTONOMY_SETTINGS_STORAGE_KEY, &raw)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if crate::core::autonomy::autonomy_background_paused(settings) {
+        let paused_since_missing = match storage
+            .get(crate::core::autonomy::AUTONOMY_PAUSED_SINCE_KEY)
+            .await
+        {
+            Ok(Some(raw)) => String::from_utf8(raw)
+                .ok()
+                .map(|value| value.trim().is_empty())
+                .unwrap_or(true),
+            Ok(None) => true,
+            Err(error) => {
+                tracing::debug!(
+                    "Failed to read autonomy pause state while saving settings: {}",
+                    error
+                );
+                true
+            }
+        };
+        if paused_since_missing {
+            let now = chrono::Utc::now().timestamp().to_string();
+            if let Err(error) = storage
+                .set(
+                    crate::core::autonomy::AUTONOMY_PAUSED_SINCE_KEY,
+                    now.as_bytes(),
+                )
+                .await
+            {
+                tracing::debug!(
+                    "Failed to persist autonomy pause start while saving settings: {}",
+                    error
+                );
+            }
+        }
+    } else {
+        let _ = storage
+            .delete(crate::core::autonomy::AUTONOMY_PAUSED_SINCE_KEY)
+            .await;
+        let _ = storage
+            .delete(crate::core::autonomy::AUTONOMY_PAUSE_NUDGE_LAST_SENT_AT_KEY)
+            .await;
+    }
+
+    Ok(())
 }
 
 fn normalize_chat_suggestion_text(input: &str) -> String {
@@ -4514,6 +4754,7 @@ pub async fn serve(
         // Model pool routes
         .route("/models", get(list_models))
         .route("/models", post(add_model))
+        .route("/models/test", post(test_model_connection))
         .route("/models/{id}", axum::routing::put(update_model))
         .route("/models/{id}", axum::routing::delete(delete_model))
         .route(
@@ -5611,7 +5852,7 @@ async fn web_ui(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    let mut response = if let Some(index_html) = read_frontend_index_html() {
+    let mut response = if let Some(index_html) = read_frontend_index_html().await {
         Html(index_html).into_response()
     } else {
         (
@@ -5661,7 +5902,7 @@ async fn web_ui_v2(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    let mut response = if let Some(index_html) = read_frontend_index_html() {
+    let mut response = if let Some(index_html) = read_frontend_index_html().await {
         Html(index_html).into_response()
     } else {
         (
@@ -6268,6 +6509,7 @@ fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value> {
     );
     add("/models", "GET", "List models", "Models");
     add("/models", "POST", "Add model", "Models");
+    add("/models/test", "POST", "Test model connection", "Models");
     add("/models/{id}", "PUT", "Update model", "Models");
     add("/models/{id}", "DELETE", "Delete model", "Models");
     add(
@@ -7094,8 +7336,12 @@ async fn serve_frontend_asset(Path(path): Path<String>) -> Response {
     let rel = PathBuf::from("assets").join(&path);
     for base in frontend_dist_roots() {
         let file_path = base.join(&rel);
-        if file_path.is_file() {
-            if let Ok(bytes) = std::fs::read(&file_path) {
+        let is_file = tokio::fs::metadata(&file_path)
+            .await
+            .map(|meta| meta.is_file())
+            .unwrap_or(false);
+        if is_file {
+            if let Ok(bytes) = tokio::fs::read(&file_path).await {
                 return (
                     StatusCode::OK,
                     [
@@ -7119,11 +7365,15 @@ fn frontend_dist_roots() -> Vec<PathBuf> {
     ]
 }
 
-fn read_frontend_index_html() -> Option<String> {
+async fn read_frontend_index_html() -> Option<String> {
     for root in frontend_dist_roots() {
         let index = root.join("index.html");
-        if index.is_file() {
-            if let Ok(html) = std::fs::read_to_string(index) {
+        let is_file = tokio::fs::metadata(&index)
+            .await
+            .map(|meta| meta.is_file())
+            .unwrap_or(false);
+        if is_file {
+            if let Ok(html) = tokio::fs::read_to_string(index).await {
                 return Some(html);
             }
         }
@@ -10730,18 +10980,9 @@ async fn delete_app(State(state): State<AppState>, Path(app_id): Path<String>) -
             let agent = state.agent.read().await;
             agent.data_dir().to_path_buf()
         };
-        let fallback = data_dir.join("apps").join(&app_id);
-        if !fallback.exists() {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": "App not found" })),
-            )
-                .into_response();
-        }
-        fallback
+        data_dir.join("apps").join(&app_id)
     };
 
-    let mut executor_deleted_files = false;
     if let Some(executor) = state.executor_client.as_ref() {
         match executor
             .request(
@@ -10751,9 +10992,8 @@ async fn delete_app(State(state): State<AppState>, Path(app_id): Path<String>) -
             .send()
             .await
         {
-            Ok(response) if response.status().is_success() => {
-                executor_deleted_files = true;
-            }
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {}
             Ok(response) => {
                 let status = StatusCode::from_u16(response.status().as_u16())
                     .unwrap_or(StatusCode::BAD_GATEWAY);
@@ -10790,48 +11030,26 @@ async fn delete_app(State(state): State<AppState>, Path(app_id): Path<String>) -
             .into_response();
     }
     match tokio::fs::remove_dir_all(&app_dir).await {
-        Ok(_) => {
-            let _ = state.app_registry.stop(&app_id).await;
-            trigger_arkpulse_after_app_change(&state, "app_delete").await;
-            let deleted_notifications = {
-                let agent = state.agent.read().await;
-                agent
-                    .storage
-                    .delete_app_notifications(&app_id, app_title.as_deref())
-                    .await
-                    .unwrap_or(0)
-            };
-            Json(serde_json::json!({
-                "status": "deleted",
-                "app_id": app_id,
-                "deleted_notifications": deleted_notifications
-            }))
-            .into_response()
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("Failed to delete app files: {}", error) })),
+            )
+                .into_response();
         }
-        Err(error) if executor_deleted_files && error.kind() == std::io::ErrorKind::NotFound => {
-            let _ = state.app_registry.stop(&app_id).await;
-            trigger_arkpulse_after_app_change(&state, "app_delete").await;
-            let deleted_notifications = {
-                let agent = state.agent.read().await;
-                agent
-                    .storage
-                    .delete_app_notifications(&app_id, app_title.as_deref())
-                    .await
-                    .unwrap_or(0)
-            };
-            Json(serde_json::json!({
-                "status": "deleted",
-                "app_id": app_id,
-                "deleted_notifications": deleted_notifications
-            }))
-            .into_response()
-        }
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("Failed to delete app files: {}", error) })),
-        )
-            .into_response(),
     }
+
+    let cleanup = cleanup_deleted_app_references(&state, &app_id, app_title.as_deref()).await;
+    trigger_arkpulse_after_app_change(&state, "app_delete").await;
+    Json(serde_json::json!({
+        "status": "deleted",
+        "app_id": app_id,
+        "deleted_notifications": cleanup.deleted_notifications,
+        "deleted_pulse_events": cleanup.deleted_pulse_events
+    }))
+    .into_response()
 }
 
 /// Upload a file for use in chat (attachments for code execution, analysis, etc.)
@@ -11623,6 +11841,7 @@ async fn resume_run(
                 run_status: processed.run_status,
                 trace_id: processed.trace_id,
                 total_tokens: processed.total_tokens,
+                choices: processed.choices,
                 degradation: processed.degradation,
                 attempted_models: processed.attempted_models,
                 user_outcome: processed.user_outcome,
@@ -13175,10 +13394,14 @@ struct RunArkPulseFixRequest {
     finding_index: Option<usize>,
 }
 
+#[derive(Debug, Clone)]
 enum ArkPulseFixPlan {
     TunnelStartVerify,
     TunnelRestartVerify,
     AppRestart(String),
+    ReadonlyInvestigation {
+        topic: crate::sentinel::DoctorReadonlyInvestigationTopic,
+    },
     ShellOperations {
         app_dir: String,
         operations: Vec<ArkPulseShellOperation>,
@@ -13216,6 +13439,11 @@ fn arkpulse_fix_plan_from_remediation(
             } else {
                 None
             }
+        }
+        crate::sentinel::DoctorRemediationSpec::ReadonlyInvestigation { topic } => {
+            Some(ArkPulseFixPlan::ReadonlyInvestigation {
+                topic: topic.clone(),
+            })
         }
         crate::sentinel::DoctorRemediationSpec::ShellCommand { command } if allow_shell_command => {
             parse_supported_arkpulse_shell_command(command.trim())
@@ -13366,10 +13594,23 @@ fn describe_arkpulse_remediation(
         Some(crate::sentinel::DoctorRemediationSpec::AppRestart { app_id }) => {
             format!("Restart app {} and re-check health", app_id)
         }
+        Some(crate::sentinel::DoctorRemediationSpec::ReadonlyInvestigation { topic }) => {
+            describe_arkpulse_readonly_investigation(topic)
+        }
         Some(crate::sentinel::DoctorRemediationSpec::ShellCommand { command }) => {
             command.trim().to_string()
         }
         None => String::new(),
+    }
+}
+
+fn describe_arkpulse_readonly_investigation(
+    topic: &crate::sentinel::DoctorReadonlyInvestigationTopic,
+) -> String {
+    match topic {
+        crate::sentinel::DoctorReadonlyInvestigationTopic::MemoryCaptureHealth => {
+            "Review failed memory captures and model health".to_string()
+        }
     }
 }
 
@@ -13440,6 +13681,25 @@ fn apply_arkpulse_sanitized_env(command: &mut tokio::process::Command) {
 }
 
 type ArkPulseFixHttpResult = (StatusCode, serde_json::Value);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealSkipReason {
+    MissingOnDisk,
+    CorruptMetadata,
+    ExplicitlyStopped,
+}
+
+enum HealViability {
+    Recoverable,
+    NotRecoverable(HealSkipReason),
+    TransientlyUnknown(String),
+}
+
+#[derive(Default)]
+struct DeletedAppCleanupSummary {
+    deleted_notifications: u64,
+    deleted_pulse_events: u64,
+}
 
 fn arkpulse_error_result(status: StatusCode, error: impl Into<String>) -> ArkPulseFixHttpResult {
     let error = error.into();
@@ -13609,6 +13869,154 @@ async fn run_arkpulse_shell_operations_fix(
     )
 }
 
+async fn lookup_app_title_for_cleanup(state: &AppState, app_id: &str) -> Option<String> {
+    let apps = state.app_registry.list().await;
+    apps.iter()
+        .find(|row| row.get("id").and_then(|value| value.as_str()) == Some(app_id))
+        .and_then(|row| row.get("title").and_then(|value| value.as_str()))
+        .map(|value| value.to_string())
+}
+
+async fn cleanup_deleted_app_references(
+    state: &AppState,
+    app_id: &str,
+    app_title: Option<&str>,
+) -> DeletedAppCleanupSummary {
+    state.app_registry.purge_deleted_app_state(app_id).await;
+    let storage = {
+        let agent = state.agent.read().await;
+        agent.storage.clone()
+    };
+    let deleted_notifications = match storage.delete_app_notifications(app_id, app_title).await {
+        Ok(count) => count,
+        Err(error) => {
+            tracing::warn!(
+                "Failed to delete app notifications while cleaning '{}': {}",
+                app_id,
+                error
+            );
+            0
+        }
+    };
+    let deleted_pulse_events =
+        match crate::sentinel::delete_app_referenced_pulse_events(&storage, app_id).await {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to prune ArkPulse history while cleaning '{}': {}",
+                    app_id,
+                    error
+                );
+                0
+            }
+        };
+    DeletedAppCleanupSummary {
+        deleted_notifications,
+        deleted_pulse_events,
+    }
+}
+
+fn heal_skip_reason_code(reason: HealSkipReason) -> &'static str {
+    match reason {
+        HealSkipReason::MissingOnDisk => "missing_on_disk",
+        HealSkipReason::CorruptMetadata => "corrupt_metadata",
+        HealSkipReason::ExplicitlyStopped => "explicitly_stopped",
+    }
+}
+
+async fn assess_auto_heal_viability(state: &AppState, app_id: &str) -> HealViability {
+    let registry_dir = state.app_registry.get_dir(app_id).await;
+    let app_dir = if let Some(path) = registry_dir {
+        path
+    } else {
+        let data_dir = {
+            let agent = state.agent.read().await;
+            agent.data_dir().to_path_buf()
+        };
+        data_dir.join("apps").join(app_id)
+    };
+    match tokio::fs::metadata(&app_dir).await {
+        Ok(metadata) => {
+            if !metadata.is_dir() {
+                return HealViability::NotRecoverable(HealSkipReason::MissingOnDisk);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return HealViability::NotRecoverable(HealSkipReason::MissingOnDisk);
+        }
+        Err(error) => {
+            return HealViability::TransientlyUnknown(format!(
+                "Could not inspect app directory for {}: {}",
+                app_id, error
+            ));
+        }
+    }
+    if state.app_registry.get_dir(app_id).await.is_some()
+        && !state.app_registry.is_enabled(app_id).await
+    {
+        return HealViability::NotRecoverable(HealSkipReason::ExplicitlyStopped);
+    }
+    match tokio::fs::read(app_dir.join(".app_meta.json")).await {
+        Ok(bytes) => {
+            if serde_json::from_slice::<serde_json::Value>(&bytes).is_err() {
+                return HealViability::NotRecoverable(HealSkipReason::CorruptMetadata);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return HealViability::NotRecoverable(HealSkipReason::CorruptMetadata);
+        }
+        Err(error) => {
+            return HealViability::TransientlyUnknown(format!(
+                "Could not read app metadata for {}: {}",
+                app_id, error
+            ));
+        }
+    }
+    HealViability::Recoverable
+}
+
+fn spawn_arkpulse_app_restart_fix(
+    state: AppState,
+    app_id: String,
+    issue_title: String,
+    target: String,
+    fix_summary: String,
+    event_timestamp: Option<String>,
+    finding_index: Option<usize>,
+) {
+    crate::spawn_logged!("src/channels/http.rs:13879", async move {
+        let started_at = std::time::Instant::now();
+        let result = match tokio::time::timeout(
+            Duration::from_secs(45),
+            run_arkpulse_app_restart_fix(&state, &app_id),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => arkpulse_error_result(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!(
+                    "App restart for {} timed out. ArkPulse aborted the remediation to keep the control plane responsive.",
+                    app_id
+                ),
+            ),
+        };
+        let status = result.0;
+        let body = result.1;
+        let latency_ms = started_at.elapsed().as_millis().min(i64::MAX as u128) as i64;
+        let plan = ArkPulseFixPlan::AppRestart(app_id.clone());
+        let audit = ArkPulseFixAuditDetails {
+            plan: &plan,
+            issue_title: &issue_title,
+            target: &target,
+            fix_summary: &fix_summary,
+            event_timestamp: event_timestamp.as_deref(),
+            finding_index,
+        };
+        persist_arkpulse_fix_audit(&state, &audit, latency_ms, status, &body).await;
+    });
+}
+
 async fn run_arkpulse_app_restart_fix(state: &AppState, app_id: &str) -> ArkPulseFixHttpResult {
     let response = restart_app(State(state.clone()), Path(app_id.to_string())).await;
     let status = response.status();
@@ -13667,11 +14075,191 @@ async fn run_arkpulse_app_restart_fix(state: &AppState, app_id: &str) -> ArkPuls
     )
 }
 
+async fn run_arkpulse_readonly_investigation_fix(
+    state: &AppState,
+    topic: &crate::sentinel::DoctorReadonlyInvestigationTopic,
+) -> ArkPulseFixHttpResult {
+    match topic {
+        crate::sentinel::DoctorReadonlyInvestigationTopic::MemoryCaptureHealth => {
+            let (storage, config) = {
+                let agent = state.agent.read().await;
+                (agent.storage.clone(), agent.config.clone())
+            };
+            let failed_count = match storage
+                .count_memory_capture_events_by_statuses_all_scopes(&["failed"])
+                .await
+            {
+                Ok(count) => count,
+                Err(error) => {
+                    return arkpulse_error_result(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to count memory capture events: {}", error),
+                    )
+                }
+            };
+            let capture_query = crate::storage::ReadonlyTableQuery {
+                table: "memory_capture_events".to_string(),
+                columns: vec![
+                    "id".to_string(),
+                    "status".to_string(),
+                    "capture_kind".to_string(),
+                    "conversation_id".to_string(),
+                    "project_id".to_string(),
+                    "created_at".to_string(),
+                    "updated_at".to_string(),
+                    "next_retry_at".to_string(),
+                    "completed_at".to_string(),
+                ],
+                filters: vec![crate::storage::ReadonlyTableFilter {
+                    column: "status".to_string(),
+                    op: "eq".to_string(),
+                    value: Some(serde_json::json!("failed")),
+                }],
+                order_by: vec![crate::storage::ReadonlyTableSort {
+                    column: "updated_at".to_string(),
+                    direction: Some("desc".to_string()),
+                }],
+                limit: Some(10),
+            };
+            let capture_rows = match storage.query_table_json(&capture_query).await {
+                Ok(payload) => payload
+                    .get("rows")
+                    .and_then(|value| value.as_array())
+                    .cloned()
+                    .unwrap_or_default(),
+                Err(error) => {
+                    return arkpulse_error_result(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to inspect memory capture events: {}", error),
+                    )
+                }
+            };
+            let model_failover = match crate::core::model_failover::ModelFailoverControlPlane::list(
+                &storage,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    return arkpulse_error_result(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to inspect model health: {}", error),
+                    )
+                }
+            };
+            let chat_model_ready = crate::core::chat_model_is_configured(&config);
+            let provider_summary = &model_failover.summary;
+            let provider_issues = model_failover
+                .provider_health
+                .iter()
+                .filter(|record| {
+                    record.disabled
+                        || record.cooldown_until.is_some()
+                        || record.failure_count > 0
+                        || record.last_error.is_some()
+                })
+                .take(3)
+                .map(|record| {
+                    let mut parts = Vec::new();
+                    parts.push(record.provider_id.clone());
+                    if record.disabled {
+                        parts.push("disabled".to_string());
+                    }
+                    if record.cooldown_until.is_some() {
+                        parts.push("cooling".to_string());
+                    }
+                    if record.failure_count > 0 {
+                        parts.push(format!("failures={}", record.failure_count));
+                    }
+                    if let Some(error) = record.last_error.as_deref() {
+                        parts.push(format!("last_error={}", truncate_for_response(error, 120)));
+                    }
+                    parts.join(", ")
+                })
+                .collect::<Vec<_>>();
+            let recent_capture_lines = capture_rows
+                .iter()
+                .take(3)
+                .map(|row| {
+                    let updated_at = row
+                        .get("updated_at")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown time");
+                    let capture_kind = row
+                        .get("capture_kind")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("capture");
+                    let conversation_id = row
+                        .get("conversation_id")
+                        .and_then(|value| value.as_str())
+                        .map(|value| format!("conversation={}", value))
+                        .unwrap_or_else(|| "conversation=global".to_string());
+                    let project_id = row
+                        .get("project_id")
+                        .and_then(|value| value.as_str())
+                        .map(|value| format!("project={}", value))
+                        .unwrap_or_else(|| "project=global".to_string());
+                    format!(
+                        "- {} | {} | {} | {}",
+                        updated_at, capture_kind, conversation_id, project_id
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut output_lines = vec![format!(
+                "Failed memory captures: {} total failed event(s); {} recent row(s) reviewed.",
+                failed_count,
+                capture_rows.len()
+            )];
+            if chat_model_ready {
+                output_lines.push(format!(
+                    "Model health: {} provider(s) tracked, {} disabled, {} cooling.",
+                    provider_summary.providers,
+                    provider_summary.disabled_providers,
+                    provider_summary.cooling_providers
+                ));
+            } else {
+                output_lines.push(
+                    "Model health: no chat-capable model is configured, so memory capture cannot succeed until a model slot is available."
+                        .to_string(),
+                );
+            }
+            if !provider_issues.is_empty() {
+                output_lines.push(format!(
+                    "Providers needing attention: {}.",
+                    provider_issues.join("; ")
+                ));
+            }
+            if !recent_capture_lines.is_empty() {
+                output_lines.push("Recent failed captures:".to_string());
+                output_lines.extend(recent_capture_lines);
+            }
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "status": "ok",
+                    "mode": "readonly_investigation",
+                    "topic": "memory_capture_health",
+                    "message": "ArkPulse diagnostic completed.",
+                    "output": output_lines.join("\n"),
+                    "details": {
+                        "failed_count": failed_count,
+                        "recent_failed_captures": capture_rows,
+                        "chat_model_configured": chat_model_ready,
+                        "model_failover_summary": provider_summary,
+                        "provider_health": model_failover.provider_health,
+                    }
+                }),
+            )
+        }
+    }
+}
+
 fn arkpulse_fix_plan_label(plan: &ArkPulseFixPlan) -> &'static str {
     match plan {
         ArkPulseFixPlan::TunnelStartVerify => "tunnel_start_verify",
         ArkPulseFixPlan::TunnelRestartVerify => "tunnel_restart_verify",
         ArkPulseFixPlan::AppRestart(_) => "app_restart",
+        ArkPulseFixPlan::ReadonlyInvestigation { .. } => "readonly_investigation",
         ArkPulseFixPlan::ShellOperations { .. } => "shell_operations",
     }
 }
@@ -13931,22 +14519,121 @@ async fn run_arkpulse_fix(
         truncate_for_response(&fix_summary, 220)
     );
 
-    let result = match &plan {
-        ArkPulseFixPlan::TunnelStartVerify => {
-            let tunnel_arc = state.tunnel.clone();
-            if let Err(error) = tunnel::spawn_tunnel(&state, None).await {
-                arkpulse_error_result(StatusCode::INTERNAL_SERVER_ERROR, error)
-            } else {
-                let discovered_url = tunnel::wait_for_tunnel_url(tunnel_arc.clone(), 12).await;
-                if let Some(url) = discovered_url.as_ref() {
-                    tunnel::persist_public_tunnel_state(&state, Some(url), None).await;
-                }
+    let audit = ArkPulseFixAuditDetails {
+        plan: &plan,
+        issue_title: &issue_title,
+        target: &target,
+        fix_summary: &fix_summary,
+        event_timestamp: selected_event_timestamp.as_deref(),
+        finding_index: selected_finding_index,
+    };
 
-                let tunnel = tunnel_arc.read().await;
-                let active = tunnel.active;
-                let url = tunnel.url.clone();
-                let message =
-                    if active && url.as_ref().is_some_and(|value| !value.trim().is_empty()) {
+    if let ArkPulseFixPlan::AppRestart(app_id) = &plan {
+        match assess_auto_heal_viability(&state, app_id).await {
+            HealViability::Recoverable => {
+                spawn_arkpulse_app_restart_fix(
+                    state.clone(),
+                    app_id.clone(),
+                    issue_title.clone(),
+                    target.clone(),
+                    fix_summary.clone(),
+                    selected_event_timestamp.clone(),
+                    selected_finding_index,
+                );
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({
+                        "status": "accepted",
+                        "mode": "app_restart",
+                        "app_id": app_id,
+                        "message": "Queued app restart. ArkPulse will apply it in the background while the control plane stays responsive."
+                    })),
+                )
+                    .into_response();
+            }
+            HealViability::NotRecoverable(HealSkipReason::ExplicitlyStopped) => {
+                let result = (
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "status": "ok",
+                        "mode": "app_restart",
+                        "app_id": app_id,
+                        "skipped": true,
+                        "reason": heal_skip_reason_code(HealSkipReason::ExplicitlyStopped),
+                        "message": "App restart skipped because the app is explicitly stopped."
+                    }),
+                );
+                return respond_arkpulse_fix(
+                    &state,
+                    ArkPulseFixResponseContext { audit, started_at },
+                    result,
+                )
+                .await;
+            }
+            HealViability::NotRecoverable(reason) => {
+                let app_title = lookup_app_title_for_cleanup(&state, app_id).await;
+                let cleanup =
+                    cleanup_deleted_app_references(&state, app_id, app_title.as_deref()).await;
+                trigger_arkpulse_after_app_change(&state, "app_delete").await;
+                let result = (
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "status": "ok",
+                        "mode": "app_restart",
+                        "app_id": app_id,
+                        "skipped": true,
+                        "reason": heal_skip_reason_code(reason),
+                        "message": "App is no longer recoverable. Cleaned stale state and skipped restart.",
+                        "deleted_notifications": cleanup.deleted_notifications,
+                        "deleted_pulse_events": cleanup.deleted_pulse_events
+                    }),
+                );
+                return respond_arkpulse_fix(
+                    &state,
+                    ArkPulseFixResponseContext { audit, started_at },
+                    result,
+                )
+                .await;
+            }
+            HealViability::TransientlyUnknown(error) => {
+                let result = (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    serde_json::json!({
+                        "status": "error",
+                        "mode": "app_restart",
+                        "app_id": app_id,
+                        "reason": "transiently_unknown",
+                        "error": error
+                    }),
+                );
+                return respond_arkpulse_fix(
+                    &state,
+                    ArkPulseFixResponseContext { audit, started_at },
+                    result,
+                )
+                .await;
+            }
+        }
+    }
+
+    let execution = async {
+        match &plan {
+            ArkPulseFixPlan::TunnelStartVerify => {
+                let tunnel_arc = state.tunnel.clone();
+                if let Err(error) = tunnel::spawn_tunnel(&state, None).await {
+                    arkpulse_error_result(StatusCode::INTERNAL_SERVER_ERROR, error)
+                } else {
+                    let discovered_url = tunnel::wait_for_tunnel_url(tunnel_arc.clone(), 12).await;
+                    if let Some(url) = discovered_url.as_ref() {
+                        tunnel::persist_public_tunnel_state(&state, Some(url), None).await;
+                    }
+
+                    let tunnel = tunnel_arc.read().await;
+                    let active = tunnel.active;
+                    let url = tunnel.url.clone();
+                    let message = if active
+                        && url.as_ref().is_some_and(|value| !value.trim().is_empty())
+                    {
                         format!(
                             "Remote access is active at {}.",
                             url.clone().unwrap_or_default()
@@ -13955,34 +14642,35 @@ async fn run_arkpulse_fix(
                         "Tunnel start requested. URL is pending; re-check /tunnel/status shortly."
                             .to_string()
                     };
-                (
-                    StatusCode::OK,
-                    serde_json::json!({
-                        "status": "ok",
-                        "mode": "tunnel_start_verify",
-                        "message": message,
-                        "active": active,
-                        "url": url
-                    }),
-                )
-            }
-        }
-        ArkPulseFixPlan::TunnelRestartVerify => {
-            tunnel::stop_tunnel_internal(&state).await;
-            let tunnel_arc = state.tunnel.clone();
-            if let Err(error) = tunnel::spawn_tunnel(&state, None).await {
-                arkpulse_error_result(StatusCode::INTERNAL_SERVER_ERROR, error)
-            } else {
-                let discovered_url = tunnel::wait_for_tunnel_url(tunnel_arc.clone(), 12).await;
-                if let Some(url) = discovered_url.as_ref() {
-                    tunnel::persist_public_tunnel_state(&state, Some(url), None).await;
+                    (
+                        StatusCode::OK,
+                        serde_json::json!({
+                            "status": "ok",
+                            "mode": "tunnel_start_verify",
+                            "message": message,
+                            "active": active,
+                            "url": url
+                        }),
+                    )
                 }
+            }
+            ArkPulseFixPlan::TunnelRestartVerify => {
+                tunnel::stop_tunnel_internal(&state).await;
+                let tunnel_arc = state.tunnel.clone();
+                if let Err(error) = tunnel::spawn_tunnel(&state, None).await {
+                    arkpulse_error_result(StatusCode::INTERNAL_SERVER_ERROR, error)
+                } else {
+                    let discovered_url = tunnel::wait_for_tunnel_url(tunnel_arc.clone(), 12).await;
+                    if let Some(url) = discovered_url.as_ref() {
+                        tunnel::persist_public_tunnel_state(&state, Some(url), None).await;
+                    }
 
-                let tunnel = tunnel_arc.read().await;
-                let active = tunnel.active;
-                let url = tunnel.url.clone();
-                let message =
-                    if active && url.as_ref().is_some_and(|value| !value.trim().is_empty()) {
+                    let tunnel = tunnel_arc.read().await;
+                    let active = tunnel.active;
+                    let url = tunnel.url.clone();
+                    let message = if active
+                        && url.as_ref().is_some_and(|value| !value.trim().is_empty())
+                    {
                         format!(
                             "Remote access restarted successfully at {}.",
                             url.clone().unwrap_or_default()
@@ -13991,38 +14679,42 @@ async fn run_arkpulse_fix(
                         "Tunnel restart requested. URL is pending; re-check /tunnel/status shortly."
                             .to_string()
                     };
-                (
-                    StatusCode::OK,
-                    serde_json::json!({
-                        "status": "ok",
-                        "mode": "tunnel_restart_verify",
-                        "message": message,
-                        "active": active,
-                        "url": url
-                    }),
-                )
+                    (
+                        StatusCode::OK,
+                        serde_json::json!({
+                            "status": "ok",
+                            "mode": "tunnel_restart_verify",
+                            "message": message,
+                            "active": active,
+                            "url": url
+                        }),
+                    )
+                }
             }
+            ArkPulseFixPlan::AppRestart(_) => unreachable!("app_restart handled above"),
+            ArkPulseFixPlan::ReadonlyInvestigation { topic } => {
+                run_arkpulse_readonly_investigation_fix(&state, topic).await
+            }
+            ArkPulseFixPlan::ShellOperations {
+                app_dir,
+                operations,
+            } => run_arkpulse_shell_operations_fix(&state, app_dir, operations).await,
         }
-        ArkPulseFixPlan::AppRestart(app_id) => run_arkpulse_app_restart_fix(&state, app_id).await,
-        ArkPulseFixPlan::ShellOperations {
-            app_dir,
-            operations,
-        } => run_arkpulse_shell_operations_fix(&state, app_dir, operations).await,
+    };
+    let result = match tokio::time::timeout(Duration::from_secs(60), execution).await {
+        Ok(result) => result,
+        Err(_) => arkpulse_error_result(
+            StatusCode::GATEWAY_TIMEOUT,
+            format!(
+                "ArkPulse {} timed out. The control plane aborted the remediation to stay responsive.",
+                arkpulse_fix_plan_label(&plan)
+            ),
+        ),
     };
 
     respond_arkpulse_fix(
         &state,
-        ArkPulseFixResponseContext {
-            audit: ArkPulseFixAuditDetails {
-                plan: &plan,
-                issue_title: &issue_title,
-                target: &target,
-                fix_summary: &fix_summary,
-                event_timestamp: selected_event_timestamp.as_deref(),
-                finding_index: selected_finding_index,
-            },
-            started_at,
-        },
+        ArkPulseFixResponseContext { audit, started_at },
         result,
     )
     .await
@@ -14444,6 +15136,7 @@ async fn chat(
                     run_status: None,
                     trace_id: None,
                     total_tokens: 0,
+                    choices: Vec::new(),
                     degradation: Vec::new(),
                     attempted_models: Vec::new(),
                     user_outcome: None,
@@ -14484,6 +15177,7 @@ async fn chat(
                 run_status: None,
                 trace_id: None,
                 total_tokens: 0,
+                choices: Vec::new(),
                 degradation: Vec::new(),
                 attempted_models: Vec::new(),
                 user_outcome: None,
@@ -14510,6 +15204,7 @@ async fn chat(
                 run_status: None,
                 trace_id: None,
                 total_tokens: 0,
+                choices: Vec::new(),
                 degradation: Vec::new(),
                 attempted_models: Vec::new(),
                 user_outcome: None,
@@ -14533,6 +15228,7 @@ async fn chat(
                     run_status: None,
                     trace_id: None,
                     total_tokens: 0,
+                    choices: Vec::new(),
                     degradation: Vec::new(),
                     attempted_models: Vec::new(),
                     user_outcome: None,
@@ -14623,6 +15319,7 @@ async fn chat(
                 run_status: None,
                 trace_id: None,
                 total_tokens: 0,
+                choices: Vec::new(),
                 degradation: Vec::new(),
                 attempted_models: Vec::new(),
                 user_outcome: None,
@@ -14646,6 +15343,7 @@ async fn chat(
                         run_status: None,
                         trace_id: None,
                         total_tokens: 0,
+                        choices: Vec::new(),
                         degradation: Vec::new(),
                         attempted_models: Vec::new(),
                         user_outcome: None,
@@ -14674,6 +15372,7 @@ async fn chat(
                         run_status: None,
                         trace_id: None,
                         total_tokens: 0,
+                        choices: Vec::new(),
                         degradation: Vec::new(),
                         attempted_models: Vec::new(),
                         user_outcome: None,
@@ -14706,6 +15405,7 @@ async fn chat(
                         run_status: None,
                         trace_id: None,
                         total_tokens: 0,
+                        choices: Vec::new(),
                         degradation: Vec::new(),
                         attempted_models: Vec::new(),
                         user_outcome: None,
@@ -14733,8 +15433,8 @@ async fn chat(
 
     let result = {
         let worker = tokio::spawn(async move {
-            let agent_guard = agent_for_chat.read().await;
-            agent_guard
+            let agent_snapshot = Agent::snapshot(&agent_for_chat).await;
+            agent_snapshot
                 .process_message_with_meta_and_hints(
                     &message,
                     &channel,
@@ -14773,6 +15473,7 @@ async fn chat(
                     run_status: processed.run_status,
                     trace_id: processed.trace_id,
                     total_tokens: processed.total_tokens,
+                    choices: processed.choices,
                     degradation: processed.degradation,
                     attempted_models: processed.attempted_models,
                     user_outcome: processed.user_outcome,
@@ -14806,6 +15507,7 @@ async fn chat(
                     run_status: Some("platform_failed".to_string()),
                     trace_id: None,
                     total_tokens: 0,
+                    choices: Vec::new(),
                     degradation,
                     attempted_models: Vec::new(),
                     user_outcome: Some(user_outcome),
@@ -15839,9 +16541,9 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
             let caller_principal = caller_principal.clone();
             let plan_override = plan_override.clone();
             tokio::spawn(async move {
-                let agent_guard = agent_ref.read().await;
+                let agent_snapshot = Agent::snapshot(&agent_ref).await;
                 if user_message_already_recorded {
-                    agent_guard
+                    agent_snapshot
                         .process_message_stream_resume_with_meta_and_hints(
                             &message,
                             &channel,
@@ -15862,7 +16564,7 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                         )
                         .await
                 } else {
-                    agent_guard
+                    agent_snapshot
                         .process_message_stream_with_meta_and_hints(
                             &message,
                             &channel,
@@ -15964,14 +16666,14 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                 if let (Some(task), Some(arguments_json)) =
                     (tracked_task.as_ref(), updated_arguments_json)
                 {
-                    let agent_guard = agent_ref.read().await;
+                    let agent_snapshot = Agent::snapshot(&agent_ref).await;
                     if task.task_id.parse::<uuid::Uuid>().is_err() {
                         tracing::warn!(
                             "Failed to parse streamed chat task id '{}' during finalize",
                             task.task_id
                         );
                     }
-                    if let Err(error) = agent_guard
+                    if let Err(error) = agent_snapshot
                         .storage
                         .update_task(&task.task_id, None, Some(arguments_json), None, None)
                         .await
@@ -16002,10 +16704,10 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                         400,
                     );
                     {
-                        let agent_guard = agent_ref.read().await;
+                        let agent_snapshot = Agent::snapshot(&agent_ref).await;
                         match task.task_id.parse::<uuid::Uuid>() {
                             Ok(task_uuid) => {
-                                if let Err(error) = agent_guard
+                                if let Err(error) = agent_snapshot
                                     .finalize_task(
                                         task_uuid,
                                         terminal_status.clone(),
@@ -16053,8 +16755,8 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                             processed.run_status.as_deref(),
                         );
                         if let Some((title, body, level)) = notification {
-                            let agent_guard = agent_ref.read().await;
-                            agent_guard
+                            let agent_snapshot = Agent::snapshot(&agent_ref).await;
+                            agent_snapshot
                                 .emit_notification(title, &body, level, "deep_research")
                                 .await;
                         }
@@ -16074,6 +16776,10 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                 });
                 if let Some(title) = processed.conversation_title {
                     content["conversation_title"] = serde_json::json!(title);
+                }
+                if !processed.choices.is_empty() {
+                    content["choices"] =
+                        serde_json::to_value(&processed.choices).unwrap_or(serde_json::Value::Null);
                 }
                 let event = Event::default()
                     .event("content")
@@ -16097,15 +16803,15 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                 if let Some(task) = tracked_task.as_ref() {
                     let result_preview = "Cancelled by user.";
                     {
-                        let agent_guard = agent_ref.read().await;
-                        agent_guard
+                        let agent_snapshot = Agent::snapshot(&agent_ref).await;
+                        agent_snapshot
                             .swarm_activity
                             .interrupt_run(
                                 &task.task_id,
                                 "Cancelled by user before the delegated run completed.",
                             )
                             .await;
-                        if let Err(storage_error) = agent_guard
+                        if let Err(storage_error) = agent_snapshot
                             .storage
                             .mark_swarm_run_interrupted(
                                 &task.task_id,
@@ -16121,7 +16827,7 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                         }
                         match task.task_id.parse::<uuid::Uuid>() {
                             Ok(task_uuid) => {
-                                if let Err(finalize_error) = agent_guard
+                                if let Err(finalize_error) = agent_snapshot
                                     .finalize_task(
                                         task_uuid,
                                         crate::core::TaskStatus::Cancelled,
@@ -16179,10 +16885,10 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                 if let Some(task) = tracked_task.as_ref() {
                     let error_text = error.to_string();
                     {
-                        let agent_guard = agent_ref.read().await;
+                        let agent_snapshot = Agent::snapshot(&agent_ref).await;
                         match task.task_id.parse::<uuid::Uuid>() {
                             Ok(task_uuid) => {
-                                if let Err(finalize_error) = agent_guard
+                                if let Err(finalize_error) = agent_snapshot
                                     .finalize_task(
                                         task_uuid,
                                         crate::core::TaskStatus::Failed {
@@ -16461,7 +17167,7 @@ async fn parse_execution_plan_override(
     let Some(raw_plan) = raw else {
         return Ok(None);
     };
-    let agent = state.agent.read().await;
+    let agent = Agent::snapshot(&state.agent).await;
     let actions = agent
         .runtime
         .list_enabled_actions()
@@ -16851,7 +17557,7 @@ async fn clear_chat(
         .and_then(|v| v.as_str())
         .unwrap_or("web");
     let project_id = request.get("project_id").and_then(|v| v.as_str());
-    let agent = state.agent.read().await;
+    let agent = Agent::snapshot(&state.agent).await;
     if let Some(pid) = project_id {
         agent
             .clear_conversation_for_project(channel, Some(pid))
@@ -21095,16 +21801,15 @@ fn build_email_settings_response(
     gmail_enabled: bool,
     workspace_enabled: bool,
 ) -> EmailSettingsResponse {
-    let available_backends = settings_configured_email_backends(
-        config,
-        config_dir,
-        gmail_enabled,
-        workspace_enabled,
-    );
+    let available_backends =
+        settings_configured_email_backends(config, config_dir, gmail_enabled, workspace_enabled);
     let provider = crate::core::email_delivery::normalize_email_provider(&config.email.provider);
     let auto_resolves_to = if provider == crate::core::email_delivery::EMAIL_PROVIDER_AUTO {
-        crate::core::email_delivery::normalize_email_backend_selection(&provider, &available_backends)
-            .ok()
+        crate::core::email_delivery::normalize_email_backend_selection(
+            &provider,
+            &available_backends,
+        )
+        .ok()
     } else {
         None
     };
@@ -21120,7 +21825,9 @@ fn build_email_settings_response(
             &available_backends,
         ),
         transport: EmailTransportSettingsResponse {
-            kind: crate::core::email_delivery::normalize_transport_kind(&config.email.transport.kind),
+            kind: crate::core::email_delivery::normalize_transport_kind(
+                &config.email.transport.kind,
+            ),
             http: EmailHttpTransportSettingsResponse {
                 base_url: trimmed_option_string(config.email.transport.http.base_url.as_deref()),
                 send_path: trimmed_option_string(config.email.transport.http.send_path.as_deref()),
@@ -22335,6 +23042,7 @@ fn build_learning_candidate_summary(
         .get("diff_summary")
         .and_then(|value| value.as_str())
         .map(|value| value.to_string());
+    let proposed_content_preview = build_learning_candidate_content_preview(candidate);
     serde_json::json!({
         "id": candidate.id,
         "candidate_type": candidate.candidate_type,
@@ -22355,7 +23063,145 @@ fn build_learning_candidate_summary(
         "skill_action": skill_action,
         "diff_summary": diff_summary,
         "preview": preview,
+        "proposed_content_preview": proposed_content_preview,
     })
+}
+
+fn truncate_candidate_preview(value: &str, max_chars: usize) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    let keep = max_chars.saturating_sub(3);
+    let mut truncated = normalized.chars().take(keep).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+fn json_scalar_preview(value: &serde_json::Value, max_chars: usize) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(truncate_candidate_preview(trimmed, max_chars))
+            }
+        }
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    }
+}
+
+fn json_string_array_preview(
+    value: Option<&serde_json::Value>,
+    max_items: usize,
+    max_chars: usize,
+) -> Vec<String> {
+    value
+        .and_then(|raw| raw.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .take(max_items)
+                .map(|item| truncate_candidate_preview(item, max_chars))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn build_learning_candidate_content_preview(
+    candidate: &crate::storage::learning_candidate::Model,
+) -> serde_json::Value {
+    match candidate.candidate_type.as_str() {
+        "strategy" => {
+            let strategy_version = candidate
+                .proposed_content
+                .get("version")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or_default()
+                .to_string();
+            let default_guidance = json_string_array_preview(
+                candidate.proposed_content.get("default_guidance"),
+                3,
+                140,
+            );
+            let task_guidance = candidate
+                .proposed_content
+                .get("task_guidance")
+                .and_then(|value| value.as_object())
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .take(3)
+                        .flat_map(|(task_type, lines)| {
+                            lines
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|item| item.as_str())
+                                .map(str::trim)
+                                .filter(|line| !line.is_empty())
+                                .take(2)
+                                .map(move |line| {
+                                    format!(
+                                        "{}: {}",
+                                        task_type,
+                                        truncate_candidate_preview(line, 140)
+                                    )
+                                })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            serde_json::json!({
+                "strategy_version": strategy_version,
+                "default_guidance": default_guidance,
+                "task_guidance": task_guidance,
+            })
+        }
+        "memory_add" | "memory_update" | "memory_retract" => {
+            let looks_sensitive = candidate
+                .proposed_content
+                .get("looks_sensitive")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let value_preview = if looks_sensitive {
+                None
+            } else {
+                candidate
+                    .proposed_content
+                    .get("value")
+                    .and_then(|value| json_scalar_preview(value, 180))
+            };
+            serde_json::json!({
+                "operation_type": candidate.proposed_content.get("operation_type").and_then(|value| value.as_str()),
+                "semantic_key": candidate.proposed_content.get("semantic_key").and_then(|value| value.as_str()),
+                "value_preview": value_preview,
+                "memory_kind": candidate.proposed_content.get("memory_kind").and_then(|value| value.as_str()),
+                "scope": candidate.proposed_content.get("scope").and_then(|value| value.as_str()),
+                "durability": candidate.proposed_content.get("durability").and_then(|value| value.as_str()),
+                "looks_sensitive": looks_sensitive,
+                "sensitive_reason": candidate.proposed_content.get("sensitive_reason").and_then(|value| value.as_str()),
+            })
+        }
+        "memory_deprecate" => serde_json::json!({
+            "item_id": candidate.proposed_content.get("item_id").and_then(|value| value.as_str()),
+            "next_status": candidate.proposed_content.get("next_status").and_then(|value| value.as_str()),
+        }),
+        "memory_merge" => serde_json::json!({
+            "target_item_id": candidate.proposed_content.get("target_item_id").and_then(|value| value.as_str()),
+            "source_item_id": candidate.proposed_content.get("source_item_id").and_then(|value| value.as_str()),
+            "reason": candidate.proposed_content.get("reason").and_then(|value| value.as_str()),
+        }),
+        _ => serde_json::Value::Null,
+    }
 }
 
 fn skill_patch_string(
@@ -22861,6 +23707,29 @@ fn prompt_telemetry_section_summary<'a>(
         .find(|item| item.section == section)
 }
 
+fn prompt_section_coverage_label(section_chars: usize, total_chars: usize) -> Option<String> {
+    if section_chars == 0 || total_chars == 0 {
+        return None;
+    }
+    Some(format!(
+        "This section accounts for about {:.1}% of the p95 final prompt size.",
+        (section_chars as f64 / total_chars as f64) * 100.0
+    ))
+}
+
+fn format_char_count(value: usize) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(ch);
+    }
+    let formatted = grouped.chars().rev().collect::<String>();
+    format!("{} chars", formatted)
+}
+
 fn aggregate_prompt_telemetry_summary(
     runs: &[crate::storage::experience_run::Model],
 ) -> PromptTelemetrySummary {
@@ -23110,6 +23979,7 @@ fn build_prompt_optimization_proposal(
     caveats: Vec<String>,
     risk_level: &str,
     target_scope: &str,
+    change_preview: EvolutionChangePreview,
 ) -> PromptOptimizationProposal {
     let review_entry = review_state.get(id);
     let review_status = review_entry
@@ -23131,6 +24001,7 @@ fn build_prompt_optimization_proposal(
         review_status,
         reviewed_at,
         reversible: true,
+        change_preview,
     }
 }
 
@@ -23147,6 +24018,22 @@ fn build_prompt_optimization_opportunities(
     if let Some(section) = prompt_telemetry_section_summary(summary, "runtime_access_summary")
         .filter(|section| section.p95_chars >= 900)
     {
+        let mut impact_estimate = vec![
+            format!(
+                "Could remove up to {} from eligible prompts before any broader prompt changes are needed.",
+                format_char_count(section.p95_chars)
+            ),
+            format!(
+                "Measured across {} sampled turn{}.",
+                section.samples,
+                if section.samples == 1 { "" } else { "s" }
+            ),
+        ];
+        if let Some(line) =
+            prompt_section_coverage_label(section.p95_chars, summary.p95_final_prompt_chars)
+        {
+            impact_estimate.push(line);
+        }
         proposals.push(build_prompt_optimization_proposal(
             review_state,
             "prompt-opt-runtime-summary-compact",
@@ -23173,12 +24060,44 @@ fn build_prompt_optimization_opportunities(
             ],
             "low",
             "prompt_profile",
+            EvolutionChangePreview {
+                before: vec![
+                    format!(
+                        "Full runtime-access prose reaches {} at p95 on recent turns.",
+                        format_char_count(section.p95_chars)
+                    ),
+                    format!(
+                        "Overall final prompt size reaches {} at p95.",
+                        format_char_count(summary.p95_final_prompt_chars)
+                    ),
+                ],
+                after: vec![
+                    "Offer a compact runtime-access profile on turns that do not depend on the full environment prose.".to_string(),
+                    "Keep the full runtime-access profile on environment-dependent turns.".to_string(),
+                ],
+                impact_estimate,
+            },
         ));
     }
 
     let action_catalog_section = prompt_telemetry_section_summary(summary, "action_catalog")
         .filter(|section| section.p95_chars >= 2500 || summary.p95_tool_schema_chars >= 12_000);
     if let Some(section) = action_catalog_section {
+        let mut impact_estimate = vec![
+            format!(
+                "Up to {} of prompt weight is tied directly to the action catalog block at p95.",
+                format_char_count(section.p95_chars)
+            ),
+            format!(
+                "Schema-heavy turns already carry {} of serialized tool schema at p95.",
+                format_char_count(summary.p95_tool_schema_chars)
+            ),
+        ];
+        if let Some(line) =
+            prompt_section_coverage_label(section.p95_chars, summary.p95_final_prompt_chars)
+        {
+            impact_estimate.push(line);
+        }
         proposals.push(build_prompt_optimization_proposal(
             review_state,
             "prompt-opt-action-catalog-compact",
@@ -23202,12 +24121,46 @@ fn build_prompt_optimization_opportunities(
             ],
             "medium",
             "prompt_profile",
+            EvolutionChangePreview {
+                before: vec![
+                    format!(
+                        "The action catalog prompt section reaches {} at p95.",
+                        format_char_count(section.p95_chars)
+                    ),
+                    format!(
+                        "Recent turns serialize {} of tool schema at p95 across {:.2} exposed tools on average.",
+                        format_char_count(summary.p95_tool_schema_chars),
+                        summary.avg_tool_count
+                    ),
+                ],
+                after: vec![
+                    "Introduce an explicit compact tool-detail mode for the largest schema-heavy turns.".to_string(),
+                    "Keep the full tool set available while shortening parameter detail where a compact profile is sufficient.".to_string(),
+                ],
+                impact_estimate,
+            },
         ));
     }
 
     if let Some(section) = prompt_telemetry_section_summary(summary, "deployed_app_hint")
         .filter(|section| section.p95_chars >= 700)
     {
+        let mut impact_estimate = vec![
+            format!(
+                "Could remove up to {} from non-app turns by scoping this hint more tightly.",
+                format_char_count(section.p95_chars)
+            ),
+            format!(
+                "Measured across {} sampled turn{} with prompt telemetry.",
+                summary.sample_count,
+                if summary.sample_count == 1 { "" } else { "s" }
+            ),
+        ];
+        if let Some(line) =
+            prompt_section_coverage_label(section.p95_chars, summary.p95_final_prompt_chars)
+        {
+            impact_estimate.push(line);
+        }
         proposals.push(build_prompt_optimization_proposal(
             review_state,
             "prompt-opt-deployed-app-scope",
@@ -23227,12 +24180,44 @@ fn build_prompt_optimization_opportunities(
             ],
             "medium",
             "prompt_profile",
+            EvolutionChangePreview {
+                before: vec![
+                    format!(
+                        "Deployed-app hints contribute {} at p95 even when the turn is not strongly app-focused.",
+                        format_char_count(section.p95_chars)
+                    ),
+                    format!(
+                        "Recent final prompts reach {} at p95.",
+                        format_char_count(summary.p95_final_prompt_chars)
+                    ),
+                ],
+                after: vec![
+                    "Inject deployed-app inventory hints only on turns that are clearly app-focused.".to_string(),
+                    "Keep the broader inventory available for app-related requests and follow-ups.".to_string(),
+                ],
+                impact_estimate,
+            },
         ));
     }
 
     if let Some(section) = prompt_telemetry_section_summary(summary, "document_excerpts")
         .filter(|section| section.p95_chars >= 1500)
     {
+        let mut impact_estimate = vec![
+            format!(
+                "Could remove up to {} from mixed-context turns that do not need the full excerpt set.",
+                format_char_count(section.p95_chars)
+            ),
+            format!(
+                "The largest recent requests reach {} at p95.",
+                format_char_count(summary.p95_estimated_total_request_chars)
+            ),
+        ];
+        if let Some(line) =
+            prompt_section_coverage_label(section.p95_chars, summary.p95_final_prompt_chars)
+        {
+            impact_estimate.push(line);
+        }
         proposals.push(build_prompt_optimization_proposal(
             review_state,
             "prompt-opt-document-context-guard",
@@ -23255,6 +24240,23 @@ fn build_prompt_optimization_opportunities(
             ],
             "high",
             "prompt_profile",
+            EvolutionChangePreview {
+                before: vec![
+                    format!(
+                        "Document excerpts contribute {} at p95 on recent turns.",
+                        format_char_count(section.p95_chars)
+                    ),
+                    format!(
+                        "Estimated total request size reaches {} at p95.",
+                        format_char_count(summary.p95_estimated_total_request_chars)
+                    ),
+                ],
+                after: vec![
+                    "Offer a compact document-context profile when the turn is not primarily document-driven.".to_string(),
+                    "Keep document-centric turns on the full excerpt profile.".to_string(),
+                ],
+                impact_estimate,
+            },
         ));
     }
 
@@ -25427,7 +26429,8 @@ async fn run_evolution_dev_action(
                         return (
                             StatusCode::BAD_REQUEST,
                             Json(ErrorResponse {
-                                error: "memory operation candidate missing operation_id.".to_string(),
+                                error: "memory operation candidate missing operation_id."
+                                    .to_string(),
                             }),
                         )
                             .into_response();
@@ -25460,7 +26463,8 @@ async fn run_evolution_dev_action(
                         return (
                             StatusCode::BAD_REQUEST,
                             Json(ErrorResponse {
-                                error: "Learning candidate is no longer pending review.".to_string(),
+                                error: "Learning candidate is no longer pending review."
+                                    .to_string(),
                             }),
                         )
                             .into_response();
@@ -25779,7 +26783,8 @@ async fn run_evolution_dev_action(
                         return (
                             StatusCode::BAD_REQUEST,
                             Json(ErrorResponse {
-                                error: "Learning candidate is no longer pending review.".to_string(),
+                                error: "Learning candidate is no longer pending review."
+                                    .to_string(),
                             }),
                         )
                             .into_response();
@@ -25819,7 +26824,9 @@ async fn run_evolution_dev_action(
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                 {
-                    if let Ok(Some(mut operation)) = storage.get_memory_operation(operation_id).await {
+                    if let Ok(Some(mut operation)) =
+                        storage.get_memory_operation(operation_id).await
+                    {
                         operation.status = "rejected".to_string();
                         operation.reviewed_at = Some(chrono::Utc::now().to_rfc3339());
                         operation.review_notes =
@@ -26066,10 +27073,13 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
         .flatten()
         .and_then(|b| String::from_utf8(b).ok());
     let data_lifecycle = load_data_lifecycle_settings(&storage).await;
-    let mut search_cfg = Some(crate::runtime::load_persisted_search_config(
-        &config_dir,
-        Some(&data_dir),
-    ));
+    let mut search_cfg = Some(
+        crate::runtime::load_persisted_search_config_async(
+            config_dir.clone(),
+            Some(data_dir.clone()),
+        )
+        .await,
+    );
     if let Some(cfg) = search_cfg.as_mut() {
         cfg.ensure_default_chain();
     }
@@ -27269,7 +28279,8 @@ async fn update_settings(
     if let Some(email) = settings.email.as_ref() {
         if let Some(to_address) = email.to_address.as_ref() {
             if !to_address.trim().is_empty() {
-                if let Err(error) = crate::core::email_delivery::validate_email_address(to_address) {
+                if let Err(error) = crate::core::email_delivery::validate_email_address(to_address)
+                {
                     return (
                         StatusCode::BAD_REQUEST,
                         Json(ErrorResponse {
@@ -27537,7 +28548,11 @@ async fn update_settings(
     }
 
     let result = {
-        let mut agent_guard = state.agent.write().await;
+        let mut agent_guard =
+            match acquire_agent_write_for_config_mutation(&state, "saving settings").await {
+                Ok(agent) => agent,
+                Err(response) => return response,
+            };
 
         // Snapshot current Telegram/WhatsApp config for change detection
         let old_telegram = agent_guard
@@ -27662,8 +28677,7 @@ async fn update_settings(
                     email.auth.aws_access_key_id = aws_access_key_id.trim().to_string();
                 }
                 if let Some(aws_secret_access_key) = auth.aws_secret_access_key.as_ref() {
-                    email.auth.aws_secret_access_key =
-                        aws_secret_access_key.trim().to_string();
+                    email.auth.aws_secret_access_key = aws_secret_access_key.trim().to_string();
                 }
                 if let Some(aws_session_token) = auth.aws_session_token.as_ref() {
                     let trimmed = aws_session_token.trim();
@@ -29902,7 +30916,8 @@ async fn update_settings(
     }
 
     if let Some(config_dir) = deferred_search_config_dir.as_ref() {
-        let mut search_config = crate::runtime::load_persisted_search_config(config_dir, None);
+        let mut search_config =
+            crate::runtime::load_persisted_search_config_async(config_dir.clone(), None).await;
 
         if let Some(key) = &search_serper_key {
             search_config.serper = if key.trim().is_empty() {
@@ -30000,8 +31015,12 @@ async fn update_settings(
         search_config.fallback2 = None;
         search_config.ensure_default_chain();
 
-        if let Err(e) =
-            crate::runtime::save_persisted_search_config(config_dir, None, &search_config)
+        if let Err(e) = crate::runtime::save_persisted_search_config_async(
+            config_dir.clone(),
+            None,
+            search_config,
+        )
+        .await
         {
             tracing::warn!("Failed to save search config: {}", e);
         }
@@ -31716,39 +32735,84 @@ async fn discover_provider_models(
         .into_response()
 }
 
+async fn test_model_connection(
+    State(state): State<AppState>,
+    Json(payload): Json<ModelConnectionTestRequest>,
+) -> Response {
+    let existing_key = if let Some(raw_id) = payload.id.as_deref() {
+        let id = raw_id.trim();
+        if id.is_empty() {
+            None
+        } else {
+            match resolve_requested_model_slot_api_key(&state, id, &payload.request).await {
+                Ok(key) => key,
+                Err(response) => return response,
+            }
+        }
+    } else {
+        None
+    };
+
+    let provider = match provider_from_model_slot_request(&payload.request, existing_key).await {
+        Ok(provider) => provider,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response()
+        }
+    };
+
+    let connectivity = match tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        test_llm_connection(&provider),
+    )
+    .await
+    {
+        Ok(Ok(())) => serde_json::json!({ "ok": true }),
+        Ok(Err(error)) => serde_json::json!({ "ok": false, "error": error }),
+        Err(_) => serde_json::json!({
+            "ok": false,
+            "error": "Connection test timed out."
+        }),
+    };
+
+    (StatusCode::OK, Json(connectivity)).into_response()
+}
+
 /// Add a new model slot
 async fn add_model(
     State(state): State<AppState>,
     Json(request): Json<ModelSlotRequest>,
 ) -> Response {
-    let result = {
-        let mut agent = state.agent.write().await;
+    let role = match request.role.as_str() {
+        "primary" => ModelRole::Primary,
+        "fast" => ModelRole::Fast,
+        "code" => ModelRole::Code,
+        "research" => ModelRole::Research,
+        "fallback" => ModelRole::Fallback,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("Unknown role: {}", request.role),
+                }),
+            )
+                .into_response();
+        }
+    };
 
-        let role = match request.role.as_str() {
-            "primary" => ModelRole::Primary,
-            "fast" => ModelRole::Fast,
-            "code" => ModelRole::Code,
-            "research" => ModelRole::Research,
-            "fallback" => ModelRole::Fallback,
-            _ => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: format!("Unknown role: {}", request.role),
-                    }),
-                )
-                    .into_response();
-            }
-        };
+    let provider = match provider_from_model_slot_request(&request, None).await {
+        Ok(provider) => provider,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response()
+        }
+    };
 
-        let provider = match provider_from_model_slot_request(&request, None).await {
-            Ok(provider) => provider,
-            Err(error) => {
-                return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response();
-            }
-        };
+    let (config_snapshot, config_dir, data_dir) = {
+        let mut agent =
+            match acquire_agent_write_for_config_mutation(&state, "saving model changes").await {
+                Ok(agent) => agent,
+                Err(response) => return response,
+            };
 
-        // Generate unique ID
         let slot_id = format!(
             "{}_{}",
             request.role,
@@ -31774,7 +32838,6 @@ async fn add_model(
 
         agent.config.model_pool.slots.push(slot.clone());
 
-        // Create LlmClient and add to runtime pool
         match crate::core::LlmClient::new(&provider) {
             Ok(client) => {
                 agent.model_pool.insert(slot_id.clone(), (slot, client));
@@ -31797,28 +32860,23 @@ async fn add_model(
         };
         reconcile_model_pool_state(&mut agent, preferred_primary);
 
-        let provider_for_probe = provider.clone();
-        agent
-            .config
-            .save(&agent.config_dir, Some(&agent.data_dir))
-            .map(|_| provider_for_probe)
+        (
+            agent.config.clone(),
+            agent.config_dir.clone(),
+            agent.data_dir.clone(),
+        )
     };
 
-    match result {
-        Ok(provider_for_probe) => {
+    match save_agent_config_snapshot(config_snapshot, config_dir, data_dir).await {
+        Ok(()) => {
             tracing::debug!(
                 "Vector memory backend retains its current configuration after model add."
             );
-            let connectivity = match test_llm_connection(&provider_for_probe).await {
-                Ok(_) => serde_json::json!({ "ok": true }),
-                Err(error) => serde_json::json!({ "ok": false, "error": error }),
-            };
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "status": "ok",
-                    "message": "Model added",
-                    "connectivity": connectivity
+                    "message": "Model added"
                 })),
             )
                 .into_response()
@@ -31839,8 +32897,35 @@ async fn update_model(
     Path(id): Path<String>,
     Json(request): Json<ModelSlotRequest>,
 ) -> Response {
-    let result = {
-        let mut agent = state.agent.write().await;
+    let role = match request.role.as_str() {
+        "primary" => ModelRole::Primary,
+        "fast" => ModelRole::Fast,
+        "code" => ModelRole::Code,
+        "research" => ModelRole::Research,
+        "fallback" => ModelRole::Fallback,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("Unknown role: {}", request.role),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let (
+        previous_slot_id_for_lookup,
+        config_dir_for_lookup,
+        data_dir_for_lookup,
+        can_reuse_existing_key,
+        existing_key_hint,
+    ) = {
+        let agent =
+            match acquire_agent_write_for_config_mutation(&state, "saving model changes").await {
+                Ok(agent) => agent,
+                Err(response) => return response,
+            };
 
         let slot_idx = resolve_model_slot_index(&agent.config.model_pool.slots, &id);
         let Some(idx) = slot_idx else {
@@ -31853,21 +32938,73 @@ async fn update_model(
                 .into_response();
         };
 
-        let role = match request.role.as_str() {
-            "primary" => ModelRole::Primary,
-            "fast" => ModelRole::Fast,
-            "code" => ModelRole::Code,
-            "research" => ModelRole::Research,
-            "fallback" => ModelRole::Fallback,
-            _ => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: format!("Unknown role: {}", request.role),
-                    }),
-                )
-                    .into_response();
+        let current_slot = agent.config.model_pool.slots[idx].clone();
+        let can_reuse_existing_key = match can_reuse_model_slot_api_key(&current_slot, &request) {
+            Ok(value) => value,
+            Err(error) => {
+                return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response();
             }
+        };
+        let existing_key_hint = match &current_slot.provider {
+            LlmProvider::Anthropic { api_key, .. } => Some(api_key.clone()),
+            LlmProvider::OpenAI { api_key, .. } => Some(api_key.clone()),
+            _ => None,
+        };
+
+        (
+            current_slot.id.trim().to_string(),
+            agent.config_dir.clone(),
+            agent.data_dir.clone(),
+            can_reuse_existing_key,
+            existing_key_hint,
+        )
+    };
+
+    let existing_key = if can_reuse_existing_key {
+        if matches!(
+            existing_key_hint.as_deref(),
+            None | Some("") | Some("[ENCRYPTED]")
+        ) {
+            load_saved_model_slot_api_key(
+                config_dir_for_lookup,
+                data_dir_for_lookup,
+                previous_slot_id_for_lookup,
+                id.clone(),
+                request.role.clone(),
+                request.label.clone(),
+            )
+            .await
+            .or(existing_key_hint)
+        } else {
+            existing_key_hint
+        }
+    } else {
+        None
+    };
+
+    let provider = match provider_from_model_slot_request(&request, existing_key).await {
+        Ok(provider) => provider,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response()
+        }
+    };
+
+    let (config_snapshot, config_dir, data_dir) = {
+        let mut agent =
+            match acquire_agent_write_for_config_mutation(&state, "saving model changes").await {
+                Ok(agent) => agent,
+                Err(response) => return response,
+            };
+
+        let slot_idx = resolve_model_slot_index(&agent.config.model_pool.slots, &id);
+        let Some(idx) = slot_idx else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "Model slot not found".to_string(),
+                }),
+            )
+                .into_response();
         };
 
         let previous_slot_id = agent.config.model_pool.slots[idx].id.trim().to_string();
@@ -31885,48 +33022,6 @@ async fn update_model(
                     .next()
                     .unwrap_or("x")
             )
-        };
-
-        // Preserve existing API key if not provided.
-        // If in-memory slot key is placeholder, recover the real value from encrypted secrets.
-        let mut existing_key = match &agent.config.model_pool.slots[idx].provider {
-            LlmProvider::Anthropic { api_key, .. } => Some(api_key.clone()),
-            LlmProvider::OpenAI { api_key, .. } => Some(api_key.clone()),
-            _ => None,
-        };
-        if matches!(
-            existing_key.as_deref(),
-            None | Some("") | Some("[ENCRYPTED]")
-        ) {
-            if let Ok(secure) = crate::core::config::SecureConfigManager::new_with_data_dir(
-                &agent.config_dir,
-                Some(&agent.data_dir),
-            ) {
-                if let Ok(secrets) = secure.load_secrets() {
-                    existing_key = secrets
-                        .model_pool_keys
-                        .get(&previous_slot_id)
-                        .cloned()
-                        .or_else(|| secrets.model_pool_keys.get(id.trim()).cloned())
-                        .or_else(|| secrets.model_pool_keys.get(request.role.trim()).cloned())
-                        .or_else(|| secrets.model_pool_keys.get(request.label.trim()).cloned());
-                }
-            }
-        }
-        let existing_key =
-            match can_reuse_model_slot_api_key(&agent.config.model_pool.slots[idx], &request) {
-                Ok(true) => existing_key,
-                Ok(false) => None,
-                Err(error) => {
-                    return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error }))
-                        .into_response();
-                }
-            };
-        let provider = match provider_from_model_slot_request(&request, existing_key).await {
-            Ok(provider) => provider,
-            Err(error) => {
-                return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response();
-            }
         };
 
         let enabled = request
@@ -31948,13 +33043,23 @@ async fn update_model(
 
         agent.config.model_pool.slots[idx] = slot.clone();
 
-        // Update runtime pool
         if !previous_slot_id.is_empty() {
             agent.model_pool.remove(&previous_slot_id);
         }
         if enabled {
-            if let Ok(client) = crate::core::LlmClient::new(&provider) {
-                agent.model_pool.insert(slot_id.clone(), (slot, client));
+            match crate::core::LlmClient::new(&provider) {
+                Ok(client) => {
+                    agent.model_pool.insert(slot_id.clone(), (slot, client));
+                }
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!("Failed to initialize model: {}", e),
+                        }),
+                    )
+                        .into_response();
+                }
             }
         }
 
@@ -31965,28 +33070,23 @@ async fn update_model(
         };
         reconcile_model_pool_state(&mut agent, preferred_primary);
 
-        let provider_for_probe = provider.clone();
-        agent
-            .config
-            .save(&agent.config_dir, Some(&agent.data_dir))
-            .map(|_| provider_for_probe)
+        (
+            agent.config.clone(),
+            agent.config_dir.clone(),
+            agent.data_dir.clone(),
+        )
     };
 
-    match result {
-        Ok(provider_for_probe) => {
+    match save_agent_config_snapshot(config_snapshot, config_dir, data_dir).await {
+        Ok(()) => {
             tracing::debug!(
                 "Vector memory backend retains its current configuration after model update."
             );
-            let connectivity = match test_llm_connection(&provider_for_probe).await {
-                Ok(_) => serde_json::json!({ "ok": true }),
-                Err(error) => serde_json::json!({ "ok": false, "error": error }),
-            };
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "status": "ok",
-                    "message": "Model updated",
-                    "connectivity": connectivity
+                    "message": "Model updated"
                 })),
             )
                 .into_response()
@@ -32003,8 +33103,12 @@ async fn update_model(
 
 /// Delete a model slot
 async fn delete_model(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let result = {
-        let mut agent = state.agent.write().await;
+    let (storage, config_snapshot, config_dir, data_dir, requested_id, resolved_slot_id) = {
+        let mut agent =
+            match acquire_agent_write_for_config_mutation(&state, "removing a model").await {
+                Ok(agent) => agent,
+                Err(response) => return response,
+            };
 
         let slot_idx = resolve_model_slot_index(&agent.config.model_pool.slots, &id);
         let Some(idx) = slot_idx else {
@@ -32035,30 +33139,39 @@ async fn delete_model(State(state): State<AppState>, Path(id): Path<String>) -> 
                 *selected_slot_id = None;
             }
         }
-        let _ = agent.storage.delete("user_selected_model_slot_v1").await;
-
-        if let Ok(manager) = crate::core::config::SecureConfigManager::new_with_data_dir(
-            &agent.config_dir,
-            Some(&agent.data_dir),
-        ) {
-            let _ = manager.update_secrets(|secrets| {
-                if !resolved_slot_id.is_empty() {
-                    secrets.model_pool_keys.remove(&resolved_slot_id);
-                }
-                if !requested_id.is_empty() && requested_id != resolved_slot_id {
-                    secrets.model_pool_keys.remove(&requested_id);
-                }
-                Ok(())
-            });
-        }
 
         reconcile_model_pool_state(&mut agent, None);
 
-        agent.config.save(&agent.config_dir, Some(&agent.data_dir))
+        (
+            agent.storage.clone(),
+            agent.config.clone(),
+            agent.config_dir.clone(),
+            agent.data_dir.clone(),
+            requested_id,
+            resolved_slot_id,
+        )
     };
 
-    match result {
-        Ok(_) => (
+    let _ = storage
+        .delete(crate::core::USER_SELECTED_MODEL_SLOT_KEY)
+        .await;
+
+    if let Err(error) = remove_saved_model_slot_api_keys(
+        config_dir.clone(),
+        data_dir.clone(),
+        resolved_slot_id.clone(),
+        requested_id.clone(),
+    )
+    .await
+    {
+        tracing::warn!(
+            "Failed to remove saved model keys for deleted slot: {}",
+            error
+        );
+    }
+
+    match save_agent_config_snapshot(config_snapshot, config_dir, data_dir).await {
+        Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({"status": "ok", "message": "Model removed"})),
         )
@@ -34093,6 +35206,33 @@ async fn delete_conversation_endpoint(
     }
 }
 
+fn clarification_choices_from_operational_payload(
+    payload: Option<&str>,
+) -> Vec<crate::core::ClarificationChoice> {
+    let Some(raw_payload) = payload else {
+        return Vec::new();
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw_payload) else {
+        return Vec::new();
+    };
+    let should_clarify = parsed
+        .get("should_clarify")
+        .or_else(|| parsed.get("clarification_needed"))
+        .or_else(|| parsed.get("ambiguous"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    if !should_clarify {
+        return Vec::new();
+    }
+    serde_json::from_value::<Vec<crate::core::ClarificationChoice>>(
+        parsed
+            .get("choices")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    )
+    .unwrap_or_default()
+}
+
 async fn get_conversation_messages(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -34137,6 +35277,47 @@ async fn get_conversation_messages(
                     std::collections::HashMap::new()
                 }
             };
+            let clarification_choices_by_trace_id = match agent
+                .storage
+                .list_operational_logs_for_trace_ids_by_event(
+                    &trace_ids,
+                    "action_selection",
+                    (trace_ids.len().saturating_mul(4).max(32)) as u64,
+                )
+                .await
+            {
+                Ok(rows) => {
+                    let mut by_trace_id = std::collections::HashMap::new();
+                    for row in rows {
+                        let Some(trace_id) = row
+                            .trace_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|trace_id| !trace_id.is_empty())
+                        else {
+                            continue;
+                        };
+                        if by_trace_id.contains_key(trace_id) {
+                            continue;
+                        }
+                        let choices =
+                            clarification_choices_from_operational_payload(row.payload.as_deref());
+                        if choices.is_empty() {
+                            continue;
+                        }
+                        by_trace_id.insert(trace_id.to_string(), choices);
+                    }
+                    by_trace_id
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "Failed to load clarification choices for conversation '{}': {}",
+                        id,
+                        error
+                    );
+                    std::collections::HashMap::new()
+                }
+            };
             let list: Vec<serde_json::Value> = msgs
                 .iter()
                 .map(|m| {
@@ -34149,11 +35330,21 @@ async fn get_conversation_messages(
                     } else {
                         0
                     };
-                    serde_json::json!({
+                    let mut payload = serde_json::json!({
                         "id": m.id, "role": m.role, "content": if m.content == crate::storage::ENCRYPTED_STORAGE_UNAVAILABLE { unavailable_message.clone() } else { m.content.clone() },
                         "timestamp": m.timestamp, "model_used": m.model_used, "trace_id": m.trace_id,
                         "total_tokens": total_tokens,
-                    })
+                    });
+                    if let Some(choices) = m
+                        .trace_id
+                        .as_deref()
+                        .map(str::trim)
+                        .and_then(|trace_id| clarification_choices_by_trace_id.get(trace_id))
+                    {
+                        payload["choices"] =
+                            serde_json::to_value(choices).unwrap_or(serde_json::Value::Null);
+                    }
+                    payload
                 })
                 .collect();
             (StatusCode::OK, Json(serde_json::json!({"messages": list}))).into_response()
@@ -35850,7 +37041,7 @@ pub async fn run_autonomy_analysis_tick(
                 if missing_inputs == 1 { "" } else { "s" }
             );
             {
-                let agent = shared.read().await;
+                let agent = Agent::snapshot(&shared).await;
                 agent
                     .emit_notification(
                         "Autonomy Needs Attention",
@@ -35873,10 +37064,8 @@ pub async fn run_autonomy_analysis_tick(
         .set(AUTONOMY_ANALYSIS_LAST_RUN_KEY, now.to_rfc3339().as_bytes())
         .await;
     let sentinel = sentinel_panel::run_sentinel_scan_tick(shared.clone(), trigger).await;
-    let ambient_intents = {
-        let agent = shared.read().await;
-        agent.revisit_ambient_intents(trigger).await
-    };
+    let agent = Agent::snapshot(&shared).await;
+    let ambient_intents = agent.revisit_ambient_intents(trigger).await;
 
     serde_json::json!({
         "status":"ok",
@@ -35924,7 +37113,7 @@ async fn evaluate_trust_request(
 }
 
 async fn get_voice_briefing(State(state): State<AppState>) -> Response {
-    let agent = state.agent.read().await;
+    let agent = Agent::snapshot(&state.agent).await;
     let settings = load_autonomy_settings(&agent).await;
     if !settings.voice_briefing_enabled {
         return (
@@ -35990,7 +37179,7 @@ async fn handle_voice_command(
     Json(request): Json<VoiceCommandRequest>,
 ) -> Response {
     let cmd = request.command.trim().to_ascii_lowercase();
-    let agent = state.agent.read().await;
+    let agent = Agent::snapshot(&state.agent).await;
     let mut settings = load_autonomy_settings(&agent).await;
     let last_brief = agent
         .storage
@@ -38464,7 +39653,11 @@ async fn arkmemory_build_health_findings(
     }
     if findings.len() < limit as usize {
         for operation in storage
-            .list_memory_operations_by_statuses(&["queued_review", "apply_failed"], project_id, limit)
+            .list_memory_operations_by_statuses(
+                &["queued_review", "apply_failed"],
+                project_id,
+                limit,
+            )
             .await?
         {
             let operation_id = operation.id.clone();
@@ -38685,15 +39878,16 @@ async fn arkmemory_apply_claimed_memory_candidate(
             let approved_ref = agent
                 .apply_memory_operation_by_id_with_source(operation_id, "arkmemory_review")
                 .await?;
-            let memory_id = storage
-                .get_memory_operation(operation_id)
-                .await?
-                .and_then(|operation| {
-                    operation
-                        .applied_memory_id
-                        .clone()
-                        .or(operation.target_memory_id.clone())
-                });
+            let memory_id =
+                storage
+                    .get_memory_operation(operation_id)
+                    .await?
+                    .and_then(|operation| {
+                        operation
+                            .applied_memory_id
+                            .clone()
+                            .or(operation.target_memory_id.clone())
+                    });
             arkmemory_record_event(
                 storage,
                 "queue_memory_operation_applied",
@@ -39598,7 +40792,7 @@ async fn mcp_handler(
                     .unwrap_or("mcp");
                 let conversation_id = args.get("conversation_id").and_then(|v| v.as_str());
                 let project_id = args.get("project_id").and_then(|v| v.as_str());
-                let agent = state.agent.read().await;
+                let agent = Agent::snapshot(&state.agent).await;
                 let caller = maybe_caller.as_ref().map(|Extension(value)| value);
                 match agent
                     .process_message_with_meta_and_hints(
@@ -41340,6 +42534,44 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    #[test]
+    fn clarification_choices_from_operational_payload_requires_true_clarification_flag() {
+        let payload = serde_json::json!({
+            "should_clarify": false,
+            "choices": [{
+                "label": "Build and deploy",
+                "submit_text": "Build and deploy it as an isolated AgentArk app."
+            }]
+        })
+        .to_string();
+
+        let choices = clarification_choices_from_operational_payload(Some(&payload));
+
+        assert!(choices.is_empty());
+    }
+
+    #[test]
+    fn clarification_choices_from_operational_payload_keeps_real_clarifications() {
+        let payload = serde_json::json!({
+            "should_clarify": true,
+            "clarification_question": "Workspace or app?",
+            "choices": [{
+                "label": "Workspace only",
+                "submit_text": "Only build the files in the workspace."
+            }]
+        })
+        .to_string();
+
+        let choices = clarification_choices_from_operational_payload(Some(&payload));
+
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].label, "Workspace only");
+        assert_eq!(
+            choices[0].submit_text,
+            "Only build the files in the workspace."
+        );
+    }
+
     async fn add_test_task(state: &AppState, task: crate::core::Task) {
         let agent = state.agent.read().await;
         agent
@@ -41959,6 +43191,29 @@ mod tests {
             r#"cd /app/data/apps/demo && rg -n "git\s*=|path\s*=" Cargo.toml | cat"#,
         );
         assert!(plan.is_none());
+    }
+
+    #[test]
+    fn arkpulse_readonly_investigation_remediation_maps_to_fix_plan() {
+        let plan = arkpulse_fix_plan_from_remediation(
+            &crate::sentinel::DoctorRemediationSpec::ReadonlyInvestigation {
+                topic: crate::sentinel::DoctorReadonlyInvestigationTopic::MemoryCaptureHealth,
+            },
+            false,
+        );
+
+        match plan {
+            Some(ArkPulseFixPlan::ReadonlyInvestigation { topic }) => {
+                assert_eq!(
+                    topic,
+                    crate::sentinel::DoctorReadonlyInvestigationTopic::MemoryCaptureHealth
+                );
+            }
+            other => panic!(
+                "expected readonly investigation plan, got {:?}",
+                other.map(|_| ())
+            ),
+        }
     }
 
     #[test]
@@ -43535,6 +44790,151 @@ const appWrapped = "/apps/demo-app/__agentark/http/fetch?url=https://api.github.
             .contains("stored ArkPulse finding"));
     }
 
+    #[tokio::test]
+    async fn arkpulse_fix_skips_missing_app_restart_and_cleans_stale_state() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        let app_id = "cad20c5e";
+        let storage = {
+            let agent = state.agent.read().await;
+            agent.storage.clone()
+        };
+        storage
+            .insert_notification(&crate::storage::entities::notification::Model {
+                id: "notif-stale-app".to_string(),
+                title: format!("App {} unavailable", app_id),
+                body: format!("App {} failed its last probe.", app_id),
+                level: "warning".to_string(),
+                source: "app_status".to_string(),
+                read: false,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await
+            .expect("notification should be inserted");
+        let pulse_event = crate::sentinel::PulseEvent {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            status: "error".to_string(),
+            message: "App root probe failed".to_string(),
+            summary: String::new(),
+            flags: vec!["app".to_string()],
+            overdue_tasks: 0,
+            failed_tasks: 0,
+            details: crate::sentinel::PulseDetails {
+                deployed_apps: vec![crate::sentinel::AppPulseInfo {
+                    id: app_id.to_string(),
+                    title: "arXiv Live Feed".to_string(),
+                    is_static: true,
+                    process_alive: false,
+                    requests_since_last_check: 0,
+                    idle_hours: 0,
+                }],
+                doctor_findings: vec![crate::sentinel::DoctorFinding {
+                    severity: "high".to_string(),
+                    category: "app".to_string(),
+                    target: format!("http://127.0.0.1:8990/apps/{}/", app_id),
+                    title: "Restart missing app".to_string(),
+                    evidence: "App root probe failed".to_string(),
+                    root_cause: "App directory no longer exists".to_string(),
+                    fix_command: format!("POST /api/apps/{}/restart", app_id),
+                    remediation: Some(crate::sentinel::DoctorRemediationSpec::AppRestart {
+                        app_id: app_id.to_string(),
+                    }),
+                    user_actionable: true,
+                }],
+                ..crate::sentinel::PulseDetails::default()
+            },
+        };
+        storage
+            .insert_arkpulse_event(&crate::storage::arkpulse_event::Model {
+                id: "pulse-stale-app".to_string(),
+                timestamp: pulse_event.timestamp.clone(),
+                status: pulse_event.status.clone(),
+                message: pulse_event.message.clone(),
+                summary: pulse_event.summary.clone(),
+                flags_json: serde_json::to_string(&pulse_event.flags).expect("flags json"),
+                overdue_tasks: pulse_event.overdue_tasks as i32,
+                failed_tasks: pulse_event.failed_tasks as i32,
+                details_json: serde_json::to_string(&pulse_event.details).expect("details json"),
+            })
+            .await
+            .expect("pulse event should be inserted");
+
+        let router = Router::new()
+            .route("/arkpulse/fix", post(run_arkpulse_fix))
+            .with_state(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/arkpulse/fix")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "issue_title": "App root probe failed",
+                    "target": format!("http://127.0.0.1:8990/apps/{}/", app_id),
+                    "remediation": {
+                        "kind": "app_restart",
+                        "app_id": app_id
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(
+            body.get("status").and_then(|value| value.as_str()),
+            Some("ok")
+        );
+        assert_eq!(
+            body.get("skipped").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            body.get("reason").and_then(|value| value.as_str()),
+            Some("missing_on_disk")
+        );
+        assert_eq!(
+            body.get("deleted_notifications")
+                .and_then(|value| value.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            body.get("deleted_pulse_events")
+                .and_then(|value| value.as_u64()),
+            Some(1)
+        );
+
+        assert_eq!(
+            storage
+                .list_notifications(10, 0, false)
+                .await
+                .expect("notifications should list")
+                .len(),
+            0
+        );
+        assert_eq!(
+            storage
+                .count_arkpulse_events()
+                .await
+                .expect("pulse rows should count"),
+            0
+        );
+    }
+
+    #[test]
+    fn describe_arkpulse_remediation_prefers_readonly_investigation_summary() {
+        let summary = describe_arkpulse_remediation(
+            Some(
+                &crate::sentinel::DoctorRemediationSpec::ReadonlyInvestigation {
+                    topic: crate::sentinel::DoctorReadonlyInvestigationTopic::MemoryCaptureHealth,
+                },
+            ),
+            "",
+        );
+
+        assert_eq!(summary, "Review failed memory captures and model health");
+    }
+
     #[test]
     fn parse_set_secret_command_rejects_normalized_paraphrases() {
         assert_eq!(
@@ -43829,6 +45229,166 @@ const appWrapped = "/apps/demo-app/__agentark/http/fetch?url=https://api.github.
             .regressions
             .iter()
             .any(|line| line.contains("p95 latency regressed")));
+    }
+
+    #[test]
+    fn build_prompt_optimization_opportunities_include_change_preview() {
+        let summary = PromptTelemetrySummary {
+            sample_count: 8,
+            p95_final_prompt_chars: 31_862,
+            p95_tool_schema_chars: 59_986,
+            p95_estimated_total_request_chars: 93_042,
+            top_sections: vec![PromptTelemetrySectionSummary {
+                section: "runtime_access_summary".to_string(),
+                samples: 8,
+                avg_chars: 1_640.0,
+                p50_chars: 1_540,
+                p95_chars: 1_962,
+            }],
+            ..PromptTelemetrySummary::default()
+        };
+
+        let proposals = build_prompt_optimization_opportunities(
+            &summary,
+            &PromptOptimizationReviewState::new(),
+        );
+        let proposal = proposals
+            .iter()
+            .find(|item| item.id == "prompt-opt-runtime-summary-compact")
+            .expect("runtime summary proposal should exist");
+
+        assert!(proposal
+            .change_preview
+            .before
+            .iter()
+            .any(|line| line.contains("1,962 chars")));
+        assert!(proposal
+            .change_preview
+            .after
+            .iter()
+            .any(|line| line.contains("compact runtime-access profile")));
+        assert!(proposal
+            .change_preview
+            .impact_estimate
+            .iter()
+            .any(|line| line.contains("6.2%")));
+    }
+
+    #[test]
+    fn build_learning_candidate_summary_includes_strategy_preview() {
+        let candidate = crate::storage::learning_candidate::Model {
+            id: "candidate-strategy-1".to_string(),
+            candidate_type: "strategy".to_string(),
+            subject_key: "pattern-1".to_string(),
+            title: "Strategy candidate".to_string(),
+            summary: Some("Generated from repeated procedural success.".to_string()),
+            project_id: None,
+            conversation_id: None,
+            pattern_id: Some("pattern-1".to_string()),
+            evidence_refs: serde_json::json!(["pattern-1"]),
+            proposed_content: serde_json::json!({
+                "version": "learned-strategy-abc123",
+                "default_guidance": [
+                    "Prefer proven local procedures before improvising a new tool plan."
+                ],
+                "task_guidance": {
+                    "research": [
+                        "When the request matches `research`, prefer the learned procedure `Investigate`.",
+                        "When the environment matches, start with tools in this order: search -> fetch."
+                    ]
+                }
+            }),
+            confidence: 0.88,
+            approval_status: "draft".to_string(),
+            review_notes: None,
+            reviewed_at: None,
+            approved_ref: None,
+            created_at: "2026-04-20T00:00:00Z".to_string(),
+            updated_at: "2026-04-20T00:00:00Z".to_string(),
+        };
+
+        let summary = build_learning_candidate_summary(&candidate);
+        let preview = summary
+            .get("proposed_content_preview")
+            .and_then(|value| value.as_object())
+            .expect("strategy preview should be present");
+
+        assert_eq!(
+            preview
+                .get("strategy_version")
+                .and_then(|value| value.as_str()),
+            Some("learned-strategy-abc123")
+        );
+        assert!(preview
+            .get("default_guidance")
+            .and_then(|value| value.as_array())
+            .expect("default guidance")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .any(|line| line.contains("Prefer proven local procedures")));
+        assert!(preview
+            .get("task_guidance")
+            .and_then(|value| value.as_array())
+            .expect("task guidance")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .any(|line| line.starts_with("research:")));
+    }
+
+    #[test]
+    fn build_learning_candidate_summary_masks_sensitive_memory_preview() {
+        let candidate = crate::storage::learning_candidate::Model {
+            id: "memory-candidate-1".to_string(),
+            candidate_type: "memory_update".to_string(),
+            subject_key: "home_base".to_string(),
+            title: "Review memory update".to_string(),
+            summary: Some("Replace stale location memory.".to_string()),
+            project_id: None,
+            conversation_id: None,
+            pattern_id: None,
+            evidence_refs: serde_json::json!(["capture-1"]),
+            proposed_content: serde_json::json!({
+                "operation_type": "update",
+                "semantic_key": "home_base",
+                "value": "ssh-key: super-secret-value",
+                "memory_kind": "location",
+                "scope": "global",
+                "durability": "permanent",
+                "looks_sensitive": true,
+                "sensitive_reason": "credential-like content"
+            }),
+            confidence: 0.91,
+            approval_status: "draft".to_string(),
+            review_notes: None,
+            reviewed_at: None,
+            approved_ref: None,
+            created_at: "2026-04-20T00:00:00Z".to_string(),
+            updated_at: "2026-04-20T00:00:00Z".to_string(),
+        };
+
+        let summary = build_learning_candidate_summary(&candidate);
+        let preview = summary
+            .get("proposed_content_preview")
+            .and_then(|value| value.as_object())
+            .expect("memory preview should be present");
+
+        assert_eq!(
+            preview
+                .get("operation_type")
+                .and_then(|value| value.as_str()),
+            Some("update")
+        );
+        assert_eq!(
+            preview.get("semantic_key").and_then(|value| value.as_str()),
+            Some("home_base")
+        );
+        assert_eq!(preview.get("value_preview"), Some(&serde_json::Value::Null));
+        assert_eq!(
+            preview
+                .get("looks_sensitive")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
     }
 
     fn test_model_slot(provider: LlmProvider) -> ModelSlot {

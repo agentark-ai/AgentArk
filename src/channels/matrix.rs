@@ -537,8 +537,8 @@ pub async fn sync_once(
 
             update_room_context(&mut state, room_id, event, &conversation_id);
             let result = {
-                let guard = agent.read().await;
-                guard
+                let agent_snapshot = Agent::snapshot(agent).await;
+                agent_snapshot
                     .process_message_with_meta(&body, "matrix", Some(&conversation_id), None)
                     .await
             };

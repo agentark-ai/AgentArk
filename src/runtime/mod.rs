@@ -96,6 +96,39 @@ impl std::fmt::Display for MissingSecretPlaceholder {
 
 impl std::error::Error for MissingSecretPlaceholder {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolPathAccessError {
+    OutsideAllowedRoots {
+        attempted_path: PathBuf,
+        allowed_roots: Vec<PathBuf>,
+    },
+}
+
+impl std::fmt::Display for ToolPathAccessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OutsideAllowedRoots {
+                attempted_path,
+                allowed_roots,
+            } => {
+                let roots = allowed_roots
+                    .iter()
+                    .map(|root| root.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "Path '{}' is outside allowed roots: {}",
+                    attempted_path.display(),
+                    roots
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ToolPathAccessError {}
+
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
@@ -1185,17 +1218,11 @@ print(json.dumps({
         if allowed_roots.iter().any(|root| candidate.starts_with(root)) {
             return Ok(());
         }
-
-        let roots = allowed_roots
-            .iter()
-            .map(|root| root.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        anyhow::bail!(
-            "Path '{}' is outside allowed roots: {}",
-            candidate.display(),
-            roots
-        );
+        Err(ToolPathAccessError::OutsideAllowedRoots {
+            attempted_path: candidate.to_path_buf(),
+            allowed_roots,
+        }
+        .into())
     }
 
     fn resolve_tool_read_path(&self, raw: &str) -> Result<PathBuf> {
@@ -3653,13 +3680,21 @@ print(json.dumps({
         self.load_builtin_actions().await?;
 
         // Load user-added skills from data dir
-        if self.actions_dir.exists() {
+        let has_actions_dir = tokio::fs::metadata(&self.actions_dir)
+            .await
+            .map(|meta| meta.is_dir())
+            .unwrap_or(false);
+        if has_actions_dir {
             tracing::info!("Loading user skills from {:?}", self.actions_dir);
             self.load_markdown_actions(&self.actions_dir, ActionSource::Custom)
                 .await?;
         }
 
-        if self.cli_skills_dir.exists() {
+        let has_cli_skills_dir = tokio::fs::metadata(&self.cli_skills_dir)
+            .await
+            .map(|meta| meta.is_dir())
+            .unwrap_or(false);
+        if has_cli_skills_dir {
             tracing::info!(
                 "Loading installed CLI skills from {:?}",
                 self.cli_skills_dir
@@ -5986,7 +6021,7 @@ print(json.dumps({
         self.register_builtin_action(ActionDef {
             name: "app_deploy".to_string(),
             description: format!(
-                "Deploy a web app or server and return a live URL. Supports either generated files OR a repository source. Use when asked to build a dashboard, create a tool, make a website, build an app, or deploy/run a repo locally for the user. For file-based apps, provide a `files` object. For repo-based apps, provide `repo_url` (and optionally `repo_ref`, `repo_subdir`, `service_mode`) so {} can clone the repo, inspect the README/manifests, stand up the detected frontend/backend services, and return managed endpoints. For generated file bundles, only request a dynamic runtime when it is genuinely needed by setting `runtime_required=true` and providing an `entry_command` (optionally `runtime_reason`). Otherwise the bundle is treated as a static/local app. Repo-based deploys default to container runtime unless overridden. Dynamic app containers default to the installed {} image unless `runtime_image` or a runner-image env override is provided. Public exposure stays off unless explicitly requested (`expose_public=true`). Declare required inputs via required_inputs and mark each item sensitive=true/false. Access guard follows the current app-hosting default when omitted for local/private apps. Public exposure requires `access_password`, and providing `access_password` enables App Guard.",
+                "Deploy a web app or server and return a live URL. Supports either generated files OR a repository source. Use when asked to build a dashboard, create a tool, make a website, build an app, or deploy/run a repo locally for the user. For file-based apps, provide a `files` object. To redeploy an existing generated app in place, provide its stable `app_id` along with the new `files` so the same deployed app is updated instead of creating a new id. For repo-based apps, provide `repo_url` (and optionally `repo_ref`, `repo_subdir`, `service_mode`) so {} can clone the repo, inspect the README/manifests, stand up the detected frontend/backend services, and return managed endpoints. For generated file bundles, only request a dynamic runtime when it is genuinely needed by setting `runtime_required=true` and providing an `entry_command` (optionally `runtime_reason`). Otherwise the bundle is treated as a static/local app. Repo-based deploys default to container runtime unless overridden. Dynamic app containers default to the installed {} image unless `runtime_image` or a runner-image env override is provided. Public exposure stays off unless explicitly requested (`expose_public=true`). Declare required inputs via required_inputs and mark each item sensitive=true/false. Access guard follows the current app-hosting default when omitted for local/private apps. Public exposure requires `access_password`, and providing `access_password` enables App Guard.",
                 crate::branding::PRODUCT_NAME,
                 crate::branding::PRODUCT_NAME
             ),
@@ -5994,6 +6029,10 @@ print(json.dumps({
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
+                    "app_id": {
+                        "type": "string",
+                        "description": "Optional stable deployed app id to update in place. Use this only when modifying an existing generated app; omit it to create a new app."
+                    },
                     "files": {
                         "type": "object",
                         "description": "Object mapping filename to file content. e.g. {\"index.html\": \"<html>...\", \"style.css\": \"body{...}\", \"app.py\": \"from fastapi import...\"}"
@@ -7068,7 +7107,7 @@ print(json.dumps({
     }
 
     async fn load_cli_skill_actions(&self) -> Result<()> {
-        let entries = match std::fs::read_dir(&self.cli_skills_dir) {
+        let mut entries = match tokio::fs::read_dir(&self.cli_skills_dir).await {
             Ok(entries) => entries,
             Err(e) => {
                 tracing::warn!(
@@ -7080,15 +7119,27 @@ print(json.dumps({
             }
         };
 
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let is_dir = entry
+                .file_type()
+                .await
+                .map(|file_type| file_type.is_dir())
+                .unwrap_or(false);
+            if !is_dir {
                 continue;
             }
-
+            let path = entry.path();
             let manifest_path = path.join("manifest.json");
             let skill_path = path.join("SKILL.md");
-            if !manifest_path.exists() || !skill_path.exists() {
+            let manifest_exists = tokio::fs::metadata(&manifest_path)
+                .await
+                .map(|meta| meta.is_file())
+                .unwrap_or(false);
+            let skill_exists = tokio::fs::metadata(&skill_path)
+                .await
+                .map(|meta| meta.is_file())
+                .unwrap_or(false);
+            if !manifest_exists || !skill_exists {
                 continue;
             }
 
@@ -14274,14 +14325,6 @@ print(result["text"])
         dir.join("SKILL.md")
     }
 
-    fn resolve_skill_markdown_path(dir: &Path) -> Option<std::path::PathBuf> {
-        let skill_md = dir.join("SKILL.md");
-        if skill_md.exists() {
-            return Some(skill_md);
-        }
-        None
-    }
-
     /// Update action content - for bundled actions, creates a custom copy first
     pub async fn update_action_content(&self, name: &str, content: &str) -> Result<bool> {
         let (source, file_path) = {
@@ -16217,12 +16260,16 @@ required:{required_block}
     /// Looks for SKILL.md files in subdirectories.
     /// These are registered as workflow actions for LLM-driven execution
     pub async fn load_markdown_actions(&self, dir: &Path, source: ActionSource) -> Result<()> {
-        if !dir.exists() {
+        let dir_exists = tokio::fs::metadata(dir)
+            .await
+            .map(|meta| meta.is_dir())
+            .unwrap_or(false);
+        if !dir_exists {
             return Ok(());
         }
 
         // Read directory entries
-        let entries = match std::fs::read_dir(dir) {
+        let mut entries = match tokio::fs::read_dir(dir).await {
             Ok(e) => e,
             Err(e) => {
                 tracing::warn!("Could not read skills directory {:?}: {}", dir, e);
@@ -16230,15 +16277,24 @@ required:{required_block}
             }
         };
 
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let is_dir = entry
+                .file_type()
+                .await
+                .map(|file_type| file_type.is_dir())
+                .unwrap_or(false);
+            if !is_dir {
                 continue;
             }
-
-            let Some(md_file) = Self::resolve_skill_markdown_path(&path) else {
+            let path = entry.path();
+            let md_file = path.join("SKILL.md");
+            let md_exists = tokio::fs::metadata(&md_file)
+                .await
+                .map(|meta| meta.is_file())
+                .unwrap_or(false);
+            if !md_exists {
                 continue;
-            };
+            }
 
             match self.parse_action_md(&md_file, source.clone()).await {
                 Ok((info, workflow_content, frontmatter)) => {
@@ -16521,6 +16577,17 @@ pub(crate) fn load_persisted_search_config(
         .unwrap_or_default()
 }
 
+pub(crate) async fn load_persisted_search_config_async(
+    config_dir: PathBuf,
+    data_dir: Option<PathBuf>,
+) -> crate::actions::SearchConfig {
+    tokio::task::spawn_blocking(move || {
+        load_persisted_search_config(&config_dir, data_dir.as_deref())
+    })
+    .await
+    .unwrap_or_default()
+}
+
 pub(crate) fn save_persisted_search_config(
     config_dir: &Path,
     data_dir: Option<&Path>,
@@ -16537,6 +16604,18 @@ pub(crate) fn save_persisted_search_config(
     Ok(())
 }
 
+pub(crate) async fn save_persisted_search_config_async(
+    config_dir: PathBuf,
+    data_dir: Option<PathBuf>,
+    config: crate::actions::SearchConfig,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        save_persisted_search_config(&config_dir, data_dir.as_deref(), &config)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("search config persistence task failed: {}", error))?
+}
+
 /// Build search config: loads user settings from persistent settings storage,
 /// injects API-backed secrets, auto-detects runtime-provided builtins such as
 /// Lightpanda and the Playwright bridge, and applies the default free fallback
@@ -16545,7 +16624,7 @@ pub(crate) async fn build_search_config(
     config_dir: &Path,
     storage: Option<&crate::storage::Storage>,
 ) -> crate::actions::SearchConfig {
-    let mut config = load_persisted_search_config(config_dir, None);
+    let mut config = load_persisted_search_config_async(config_dir.to_path_buf(), None).await;
 
     if let Ok(manager) = crate::core::config::SecureConfigManager::new(config_dir) {
         if let Ok(secrets) = manager.load_secrets() {

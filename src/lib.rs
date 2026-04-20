@@ -44,6 +44,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use tracing_subscriber::fmt::{format::Writer, time::FormatTime};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
@@ -292,6 +293,15 @@ fn print_unix_cli_banner_with_color(mode: &str, color: Option<&str>) {
     println!("{}{}{}", prefix, rule, suffix);
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct HumanReadableUtcLogTime;
+
+impl FormatTime for HumanReadableUtcLogTime {
+    fn format_time(&self, w: &mut Writer<'_>) -> std::fmt::Result {
+        write!(w, "{}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"))
+    }
+}
+
 pub async fn run() -> Result<()> {
     let args = Args::parse();
 
@@ -318,6 +328,7 @@ pub async fn run() -> Result<()> {
         .with(env_filter)
         .with(
             tracing_subscriber::fmt::layer()
+                .with_timer(HumanReadableUtcLogTime)
                 .with_target(false)
                 .with_thread_ids(false)
                 .with_thread_names(false),
@@ -967,6 +978,13 @@ fn describe_cli_pulse_remediation(finding: &crate::sentinel::DoctorFinding) -> O
         }
         Some(crate::sentinel::DoctorRemediationSpec::AppRestart { app_id }) => {
             Some(format!("Restart app {} and re-check health", app_id))
+        }
+        Some(crate::sentinel::DoctorRemediationSpec::ReadonlyInvestigation { topic }) => {
+            Some(match topic {
+                crate::sentinel::DoctorReadonlyInvestigationTopic::MemoryCaptureHealth => {
+                    "Review failed memory captures and model health".to_string()
+                }
+            })
         }
         Some(crate::sentinel::DoctorRemediationSpec::ShellCommand { command }) => {
             let normalized = command.trim();

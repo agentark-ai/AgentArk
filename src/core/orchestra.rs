@@ -82,6 +82,7 @@ impl SubAgentType {
 }
 
 /// The main orchestration controller
+#[derive(Clone)]
 pub struct Orchestra {
     _config: OrchestraConfig,
 }

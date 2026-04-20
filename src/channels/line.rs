@@ -336,9 +336,9 @@ pub async fn handle_webhook(
         }
 
         let response = {
-            let guard = agent.read().await;
-            persist_destination(&guard, &destination).await?;
-            let processed = guard
+            let agent_snapshot = Agent::snapshot(&agent).await;
+            persist_destination(&agent_snapshot, &destination).await?;
+            let processed = agent_snapshot
                 .process_message_with_meta(text.as_str(), "line", Some(&conversation_id), None)
                 .await?;
             Agent::render_plain_channel_response(processed)

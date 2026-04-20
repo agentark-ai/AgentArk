@@ -2,14 +2,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::Result;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::core::self_evolve::skill_evolution::{self, SkillMetricsSnapshot, SkillWindowDirection};
 use crate::core::{ExecutionRun, ExecutionRunStatus, ToolAttempt};
 use crate::storage::{
-    KvLeaseGuard, Storage, experience_edge, experience_item, experience_run, learning_candidate,
-    procedural_pattern,
+    experience_edge, experience_item, experience_run, learning_candidate, procedural_pattern,
+    KvLeaseGuard, Storage,
 };
 
 pub const LEARNING_ENABLED_KEY: &str = "learning_enabled_v1";
@@ -2093,7 +2093,25 @@ pub async fn run_candidate_generation(storage: &Storage, data_dir: &Path) -> Res
 
     let result = async {
         let cap = load_learning_queue_cap(storage).await as u64;
-        let skill_catalog = skill_evolution::load_skill_catalog(data_dir).unwrap_or_default();
+        let skill_catalog = {
+            let data_dir = data_dir.to_path_buf();
+            match tokio::task::spawn_blocking(move || skill_evolution::load_skill_catalog(&data_dir))
+                .await
+            {
+                Ok(Ok(catalog)) => catalog,
+                Ok(Err(error)) => {
+                    tracing::warn!("Failed to load skill catalog during candidate generation: {}", error);
+                    Vec::new()
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "Skill catalog loader task failed during candidate generation: {}",
+                        error
+                    );
+                    Vec::new()
+                }
+            }
+        };
         let known_skill_names = skill_catalog
             .iter()
             .map(|entry| entry.name.trim().to_ascii_lowercase())
@@ -2752,11 +2770,9 @@ mod tests {
         };
         let action_name = candidate_action_name(&pattern);
         assert!(action_name.starts_with("learned-fix-tool-bug-flow"));
-        assert!(
-            action_name
-                .chars()
-                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
-        );
+        assert!(action_name
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-'));
     }
 
     #[test]
