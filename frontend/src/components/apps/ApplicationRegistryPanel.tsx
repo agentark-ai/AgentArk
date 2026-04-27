@@ -54,10 +54,10 @@ async function copyText(value: string): Promise<void> {
 
 function stateDotColor(state: string): string {
   const normalized = state.trim().toLowerCase();
-  if (normalized === "running") return "rgba(74,210,157,0.85)";
-  if (normalized === "failed") return "rgba(255,100,100,0.85)";
-  if (normalized === "stopped" || normalized === "completed") return "rgba(255,191,130,0.85)";
-  return "rgba(180,200,220,0.5)";
+  if (normalized === "running") return "var(--ui-rgba-74-210-157-850)";
+  if (normalized === "failed") return "var(--ui-rgba-255-100-100-850)";
+  if (normalized === "stopped" || normalized === "completed") return "var(--ui-rgba-255-191-130-850)";
+  return "var(--ui-rgba-180-200-220-500)";
 }
 
 export function ApplicationRegistryPanel({ autoRefresh }: { autoRefresh: boolean }) {
@@ -222,7 +222,7 @@ export function ApplicationRegistryPanel({ autoRefresh }: { autoRefresh: boolean
                 (stopMutation.isPending && stopMutation.variables?.id === id);
 
               return (
-                <Box key={id} sx={{ width: "100%", px: 0, py: 1.15, borderBottom: "1px solid", borderColor: "divider", transition: "background 0.15s ease", "&:hover": { background: "rgba(57, 208, 255, 0.04)" } }}>
+                <Box key={id} sx={{ width: "100%", px: 0, py: 1.15, borderBottom: "1px solid", borderColor: "divider", transition: "background 0.15s ease", "&:hover": { background: "var(--ui-rgba-57-208-255-040)" } }}>
                   <Stack spacing={0.75}>
                     {/* Line 1: dot + name ... status text */}
                     <Stack direction="row" sx={{ alignItems: "center", justifyContent: "space-between", gap: 1 }}>
@@ -462,7 +462,7 @@ export function ApplicationRegistryPanel({ autoRefresh }: { autoRefresh: boolean
                             </Typography>
                           ) : null}
                           {currentCommand ? (
-                            <Typography variant="caption" sx={{ wordBreak: "break-all", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", color: "rgba(191, 223, 255, 0.84)" }}>
+                            <Typography variant="caption" sx={{ wordBreak: "break-all", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", color: "var(--ui-rgba-191-223-255-840)" }}>
                               {currentCommand}
                             </Typography>
                           ) : null}

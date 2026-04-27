@@ -86,8 +86,8 @@ export function MetricBarCard({
       sx={{
         p: compact ? 1.15 : 1.6,
         borderRadius: "8px",
-        border: "1px solid rgba(108,156,212,0.18)",
-        background: "rgba(12, 18, 28, 0.86)",
+        border: "1px solid var(--ui-rgba-108-156-212-180)",
+        background: "var(--ui-rgba-12-18-28-860)",
       }}
     >
       <Typography variant="subtitle1" className="metric-bar-card-title">
@@ -97,6 +97,22 @@ export function MetricBarCard({
         {value}
       </Typography>
       {hasMeaningfulData ? (
+        visibleRows.length <= 1 ? (
+          <Typography
+            variant="body2"
+            sx={{
+              color: "text.secondary",
+              mt: compact ? 0.5 : 0.75,
+              display: "block",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+            title={visibleRows[0]?.label ?? ""}
+          >
+            {visibleRows.length === 1 ? `via ${visibleRows[0].label}` : ""}
+          </Typography>
+        ) : (
         <>
           <Box
             className="metric-bar-card-meter"
@@ -108,9 +124,9 @@ export function MetricBarCard({
               display: "flex",
               gap: "2px",
               padding: "1px",
-              background: "rgba(108,156,212,0.06)",
-              border: "1px solid rgba(108,156,212,0.12)",
-              boxShadow: "inset 0 1px 0 rgba(255,255,255,0.03)",
+              background: "var(--ui-rgba-108-156-212-060)",
+              border: "1px solid var(--ui-rgba-108-156-212-120)",
+              boxShadow: "inset 0 1px 0 var(--ui-rgba-255-255-255-030)",
               overflow: "hidden",
               position: "relative",
             }}
@@ -153,21 +169,21 @@ export function MetricBarCard({
                         minWidth: 4,
                         borderRadius: 999,
                         background: `linear-gradient(90deg, ${seg.color} 0%, ${seg.color}B8 55%, ${seg.color}66 100%)`,
-                        boxShadow: `0 0 14px ${seg.color}55, inset 0 1px 0 rgba(255,255,255,0.18)`,
+                        boxShadow: `0 0 14px ${seg.color}55, inset 0 1px 0 var(--ui-rgba-255-255-255-180)`,
                         position: "relative",
                         overflow: "hidden",
                         transition:
                           "filter 180ms ease, box-shadow 180ms ease, transform 180ms ease",
                         "&:hover": {
                           filter: "brightness(1.15)",
-                          boxShadow: `0 0 22px ${seg.color}99, inset 0 1px 0 rgba(255,255,255,0.25)`,
+                          boxShadow: `0 0 22px ${seg.color}99, inset 0 1px 0 var(--ui-rgba-255-255-255-250)`,
                         },
                         "&::after": {
                           content: '""',
                           position: "absolute",
                           inset: 0,
                           background:
-                            "linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.22) 50%, transparent 100%)",
+                            "linear-gradient(90deg, transparent 0%, var(--ui-rgba-255-255-255-220) 50%, transparent 100%)",
                           transform: "translateX(-100%)",
                           animation:
                             "metric-meter-shimmer 3.2s ease-in-out infinite",
@@ -186,7 +202,7 @@ export function MetricBarCard({
                   flex: 1,
                   borderRadius: 999,
                   background:
-                    "linear-gradient(90deg, rgba(108,156,212,0.10), rgba(108,156,212,0.04))",
+                    "linear-gradient(90deg, var(--ui-rgba-108-156-212-100), var(--ui-rgba-108-156-212-040))",
                 }}
               />
             )}
@@ -239,6 +255,7 @@ export function MetricBarCard({
             ))}
           </Stack>
         </>
+        )
       ) : (
         <Typography variant="body2" className="metric-bar-card-empty-copy">
           No usage in the selected range yet.

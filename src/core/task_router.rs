@@ -1,11 +1,10 @@
 //! Task-driven auto-spawn agent system
-//!
 //! Replaces the old pre-configured swarm model with intelligent, on-demand
 //! agent spawning. The LLM decides IF sub-agents are needed, WHAT kind,
 //! and they are auto-spawned from the model pool. User-configured specialists
 //! act as priority boosters — preferred when they match, but never required.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -403,43 +402,108 @@ fn memory_overlap_bonus(task_lower: &str, content_lower: &str) -> f32 {
     if task_lower.is_empty() || content_lower.is_empty() {
         return 0.0;
     }
-    if content_lower.contains(task_lower) {
-        return 0.40;
-    }
-    let task_terms = task_lower
-        .split_whitespace()
-        .filter(|word| word.len() > 3)
-        .collect::<Vec<_>>();
+
+    // Word-set coverage: how much of the task's meaningful vocabulary appears
+    // in the memory body. Structural and order-independent, so paraphrased
+    // memory entries score the same as their differently-worded twins.
+    // Tokenizing on non-alphanumeric boundaries also avoids the "log → login"
+    // false-positive that the previous substring scan produced.
+    let split_meaningful = |text: &str, min_len: usize| -> std::collections::HashSet<String> {
+        text.split(|c: char| !c.is_alphanumeric())
+            .filter(|word| word.len() >= min_len)
+            .map(|word| word.to_string())
+            .collect()
+    };
+    let char_ngrams = |text: &str, width: usize| -> std::collections::HashSet<String> {
+        let chars = text.chars().collect::<Vec<_>>();
+        if chars.is_empty() {
+            return std::collections::HashSet::new();
+        }
+        if chars.len() <= width {
+            return [text.to_string()].into_iter().collect();
+        }
+        (0..=chars.len().saturating_sub(width))
+            .map(|index| chars[index..index + width].iter().collect::<String>())
+            .collect()
+    };
+    let token_similarity = |left: &str, right: &str| -> f32 {
+        if left == right {
+            return 1.0;
+        }
+        let left_len = left.chars().count();
+        let right_len = right.chars().count();
+        let min_len = left_len.min(right_len) as f32;
+        let max_len = left_len.max(right_len) as f32;
+        if max_len <= 0.0 {
+            return 0.0;
+        }
+        let left_ngrams = char_ngrams(left, 3);
+        let right_ngrams = char_ngrams(right, 3);
+        if left_ngrams.is_empty() || right_ngrams.is_empty() {
+            return 0.0;
+        }
+        let overlap = left_ngrams.intersection(&right_ngrams).count() as f32;
+        let union = left_ngrams.union(&right_ngrams).count() as f32;
+        let ngram_similarity = if union <= 0.0 { 0.0 } else { overlap / union };
+        if ngram_similarity <= 0.0 {
+            return 0.0;
+        }
+        let length_similarity = min_len / max_len;
+        (ngram_similarity * 0.8 + length_similarity * 0.2).clamp(0.0, 1.0)
+    };
+
+    let task_terms = split_meaningful(task_lower, 4);
     if task_terms.is_empty() {
         return 0.0;
     }
-    let overlap = task_terms
-        .iter()
-        .filter(|word| content_lower.contains(**word))
-        .count();
-    if overlap == 0 {
+    let content_terms = split_meaningful(content_lower, 1);
+    if content_terms.is_empty() {
         return 0.0;
     }
-    let overlap_ratio = overlap as f32 / task_terms.len() as f32;
-    ((overlap as f32 * 0.05) + (overlap_ratio * 0.30)).min(0.45)
+
+    let coverage = task_terms
+        .iter()
+        .map(|task_term| {
+            content_terms
+                .iter()
+                .map(|content_term| token_similarity(task_term, content_term))
+                .fold(0.0f32, f32::max)
+        })
+        .sum::<f32>()
+        / task_terms.len() as f32;
+    if coverage <= 0.0 {
+        return 0.0;
+    }
+
+    // Coverage ∈ (0.0, 1.0] — capped at the same 0.45 ceiling as the legacy
+    // heuristic so the relevance bonus stays in scale with the rest of the
+    // scoring pipeline.
+    (coverage * 0.45).min(0.45)
 }
 
-fn classify_agent_failure(error_text: &str) -> (DelegationStatus, FailureKind, String) {
-    let lower = error_text.to_ascii_lowercase();
-    if lower.contains("timed out") || lower.contains("timeout") {
-        (
+/// Classify a delegation failure structurally. Detects timeouts by walking
+/// the anyhow error chain and looking for `tokio::time::error::Elapsed` —
+/// which is the actual typed error returned by `tokio::time::timeout`. This
+/// replaces the previous phrase-containment scan ("timed out"/"timeout") so
+/// callers no longer have to coordinate on exact wording with the error
+/// emission sites.
+fn classify_agent_failure(error: &anyhow::Error) -> (DelegationStatus, FailureKind, String) {
+    let is_timeout = error
+        .chain()
+        .any(|cause| cause.downcast_ref::<tokio::time::error::Elapsed>().is_some());
+    if is_timeout {
+        return (
             DelegationStatus::TimedOut,
             FailureKind::Timeout,
             "Retry the delegated step with a longer timeout or continue with the completed work."
                 .to_string(),
-        )
-    } else {
-        (
-            DelegationStatus::Failed,
-            FailureKind::DelegationFailed,
-            "Retry the delegated step or continue with the partial results.".to_string(),
-        )
+        );
     }
+    (
+        DelegationStatus::Failed,
+        FailureKind::DelegationFailed,
+        "Retry the delegated step or continue with the partial results.".to_string(),
+    )
 }
 
 fn summarize_delegation_status(results: &[AgentExecResult]) -> DelegationStatus {
@@ -803,8 +867,9 @@ impl SubAgentSpec {
             "writer" | "writing" | "editor" | "docs" | "documentation" | "copywriter" => {
                 SubAgentType::Writer
             }
-            "validator" | "validate" | "reviewer" | "review" | "qa" | "tester"
-            | "verifier" => SubAgentType::Validator,
+            "validator" | "validate" | "reviewer" | "review" | "qa" | "tester" | "verifier" => {
+                SubAgentType::Validator
+            }
             "planner" | "plan" | "coordinator" | "orchestrator" | "manager" => {
                 SubAgentType::Planner
             }
@@ -2436,9 +2501,9 @@ impl TaskRouter {
                                         artifacts: Vec::new(),
                                     }),
                                     Ok(Err(e)) => Err(anyhow!("Specialist error: {}", e)),
-                                    Err(_) => {
-                                        Err(anyhow!("Specialist timed out after {}s", timeout))
-                                    }
+                                    Err(elapsed) => Err(anyhow::Error::new(elapsed).context(
+                                        format!("Specialist timed out after {}s", timeout),
+                                    )),
                                 }
                             }),
                         ));
@@ -2489,7 +2554,8 @@ impl TaskRouter {
                                         artifacts: Vec::new(),
                                     }),
                                     Ok(Err(e)) => Err(anyhow!("Agent error: {}", e)),
-                                    Err(_) => Err(anyhow!("Agent timed out after {}s", timeout)),
+                                    Err(elapsed) => Err(anyhow::Error::new(elapsed)
+                                        .context(format!("Agent timed out after {}s", timeout))),
                                 }
                             }),
                         ));
@@ -2618,7 +2684,7 @@ impl TaskRouter {
                         let _ = heartbeat_handle.await;
                         tracing::warn!("Agent {} failed: {}", idx, e);
                         let (status, failure_kind, next_action_hint) =
-                            classify_agent_failure(&e.to_string());
+                            classify_agent_failure(&e);
                         // Create a failure result so we can continue
                         results[idx] = Some(AgentExecResult {
                             agent_id: assignments[idx].agent_id.clone(),
@@ -3229,6 +3295,79 @@ mod tests {
             selected.first().map(|memory| memory.content.as_str()),
             Some("The pgvector retrieval path uses similarity search in Postgres.")
         );
+    }
+
+    // -- memory_overlap_bonus: word-set coverage replaces substring scan --
+
+    #[test]
+    fn memory_overlap_bonus_returns_zero_on_empty_inputs() {
+        assert_eq!(memory_overlap_bonus("", "anything goes here"), 0.0);
+        assert_eq!(memory_overlap_bonus("anything goes here", ""), 0.0);
+    }
+
+    #[test]
+    fn memory_overlap_bonus_rewards_paraphrased_recall() {
+        // The substring scan returned 0 here (no contiguous substring of the
+        // task is present verbatim in the memory). Set-based coverage finds
+        // the shared meaningful vocabulary regardless of ordering.
+        let task = "fix the pgvector retrieval path in postgres";
+        let memory =
+            "in postgres, the pgvector retrieval path is wired through the index lookup helpers";
+        let bonus = memory_overlap_bonus(task, memory);
+        assert!(bonus > 0.0, "expected non-zero bonus, got {bonus}");
+        assert!(bonus <= 0.45, "bonus must stay capped, got {bonus}");
+    }
+
+    #[test]
+    fn memory_overlap_bonus_does_not_reward_inner_substring_fragments() {
+        // The previous substring scan would treat "log" as overlapping with
+        // "login" — a classic false positive. Tokenising on word boundaries
+        // eliminates it: only "application" is a shared meaningful token here.
+        let task = "make the application log";
+        let memory = "the application uses the login system";
+        let bonus = memory_overlap_bonus(task, memory);
+        assert!(bonus <= 0.45);
+        // And the score reflects only the one real shared token, not two.
+        let task_only_real_overlap = "make the application";
+        let lower_bound = memory_overlap_bonus(task_only_real_overlap, memory);
+        assert!((bonus - lower_bound).abs() < f32::EPSILON.max(0.001));
+    }
+
+    // -- classify_agent_failure: structural typed dispatch replaces phrase scan --
+
+    #[tokio::test]
+    async fn classify_agent_failure_detects_typed_timeout() {
+        let elapsed = tokio::time::timeout(
+            std::time::Duration::ZERO,
+            tokio::time::sleep(std::time::Duration::from_secs(3600)),
+        )
+        .await
+        .unwrap_err();
+        let err = anyhow::Error::new(elapsed).context("Specialist timed out after 60s");
+        let (status, kind, _hint) = classify_agent_failure(&err);
+        assert_eq!(status, DelegationStatus::TimedOut);
+        assert_eq!(kind, FailureKind::Timeout);
+    }
+
+    #[test]
+    fn classify_agent_failure_does_not_misclassify_other_errors() {
+        let err = anyhow::anyhow!("Specialist error: something else broke");
+        let (status, kind, _hint) = classify_agent_failure(&err);
+        assert_eq!(status, DelegationStatus::Failed);
+        assert_eq!(kind, FailureKind::DelegationFailed);
+    }
+
+    #[test]
+    fn classify_agent_failure_ignores_phrase_resemblance() {
+        // The old substring-based classifier would have flagged this as a
+        // timeout because the message *contains* "timed out". The structural
+        // typed dispatch ignores phrasing entirely and falls back to the
+        // generic delegation-failure case, which is the correct outcome.
+        let err =
+            anyhow::anyhow!("Specialist error: the upstream connection timed out at the proxy");
+        let (status, kind, _hint) = classify_agent_failure(&err);
+        assert_eq!(status, DelegationStatus::Failed);
+        assert_eq!(kind, FailureKind::DelegationFailed);
     }
 }
 

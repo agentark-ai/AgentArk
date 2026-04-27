@@ -5,8 +5,14 @@ import {
   ButtonBase,
   Chip,
   CircularProgress,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
   Divider,
+  FormControlLabel,
   Stack,
+  Switch,
   Typography,
 } from "@mui/material";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -16,16 +22,21 @@ import { formatUiRelativeDateTimeMeta } from "../lib/dateFormat";
 import { SuggestionRunDialog, type SuggestionRunState } from "./SuggestionRunDialog";
 import { WorkspacePageHeader, WorkspacePageShell } from "./WorkspacePage";
 import type {
-  SentinelBackgroundLearning,
   SentinelFeedResponse,
-  SentinelObservation,
   SentinelProposal,
 } from "../types";
 
 const REFRESH_MS = 8000;
-const SENTINEL_SECTION_PAGE_SIZE = 4;
+const SENTINEL_SECTION_PAGE_SIZE = 12;
+const CHAT_PENDING_LAUNCH_STORAGE_KEY = "agentark.chat.pendingLaunch";
 
 type JsonRecord = Record<string, unknown>;
+type SentinelClarificationChoice = { label: string; submitText: string };
+type SentinelProposalGroup = {
+  key: string;
+  proposal: SentinelProposal;
+  proposals: SentinelProposal[];
+};
 
 function asRecord(value: unknown): JsonRecord {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : {};
@@ -88,16 +99,10 @@ function proposalTone(status: string): "success" | "warning" | "error" | "defaul
 
 function proposalDotColor(status: string): string {
   const tone = proposalTone(status);
-  if (tone === "success") return "rgba(74,210,157,0.85)";
-  if (tone === "warning" || tone === "info") return "rgba(57,208,255,0.85)";
-  if (tone === "error") return "rgba(255,100,100,0.85)";
-  return "rgba(180,200,220,0.5)";
-}
-
-function observationDotColor(priority: number): string {
-  if (priority <= 1) return "rgba(255,100,100,0.85)";
-  if (priority === 2) return "rgba(57,208,255,0.85)";
-  return "rgba(74,210,157,0.85)";
+  if (tone === "success") return "var(--ui-rgba-74-210-157-850)";
+  if (tone === "warning" || tone === "info") return "var(--ui-rgba-57-208-255-850)";
+  if (tone === "error") return "var(--ui-rgba-255-100-100-850)";
+  return "var(--ui-rgba-180-200-220-500)";
 }
 
 function proposalActionLabel(proposal: SentinelProposal): string {
@@ -127,23 +132,8 @@ function sourceKindLabel(value: string): string {
   if (normalized === "in_app_activity") return "Inside AgentArk";
   if (normalized === "connected_service" || normalized === "service_event") return "Connected apps";
   if (normalized === "chat") return "Chat";
-  if (normalized === "observation") return "Recent activity";
+  if (normalized === "observation") return "System signal";
   return humanizeBackgroundKey(normalized);
-}
-
-function observationKindLabel(value: string): string {
-  const normalized = value.trim().toLowerCase();
-  if (!normalized) return "Observation";
-  if (normalized === "pattern" || normalized === "pattern_match") return "Repeated pattern";
-  if (normalized === "opportunity") return "Opportunity";
-  if (normalized === "risk") return "Heads-up";
-  return humanizeBackgroundKey(normalized);
-}
-
-function priorityLabel(value: number): string {
-  if (value <= 1) return "High priority";
-  if (value === 2) return "Medium priority";
-  return "Low priority";
 }
 
 function backgroundTone(status: string): "success" | "warning" | "error" | "default" | "info" {
@@ -170,6 +160,131 @@ function compactText(value: string, maxChars = 120): string {
   return `${chars.slice(0, Math.max(0, maxChars - 3)).join("").trimEnd()}...`;
 }
 
+function proposalMetadata(proposal: SentinelProposal): JsonRecord {
+  return asRecord(proposal.metadata);
+}
+
+function proposalClarificationChoices(proposal: SentinelProposal): SentinelClarificationChoice[] {
+  const rawChoices = proposalMetadata(proposal).choices;
+  if (!Array.isArray(rawChoices)) return [];
+  return rawChoices
+    .filter((choice): choice is JsonRecord => !!choice && typeof choice === "object" && !Array.isArray(choice))
+    .map((choice) => {
+      const label = str(choice.label, "").trim();
+      const submitText = str(choice.submit_text, str(choice.submitText, "")).trim();
+      if (!label || !submitText) return null;
+      return { label, submitText };
+    })
+    .filter((choice): choice is SentinelClarificationChoice => choice !== null);
+}
+
+function proposalConversationId(proposal: SentinelProposal): string {
+  return str(proposalMetadata(proposal).conversation_id, "").trim();
+}
+
+function proposalProjectId(proposal: SentinelProposal): string {
+  return str(proposalMetadata(proposal).project_id, "").trim();
+}
+
+function proposalHasRunnableAction(proposal: SentinelProposal): boolean {
+  return !!proposal.action && !!str(proposal.action.action_kind, "").trim();
+}
+
+function proposalLooksLikeRouterNoise(proposal: SentinelProposal): boolean {
+  const metadata = proposalMetadata(proposal);
+  const combined = [
+    proposal.title,
+    proposal.detail,
+    proposal.rationale,
+    proposal.last_run_summary || "",
+    str(metadata.status, ""),
+    str(metadata.current_stage, ""),
+  ]
+    .join("\n")
+    .toLowerCase();
+  return (
+    combined.includes("semantic router") ||
+    combined.includes("could not route this request") ||
+    combined.includes("router model call failed") ||
+    combined.includes("unified semantic router failed")
+  );
+}
+
+function proposalIsUserActionable(proposal: SentinelProposal): boolean {
+  const status = str(proposal.status, "").toLowerCase();
+  if (status !== "open" && status !== "queued_for_approval") return false;
+  if (proposal.proposal_kind === "chat_suggestion_accept") return true;
+  if (proposal.source_kind === "execution_run" && proposalLooksLikeRouterNoise(proposal)) return false;
+  const choices = proposalClarificationChoices(proposal);
+  if (choices.length > 0) return true;
+  if (!proposalHasRunnableAction(proposal)) return false;
+  if (proposal.source_kind !== "execution_run") return true;
+
+  const metadata = proposalMetadata(proposal);
+  if (typeof metadata.user_actionable === "boolean") return metadata.user_actionable;
+
+  const runStatus = str(proposal.run_status, str(metadata.status, "")).toLowerCase();
+  if (runStatus === "needs_input") return choices.length > 0;
+  return runStatus === "needs_stronger_model";
+}
+
+function proposalIntentKey(proposal: SentinelProposal): string {
+  const metadata = proposalMetadata(proposal);
+  const sourceIdentity =
+    str(metadata.run_id, "") ||
+    str(proposal.source_id, "") ||
+    str(proposal.trace_id, "") ||
+    proposalConversationId(proposal) ||
+    proposal.fingerprint ||
+    proposal.id;
+  const choices = proposalClarificationChoices(proposal);
+  if (choices.length > 0) {
+    return [
+      "clarification",
+      proposal.proposal_kind,
+      proposal.source_kind,
+      sourceIdentity.toLowerCase(),
+      str(proposal.run_status, proposal.status).toLowerCase(),
+      str(proposal.action?.action_kind, "").toLowerCase(),
+      String(choices.length),
+    ].join(":");
+  }
+  return [
+    "proposal",
+    proposal.proposal_kind,
+    proposal.source_kind,
+    sourceIdentity.toLowerCase(),
+    str(proposal.run_status, proposal.status).toLowerCase(),
+    proposal.fingerprint,
+  ].join(":");
+}
+
+function groupSentinelProposals(proposals: SentinelProposal[]): SentinelProposalGroup[] {
+  const groups = new Map<string, SentinelProposalGroup>();
+  for (const proposal of proposals) {
+    const key = proposalIntentKey(proposal);
+    const existing = groups.get(key);
+    if (existing) {
+      existing.proposals.push(proposal);
+      continue;
+    }
+    groups.set(key, { key, proposal, proposals: [proposal] });
+  }
+  return Array.from(groups.values());
+}
+
+function storeChatPendingLaunch(snapshot: {
+  createdAt: number;
+  launchMode: "message";
+  message: string;
+  conversationId?: string;
+  projectId?: string;
+  source?: string;
+}): void {
+  if (typeof window === "undefined") return;
+  window.sessionStorage.setItem(CHAT_PENDING_LAUNCH_STORAGE_KEY, JSON.stringify(snapshot));
+}
+
 export function SentinelPanel({
   autoRefresh,
   navigateToView,
@@ -184,9 +299,8 @@ export function SentinelPanel({
   const [runOpen, setRunOpen] = useState(false);
   const [runMinimized, setRunMinimized] = useState(false);
   const [selectedProposalId, setSelectedProposalId] = useState("");
-  const [selectedObservationId, setSelectedObservationId] = useState("");
   const [proposalPage, setProposalPage] = useState(0);
-  const [observationPage, setObservationPage] = useState(0);
+  const [showSentinelInternals, setShowSentinelInternals] = useState(false);
 
   const settingsQ = useQuery({
     queryKey: ["sentinel-settings"],
@@ -264,72 +378,33 @@ export function SentinelPanel({
   const feed = feedQ.data as SentinelFeedResponse | undefined;
   const openProposals = useMemo(
     () =>
-      (feed?.proposals || []).filter((proposal) =>
-        ["open", "running", "queued_for_approval", "snoozed"].includes(String(proposal.status || "").toLowerCase())
-      ),
+      (feed?.proposals || []).filter((proposal) => proposalIsUserActionable(proposal)),
     [feed?.proposals]
   );
-  const recentObservations = useMemo(() => feed?.observations || [], [feed?.observations]);
-  const proposalPageCount = Math.max(1, Math.ceil(openProposals.length / SENTINEL_SECTION_PAGE_SIZE));
-  const observationPageCount = Math.max(1, Math.ceil(recentObservations.length / SENTINEL_SECTION_PAGE_SIZE));
-  const pagedOpenProposals = useMemo(
+  const openProposalGroups = useMemo(() => groupSentinelProposals(openProposals), [openProposals]);
+  const proposalPageCount = Math.max(1, Math.ceil(openProposalGroups.length / SENTINEL_SECTION_PAGE_SIZE));
+  const pagedOpenProposalGroups = useMemo(
     () =>
-      openProposals.slice(
+      openProposalGroups.slice(
         proposalPage * SENTINEL_SECTION_PAGE_SIZE,
         proposalPage * SENTINEL_SECTION_PAGE_SIZE + SENTINEL_SECTION_PAGE_SIZE
       ),
-    [openProposals, proposalPage]
+    [openProposalGroups, proposalPage]
   );
-  const pagedRecentObservations = useMemo(
-    () =>
-      recentObservations.slice(
-        observationPage * SENTINEL_SECTION_PAGE_SIZE,
-        observationPage * SENTINEL_SECTION_PAGE_SIZE + SENTINEL_SECTION_PAGE_SIZE
-      ),
-    [recentObservations, observationPage]
-  );
-
   useEffect(() => {
     setProposalPage((current) => Math.min(current, Math.max(0, proposalPageCount - 1)));
   }, [proposalPageCount]);
 
-  useEffect(() => {
-    setObservationPage((current) => Math.min(current, Math.max(0, observationPageCount - 1)));
-  }, [observationPageCount]);
-
-  useEffect(() => {
-    if (pagedOpenProposals.length === 0) {
-      setSelectedProposalId("");
-      return;
-    }
-    if (!pagedOpenProposals.some((proposal) => proposal.id === selectedProposalId)) {
-      setSelectedProposalId(pagedOpenProposals[0]?.id || "");
-    }
-  }, [pagedOpenProposals, selectedProposalId]);
-
-  useEffect(() => {
-    if (pagedRecentObservations.length === 0) {
-      setSelectedObservationId("");
-      return;
-    }
-    if (!pagedRecentObservations.some((observation) => observation.id === selectedObservationId)) {
-      setSelectedObservationId(pagedRecentObservations[0]?.id || "");
-    }
-  }, [pagedRecentObservations, selectedObservationId]);
-
-  const selectedProposal = useMemo(
-    () => pagedOpenProposals.find((proposal) => proposal.id === selectedProposalId) || pagedOpenProposals[0] || null,
-    [pagedOpenProposals, selectedProposalId]
-  );
-  const selectedObservation = useMemo(
+  const selectedProposalGroup = useMemo(
     () =>
-      pagedRecentObservations.find((observation) => observation.id === selectedObservationId) ||
-      pagedRecentObservations[0] ||
+      openProposalGroups.find((group) => group.proposals.some((proposal) => proposal.id === selectedProposalId)) ||
       null,
-    [pagedRecentObservations, selectedObservationId]
+    [openProposalGroups, selectedProposalId]
   );
-
-  const backgroundLearning: SentinelBackgroundLearning | null = feed?.background_learning || null;
+  const selectedProposal = useMemo(
+    () => selectedProposalGroup?.proposal || null,
+    [selectedProposalGroup]
+  );
   const scan = feed?.scan;
   const stats = feed?.stats;
   const configuredMode = str(settingsQ.data?.autonomy_mode, "assist").toLowerCase();
@@ -338,6 +413,8 @@ export function SentinelPanel({
   const autonomyDisabled = Boolean(settingsQ.data?.agent_paused) || currentAutonomyMode === "off";
   const lastScanLabel = scan?.last_completed_at ? humanTs(scan.last_completed_at).label : "Waiting for the first check";
   const currentModeLabel = settingsQ.data?.agent_paused ? "Paused" : modeLabel(currentAutonomyMode);
+  const connectedServicesCount = num(stats?.connected_services, 0);
+  const inAppEventCount = num(stats?.in_app_events, 0);
   const sentinelHeroHeadline =
     settingsQ.data?.agent_paused
       ? "ArkSentinel is paused."
@@ -345,9 +422,7 @@ export function SentinelPanel({
         ? "ArkSentinel is turned off."
         : openProposals.length > 0
           ? `${openProposals.length} follow-up${openProposals.length === 1 ? "" : "s"} waiting for you.`
-          : recentObservations.length > 0
-            ? "No action needed right now."
-            : "No follow-ups right now.";
+          : "No follow-ups right now.";
   const sentinelHeroDetail =
     settingsQ.data?.agent_paused
       ? "Turn autonomy back on to resume background checks, suggestions, and learning."
@@ -355,24 +430,13 @@ export function SentinelPanel({
         ? "ArkSentinel is not scanning for follow-ups while this mode is off."
         : openProposals.length > 0
           ? "Review the suggested next steps below or leave them for later."
-          : currentAutonomyMode === "auto"
-            ? "ArkSentinel is scanning in the background and can handle lightweight routine work automatically."
-            : "ArkSentinel is scanning in the background and will ask before it acts.";
-  const heroTone =
-    settingsQ.data?.agent_paused || currentAutonomyMode === "off"
-      ? {
-          border: "rgba(148, 163, 184, 0.24)",
-          background: "linear-gradient(135deg, rgba(25, 29, 35, 0.96), rgba(15, 17, 21, 0.96))"
-        }
-      : openProposals.length > 0
-        ? {
-            border: "rgba(251, 191, 36, 0.24)",
-            background: "linear-gradient(135deg, rgba(33, 27, 15, 0.96), rgba(15, 17, 21, 0.96))"
-          }
-        : {
-            border: "rgba(255, 255, 255, 0.12)",
-            background: "linear-gradient(135deg, rgba(24, 24, 28, 0.96), rgba(15, 17, 21, 0.96))"
-          };
+          : connectedServicesCount === 0 && inAppEventCount === 0
+            ? "ArkSentinel is watching for follow-ups. Anything worth your attention will appear here."
+            : connectedServicesCount === 0
+              ? `ArkSentinel is watching AgentArk activity and has ${inAppEventCount} in-app signal${inAppEventCount === 1 ? "" : "s"} on file. Nothing needs your attention right now.`
+            : currentAutonomyMode === "auto"
+              ? `ArkSentinel is quietly watching your ${connectedServicesCount} connected service${connectedServicesCount === 1 ? "" : "s"} and can handle lightweight routine work for you.`
+              : `ArkSentinel is quietly watching your ${connectedServicesCount} connected service${connectedServicesCount === 1 ? "" : "s"} and will ask before it acts.`;
   const heroStats = [
     {
       label: "Waiting for you",
@@ -388,27 +452,13 @@ export function SentinelPanel({
       label: "Connected apps",
       value: String(stats?.connected_services ?? 0),
       helper: `${stats?.connected_services ?? 0} connected service${(stats?.connected_services ?? 0) === 1 ? "" : "s"}`
+    },
+    {
+      label: "In-app signals",
+      value: String(stats?.in_app_events ?? 0),
+      helper: `${stats?.recent_runs ?? 0} recent run${(stats?.recent_runs ?? 0) === 1 ? "" : "s"} checked`
     }
   ];
-  const currentStatusSummary = str(scan?.last_error, "").trim()
-    ? `The last background pass hit an issue: ${str(scan?.last_error, "").trim()}`
-    : scan?.last_completed_at
-      ? `ArkSentinel last checked ${humanTs(scan.last_completed_at).label}.`
-      : "ArkSentinel has not completed its first background check yet.";
-  const backgroundLearningSummary =
-    str(backgroundLearning?.summary, "").trim() ||
-    (autonomyDisabled
-      ? "Learning is paused until background help is turned back on."
-      : "ArkSentinel reviews recent activity to remember what worked, spot repeated patterns, and improve future suggestions.");
-
-  function openAdvancedSettings() {
-    const nextUrl = "/ui/settings?settings_tab=advanced";
-    const currentUrl = `${window.location.pathname}${window.location.search}`;
-    if (currentUrl === nextUrl) return;
-    window.history.pushState(null, "", nextUrl);
-    window.dispatchEvent(new PopStateEvent("popstate"));
-  }
-
   async function runProposal(proposal: SentinelProposal) {
     setError(null);
     setSuccess(null);
@@ -440,6 +490,7 @@ export function SentinelPanel({
         completedAt: runStatus === "queued_for_approval" || !traceId ? new Date().toISOString() : undefined,
         suggestionId: proposal.id,
       });
+      setSelectedProposalId((current) => current === proposal.id ? "" : current);
       setSuccess("ArkSentinel proposal accepted.");
     } catch (runError) {
       const message = errMessage(runError);
@@ -462,6 +513,7 @@ export function SentinelPanel({
     setSuccess(null);
     try {
       await dismissMutation.mutateAsync(id);
+      setSelectedProposalId((current) => current === id ? "" : current);
       setSuccess("ArkSentinel proposal dismissed.");
     } catch (dismissError) {
       setError(errMessage(dismissError));
@@ -473,10 +525,33 @@ export function SentinelPanel({
     setSuccess(null);
     try {
       await snoozeMutation.mutateAsync(id);
+      setSelectedProposalId((current) => current === id ? "" : current);
       setSuccess("ArkSentinel proposal snoozed for 6 hours.");
     } catch (snoozeError) {
       setError(errMessage(snoozeError));
     }
+  }
+
+  function launchClarificationChoice(proposal: SentinelProposal, choice: SentinelClarificationChoice) {
+    const conversationId = proposalConversationId(proposal);
+    if (!conversationId) {
+      setError("This item is missing its source chat. Open the technical details and continue from the linked run.");
+      return;
+    }
+    setError(null);
+    setSuccess(null);
+    storeChatPendingLaunch({
+      createdAt: Date.now(),
+      launchMode: "message",
+      message: choice.submitText,
+      conversationId,
+      projectId: proposalProjectId(proposal) || undefined,
+      source: "sentinel",
+    });
+    void dismissMutation.mutateAsync(proposal.id).catch(() => undefined);
+    setSelectedProposalId((current) => current === proposal.id ? "" : current);
+    setSuccess(`Sending "${choice.label}" to the source chat.`);
+    navigateToView("chat");
   }
 
   return (
@@ -485,7 +560,8 @@ export function SentinelPanel({
         <WorkspacePageHeader
           eyebrow="Ark Autonomy"
           title="ArkSentinel"
-          description="Unfinished work, repeated routines, pending follow-ups, and suggested next actions."
+          descriptionNoWrap
+          description="Sentinel watches your connected services for things worth your attention and suggests safe next actions - you stay in control."
           actions={
             <Stack
               direction="row"
@@ -493,7 +569,7 @@ export function SentinelPanel({
               useFlexGap
               sx={{
                 flexWrap: "wrap",
-                alignItems: "flex-start"
+                alignItems: "center"
               }}>
               <Chip
                 color={autonomyDisabled ? "warning" : currentAutonomyMode === "auto" ? "success" : "info"}
@@ -501,6 +577,24 @@ export function SentinelPanel({
               />
               <Chip label={openProposals.length > 0 ? `${openProposals.length} waiting` : "Nothing waiting"} />
               <Chip label={`Checked ${lastScanLabel}`} />
+              <FormControlLabel
+                control={
+                  <Switch
+                    size="small"
+                    checked={showSentinelInternals}
+                    onChange={(event) => {
+                      const next = event.target.checked;
+                      setShowSentinelInternals(next);
+                    }}
+                  />
+                }
+                label={
+                  <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                    Show Sentinel internals
+                  </Typography>
+                }
+                sx={{ ml: 0.5, mr: 0 }}
+              />
             </Stack>
           }
         />
@@ -528,7 +622,6 @@ export function SentinelPanel({
               <Typography variant="body2" sx={{ color: "text.secondary" }}>
                 {sentinelHeroDetail}
               </Typography>
-
               {str(scan?.last_error, "").trim() ? (
                 <Alert severity="warning">{str(scan?.last_error, "")}</Alert>
               ) : null}
@@ -540,7 +633,15 @@ export function SentinelPanel({
               <Stack direction="row" sx={{ justifyContent: "space-between", alignItems: "center" }}>
                 <Stack direction="row" spacing={1} useFlexGap sx={{ alignItems: "center", flexWrap: "wrap" }}>
                   <Typography variant="h6">Needs your attention</Typography>
-                  <Chip size="small" variant="outlined" label={`${openProposals.length} total`} />
+                  <Chip
+                    size="small"
+                    variant="outlined"
+                    label={
+                      openProposalGroups.length === openProposals.length
+                        ? `${openProposals.length} total`
+                        : `${openProposalGroups.length} grouped`
+                    }
+                  />
                 </Stack>
                 <Stack direction="row" spacing={1} useFlexGap sx={{ alignItems: "center", flexWrap: "wrap" }}>
                   {proposalPageCount > 1 ? (
@@ -555,95 +656,62 @@ export function SentinelPanel({
                   <Typography variant="body2" sx={{
                     color: "text.secondary"
                   }}>
-                    No suggestions waiting.
+                    Nothing waiting. Sentinel will flag anything new right here.
                   </Typography>
                 ) : (
                   <Stack spacing={1}>
-                    {pagedOpenProposals.map((proposal) => {
-                      const selected = selectedProposal?.id === proposal.id;
+                    {pagedOpenProposalGroups.map((group) => {
+                      const proposal = group.proposal;
+                      const choices = proposalClarificationChoices(proposal);
                       return (
                         <ButtonBase
-                          key={proposal.id}
+                          key={group.key}
                           onClick={() => setSelectedProposalId(proposal.id)}
+                          aria-label={`Review ${proposal.title}`}
                           sx={{
                             width: "100%",
                             textAlign: "left",
-                            px: 0,
+                            px: 1,
                             py: 1.15,
                             borderBottom: "1px solid",
                             borderColor: "divider",
                             transition: "background 0.15s ease",
-                            "&:hover": { background: "rgba(57, 208, 255, 0.04)" },
-                            ...(selected && { background: "rgba(57, 208, 255, 0.06)" }),
+                            "&:hover": { background: "var(--ui-rgba-57-208-255-040)" },
                           }}
                         >
                           <Stack sx={{ width: "100%", minWidth: 0 }}>
-                            <Stack direction="row" sx={{ justifyContent: "space-between", alignItems: "center" }}>
-                              <Stack direction="row" spacing={1} sx={{ alignItems: "center", minWidth: 0 }}>
+                            <Stack
+                              direction={{ xs: "column", sm: "row" }}
+                              spacing={0.75}
+                              sx={{ justifyContent: "space-between", alignItems: { xs: "flex-start", sm: "center" } }}
+                            >
+                              <Stack direction="row" spacing={1} sx={{ alignItems: "center", minWidth: 0, maxWidth: "100%" }}>
                                 <Box sx={{ width: 7, height: 7, borderRadius: "50%", flexShrink: 0, background: proposalDotColor(proposal.status) }} />
-                                <Typography variant="body2" sx={{ fontWeight: 600 }}>{proposal.title}</Typography>
+                                <Typography variant="subtitle2" sx={{ fontWeight: 600, minWidth: 0 }}>
+                                  {proposal.title}
+                                </Typography>
+                                {group.proposals.length > 1 ? (
+                                  <Chip size="small" variant="outlined" label={`${group.proposals.length} similar`} />
+                                ) : null}
+                                {choices.length > 0 ? (
+                                  <Chip size="small" color="info" variant="outlined" label={`${choices.length} choices`} />
+                                ) : null}
                               </Stack>
-                              <Typography variant="caption" sx={{ color: "text.secondary", flexShrink: 0, ml: 1 }}>
+                              <Typography variant="caption" sx={{ color: "text.secondary", flexShrink: 0 }}>
                                 {humanTs(proposal.updated_at).label}
                               </Typography>
                             </Stack>
-                            <Typography variant="caption" sx={{ color: "text.secondary", pl: "15px" }}>
+                            <Typography variant="caption" sx={{ color: "text.secondary", pl: "15px", pr: 1 }}>
                               {compactText(proposal.detail, 150)}
                             </Typography>
                           </Stack>
                         </ButtonBase>
                       );
                     })}
-                    {selectedProposal ? (
-                      <Box className="metadata-box">
-                        <Stack spacing={0.9}>
-                          <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ justifyContent: "space-between" }}>
-                            <Stack
-                              direction="row"
-                              spacing={1}
-                              useFlexGap
-                              sx={{
-                                flexWrap: "wrap",
-                                alignItems: "center"
-                              }}>
-                              <Typography variant="subtitle2">{selectedProposal.title}</Typography>
-                              <Chip size="small" color={proposalTone(selectedProposal.status)} label={proposalStatusLabel(selectedProposal.status)} />
-                              <Chip size="small" variant="outlined" label={selectedProposal.source_label || sourceKindLabel(selectedProposal.source_kind)} />
-                            </Stack>
-                            <Stack direction="row" spacing={1}>
-                              <Button
-                                size="small"
-                                variant="contained"
-                                onClick={() => void runProposal(selectedProposal)}
-                                disabled={approveMutation.isPending}
-                              >
-                                {proposalActionLabel(selectedProposal)}
-                              </Button>
-                              <Button size="small" variant="outlined" onClick={() => void snoozeProposal(selectedProposal.id)}>
-                                Snooze
-                              </Button>
-                              <Button size="small" onClick={() => void dismissProposal(selectedProposal.id)}>
-                                Dismiss
-                              </Button>
-                            </Stack>
-                          </Stack>
-                          <Typography variant="body2">{selectedProposal.detail}</Typography>
-                          <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                            Why now: {selectedProposal.rationale}
-                          </Typography>
-                          <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: "wrap" }}>
-                            {selectedProposal.snoozed_until ? (
-                              <Chip size="small" variant="outlined" label={`Later until ${humanTs(selectedProposal.snoozed_until).label}`} />
-                            ) : null}
-                            <Chip size="small" variant="outlined" label={`Updated ${humanTs(selectedProposal.updated_at).label}`} />
-                          </Stack>
-                        </Stack>
-                      </Box>
-                    ) : null}
                     {proposalPageCount > 1 ? (
                       <Stack direction="row" spacing={1} sx={{ justifyContent: "space-between", alignItems: "center", pt: 0.25 }}>
                         <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                          Showing {pagedOpenProposals.length} of {openProposals.length}
+                          Showing {pagedOpenProposalGroups.length} of {openProposalGroups.length}
                         </Typography>
                         <Stack direction="row" spacing={1}>
                           <Button
@@ -672,117 +740,175 @@ export function SentinelPanel({
               </Stack>
             </Box>
 
-            <Box className="list-shell">
-              <Stack spacing={1}>
-                <Stack direction="row" sx={{ justifyContent: "space-between", alignItems: "center" }}>
-                  <Stack direction="row" spacing={1} useFlexGap sx={{ alignItems: "center", flexWrap: "wrap" }}>
-                    <Typography variant="h6">Recent signals</Typography>
-                    <Chip size="small" variant="outlined" label={`${recentObservations.length} total`} />
+        </Stack>
+      </WorkspacePageShell>
+      <Dialog
+        open={!!selectedProposal}
+        onClose={() => setSelectedProposalId("")}
+        maxWidth="md"
+        fullWidth
+        slotProps={{
+          paper: {
+            className: "diagnostics-dialog-shell",
+          },
+        }}
+      >
+        {selectedProposal ? (
+          <>
+            <DialogTitle className="diagnostics-dialog-title" sx={{ pb: 1 }}>
+              <Stack spacing={0.75}>
+                <Typography variant="h6">{selectedProposal.title}</Typography>
+                <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: "wrap", alignItems: "center" }}>
+                  <Chip size="small" color={proposalTone(selectedProposal.status)} label={proposalStatusLabel(selectedProposal.status)} />
+                  <Chip size="small" variant="outlined" label={selectedProposal.source_label || sourceKindLabel(selectedProposal.source_kind)} />
+                  {selectedProposalGroup && selectedProposalGroup.proposals.length > 1 ? (
+                    <Chip size="small" variant="outlined" label={`${selectedProposalGroup.proposals.length} grouped`} />
+                  ) : null}
+                  <Chip size="small" variant="outlined" label={`Updated ${humanTs(selectedProposal.updated_at).label}`} />
+                </Stack>
+              </Stack>
+            </DialogTitle>
+            <DialogContent dividers className="diagnostics-dialog-content">
+              <Stack spacing={2}>
+                {proposalClarificationChoices(selectedProposal).length > 0 ? (
+                  <Stack spacing={1}>
+                    <Typography variant="subtitle2">Choose how to continue</Typography>
+                    <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: "wrap" }}>
+                      {proposalClarificationChoices(selectedProposal).map((choice, idx) => (
+                        <Button
+                          key={`${selectedProposal.id}-${choice.submitText}-${idx}`}
+                          size="small"
+                          variant={idx === 0 ? "contained" : "outlined"}
+                          onClick={() => launchClarificationChoice(selectedProposal, choice)}
+                        >
+                          {choice.label}
+                        </Button>
+                      ))}
+                    </Stack>
                   </Stack>
-                  {observationPageCount > 1 ? (
+                ) : null}
+
+                <Stack spacing={0.75}>
+                  <Typography variant="subtitle2">Details</Typography>
+                  <Typography variant="body1">{selectedProposal.detail}</Typography>
+                  {selectedProposal.rationale ? (
+                    <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                      Reason: {selectedProposal.rationale}
+                    </Typography>
+                  ) : null}
+                  {selectedProposal.last_run_summary ? (
+                    <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                      Last result: {selectedProposal.last_run_summary}
+                    </Typography>
+                  ) : null}
+                  {selectedProposalGroup && selectedProposalGroup.proposals.length > 1 ? (
                     <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                      Page {observationPage + 1} of {observationPageCount}
+                      Grouped {selectedProposalGroup.proposals.length} matching follow-ups from the same run context.
                     </Typography>
                   ) : null}
                 </Stack>
-                {recentObservations.length === 0 ? (
-                  <Typography variant="body2" sx={{
-                    color: "text.secondary"
-                  }}>
-                    No recent signals saved.
-                  </Typography>
-                ) : (
-                  <Stack spacing={1}>
-                    {pagedRecentObservations.map((observation: SentinelObservation) => {
-                      const selected = selectedObservation?.id === observation.id;
-                      return (
-                        <ButtonBase
-                          key={observation.id}
-                          onClick={() => setSelectedObservationId(observation.id)}
+
+                <Divider />
+
+                <Stack spacing={1}>
+                  <Typography variant="subtitle2">Technical details</Typography>
+                  <Box
+                    sx={{
+                      display: "grid",
+                      gridTemplateColumns: { xs: "1fr", sm: "150px minmax(0, 1fr)" },
+                      columnGap: 1.5,
+                      rowGap: 0.75,
+                    }}
+                  >
+                    <Typography variant="caption" sx={{ color: "text.secondary" }}>Proposal ID</Typography>
+                    <Typography variant="body2" sx={{ overflowWrap: "anywhere" }}>{selectedProposal.id}</Typography>
+                    <Typography variant="caption" sx={{ color: "text.secondary" }}>Kind</Typography>
+                    <Typography variant="body2">{selectedProposal.proposal_kind || "-"}</Typography>
+                    <Typography variant="caption" sx={{ color: "text.secondary" }}>Source</Typography>
+                    <Typography variant="body2" sx={{ overflowWrap: "anywhere" }}>
+                      {sourceKindLabel(selectedProposal.source_kind)}
+                      {selectedProposal.source_id ? ` (${selectedProposal.source_id})` : ""}
+                    </Typography>
+                    <Typography variant="caption" sx={{ color: "text.secondary" }}>Status</Typography>
+                    <Typography variant="body2">{selectedProposal.status || "-"}</Typography>
+                    <Typography variant="caption" sx={{ color: "text.secondary" }}>Run status</Typography>
+                    <Typography variant="body2">{selectedProposal.run_status || "-"}</Typography>
+                    <Typography variant="caption" sx={{ color: "text.secondary" }}>Priority</Typography>
+                    <Typography variant="body2">{selectedProposal.priority ?? "-"}</Typography>
+                    <Typography variant="caption" sx={{ color: "text.secondary" }}>Confidence</Typography>
+                    <Typography variant="body2">
+                      {typeof selectedProposal.confidence === "number" ? `${(selectedProposal.confidence * 100).toFixed(0)}%` : "-"}
+                    </Typography>
+                    <Typography variant="caption" sx={{ color: "text.secondary" }}>Created</Typography>
+                    <Typography variant="body2">{humanTs(selectedProposal.created_at).label}</Typography>
+                    <Typography variant="caption" sx={{ color: "text.secondary" }}>Updated</Typography>
+                    <Typography variant="body2">{humanTs(selectedProposal.updated_at).label}</Typography>
+                    <Typography variant="caption" sx={{ color: "text.secondary" }}>Trace ID</Typography>
+                    <Typography variant="body2" sx={{ overflowWrap: "anywhere" }}>{selectedProposal.trace_id || "-"}</Typography>
+                    <Typography variant="caption" sx={{ color: "text.secondary" }}>Action</Typography>
+                    <Typography variant="body2" sx={{ overflowWrap: "anywhere" }}>
+                      {selectedProposal.action?.action_kind || "-"}
+                    </Typography>
+                    {selectedProposal.snoozed_until ? (
+                      <>
+                        <Typography variant="caption" sx={{ color: "text.secondary" }}>Later until</Typography>
+                        <Typography variant="body2">{humanTs(selectedProposal.snoozed_until).label}</Typography>
+                      </>
+                    ) : null}
+                  </Box>
+                  {showSentinelInternals ? (
+                    <Box className="metadata-box micro-surface" sx={{ maxHeight: 260, p: 1.25, overflow: "auto" }}>
+                      <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                        Fingerprint: {selectedProposal.fingerprint || "-"}
+                      </Typography>
+                      {Object.keys(proposalMetadata(selectedProposal)).length > 0 ? (
+                        <Box
+                          component="pre"
                           sx={{
-                            width: "100%",
-                            textAlign: "left",
-                            px: 0,
-                            py: 1.15,
-                            borderBottom: "1px solid",
-                            borderColor: "divider",
-                            transition: "background 0.15s ease",
-                            "&:hover": { background: "rgba(57, 208, 255, 0.04)" },
-                            ...(selected && { background: "rgba(57, 208, 255, 0.06)" }),
+                            m: 0,
+                            mt: 1,
+                            whiteSpace: "pre-wrap",
+                            overflowWrap: "anywhere",
+                            fontSize: "0.75rem",
                           }}
                         >
-                          <Stack sx={{ width: "100%", minWidth: 0 }}>
-                            <Stack direction="row" sx={{ justifyContent: "space-between", alignItems: "center" }}>
-                              <Stack direction="row" spacing={1} sx={{ alignItems: "center", minWidth: 0 }}>
-                                <Box sx={{ width: 7, height: 7, borderRadius: "50%", flexShrink: 0, background: observationDotColor(observation.priority) }} />
-                                <Typography variant="body2" sx={{ fontWeight: 600 }}>{observation.title}</Typography>
-                              </Stack>
-                              <Typography variant="caption" sx={{ color: "text.secondary", flexShrink: 0, ml: 1 }}>
-                                {humanTs(observation.updated_at).label}
-                              </Typography>
-                            </Stack>
-                            <Typography variant="caption" sx={{ color: "text.secondary", pl: "15px" }}>
-                              {compactText(observation.detail, 150)}
-                            </Typography>
-                          </Stack>
-                        </ButtonBase>
-                      );
-                    })}
-                    {selectedObservation ? (
-                      <Box className="metadata-box">
-                        <Stack spacing={0.75}>
-                          <Stack
-                            direction="row"
-                            spacing={1}
-                            useFlexGap
-                            sx={{
-                              flexWrap: "wrap",
-                              alignItems: "center"
-                            }}>
-                            <Typography variant="subtitle2">{selectedObservation.title}</Typography>
-                            <Chip size="small" variant="outlined" label={observationKindLabel(selectedObservation.kind)} />
-                            <Chip size="small" variant="outlined" label={priorityLabel(selectedObservation.priority)} />
-                          </Stack>
-                          <Typography variant="body2">{selectedObservation.detail}</Typography>
-                          <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                            {selectedObservation.source_label || sourceKindLabel(selectedObservation.source_kind)} | Updated {humanTs(selectedObservation.updated_at).label}
-                          </Typography>
-                        </Stack>
-                      </Box>
-                    ) : null}
-                    {observationPageCount > 1 ? (
-                      <Stack direction="row" spacing={1} sx={{ justifyContent: "space-between", alignItems: "center", pt: 0.25 }}>
-                        <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                          Showing {pagedRecentObservations.length} of {recentObservations.length}
-                        </Typography>
-                        <Stack direction="row" spacing={1}>
-                          <Button
-                            size="small"
-                            variant="outlined"
-                            disabled={observationPage === 0}
-                            onClick={() => setObservationPage((current) => Math.max(0, current - 1))}
-                          >
-                            Prev
-                          </Button>
-                          <Button
-                            size="small"
-                            variant="outlined"
-                            disabled={observationPage >= observationPageCount - 1}
-                            onClick={() =>
-                              setObservationPage((current) => Math.min(observationPageCount - 1, current + 1))
-                            }
-                          >
-                            Next
-                          </Button>
-                        </Stack>
-                      </Stack>
-                    ) : null}
-                  </Stack>
-                )}
+                          {JSON.stringify(proposalMetadata(selectedProposal), null, 2)}
+                        </Box>
+                      ) : null}
+                    </Box>
+                  ) : null}
+                </Stack>
               </Stack>
-            </Box>
-        </Stack>
-      </WorkspacePageShell>
+            </DialogContent>
+            <DialogActions className="diagnostics-dialog-actions" sx={{ px: 3, py: 1.5 }}>
+              <Button onClick={() => setSelectedProposalId("")}>Close</Button>
+              <Button
+                variant="outlined"
+                onClick={() => void snoozeProposal(selectedProposal.id)}
+                disabled={snoozeMutation.isPending}
+              >
+                Snooze
+              </Button>
+              <Button
+                variant="text"
+                onClick={() => void dismissProposal(selectedProposal.id)}
+                disabled={dismissMutation.isPending}
+              >
+                Dismiss
+              </Button>
+              {proposalClarificationChoices(selectedProposal).length === 0 ? (
+                <Button
+                  variant="contained"
+                  onClick={() => void runProposal(selectedProposal)}
+                  disabled={approveMutation.isPending}
+                >
+                  {proposalActionLabel(selectedProposal)}
+                </Button>
+              ) : null}
+            </DialogActions>
+          </>
+        ) : null}
+      </Dialog>
       <SuggestionRunDialog
         run={run}
         open={runOpen}

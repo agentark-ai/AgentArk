@@ -287,7 +287,7 @@ pub(super) fn is_public_tunnel_login_asset_path(path: &str) -> bool {
 
 pub(super) async fn control_plane_tunnel_is_active(state: &AppState) -> bool {
     let tunnel = state.tunnel.read().await;
-    tunnel.active && tunnel.selected_app_id.is_none()
+    tunnel.active && tunnel.selected_app_id.is_none() && tunnel.control_plane_enabled
 }
 
 pub(super) async fn ensure_control_plane_tunnel_ready(
@@ -463,16 +463,18 @@ async fn request_matches_active_control_plane_tunnel(
     state: &AppState,
     headers: &HeaderMap,
 ) -> bool {
-    let (active, tunnel_url, selected_app_id) = {
+    let (active, tunnel_url, selected_app_id, control_plane_enabled) = {
         let tunnel = state.tunnel.read().await;
         (
             tunnel.active,
             tunnel.url.clone(),
             tunnel.selected_app_id.clone(),
+            tunnel.control_plane_enabled,
         )
     };
     active
         && selected_app_id.is_none()
+        && control_plane_enabled
         && request_matches_active_tunnel(headers, tunnel_url.as_deref())
 }
 

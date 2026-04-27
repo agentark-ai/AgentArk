@@ -75,7 +75,7 @@ type IntegrationQuickstartPanelProps = {
 };
 
 const INTEGRATION_SORT_ORDER: Record<string, number> = {
-  google_workspace: 0, github: 1, moltbook: 2, "1password": 3, notion: 4, jira: 5, sentry: 6, linear: 7,
+  google_workspace: 0, github: 1, "1password": 3, notion: 4, jira: 5, sentry: 6, linear: 7,
   google_analytics: 10, google_search_console: 11, garmin: 12, shopify: 13, social_analytics: 14,
   google_places: 99,
 };
@@ -234,14 +234,16 @@ export function IntegrationQuickstartPanel({
   });
   const customApis = useMemo(() => asRecords(asRecord(customApisQ.data).custom_apis), [customApisQ.data]);
   const sortedIntegrations = useMemo(() => {
-    return [...integrations].sort((a, b) => {
-      const rankDiff = connectorSortRank(a) - connectorSortRank(b);
-      if (rankDiff !== 0) return rankDiff;
-      const orderA = INTEGRATION_SORT_ORDER[a.id] ?? 50;
-      const orderB = INTEGRATION_SORT_ORDER[b.id] ?? 50;
-      if (orderA !== orderB) return orderA - orderB;
-      return a.name.localeCompare(b.name);
-    });
+    return integrations
+      .filter((integration) => integration.id.trim().toLowerCase() !== "moltbook")
+      .sort((a, b) => {
+        const rankDiff = connectorSortRank(a) - connectorSortRank(b);
+        if (rankDiff !== 0) return rankDiff;
+        const orderA = INTEGRATION_SORT_ORDER[a.id] ?? 50;
+        const orderB = INTEGRATION_SORT_ORDER[b.id] ?? 50;
+        if (orderA !== orderB) return orderA - orderB;
+        return a.name.localeCompare(b.name);
+      });
   }, [integrations]);
   const actionButtonSx = {
     minWidth: 0,
@@ -254,9 +256,9 @@ export function IntegrationQuickstartPanel({
   const tagChipSx = {
     height: 22,
     borderRadius: 1,
-    background: "rgba(14, 25, 43, 0.95)",
-    border: "1px solid rgba(112,153,201,0.18)",
-    color: "rgba(198,214,235,0.82)",
+    background: "var(--ui-rgba-14-25-43-950)",
+    border: "1px solid var(--ui-rgba-112-153-201-180)",
+    color: "var(--ui-rgba-198-214-235-820)",
     "& .MuiChip-label": {
       px: 1,
       fontSize: "0.63rem",
@@ -268,9 +270,9 @@ export function IntegrationQuickstartPanel({
   const countChipSx = {
     height: 22,
     borderRadius: 1,
-    background: "rgba(14, 25, 43, 0.92)",
-    border: "1px solid rgba(112,153,201,0.16)",
-    color: "rgba(173,192,214,0.9)",
+    background: "var(--ui-rgba-14-25-43-920)",
+    border: "1px solid var(--ui-rgba-112-153-201-160)",
+    color: "var(--ui-rgba-173-192-214-900)",
     "& .MuiChip-label": {
       px: 1,
       fontSize: "0.64rem",
@@ -419,7 +421,7 @@ export function IntegrationQuickstartPanel({
                   state === "connected" || state === "starting" || state === "configured";
                 return (
                   <Grid2 key={integration.id} size={{ xs: 12, md: 6, xl: 4 }}>
-                    <Box sx={{ p: 1.5, borderRadius: 1.5, border: isConfigured ? "1px solid rgba(64,196,255,0.24)" : "1px solid rgba(112,153,201,0.16)", background: isConfigured ? "rgba(8,24,42,0.56)" : "rgba(7,17,32,0.6)", height: "100%" }}>
+                    <Box sx={{ p: 1.5, borderRadius: 1.5, border: isConfigured ? "1px solid var(--ui-rgba-64-196-255-240)" : "1px solid var(--ui-rgba-112-153-201-160)", background: isConfigured ? "var(--ui-rgba-8-24-42-560)" : "var(--ui-rgba-7-17-32-600)", height: "100%" }}>
                       <Stack spacing={1.1} sx={{ height: "100%", justifyContent: "space-between" }}>
                         <Box>
                           <Stack
@@ -503,7 +505,7 @@ export function IntegrationQuickstartPanel({
           <Stack spacing={1}>
             <Typography variant="subtitle2">Imported Custom APIs</Typography>
             <TableContainer className="table-shell" sx={{ width: "100%", overflowX: "auto" }}>
-            <Table size="small" sx={{ minWidth: 720, "& td, & th": { borderColor: "rgba(112,153,201,0.12)", py: 0.75 } }}>
+            <Table size="small" sx={{ minWidth: 720, "& td, & th": { borderColor: "var(--ui-rgba-112-153-201-120)", py: 0.75 } }}>
               <TableHead>
                 <TableRow>
                   <TableCell>Name</TableCell>
@@ -600,7 +602,7 @@ export function IntegrationQuickstartPanel({
                   <TextField label="Token / Secret" type="password" fullWidth value={customApiForm.secret} onChange={(e) => setCustomApiForm((current) => ({ ...current, secret: e.target.value }))} helperText="Stored encrypted and injected only into API requests." />
                 </Stack>
                 <TableContainer className="table-shell" sx={{ width: "100%", overflowX: "auto", maxHeight: "none" }}>
-                <Table size="small" sx={{ minWidth: 720, "& td, & th": { borderColor: "rgba(112,153,201,0.12)", py: 0.75 } }}>
+                <Table size="small" sx={{ minWidth: 720, "& td, & th": { borderColor: "var(--ui-rgba-112-153-201-120)", py: 0.75 } }}>
                   <TableHead>
                     <TableRow>
                       <TableCell>Import</TableCell>

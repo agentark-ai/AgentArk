@@ -1,6 +1,6 @@
 //! Gmail integration (scan and reply)
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -695,7 +695,7 @@ pub async fn gmail_reply(config_dir: &Path, args: &serde_json::Value) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_scan_mode, GmailScanArgs, GmailScanMode};
+    use super::{GmailScanArgs, GmailScanMode, effective_scan_mode};
 
     #[test]
     fn gmail_scan_auto_mode_uses_recent_when_only_max_results_is_set() {

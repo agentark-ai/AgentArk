@@ -9,6 +9,7 @@ pub mod ga4;
 pub mod garmin;
 pub mod github;
 pub mod gsc;
+pub mod home_assistant;
 pub mod lightpanda;
 pub mod media_gen;
 pub mod moltbook;
@@ -166,6 +167,21 @@ fn external_integration_is_connected(
     manager: &crate::core::config::SecureConfigManager,
     integration_id: &str,
 ) -> Option<bool> {
+    if integration_id == "media_gen" {
+        let config = manager.load().ok()?;
+        return Some(
+            config
+                .media_gen
+                .provider_api_keys
+                .iter()
+                .any(|(provider, key)| {
+                    media_gen::MediaProvider::parse(provider).is_some()
+                        && !key.trim().is_empty()
+                        && key.trim() != "[ENCRYPTED]"
+                }),
+        );
+    }
+
     let spec = crate::core::connect_flow::spec_by_id(integration_id)?;
     let connected = match spec.required.kind {
         crate::core::connect_flow::SecretRequirementKind::All => spec
@@ -340,6 +356,11 @@ impl IntegrationManager {
             config_dir.clone(),
         ));
 
+        // Register Home Assistant
+        self.register(home_assistant::HomeAssistantConnector::new_with_config_dir(
+            config_dir.clone(),
+        ));
+
         // Register Twilio Voice & SMS
         self.register(twilio::TwilioConnector::new_with_config_dir(
             config_dir.clone(),
@@ -396,6 +417,10 @@ impl IntegrationManager {
             return false;
         }
 
+        if integration_id == "media_gen" {
+            return true;
+        }
+
         if matches!(
             integration_id,
             "gmail" | "google_calendar" | "google_workspace"
@@ -406,7 +431,16 @@ impl IntegrationManager {
         let Some(integration) = self.integrations.get(integration_id) else {
             return false;
         };
-        matches!(integration.status().await, IntegrationStatus::Connected)
+        match tokio::time::timeout(INTEGRATION_STATUS_TIMEOUT, integration.status()).await {
+            Ok(status) => matches!(status, IntegrationStatus::Connected),
+            Err(_) => {
+                tracing::warn!(
+                    "Integration readiness check timed out for '{}'; treating as not ready",
+                    integration_id
+                );
+                false
+            }
+        }
     }
 
     /// List integration IDs that are both enabled and currently ready to use.

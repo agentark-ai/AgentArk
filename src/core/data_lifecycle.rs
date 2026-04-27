@@ -5,6 +5,7 @@ use crate::storage::Storage;
 
 const DATA_LIFECYCLE_SETTINGS_KEY: &str = "data_lifecycle_settings_v1";
 const MAX_RETENTION_DAYS: u64 = 36_500;
+const LEGACY_MEMORY_RETENTION_DAYS: u64 = 365;
 const MAX_INTERVAL_SECS: u64 = 7 * 24 * 60 * 60;
 const MIN_NOTIFICATION_INTERVAL_SECS: u64 = 300;
 const MIN_HOUSEKEEPING_INTERVAL_SECS: u64 = 300;
@@ -148,11 +149,11 @@ fn default_learning_candidate_retention_days() -> u64 {
 }
 
 fn default_experience_item_retention_days() -> u64 {
-    365
+    0
 }
 
 fn default_procedural_pattern_retention_days() -> u64 {
-    365
+    0
 }
 
 fn default_recall_event_retention_days() -> u64 {
@@ -249,6 +250,12 @@ impl DataLifecycleSettings {
         self.procedural_pattern_retention_days = self
             .procedural_pattern_retention_days
             .min(MAX_RETENTION_DAYS);
+        if self.experience_item_retention_days == LEGACY_MEMORY_RETENTION_DAYS {
+            self.experience_item_retention_days = 0;
+        }
+        if self.procedural_pattern_retention_days == LEGACY_MEMORY_RETENTION_DAYS {
+            self.procedural_pattern_retention_days = 0;
+        }
         self.recall_event_retention_days = self.recall_event_retention_days.min(MAX_RETENTION_DAYS);
         self.recall_test_retention_days = self.recall_test_retention_days.min(MAX_RETENTION_DAYS);
         self.notification_cleanup_interval_secs = self

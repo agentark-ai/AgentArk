@@ -5,96 +5,96 @@ export const appTheme = createTheme({
   palette: {
     mode: "dark",
     primary: {
-      main: "#4a7fae",
-      light: "#6b97bf",
-      dark: "#2d587f",
+      main: "#d8ad78",
+      light: "#f1d6ad",
+      dark: "#8d6841",
     },
     secondary: {
-      main: "#8fa3c9",
-      light: "#bcc8df",
+      main: "#f0e2cf",
+      light: "#fff4e5",
     },
     success: {
-      main: "#89d7ab",
+      main: "#8bd6a5",
     },
     warning: {
-      main: "#ffbf82",
+      main: "#d8ad78",
     },
     error: {
       main: "#ff9b9b",
     },
     info: {
-      main: "#7ab8ff",
+      main: "#d8c2a6",
     },
     background: {
-      default: "#0d0e11",
-      paper: "#17181c",
+      default: "#0a0a0a",
+      paper: "#111111",
     },
     text: {
-      primary: "#f5f6f8",
-      secondary: "rgba(213, 216, 223, 0.72)",
+      primary: "#f6f0e8",
+      secondary: "rgba(226, 218, 208, 0.72)",
     },
-    divider: "rgba(255, 255, 255, 0.08)",
+    divider: "rgba(255, 255, 255, 0.10)",
   },
   shape: {
-    borderRadius: 16,
+    borderRadius: 8,
   },
   typography: {
-    fontFamily: "'IBM Plex Sans', 'Segoe UI', sans-serif",
+    fontFamily: "'Inter', 'IBM Plex Sans', 'Segoe UI', sans-serif",
     fontSize: 14,
     h3: {
-      fontFamily: "'Space Grotesk', 'IBM Plex Sans', 'Segoe UI', sans-serif",
-      fontWeight: 700,
+      fontFamily: "'JetBrains Mono', 'Inter', 'IBM Plex Sans', 'Segoe UI', sans-serif",
+      fontWeight: 600,
       fontSize: "1.6rem",
       lineHeight: 1.24,
-      letterSpacing: "-0.01em",
+      letterSpacing: 0,
     },
     h4: {
-      fontFamily: "'Space Grotesk', 'IBM Plex Sans', 'Segoe UI', sans-serif",
-      fontWeight: 700,
+      fontFamily: "'JetBrains Mono', 'Inter', 'IBM Plex Sans', 'Segoe UI', sans-serif",
+      fontWeight: 600,
       fontSize: "1.4rem",
       lineHeight: 1.28,
-      letterSpacing: "-0.01em",
+      letterSpacing: 0,
     },
     h5: {
-      fontFamily: "'Space Grotesk', 'IBM Plex Sans', 'Segoe UI', sans-serif",
-      fontWeight: 700,
+      fontFamily: "'JetBrains Mono', 'Inter', 'IBM Plex Sans', 'Segoe UI', sans-serif",
+      fontWeight: 600,
       fontSize: "1.2rem",
       lineHeight: 1.32,
-      letterSpacing: "-0.015em",
+      letterSpacing: 0,
     },
     h6: {
-      fontFamily: "'Space Grotesk', 'IBM Plex Sans', 'Segoe UI', sans-serif",
+      fontFamily: "'JetBrains Mono', 'Inter', 'IBM Plex Sans', 'Segoe UI', sans-serif",
       fontWeight: 600,
       fontSize: "1rem",
       lineHeight: 1.34,
     },
     subtitle1: {
-      fontFamily: "'IBM Plex Sans', 'Segoe UI', sans-serif",
+      fontFamily: "'Inter', 'IBM Plex Sans', 'Segoe UI', sans-serif",
       fontSize: "0.9rem",
       fontWeight: 600,
       lineHeight: 1.4,
     },
     subtitle2: {
-      fontFamily: "'IBM Plex Sans', 'Segoe UI', sans-serif",
+      fontFamily: "'Inter', 'IBM Plex Sans', 'Segoe UI', sans-serif",
       fontSize: "0.82rem",
       fontWeight: 600,
       lineHeight: 1.4,
     },
     body1: {
-      fontFamily: "'IBM Plex Sans', 'Segoe UI', sans-serif",
+      fontFamily: "'Inter', 'IBM Plex Sans', 'Segoe UI', sans-serif",
       fontSize: "0.94rem",
       lineHeight: 1.58,
     },
     body2: {
-      fontFamily: "'IBM Plex Sans', 'Segoe UI', sans-serif",
+      fontFamily: "'Inter', 'IBM Plex Sans', 'Segoe UI', sans-serif",
       fontSize: "0.88rem",
       lineHeight: 1.54,
     },
     caption: {
-      fontFamily: "'IBM Plex Sans', 'Segoe UI', sans-serif",
+      fontFamily: "'JetBrains Mono', 'Inter', 'IBM Plex Sans', 'Segoe UI', sans-serif",
       fontSize: "0.72rem",
       lineHeight: 1.4,
-      color: "rgba(213, 216, 223, 0.68)",
+      color: "var(--ui-rgba-213-216-223-680)",
     },
   },
   components: {
@@ -102,21 +102,21 @@ export const appTheme = createTheme({
       styleOverrides: {
         body: {
           scrollbarWidth: "thin",
-          scrollbarColor: "rgba(108,156,212,0.2) transparent",
+          scrollbarColor: "var(--ui-rgba-0-255-170-150) transparent",
         },
       },
     },
     MuiCard: {
       styleOverrides: {
         root: {
-          border: "1px solid rgba(255, 255, 255, 0.08)",
-          background: "linear-gradient(180deg, rgba(24, 24, 27, 0.94), rgba(17, 17, 20, 0.92))",
-          backdropFilter: "blur(14px)",
-          borderRadius: 20,
+          border: "1px solid var(--surface-border)",
+          background: "var(--surface-bg-elevated)",
+          backdropFilter: "blur(8px)",
+          borderRadius: 8,
           transition: "border-color 0.25s ease, box-shadow 0.25s ease, transform 0.2s ease",
           "&:hover": {
-            borderColor: "rgba(255, 255, 255, 0.12)",
-            boxShadow: "0 12px 28px rgba(0, 0, 0, 0.18)",
+            borderColor: "var(--surface-border-strong)",
+            boxShadow: "var(--surface-shadow-soft)",
           },
         },
       },
@@ -142,7 +142,8 @@ export const appTheme = createTheme({
           fontWeight: 600,
           fontSize: "0.78rem",
           lineHeight: 1.16,
-          letterSpacing: "0.012em",
+          letterSpacing: 0,
+          fontFamily: "var(--font-mono)",
           borderRadius: "var(--button-radius)",
           minHeight: "var(--button-height-sm)",
           padding: "0 var(--button-pad-x-sm)",
@@ -153,9 +154,9 @@ export const appTheme = createTheme({
             background: "var(--button-bg-pressed)",
           },
           "&.Mui-disabled": {
-            color: "rgba(170, 193, 220, 0.38)",
-            borderColor: "rgba(95, 132, 172, 0.14)",
-            background: "rgba(10, 18, 31, 0.42)",
+            color: "var(--ui-rgba-170-193-220-380)",
+            borderColor: "var(--ui-rgba-95-132-172-140)",
+            background: "var(--ui-rgba-10-18-31-420)",
             boxShadow: "none",
           },
           variants: [
@@ -192,33 +193,33 @@ export const appTheme = createTheme({
             {
               props: { variant: "outlined", color: "success" },
               style: {
-                borderColor: "rgba(74, 210, 157, 0.28)",
+                borderColor: "var(--ui-rgba-74-210-157-280)",
                 color: "#79f0bb",
                 "&:hover": {
-                  borderColor: "rgba(74, 210, 157, 0.42)",
-                  background: "rgba(9, 37, 29, 0.82)",
+                  borderColor: "var(--ui-rgba-74-210-157-420)",
+                  background: "var(--ui-rgba-9-37-29-820)",
                 },
               },
             },
             {
               props: { variant: "outlined", color: "warning" },
               style: {
-                borderColor: "rgba(255, 159, 67, 0.3)",
+                borderColor: "var(--ui-rgba-255-159-67-300)",
                 color: "#ffbc7c",
                 "&:hover": {
-                  borderColor: "rgba(255, 159, 67, 0.44)",
-                  background: "rgba(47, 24, 8, 0.82)",
+                  borderColor: "var(--ui-rgba-255-159-67-440)",
+                  background: "var(--ui-rgba-47-24-8-820)",
                 },
               },
             },
             {
               props: { variant: "outlined", color: "error" },
               style: {
-                borderColor: "rgba(255, 107, 107, 0.3)",
+                borderColor: "var(--ui-rgba-255-107-107-300)",
                 color: "#ff9f9f",
                 "&:hover": {
-                  borderColor: "rgba(255, 107, 107, 0.44)",
-                  background: "rgba(46, 11, 18, 0.82)",
+                  borderColor: "var(--ui-rgba-255-107-107-440)",
+                  background: "var(--ui-rgba-46-11-18-820)",
                 },
               },
             },
@@ -254,16 +255,16 @@ export const appTheme = createTheme({
         contained: {
           background: "var(--button-bg-primary)",
           color: "var(--button-text-strong)",
-          borderColor: "rgba(158, 185, 212, 0.24)",
+          borderColor: "var(--button-border-strong)",
           boxShadow: "var(--button-shadow-primary)",
           "&:hover": {
             background: "var(--button-bg-primary-hover)",
-            borderColor: "rgba(173, 199, 224, 0.3)",
+            borderColor: "var(--surface-border-strong)",
             boxShadow: "var(--button-shadow-hover)",
           },
         },
         outlined: {
-          background: "rgba(22, 22, 26, 0.78)",
+          background: "var(--ui-rgba-22-22-26-780)",
           borderColor: "var(--button-border)",
           boxShadow: "none",
           "&:hover": {
@@ -278,7 +279,7 @@ export const appTheme = createTheme({
           background: "transparent",
           "&:hover": {
             color: "var(--button-text)",
-            background: "rgba(255, 255, 255, 0.05)",
+            background: "var(--ui-rgba-255-255-255-050)",
           },
         },
       },
@@ -286,18 +287,18 @@ export const appTheme = createTheme({
     MuiChip: {
       styleOverrides: {
         root: {
-          fontFamily: "'IBM Plex Sans', 'Space Grotesk', sans-serif",
+          fontFamily: "var(--font-mono)",
           fontSize: "0.68rem",
           fontWeight: 500,
-          letterSpacing: "0.025em",
-          borderRadius: 999,
+          letterSpacing: 0,
+          borderRadius: 6,
           transition: "all 0.2s ease",
           "&:hover": {
             boxShadow: "none",
           },
         },
         outlined: {
-          borderColor: "rgba(118, 152, 190, 0.18)",
+          borderColor: "var(--surface-border)",
         },
         colorSuccess: {
           "&:hover": {
@@ -319,9 +320,9 @@ export const appTheme = createTheme({
     MuiTableContainer: {
       styleOverrides: {
         root: {
-          borderRadius: 14,
-          border: "1px solid rgba(118, 152, 190, 0.12)",
-          background: "rgba(255, 255, 255, 0.018)",
+          borderRadius: 8,
+          border: "1px solid var(--surface-border)",
+          background: "var(--cyber-panel)",
         },
       },
     },
@@ -329,13 +330,14 @@ export const appTheme = createTheme({
       styleOverrides: {
         root: {
           "& .MuiTableCell-head": {
-            background: "rgba(8, 18, 33, 0.74)",
-            color: "rgba(214, 228, 255, 0.55)",
+            background: "var(--cyber-panel-raised)",
+            color: "var(--ui-rgba-0-255-170-400)",
+            fontFamily: "var(--font-mono)",
             fontWeight: 500,
             fontSize: "0.68rem",
-            letterSpacing: "0.04em",
+            letterSpacing: 0,
             textTransform: "uppercase" as const,
-            borderBottom: "1px solid rgba(118, 152, 190, 0.12)",
+            borderBottom: "1px solid var(--surface-border)",
             padding: "8px 12px",
           },
         },
@@ -347,14 +349,14 @@ export const appTheme = createTheme({
           "& .MuiTableRow-root": {
             transition: "background 0.15s ease",
             "&:hover": {
-              background: "rgba(57, 208, 255, 0.04) !important",
+              background: "var(--ui-rgba-0-255-170-040) !important",
             },
           },
           "& .MuiTableCell-body": {
-            borderBottom: "1px solid rgba(118, 152, 190, 0.06)",
+            borderBottom: "1px solid var(--surface-border)",
             padding: "8px 12px",
             fontSize: "0.81rem",
-            color: "#e8f4ff",
+            color: "var(--text-primary)",
           },
         },
       },
@@ -367,12 +369,12 @@ export const appTheme = createTheme({
     MuiInputBase: {
       styleOverrides: {
         root: {
-          color: "#e8f4ff !important",
+          color: "var(--text-primary) !important",
         },
         input: {
-          color: "#e8f4ff !important",
+          color: "var(--text-primary) !important",
           "&::placeholder": {
-            color: "rgba(140, 170, 210, 0.5) !important",
+            color: "var(--text-dim) !important",
             opacity: "1 !important",
           },
         },
@@ -381,9 +383,9 @@ export const appTheme = createTheme({
     MuiInputLabel: {
       styleOverrides: {
         root: {
-          color: "rgba(214, 228, 255, 0.55)",
+          color: "var(--text-secondary)",
           "&.Mui-focused": {
-            color: "#39d0ff",
+            color: "var(--teal)",
           },
         },
       },
@@ -391,17 +393,17 @@ export const appTheme = createTheme({
     MuiSelect: {
       styleOverrides: {
         select: {
-          color: "#e8f4ff",
+          color: "var(--text-primary)",
         },
         icon: {
-          color: "rgba(214, 228, 255, 0.5)",
+          color: "var(--text-secondary)",
         },
       },
     },
     MuiFormHelperText: {
       styleOverrides: {
         root: {
-          color: "rgba(214, 228, 255, 0.45)",
+          color: "var(--ui-rgba-214-228-255-450)",
         },
       },
     },
@@ -409,14 +411,14 @@ export const appTheme = createTheme({
       styleOverrides: {
         root: {
           fontSize: "0.76rem",
-          color: "#e8f4ff",
+          color: "var(--text-primary)",
           "&:hover": {
-            background: "rgba(57, 208, 255, 0.06)",
+            background: "var(--ui-rgba-0-255-170-060)",
           },
           "&.Mui-selected": {
-            background: "rgba(57, 208, 255, 0.1)",
+            background: "var(--ui-rgba-0-255-170-100)",
             "&:hover": {
-              background: "rgba(57, 208, 255, 0.14)",
+              background: "var(--ui-rgba-0-255-170-150)",
             },
           },
         },
@@ -425,26 +427,26 @@ export const appTheme = createTheme({
     MuiOutlinedInput: {
       styleOverrides: {
         root: {
-          borderRadius: 10,
+          borderRadius: 8,
           fontSize: "0.82rem",
-          color: "#e8f4ff",
+          color: "var(--text-primary)",
           "& .MuiOutlinedInput-notchedOutline": {
-            borderColor: "rgba(118, 152, 190, 0.12)",
+            borderColor: "var(--surface-border)",
             transition: "border-color 0.2s ease, box-shadow 0.2s ease",
           },
           "&:hover .MuiOutlinedInput-notchedOutline": {
-            borderColor: "rgba(118, 152, 190, 0.2)",
+            borderColor: "var(--surface-border-strong)",
           },
           "&.Mui-focused .MuiOutlinedInput-notchedOutline": {
-            borderColor: "#39d0ff",
-            boxShadow: "0 0 0 2px rgba(57, 208, 255, 0.1)",
+            borderColor: "var(--teal)",
+            boxShadow: "0 0 0 2px var(--ui-rgba-0-255-170-100)",
           },
         },
         input: {
           padding: "9px 11px",
-          color: "#e8f4ff",
+          color: "var(--text-primary)",
           "&::placeholder": {
-            color: "rgba(140, 170, 210, 0.4)",
+            color: "var(--text-dim)",
             opacity: 1,
           },
         },
@@ -457,43 +459,43 @@ export const appTheme = createTheme({
           backgroundImage: "none",
           border: "1px solid var(--surface-border)",
           borderRadius: 8,
-          backdropFilter: "blur(14px)",
-          boxShadow: "0 28px 96px rgba(0,0,0,0.5)",
+          backdropFilter: "blur(8px)",
+          boxShadow: "0 28px 96px var(--ui-rgba-0-0-0-500)",
         },
       },
     },
     MuiAlert: {
       styleOverrides: {
         root: {
-          borderRadius: 10,
+          borderRadius: 8,
           fontSize: "0.82rem",
           variants: [
             {
               props: { variant: "standard", color: "info" },
               style: {
-                background: "rgba(57, 208, 255, 0.06)",
-                border: "1px solid rgba(57, 208, 255, 0.15)",
+                background: "var(--ui-rgba-57-208-255-060)",
+                border: "1px solid var(--ui-rgba-57-208-255-150)",
               },
             },
             {
               props: { variant: "standard", color: "success" },
               style: {
-                background: "rgba(74, 210, 157, 0.06)",
-                border: "1px solid rgba(74, 210, 157, 0.15)",
+                background: "var(--ui-rgba-74-210-157-060)",
+                border: "1px solid var(--ui-rgba-74-210-157-150)",
               },
             },
             {
               props: { variant: "standard", color: "warning" },
               style: {
-                background: "rgba(255, 159, 67, 0.06)",
-                border: "1px solid rgba(255, 159, 67, 0.15)",
+                background: "var(--ui-rgba-255-159-67-060)",
+                border: "1px solid var(--ui-rgba-255-159-67-150)",
               },
             },
             {
               props: { variant: "standard", color: "error" },
               style: {
-                background: "rgba(255, 107, 107, 0.06)",
-                border: "1px solid rgba(255, 107, 107, 0.15)",
+                background: "var(--ui-rgba-255-107-107-060)",
+                border: "1px solid var(--ui-rgba-255-107-107-150)",
               },
             },
           ],
@@ -503,10 +505,10 @@ export const appTheme = createTheme({
     MuiTabs: {
       styleOverrides: {
         indicator: {
-          backgroundColor: "#39d0ff",
+          backgroundColor: "var(--teal)",
           height: 2,
           borderRadius: 1,
-          boxShadow: "0 0 8px rgba(57, 208, 255, 0.3)",
+          boxShadow: "0 0 8px var(--ui-rgba-0-255-170-150)",
         },
       },
     },
@@ -514,16 +516,17 @@ export const appTheme = createTheme({
       styleOverrides: {
         root: {
           textTransform: "none" as const,
+          fontFamily: "var(--font-mono)",
           fontWeight: 500,
           fontSize: "0.78rem",
-          letterSpacing: "0.01em",
-          color: "rgba(214, 228, 255, 0.55)",
+          letterSpacing: 0,
+          color: "var(--text-secondary)",
           transition: "color 0.2s ease",
           "&:hover": {
-            color: "rgba(214, 228, 255, 0.85)",
+            color: "var(--text-primary)",
           },
           "&.Mui-selected": {
-            color: "#e8f4ff",
+            color: "var(--teal)",
             fontWeight: 600,
           },
         },
@@ -533,8 +536,8 @@ export const appTheme = createTheme({
       styleOverrides: {
         root: {
           background: "transparent",
-          border: "1px solid rgba(118, 152, 190, 0.12)",
-          borderRadius: "12px !important",
+          border: "1px solid var(--surface-border)",
+          borderRadius: "8px !important",
           "&:before": {
             display: "none",
           },
@@ -572,9 +575,11 @@ export const appTheme = createTheme({
     MuiTooltip: {
       styleOverrides: {
         tooltip: {
-          background: "rgba(6, 14, 28, 0.95)",
-          border: "1px solid rgba(118, 152, 190, 0.14)",
+          background: "var(--cyber-panel-raised)",
+          border: "1px solid var(--surface-border)",
           borderRadius: 8,
+          color: "var(--text-primary)",
+          fontFamily: "var(--font-mono)",
           fontSize: "0.72rem",
           backdropFilter: "blur(8px)",
         },
@@ -584,9 +589,9 @@ export const appTheme = createTheme({
       styleOverrides: {
         switchBase: {
           "&.Mui-checked": {
-            color: "#39d0ff",
+            color: "var(--teal)",
             "& + .MuiSwitch-track": {
-              backgroundColor: "rgba(57, 208, 255, 0.35)",
+              backgroundColor: "var(--ui-rgba-0-255-170-150)",
             },
           },
         },

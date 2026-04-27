@@ -50,6 +50,8 @@ fn env_alias_to_custom_key(env: &str) -> Option<&'static str> {
         "ONEPASSWORD_TOKEN" => "onepassword_token",
         "ONEPASSWORD_HOST" => "onepassword_host",
         "GOOGLE_PLACES_API_KEY" => "google_places_api_key",
+        "HOME_ASSISTANT_URL" => "home_assistant_url",
+        "HOME_ASSISTANT_TOKEN" => "home_assistant_token",
         "TWILIO_ACCOUNT_SID" => "twilio_account_sid",
         "TWILIO_AUTH_TOKEN" => "twilio_auth_token",
         "TWILIO_FROM_NUMBER" => "twilio_from_number",

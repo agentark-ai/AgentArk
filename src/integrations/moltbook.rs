@@ -48,6 +48,10 @@ impl MoltbookConnector {
         Self::new_with_config_dir(config_dir)
     }
 
+    pub fn has_configured_api_key(&self) -> bool {
+        Self::load_api_key_from(&self.config_dir).is_some()
+    }
+
     fn checked_url(path: &str) -> Result<String> {
         let url = format!("{}{}", Self::API_BASE, path);
         let parsed = url::Url::parse(&url)?;

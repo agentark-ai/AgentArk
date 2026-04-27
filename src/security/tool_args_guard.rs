@@ -12,7 +12,7 @@
 //! membership, exact-match hostnames) — nothing about attacker phrasing or
 //! anticipated wording.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 use crate::core::net::{

@@ -1,4 +1,4 @@
-//! ArkSentinel — AgentArk's Background Guardian
+//! ArkSentinel - AgentArk's Background Guardian
 //!
 //! A unified background daemon that keeps AgentArk alive and proactive 24/7:
 //!
@@ -17,7 +17,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use crate::channels;
 use crate::core::data_lifecycle::load_data_lifecycle_settings;
@@ -26,6 +26,8 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, Semaphore};
+
+mod managed_backup;
 
 type SharedAgent = Arc<RwLock<Agent>>;
 
@@ -285,11 +287,11 @@ async fn run_with_busy_deferral<F, Fut>(
                 tokio::time::sleep(Duration::from_secs((defer_minutes * 60) as u64)).await;
                 continue;
             };
-            tracing::debug!("ArkSentinel: {} started", label);
+            tracing::info!("ArkSentinel: {} started", label);
             match tokio::time::timeout(Duration::from_secs(*SENTINEL_JOB_TIMEOUT_SECS), job()).await
             {
                 Ok(()) => {
-                    tracing::debug!("ArkSentinel: {} completed", label);
+                    tracing::info!("ArkSentinel: {} completed", label);
                 }
                 Err(_) => {
                     tracing::warn!(
@@ -805,8 +807,31 @@ pub async fn get_pulse_log(agent: &Agent) -> Vec<PulseEvent> {
         .await
     {
         Ok(rows) => {
-            let mut events: Vec<PulseEvent> =
-                rows.into_iter().filter_map(pulse_event_from_row).collect();
+            let live_app_ids = live_app_ids_for_pulse(agent).await;
+            let mut stale_event_ids = Vec::new();
+            let mut events = Vec::new();
+            for row in rows {
+                let Some(event) = pulse_event_from_row(row.clone()) else {
+                    continue;
+                };
+                if pulse_event_has_missing_app_reference(&event, &live_app_ids) {
+                    stale_event_ids.push(row.id);
+                    continue;
+                }
+                events.push(event);
+            }
+            if !stale_event_ids.is_empty() {
+                if let Err(error) = agent
+                    .storage
+                    .delete_arkpulse_events_by_ids(&stale_event_ids)
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to prune stale ArkPulse app events while loading log: {}",
+                        error
+                    );
+                }
+            }
             events.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
             events
         }
@@ -931,6 +956,63 @@ fn pulse_event_app_ids(event: &PulseEvent) -> HashSet<String> {
     ids
 }
 
+async fn live_app_ids_for_pulse(agent: &Agent) -> HashSet<String> {
+    let mut ids = agent
+        .app_registry
+        .list()
+        .await
+        .into_iter()
+        .filter_map(|row| {
+            row.get("id")
+                .and_then(|value| value.as_str())
+                .map(|value| value.trim().to_string())
+        })
+        .filter(|app_id| !app_id.is_empty())
+        .collect::<HashSet<_>>();
+
+    let apps_dir = agent.data_dir().join("apps");
+    if let Ok(mut entries) = tokio::fs::read_dir(&apps_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let app_id = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if app_id.is_empty() || app_id.eq_ignore_ascii_case("new") {
+                continue;
+            }
+            let meta_path = path.join(".app_meta.json");
+            let valid_meta = match tokio::fs::read(&meta_path).await {
+                Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .map(|value| value.is_object())
+                    .unwrap_or(false),
+                Err(_) => false,
+            };
+            if valid_meta {
+                ids.insert(app_id);
+            }
+        }
+    }
+
+    ids
+}
+
+fn pulse_event_has_missing_app_reference(
+    event: &PulseEvent,
+    live_app_ids: &HashSet<String>,
+) -> bool {
+    let referenced_app_ids = pulse_event_app_ids(event);
+    !referenced_app_ids.is_empty()
+        && referenced_app_ids
+            .iter()
+            .any(|app_id| !live_app_ids.contains(app_id))
+}
+
 fn pulse_event_references_app(event: &PulseEvent, app_id: &str) -> bool {
     pulse_event_app_ids(event).contains(app_id)
         || event
@@ -1010,6 +1092,7 @@ struct AppEndpoint {
 struct PulseDoctorContext {
     storage: crate::storage::Storage,
     data_dir: PathBuf,
+    allow_managed_backup_work: bool,
     app_registry: crate::actions::app::AppRegistry,
     config: crate::core::config::AgentConfig,
     embedding_client: Option<Arc<crate::core::EmbeddingClient>>,
@@ -2459,60 +2542,41 @@ async fn run_resource_checks(
 async fn run_data_safety_checks(
     storage: &crate::storage::Storage,
     data_dir: &Path,
+    allow_backup_work: bool,
     findings: &mut Vec<DoctorFinding>,
-) {
-    let backup_dir = data_dir.join("backups");
-    if tokio::fs::metadata(&backup_dir).await.is_err() {
-        push_internal_finding!(
-            findings,
-            "medium",
-            "data_safety",
-            backup_dir.display().to_string(),
-            "No backup directory found",
-            "Expected backup directory does not exist".to_string(),
-            "Data recovery posture is weak without regular backups.",
-            "mkdir -p data/backups && configure periodic backups".to_string(),
-        );
-    } else {
-        let mut latest: Option<SystemTime> = None;
-        if let Ok(mut entries) = tokio::fs::read_dir(&backup_dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                if let Ok(meta) = entry.metadata().await {
-                    if let Ok(modified_at) = meta.modified() {
-                        latest =
-                            Some(latest.map_or(modified_at, |current| current.max(modified_at)));
-                    }
-                }
-            }
+) -> String {
+    let backup_status = match managed_backup::ensure_managed_postgres_backup(
+        data_dir,
+        managed_backup::ManagedBackupOptions { allow_backup_work },
+    )
+    .await
+    {
+        Ok(managed_backup::ManagedBackupOutcome::Fresh) => "fresh".to_string(),
+        Ok(managed_backup::ManagedBackupOutcome::Created { path, size_bytes }) => {
+            tracing::info!(
+                target: "agentark::sentinel",
+                path = %path.display(),
+                size_bytes,
+                "Managed backup was refreshed during data safety checks"
+            );
+            "created".to_string()
         }
-        if let Some(ts) = latest {
-            if let Ok(age) = ts.elapsed() {
-                if age > Duration::from_secs(7 * 24 * 3600) {
-                    push_finding!(
-                        findings,
-                        "high",
-                        "data_safety",
-                        backup_dir.display().to_string(),
-                        "Backups are stale",
-                        format!("Latest backup age: {:.1} days", age.as_secs_f64() / 86400.0),
-                        "Recovery point objective is likely not met.",
-                        "Run backup now and schedule daily backups".to_string(),
-                    );
-                }
-            }
-        } else {
+        Ok(managed_backup::ManagedBackupOutcome::DeferredBusy) => "deferred_busy".to_string(),
+        Ok(managed_backup::ManagedBackupOutcome::AlreadyRunning) => "already_running".to_string(),
+        Err(error) => {
             push_finding!(
                 findings,
-                "high",
+                "critical",
                 "data_safety",
-                backup_dir.display().to_string(),
-                "Backup directory is empty",
-                "No backup artifacts found".to_string(),
-                "No restore point is available if DB corruption occurs.",
-                "Create a Postgres logical backup or snapshot the Postgres volume".to_string(),
+                error.target,
+                "Managed backup failed",
+                error.evidence,
+                "AgentArk could not create or refresh its framework-managed Postgres backup.",
+                "Check the AgentArk data volume permissions and Postgres backup tooling; ArkPulse will retry automatically.".to_string(),
             );
+            "failed".to_string()
         }
-    }
+    };
 
     match storage.latest_migration_version().await {
         Ok(Some(version)) => {
@@ -2663,6 +2727,8 @@ async fn run_data_safety_checks(
             );
         }
     }
+
+    backup_status
 }
 
 async fn run_policy_compliance_checks(findings: &mut Vec<DoctorFinding>) {
@@ -3144,15 +3210,24 @@ async fn run_doctor_checks(
 
     let data_safety_started = Instant::now();
     let findings_before = findings.len();
-    run_data_safety_checks(&ctx.storage, &data_dir, &mut findings).await;
+    let managed_backup_status = run_data_safety_checks(
+        &ctx.storage,
+        &data_dir,
+        ctx.allow_managed_backup_work,
+        &mut findings,
+    )
+    .await;
     sections.push(build_scan_section(
         "data_safety",
         "Data safety",
         data_safety_started.elapsed(),
         &findings[findings_before..],
-        "Checked backup posture and durable schema readiness.",
-        "Verified backup directory presence and expected storage tables.",
-        vec![pulse_metric("Data dir", data_dir.display().to_string())],
+        "Checked managed backup creation and durable schema readiness.",
+        "Prepared or refreshed framework-managed Postgres backups and verified expected storage tables.",
+        vec![
+            pulse_metric("Data dir", data_dir.display().to_string()),
+            pulse_metric("Managed backup", managed_backup_status),
+        ],
     ));
 
     let policy_started = Instant::now();
@@ -3246,7 +3321,7 @@ async fn run_doctor_checks(
 
 /// ArkSentinel configuration (loaded from settings, with sensible defaults)
 pub struct SentinelConfig {
-    /// How often to check process health (seconds) — used by http.rs process watchdog
+    /// How often to check process health (seconds) - used by http.rs process watchdog
     pub _process_check_interval: u64,
     /// How often to check for due tasks (seconds)
     pub scheduler_interval: u64,
@@ -3340,7 +3415,7 @@ pub fn start(
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let mut handles = Vec::new();
 
-    // ── Task Scheduler ──────────────────────────────────────────────────
+    // -- Task Scheduler --------------------------------------------------
     handles.push({
         let agent = agent.clone();
         let mut shutdown = shutdown_rx.clone();
@@ -3366,7 +3441,7 @@ pub fn start(
         })
     });
 
-    // ── Watcher Poller ──────────────────────────────────────────────────
+    // -- Watcher Poller --------------------------------------------------
     handles.push({
         let agent = agent.clone();
         let mut shutdown = shutdown_rx.clone();
@@ -3440,7 +3515,7 @@ pub fn start(
         });
     }
 
-    // ── Memory Consolidation ────────────────────────────────────────────
+    // -- Memory Consolidation --------------------------------------------
     handles.push({
         let agent = agent.clone();
         let mut shutdown = shutdown_rx.clone();
@@ -3561,7 +3636,7 @@ pub fn start(
         })
     });
 
-    // ── Approval Expiry ─────────────────────────────────────────────────
+    // -- Approval Expiry -------------------------------------------------
     handles.push({
         let agent = agent.clone();
         let mut shutdown = shutdown_rx.clone();
@@ -3575,14 +3650,14 @@ pub fn start(
                     break;
                 }
                 record_loop_heartbeat(&agent, SENTINEL_APPROVAL_EXPIRY_HEARTBEAT_KEY).await;
-                tracing::debug!("ArkSentinel: approval_expiry started");
+                tracing::info!("ArkSentinel: approval_expiry started");
                 match tokio::time::timeout(
                     Duration::from_secs(*SENTINEL_JOB_TIMEOUT_SECS),
                     run_approval_expiry(&agent),
                 )
                 .await
                 {
-                    Ok(()) => tracing::debug!("ArkSentinel: approval_expiry completed"),
+                    Ok(()) => tracing::info!("ArkSentinel: approval_expiry completed"),
                     Err(_) => tracing::warn!(
                         "ArkSentinel: approval_expiry timed out after {}s",
                         *SENTINEL_JOB_TIMEOUT_SECS
@@ -3592,7 +3667,7 @@ pub fn start(
         })
     });
 
-    // ── ArkPulse (proactive agent wake-up) ───────────────────────────────
+    // -- ArkPulse (proactive agent wake-up) -------------------------------
     if config.pulse_interval > 0 {
         handles.push({
             let agent = agent.clone();
@@ -3634,7 +3709,7 @@ pub fn start(
         });
     }
 
-    // ── Autonomy Auto-Analysis (periodic insight generation) ─────────────
+    // -- Autonomy Auto-Analysis (periodic insight generation) -------------
     if config.auto_analysis_interval > 0 {
         handles.push({
             let agent = agent.clone();
@@ -3670,11 +3745,36 @@ pub fn start(
                         || {
                             let agent = agent.clone();
                             async move {
-                                let _ = channels::http::run_autonomy_analysis_tick(
-                                    agent.clone(),
-                                    "sentinel_periodic",
+                                tracing::info!("ArkSentinel: auto_analysis tick started");
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_secs(45),
+                                    channels::http::run_autonomy_analysis_tick(
+                                        agent.clone(),
+                                        "sentinel_periodic",
+                                    ),
                                 )
-                                .await;
+                                .await
+                                {
+                                    Ok(result) => {
+                                        tracing::info!(
+                                            status = result
+                                                .get("status")
+                                                .and_then(|value| value.as_str())
+                                                .unwrap_or("unknown"),
+                                            skipped = result
+                                                .get("skipped")
+                                                .and_then(|value| value.as_bool())
+                                                .unwrap_or(false),
+                                            "ArkSentinel: auto_analysis tick completed"
+                                        );
+                                    }
+                                    Err(_) => {
+                                        tracing::warn!(
+                                            timeout_secs = 45,
+                                            "ArkSentinel: auto_analysis tick timed out"
+                                        );
+                                    }
+                                }
                             }
                         },
                     )
@@ -3684,8 +3784,8 @@ pub fn start(
         });
     }
 
-    // ── Vector memory cleanup (monthly, idle-only) ──────────────────────
-    // ── Unused App Notifications ────────────────────────────────────────
+    // -- Vector memory cleanup (monthly, idle-only) ----------------------
+    // -- Unused App Notifications ----------------------------------------
     handles.push({
         let agent = agent.clone();
         let mut shutdown = shutdown_rx.clone();
@@ -3740,14 +3840,14 @@ pub fn start(
                         let agent_guard = agent.read().await;
                         agent_guard.runtime.clone()
                     };
-                    tracing::debug!("ArkSentinel: container_reaper started");
+                    tracing::info!("ArkSentinel: container_reaper started");
                     let result = tokio::time::timeout(
                         Duration::from_secs(*SENTINEL_JOB_TIMEOUT_SECS),
                         async move { runtime.reconcile_orphan_containers().await },
                     )
                     .await;
                     match result {
-                        Ok(Ok(_)) => tracing::debug!("ArkSentinel: container_reaper completed"),
+                        Ok(Ok(_)) => tracing::info!("ArkSentinel: container_reaper completed"),
                         Ok(Err(error)) => {
                             tracing::warn!(
                                 "ArkSentinel: sandbox container reconciliation failed: {}",
@@ -3764,7 +3864,7 @@ pub fn start(
         });
     }
 
-    // ── Security Log Cleanup (every 15 days, idle-only) ─────────────────
+    // -- Security Log Cleanup (every 15 days, idle-only) -----------------
     handles.push({
         let agent = agent.clone();
         let mut shutdown = shutdown_rx.clone();
@@ -3827,9 +3927,9 @@ pub fn start(
     handles
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Task Scheduler — execute cron/scheduled tasks when due
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// Task Scheduler - execute cron/scheduled tasks when due
+// ===========================================================================
 
 async fn run_scheduler(agent: &SharedAgent) {
     let autonomy_paused = is_agent_autonomy_paused(agent).await;
@@ -3863,9 +3963,9 @@ async fn run_scheduler(agent: &SharedAgent) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Watcher Poller — check conditions and fire triggers
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// Watcher Poller - check conditions and fire triggers
+// ===========================================================================
 
 async fn record_loop_heartbeat(agent: &SharedAgent, key: &str) {
     let storage = { agent.read().await.storage.clone() };
@@ -4084,6 +4184,7 @@ async fn run_watchers(agent: &SharedAgent) {
                             &watcher.description,
                             &watcher.condition,
                             &result,
+                            watcher.last_result.as_deref(),
                         )
                         .await
                     {
@@ -4165,9 +4266,9 @@ async fn run_watchers(agent: &SharedAgent) {
     watcher_manager.cleanup().await;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Background Learning
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 async fn persist_background_learning_job_result(
     storage: &crate::storage::Storage,
@@ -4502,9 +4603,9 @@ async fn run_candidate_generation_job(agent: &SharedAgent) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Approval Expiry
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 async fn run_approval_expiry(agent: &SharedAgent) {
     const APPROVAL_EXPIRY_SECS: i64 = 7 * 24 * 60 * 60;
@@ -4598,10 +4699,14 @@ async fn load_autonomy_settings_snapshot(
 ) -> crate::core::AutonomySettings {
     if let Ok(Some(raw)) = storage.get("autonomy_settings_v1").await {
         if let Ok(parsed) = serde_json::from_slice::<crate::core::AutonomySettings>(&raw) {
-            return parsed;
+            let mut settings = parsed;
+            settings.enforce_dependencies();
+            return settings;
         }
     }
-    crate::core::AutonomySettings::default()
+    let mut settings = crate::core::AutonomySettings::default();
+    settings.enforce_dependencies();
+    settings
 }
 
 async fn maybe_emit_autonomy_pause_nudge(agent: &SharedAgent, autonomy_paused: bool) {
@@ -4895,9 +5000,9 @@ fn build_critical_notification(
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ArkPulse — proactive agent wake-up
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// ArkPulse - proactive agent wake-up
+// ===========================================================================
 
 pub async fn run_pulse(agent: &SharedAgent) {
     if is_agent_autonomy_paused(agent).await {
@@ -4956,7 +5061,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
         }
     }
 
-    // ── Code-only checks first (zero LLM tokens) ────────────────────────
+    // -- Code-only checks first (zero LLM tokens) ------------------------
     // Only wake the LLM if there's actually something worth acting on.
 
     let http_client = reqwest::Client::builder()
@@ -4964,12 +5069,14 @@ pub async fn run_pulse(agent: &SharedAgent) {
         .build()
         .unwrap_or_default();
 
+    let allow_managed_backup_work = !sentinel_under_load(agent).await;
     let (pulse_ctx, tasks, watcher_manager, security_events, notification_store) = {
         let agent_guard = agent.read().await;
         (
             PulseDoctorContext {
                 storage: agent_guard.storage.clone(),
                 data_dir: agent_guard.data_dir.clone(),
+                allow_managed_backup_work,
                 app_registry: agent_guard.app_registry.clone(),
                 config: agent_guard.config.clone(),
                 embedding_client: agent_guard.embedding_client.clone(),
@@ -5047,7 +5154,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
             })
             .collect();
 
-        // Find goals with approaching deadlines (≤3 days or overdue)
+        // Find goals with approaching deadlines (<=3 days or overdue)
         let approaching_goals: Vec<String> = all_tasks
             .iter()
             .filter(|t| {
@@ -5110,7 +5217,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
             ],
         });
 
-        // ── Health checks ────────────────────────────────────────────────
+        // -- Health checks ------------------------------------------------
         let mut health_checks = Vec::new();
         let health_snapshot_started = Instant::now();
 
@@ -5334,7 +5441,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
             ],
         });
 
-        // ── Security snapshot ────────────────────────────────────────────
+        // -- Security snapshot --------------------------------------------
         let security_snapshot_started = Instant::now();
         let sec_snapshot = security_events.snapshot();
         let mut security_persisted = false;
@@ -5854,15 +5961,15 @@ pub async fn run_pulse(agent: &SharedAgent) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Vector memory cleanup — prune stale ephemeral memories, keep core facts
+// ===========================================================================
+// Vector memory cleanup - prune stale ephemeral memories, keep core facts
 // Runs once per month, only when server is idle (no recent activity).
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Security Log Cleanup — prune entries older than 15 days
+// ===========================================================================
+// Security Log Cleanup - prune entries older than 15 days
 // Runs every 15 days, only when server is idle.
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 const SECURITY_CLEANUP_KEY: &str = "security_log_last_cleanup";
 
@@ -5927,9 +6034,9 @@ async fn run_security_log_cleanup(agent: &SharedAgent) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Unused App Notifications — notify user about idle deployed apps daily
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// Unused App Notifications - notify user about idle deployed apps daily
+// ===========================================================================
 
 const UNUSED_APP_NOTIFY_PREFIX: &str = "unused_app_last_notified:";
 /// Apps idle for more than 24 hours get a notification
@@ -5960,7 +6067,7 @@ async fn run_unused_app_check(agent: &SharedAgent) {
     let now = chrono::Utc::now();
 
     for (app_id, title, last_accessed) in &unused_apps {
-        // Check cooldown — don't spam the same app notification every hour
+        // Check cooldown - don't spam the same app notification every hour
         let notify_key = format!("{}{}", UNUSED_APP_NOTIFY_PREFIX, app_id);
         let last_notified = storage
             .get(&notify_key)

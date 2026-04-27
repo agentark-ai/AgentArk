@@ -339,9 +339,9 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
   const tagChipSx = {
     height: 22,
     borderRadius: 1,
-    background: "rgba(14, 25, 43, 0.95)",
-    border: "1px solid rgba(112,153,201,0.18)",
-    color: "rgba(198,214,235,0.82)",
+    background: "var(--ui-rgba-14-25-43-950)",
+    border: "1px solid var(--ui-rgba-112-153-201-180)",
+    color: "var(--ui-rgba-198-214-235-820)",
     "& .MuiChip-label": {
       px: 1,
       fontSize: "0.63rem",
@@ -353,9 +353,9 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
   const statusChipSx = {
     height: 22,
     borderRadius: 1,
-    background: "rgba(14, 25, 43, 0.92)",
-    border: "1px solid rgba(112,153,201,0.16)",
-    color: "rgba(173,192,214,0.9)",
+    background: "var(--ui-rgba-14-25-43-920)",
+    border: "1px solid var(--ui-rgba-112-153-201-160)",
+    color: "var(--ui-rgba-173-192-214-900)",
     "& .MuiChip-label": {
       px: 1,
       fontSize: "0.64rem",
@@ -656,20 +656,20 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
           p: 1.5,
           borderRadius: 1.5,
           border: configuredLook
-            ? "1px solid rgba(64,196,255,0.24)"
-            : "1px solid rgba(112,153,201,0.16)",
+            ? "1px solid var(--ui-rgba-64-196-255-240)"
+            : "1px solid var(--ui-rgba-112-153-201-160)",
           background: configuredLook
-            ? "rgba(8,24,42,0.56)"
-            : "rgba(7,17,32,0.6)",
+            ? "var(--ui-rgba-8-24-42-560)"
+            : "var(--ui-rgba-7-17-32-600)",
           transition: "border-color 0.15s, background 0.15s, box-shadow 0.15s",
           "&:hover": {
             borderColor: configuredLook
-              ? "rgba(109, 226, 255, 0.34)"
-              : "rgba(148, 181, 220, 0.24)",
+              ? "var(--ui-rgba-109-226-255-340)"
+              : "var(--ui-rgba-148-181-220-240)",
             background: configuredLook
-              ? "rgba(9,28,48,0.66)"
-              : "rgba(9,21,39,0.72)",
-            boxShadow: "0 8px 24px rgba(0,0,0,0.18)",
+              ? "var(--ui-rgba-9-28-48-660)"
+              : "var(--ui-rgba-9-21-39-720)",
+            boxShadow: "0 8px 24px var(--ui-rgba-0-0-0-180)",
           },
         }}
       >
@@ -1426,8 +1426,8 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
                 sx={{
                   p: 1.2,
                   borderRadius: "8px",
-                  border: "1px solid rgba(255,255,255,0.08)",
-                  background: "rgba(255,255,255,0.02)"
+                  border: "1px solid var(--ui-rgba-255-255-255-080)",
+                  background: "var(--ui-rgba-255-255-255-020)"
                 }}
               >
                 <Stack spacing={0.75}>

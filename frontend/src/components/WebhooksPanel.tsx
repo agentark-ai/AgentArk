@@ -580,7 +580,7 @@ export function WebhooksPanel({ autoRefresh }: WebhooksPanelProps) {
             const ingestPath = str(source.ingest_path);
             const ingestUrl = typeof window === "undefined" ? ingestPath : `${window.location.origin}${ingestPath}`;
             return (
-              <Box key={sourceId} sx={{ p: 1.5, borderRadius: 2, border: "1px solid rgba(120,180,255,0.18)", background: "rgba(8,20,38,0.6)" }}>
+              <Box key={sourceId} sx={{ p: 1.5, borderRadius: 2, border: "1px solid var(--ui-rgba-120-180-255-180)", background: "var(--ui-rgba-8-20-38-600)" }}>
                 <Stack direction={{ xs: "column", md: "row" }} spacing={1.5} sx={{
                   justifyContent: "space-between"
                 }}>

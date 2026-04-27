@@ -330,6 +330,9 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
   const tunnelAvailable = toBool(tunnel.available);
   const tunnelErrorText = str(tunnel.error, "").trim();
   const selectedPublicAppId = str(tunnel.selected_app_id, "").trim();
+  const tunnelControlPlaneEnabled = toBool(tunnel.control_plane_enabled);
+  const tunnelExposureActive =
+    tunnelActive && (!!selectedPublicAppId || tunnelControlPlaneEnabled);
   const tunnelStarting =
     tunnelActionState === "starting" || tunnelStartMutation.isPending;
   const tunnelStopping =
@@ -342,10 +345,15 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
       }
       return;
     }
-    if (tunnelActionState === "stopping" && !tunnelActive) {
+    if (tunnelActionState === "stopping" && !tunnelExposureActive) {
       setTunnelActionState("idle");
     }
-  }, [tunnelActionState, tunnelBaseUrl, tunnelErrorText, tunnelActive]);
+  }, [
+    tunnelActionState,
+    tunnelBaseUrl,
+    tunnelErrorText,
+    tunnelExposureActive,
+  ]);
 
   useEffect(() => {
     if (!appsActionSuccess) return;
@@ -644,7 +652,15 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
                   const hasProtectedVariant =
                     !!accessUrl && localAccessUrl !== localUrl;
                   const controlPlaneTunnelOnly =
-                    tunnelActive && !!tunnelBaseUrl && !selectedPublicAppId;
+                    tunnelActive &&
+                    !!tunnelBaseUrl &&
+                    !selectedPublicAppId &&
+                    tunnelControlPlaneEnabled;
+                  const publicTunnelReadyOnly =
+                    tunnelActive &&
+                    !!tunnelBaseUrl &&
+                    !selectedPublicAppId &&
+                    !tunnelControlPlaneEnabled;
                   const publicShareUrl = publicUrl;
                   const localShareUrl = localUrl;
                   const shareUrl = publicShareUrl || localShareUrl;
@@ -772,11 +788,11 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
                     },
                     {
                       label: tunnelStopping
-                        ? "Stopping..."
+                        ? "Stopping Exposure..."
                         : tunnelMeta.isPrivate
-                          ? "Stop Private Access"
-                          : "Stop Public Tunnel",
-                      disabled: tunnelStopping || !tunnelActive,
+                          ? "Stop Private Exposure"
+                          : "Stop Public Exposure",
+                      disabled: tunnelStopping || !tunnelExposureActive,
                       onClick: stopTunnel,
                     },
                     {
@@ -992,6 +1008,15 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
                             >
                               {shareCaptionLabel} control-plane access is active.
                               Expose this app to get a working app link.
+                            </Typography>
+                          ) : publicTunnelReadyOnly ? (
+                            <Typography
+                              variant="caption"
+                              component="div"
+                              sx={{ color: "text.secondary" }}
+                            >
+                              {shareCaptionLabel} infrastructure is ready. Expose
+                              this app to get a working app link.
                             </Typography>
                           ) : null}
                           {toBool(appItem.access_guard_enabled) &&

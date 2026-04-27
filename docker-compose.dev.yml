@@ -17,6 +17,7 @@ services:
       context: .
       args:
         AGENTARK_DOCKER_FEATURES: ${AGENTARK_DOCKER_FEATURES:-telegram,docker,ssh}
+        AGENTARK_BUILD_JOBS: ${AGENTARK_BUILD_JOBS:-2}
         INSTALL_PLAYWRIGHT_RUNTIME: ${AGENTARK_INSTALL_PLAYWRIGHT_RUNTIME:-true}
         INSTALL_TAILSCALE: ${AGENTARK_INSTALL_TAILSCALE:-true}
         INSTALL_CLOUDFLARED: ${AGENTARK_INSTALL_CLOUDFLARED:-true}
@@ -24,6 +25,9 @@ services:
         INSTALL_GWS: ${AGENTARK_INSTALL_GWS:-true}
         INSTALL_DOCKER_CLI: ${AGENTARK_INSTALL_DOCKER_CLI:-true}
         INSTALL_WHATSAPP_BRIDGE: ${AGENTARK_INSTALL_WHATSAPP_BRIDGE:-true}
+    image: ${AGENTARK_IMAGE:-agentark:dev}
+
+  agentark-embeddings:
     image: ${AGENTARK_IMAGE:-agentark:dev}
 
   agentark-executor:

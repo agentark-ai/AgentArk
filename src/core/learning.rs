@@ -2,14 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::Result;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::core::self_evolve::skill_evolution::{self, SkillMetricsSnapshot, SkillWindowDirection};
-use crate::core::{ExecutionRun, ExecutionRunStatus, ToolAttempt};
 use crate::storage::{
-    experience_edge, experience_item, experience_run, learning_candidate, procedural_pattern,
-    KvLeaseGuard, Storage,
+    KvLeaseGuard, Storage, experience_edge, experience_item, experience_run, learning_candidate,
+    procedural_pattern,
 };
 
 pub const LEARNING_ENABLED_KEY: &str = "learning_enabled_v1";
@@ -63,65 +62,40 @@ fn short_hash(parts: &[&str]) -> String {
         .to_string()
 }
 
-fn scope_from_ids(project_id: Option<&str>, conversation_id: Option<&str>) -> &'static str {
-    if conversation_id.is_some() {
-        "conversation"
-    } else if project_id.is_some() {
-        "project"
-    } else {
-        "global"
-    }
-}
-
-fn normalize_token(token: &str) -> Option<String> {
-    let trimmed = token
-        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric())
-        .to_ascii_lowercase();
-    if trimmed.len() < 3 || trimmed.chars().all(|ch| ch.is_ascii_digit()) {
-        return None;
-    }
-    Some(trimmed)
-}
-
-fn derive_intent_key(message: &str, task_type: &str) -> String {
-    let mut seen = std::collections::HashSet::new();
-    let mut tokens = message
+pub(crate) fn derive_intent_key(request_text: &str, task_type: &str) -> String {
+    let task = task_type
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    let mut words = request_text
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
         .split_whitespace()
-        .filter_map(normalize_token)
-        .filter(|token| seen.insert(token.clone()))
-        .take(6)
+        .take(8)
+        .map(str::to_string)
         .collect::<Vec<_>>();
-    if tokens.is_empty() {
-        tokens.push("general".to_string());
+    if words.is_empty() {
+        words.push(short_hash(&[request_text]).chars().take(8).collect());
     }
-    format!("{}::{}", task_type, tokens.join("-"))
-}
-
-fn tool_sequence_digest(tool_attempts: &[ToolAttempt]) -> Option<String> {
-    if tool_attempts.is_empty() {
-        return None;
-    }
-    let sequence = tool_attempts
-        .iter()
-        .map(|attempt| attempt.tool_name.as_str())
-        .collect::<Vec<_>>();
-    Some(short_hash(&sequence))
-}
-
-fn tool_sequence_json(tool_attempts: &[ToolAttempt]) -> Value {
-    Value::Array(
-        tool_attempts
-            .iter()
-            .map(|attempt| {
-                json!({
-                    "tool_name": attempt.tool_name,
-                    "status": attempt.status.as_str(),
-                    "sequence_no": attempt.sequence_no,
-                    "retryable": attempt.retryable,
-                    "side_effect_level": attempt.side_effect_level,
-                })
-            })
-            .collect(),
+    format!(
+        "{}::{}",
+        if task.is_empty() {
+            "general"
+        } else {
+            task.as_str()
+        },
+        words.join("-")
     )
 }
 
@@ -136,137 +110,6 @@ fn tool_names_from_value(value: &Value) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
-}
-
-fn compact_json_value(value: &Value, depth: usize) -> Value {
-    if depth == 0 {
-        return Value::String("[truncated]".to_string());
-    }
-
-    match value {
-        Value::String(text) => Value::String(safe_truncate(text, 240)),
-        Value::Array(items) => Value::Array(
-            items
-                .iter()
-                .take(8)
-                .map(|item| compact_json_value(item, depth.saturating_sub(1)))
-                .collect(),
-        ),
-        Value::Object(map) => {
-            let mut compact = serde_json::Map::new();
-            for (key, item) in map.iter().take(16) {
-                compact.insert(
-                    safe_truncate(key, 64),
-                    compact_json_value(item, depth.saturating_sub(1)),
-                );
-            }
-            Value::Object(compact)
-        }
-        other => other.clone(),
-    }
-}
-
-fn parse_operational_json(raw: Option<&str>) -> Option<Value> {
-    raw.and_then(|text| serde_json::from_str::<Value>(text).ok())
-        .map(|value| compact_json_value(&value, 4))
-}
-
-fn summarize_operational_event(row: &crate::storage::entities::operational_log::Model) -> Value {
-    let mut summary = serde_json::Map::new();
-    summary.insert(
-        "created_at".to_string(),
-        Value::String(row.created_at.clone()),
-    );
-    summary.insert("success".to_string(), Value::Bool(row.success));
-    summary.insert("outcome".to_string(), Value::String(row.outcome.clone()));
-    if let Some(latency_ms) = row.latency_ms {
-        summary.insert("latency_ms".to_string(), json!(latency_ms));
-    }
-    if let Some(tool_name) = row
-        .tool_name
-        .as_ref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        summary.insert("tool_name".to_string(), Value::String(tool_name.clone()));
-    }
-    if let Some(payload) = parse_operational_json(row.payload.as_deref()) {
-        summary.insert("payload".to_string(), payload);
-    }
-    if let Some(arguments) = parse_operational_json(row.arguments.as_deref()) {
-        summary.insert("arguments".to_string(), arguments);
-    }
-    Value::Object(summary)
-}
-
-fn build_decision_episode(
-    logs: &[crate::storage::entities::operational_log::Model],
-) -> Option<Value> {
-    if logs.is_empty() {
-        return None;
-    }
-
-    let mut decision = serde_json::Map::new();
-    let mut tool_calls = Vec::new();
-    for row in logs {
-        match row.event_type.as_str() {
-            "request_shape_assessment" if !decision.contains_key("request_shape") => {
-                decision.insert(
-                    "request_shape".to_string(),
-                    summarize_operational_event(row),
-                );
-            }
-            "action_selection" if !decision.contains_key("action_selection") => {
-                decision.insert(
-                    "action_selection".to_string(),
-                    summarize_operational_event(row),
-                );
-            }
-            "routing_decision" if !decision.contains_key("routing") => {
-                decision.insert("routing".to_string(), summarize_operational_event(row));
-            }
-            "tool_plan_validation" if !decision.contains_key("tool_plan_validation") => {
-                decision.insert(
-                    "tool_plan_validation".to_string(),
-                    summarize_operational_event(row),
-                );
-            }
-            "llm_decision" if !decision.contains_key("llm_decision") => {
-                decision.insert("llm_decision".to_string(), summarize_operational_event(row));
-            }
-            "tool_batch_summary" if !decision.contains_key("tool_batch") => {
-                decision.insert("tool_batch".to_string(), summarize_operational_event(row));
-            }
-            "tool_call" if tool_calls.len() < 6 => {
-                tool_calls.push(summarize_operational_event(row));
-            }
-            "response_complete" | "request_failed" if !decision.contains_key("outcome") => {
-                decision.insert("outcome".to_string(), summarize_operational_event(row));
-            }
-            _ => {}
-        }
-    }
-    if !tool_calls.is_empty() {
-        tool_calls.reverse();
-        decision.insert("tool_calls".to_string(), Value::Array(tool_calls));
-    }
-    if decision.is_empty() {
-        None
-    } else {
-        Some(Value::Object(decision))
-    }
-}
-
-fn prompt_telemetry_from_logs(
-    logs: &[crate::storage::entities::operational_log::Model],
-) -> Option<Value> {
-    logs.iter()
-        .filter(|row| row.event_type == "prompt_telemetry")
-        .max_by_key(|row| row.created_at.as_str())
-        .and_then(|row| {
-            row.payload
-                .as_deref()
-                .and_then(|text| serde_json::from_str::<Value>(text).ok())
-        })
 }
 
 fn suggested_steps_from_tools(tool_names: &[String]) -> Vec<String> {
@@ -595,10 +438,6 @@ pub async fn load_learning_queue_cap(storage: &Storage) -> usize {
         .unwrap_or(DEFAULT_QUEUE_CAP)
 }
 
-fn build_experience_run_id(execution_run_id: &str) -> String {
-    stable_id("exprun", &[execution_run_id])
-}
-
 fn build_item_id(
     kind: &str,
     scope: &str,
@@ -637,201 +476,6 @@ fn build_pattern_id(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn record_execution_experience(
-    storage: &Storage,
-    execution_run: &ExecutionRun,
-    message: &str,
-    channel: &str,
-    conversation_id: Option<&str>,
-    project_id: Option<&str>,
-    prompt_version: Option<&str>,
-    classifier_prompt_version: Option<&str>,
-    specialist_prompt_version: Option<&str>,
-    strategy_version: Option<&str>,
-    policy_version: Option<&str>,
-    model_slot: Option<&str>,
-) -> Result<()> {
-    if !load_learning_enabled(storage).await {
-        return Ok(());
-    }
-    let tool_attempts = storage
-        .list_tool_attempts_for_run(&execution_run.id)
-        .await
-        .unwrap_or_default();
-    let task_type = crate::core::self_evolve::strategy_runtime::infer_task_type_from_action_names(
-        tool_attempts
-            .iter()
-            .map(|attempt| attempt.tool_name.as_str()),
-    );
-    let intent_key = derive_intent_key(message, &task_type);
-    let scope = scope_from_ids(project_id, conversation_id).to_string();
-    let sequence_json = tool_sequence_json(&tool_attempts);
-    let sequence_digest = tool_sequence_digest(&tool_attempts);
-    let success_state = if matches!(
-        execution_run.status,
-        ExecutionRunStatus::Completed | ExecutionRunStatus::Degraded
-    ) {
-        "provisional"
-    } else {
-        "failed"
-    };
-    let mut metadata = json!({
-        "execution_status": execution_run.status.as_str(),
-        "degradation": execution_run.degradation,
-        "attempted_models": execution_run.attempted_models,
-        "last_error": execution_run.last_error,
-        "tool_count": tool_attempts.len(),
-        "degraded": matches!(execution_run.status, ExecutionRunStatus::Degraded),
-    });
-    let (decision_episode, prompt_telemetry) = if let Some(trace_id) = execution_run
-        .trace_id
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        let logs = storage
-            .list_operational_logs_for_trace_ids(&[trace_id.to_string()], 64)
-            .await
-            .unwrap_or_default();
-        (
-            build_decision_episode(&logs),
-            prompt_telemetry_from_logs(&logs),
-        )
-    } else {
-        (None, None)
-    };
-    if let Some(obj) = metadata.as_object_mut() {
-        if let Some(version) = classifier_prompt_version.filter(|value| !value.trim().is_empty()) {
-            obj.insert(
-                "classifier_prompt_version".to_string(),
-                Value::String(version.to_string()),
-            );
-        }
-        if let Some(version) = specialist_prompt_version.filter(|value| !value.trim().is_empty()) {
-            obj.insert(
-                "specialist_prompt_version".to_string(),
-                Value::String(version.to_string()),
-            );
-        }
-        if let Some(decision_episode) = decision_episode {
-            obj.insert("decision_episode".to_string(), decision_episode);
-        }
-        if let Some(prompt_telemetry) = prompt_telemetry {
-            obj.insert("prompt_telemetry".to_string(), prompt_telemetry);
-        }
-    }
-    let experience_id = build_experience_run_id(&execution_run.id);
-    let now = chrono::Utc::now().to_rfc3339();
-    storage
-        .upsert_experience_run(&experience_run::Model {
-            id: experience_id.clone(),
-            execution_run_id: Some(execution_run.id.clone()),
-            trace_id: execution_run.trace_id.clone(),
-            conversation_id: conversation_id.map(|value| value.to_string()),
-            project_id: project_id.map(|value| value.to_string()),
-            channel: channel.to_string(),
-            scope,
-            intent_key,
-            task_type: Some(task_type),
-            request_text: Some(safe_truncate(message.trim(), 2000)),
-            tool_sequence_digest: sequence_digest.clone(),
-            tool_sequence_json: sequence_json,
-            strategy_version: strategy_version.map(|value| value.to_string()),
-            policy_version: policy_version.map(|value| value.to_string()),
-            prompt_version: prompt_version.map(|value| value.to_string()),
-            model_slot: model_slot.map(|value| value.to_string()),
-            success_state: success_state.to_string(),
-            correction_state: "none".to_string(),
-            outcome_summary: execution_run.result_summary.clone(),
-            failure_reason: execution_run.last_error.clone(),
-            metadata,
-            consolidated: false,
-            accepted_at: None,
-            corrected_at: None,
-            heuristic_reflected: false,
-            heuristic_reflection_status: Some("pending".to_string()),
-            heuristic_reflection_attempted_at: None,
-            heuristic_reflection_completed_at: None,
-            heuristic_lesson_id: None,
-            heuristic_reflection_error: None,
-            created_at: execution_run.created_at.clone(),
-            updated_at: execution_run.updated_at.clone(),
-        })
-        .await?;
-
-    for attempt in tool_attempts {
-        let edge_type = if attempt.status.as_str() == "success" {
-            "succeeded_with"
-        } else {
-            "failed_with"
-        };
-        storage
-            .upsert_experience_edge(&experience_edge::Model {
-                id: stable_id(
-                    "edge",
-                    &[
-                        experience_id.as_str(),
-                        edge_type,
-                        attempt.tool_name.as_str(),
-                        &attempt.sequence_no.to_string(),
-                    ],
-                ),
-                source_ref: experience_id.clone(),
-                source_kind: "experience_run".to_string(),
-                target_ref: format!("tool:{}", attempt.tool_name),
-                target_kind: "tool".to_string(),
-                edge_type: edge_type.to_string(),
-                weight: if edge_type == "succeeded_with" {
-                    1.0
-                } else {
-                    0.35
-                },
-                source_run_id: Some(experience_id.clone()),
-                metadata: json!({
-                    "tool_name": attempt.tool_name,
-                    "tool_status": attempt.status.as_str(),
-                    "sequence_no": attempt.sequence_no,
-                }),
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            })
-            .await?;
-    }
-
-    Ok(())
-}
-
-pub async fn record_user_correction(
-    storage: &Storage,
-    conversation_id: &str,
-    message: &str,
-) -> Result<()> {
-    if !load_learning_enabled(storage).await {
-        return Ok(());
-    }
-    let signal = safe_truncate(message.trim(), 180);
-    let mut corrected = false;
-    if let Some(trace_id) = storage
-        .latest_assistant_trace_id_for_conversation(conversation_id)
-        .await?
-    {
-        corrected = storage
-            .mark_provisional_experience_run_corrected_by_trace_id(&trace_id, &signal)
-            .await?
-            .is_some();
-    }
-    if !corrected {
-        let _ = storage
-            .mark_latest_provisional_experience_run_corrected(
-                conversation_id,
-                &signal,
-                CORRECTION_WINDOW_MINUTES,
-            )
-            .await?;
-    }
-    Ok(())
-}
-
 fn positive_procedure_summary(run: &experience_run::Model, tool_names: &[String]) -> String {
     if tool_names.is_empty() {
         format!(
@@ -859,16 +503,43 @@ fn negative_lesson_summary(run: &experience_run::Model, tool_names: &[String]) -
     )
 }
 
+fn experience_run_learning_signal_bool(run: &experience_run::Model, key: &str) -> bool {
+    run.metadata
+        .get("learning_signal")
+        .and_then(|value| value.get(key))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
+fn experience_run_has_procedure_evidence(
+    run: &experience_run::Model,
+    tool_names: &[String],
+) -> bool {
+    experience_run_learning_signal_bool(run, "procedure_eligible")
+        || !tool_names.is_empty()
+        || run.correction_state == "corrected"
+        || run.success_state == "failed"
+}
+
 pub async fn sync_user_preference_to_experience_item(
     storage: &Storage,
     key: &str,
     value: &str,
     confidence: f64,
     source: &str,
+    sensitivity: Option<&str>,
 ) -> Result<()> {
     let Some((kind, title, content)) = describe_user_preference_memory(key, value) else {
         return Ok(());
     };
+    let sensitivity =
+        crate::storage::entities::user_preference::normalize_memory_sensitivity(sensitivity)
+            .unwrap_or_else(|| {
+                crate::storage::entities::user_preference::classify_user_preference_sensitivity(
+                    key, value,
+                )
+            })
+            .as_str();
     let normalized_key = format!("user_pref::{}", key.trim());
     let id = build_item_id(kind, "global", None, None, &normalized_key);
     let existing = storage.get_experience_item(&id).await?;
@@ -903,6 +574,7 @@ pub async fn sync_user_preference_to_experience_item(
                 "source": source,
                 "user_preference_key": key.trim(),
                 "user_preference_value": safe_truncate(value.trim(), 220),
+                "sensitivity": sensitivity,
             }),
             last_supported_at: Some(now.clone()),
             last_contradicted_at: existing
@@ -922,12 +594,16 @@ pub async fn sync_user_preference_to_experience_item(
 
 async fn consolidate_run(storage: &Storage, run: &experience_run::Model) -> Result<()> {
     let tool_names = tool_names_from_value(&run.tool_sequence_json);
-    let scope = run.scope.as_str();
-    let project_id = run.project_id.as_deref();
-    let conversation_id = run.conversation_id.as_deref();
+    let scope = "global";
+    let project_id = None;
+    let conversation_id = None;
     let now = chrono::Utc::now().to_rfc3339();
 
     let is_negative = run.correction_state == "corrected" || run.success_state == "failed";
+    if !is_negative && !experience_run_has_procedure_evidence(run, &tool_names) {
+        storage.mark_experience_run_consolidated(&run.id).await?;
+        return Ok(());
+    }
     if is_negative {
         let related_procedure_key = format!(
             "procedure::{}::{}",
@@ -995,8 +671,8 @@ async fn consolidate_run(storage: &Storage, run: &experience_run::Model) -> Resu
             id: id.clone(),
             kind: kind.to_string(),
             scope: scope.to_string(),
-            project_id: run.project_id.clone(),
-            conversation_id: run.conversation_id.clone(),
+            project_id: None,
+            conversation_id: None,
             title: if is_negative {
                 format!("Lesson for {}", run.intent_key)
             } else {
@@ -1016,6 +692,12 @@ async fn consolidate_run(storage: &Storage, run: &experience_run::Model) -> Resu
                 "suggested_steps": steps,
                 "source_run_id": run.id,
                 "polarity": if is_negative { "negative" } else { "positive" },
+                "learning_signal": run
+                    .metadata
+                    .get("learning_signal")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "global_learning": true,
             }),
             last_supported_at: Some(now.clone()),
             last_contradicted_at: existing
@@ -1076,15 +758,14 @@ pub async fn run_pattern_induction(storage: &Storage) -> Result<usize> {
         return Ok(0);
     }
     let procedures = storage
-        .list_active_experience_items(
+        .list_active_experience_items_any_scope(
             &["procedure"],
-            None,
-            None,
             load_learning_queue_cap(storage).await as u64,
         )
         .await?
         .into_iter()
         .filter(|procedure| !experience_item_is_external_source(procedure))
+        .filter(procedure_item_is_pattern_eligible)
         .collect::<Vec<_>>();
     let mut updated = 0usize;
     for procedure in procedures {
@@ -1096,13 +777,7 @@ pub async fn run_pattern_induction(storage: &Storage) -> Result<usize> {
         let tool_digest = metadata
             .get("tool_sequence_digest")
             .and_then(|value| value.as_str());
-        let pattern_id = build_pattern_id(
-            &procedure.scope,
-            procedure.project_id.as_deref(),
-            procedure.conversation_id.as_deref(),
-            intent_key,
-            tool_digest,
-        );
+        let pattern_id = build_pattern_id("global", None, None, intent_key, tool_digest);
         let tool_sequence = metadata
             .get("tool_sequence")
             .cloned()
@@ -1120,13 +795,13 @@ pub async fn run_pattern_induction(storage: &Storage) -> Result<usize> {
             .upsert_procedural_pattern(&procedural_pattern::Model {
                 id: pattern_id.clone(),
                 intent_key: intent_key.to_string(),
-                scope: procedure.scope.clone(),
-                project_id: procedure.project_id.clone(),
-                conversation_id: procedure.conversation_id.clone(),
+                scope: "global".to_string(),
+                project_id: None,
+                conversation_id: None,
                 title: procedure.title.clone(),
                 trigger_summary: format!(
-                    "Use when the request matches `{}` within the current {} scope.",
-                    intent_key, procedure.scope
+                    "Use when the request matches `{}` and the learned evidence remains applicable.",
+                    intent_key
                 ),
                 summary: procedure.content.clone(),
                 tool_sequence_digest: tool_digest.map(|value| value.to_string()),
@@ -1146,6 +821,8 @@ pub async fn run_pattern_induction(storage: &Storage) -> Result<usize> {
                 },
                 metadata: json!({
                     "source_item_id": procedure.id,
+                    "source_scope": procedure.scope,
+                    "global_learning": true,
                     "task_type": metadata.get("task_type").cloned().unwrap_or(Value::Null),
                 }),
                 created_at: now.clone(),
@@ -1401,9 +1078,9 @@ pub(crate) async fn upsert_reflected_heuristic_lesson(
     heuristic: &ReflectedHeuristic,
 ) -> Result<ReflectedHeuristicPersistOutcome> {
     let now = chrono::Utc::now().to_rfc3339();
-    let scope = run.scope.as_str();
-    let project_id = run.project_id.as_deref();
-    let conversation_id = run.conversation_id.as_deref();
+    let scope = "global";
+    let project_id = None;
+    let conversation_id = None;
     let current_task_type = run.task_type.as_deref().unwrap_or("general");
     let lessons = storage
         .list_active_experience_items(&["lesson"], project_id, conversation_id, 48)
@@ -1505,8 +1182,8 @@ pub(crate) async fn upsert_reflected_heuristic_lesson(
                 id: id.clone(),
                 kind: "lesson".to_string(),
                 scope: scope.to_string(),
-                project_id: run.project_id.clone(),
-                conversation_id: run.conversation_id.clone(),
+                project_id: None,
+                conversation_id: None,
                 title: reflected_heuristic_title(run, &heuristic.polarity),
                 content: safe_truncate(&heuristic.heuristic, 260),
                 normalized_key,
@@ -1678,6 +1355,18 @@ fn metadata_marks_external_source(metadata: &Value) -> bool {
 
 fn experience_item_is_external_source(item: &experience_item::Model) -> bool {
     metadata_marks_external_source(&item.metadata)
+}
+
+fn experience_item_learning_signal_bool(item: &experience_item::Model, key: &str) -> bool {
+    item.metadata
+        .get("learning_signal")
+        .and_then(|value| value.get(key))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
+fn procedure_item_is_pattern_eligible(item: &experience_item::Model) -> bool {
+    experience_item_learning_signal_bool(item, "procedure_eligible") || item.support_count >= 2
 }
 
 fn procedural_pattern_is_external_source(pattern: &procedural_pattern::Model) -> bool {
@@ -2181,10 +1870,13 @@ pub async fn run_candidate_generation(storage: &Storage, data_dir: &Path) -> Res
                         id: workflow_candidate_id,
                         candidate_type: "skill_patch".to_string(),
                         subject_key: action_name.clone(),
-                        title: format!("Skill candidate: {}", pattern.title),
-                        summary: Some("Generated from repeated successful procedures.".to_string()),
-                        project_id: pattern.project_id.clone(),
-                        conversation_id: pattern.conversation_id.clone(),
+                        title: format!("Teach your agent a new skill: {}", pattern.title),
+                        summary: Some(
+                            "Your agent has handled this kind of request well several times. Save it as a reusable skill so future requests start from what worked."
+                                .to_string(),
+                        ),
+                        project_id: None,
+                        conversation_id: None,
                         pattern_id: Some(pattern.id.clone()),
                         evidence_refs: json!([pattern.id]),
                         proposed_content: build_skill_patch_candidate_content(
@@ -2242,10 +1934,13 @@ pub async fn run_candidate_generation(storage: &Storage, data_dir: &Path) -> Res
                         id: strategy_candidate_id,
                         candidate_type: "strategy".to_string(),
                         subject_key: pattern.id.clone(),
-                        title: format!("Strategy candidate: {}", pattern.title),
-                        summary: Some("Generated from high-confidence procedural patterns.".to_string()),
-                        project_id: pattern.project_id.clone(),
-                        conversation_id: pattern.conversation_id.clone(),
+                        title: format!("Save a handling approach your agent uses: {}", pattern.title),
+                        summary: Some(
+                            "Your agent has found a repeatable approach for this kind of request. Save it so this becomes the default way it handles similar ones."
+                                .to_string(),
+                        ),
+                        project_id: None,
+                        conversation_id: None,
                         pattern_id: Some(pattern.id.clone()),
                         evidence_refs: json!([pattern.id]),
                         proposed_content: serde_json::to_value(strategy_profile).unwrap_or(Value::Null),
@@ -2267,7 +1962,7 @@ pub async fn run_candidate_generation(storage: &Storage, data_dir: &Path) -> Res
         }
 
         let reflected_lessons = storage
-            .list_active_experience_items(&["lesson"], None, None, cap)
+            .list_active_experience_items_any_scope(&["lesson"], cap)
             .await?
             .into_iter()
             .filter(experience_item_is_reflected_heuristic)
@@ -2278,13 +1973,7 @@ pub async fn run_candidate_generation(storage: &Storage, data_dir: &Path) -> Res
                 continue;
             }
             let task_type = reflected_heuristic_task_type(&lesson).unwrap_or("general");
-            let subject_key = format!(
-                "heuristic_strategy::{}::{}::{}::{}",
-                lesson.scope,
-                lesson.project_id.as_deref().unwrap_or(""),
-                lesson.conversation_id.as_deref().unwrap_or(""),
-                task_type
-            );
+            let subject_key = format!("heuristic_strategy::global::{}", task_type);
             heuristic_groups.entry(subject_key).or_default().push(lesson);
         }
         for (subject_key, mut lessons) in heuristic_groups {
@@ -2340,13 +2029,13 @@ pub async fn run_candidate_generation(storage: &Storage, data_dir: &Path) -> Res
                         id: stable_id("candidate", &["strategy", subject_key.as_str()]),
                         candidate_type: "strategy".to_string(),
                         subject_key: subject_key.clone(),
-                        title: format!("Strategy candidate from reflected heuristics: {}", task_type),
+                        title: format!("Save a rule of thumb your agent learned for {} requests", task_type),
                         summary: Some(
-                            "Generated from repeated reflected heuristics in the background learning loop."
+                            "Your agent noticed a consistent pattern across similar requests. Save it so it applies by default on future ones like these."
                                 .to_string(),
                         ),
-                        project_id: selected[0].project_id.clone(),
-                        conversation_id: selected[0].conversation_id.clone(),
+                        project_id: None,
+                        conversation_id: None,
                         pattern_id: None,
                         evidence_refs,
                         proposed_content: serde_json::to_value(strategy_profile)
@@ -2428,7 +2117,7 @@ pub async fn run_candidate_generation(storage: &Storage, data_dir: &Path) -> Res
                     if content != skill.content {
                         action = Some("optimize_description");
                         diff_summary = Some(
-                            "Tighten the trigger description so the skill stops matching known out-of-scope requests."
+                            "Stop this skill from running on requests it isn't good at, based on recent failures."
                                 .to_string(),
                         );
                         updated_content = Some(content);
@@ -2452,7 +2141,7 @@ pub async fn run_candidate_generation(storage: &Storage, data_dir: &Path) -> Res
                     if content != skill.content {
                         action = Some("improve_skill");
                         diff_summary = Some(
-                            "Add a focused failure-check section based on recent corrected and failed runs."
+                            "Add guidance to help this skill handle what's been going wrong recently."
                                 .to_string(),
                         );
                         updated_content = Some(content);
@@ -2493,7 +2182,7 @@ pub async fn run_candidate_generation(storage: &Storage, data_dir: &Path) -> Res
                         id: candidate_id,
                         candidate_type: "skill_patch".to_string(),
                         subject_key: skill.name.clone(),
-                        title: format!("Skill patch: {}", skill.name),
+                        title: format!("Improve the '{}' skill", skill.name),
                         summary: Some(diff_summary.clone()),
                         project_id: None,
                         conversation_id: None,
@@ -2563,7 +2252,7 @@ pub async fn run_candidate_generation(storage: &Storage, data_dir: &Path) -> Res
         }
 
         let at_risk_procedures = storage
-            .list_active_experience_items(&["procedure"], None, None, cap)
+            .list_active_experience_items_any_scope(&["procedure"], cap)
             .await?
             .into_iter()
             .filter(|item| !experience_item_is_external_source(item))
@@ -2588,13 +2277,13 @@ pub async fn run_candidate_generation(storage: &Storage, data_dir: &Path) -> Res
                         id: stable_id("candidate", &["memory_deprecate", item.id.as_str()]),
                         candidate_type: "memory_deprecate".to_string(),
                         subject_key: item.id.clone(),
-                        title: format!("Deprecate stale procedure: {}", item.title),
+                        title: format!("Retire an outdated note: {}", item.title),
                         summary: Some(
-                            "The contradiction count has overtaken positive support for this procedure."
+                            "This note has been contradicted more often than it has been useful. Safe to retire so it stops influencing future requests."
                                 .to_string(),
                         ),
-                        project_id: item.project_id.clone(),
-                        conversation_id: item.conversation_id.clone(),
+                        project_id: None,
+                        conversation_id: None,
                         pattern_id: None,
                         evidence_refs: json!([item.id]),
                         proposed_content: json!({
@@ -2619,10 +2308,8 @@ pub async fn run_candidate_generation(storage: &Storage, data_dir: &Path) -> Res
         }
 
         let mergeable_items = storage
-            .list_active_experience_items(
+            .list_active_experience_items_any_scope(
                 &["constraint", "personal_fact", "lesson", "procedure"],
-                None,
-                None,
                 cap,
             )
             .await?
@@ -2672,13 +2359,13 @@ pub async fn run_candidate_generation(storage: &Storage, data_dir: &Path) -> Res
                             ),
                             candidate_type: "memory_merge".to_string(),
                             subject_key: target.id.clone(),
-                            title: format!("Merge duplicate memory into {}", target.title),
+                            title: format!("Combine a duplicate note into '{}'", target.title),
                             summary: Some(
-                                "Two active memories carry substantially the same content and can be merged."
+                                "Two notes are saying substantially the same thing. Merging keeps things tidy without losing either version."
                                     .to_string(),
                             ),
-                            project_id: target.project_id.clone(),
-                            conversation_id: target.conversation_id.clone(),
+                            project_id: None,
+                            conversation_id: None,
                             pattern_id: None,
                             evidence_refs: json!([target.id, source.id]),
                             proposed_content: json!({
@@ -2731,8 +2418,6 @@ pub async fn run_candidate_generation(storage: &Storage, data_dir: &Path) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::entities::operational_log;
-
     #[test]
     fn derive_intent_key_is_task_aware_and_stable() {
         let key = derive_intent_key(
@@ -2770,9 +2455,11 @@ mod tests {
         };
         let action_name = candidate_action_name(&pattern);
         assert!(action_name.starts_with("learned-fix-tool-bug-flow"));
-        assert!(action_name
-            .chars()
-            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-'));
+        assert!(
+            action_name
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+        );
     }
 
     #[test]
@@ -2842,98 +2529,5 @@ mod tests {
             embedding: None,
         };
         assert!(experience_item_is_external_source(&item));
-    }
-
-    #[test]
-    fn decision_episode_captures_recent_routing_evidence() {
-        let logs = vec![
-            operational_log::Model {
-                id: "log-outcome".to_string(),
-                created_at: "2026-04-14T01:03:00Z".to_string(),
-                trace_id: Some("trace-1".to_string()),
-                conversation_id: Some("conv-1".to_string()),
-                channel: "web".to_string(),
-                event_type: "response_complete".to_string(),
-                success: true,
-                outcome: "completed".to_string(),
-                tool_name: None,
-                latency_ms: Some(1200),
-                arguments: None,
-                payload: Some(r#"{"status":"completed","tool_calls":1}"#.to_string()),
-                strategy_version: None,
-                policy_version: None,
-                prompt_version: None,
-                model_slot: None,
-            },
-            operational_log::Model {
-                id: "log-routing".to_string(),
-                created_at: "2026-04-14T01:02:00Z".to_string(),
-                trace_id: Some("trace-1".to_string()),
-                conversation_id: Some("conv-1".to_string()),
-                channel: "web".to_string(),
-                event_type: "routing_decision".to_string(),
-                success: true,
-                outcome: "ok".to_string(),
-                tool_name: None,
-                latency_ms: Some(45),
-                arguments: None,
-                payload: Some(
-                    r#"{"complexity":"Complex","needs_delegation":false,"mode":"direct"}"#
-                        .to_string(),
-                ),
-                strategy_version: None,
-                policy_version: None,
-                prompt_version: None,
-                model_slot: None,
-            },
-            operational_log::Model {
-                id: "log-shape".to_string(),
-                created_at: "2026-04-14T01:01:00Z".to_string(),
-                trace_id: Some("trace-1".to_string()),
-                conversation_id: Some("conv-1".to_string()),
-                channel: "web".to_string(),
-                event_type: "request_shape_assessment".to_string(),
-                success: true,
-                outcome: "classified".to_string(),
-                tool_name: None,
-                latency_ms: Some(12),
-                arguments: None,
-                payload: Some(
-                    r#"{"shape":"app","execution_mode":"immediate","preferred_actions":["app_deploy"]}"#
-                        .to_string(),
-                ),
-                strategy_version: None,
-                policy_version: None,
-                prompt_version: None,
-                model_slot: None,
-            },
-        ];
-
-        let episode = build_decision_episode(&logs).expect("decision episode");
-        let payload = episode.as_object().expect("object");
-        assert_eq!(
-            payload
-                .get("request_shape")
-                .and_then(|value| value.get("payload"))
-                .and_then(|value| value.get("shape"))
-                .and_then(Value::as_str),
-            Some("app")
-        );
-        assert_eq!(
-            payload
-                .get("routing")
-                .and_then(|value| value.get("payload"))
-                .and_then(|value| value.get("complexity"))
-                .and_then(Value::as_str),
-            Some("Complex")
-        );
-        assert_eq!(
-            payload
-                .get("outcome")
-                .and_then(|value| value.get("payload"))
-                .and_then(|value| value.get("status"))
-                .and_then(Value::as_str),
-            Some("completed")
-        );
     }
 }

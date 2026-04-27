@@ -52,15 +52,15 @@ function Sparkline({ values, className }: { values: number[]; className?: string
     >
       <defs>
         <linearGradient id={`spark-${id}`} x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor="rgba(47, 212, 255, 0.32)" />
-          <stop offset="100%" stopColor="rgba(47, 212, 255, 0.00)" />
+          <stop offset="0%" stopColor="var(--ui-rgba-47-212-255-320)" />
+          <stop offset="100%" stopColor="var(--ui-rgba-47-212-255-000)" />
         </linearGradient>
       </defs>
       <polygon points={points.area} fill={`url(#spark-${id})`} />
       <polyline
         points={points.line}
         fill="none"
-        stroke="rgba(47, 212, 255, 0.95)"
+        stroke="var(--ui-rgba-47-212-255-950)"
         strokeWidth="2"
         strokeLinejoin="round"
         strokeLinecap="round"

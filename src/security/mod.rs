@@ -29,7 +29,6 @@ pub mod model_hardening;
 pub mod model_input;
 pub mod normalize;
 pub mod outbound;
-pub mod output_guard;
 pub mod pii;
 pub mod skill_review;
 pub mod tool_args_guard;
@@ -39,15 +38,15 @@ pub use action_guard::ActionGuard;
 pub use model_hardening::protect_system_prompt;
 #[allow(unused_imports)]
 pub use model_input::{
-    render_model_input_fallback, sanitize_model_input_json, sanitize_model_input_text,
     CurrentChatPiiPolicy, ModelInputContext, ModelInputPrivacyDecision,
     ModelInputPrivacyJsonResult, ModelInputPrivacyMode, ModelInputPrivacyTextResult,
-    ModelPrivacyConfig,
+    ModelPrivacyConfig, render_model_input_fallback, sanitize_model_input_json,
+    sanitize_model_input_text,
 };
 pub use normalize::normalize_for_analysis;
 pub use outbound::{
-    check_outbound_text, format_outbound_privacy_block, sanitize_outbound_json,
-    OutboundPrivacyDecision, OutboundPrivacyPolicy, OutboundPrivacyTextResult,
+    OutboundPrivacyDecision, OutboundPrivacyPolicy, check_outbound_text,
+    format_outbound_privacy_block, sanitize_outbound_json,
 };
 pub use pii::redact_pii;
 pub use trust_boundary::{
@@ -292,12 +291,37 @@ fn is_likely_identifier_slug(value: &str) -> bool {
         })
 }
 
+fn is_identifier_segment(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn is_likely_code_expression_token(value: &str) -> bool {
+    fn is_member_expression(value: &str) -> bool {
+        value.split('.').all(is_identifier_segment)
+    }
+
+    let trimmed = value.trim();
+    if let Some((left, right)) = trimmed.split_once('=') {
+        return is_member_expression(left) && is_member_expression(right);
+    }
+    trimmed.contains('.')
+        && trimmed.contains('_')
+        && trimmed.split('.').count() >= 2
+        && is_member_expression(trimmed)
+}
+
 fn is_opaque_token_shape(value: &str) -> bool {
     let trimmed = value.trim();
     trimmed.chars().count() >= OPAQUE_TOKEN_MIN_CHARS
         && !trimmed.chars().any(char::is_whitespace)
         && trimmed.chars().all(opaque_token_shape_char)
         && !is_likely_identifier_slug(trimmed)
+        && !is_likely_code_expression_token(trimmed)
         && opaque_token_has_secret_signal(trimmed)
         && shannon_entropy_bits_per_char(trimmed) >= OPAQUE_TOKEN_ENTROPY_BITS_PER_CHAR
 }
@@ -490,21 +514,6 @@ pub struct FilteredOutput {
     pub _is_clean: bool,
 }
 
-pub fn get_secret_input_block_response(kind: &SecretInputType) -> &'static str {
-    match kind {
-        SecretInputType::PrivateKeyMaterial => {
-            "That looks like private key material or a certificate. For safety, I won't process it in chat or send it to the LLM.\n\n\
-Use the secure credential form in chat, Settings, Integrations, or Actions Secrets to store credentials encrypted.\n\n\
-If you already pasted a key, rotate/revoke it."
-        }
-        SecretInputType::ApiKeyOrToken => {
-            "That looks like an API key/token/password. For safety, I won't process it in chat or send it to the LLM.\n\n\
-Use the secure credential form in chat, Settings, Integrations, or Actions Secrets to store credentials encrypted.\n\n\
-If you already shared a live key, rotate/revoke it."
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,6 +609,15 @@ mod tests {
     #[test]
     fn test_secret_redaction_keeps_sentence_with_internal_identifier() {
         let message = "Inspect memory_capture_events and capture model health";
+        let result = redact_secret_input(message);
+
+        assert!(!result.had_secret());
+        assert_eq!(result.text, message);
+    }
+
+    #[test]
+    fn test_secret_redaction_keeps_python_traceback_expressions() {
+        let message = "subprocess.check_call stdout=subprocess.DEVNULL stderr=subprocess.DEVNULL";
         let result = redact_secret_input(message);
 
         assert!(!result.had_secret());

@@ -46,7 +46,6 @@ import type {
 import { ExtensionPacksPanel } from "./ExtensionPacksPanel";
 import { IntegrationQuickstartPanel } from "./IntegrationQuickstartPanel";
 import { IntegrationRoutingPanel } from "./IntegrationRoutingPanel";
-import { MoltbookManager } from "./MoltbookManager";
 import { PluginSdkPanel } from "./PluginSdkPanel";
 
 const REFRESH_MS = 8000;
@@ -149,7 +148,7 @@ export function ChannelIcon({ name, size = 20 }: { name: string; size?: number }
       />
     );
   }
-  const color = CHANNEL_ICON_COLORS[key] || "rgba(180,200,225,0.6)";
+  const color = CHANNEL_ICON_COLORS[key] || "var(--ui-rgba-180-200-225-600)";
   const letter = name.charAt(0).toUpperCase();
   return (
     <Box
@@ -165,7 +164,7 @@ export function ChannelIcon({ name, size = 20 }: { name: string; size?: number }
         flexShrink: 0,
         fontSize: size * 0.55,
         fontWeight: 800,
-        color: ["#ffffff", "#f0f0f0", "#25D366", "#69e2ff", "#0DBD8B"].includes(color) ? "rgba(0,0,0,0.85)" : "#fff",
+        color: ["#ffffff", "#f0f0f0", "#25D366", "#69e2ff", "#0DBD8B"].includes(color) ? "var(--ui-rgba-0-0-0-850)" : "#fff",
         lineHeight: 1,
       }}
     >
@@ -176,7 +175,7 @@ export function ChannelIcon({ name, size = 20 }: { name: string; size?: number }
 
 function ConnectorIcon({ id, name, size = 22 }: { id: string; name: string; size?: number }) {
   const key = id.toLowerCase();
-  const color = CHANNEL_ICON_COLORS[key] || "rgba(108,156,212,0.3)";
+  const color = CHANNEL_ICON_COLORS[key] || "var(--ui-rgba-108-156-212-300)";
   const letter = name.charAt(0).toUpperCase();
   return (
     <Box
@@ -192,7 +191,7 @@ function ConnectorIcon({ id, name, size = 22 }: { id: string; name: string; size
         flexShrink: 0,
         fontSize: size * 0.5,
         fontWeight: 800,
-        color: ["#ffffff", "#f0f0f0", "#25D366", "#69e2ff", "#0DBD8B"].includes(color) ? "rgba(0,0,0,0.85)" : "#fff",
+        color: ["#ffffff", "#f0f0f0", "#25D366", "#69e2ff", "#0DBD8B"].includes(color) ? "var(--ui-rgba-0-0-0-850)" : "#fff",
         lineHeight: 1,
       }}
     >
@@ -524,26 +523,26 @@ function integrationCardAccent(state: IntegrationCardState): {
 } {
   if (state === "enabled") {
     return {
-      border: "rgba(74,210,157,0.35)",
-      background: "rgba(74,210,157,0.06)",
-      hoverBorder: "rgba(74,210,157,0.55)",
-      hoverBackground: "rgba(74,210,157,0.1)",
-      chipBorder: "rgba(74,210,157,0.3)",
-      chipColor: "rgba(74,210,157,0.9)"
+      border: "var(--ui-rgba-74-210-157-350)",
+      background: "var(--ui-rgba-74-210-157-060)",
+      hoverBorder: "var(--ui-rgba-74-210-157-550)",
+      hoverBackground: "var(--ui-rgba-74-210-157-100)",
+      chipBorder: "var(--ui-rgba-74-210-157-300)",
+      chipColor: "var(--ui-rgba-74-210-157-900)"
     };
   }
   return {
-    border: "rgba(255,180,50,0.28)",
-    background: "rgba(255,180,50,0.05)",
-    hoverBorder: "rgba(255,180,50,0.44)",
-    hoverBackground: "rgba(255,180,50,0.08)",
-    chipBorder: "rgba(255,180,50,0.24)",
-    chipColor: "rgba(255,196,92,0.92)"
+    border: "var(--ui-rgba-255-180-50-280)",
+    background: "var(--ui-rgba-255-180-50-050)",
+    hoverBorder: "var(--ui-rgba-255-180-50-440)",
+    hoverBackground: "var(--ui-rgba-255-180-50-080)",
+    chipBorder: "var(--ui-rgba-255-180-50-240)",
+    chipColor: "var(--ui-rgba-255-196-92-920)"
   };
 }
 
 function integrationCardDotColor(state: IntegrationCardState): string {
-  return state === "enabled" ? "#4ad29d" : "rgba(255,180,50,0.85)";
+  return state === "enabled" ? "#4ad29d" : "var(--ui-rgba-255-180-50-850)";
 }
 
 type MessagingDisplayState = "off" | "checking" | "needs_setup" | "ready" | "error";
@@ -870,7 +869,6 @@ export function IntegrationsPanel({
   const showConnectorsPage = mode === "connectors";
   const shouldLoadConnectorCatalog = showCatalog || showConnectorsPage;
   const [active, setActive] = useState<IntegrationItem | null>(null);
-  const [moltbookOpen, setMoltbookOpen] = useState(false);
   const [formValues, setFormValues] = useState<Record<string, string>>({});
   const [formError, setFormError] = useState<string | null>(null);
   const [googleWorkspaceHelpOpen, setGoogleWorkspaceHelpOpen] = useState(false);
@@ -1312,7 +1310,9 @@ export function IntegrationsPanel({
   });
 
   const integrations = shouldLoadConnectorCatalog
-    ? (integrationsQ.data?.integrations || [])
+    ? (integrationsQ.data?.integrations || []).filter(
+        (integration) => normalizeIntegrationId(integration.id) !== "moltbook",
+      )
     : [];
   const integrationSyncStatuses = showCatalog ? integrationSyncStatusQ.data?.statuses || [] : [];
   const integrationSyncStatusById = useMemo(
@@ -1788,9 +1788,9 @@ export function IntegrationsPanel({
       : null
   ].filter((item): item is { key: string; label: string; detail: string; badge: string } => Boolean(item));
   const sectionAccordionSx = {
-    border: "1px solid rgba(112,153,201,0.14)",
+    border: "1px solid var(--ui-rgba-112-153-201-140)",
     borderRadius: "8px",
-    background: "rgba(8,18,34,0.7)",
+    background: "var(--ui-rgba-8-18-34-700)",
     boxShadow: "none",
     "&:before": { display: "none" },
     "&.Mui-expanded": { mt: 0, mb: 0 },
@@ -1810,9 +1810,9 @@ export function IntegrationsPanel({
   const sectionCountChipSx = {
     height: 22,
     borderRadius: 1,
-    background: "rgba(14, 25, 43, 0.92)",
-    border: "1px solid rgba(112,153,201,0.16)",
-    color: "rgba(173,192,214,0.9)",
+    background: "var(--ui-rgba-14-25-43-920)",
+    border: "1px solid var(--ui-rgba-112-153-201-160)",
+    color: "var(--ui-rgba-173-192-214-900)",
     "& .MuiChip-label": {
       px: 1,
       fontSize: "0.64rem",
@@ -1824,9 +1824,9 @@ export function IntegrationsPanel({
   const sectionTagChipSx = {
     height: 22,
     borderRadius: 1,
-    background: "rgba(14, 25, 43, 0.95)",
-    border: "1px solid rgba(112,153,201,0.18)",
-    color: "rgba(198,214,235,0.82)",
+    background: "var(--ui-rgba-14-25-43-950)",
+    border: "1px solid var(--ui-rgba-112-153-201-180)",
+    color: "var(--ui-rgba-198-214-235-820)",
     "& .MuiChip-label": {
       px: 1,
       fontSize: "0.63rem",
@@ -2760,10 +2760,10 @@ export function IntegrationsPanel({
     return (
       <Box
         sx={{
-          border: "1px solid rgba(110, 160, 255, 0.18)",
+          border: "1px solid var(--ui-rgba-110-160-255-180)",
           borderRadius: 2,
           p: 1.25,
-          background: "rgba(10, 18, 32, 0.5)"
+          background: "var(--ui-rgba-10-18-32-500)"
         }}
       >
         <Stack spacing={1.25}>
@@ -2831,7 +2831,7 @@ export function IntegrationsPanel({
                   <Box
                     key={str(row.key, `${channel}-${str(row.sender_id)}`)}
                     sx={{
-                      border: "1px solid rgba(255,255,255,0.08)",
+                      border: "1px solid var(--ui-rgba-255-255-255-080)",
                       borderRadius: 1.5,
                       px: 1,
                       py: 0.9
@@ -2909,7 +2909,7 @@ export function IntegrationsPanel({
                   <Box
                     key={str(row.key, `${channel}-${str(row.sender_id)}`)}
                     sx={{
-                      border: "1px solid rgba(255,255,255,0.08)",
+                      border: "1px solid var(--ui-rgba-255-255-255-080)",
                       borderRadius: 1.5,
                       px: 1,
                       py: 0.9
@@ -3002,10 +3002,6 @@ export function IntegrationsPanel({
   };
 
   const openConfig = (integration: IntegrationItem) => {
-    if (normalizeIntegrationId(integration.id) === "moltbook") {
-      setMoltbookOpen(true);
-      return;
-    }
     setActive(integration);
     setFormError(null);
     const nextValues: Record<string, string> = {};
@@ -3425,7 +3421,7 @@ export function IntegrationsPanel({
     } catch (err) {
       if (authWindow && !authWindow.closed) {
         authWindow.document.write(
-          `<!doctype html><title>Sign-in failed</title><body style="font-family:system-ui;background:#0b1320;color:#dce7f7;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;padding:24px;"><div style="max-width:420px;background:#102236;border:1px solid rgba(112,153,201,0.18);border-radius:16px;padding:20px;"><h2 style="margin:0 0 12px;font-size:18px;">Sign-in could not start</h2><p style="margin:0;color:#a9bdd6;line-height:1.5;">${String(asErrorMessage(err))
+          `<!doctype html><title>Sign-in failed</title><body style="font-family:system-ui;background:#0b1320;color:#dce7f7;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;padding:24px;"><div style="max-width:420px;background:#102236;border:1px solid var(--ui-rgba-112-153-201-180);border-radius:16px;padding:20px;"><h2 style="margin:0 0 12px;font-size:18px;">Sign-in could not start</h2><p style="margin:0;color:#a9bdd6;line-height:1.5;">${String(asErrorMessage(err))
             .replace(/&/g, "&amp;")
             .replace(/</g, "&lt;")
             .replace(/>/g, "&gt;")}</p></div></body>`
@@ -3514,9 +3510,9 @@ export function IntegrationsPanel({
                 <Grid2 key={bundle.id} size={{ xs: 12, sm: 6 }}>
                   <Box
                     sx={{
-                      border: "1px solid rgba(112,153,201,0.14)",
+                      border: "1px solid var(--ui-rgba-112-153-201-140)",
                       borderRadius: 1.5,
-                      background: checked ? "rgba(15, 68, 110, 0.18)" : "rgba(7,17,32,0.28)"
+                      background: checked ? "var(--ui-rgba-15-68-110-180)" : "var(--ui-rgba-7-17-32-280)"
                     }}
                   >
                     <FormControlLabel
@@ -3799,7 +3795,7 @@ export function IntegrationsPanel({
                             "&:hover": {
                               borderColor: accent.hoverBorder,
                               background: accent.hoverBackground,
-                              boxShadow: "0 8px 24px rgba(0,0,0,0.18)"
+                              boxShadow: "0 8px 24px var(--ui-rgba-0-0-0-180)"
                             }
                           }}
                         >
@@ -3911,8 +3907,8 @@ export function IntegrationsPanel({
                       sx={{
                         p: 1.15,
                         borderRadius: 1.5,
-                        border: "1px solid rgba(74,210,157,0.18)",
-                        background: "rgba(10, 28, 20, 0.26)",
+                        border: "1px solid var(--ui-rgba-74-210-157-180)",
+                        background: "var(--ui-rgba-10-28-20-260)",
                         minHeight: 84
                       }}
                     >
@@ -3932,7 +3928,7 @@ export function IntegrationsPanel({
                                 width: 8,
                                 height: 8,
                                 borderRadius: "50%",
-                                background: "rgba(74,210,157,0.92)",
+                                background: "var(--ui-rgba-74-210-157-920)",
                                 flexShrink: 0
                               }}
                             />
@@ -4049,7 +4045,7 @@ export function IntegrationsPanel({
                         "&:hover": {
                           borderColor: accent.hoverBorder,
                           background: accent.hoverBackground,
-                          boxShadow: "0 8px 24px rgba(0,0,0,0.18)"
+                          boxShadow: "0 8px 24px var(--ui-rgba-0-0-0-180)"
                         }
                       }}
                     >
@@ -4196,7 +4192,7 @@ export function IntegrationsPanel({
             ) : integrationSyncFeed.length > 0 ? (
               <Table
                 size="small"
-                sx={{ "& td, & th": { borderColor: "rgba(112,153,201,0.12)", py: 0.75 } }}
+                sx={{ "& td, & th": { borderColor: "var(--ui-rgba-112-153-201-120)", py: 0.75 } }}
               >
                 <TableHead>
                   <TableRow>
@@ -4273,7 +4269,7 @@ export function IntegrationsPanel({
               <Typography variant="subtitle2" sx={{ mb: 1 }}>
                 Connected Channels
               </Typography>
-              <Table size="small" sx={{ "& td, & th": { borderColor: "rgba(112,153,201,0.12)", py: 0.75 } }}>
+              <Table size="small" sx={{ "& td, & th": { borderColor: "var(--ui-rgba-112-153-201-120)", py: 0.75 } }}>
                 <TableHead>
                   <TableRow>
                     <TableCell sx={{ fontWeight: 600, width: "22%" }}>Channel</TableCell>
@@ -4295,7 +4291,7 @@ export function IntegrationsPanel({
                       </TableCell>
                       <TableCell>
                         <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.75 }}>
-                          <Box component="span" sx={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, bgcolor: "rgba(74,210,157,0.85)" }} />
+                          <Box component="span" sx={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, bgcolor: "var(--ui-rgba-74-210-157-850)" }} />
                           <Typography variant="body2" noWrap sx={{
                             color: "text.secondary"
                           }}>{channelStatusLabel(channel.status, channel.enabled)}</Typography>
@@ -4315,7 +4311,7 @@ export function IntegrationsPanel({
                   ))}
                 </TableBody>
               </Table>
-              <Divider sx={{ my: 1.5, borderColor: "rgba(112,153,201,0.12)" }} />
+              <Divider sx={{ my: 1.5, borderColor: "var(--ui-rgba-112-153-201-120)" }} />
             </>
           ) : null}
           <Stack spacing={1.25}>
@@ -4343,17 +4339,17 @@ export function IntegrationsPanel({
                     p: 1.5,
                     borderRadius: 1.5,
                     border: emailDeliveryReady
-                      ? "1px solid rgba(64,196,255,0.24)"
-                      : "1px solid rgba(112,153,201,0.16)",
-                    background: emailDeliveryReady ? "rgba(8,24,42,0.56)" : "rgba(7,17,32,0.6)",
+                      ? "1px solid var(--ui-rgba-64-196-255-240)"
+                      : "1px solid var(--ui-rgba-112-153-201-160)",
+                    background: emailDeliveryReady ? "var(--ui-rgba-8-24-42-560)" : "var(--ui-rgba-7-17-32-600)",
                     cursor: "pointer",
                     transition: "border-color 0.15s, background 0.15s, box-shadow 0.15s",
                     "&:hover": {
                       borderColor: emailDeliveryReady
-                        ? "rgba(64,196,255,0.36)"
-                        : "rgba(112,153,201,0.26)",
-                      background: emailDeliveryReady ? "rgba(8,28,48,0.66)" : "rgba(9,22,40,0.72)",
-                      boxShadow: "0 8px 24px rgba(0,0,0,0.18)"
+                        ? "var(--ui-rgba-64-196-255-360)"
+                        : "var(--ui-rgba-112-153-201-260)",
+                      background: emailDeliveryReady ? "var(--ui-rgba-8-28-48-660)" : "var(--ui-rgba-9-22-40-720)",
+                      boxShadow: "0 8px 24px var(--ui-rgba-0-0-0-180)"
                     }
                   }}
                 >
@@ -4419,7 +4415,7 @@ export function IntegrationsPanel({
               </Grid2>
             </Grid2>
           </Stack>
-          <Divider sx={{ my: 1.5, borderColor: "rgba(112,153,201,0.12)" }} />
+          <Divider sx={{ my: 1.5, borderColor: "var(--ui-rgba-112-153-201-120)" }} />
           <Stack spacing={1.25}>
             <Box>
               <Typography variant="subtitle2">Setup Wizards</Typography>
@@ -4453,14 +4449,14 @@ export function IntegrationsPanel({
                         width: "100%",
                         p: 1.5,
                         borderRadius: 1.5,
-                        border: isConfigured ? "1px solid rgba(64,196,255,0.24)" : "1px solid rgba(112,153,201,0.16)",
-                        background: isConfigured ? "rgba(8,24,42,0.56)" : "rgba(7,17,32,0.6)",
+                        border: isConfigured ? "1px solid var(--ui-rgba-64-196-255-240)" : "1px solid var(--ui-rgba-112-153-201-160)",
+                        background: isConfigured ? "var(--ui-rgba-8-24-42-560)" : "var(--ui-rgba-7-17-32-600)",
                         cursor: "pointer",
                         transition: "border-color 0.15s, background 0.15s, box-shadow 0.15s",
                         "&:hover": {
-                          borderColor: isConfigured ? "rgba(64,196,255,0.36)" : "rgba(112,153,201,0.26)",
-                          background: isConfigured ? "rgba(8,28,48,0.66)" : "rgba(9,22,40,0.72)",
-                          boxShadow: "0 8px 24px rgba(0,0,0,0.18)"
+                          borderColor: isConfigured ? "var(--ui-rgba-64-196-255-360)" : "var(--ui-rgba-112-153-201-260)",
+                          background: isConfigured ? "var(--ui-rgba-8-28-48-660)" : "var(--ui-rgba-9-22-40-720)",
+                          boxShadow: "0 8px 24px var(--ui-rgba-0-0-0-180)"
                         }
                       }}
                     >
@@ -4519,7 +4515,7 @@ export function IntegrationsPanel({
               })}
             </Grid2>
           </Stack>
-          <Divider sx={{ my: 1.5, borderColor: "rgba(112,153,201,0.12)" }} />
+          <Divider sx={{ my: 1.5, borderColor: "var(--ui-rgba-112-153-201-120)" }} />
           <Stack spacing={1.25}>
             <Stack
               direction={{ xs: "column", sm: "row" }}
@@ -4679,7 +4675,7 @@ export function IntegrationsPanel({
               Failed to load channels: {(settingsQ.error as Error)?.message || "Unknown error"}
             </Alert>
           ) : (
-            <Table size="small" sx={{ "& td, & th": { borderColor: "rgba(112,153,201,0.12)", py: 0.75 } }}>
+            <Table size="small" sx={{ "& td, & th": { borderColor: "var(--ui-rgba-112-153-201-120)", py: 0.75 } }}>
               <TableHead>
                 <TableRow>
                   <TableCell sx={{ fontWeight: 600, width: "22%" }}>Channel</TableCell>
@@ -4693,7 +4689,7 @@ export function IntegrationsPanel({
                   <TableCell>Telegram</TableCell>
                   <TableCell>
                     <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.75 }}>
-                      <Box component="span" sx={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, bgcolor: telegramEnabledSaved ? "rgba(74,210,157,0.85)" : "rgba(180,200,220,0.5)" }} />
+                      <Box component="span" sx={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, bgcolor: telegramEnabledSaved ? "var(--ui-rgba-74-210-157-850)" : "var(--ui-rgba-180-200-220-500)" }} />
                       <Typography variant="body2" noWrap sx={{
                         color: "text.secondary"
                       }}>{channelStatusLabel(telegramConnectionStatusRaw, telegramEnabledSaved)}</Typography>
@@ -4725,10 +4721,10 @@ export function IntegrationsPanel({
                           flexShrink: 0,
                           bgcolor:
                             messagingDisplayState(whatsappConnectionStatusRaw, channelForm.whatsapp_enabled) === "ready"
-                              ? "rgba(74,210,157,0.85)"
+                              ? "var(--ui-rgba-74-210-157-850)"
                               : channelForm.whatsapp_enabled
-                                ? "rgba(255,180,50,0.85)"
-                                : "rgba(180,200,220,0.5)"
+                                ? "var(--ui-rgba-255-180-50-850)"
+                                : "var(--ui-rgba-180-200-220-500)"
                         }}
                       />
                       <Typography variant="body2" noWrap sx={{
@@ -4752,7 +4748,7 @@ export function IntegrationsPanel({
               </TableBody>
             </Table>
           )}
-          <Divider sx={{ my: 1.5, borderColor: "rgba(112,153,201,0.12)" }} />
+          <Divider sx={{ my: 1.5, borderColor: "var(--ui-rgba-112-153-201-120)" }} />
           <Stack spacing={1.25}>
             <Box>
               <Typography variant="subtitle2">Setup Wizards</Typography>
@@ -4797,7 +4793,7 @@ export function IntegrationsPanel({
                         "&:hover": {
                           borderColor: accent.hoverBorder,
                           background: accent.hoverBackground,
-                          boxShadow: "0 8px 24px rgba(0,0,0,0.18)"
+                          boxShadow: "0 8px 24px var(--ui-rgba-0-0-0-180)"
                         }
                       }}
                     >
@@ -5057,7 +5053,7 @@ export function IntegrationsPanel({
                       "&:hover": {
                         borderColor: accent.hoverBorder,
                         background: accent.hoverBackground,
-                        boxShadow: "0 2px 12px rgba(0,0,0,0.2)",
+                        boxShadow: "0 2px 12px var(--ui-rgba-0-0-0-200)",
                         opacity: 1
                       }
                     }}
@@ -5770,9 +5766,9 @@ export function IntegrationsPanel({
               <Accordion
                 disableGutters
                 sx={{
-                  border: "1px solid rgba(110, 160, 255, 0.18)",
+                  border: "1px solid var(--ui-rgba-110-160-255-180)",
                   borderRadius: 1.5,
-                  background: "rgba(8, 24, 42, 0.32)",
+                  background: "var(--ui-rgba-8-24-42-320)",
                   "&:before": { display: "none" }
                 }}
               >
@@ -6963,10 +6959,10 @@ export function IntegrationsPanel({
             {(!activeHasSavedConfig || editingConnected) && active?.id === "google_workspace" ? (
               <Box
                 sx={{
-                  border: "1px solid rgba(112,153,201,0.12)",
+                  border: "1px solid var(--ui-rgba-112-153-201-120)",
                   borderRadius: 2,
                   p: 1.25,
-                  background: "rgba(8, 18, 32, 0.46)"
+                  background: "var(--ui-rgba-8-18-32-460)"
                 }}
               >
                 <Stack
@@ -7012,10 +7008,10 @@ export function IntegrationsPanel({
             {(!activeHasSavedConfig || editingConnected) && activeNeedsOauth ? (
               <Box
                 sx={{
-                  border: "1px solid rgba(64, 196, 255, 0.24)",
+                  border: "1px solid var(--ui-rgba-64-196-255-240)",
                   borderRadius: 2,
                   p: 1.5,
-                  background: "rgba(8, 24, 42, 0.56)"
+                  background: "var(--ui-rgba-8-24-42-560)"
                 }}
               >
                 <Box>
@@ -7036,15 +7032,15 @@ export function IntegrationsPanel({
             ) : null}
             {active ? (
               <>
-                <Divider sx={{ borderColor: "rgba(112,153,201,0.12)" }} />
+                <Divider sx={{ borderColor: "var(--ui-rgba-112-153-201-120)" }} />
                 <Accordion
                   expanded={syncExpanded}
                   onChange={(_, expanded) => setSyncExpanded(expanded)}
                   disableGutters
                   sx={{
-                    border: "1px solid rgba(110, 160, 255, 0.18)",
+                    border: "1px solid var(--ui-rgba-110-160-255-180)",
                     borderRadius: 2,
-                    background: "rgba(10, 18, 32, 0.5)",
+                    background: "var(--ui-rgba-10-18-32-500)",
                     "&:before": { display: "none" }
                   }}
                 >
@@ -7775,21 +7771,6 @@ export function IntegrationsPanel({
         </DialogActions>
       </Dialog>
       ) : null}
-      <Dialog
-        open={moltbookOpen}
-        onClose={() => setMoltbookOpen(false)}
-        maxWidth="lg"
-        fullWidth
-        slotProps={{ paper: { sx: { borderRadius: "8px", border: "1px solid var(--surface-border)", background: "var(--surface-bg-elevated)", boxShadow: "0 28px 96px rgba(0,0,0,0.5)", maxHeight: "90vh" } } }}
-      >
-        <DialogTitle sx={{ pb: 0.5, display: "flex", alignItems: "center", gap: 1.5, borderBottom: "1px solid", borderColor: "divider" }}>
-          <Typography variant="h6" sx={{ flex: 1, fontWeight: 700 }}>Moltbook</Typography>
-          <Button size="small" variant="outlined" color="secondary" onClick={() => setMoltbookOpen(false)}>Close</Button>
-        </DialogTitle>
-        <DialogContent sx={{ p: 0, overflow: "auto" }}>
-          <MoltbookManager autoRefresh={autoRefresh} />
-        </DialogContent>
-      </Dialog>
     </Stack>
   );
 }

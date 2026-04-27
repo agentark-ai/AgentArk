@@ -70,6 +70,21 @@ fn secrets_file_lock() -> &'static std::sync::Mutex<()> {
     SECRETS_FILE_LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
+fn run_blocking_config_section<T, F>(op: F) -> T
+where
+    F: FnOnce() -> T,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        if matches!(
+            handle.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        ) {
+            return tokio::task::block_in_place(op);
+        }
+    }
+    op()
+}
+
 /// Set or replace the global key manager (called at startup and after password rotation)
 pub fn set_global_key_manager(km: Arc<KeyManager>) {
     if let Ok(mut guard) = global_key_manager_cell().write() {
@@ -484,6 +499,7 @@ fn default_local_embeddings_model() -> String {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum EmbeddingsProviderKind {
+    Disabled,
     #[default]
     LocalHf,
     Ollama,
@@ -813,9 +829,15 @@ pub struct MediaGenConfig {
     #[serde(default)]
     pub fallback_video_provider: Option<String>,
     /// API keys for media providers (stored encrypted in secrets.enc)
-    /// Keys: replicate, stability_ai, fal, together, openai, google, runway, luma
+    /// Keys: replicate, stability_ai, fal, together, openai_dalle, openai_sora,
+    /// google_gemini, google_veo, runway, luma
     #[serde(default)]
     pub provider_api_keys: std::collections::HashMap<String, String>,
+    /// Optional compatible endpoint overrides for known media provider adapters.
+    /// These are not arbitrary custom providers; the selected provider's request/response
+    /// format is still used.
+    #[serde(default)]
+    pub provider_base_urls: std::collections::HashMap<String, String>,
 }
 
 /// Browser automation configuration
@@ -1657,7 +1679,9 @@ impl SecureConfigManager {
             tracing::error!(
                 "Failed to load encrypted agent config from settings storage: {}. \
                  Starting with default runtime config; encrypted data was preserved for recovery and settings writes will stay blocked until the original key is restored.",
-                config_issue.as_deref().unwrap_or("unknown settings load failure")
+                config_issue
+                    .as_deref()
+                    .unwrap_or("unknown settings load failure")
             );
         }
 
@@ -1826,10 +1850,12 @@ impl SecureConfigManager {
     where
         F: FnOnce(&Self) -> Result<T>,
     {
-        let _guard = secrets_file_lock()
-            .lock()
-            .map_err(|_| anyhow!("secrets file lock poisoned"))?;
-        op(self)
+        run_blocking_config_section(|| {
+            let _guard = secrets_file_lock()
+                .lock()
+                .map_err(|_| anyhow!("secrets file lock poisoned"))?;
+            op(self)
+        })
     }
 
     pub fn update_secrets<T, F>(&self, update: F) -> Result<T>
@@ -2619,7 +2645,9 @@ impl SecureConfigManager {
                     tg.bot_token = token.clone();
                 } else {
                     // Secret exists but config section was lost (e.g. volume reset) — recreate it
-                    tracing::info!("Recovered Telegram config from encrypted secrets (config.toml was missing [telegram] section)");
+                    tracing::info!(
+                        "Recovered Telegram config from encrypted secrets (config.toml was missing [telegram] section)"
+                    );
                     config.telegram = Some(TelegramConfig {
                         bot_token: token.clone(),
                         allowed_users: vec![],

@@ -174,15 +174,6 @@ pub struct BrowserSessionView {
     pub can_complete: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct BrowserConversationSessionSummary {
-    pub id: String,
-    pub task_description: String,
-    pub status: String,
-    pub detail: Option<String>,
-    pub updated_at: String,
-}
-
 #[derive(Clone)]
 pub struct BrowserSessionManager {
     sessions: Arc<DashMap<String, BrowserSession>>,
@@ -593,37 +584,6 @@ impl BrowserSessionManager {
             .collect()
     }
 
-    pub async fn latest_ready_session_for_conversation(
-        &self,
-        conversation_id: &str,
-    ) -> Option<BrowserConversationSessionSummary> {
-        self.cleanup_stale_sessions().await;
-        self.prune_unreachable_live_sessions().await;
-
-        let conversation_id = conversation_id.trim();
-        if conversation_id.is_empty() {
-            return None;
-        }
-
-        let mut candidates = self
-            .sessions
-            .iter()
-            .filter_map(|entry| {
-                (entry.conversation_id.as_deref() == Some(conversation_id)
-                    && matches!(entry.status, SessionStatus::Ready { .. }))
-                .then(|| BrowserConversationSessionSummary {
-                    id: entry.id.clone(),
-                    task_description: entry.task_description.clone(),
-                    status: entry.status.kind().to_string(),
-                    detail: entry.status.detail(),
-                    updated_at: entry.updated_at.clone(),
-                })
-            })
-            .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
-        candidates.into_iter().next()
-    }
-
     pub async fn stop_session(&self, session_id: &str) -> Result<BrowserSessionView> {
         let session_id = session_id.trim();
         if session_id.is_empty() {
@@ -707,89 +667,6 @@ impl BrowserSessionManager {
         Ok(!removed_sidecar_session_id.is_empty() || existed_in_storage)
     }
 
-    pub async fn resolve_browser_tool_session_id(
-        &self,
-        requested_session_id: Option<&str>,
-        conversation_id: Option<&str>,
-    ) -> Option<String> {
-        self.cleanup_stale_sessions().await;
-        self.prune_unreachable_live_sessions().await;
-        let conversation_id = conversation_id
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-
-        if let Some(requested) = requested_session_id
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            if let Some(sidecar_session_id) = self.touch_live_session(requested).await {
-                return Some(sidecar_session_id);
-            }
-
-            let managed_session_id = self
-                .sessions
-                .iter()
-                .find(|entry| {
-                    session_status_has_live_session(&entry.status)
-                        && entry.sidecar_session_id.trim() == requested
-                })
-                .map(|entry| entry.id.clone());
-            if let Some(managed_session_id) = managed_session_id {
-                if let Some(sidecar_session_id) =
-                    self.touch_live_session(managed_session_id.as_str()).await
-                {
-                    return Some(sidecar_session_id);
-                }
-            }
-
-            let mut prefix_matches = self
-                .sessions
-                .iter()
-                .filter_map(|entry| {
-                    let requested_matches = session_status_has_live_session(&entry.status)
-                        && (entry.id.starts_with(requested)
-                            || entry.sidecar_session_id.starts_with(requested));
-                    requested_matches.then(|| {
-                        (
-                            entry.id.clone(),
-                            entry.updated_at.clone(),
-                            conversation_id.is_some_and(|conversation_id| {
-                                entry.conversation_id.as_deref() == Some(conversation_id)
-                            }),
-                        )
-                    })
-                })
-                .collect::<Vec<_>>();
-            if prefix_matches.len() > 1 && conversation_id.is_some() {
-                prefix_matches.retain(|(_, _, same_conversation)| *same_conversation);
-            }
-            prefix_matches.sort_by(|left, right| right.1.cmp(&left.1));
-            prefix_matches.dedup_by(|left, right| left.0 == right.0);
-            if prefix_matches.len() == 1 {
-                if let Some(sidecar_session_id) =
-                    self.touch_live_session(prefix_matches[0].0.as_str()).await
-                {
-                    return Some(sidecar_session_id);
-                }
-            }
-
-            if let Some(conversation_id) = conversation_id {
-                if let Some(sidecar_session_id) = self
-                    .latest_live_session_for_conversation(conversation_id)
-                    .await
-                {
-                    return Some(sidecar_session_id);
-                }
-            }
-
-            return Some(requested.to_string());
-        }
-
-        let conversation_id = conversation_id?;
-        self.latest_live_session_for_conversation(conversation_id)
-            .await
-    }
-
     pub fn active_count(&self) -> usize {
         self.sessions
             .iter()
@@ -871,15 +748,6 @@ impl BrowserSessionManager {
         let (sidecar_session_id, snapshot) = touched?;
         persist_browser_session(self.storage.as_ref(), &snapshot).await;
         Some(sidecar_session_id)
-    }
-
-    async fn latest_live_session_for_conversation(&self, conversation_id: &str) -> Option<String> {
-        let managed_session_id = self
-            .latest_managed_live_session_for_conversation(Some(conversation_id))
-            .await?;
-        self.sessions
-            .get(&managed_session_id)
-            .map(|entry| entry.sidecar_session_id.clone())
     }
 
     async fn latest_managed_live_session_for_conversation(
@@ -1156,9 +1024,9 @@ impl BrowserSessionManager {
                         && warned_for_updated_at.as_deref() != Some(updated_at.as_str())
                     {
                         notify_fn(BrowserSessionNotification::notice(
-                        &session_id,
-                        "This browser session has been idle for almost 15 minutes. It will close automatically in about 1 minute unless you continue the task or reopen the live handoff.",
-                    ));
+                            &session_id,
+                            "This browser session has been idle for almost 15 minutes. It will close automatically in about 1 minute unless you continue the task or reopen the live handoff.",
+                        ));
                         warned_for_updated_at = Some(updated_at.clone());
                     }
 
@@ -1172,9 +1040,9 @@ impl BrowserSessionManager {
                     sessions.remove(&session_id);
                     delete_persisted_browser_session(storage.as_ref(), &session_id).await;
                     notify_fn(BrowserSessionNotification::closed(
-                    &session_id,
-                    "Browser session closed after 15 minutes of inactivity to keep AgentArk responsive. Ask me to reopen it if you want to continue.",
-                ));
+                        &session_id,
+                        "Browser session closed after 15 minutes of inactivity to keep AgentArk responsive. Ask me to reopen it if you want to continue.",
+                    ));
                     return;
                 }
             }
@@ -2030,157 +1898,6 @@ mod tests {
             updated_at: updated_at.to_string(),
             operator_handoff_tx: None,
         }
-    }
-
-    #[tokio::test]
-    async fn resolve_browser_tool_session_id_maps_managed_session_to_sidecar() {
-        let manager = test_manager();
-        manager.sessions.insert(
-            "managed-1".to_string(),
-            test_session(
-                "managed-1",
-                "sidecar-1",
-                Some("conversation-1"),
-                SessionStatus::Ready {
-                    summary: "Browser ready".to_string(),
-                },
-                "2026-01-01T00:05:00Z",
-            ),
-        );
-
-        let resolved = manager
-            .resolve_browser_tool_session_id(Some("managed-1"), Some("conversation-1"))
-            .await;
-
-        assert_eq!(resolved.as_deref(), Some("sidecar-1"));
-    }
-
-    #[tokio::test]
-    async fn resolve_browser_tool_session_id_reuses_latest_live_chat_session_when_missing() {
-        let manager = test_manager();
-        manager.sessions.insert(
-            "managed-old".to_string(),
-            test_session(
-                "managed-old",
-                "sidecar-old",
-                Some("conversation-1"),
-                SessionStatus::Ready {
-                    summary: "Browser ready".to_string(),
-                },
-                "2026-01-01T00:05:00Z",
-            ),
-        );
-        manager.sessions.insert(
-            "managed-new".to_string(),
-            test_session(
-                "managed-new",
-                "sidecar-new",
-                Some("conversation-1"),
-                SessionStatus::Active,
-                "2026-01-01T00:10:00Z",
-            ),
-        );
-
-        let resolved = manager
-            .resolve_browser_tool_session_id(None, Some("conversation-1"))
-            .await;
-
-        assert_eq!(resolved.as_deref(), Some("sidecar-new"));
-    }
-
-    #[tokio::test]
-    async fn resolve_browser_tool_session_id_accepts_short_managed_prefix() {
-        let manager = test_manager();
-        manager.sessions.insert(
-            "3fd67131-full-managed-id".to_string(),
-            test_session(
-                "3fd67131-full-managed-id",
-                "sidecar-1",
-                Some("conversation-1"),
-                SessionStatus::Ready {
-                    summary: "Browser ready".to_string(),
-                },
-                "2026-01-01T00:05:00Z",
-            ),
-        );
-
-        let resolved = manager
-            .resolve_browser_tool_session_id(Some("3fd67131"), Some("conversation-1"))
-            .await;
-
-        assert_eq!(resolved.as_deref(), Some("sidecar-1"));
-    }
-
-    #[tokio::test]
-    async fn resolve_browser_tool_session_id_prefers_conversation_live_session_over_bad_requested_id(
-    ) {
-        let manager = test_manager();
-        manager.sessions.insert(
-            "managed-1".to_string(),
-            test_session(
-                "managed-1",
-                "sidecar-1",
-                Some("conversation-1"),
-                SessionStatus::Ready {
-                    summary: "Browser ready".to_string(),
-                },
-                "2026-01-01T00:05:00Z",
-            ),
-        );
-
-        let resolved = manager
-            .resolve_browser_tool_session_id(Some("bad-short-id"), Some("conversation-1"))
-            .await;
-
-        assert_eq!(resolved.as_deref(), Some("sidecar-1"));
-    }
-
-    #[tokio::test]
-    async fn latest_ready_session_for_conversation_prefers_most_recent_ready() {
-        let manager = test_manager();
-        manager.sessions.insert(
-            "managed-active".to_string(),
-            test_session(
-                "managed-active",
-                "sidecar-active",
-                Some("conversation-1"),
-                SessionStatus::Active,
-                "2026-01-01T00:15:00Z",
-            ),
-        );
-        manager.sessions.insert(
-            "managed-old".to_string(),
-            test_session(
-                "managed-old",
-                "sidecar-old",
-                Some("conversation-1"),
-                SessionStatus::Ready {
-                    summary: "Older ready browser".to_string(),
-                },
-                "2026-01-01T00:05:00Z",
-            ),
-        );
-        manager.sessions.insert(
-            "managed-new".to_string(),
-            test_session(
-                "managed-new",
-                "sidecar-new",
-                Some("conversation-1"),
-                SessionStatus::Ready {
-                    summary: "Newest ready browser".to_string(),
-                },
-                "2026-01-01T00:10:00Z",
-            ),
-        );
-
-        let summary = manager
-            .latest_ready_session_for_conversation("conversation-1")
-            .await
-            .expect("expected reusable ready browser session");
-
-        assert_eq!(summary.id, "managed-new");
-        assert_eq!(summary.status, "ready");
-        assert_eq!(summary.detail.as_deref(), Some("Newest ready browser"));
     }
 
     #[tokio::test]

@@ -2,6 +2,7 @@
 
 pub mod abuse_tracker_state;
 pub mod action;
+pub mod action_catalog_index;
 pub mod approval_log;
 pub mod arkpulse_event;
 pub mod automation_run;
@@ -30,6 +31,7 @@ pub mod notification;
 pub mod operational_log;
 pub mod procedural_pattern;
 pub mod project;
+pub mod readiness_evaluation;
 pub mod recall_event;
 pub mod recall_test;
 pub mod run_checkpoint;

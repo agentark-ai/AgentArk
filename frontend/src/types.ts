@@ -59,6 +59,9 @@ export type BackgroundSessionSummary = {
   next_expected_action?: string | null;
   last_error?: string | null;
   preferred_delivery_channel?: string | null;
+  channel?: string | null;
+  conversation_id?: string | null;
+  project_id?: string | null;
   linked_task_ids: string[];
   linked_watcher_ids: string[];
   created_at: string;
@@ -303,6 +306,7 @@ export type SentinelProposal = {
   last_run_summary?: string | null;
   action?: RecommendedAction | null;
   chat_suggestion_id?: string | null;
+  metadata?: Record<string, unknown>;
 };
 
 export type SentinelScanState = {
@@ -353,6 +357,8 @@ export type SentinelFeedResponse = {
     completed_recently: number;
     connected_services: number;
     important_service_events: number;
+    in_app_events?: number;
+    chat_suggestions?: number;
     recent_runs: number;
     auto_mode_enabled: boolean;
   };
@@ -371,7 +377,22 @@ export type RecommendedAction = {
     score?: number;
     requires_approval?: boolean;
     reasons?: string[];
+    blocked?: boolean;
   };
+  readiness?: DevelopmentalReadiness | null;
+};
+
+export type DevelopmentalReadiness = {
+  policy_version?: string;
+  score?: number;
+  stage?: string;
+  label?: string;
+  plain_summary?: string;
+  allows_review?: boolean;
+  allows_auto?: boolean;
+  reasons?: string[];
+  blockers?: string[];
+  signals?: unknown;
 };
 
 export type BriefingResponse = {

@@ -853,43 +853,6 @@ impl BackgroundSessionManager {
         Some(updated)
     }
 
-    pub async fn set_delivery_channel(
-        &self,
-        id: &str,
-        channel: Option<&str>,
-        actor: Option<&str>,
-    ) -> Option<BackgroundSession> {
-        let updated = {
-            let mut sessions = self.sessions.write().await;
-            let session = sessions.get_mut(id.trim())?;
-            let normalized = normalize_text_field(channel.map(|value| value.to_string()), 120);
-            if session.preferred_delivery_channel == normalized {
-                return Some(session.clone());
-            }
-
-            session.preferred_delivery_channel = normalized.clone();
-            let now = Utc::now();
-            session.updated_at = now;
-            session.last_activity_at = now;
-            let detail = normalized
-                .as_ref()
-                .map(|value| format!("Preferred delivery channel set to '{}'.", value));
-            push_event(
-                &mut session.events,
-                build_event(
-                    "delivery_rebound",
-                    "Background session delivery route updated.",
-                    detail,
-                    actor,
-                ),
-            );
-            Some(session.clone())
-        }?;
-
-        self.persist_session(&updated).await;
-        Some(updated)
-    }
-
     pub async fn record_consolidation(
         &self,
         id: &str,

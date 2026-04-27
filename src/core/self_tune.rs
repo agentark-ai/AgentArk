@@ -1,5 +1,4 @@
 //! Self-Tune: Adaptive learning from user interactions
-//!
 //! Tracks tool success rates, learns user communication style,
 //! adjusts autonomy confidence, and generates prompt hints —
 //! all automatically from usage patterns.
@@ -189,67 +188,6 @@ pub async fn analyze_user_style(
 }
 
 // ── Prompt Block Generation ──────────────────────────────────────────────────
-
-pub async fn build_self_tune_prompt_block(storage: &crate::storage::Storage) -> String {
-    let mut lines = Vec::new();
-
-    let style = load_style_profile(storage).await;
-    if !style.preferred_length.is_empty() && style.messages_analyzed >= 5 {
-        lines.push(format!(
-            "- User prefers {} responses in {} format.",
-            style.preferred_length, style.preferred_format
-        ));
-    }
-    if !style.domains.is_empty() {
-        lines.push(format!(
-            "- User's primary domains: {}.",
-            style.domains.join(", ")
-        ));
-    }
-    for hint in style.tone_hints.iter().take(3) {
-        if !hint.trim().is_empty() {
-            lines.push(format!("- User feedback: {}", hint));
-        }
-    }
-
-    let biases = load_tool_biases(storage).await;
-    for (tool, stats) in &biases.tools {
-        let total = stats.successes + stats.failures;
-        if total >= 10 {
-            let rate = stats.successes as f64 / total as f64;
-            if rate < 0.5 {
-                lines.push(format!(
-                    "- Tool '{}' has low success rate ({:.0}%). Consider alternatives.",
-                    tool,
-                    rate * 100.0
-                ));
-            }
-        }
-    }
-
-    let autonomy = load_autonomy_confidence(storage).await;
-    if autonomy.suggested_max_score > 0 {
-        lines.push(format!(
-            "- Recent autonomous successes suggest the user may tolerate a higher autonomy ceiling (suggested max score: {}), but do not change settings unless the user explicitly asks.",
-            autonomy.suggested_max_score
-        ));
-    }
-    if autonomy.last_rejection_at.is_some() {
-        lines.push(
-            "- The user recently rejected an autonomous action. Be more conservative with proactive execution and prefer explicit confirmation for risky work."
-                .to_string(),
-        );
-    }
-
-    if lines.is_empty() {
-        return String::new();
-    }
-
-    format!(
-        "\n## Learned Preferences (auto-tuned)\n{}\n",
-        lines.join("\n")
-    )
-}
 
 // ── Interaction Counter ──────────────────────────────────────────────────────
 

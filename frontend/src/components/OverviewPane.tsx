@@ -850,8 +850,8 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
                         px: 0.9,
                         py: 0.75,
                         borderRadius: 2,
-                        background: "rgba(255, 255, 255, 0.03)",
-                        border: "1px solid rgba(255, 255, 255, 0.08)"
+                        background: "var(--ui-rgba-255-255-255-030)",
+                        border: "1px solid var(--ui-rgba-255-255-255-080)"
                       }}>
                       <Chip size="small" label={session.status.replace(/_/g, " ")} color={automationStatusColor(session.status)} />
                       <Box sx={{ minWidth: 0, flex: 1 }}>
@@ -880,7 +880,7 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
                       <Typography
                         variant="overline"
                         sx={{
-                          color: "rgba(183, 188, 196, 0.68)",
+                          color: "var(--ui-rgba-183-188-196-680)",
                           letterSpacing: 0,
                           display: "block",
                           mb: 0.35
@@ -945,8 +945,8 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
                               px: 0.9,
                               py: 0.7,
                               borderRadius: 2,
-                              background: "rgba(255, 255, 255, 0.03)",
-                              border: "1px solid rgba(255, 255, 255, 0.08)"
+                              background: "var(--ui-rgba-255-255-255-030)",
+                              border: "1px solid var(--ui-rgba-255-255-255-080)"
                             }}>
                             <Chip size="small" label={automationKindLabel(item.kind)} />
                             <Typography variant="body2" noWrap sx={{ minWidth: 0, flex: 1 }} title={item.title}>
@@ -1021,8 +1021,8 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
         slotProps={{
           paper: {
             sx: {
-              background: "rgba(22, 22, 26, 0.98)",
-              border: "1px solid rgba(255, 255, 255, 0.08)",
+              background: "var(--ui-rgba-22-22-26-980)",
+              border: "1px solid var(--ui-rgba-255-255-255-080)",
               backdropFilter: "blur(20px)",
             },
           }
@@ -1239,8 +1239,8 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
         slotProps={{
           paper: {
             sx: {
-              background: "rgba(22, 22, 26, 0.98)",
-              border: "1px solid rgba(255, 255, 255, 0.08)",
+              background: "var(--ui-rgba-22-22-26-980)",
+              border: "1px solid var(--ui-rgba-255-255-255-080)",
               backdropFilter: "blur(20px)",
             },
           }
@@ -1276,8 +1276,8 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
         slotProps={{
           paper: {
             sx: {
-              background: "rgba(22, 22, 26, 0.98)",
-              border: "1px solid rgba(255, 255, 255, 0.08)",
+              background: "var(--ui-rgba-22-22-26-980)",
+              border: "1px solid var(--ui-rgba-255-255-255-080)",
               backdropFilter: "blur(20px)",
             },
           }
@@ -1365,8 +1365,8 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
                     sx={{
                       p: 1.25,
                       borderRadius: 2,
-                      border: "1px solid rgba(255, 255, 255, 0.08)",
-                      background: "rgba(24, 24, 28, 0.9)",
+                      border: "1px solid var(--ui-rgba-255-255-255-080)",
+                      background: "var(--ui-rgba-24-24-28-900)",
                     }}
                   >
                     <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>

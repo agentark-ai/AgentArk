@@ -1,0 +1,898 @@
+{
+  "schema_version": "v1",
+  "description": "Semantic benchmark corpus for AgentArk TurnPlanner. Assertions operate on structural plan shape (goal count, typed object_ref kinds, side-effect classes, secret sidecar flag) and on capability embedding match via the step resolver. Assertions never compare the user's prompt text, never compare the emitted capability_need text, and never check for keywords in either. Paraphrases intentionally vary word order, casing, synonyms, typos, abbreviations, punctuation, and grammar so that any variant producing a different plan shape is a routing defect.",
+  "invariants": [
+    "All paraphrases of a canonical prompt must produce equivalent plan shapes.",
+    "capability_target is what the step resolver should pick after embedding retrieval + LLM commit, not a match against the emitted capability_need text.",
+    "capability_target_any_of accepts resolution to any listed action (used when two catalog actions legitimately serve the same capability).",
+    "object_ref.resolution_family is a runtime strategy family (by_id | most_recent_in_context | last_agent_created | by_description), not a user-phrase classification.",
+    "requires_secret_sidecar=true means the redactor placed a [REDACTED_SECRET] placeholder in the planner's input and the goal routes raw secret material via sidecar, never via the LLM prompt or log.",
+    "authorization_gated=true means the capability_target requires an active integration/grant; when missing, the step resolver must produce respond_without_tool rather than a fake tool call.",
+    "No entry asserts on the exact text of capability_need, turn_summary, reasoning, or paraphrase wording."
+  ],
+  "assertion_fields": {
+    "goal_count": "Integer. Must equal the number of goals in the emitted TurnPlan.",
+    "goals[].capability_target": "String action name. The step resolver must pick this action. Absent when capability_target_any_of is used.",
+    "goals[].capability_target_any_of": "Array of action names. The step resolver must pick one of these.",
+    "goals[].embedding_similarity_min": "Float 0..1. Minimum cosine similarity between capability_need embedding and the chosen candidate action's descriptor embedding. Threshold is a calibration knob; tune as corpus matures.",
+    "goals[].object_ref": "Object with kind (ObjectKind enum) and resolution_family, or null.",
+    "goals[].side_effect": "StepSideEffect variant expected on the resolved step.",
+    "goals[].hints": "Optional GoalHints subset to assert; unspecified hint fields are not checked.",
+    "goals[].depends_on": "Array of goal ids this goal must wait for.",
+    "goals[].authorization_gated": "Boolean; when true, the capability_target is expected to require integration auth and may degrade to respond_without_tool.",
+    "goals[].may_degrade_to": "Fallback action or respond_without_tool when the preferred capability_target is unavailable.",
+    "clarification_needed": "Boolean. When true, goals must be empty and clarification_question must be set.",
+    "requires_secret_sidecar": "Boolean.",
+    "turn_confidence_min": "Float 0..1. Lower bound on TurnPlan.confidence for the canonical and all paraphrases."
+  },
+  "entries": [
+    {
+      "id": "app_build_arxiv_dashboard",
+      "category": "app_build",
+      "prompts": {
+        "canonical": "Build an arXiv research dashboard that refreshes every 10 seconds and shows the latest RL and time-series papers, with a refresh button, and publish it so I can open the link.",
+        "paraphrases": [
+          "pls deploy a live arxiv board auto-refreshing each 10 sec with reinforcement learning + forecasting papers and a manual refresh button",
+          "I want a running arxiv app that keeps pulling new RL and time-series research every 10s, with a button to force reload",
+          "create a web app: latest arxiv papers on reinforcement learning and time series modeling, 10-second auto-refresh, include refresh btn",
+          "need a deployed arxiv dashboard page, reloads every ten seconds, rl & timeseries topics, refresh button pls",
+          "BUILD ME a running arxiv site, auto reload every 10 sec, topics: RL, time-series forecasting, with refresh button, give me the URL"
+        ]
+      },
+      "expected": {
+        "goal_count": 1,
+        "goals": [
+          {
+            "capability_target": "app_deploy",
+            "embedding_similarity_min": 0.50,
+            "object_ref": null,
+            "side_effect": "create_object",
+            "hints": {"public_freshness_required": true, "workspace_modification_request": true},
+            "depends_on": []
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.55
+      },
+      "notes": "The 10-second refresh is artifact runtime behavior (the page's own setInterval), not AgentArk automation. Must not route to watcher or schedule_task. Public freshness is an advisory hint, not a reason to change the surface."
+    },
+    {
+      "id": "workspace_static_arxiv_html",
+      "category": "workspace_write",
+      "prompts": {
+        "canonical": "Write a static HTML page that auto-refreshes every 10 seconds and pulls arxiv data for latest papers on machine learning, reinforcement learning and time series modelling.",
+        "paraphrases": [
+          "just give me the code for a static html page that refreshes every 10s with arxiv latest ml/rl/ts papers, i'll host it myself",
+          "can u write me a single html file, refresh ten seconds, pulls arxiv papers ML RL TS, novel approaches",
+          "need an .html file only (no deploy) that polls arxiv every 10 seconds and lists recent papers on ML / RL / time series",
+          "write the html source: arxiv latest papers, 10-sec refresh, topics ML+RL+time-series, novel approaches"
+        ]
+      },
+      "expected": {
+        "goal_count": 1,
+        "goals": [
+          {
+            "capability_target_any_of": ["file_write", "app_deploy"],
+            "embedding_similarity_min": 0.45,
+            "object_ref": null,
+            "side_effect": "create_object",
+            "hints": {"workspace_modification_request": true},
+            "depends_on": []
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.50
+      },
+      "notes": "Prompt explicitly asks for file/code rather than a deployed app. Either workspace file_write or app_deploy is acceptable; step resolver commits based on embedding similarity. What is not acceptable is routing to watcher/schedule_task because of the 10-second phrasing."
+    },
+    {
+      "id": "app_build_finance_tracker",
+      "category": "app_build",
+      "prompts": {
+        "canonical": "Build me a personal finance tracker dashboard with income/expense categories, monthly budget bars, spending pie chart, smart alerts, CSV import/export, dark theme, mobile responsive, local SQLite storage. Deploy it and give me the link.",
+        "paraphrases": [
+          "pls deploy a finance tracking app: add income/expenses by category, budget progress bars, charts (pie/bar/trend), 80% alerts, csv import-export, dark theme, mobile-ready, sqlite",
+          "i need a personal finance dashboard i can open in browser. categories, monthly budgets, alerts, csv, dark theme, sqlite. deploy pls",
+          "build+host a finance tracker: incomes, expenses, categories, budget limits w/ progress bars, spending pie, income vs expense bar, savings trend, 80% warning alerts, csv io, dark, responsive, local sqlite. send the link"
+        ]
+      },
+      "expected": {
+        "goal_count": 1,
+        "goals": [
+          {
+            "capability_target": "app_deploy",
+            "embedding_similarity_min": 0.55,
+            "object_ref": null,
+            "side_effect": "create_object",
+            "hints": {"workspace_modification_request": true},
+            "depends_on": []
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.60
+      },
+      "notes": "Explicit 'deploy it and give me the link' removes the ambiguity between workspace-file and app-deploy."
+    },
+    {
+      "id": "app_build_github_deploy",
+      "category": "app_build",
+      "prompts": {
+        "canonical": "Deploy this GitHub repo locally and make it available: https://github.com/mdn/beginner-html-site-styled",
+        "paraphrases": [
+          "clone and host github.com/mdn/beginner-html-site-styled locally, give me the link",
+          "plz deploy https://github.com/mdn/beginner-html-site-styled here and open it for me",
+          "pull the mdn beginner-html-site-styled repo and serve it locally, send url",
+          "run this repo as an app: https://github.com/mdn/beginner-html-site-styled"
+        ]
+      },
+      "expected": {
+        "goal_count": 1,
+        "goals": [
+          {
+            "capability_target": "app_deploy",
+            "embedding_similarity_min": 0.50,
+            "object_ref": null,
+            "side_effect": "create_object",
+            "hints": {"workspace_modification_request": true},
+            "depends_on": []
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.55
+      },
+      "notes": "URL in prompt supplies source; app_deploy step resolver uses it as the git_ref arg. The router must not treat this as a browser navigation."
+    },
+    {
+      "id": "watcher_iran_news_telegram",
+      "category": "watcher",
+      "prompts": {
+        "canonical": "Spawn an agent that monitors Iran news and notifies when something related to war, major breaking news, or related to India is detected. Push to Telegram, check every 1 minute.",
+        "paraphrases": [
+          "poll iran news every 1 min; if war-related, major breaking, or India-related, ping me on telegram",
+          "watch iran news 1 minute cadence and telegram-alert me on war/breaking/india items",
+          "please set up an ongoing watcher on Iran news (1-min interval) that telegrams me for war/breaking/India criteria",
+          "i want a persistent iran news monitor, check each minute, notify via telegram when something big or India-linked hits"
+        ]
+      },
+      "expected": {
+        "goal_count": 1,
+        "goals": [
+          {
+            "capability_target_any_of": ["watch", "schedule_task"],
+            "embedding_similarity_min": 0.50,
+            "object_ref": null,
+            "side_effect": "create_object",
+            "hints": {"public_freshness_required": true},
+            "depends_on": []
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.60
+      },
+      "notes": "Durable watcher with 1-minute polling cadence and a Telegram delivery channel. The 1-minute cadence here IS AgentArk orchestration (unlike the embedded-in-artifact 10-second refresh of app_build_arxiv_dashboard)."
+    },
+    {
+      "id": "watcher_rtsp_camera",
+      "category": "watcher",
+      "prompts": {
+        "canonical": "Monitor this RTSP feed every 10 seconds and tell me if a new person is detected: rtsp://camera.local:554/stream",
+        "paraphrases": [
+          "poll rtsp://camera.local:554/stream every 10s, alert me on new person detection",
+          "watch my front camera (rtsp://camera.local:554/stream) at 10-sec intervals, notify on new person",
+          "set up ongoing person-detection watcher on this rtsp stream, 10-second cadence: rtsp://camera.local:554/stream"
+        ]
+      },
+      "expected": {
+        "goal_count": 1,
+        "goals": [
+          {
+            "capability_target_any_of": ["watch", "schedule_task"],
+            "embedding_similarity_min": 0.50,
+            "object_ref": null,
+            "side_effect": "create_object",
+            "hints": {},
+            "depends_on": []
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.55
+      },
+      "notes": "RTSP URL is payload not command. Cadence is external AgentArk orchestration because the goal is repeat-polling a live feed. Contrast with the embedded-refresh app case."
+    },
+    {
+      "id": "mixed_watcher_plus_dashboard_hn",
+      "category": "mixed",
+      "prompts": {
+        "canonical": "Monitor Hacker News top stories every 5 minutes. For any story that hits 100+ points and mentions AI/LLM/agents, summarize in 2 sentences. Save to a feed page. Deploy a live dashboard showing today's AI highlights with links to the original posts. Include a refresh button.",
+        "paraphrases": [
+          "set up a 5-minute HN top-stories watcher (condition: 100+ points and mentions AI/LLM/agents, 2-sentence summary) AND deploy a live dashboard showing today's AI highlights with links + refresh button",
+          "i need two things: (a) ongoing HN watcher every 5 min filtering 100+ points+AI/LLM/agents and summarizing, (b) a deployed dashboard page that shows today's highlights with links and a refresh button",
+          "please spawn a HN monitor (5-min cadence, threshold 100 pts, topics AI/LLM/agents, summarize 2 lines) and also deploy a live AI-highlights dashboard reading from that feed, with manual refresh",
+          "watch HN top stories each 5 minutes, keep items scoring 100+ that talk about AI/LLM/agents, summarize them, then deploy a dashboard showing today's AI highlights with post links and a refresh button"
+        ]
+      },
+      "expected": {
+        "goal_count": 2,
+        "goals": [
+          {
+            "capability_target_any_of": ["watch", "schedule_task"],
+            "embedding_similarity_min": 0.50,
+            "object_ref": null,
+            "side_effect": "create_object",
+            "hints": {"public_freshness_required": true},
+            "depends_on": []
+          },
+          {
+            "capability_target": "app_deploy",
+            "embedding_similarity_min": 0.50,
+            "object_ref": null,
+            "side_effect": "create_object",
+            "hints": {"workspace_modification_request": true},
+            "depends_on": ["goal_0"]
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.55
+      },
+      "notes": "Two distinct goals: one persistent watcher (5-min cadence is external), one deployed dashboard (refresh button is artifact runtime). Dashboard depends on watcher output (depends_on references the earlier goal by its emitted id; the test asserts the second goal declares a dependency on the first, regardless of the ids chosen)."
+    },
+    {
+      "id": "background_session_create_pricing",
+      "category": "background_session",
+      "prompts": {
+        "canonical": "Keep monitoring OpenAI, Anthropic, Google AI, and Perplexity pricing in the background. Create one ongoing session for this, check twice a day, and notify me in-app only if pricing or plan tiers change.",
+        "paraphrases": [
+          "spin up a single ongoing background session monitoring OpenAI / Anthropic / Google AI / Perplexity pricing; check 2x/day; in-app notifications only, only on pricing or plan-tier changes",
+          "ongoing bg session pls: track openai anthropic google-ai perplexity pricing, twice daily, ping me in app only when prices or plan tiers change",
+          "background-monitor llm provider pricing (oa/anth/goog/perp), 2 checks per day, in-app notify only on change, one durable session",
+          "keep an eye on pricing for openai, anthropic, google ai, perplexity in the background - one session, 2x daily, app notifications only if things change"
+        ]
+      },
+      "expected": {
+        "goal_count": 1,
+        "goals": [
+          {
+            "capability_target_any_of": ["background_session_create", "schedule_task", "watch"],
+            "embedding_similarity_min": 0.45,
+            "object_ref": null,
+            "side_effect": "create_object",
+            "hints": {"public_freshness_required": true},
+            "depends_on": []
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.50
+      },
+      "notes": "Durable background session with twice-daily cadence and in-app notification channel. capability_target_any_of accepts whichever underlying action name the catalog exposes (background_session_create / schedule_task / watch)."
+    },
+    {
+      "id": "background_session_status_query",
+      "category": "background_session",
+      "prompts": {
+        "canonical": "What is the status of this background work?",
+        "paraphrases": [
+          "hows the background session going?",
+          "give me status on that bg session",
+          "update on the ongoing background work pls",
+          "status check on this background monitor"
+        ]
+      },
+      "expected": {
+        "goal_count": 1,
+        "goals": [
+          {
+            "capability_target_any_of": ["background_session_status", "list_background_sessions", "agentark_inspect"],
+            "embedding_similarity_min": 0.40,
+            "object_ref": {"kind": "background_session", "resolution_family": "most_recent_in_context"},
+            "side_effect": "read",
+            "hints": {},
+            "depends_on": []
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.45
+      },
+      "notes": "Reference to 'this' / 'that' background session resolves against recent conversation context. The planner binds object_ref with resolution_family=most_recent_in_context; orchestrator validates against storage."
+    },
+    {
+      "id": "background_session_pause_recent",
+      "category": "background_session",
+      "prompts": {
+        "canonical": "Pause this background work for now.",
+        "paraphrases": [
+          "hold the bg session, pause pls",
+          "can u pause that background monitor",
+          "stop running it for now (pause, not delete)",
+          "PAUSE this background session"
+        ]
+      },
+      "expected": {
+        "goal_count": 1,
+        "goals": [
+          {
+            "capability_target_any_of": ["background_session_update", "background_session_pause"],
+            "embedding_similarity_min": 0.35,
+            "object_ref": {"kind": "background_session", "resolution_family": "most_recent_in_context"},
+            "side_effect": "modify_object",
+            "hints": {},
+            "depends_on": []
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.45
+      },
+      "notes": "Pausing requires a validated object_ref. If the planner cannot bind to an existing session, it should emit clarification_needed=true, not invent a new session."
+    },
+    {
+      "id": "background_session_reconfigure_telegram",
+      "category": "background_session",
+      "prompts": {
+        "canonical": "Telegram is configured now. Use Telegram for this session.",
+        "paraphrases": [
+          "switch this bg session to telegram notifications",
+          "notify via telegram for this one please",
+          "i have telegram set up now, route this session's alerts there",
+          "update this session: telegram channel instead"
+        ]
+      },
+      "expected": {
+        "goal_count": 1,
+        "goals": [
+          {
+            "capability_target_any_of": ["background_session_update", "background_session_configure_channel"],
+            "embedding_similarity_min": 0.35,
+            "object_ref": {"kind": "background_session", "resolution_family": "most_recent_in_context"},
+            "side_effect": "modify_object",
+            "hints": {},
+            "depends_on": []
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.45
+      },
+      "notes": "Channel reconfiguration on an existing durable object. Step resolver picks the update action with notification_channel=telegram arg."
+    },
+    {
+      "id": "background_session_refocus",
+      "category": "background_session",
+      "prompts": {
+        "canonical": "Actually change this to reinforcement learning papers instead.",
+        "paraphrases": [
+          "scratch that, make this bg session track reinforcement learning papers",
+          "swap the topic for this session to RL papers",
+          "update the focus: reinforcement learning papers, not the previous topic",
+          "refocus this watcher to reinforcement-learning research instead"
+        ]
+      },
+      "expected": {
+        "goal_count": 1,
+        "goals": [
+          {
+            "capability_target_any_of": ["background_session_update", "watch_update"],
+            "embedding_similarity_min": 0.35,
+            "object_ref": {"kind": "background_session", "resolution_family": "most_recent_in_context"},
+            "side_effect": "modify_object",
+            "hints": {},
+            "depends_on": []
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.45
+      },
+      "notes": "User-correction turn but no clarification needed; planner updates the session's focus/objective."
+    },
+    {
+      "id": "reminder_future_date_with_channel",
+      "category": "reminder",
+      "prompts": {
+        "canonical": "Remind me on June 30, 2026 that the annual license renewal is due. Keep this as ongoing background work and notify me in app only for now.",
+        "paraphrases": [
+          "on 2026-06-30 ping me: annual license renewal is due. in-app notification only. keep this as ongoing background work",
+          "reminder for 30 june 2026: the annual license renewal is due. app notify only. ongoing",
+          "please schedule: 2026-06-30 - notify annual license renewal is due - channel in-app only - as background work",
+          "set a future reminder 30/06/2026 saying annual license renewal is due, in-app only, treat as ongoing background"
+        ]
+      },
+      "expected": {
+        "goal_count": 1,
+        "goals": [
+          {
+            "capability_target_any_of": ["schedule_task", "reminder_create", "watch", "calendar_create"],
+            "embedding_similarity_min": 0.45,
+            "object_ref": null,
+            "side_effect": "create_object",
+            "hints": {},
+            "depends_on": []
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.50
+      },
+      "notes": "Scheduled one-shot reminder on a future absolute date. In-app delivery channel. The 'ongoing background work' phrasing must not confuse this with the pricing-monitor background session - it is a single scheduled event, not continuous polling."
+    },
+    {
+      "id": "calendar_events_batch_3",
+      "category": "calendar",
+      "prompts": {
+        "canonical": "Create events for these dates and notify me when they arrive: Meeting with Priya on 30 June 2026, Meeting with Morgan on 30 September 2026, Meeting with Jordan on 31 December 2026.",
+        "paraphrases": [
+          "add 3 calendar events: 30 jun 2026 - meeting w/ priya, 30 sep 2026 - meeting w/ morgan, 31 dec 2026 - meeting w/ jordan; notify me when each arrives",
+          "schedule these meetings and remind me: priya 2026-06-30, morgan 2026-09-30, jordan 2026-12-31",
+          "pls create calendar entries: priya june 30 2026, morgan sept 30 2026, jordan dec 31 2026, with notifications",
+          "three events to create + reminders: meeting priya (30/06/2026), meeting morgan (30/09/2026), meeting jordan (31/12/2026)"
+        ]
+      },
+      "expected": {
+        "goal_count": 3,
+        "goals": [
+          {
+            "capability_target_any_of": ["calendar_create", "reminder_create", "schedule_task"],
+            "embedding_similarity_min": 0.40,
+            "object_ref": null,
+            "side_effect": "create_object",
+            "hints": {},
+            "depends_on": []
+          },
+          {
+            "capability_target_any_of": ["calendar_create", "reminder_create", "schedule_task"],
+            "embedding_similarity_min": 0.40,
+            "object_ref": null,
+            "side_effect": "create_object",
+            "hints": {},
+            "depends_on": []
+          },
+          {
+            "capability_target_any_of": ["calendar_create", "reminder_create", "schedule_task"],
+            "embedding_similarity_min": 0.40,
+            "object_ref": null,
+            "side_effect": "create_object",
+            "hints": {},
+            "depends_on": []
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.55
+      },
+      "notes": "Canonical multi-goal turn: 3 independent calendar events. No dependencies between them. Planner must NOT collapse into a single 'create many events' goal."
+    },
+    {
+      "id": "skill_import_from_url",
+      "category": "skill_import",
+      "prompts": {
+        "canonical": "Import this as a skill: https://en.wikipedia.org/wiki/ELIZA",
+        "paraphrases": [
+          "pls install https://en.wikipedia.org/wiki/ELIZA as a new skill",
+          "add the ELIZA wikipedia page as an AgentArk skill: https://en.wikipedia.org/wiki/ELIZA",
+          "register this URL as a skill for me: https://en.wikipedia.org/wiki/ELIZA",
+          "ingest https://en.wikipedia.org/wiki/ELIZA as a reusable skill"
+        ]
+      },
+      "expected": {
+        "goal_count": 1,
+        "goals": [
+          {
+            "capability_target_any_of": ["skill_import", "import_skill_from_url", "manage_actions"],
+            "embedding_similarity_min": 0.45,
+            "object_ref": null,
+            "side_effect": "create_object",
+            "hints": {},
+            "depends_on": []
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.55
+      },
+      "notes": "URL is payload; skill_import action takes it as source_url arg. If the fetched manifest contains install steps, the step resolver may emit a derived follow-up step at runtime, but the plan goal count is still 1."
+    },
+    {
+      "id": "swarm_launch_plan",
+      "category": "swarm",
+      "prompts": {
+        "canonical": "Use multiple agents for this. We run a B2B SaaS for finance teams. I want a launch plan for a new approval workflows feature. 1) Research buyer pain points and objections. 2) Propose product positioning and packaging. 3) Draft the rollout plan across sales, support, and onboarding. 4) Validate risks, missing assumptions, and success metrics. Give me one final operator-ready answer.",
+        "paraphrases": [
+          "delegate this to a swarm: launch plan for new approval-workflows feature in our b2b saas (finance teams). sub-tasks = pain-points research, positioning/packaging, rollout plan (sales/support/onboarding), risk+metrics validation. one final answer pls",
+          "use swarm for this launch plan (approval workflows feature, finance-teams b2b saas). break into: research, positioning, rollout, risk validation. consolidate into one operator-ready output",
+          "multi-agent task: produce an approval-workflows launch plan for our finance-team saas. sub-steps (research, positioning+packaging, sales/support/onboarding rollout, risk/metric validation), then give me a single final plan"
+        ]
+      },
+      "expected": {
+        "goal_count": 1,
+        "goals": [
+          {
+            "capability_target_any_of": ["swarm", "spawn_swarm", "delegate"],
+            "embedding_similarity_min": 0.50,
+            "object_ref": null,
+            "side_effect": "create_object",
+            "hints": {},
+            "depends_on": []
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.55
+      },
+      "notes": "Explicit user request for swarm/delegate. Sub-task decomposition is internal to the swarm runtime, not to the TurnPlan."
+    },
+    {
+      "id": "browser_automation_wikipedia_pause",
+      "category": "browser",
+      "prompts": {
+        "canonical": "Open https://www.wikipedia.org, search for 'OpenAI', go to the article, and when you get there stop and ask me: 'Should I inspect the History section or the Products section?' Do not continue until I answer.",
+        "paraphrases": [
+          "navigate wikipedia.org, search for OpenAI, open the article, then pause and prompt me: History or Products section? wait for my reply",
+          "browse https://www.wikipedia.org -> search 'OpenAI' -> open article -> STOP and ask me whether to inspect History or Products section; don't continue without my input",
+          "automated browser: wikipedia.org, query=OpenAI, click the article, halt at the article page and ask me about History vs Products section"
+        ]
+      },
+      "expected": {
+        "goal_count": 1,
+        "goals": [
+          {
+            "capability_target_any_of": ["browser_auto", "browser"],
+            "embedding_similarity_min": 0.50,
+            "object_ref": null,
+            "side_effect": "none",
+            "hints": {"waits_for_user_input": true},
+            "depends_on": []
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.55
+      },
+      "notes": "Single goal with an explicit mid-flow user checkpoint. waits_for_user_input=true biases the orchestrator to pause instead of looping."
+    },
+    {
+      "id": "browser_automation_sequential_hn_login",
+      "category": "browser",
+      "prompts": {
+        "canonical": "Go to https://news.ycombinator.com/login and let me login, then you list my submissions.",
+        "paraphrases": [
+          "open hn login page https://news.ycombinator.com/login - let me sign in - then list my submissions",
+          "navigate to hacker news login (https://news.ycombinator.com/login), wait for my login, then show my submissions",
+          "step 1: go to https://news.ycombinator.com/login so i can log in. step 2: after i'm in, list my submissions",
+          "first open hn login, i'll log in myself; after that list out my submissions"
+        ]
+      },
+      "expected": {
+        "goal_count": 2,
+        "goals": [
+          {
+            "capability_target_any_of": ["browser_auto", "browser"],
+            "embedding_similarity_min": 0.45,
+            "object_ref": null,
+            "side_effect": "none",
+            "hints": {"waits_for_user_input": true},
+            "depends_on": []
+          },
+          {
+            "capability_target_any_of": ["browser_auto", "browser"],
+            "embedding_similarity_min": 0.45,
+            "object_ref": null,
+            "side_effect": "read",
+            "hints": {},
+            "depends_on": ["goal_0"]
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.50
+      },
+      "notes": "Two sequential browser goals. Goal 1 pauses for user login; goal 2 depends on completion of goal 1 (user signal)."
+    },
+    {
+      "id": "deep_research_india_ai",
+      "category": "deep_research",
+      "prompts": {
+        "canonical": "Research whether India should aggressively expand domestic AI research investment, frontier-model infrastructure, and public AI compute between 2026 and 2040, as of April 4, 2026. Cover: current capacity, open vs closed vs hybrid, compute/power/semis, economic upside, risks, international comparison, pro and skeptical arguments, and policy options.",
+        "paraphrases": [
+          "deep research: should india aggressively expand domestic AI r&d investment / frontier infra / public compute 2026-2040, as of 4 apr 2026. include current capacity, strategy (open/closed/hybrid), compute+power+semi, econ upside, risks, intl comparison, arguments both sides, policy options",
+          "please run a deep research report on india's AI expansion strategy 2026-2040 covering capacity, strategy choice, compute/semis/power, economic benefits, safety/misuse/surveillance risks, usa/china/eu comparison, opposing viewpoints, realistic policy options",
+          "comprehensive research: india AI investment thesis 2026-2040 - universities/labs/talent, open vs closed, gpus/power/chip deps, sector upside, risks, international peer comparison, pro and con arguments, policy menu"
+        ]
+      },
+      "expected": {
+        "goal_count": 1,
+        "goals": [
+          {
+            "capability_target_any_of": ["deep_research", "research"],
+            "embedding_similarity_min": 0.55,
+            "object_ref": null,
+            "side_effect": "read",
+            "hints": {"public_freshness_required": true},
+            "depends_on": []
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.60
+      },
+      "notes": "Deep research surfaces the multi-step decomposition internally. The TurnPlan has one goal regardless of the number of sub-queries."
+    },
+    {
+      "id": "arksystem_inspect_arkpulse",
+      "category": "arksystem_inspect",
+      "prompts": {
+        "canonical": "What was arkpulse's latest run?",
+        "paraphrases": [
+          "tell me about the most recent arkpulse run",
+          "show me the latest arkpulse execution details",
+          "arkpulse: last run summary pls",
+          "what did arkpulse do in its latest run"
+        ]
+      },
+      "expected": {
+        "goal_count": 1,
+        "goals": [
+          {
+            "capability_target": "agentark_inspect",
+            "embedding_similarity_min": 0.45,
+            "object_ref": null,
+            "side_effect": "read",
+            "hints": {},
+            "depends_on": []
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.55
+      },
+      "notes": "Internal-inspection query. Step resolver picks agentark_inspect with surface=arkpulse,limit=1 args. Post-success predicate OutputNonEmpty terminates the step; orchestrator must not wander to web_search/browser."
+    },
+    {
+      "id": "integration_install_linear_plus_list",
+      "category": "integration_install",
+      "prompts": {
+        "canonical": "Install the Linear integration. List my assigned Linear issues.",
+        "paraphrases": [
+          "add linear integration, then show my assigned issues",
+          "set up linear and after that list the issues assigned to me",
+          "connect Linear + fetch issues where I am assignee",
+          "i need linear connected; then pull my assigned issues"
+        ]
+      },
+      "expected": {
+        "goal_count": 2,
+        "goals": [
+          {
+            "capability_target_any_of": ["install_integration", "integration_install", "connect_integration"],
+            "embedding_similarity_min": 0.45,
+            "object_ref": null,
+            "side_effect": "create_object",
+            "hints": {},
+            "depends_on": []
+          },
+          {
+            "capability_target_any_of": ["linear_list_issues", "integration_call", "list_issues"],
+            "embedding_similarity_min": 0.45,
+            "object_ref": {"kind": "integration", "resolution_family": "last_agent_created"},
+            "side_effect": "read",
+            "hints": {},
+            "depends_on": ["goal_0"],
+            "authorization_gated": true,
+            "may_degrade_to": "respond_without_tool"
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.50
+      },
+      "notes": "Install + use is two goals. Goal 2 depends on goal 1 completing (integration authorized). If goal 1 requires user auth flow that doesn't complete synchronously, goal 2 defers rather than inventing a fake tool call."
+    },
+    {
+      "id": "secret_intake_api_key_sidecar",
+      "category": "secret_intake",
+      "prompts": {
+        "canonical": "My OpenAI key is sk-proj-benchmarktest000000000000000000000000000000",
+        "paraphrases": [
+          "heres my openai api key: sk-proj-benchmarktest000000000000000000000000000000",
+          "store this openai key pls: sk-proj-benchmarktest000000000000000000000000000000",
+          "save openai: sk-proj-benchmarktest000000000000000000000000000000",
+          "openai key to configure => sk-proj-benchmarktest000000000000000000000000000000"
+        ]
+      },
+      "expected": {
+        "goal_count": 1,
+        "goals": [
+          {
+            "capability_target_any_of": ["store_model_credential", "store_credential", "configure_provider"],
+            "embedding_similarity_min": 0.40,
+            "object_ref": null,
+            "side_effect": "create_object",
+            "hints": {},
+            "depends_on": []
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": true,
+        "turn_confidence_min": 0.45
+      },
+      "notes": "The raw secret value is replaced by [REDACTED_SECRET] before the planner's LLM call. The raw value flows into the credential-storage action via a sidecar channel (captured from the original user message, never re-embedded in prompts or logs). The corpus value is an obvious benchmark placeholder, not a real key."
+    },
+    {
+      "id": "mixed_memory_plus_question",
+      "category": "mixed",
+      "prompts": {
+        "canonical": "My name is Alex. Do you know what OpenClaw is?",
+        "paraphrases": [
+          "i'm alex btw. also - what is openclaw?",
+          "hey, my name's alex. and... what's openclaw?",
+          "pls remember my name is alex. also, do u know what OpenClaw is?",
+          "name: alex. question: what is openclaw"
+        ]
+      },
+      "expected": {
+        "goal_count": 2,
+        "goals": [
+          {
+            "capability_target_any_of": ["memory_save", "save_user_fact", "user_memory_write"],
+            "embedding_similarity_min": 0.35,
+            "object_ref": null,
+            "side_effect": "create_object",
+            "hints": {},
+            "depends_on": []
+          },
+          {
+            "capability_target_any_of": ["web_search", "research", "respond_without_tool"],
+            "embedding_similarity_min": 0.35,
+            "object_ref": null,
+            "side_effect": "read",
+            "hints": {"public_freshness_required": true},
+            "depends_on": []
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.40
+      },
+      "notes": "Canonical two-goal mixed-intent turn. Goal 1 saves identity fact; goal 2 answers the lookup question. Neither blocks the other. The planner MUST NOT collapse this into a single intent (old system did via self_memory_lookup short-circuit)."
+    },
+    {
+      "id": "mixed_memory_plus_gmail_meetings_app",
+      "category": "mixed",
+      "prompts": {
+        "canonical": "Remember my profile label is demo-user and my organization is example-org. Can you make an app so that I can track my Gmail meetings in a frontend UI, upcoming and all?",
+        "paraphrases": [
+          "remember profile label demo-user and org example-org. also build a frontend app where i can see upcoming gmail meetings",
+          "save profile label=demo-user, organization=example-org; please create a UI app for tracking meetings from Gmail, including upcoming ones",
+          "store my profile details as demo-user at example-org, then make me a web dashboard for Gmail meeting tracking",
+          "profile label demo-user, org example-org. Need an app UI that shows my Gmail meetings/upcoming schedule"
+        ]
+      },
+      "expected": {
+        "goal_count": 2,
+        "goals": [
+          {
+            "capability_target_any_of": ["memory_save", "save_user_fact", "user_memory_write"],
+            "embedding_similarity_min": 0.35,
+            "object_ref": null,
+            "side_effect": "create_object",
+            "hints": {},
+            "depends_on": []
+          },
+          {
+            "capability_target": "app_deploy",
+            "embedding_similarity_min": 0.50,
+            "object_ref": null,
+            "side_effect": "create_object",
+            "hints": {"workspace_modification_request": true},
+            "depends_on": []
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.45
+      },
+      "notes": "Mixed memory + app-build request. Gmail is part of the app spec and may require auth during app/runtime setup, but the turn must still preserve the separate memory goal and app deployment goal."
+    },
+    {
+      "id": "google_workspace_tools_query",
+      "category": "capability_inventory",
+      "prompts": {
+        "canonical": "What tools do you currently have for Google Workspace?",
+        "paraphrases": [
+          "which google workspace capabilities are available right now",
+          "list my gws tools",
+          "google workspace - what can you do?",
+          "show me which Google Workspace actions are wired up"
+        ]
+      },
+      "expected": {
+        "goal_count": 1,
+        "goals": [
+          {
+            "capability_target_any_of": ["list_integrations", "capability_resolve", "product_help", "agentark_inspect"],
+            "embedding_similarity_min": 0.40,
+            "object_ref": null,
+            "side_effect": "read",
+            "hints": {},
+            "depends_on": []
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.45
+      },
+      "notes": "Capability-inventory question. Multiple valid step-resolver picks. Planner should not guess at specific Google Workspace action outputs without first inspecting the catalog."
+    },
+    {
+      "id": "drive_file_search_auth_gated",
+      "category": "integration_call",
+      "prompts": {
+        "canonical": "Find my Drive file named roadmap.",
+        "paraphrases": [
+          "search my google drive for a file called roadmap",
+          "look up 'roadmap' in my drive",
+          "drive file: roadmap - where is it",
+          "where is my drive file roadmap?"
+        ]
+      },
+      "expected": {
+        "goal_count": 1,
+        "goals": [
+          {
+            "capability_target_any_of": ["drive_search", "google_drive_search", "integration_call"],
+            "embedding_similarity_min": 0.40,
+            "object_ref": null,
+            "side_effect": "read",
+            "hints": {},
+            "depends_on": [],
+            "authorization_gated": true,
+            "may_degrade_to": "respond_without_tool"
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.40
+      },
+      "notes": "Authorization-gated. If Google Drive integration is not authorized for this principal, the step resolver's auth filter removes drive_* actions; the resolver emits respond_without_tool explaining the missing access. It must NOT fall back to web_search or fabricate results."
+    },
+    {
+      "id": "places_disconnected_web_fallback",
+      "category": "integration_call_with_fallback",
+      "prompts": {
+        "canonical": "List independent bookstores near London Bridge.",
+        "paraphrases": [
+          "find independent bookshops around london bridge",
+          "bookstores near london bridge - list em",
+          "what indie bookstores are in/near london bridge",
+          "looking for independent bookshops around the london bridge area"
+        ]
+      },
+      "expected": {
+        "goal_count": 1,
+        "goals": [
+          {
+            "capability_target_any_of": ["places_search", "web_search", "research"],
+            "embedding_similarity_min": 0.35,
+            "object_ref": null,
+            "side_effect": "read",
+            "hints": {"public_freshness_required": true},
+            "depends_on": [],
+            "authorization_gated": false,
+            "may_degrade_to": "web_search"
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.40
+      },
+      "notes": "When a dedicated Places integration is authorized, the step resolver prefers it. When not, the auth filter removes Places actions; web_search/research remains available and is used as a natural fallback. Either resolution is acceptable; what must not happen is failure or fabrication."
+    }
+  ]
+}

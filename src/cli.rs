@@ -14,6 +14,12 @@ pub enum ServiceMode {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Compatibility alias for --chat.
+    Chat,
+    /// Compatibility alias for --setup.
+    Setup,
+    /// Compatibility alias for --pulse.
+    Pulse,
     Gateway(StatusCommandArgs),
     Channel(StatusCommandArgs),
     Routing(RoutingCommandArgs),
@@ -203,9 +209,9 @@ fn build_onboard_steps(summary: OnboardSummary) -> Vec<OnboardStep> {
             status: if summary.chat_ready { "ready" } else { "blocking" },
             detail: chat_detail,
             next_action: if summary.chat_ready {
-                "Run `agentark chat` to start using CLI chat.".to_string()
+                "Run `agentark --chat` to start using CLI chat.".to_string()
             } else {
-                "Run `agentark setup`, or open http://localhost:8990 and go to Settings > Models."
+                "Run `agentark --setup`, or open http://localhost:8990 and go to Settings > Models."
                     .to_string()
             },
         },
@@ -294,6 +300,9 @@ fn build_onboard_steps(summary: OnboardSummary) -> Vec<OnboardStep> {
 
 pub async fn run(agent: crate::core::Agent, command: Command) -> Result<()> {
     match command {
+        Command::Chat | Command::Setup | Command::Pulse => {
+            anyhow::bail!("top-level CLI alias reached operator command dispatcher")
+        }
         Command::Gateway(args) => run_gateway_status(agent, args.json).await,
         Command::Channel(args) => run_channel_status(agent, args.json).await,
         Command::Routing(args) => run_routing(agent, args).await,
@@ -729,7 +738,7 @@ mod tests {
         assert_eq!(steps[0].id, "chat_model");
         assert_eq!(steps[0].status, "blocking");
         assert!(steps[0].detail.contains("No chat model"));
-        assert!(steps[0].next_action.contains("agentark setup"));
+        assert!(steps[0].next_action.contains("agentark --setup"));
     }
 
     #[test]
@@ -753,6 +762,6 @@ mod tests {
         assert_eq!(steps[0].id, "chat_model");
         assert_eq!(steps[0].status, "ready");
         assert!(steps[0].detail.contains("2 chat model route(s)"));
-        assert!(steps[0].next_action.contains("agentark chat"));
+        assert!(steps[0].next_action.contains("agentark --chat"));
     }
 }

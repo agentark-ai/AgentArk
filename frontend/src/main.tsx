@@ -7,10 +7,14 @@ import { initializeUiSession } from "./api/client";
 import { appTheme } from "./theme";
 import "./styles.css";
 
+const QUERY_STALE_TIME_MS = 10_000;
+const QUERY_GC_TIME_MS = 2 * 60_000;
+
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
-      staleTime: 10_000,
+      staleTime: QUERY_STALE_TIME_MS,
+      gcTime: QUERY_GC_TIME_MS,
       refetchOnWindowFocus: false,
       retry: 1
     }

@@ -59,6 +59,15 @@ services:
         limits:
           memory: 512M
 
+  agentark-embeddings:
+    cpus: "${AGENTARK_EMBEDDINGS_CPUS:-0.75}"
+    mem_limit: "${AGENTARK_EMBEDDINGS_MEMORY:-512M}"
+    deploy:
+      resources:
+        limits:
+          cpus: "${AGENTARK_EMBEDDINGS_CPUS:-0.75}"
+          memory: "${AGENTARK_EMBEDDINGS_MEMORY:-512M}"
+
   agentark-executor:
     environment:
       - AGENTARK_DB_MAX_CONNECTIONS=8

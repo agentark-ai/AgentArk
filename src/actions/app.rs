@@ -9,16 +9,17 @@
 //! reverse-proxies /apps/{id}/* to that port.
 
 use anyhow::{Context, Result};
+use scraper::{Html, Selector};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc::Sender;
 use tokio::sync::RwLock;
+use tokio::sync::mpsc::Sender;
 
-use crate::core::runtime_image;
 use crate::core::StreamEvent;
+use crate::core::runtime_image;
 
 /// Port range for dynamic apps (localhost only)
 const PORT_RANGE_START: u16 = 9100;
@@ -78,6 +79,379 @@ fn control_plane_executor_client() -> Option<crate::clients::ExecutorClient> {
             .ok()?;
     client.bearer_token()?;
     Some(client)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StaticAssetReference {
+    Bundled(String),
+    RootAbsolute(String),
+}
+
+fn normalize_static_bundle_path(raw: &str) -> Option<String> {
+    let normalized = raw.trim().replace('\\', "/");
+    if normalized.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for part in normalized.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            parts.pop()?;
+            continue;
+        }
+        parts.push(part);
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
+fn has_url_scheme(raw: &str) -> bool {
+    let Some(colon_idx) = raw.find(':') else {
+        return false;
+    };
+    let prefix = &raw[..colon_idx];
+    if prefix.is_empty() {
+        return false;
+    }
+    prefix
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+}
+
+fn strip_url_suffixes(raw: &str) -> &str {
+    let query_idx = raw.find('?');
+    let hash_idx = raw.find('#');
+    let end = match (query_idx, hash_idx) {
+        (Some(a), Some(b)) => a.min(b),
+        (Some(a), None) | (None, Some(a)) => a,
+        (None, None) => raw.len(),
+    };
+    &raw[..end]
+}
+
+fn resolve_static_asset_reference(owner_file: &str, raw: &str) -> Option<StaticAssetReference> {
+    let trimmed = raw.trim().trim_matches('"').trim_matches('\'').trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("//")
+        || has_url_scheme(trimmed)
+    {
+        return None;
+    }
+    let without_suffix = strip_url_suffixes(trimmed).trim();
+    if without_suffix.is_empty() {
+        return None;
+    }
+    if without_suffix.starts_with('/') {
+        return Some(StaticAssetReference::RootAbsolute(
+            without_suffix.to_string(),
+        ));
+    }
+
+    let owner_dir = owner_file
+        .rsplit_once('/')
+        .map(|(dir, _)| dir)
+        .filter(|dir| !dir.is_empty());
+    let combined = match owner_dir {
+        Some(dir) => format!("{}/{}", dir, without_suffix),
+        None => without_suffix.to_string(),
+    };
+    normalize_static_bundle_path(&combined).map(StaticAssetReference::Bundled)
+}
+
+fn srcset_candidates(raw: &str) -> impl Iterator<Item = &str> {
+    raw.split(',')
+        .filter_map(|candidate| candidate.split_whitespace().next())
+}
+
+fn css_url_references(raw: &str) -> Vec<String> {
+    let mut refs = Vec::new();
+    let mut rest = raw;
+    loop {
+        let lower_rest = rest.to_ascii_lowercase();
+        let Some(idx) = lower_rest.find("url(") else {
+            break;
+        };
+        let after = &rest[idx + 4..];
+        let Some(end) = after.find(')') else {
+            break;
+        };
+        refs.push(after[..end].trim().to_string());
+        rest = &after[end + 1..];
+    }
+    refs
+}
+
+fn html_tag_name_boundary(ch: Option<char>) -> bool {
+    ch.is_none_or(|ch| ch.is_ascii_whitespace() || matches!(ch, '>' | '/' | '\t' | '\r' | '\n'))
+}
+
+fn html_raw_text_element_needs_close(tag_name: &str) -> bool {
+    matches!(tag_name, "script" | "style" | "textarea" | "title")
+}
+
+fn find_unclosed_html_raw_text_element(content: &str) -> Option<&'static str> {
+    let lower = content.to_ascii_lowercase();
+    let mut cursor = 0usize;
+
+    while let Some(relative_start) = lower[cursor..].find('<') {
+        let start = cursor + relative_start;
+        let after_lt = start + 1;
+        let Some(next) = lower[after_lt..].chars().next() else {
+            return None;
+        };
+
+        if next == '!' || next == '?' || next == '/' {
+            cursor = lower[after_lt..]
+                .find('>')
+                .map(|relative_end| after_lt + relative_end + 1)
+                .unwrap_or(lower.len());
+            continue;
+        }
+
+        let name_start = after_lt;
+        let mut name_end = name_start;
+        for (offset, ch) in lower[name_start..].char_indices() {
+            if ch.is_ascii_alphanumeric() {
+                name_end = name_start + offset + ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if name_end == name_start {
+            cursor = after_lt;
+            continue;
+        }
+
+        let tag_name = &lower[name_start..name_end];
+        if !html_tag_name_boundary(lower[name_end..].chars().next()) {
+            cursor = name_end;
+            continue;
+        }
+        let Some(start_tag_end_relative) = lower[start..].find('>') else {
+            return match tag_name {
+                "script" => Some("script"),
+                "style" => Some("style"),
+                "textarea" => Some("textarea"),
+                "title" => Some("title"),
+                _ => None,
+            };
+        };
+        let start_tag_end = start + start_tag_end_relative;
+        if !html_raw_text_element_needs_close(tag_name) {
+            cursor = start_tag_end + 1;
+            continue;
+        }
+        let close_prefix = format!("</{}", tag_name);
+        let body_start = start_tag_end + 1;
+        let Some(close_relative) = lower[body_start..].find(&close_prefix) else {
+            return match tag_name {
+                "script" => Some("script"),
+                "style" => Some("style"),
+                "textarea" => Some("textarea"),
+                "title" => Some("title"),
+                _ => None,
+            };
+        };
+        let close_start = body_start + close_relative;
+        let close_name_end = close_start + close_prefix.len();
+        if !html_tag_name_boundary(lower[close_name_end..].chars().next()) {
+            cursor = close_name_end;
+            continue;
+        }
+        cursor = lower[close_start..]
+            .find('>')
+            .map(|relative_end| close_start + relative_end + 1)
+            .unwrap_or(lower.len());
+    }
+
+    None
+}
+
+fn validate_static_app_html_structure(
+    files: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    let mut malformed: Vec<String> = Vec::new();
+    for (filename, content) in files {
+        let Some(owner_file) = normalize_static_bundle_path(filename) else {
+            continue;
+        };
+        let lower_name = owner_file.to_ascii_lowercase();
+        if !lower_name.ends_with(".html") && !lower_name.ends_with(".htm") {
+            continue;
+        }
+        let Some(content) = content.as_str() else {
+            continue;
+        };
+        if let Some(tag_name) = find_unclosed_html_raw_text_element(content) {
+            malformed.push(format!(
+                "{} has an unclosed <{}> block",
+                owner_file, tag_name
+            ));
+        }
+    }
+
+    if malformed.is_empty() {
+        return Ok(());
+    }
+
+    malformed.sort();
+    malformed.dedup();
+    anyhow::bail!(
+        "Static app bundle contains malformed HTML ({}). Redeploy a complete HTML document with all raw-text blocks closed; for generated pages with substantial styling or scripting, use separate app-relative files such as style.css and app.js and include them in the files object.",
+        malformed
+            .iter()
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+}
+
+fn record_static_asset_reference(
+    owner_file: &str,
+    raw_ref: &str,
+    available_files: &HashSet<String>,
+    missing_refs: &mut Vec<String>,
+    root_absolute_refs: &mut Vec<String>,
+) {
+    match resolve_static_asset_reference(owner_file, raw_ref) {
+        Some(StaticAssetReference::Bundled(path)) => {
+            if !available_files.contains(&path) {
+                missing_refs.push(format!(
+                    "{} references missing local asset {}",
+                    owner_file, path
+                ));
+            }
+        }
+        Some(StaticAssetReference::RootAbsolute(path)) => {
+            root_absolute_refs.push(format!(
+                "{} references root-relative asset {}",
+                owner_file, path
+            ));
+        }
+        None => {}
+    }
+}
+
+fn validate_static_app_asset_references(
+    files: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    let available_files: HashSet<String> = files
+        .keys()
+        .filter_map(|name| normalize_static_bundle_path(name))
+        .collect();
+    validate_static_app_html_structure(files)?;
+    let mut missing_refs: Vec<String> = Vec::new();
+    let mut root_absolute_refs: Vec<String> = Vec::new();
+
+    let html_selectors = [
+        ("link[href]", "href"),
+        ("script[src]", "src"),
+        ("img[src]", "src"),
+        ("source[src]", "src"),
+        ("video[src]", "src"),
+        ("audio[src]", "src"),
+        ("iframe[src]", "src"),
+        ("object[data]", "data"),
+    ];
+    let parsed_selectors: Vec<(Selector, &str)> = html_selectors
+        .iter()
+        .filter_map(|(selector, attr)| Selector::parse(selector).ok().map(|s| (s, *attr)))
+        .collect();
+    let srcset_selector = Selector::parse("[srcset]").ok();
+
+    for (filename, content) in files {
+        let Some(owner_file) = normalize_static_bundle_path(filename) else {
+            continue;
+        };
+        let Some(content) = content.as_str() else {
+            continue;
+        };
+        let lower_name = owner_file.to_ascii_lowercase();
+        if lower_name.ends_with(".html") || lower_name.ends_with(".htm") {
+            let document = Html::parse_document(content);
+            for (selector, attr) in &parsed_selectors {
+                for element in document.select(selector) {
+                    if let Some(raw) = element.value().attr(attr) {
+                        record_static_asset_reference(
+                            &owner_file,
+                            raw,
+                            &available_files,
+                            &mut missing_refs,
+                            &mut root_absolute_refs,
+                        );
+                    }
+                }
+            }
+            if let Some(selector) = &srcset_selector {
+                for element in document.select(selector) {
+                    if let Some(raw) = element.value().attr("srcset") {
+                        for candidate in srcset_candidates(raw) {
+                            record_static_asset_reference(
+                                &owner_file,
+                                candidate,
+                                &available_files,
+                                &mut missing_refs,
+                                &mut root_absolute_refs,
+                            );
+                        }
+                    }
+                }
+            }
+        } else if lower_name.ends_with(".css") {
+            for raw_ref in css_url_references(content) {
+                record_static_asset_reference(
+                    &owner_file,
+                    &raw_ref,
+                    &available_files,
+                    &mut missing_refs,
+                    &mut root_absolute_refs,
+                );
+            }
+        }
+    }
+
+    if missing_refs.is_empty() && root_absolute_refs.is_empty() {
+        return Ok(());
+    }
+
+    missing_refs.sort();
+    missing_refs.dedup();
+    root_absolute_refs.sort();
+    root_absolute_refs.dedup();
+    let mut details = Vec::new();
+    if !missing_refs.is_empty() {
+        details.push(format!(
+            "missing bundled files: {}",
+            missing_refs
+                .iter()
+                .take(8)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    if !root_absolute_refs.is_empty() {
+        details.push(format!(
+            "root-relative asset paths will not resolve under the app URL; use relative paths instead: {}",
+            root_absolute_refs
+                .iter()
+                .take(8)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    anyhow::bail!(
+        "Static app bundle has unresolved local asset references ({})",
+        details.join(" | ")
+    );
 }
 
 async fn restart_delegated_runtime(
@@ -2380,11 +2754,7 @@ async fn discover_current_agent_image() -> Option<String> {
         return None;
     }
     let image = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if image.is_empty() {
-        None
-    } else {
-        Some(image)
-    }
+    if image.is_empty() { None } else { Some(image) }
 }
 
 async fn resolve_runtime_image(runtime_image: Option<&str>) -> String {
@@ -2490,6 +2860,41 @@ fn shell_quote_arg(arg: &str) -> String {
     } else {
         format!("'{}'", arg.replace('\'', "'\"'\"'"))
     }
+}
+
+pub fn app_meta_lifecycle_command(meta: &serde_json::Value, key: &str) -> Option<String> {
+    let (top_level_keys, nested_keys): (&[&str], &[&str]) = match key {
+        "entry_command" | "start_command" => {
+            (&["entry_command", "start_command"], &["start", "entry"])
+        }
+        "install_command" => (&["install_command"], &["install", "setup"]),
+        "stop_command" => (&["stop_command"], &["stop"]),
+        _ => (&[], &[]),
+    };
+
+    for candidate in top_level_keys {
+        if let Some(value) = meta
+            .get(candidate)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(value.to_string());
+        }
+    }
+
+    let commands = meta.get("commands").and_then(|value| value.as_object())?;
+    for candidate in nested_keys {
+        if let Some(value) = commands
+            .get(*candidate)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(value.to_string());
+        }
+    }
+    None
 }
 
 fn join_shell_command(args: &[String]) -> String {
@@ -2970,6 +3375,100 @@ async fn stop_child_process(child: &mut tokio::process::Child, app_id: &str) -> 
     Ok(())
 }
 
+async fn read_app_lifecycle_command(app_dir: &Path, key: &str) -> Option<String> {
+    let bytes = tokio::fs::read(app_dir.join(".app_meta.json")).await.ok()?;
+    let meta = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
+    app_meta_lifecycle_command(&meta, key)
+}
+
+fn build_local_lifecycle_env(app_dir: &Path) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    if let Some(path) = with_node_bin_path(app_dir) {
+        env.insert("PATH".to_string(), path);
+    }
+    let venv_dir = app_dir.join(".venv");
+    let venv_bin = if cfg!(windows) {
+        venv_dir.join("Scripts")
+    } else {
+        venv_dir.join("bin")
+    };
+    if venv_bin.exists() {
+        if let Some(path) = prepend_path_entry(&venv_bin, env.get("PATH").map(|v| v.as_str())) {
+            env.insert("PATH".to_string(), path);
+        }
+        env.insert(
+            "VIRTUAL_ENV".to_string(),
+            venv_dir.to_string_lossy().to_string(),
+        );
+    }
+    env
+}
+
+async fn run_container_lifecycle_command(
+    container_id: &str,
+    command: &str,
+    label: &str,
+) -> Result<()> {
+    let command = validate_app_command(command, label)?;
+    let args = split_command_args(&command, label)?;
+    let mut docker_args = vec![
+        "exec".to_string(),
+        "-w".to_string(),
+        "/workspace".to_string(),
+        container_id.to_string(),
+    ];
+    docker_args.extend(args);
+    let output = run_docker(&docker_args, None, 45).await?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = if !stderr.trim().is_empty() {
+        stderr.trim().to_string()
+    } else {
+        stdout.trim().to_string()
+    };
+    anyhow::bail!("{} failed in app container: {}", label, detail);
+}
+
+async fn run_app_stop_command(
+    app_id: &str,
+    app_dir: &Path,
+    container_id: Option<&str>,
+    command: &str,
+) {
+    let localized = localize_app_entry_command(command, app_dir);
+    let result = if let Some(container_id) = container_id {
+        if is_container_running(container_id).await {
+            run_container_lifecycle_command(container_id, &localized, "stop_command").await
+        } else {
+            Ok(())
+        }
+    } else {
+        let env = build_local_lifecycle_env(app_dir);
+        run_local_command_with_progress(
+            &localized,
+            "stop_command",
+            app_dir,
+            &env,
+            45,
+            &None,
+            "stop",
+        )
+        .await
+        .map(|_| ())
+    };
+    if let Err(error) = result {
+        tracing::warn!(
+            app_id = %app_id,
+            command = %localized,
+            error = %error,
+            "App stop command failed; continuing with managed runtime stop"
+        );
+    }
+}
+
 pub async fn launch_dynamic_container(
     app_id: &str,
     app_dir: &Path,
@@ -3437,16 +3936,15 @@ async fn write_file_with_progress(
 
     let segments: Vec<&str> = content.split_inclusive('\n').collect();
     let total_lines = segments.len();
-    // Stream normal-sized files line-by-line so the UI can render the code as it is written.
-    // Fall back to sampled updates for very large files to avoid flooding the event stream.
-    const FILE_WRITE_PROGRESS_LINE_BY_LINE_MAX_LINES: usize = 4_000;
-    let emit_every_line = total_lines <= FILE_WRITE_PROGRESS_LINE_BY_LINE_MAX_LINES;
-    let sampled_step = (total_lines / 200).clamp(10, 50);
+    const FILE_WRITE_PROGRESS_MAX_EVENTS: usize = 8;
+    let sampled_step = (total_lines / FILE_WRITE_PROGRESS_MAX_EVENTS)
+        .max(1)
+        .min(250);
     for (idx, segment) in segments.iter().enumerate() {
         file.write_all(segment.as_bytes()).await?;
         let line_no = idx + 1;
         let is_last = line_no >= total_lines;
-        if emit_every_line || line_no == 1 || is_last || (line_no % sampled_step == 0) {
+        if line_no == 1 || is_last || (line_no % sampled_step == 0) {
             let line_text = segment.trim_end_matches('\n').trim_end_matches('\r');
             emit_file_write_progress(
                 stream_tx,
@@ -4077,6 +4575,7 @@ impl AppRegistry {
             let title = app.title.clone();
             let port = app.port;
             let is_static = app.is_static;
+            let app_dir = app.app_dir.clone();
             let is_isolated_runtime = app.container_id.is_some();
             let created_at = app.created_at.to_rfc3339();
             let access_key = if app.access_guard_enabled {
@@ -4090,6 +4589,17 @@ impl AppRegistry {
             let restoring = app.restoring;
             let restore_error = app.restore_error.clone();
             drop(app);
+            let start_command = read_app_lifecycle_command(&app_dir, "entry_command")
+                .await
+                .unwrap_or_default();
+            let install_command = read_app_lifecycle_command(&app_dir, "install_command")
+                .await
+                .unwrap_or_default();
+            let stop_command = read_app_lifecycle_command(&app_dir, "stop_command")
+                .await
+                .unwrap_or_default();
+            let has_start_command = !start_command.is_empty();
+            let has_stop_command = !stop_command.is_empty();
             let access_url = self
                 .issue_access_url(&id)
                 .await
@@ -4102,6 +4612,12 @@ impl AppRegistry {
                 "running": running,
                 "runtime_mode": runtime_mode,
                 "is_isolated_runtime": is_isolated_runtime,
+                "entry_command": start_command.clone(),
+                "start_command": start_command,
+                "install_command": install_command,
+                "stop_command": stop_command,
+                "has_start_command": has_start_command,
+                "has_stop_command": has_stop_command,
                 "created_at": created_at,
                 "url": relative_app_root_url(&id),
                 "access_url": access_url,
@@ -4584,11 +5100,15 @@ impl AppRegistry {
         if app.is_static {
             return Ok(());
         }
+        let app_dir = app.app_dir.clone();
         let mut child = app.process.take();
         let container_id = app.container_id.take();
         app.port = None;
         drop(app);
 
+        if let Some(command) = read_app_lifecycle_command(&app_dir, "stop_command").await {
+            run_app_stop_command(app_id, &app_dir, container_id.as_deref(), &command).await;
+        }
         if let Some(ref cid) = container_id {
             stop_container(cid).await?;
             tracing::info!("Stopped app container: {} ({})", app_id, cid);
@@ -4608,11 +5128,18 @@ impl AppRegistry {
         };
         if let Some(app) = app_handle {
             let mut app = app.write().await;
+            let is_static = app.is_static;
+            let app_dir = app.app_dir.clone();
             let mut child = app.process.take();
             let container_id = app.container_id.take();
             app.port = None;
             drop(app);
 
+            if !is_static {
+                if let Some(command) = read_app_lifecycle_command(&app_dir, "stop_command").await {
+                    run_app_stop_command(app_id, &app_dir, container_id.as_deref(), &command).await;
+                }
+            }
             if let Some(ref cid) = container_id {
                 stop_container(cid).await?;
                 tracing::info!("Stopped app container: {} ({})", app_id, cid);
@@ -4917,12 +5444,10 @@ impl AppRegistry {
                     .to_string();
                 let entry_command = meta
                     .as_ref()
-                    .and_then(|m| m.get("entry_command").and_then(|c| c.as_str()))
-                    .map(|s| s.to_string());
+                    .and_then(|m| app_meta_lifecycle_command(m, "entry_command"));
                 let install_command = meta
                     .as_ref()
-                    .and_then(|m| m.get("install_command").and_then(|c| c.as_str()))
-                    .map(|s| s.to_string());
+                    .and_then(|m| app_meta_lifecycle_command(m, "install_command"));
                 let runtime_image = meta
                     .as_ref()
                     .and_then(|m| m.get("runtime_image").and_then(|c| c.as_str()))
@@ -5242,6 +5767,20 @@ pub async fn app_deploy(
     if files.is_empty() {
         anyhow::bail!("'files' must contain at least one file");
     }
+    for (filename, content) in files {
+        if filename.contains("..") || filename.starts_with('/') || filename.starts_with('\\') {
+            anyhow::bail!(
+                "File '{}' is not a safe app-relative path; use paths inside the app bundle",
+                filename
+            );
+        }
+        if !content.is_string() {
+            anyhow::bail!(
+                "File '{}' must have string content; app_deploy does not accept nested file objects",
+                filename
+            );
+        }
+    }
     let file_count = files.len();
 
     let requested_app_id = arguments
@@ -5319,6 +5858,12 @@ pub async fn app_deploy(
         .unwrap_or("App");
     let mut entry_command = arguments
         .get("entry_command")
+        .or_else(|| arguments.get("start_command"))
+        .or_else(|| {
+            arguments
+                .get("commands")
+                .and_then(|value| value.get("start").or_else(|| value.get("entry")))
+        })
         .and_then(|v| v.as_str())
         .map(|value| value.to_string())
         .or_else(|| {
@@ -5326,12 +5871,16 @@ pub async fn app_deploy(
                 target
                     .meta
                     .as_ref()
-                    .and_then(|value| value.get("entry_command").and_then(|v| v.as_str()))
-                    .map(|value| value.to_string())
+                    .and_then(|value| app_meta_lifecycle_command(value, "entry_command"))
             })
         });
     let mut install_command = arguments
         .get("install_command")
+        .or_else(|| {
+            arguments
+                .get("commands")
+                .and_then(|value| value.get("install").or_else(|| value.get("setup")))
+        })
         .and_then(|v| v.as_str())
         .map(|value| value.to_string())
         .or_else(|| {
@@ -5339,8 +5888,26 @@ pub async fn app_deploy(
                 target
                     .meta
                     .as_ref()
-                    .and_then(|value| value.get("install_command").and_then(|v| v.as_str()))
-                    .map(|value| value.to_string())
+                    .and_then(|value| app_meta_lifecycle_command(value, "install_command"))
+            })
+        });
+    let stop_command = arguments
+        .get("stop_command")
+        .or_else(|| {
+            arguments
+                .get("commands")
+                .and_then(|value| value.get("stop"))
+        })
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .or_else(|| {
+            existing_target.as_ref().and_then(|target| {
+                target
+                    .meta
+                    .as_ref()
+                    .and_then(|value| app_meta_lifecycle_command(value, "stop_command"))
             })
         });
     let runtime_image = arguments
@@ -5369,18 +5936,18 @@ pub async fn app_deploy(
                 })
             }),
     );
-    let mut runtime_required = arguments
-        .get("runtime_required")
-        .and_then(|v| v.as_bool())
-        .or_else(|| {
-            existing_target.as_ref().and_then(|target| {
-                target
-                    .meta
-                    .as_ref()
-                    .and_then(|value| value.get("runtime_required").and_then(|v| v.as_bool()))
-            })
-        })
-        .unwrap_or(false);
+    let requested_runtime_required = arguments.get("runtime_required").and_then(|v| v.as_bool());
+    let persisted_runtime_required = existing_target.as_ref().and_then(|target| {
+        target
+            .meta
+            .as_ref()
+            .and_then(|value| value.get("runtime_required").and_then(|v| v.as_bool()))
+    });
+    let mut runtime_required = requested_runtime_required
+        .or(persisted_runtime_required)
+        .unwrap_or_else(|| entry_command.is_some());
+    let runtime_required_was_inferred =
+        requested_runtime_required.is_none() && persisted_runtime_required.is_none();
     let runtime_reason = arguments
         .get("runtime_reason")
         .and_then(|v| v.as_str())
@@ -5459,13 +6026,25 @@ pub async fn app_deploy(
     } else if !runtime_required {
         emit_progress(
             &stream_tx,
-            "No runtime_required flag was provided; treating this generated bundle as a static/local deploy",
+            "runtime_required=false was provided; treating this generated bundle as a static/local deploy",
         )
         .await;
         install_command = None;
         entry_command = None;
+    } else if runtime_required_was_inferred {
+        emit_progress(
+            &stream_tx,
+            "Runtime command provided; deploying this bundle as a persistent dynamic app",
+        )
+        .await;
+    }
+    if let Some(command) = stop_command.as_ref() {
+        validate_app_command(command, "stop_command")?;
     }
     let is_static = entry_command.is_none();
+    if is_static {
+        validate_static_app_asset_references(files)?;
+    }
 
     let updating_existing = existing_target.is_some();
     let app_id = existing_target
@@ -5519,11 +6098,6 @@ pub async fn app_deploy(
     let mut written_names: Vec<String> = Vec::new();
     for (filename, content) in files {
         let content_str = content.as_str().unwrap_or_default();
-        // Prevent path traversal
-        if filename.contains("..") || filename.starts_with('/') || filename.starts_with('\\') {
-            tracing::warn!("Skipping file with suspicious path: {}", filename);
-            continue;
-        }
         let file_path = app_dir.join(filename);
         if let Some(parent) = file_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -5584,7 +6158,7 @@ pub async fn app_deploy(
     let effective_install_cmd = if let Some(cmd) = install_command.as_ref() {
         Some(cmd.to_string())
     } else if has_requirements {
-        Some("python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -q".to_string())
+        Some("pip install -r requirements.txt -q".to_string())
     } else if has_package_json {
         Some("npm install --omit=dev".to_string())
     } else {
@@ -5602,10 +6176,35 @@ pub async fn app_deploy(
         })
         .map(|value| value.to_string())
         .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    let conversation_id = arguments
+        .get("_conversation_id")
+        .or_else(|| arguments.get("conversation_id"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .or_else(|| {
+            existing_target.as_ref().and_then(|target| {
+                target
+                    .meta
+                    .as_ref()
+                    .and_then(|value| value.get("conversation_id").and_then(|v| v.as_str()))
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.to_string())
+            })
+        });
     let meta = serde_json::json!({
         "title": title,
         "entry_command": entry_command.clone(),
+        "start_command": entry_command.clone(),
         "install_command": effective_install_cmd.clone(),
+        "stop_command": stop_command.clone(),
+        "commands": {
+            "install": effective_install_cmd.clone(),
+            "start": entry_command.clone(),
+            "stop": stop_command.clone(),
+        },
         "runtime_image": runtime_image.clone(),
         "runtime_preference": runtime_preference.as_str(),
         "runtime_required": runtime_required,
@@ -5624,6 +6223,7 @@ pub async fn app_deploy(
         "config_values": config_values.clone(),
         "access_guard_enabled": access_guard_enabled,
         "enabled": true,
+        "conversation_id": conversation_id,
         "created_at": created_at,
         "updated_at": chrono::Utc::now().to_rfc3339(),
         "last_accessed": chrono::Utc::now().to_rfc3339(),
@@ -5653,6 +6253,10 @@ pub async fn app_deploy(
             )
             .await;
         let url = format!("/apps/{}/", app_id);
+        let access_url = registry
+            .issue_access_url(&app_id)
+            .await
+            .unwrap_or_else(|| url.clone());
         tracing::info!("Static app deployed at {}", url);
         emit_progress(&stream_tx, &format!("Static app ready at {}", url)).await;
         return Ok(serde_json::json!({
@@ -5660,6 +6264,7 @@ pub async fn app_deploy(
             "type": "static",
             "app_id": app_id,
             "url": url,
+            "access_url": access_url,
             "title": title,
             "updated_existing": updating_existing,
             "runtime_preference": runtime_preference.as_str(),
@@ -5862,6 +6467,10 @@ pub async fn app_deploy(
     }
 
     let url = format!("/apps/{}/", app_id);
+    let access_url = registry
+        .issue_access_url(&app_id)
+        .await
+        .unwrap_or_else(|| url.clone());
     tracing::info!("Dynamic app deployed at {} (port {})", url, port);
     emit_progress(&stream_tx, &format!("Dynamic app ready at {}", url)).await;
 
@@ -5871,6 +6480,7 @@ pub async fn app_deploy(
         "runtime": runtime_label,
         "app_id": app_id,
         "url": url,
+        "access_url": access_url,
         "port": port,
         "title": title,
         "updated_existing": updating_existing,
@@ -6470,6 +7080,76 @@ $ npm run dev
                 .and_then(|value| value.as_str())
                 .is_some(),
             "updated deployments should stamp updated_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn app_deploy_rejects_static_bundle_with_missing_stylesheet() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let registry = AppRegistry::new();
+        let llm_env = HashMap::new();
+
+        let error = app_deploy(
+            config_dir.path(),
+            data_dir.path(),
+            &serde_json::json!({
+                "title": "Broken static app",
+                "files": {
+                    "index.html": "<!doctype html><html><head><link rel=\"stylesheet\" href=\"styles.css\"></head><body>demo</body></html>"
+                }
+            }),
+            &registry,
+            &llm_env,
+            None,
+        )
+        .await
+        .expect_err("missing local stylesheet should reject the static bundle");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("styles.css"),
+            "error should name the missing asset, got: {}",
+            message
+        );
+        assert!(
+            registry.list().await.is_empty(),
+            "invalid static bundles must not be registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn app_deploy_rejects_static_bundle_with_unclosed_style_block() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let registry = AppRegistry::new();
+        let llm_env = HashMap::new();
+
+        let error = app_deploy(
+            config_dir.path(),
+            data_dir.path(),
+            &serde_json::json!({
+                "title": "Truncated static app",
+                "files": {
+                    "index.html": "<!doctype html><html><head><style>.hero { color: white;"
+                }
+            }),
+            &registry,
+            &llm_env,
+            None,
+        )
+        .await
+        .expect_err("unclosed style block should reject the static bundle");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("unclosed <style>"),
+            "error should name the malformed raw text block, got: {}",
+            message
+        );
+        assert!(
+            registry.list().await.is_empty(),
+            "malformed static bundles must not be registered"
         );
     }
 }

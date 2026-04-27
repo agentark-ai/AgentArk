@@ -27,11 +27,11 @@ function Sparkline({ values }: { values: number[] }) {
 
   return (
     <svg width="100%" height={height} viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" aria-hidden>
-      <polygon points={area} fill="rgba(255, 255, 255, 0.08)" />
+      <polygon points={area} fill="var(--ui-rgba-255-255-255-080)" />
       <polyline
         points={line}
         fill="none"
-        stroke="rgba(124, 230, 255, 0.72)"
+        stroke="var(--ui-rgba-124-230-255-720)"
         strokeWidth="2"
         strokeLinejoin="round"
         strokeLinecap="round"
@@ -250,7 +250,7 @@ export function TodaysHighlights({ tasks, traces }: Props) {
                 <Typography key={row.label} variant="caption" sx={{
                   color: "text.secondary"
                 }}>
-                  {row.label}: <span style={{ color: "rgba(244, 245, 247, 0.92)" }}>{row.value}</span>
+                  {row.label}: <span style={{ color: "var(--ui-rgba-244-245-247-920)" }}>{row.value}</span>
                 </Typography>
               ))}
             </Stack>
@@ -260,7 +260,7 @@ export function TodaysHighlights({ tasks, traces }: Props) {
             <Stack direction="row" spacing={0.75} sx={{
               alignItems: "center"
             }}>
-              <ScheduleRoundedIcon sx={{ fontSize: 14, color: "rgba(244, 245, 247, 0.78)", flexShrink: 0 }} />
+              <ScheduleRoundedIcon sx={{ fontSize: 14, color: "var(--ui-rgba-244-245-247-780)", flexShrink: 0 }} />
               <Typography variant="body2" sx={{
                 color: "text.secondary"
               }}>

@@ -128,12 +128,12 @@ function chipColor(status: string): "success" | "warning" | "error" | "default" 
 
 function dotColor(status: string): string {
   const normalized = status.toLowerCase();
-  if (normalized === "active") return "rgba(57,208,255,0.85)";
-  if (normalized === "completed") return "rgba(74,210,157,0.85)";
-  if (normalized === "failed") return "rgba(255,100,100,0.85)";
-  if (["paused", "waiting", "needs_input"].includes(normalized)) return "rgba(255,191,130,0.85)";
-  if (["draft", "cancelled"].includes(normalized)) return "rgba(180,200,220,0.5)";
-  return "rgba(180,200,220,0.5)";
+  if (normalized === "active") return "var(--ui-rgba-57-208-255-850)";
+  if (normalized === "completed") return "var(--ui-rgba-74-210-157-850)";
+  if (normalized === "failed") return "var(--ui-rgba-255-100-100-850)";
+  if (["paused", "waiting", "needs_input"].includes(normalized)) return "var(--ui-rgba-255-191-130-850)";
+  if (["draft", "cancelled"].includes(normalized)) return "var(--ui-rgba-180-200-220-500)";
+  return "var(--ui-rgba-180-200-220-500)";
 }
 
 function statusLabel(status: string): string {
@@ -597,7 +597,7 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                       borderBottom: "1px solid",
                       borderColor: "divider",
                       transition: "background 0.15s ease",
-                      "&:hover": { background: "rgba(57, 208, 255, 0.04)" },
+                      "&:hover": { background: "var(--ui-rgba-57-208-255-040)" },
                       display: "block",
                     }}
                   >
@@ -811,7 +811,7 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
               borderRadius: "8px",
               border: "1px solid var(--surface-border)",
               background: "var(--surface-bg-elevated)",
-              boxShadow: "0 28px 96px rgba(0,0,0,0.5)",
+              boxShadow: "0 28px 96px var(--ui-rgba-0-0-0-500)",
             },
           },
         }}
@@ -862,7 +862,7 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                   border: "1px solid var(--surface-border)",
                   background: "var(--micro-surface-bg)",
                   p: 1.45,
-                  boxShadow: "inset 0 1px 0 rgba(255,255,255,0.04)",
+                  boxShadow: "inset 0 1px 0 var(--ui-rgba-255-255-255-040)",
                 }}
               >
                 <Stack spacing={1.15}>
@@ -885,8 +885,8 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                       variant="outlined"
                       label={`${selectedSession.counts.tasks_total} tasks`}
                       sx={{
-                        borderColor: "rgba(255,255,255,0.14)",
-                        background: "rgba(255,255,255,0.03)",
+                        borderColor: "var(--ui-rgba-255-255-255-140)",
+                        background: "var(--ui-rgba-255-255-255-030)",
                       }}
                     />
                     <Chip
@@ -894,8 +894,8 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                       variant="outlined"
                       label={`${selectedSession.counts.watchers_total} watchers`}
                       sx={{
-                        borderColor: "rgba(255,255,255,0.14)",
-                        background: "rgba(255,255,255,0.03)",
+                        borderColor: "var(--ui-rgba-255-255-255-140)",
+                        background: "var(--ui-rgba-255-255-255-030)",
                       }}
                     />
                     <Chip
@@ -903,8 +903,8 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                       variant="outlined"
                       label={`${sessionCount(selectedSession)} linked`}
                       sx={{
-                        borderColor: "rgba(255,255,255,0.14)",
-                        background: "rgba(255,255,255,0.03)",
+                        borderColor: "var(--ui-rgba-255-255-255-140)",
+                        background: "var(--ui-rgba-255-255-255-030)",
                       }}
                     />
                   </Stack>
@@ -915,12 +915,12 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                         sx={{
                           height: "100%",
                           borderRadius: "8px",
-                          border: "1px solid rgba(255,255,255,0.08)",
-                          background: "rgba(255,255,255,0.03)",
+                          border: "1px solid var(--ui-rgba-255-255-255-080)",
+                          background: "var(--ui-rgba-255-255-255-030)",
                           p: 1.15,
                         }}
                       >
-                        <Typography variant="caption" sx={{ color: "rgba(188, 198, 212, 0.68)" }}>
+                        <Typography variant="caption" sx={{ color: "var(--ui-rgba-188-198-212-680)" }}>
                           Objective
                         </Typography>
                         <Typography variant="body1" sx={{ mt: 0.45, fontWeight: 600, lineHeight: 1.45 }}>
@@ -933,15 +933,15 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                         sx={{
                           height: "100%",
                           borderRadius: "8px",
-                          border: "1px solid rgba(255,255,255,0.08)",
-                          background: "rgba(255,255,255,0.03)",
+                          border: "1px solid var(--ui-rgba-255-255-255-080)",
+                          background: "var(--ui-rgba-255-255-255-030)",
                           p: 1.15,
                         }}
                       >
-                        <Typography variant="caption" sx={{ color: "rgba(188, 198, 212, 0.68)" }}>
+                        <Typography variant="caption" sx={{ color: "var(--ui-rgba-188-198-212-680)" }}>
                           Updated
                         </Typography>
-                        <Typography variant="body2" sx={{ mt: 0.45, color: "rgba(231, 236, 243, 0.78)" }}>
+                        <Typography variant="body2" sx={{ mt: 0.45, color: "var(--ui-rgba-231-236-243-780)" }}>
                           {formatTimestamp(selectedSession.updated_at)}
                         </Typography>
                       </Box>
@@ -974,13 +974,13 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                     <Box
                       sx={{
                         borderRadius: "8px",
-                        border: "1px solid rgba(255,255,255,0.08)",
-                        background: "rgba(255,255,255,0.025)",
+                        border: "1px solid var(--ui-rgba-255-255-255-080)",
+                        background: "var(--ui-rgba-255-255-255-025)",
                         p: 1.25,
                       }}
                     >
                       <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>Summary</Typography>
-                      <Typography variant="body2" sx={{ mt: 0.7, whiteSpace: "pre-wrap", color: "rgba(231, 236, 243, 0.76)" }}>
+                      <Typography variant="body2" sx={{ mt: 0.7, whiteSpace: "pre-wrap", color: "var(--ui-rgba-231-236-243-760)" }}>
                         {selectedSession.summary}
                       </Typography>
                     </Box>
@@ -997,12 +997,12 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                           sx={{
                             height: "100%",
                             borderRadius: "8px",
-                            border: "1px solid rgba(255,255,255,0.08)",
-                            background: "rgba(255,255,255,0.025)",
+                            border: "1px solid var(--ui-rgba-255-255-255-080)",
+                            background: "var(--ui-rgba-255-255-255-025)",
                             p: 1.15,
                           }}
                         >
-                          <Typography variant="caption" sx={{ color: "rgba(188, 198, 212, 0.68)" }}>
+                          <Typography variant="caption" sx={{ color: "var(--ui-rgba-188-198-212-680)" }}>
                             {item.label}
                           </Typography>
                           <Typography variant="body2" sx={{ mt: 0.5, lineHeight: 1.5 }}>
@@ -1017,13 +1017,13 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                     <Box
                       sx={{
                         borderRadius: "8px",
-                        border: "1px solid rgba(255,255,255,0.08)",
-                        background: "rgba(255,255,255,0.025)",
+                        border: "1px solid var(--ui-rgba-255-255-255-080)",
+                        background: "var(--ui-rgba-255-255-255-025)",
                         p: 1.25,
                       }}
                     >
                       <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>Working memory</Typography>
-                      <Typography variant="body2" sx={{ mt: 0.75, whiteSpace: "pre-wrap", color: "rgba(231, 236, 243, 0.76)" }}>
+                      <Typography variant="body2" sx={{ mt: 0.75, whiteSpace: "pre-wrap", color: "var(--ui-rgba-231-236-243-760)" }}>
                         {detailQ.data.session_detail.working_memory}
                       </Typography>
                     </Box>
@@ -1048,8 +1048,8 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                       sx={{
                         height: "100%",
                         borderRadius: "8px",
-                        border: "1px solid rgba(255,255,255,0.08)",
-                        background: "rgba(255,255,255,0.025)",
+                        border: "1px solid var(--ui-rgba-255-255-255-080)",
+                        background: "var(--ui-rgba-255-255-255-025)",
                         p: 1.25,
                       }}
                     >
@@ -1065,9 +1065,9 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                               className="micro-surface-list-item"
                               sx={{
                                 borderRadius: "8px",
-                                border: "1px solid rgba(255,255,255,0.07)",
-                                background: "rgba(255,255,255,0.02)",
-                                borderLeft: "3px solid rgba(255,255,255,0.12)",
+                                border: "1px solid var(--ui-rgba-255-255-255-070)",
+                                background: "var(--ui-rgba-255-255-255-020)",
+                                borderLeft: "3px solid var(--ui-rgba-255-255-255-120)",
                               }}
                             >
                               <Stack
@@ -1105,8 +1105,8 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                       sx={{
                         height: "100%",
                         borderRadius: "8px",
-                        border: "1px solid rgba(255,255,255,0.08)",
-                        background: "rgba(255,255,255,0.025)",
+                        border: "1px solid var(--ui-rgba-255-255-255-080)",
+                        background: "var(--ui-rgba-255-255-255-025)",
                         p: 1.25,
                       }}
                     >
@@ -1122,9 +1122,9 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                               className="micro-surface-list-item"
                               sx={{
                                 borderRadius: "8px",
-                                border: "1px solid rgba(255,255,255,0.07)",
-                                background: "rgba(255,255,255,0.02)",
-                                borderLeft: "3px solid rgba(52, 211, 153, 0.7)",
+                                border: "1px solid var(--ui-rgba-255-255-255-070)",
+                                background: "var(--ui-rgba-255-255-255-020)",
+                                borderLeft: "3px solid var(--ui-rgba-52-211-153-700)",
                               }}
                             >
                               <Stack

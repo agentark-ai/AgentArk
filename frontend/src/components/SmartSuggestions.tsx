@@ -57,7 +57,7 @@ export function SmartSuggestions({
           <Stack direction="row" spacing={0.75} sx={{
             alignItems: "center"
           }}>
-            <AutoAwesomeRoundedIcon sx={{ fontSize: 18, color: "rgba(244, 245, 247, 0.82)" }} />
+            <AutoAwesomeRoundedIcon sx={{ fontSize: 18, color: "var(--ui-rgba-244-245-247-820)" }} />
             <Box sx={{ flex: 1 }}>
               <Typography variant="body1" sx={{ fontWeight: 700 }}>
                 Recommended Actions
@@ -78,7 +78,7 @@ export function SmartSuggestions({
                 sx={{
                   p: "8px 10px",
                   background:
-                    "linear-gradient(180deg, rgba(24, 24, 28, 0.92), rgba(15, 15, 18, 0.88))",
+                    "linear-gradient(180deg, var(--ui-rgba-24-24-28-920), var(--ui-rgba-15-15-18-880))",
                 }}
               >
                 <Stack spacing={0.5}>
@@ -95,11 +95,11 @@ export function SmartSuggestions({
                         width: 22,
                         height: 22,
                         borderRadius: "50%",
-                        border: "1px solid rgba(255, 255, 255, 0.1)",
+                        border: "1px solid var(--ui-rgba-255-255-255-100)",
                         display: "inline-flex",
                         alignItems: "center",
                         justifyContent: "center",
-                        color: "rgba(239, 241, 244, 0.88)",
+                        color: "var(--ui-rgba-239-241-244-880)",
                         fontSize: "0.68rem",
                         fontWeight: 700,
                         flexShrink: 0,
@@ -119,7 +119,7 @@ export function SmartSuggestions({
                     <Typography
                       variant="caption"
                       sx={{
-                        color: "rgba(173, 177, 186, 0.62)",
+                        color: "var(--ui-rgba-173-177-186-620)",
                         textTransform: "uppercase",
                         letterSpacing: 0,
                       }}

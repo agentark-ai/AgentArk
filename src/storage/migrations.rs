@@ -50,6 +50,11 @@ async fn ensure_optional_sql(
     Ok(())
 }
 
+const ACTION_CATALOG_INDEX_HNSW_SQL: &str =
+    "CREATE INDEX IF NOT EXISTS idx_action_catalog_index_embedding_hnsw \
+     ON action_catalog_index USING hnsw (embedding vector_cosine_ops) \
+     WHERE enabled = true AND embedding IS NOT NULL";
+
 fn sql_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -142,6 +147,28 @@ async fn ensure_foreign_key(
     Ok(())
 }
 
+async fn ensure_action_catalog_index_table(
+    db: &DatabaseConnection,
+    backend: DbBackend,
+) -> Result<()> {
+    let sql = format!(
+        "CREATE TABLE IF NOT EXISTS action_catalog_index (\
+         action_name TEXT PRIMARY KEY,\
+         source TEXT NOT NULL,\
+         version TEXT NOT NULL,\
+         descriptor_hash TEXT NOT NULL,\
+         descriptor_text TEXT NOT NULL,\
+         enabled BOOLEAN NOT NULL DEFAULT true,\
+         metadata_json JSONB NOT NULL DEFAULT '{{}}'::jsonb,\
+         embedding vector({}),\
+         updated_at TEXT NOT NULL\
+         )",
+        crate::actions::ACTION_CATALOG_EMBEDDING_DIM
+    );
+    db.execute(Statement::from_string(backend, sql)).await?;
+    Ok(())
+}
+
 macro_rules! ensure_table_list {
     ($db:expr, $backend:expr, $schema:expr, [$($entity:path),+ $(,)?]) => {
         $(
@@ -167,6 +194,8 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
         vector_extension.to_string(PostgresQueryBuilder),
     ))
     .await?;
+
+    ensure_action_catalog_index_table(db, backend).await?;
 
     ensure_table_list!(
         db,
@@ -208,6 +237,7 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
             experience_edge::Entity,
             procedural_pattern::Entity,
             learning_candidate::Entity,
+            readiness_evaluation::Entity,
             memory_capture_event::Entity,
             memory_operation::Entity,
             memory_evidence_link::Entity,
@@ -820,6 +850,15 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
             .unique()
             .if_not_exists()
             .to_owned(),
+    )
+    .await?;
+    ensure_pgvector_hnsw_index(
+        db,
+        backend,
+        "action_catalog_index",
+        "embedding",
+        ACTION_CATALOG_INDEX_HNSW_SQL,
+        "action catalog pgvector HNSW partial index",
     )
     .await?;
     ensure_pgvector_hnsw_index(
@@ -1796,7 +1835,7 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::vector_type_has_dimensions;
+    use super::{vector_type_has_dimensions, ACTION_CATALOG_INDEX_HNSW_SQL};
 
     #[test]
     fn vector_type_dimension_detection_requires_explicit_dimensions() {
@@ -1804,5 +1843,13 @@ mod tests {
         assert!(vector_type_has_dimensions("public.vector(1536)"));
         assert!(!vector_type_has_dimensions("vector"));
         assert!(!vector_type_has_dimensions("text"));
+    }
+
+    #[test]
+    fn action_catalog_hnsw_index_is_partial_and_cosine() {
+        assert!(ACTION_CATALOG_INDEX_HNSW_SQL.contains("USING hnsw"));
+        assert!(ACTION_CATALOG_INDEX_HNSW_SQL.contains("vector_cosine_ops"));
+        assert!(ACTION_CATALOG_INDEX_HNSW_SQL.contains("enabled = true"));
+        assert!(ACTION_CATALOG_INDEX_HNSW_SQL.contains("embedding IS NOT NULL"));
     }
 }

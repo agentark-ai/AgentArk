@@ -1,0 +1,19223 @@
+import {
+  Accordion,
+  AccordionDetails,
+  AccordionSummary,
+  Alert,
+  Autocomplete,
+  Avatar,
+  Box,
+  Button,
+  ButtonBase,
+  Checkbox,
+  Chip,
+  CircularProgress,
+  Collapse,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
+  Drawer,
+  Divider,
+  IconButton,
+  List,
+  ListItem,
+  ListItemText,
+  Link,
+  Menu,
+  MenuItem,
+  Stack,
+  Tab,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  Tabs,
+  TextField,
+  Tooltip,
+  Typography,
+} from "@mui/material";
+import Grid2 from "@mui/material/Grid";
+import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
+import ArrowDropDownRoundedIcon from "@mui/icons-material/ArrowDropDownRounded";
+import AddRoundedIcon from "@mui/icons-material/AddRounded";
+import AttachFileRoundedIcon from "@mui/icons-material/AttachFileRounded";
+import AutorenewRoundedIcon from "@mui/icons-material/AutorenewRounded";
+import CheckCircleRoundedIcon from "@mui/icons-material/CheckCircleRounded";
+import ChevronLeftRoundedIcon from "@mui/icons-material/ChevronLeftRounded";
+import ChevronRightRoundedIcon from "@mui/icons-material/ChevronRightRounded";
+import ContentCopyRoundedIcon from "@mui/icons-material/ContentCopyRounded";
+import ErrorOutlineRoundedIcon from "@mui/icons-material/ErrorOutlineRounded";
+import FileDownloadRoundedIcon from "@mui/icons-material/FileDownloadRounded";
+import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
+import MoreVertIcon from "@mui/icons-material/MoreVert";
+import OpenInFullRoundedIcon from "@mui/icons-material/OpenInFullRounded";
+import RadioButtonUncheckedRoundedIcon from "@mui/icons-material/RadioButtonUncheckedRounded";
+import StarBorderRoundedIcon from "@mui/icons-material/StarBorderRounded";
+import StarRoundedIcon from "@mui/icons-material/StarRounded";
+import ArrowUpwardRoundedIcon from "@mui/icons-material/ArrowUpwardRounded";
+import StopRoundedIcon from "@mui/icons-material/StopRounded";
+import CloseIcon from "@mui/icons-material/Close";
+import FilterListRoundedIcon from "@mui/icons-material/FilterListRounded";
+import SettingsRoundedIcon from "@mui/icons-material/SettingsRounded";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Sparkles, UserRound } from "lucide-react";
+import {
+  Fragment,
+  memo,
+  isValidElement,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type CSSProperties,
+  type DragEvent,
+  type JSX,
+  type MouseEvent,
+  type ReactNode,
+} from "react";
+import ReactECharts from "echarts-for-react";
+import { api, apiUrl } from "../../api/client";
+import AgentLogo from "../../assets/logo.svg";
+import { MetricBarCard } from "../analytics/MetricBarCard";
+import { CompanionDevicesPanel } from "../CompanionDevicesPanel";
+import { IntegrationQuickstartPanel } from "../IntegrationQuickstartPanel";
+import { IntegrationsPanel } from "../IntegrationsPanel";
+import { LiveEventConsole } from "../LiveEventConsole";
+import { ObservabilityPanel } from "../ObservabilityPanel";
+import { PluginSdkPanel } from "../PluginSdkPanel";
+import {
+  SuggestionRunDialog,
+  type SuggestionRunState,
+} from "../SuggestionRunDialog";
+import { WebhooksPanel } from "../WebhooksPanel";
+import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
+import {
+  getTunnelAccessMeta,
+  getTunnelPanelPasswordPrompt,
+  getTunnelPanelResumeMessage,
+  getTunnelPanelStartMessage,
+  getTunnelPanelStartingMessage,
+  getTunnelPanelWarning,
+  getTunnelProviderHelp,
+  getTunnelStartButtonLabel,
+  getTunnelStopButtonLabel,
+  getTunnelUrlFieldLabel,
+} from "../../lib/tunnelAccess";
+import {
+  formatUiDateOnly,
+  formatUiDateRange,
+  formatUiDateTime,
+  formatUiDateTimeMeta,
+  formatUiRelativeDateTimeMeta,
+} from "../../lib/dateFormat";
+import {
+  isBackgroundSessionVisibleInUi,
+  isOneShotReminderTask,
+  taskActionDisplay,
+  taskKind,
+  taskKindLabel,
+} from "../../lib/backgroundSessions";
+import type {
+  ArkPulseRemediationSpec,
+  ArkPulseRunFixRequest,
+  BackgroundSessionSummary,
+  SkillImportResponse,
+  Task,
+  TraceOperationalEvent,
+  TraceSummary,
+} from "../../types";
+import { useUiStore } from "../../store/uiStore";
+
+const REFRESH_MS = 8000;
+const EVOLUTION_DEV_QUERY_LIMIT = 250;
+const EVOLUTION_DEV_REFRESH_MS = 30000;
+const DEVELOPER_MODE_STORAGE_KEY = "agentark.developer_mode";
+const DEVELOPER_MODE_EVENT = "agentark:developer-mode-change";
+const OLLAMA_DEFAULT_BASE_URL = "http://localhost:11434";
+const OPENROUTER_DEFAULT_BASE_URL = "https://openrouter.ai/api/v1";
+const SHOW_EXPERIMENTAL_AUTONOMY_TOOLS = false;
+const CHAT_LAST_CONVERSATION_STORAGE_KEY = "agentark.chat.lastConversationId";
+const CHAT_PENDING_RUN_STORAGE_KEY = "agentark.chat.pendingRun";
+const CHAT_BACKGROUND_RUN_STORAGE_KEY = "agentark.chat.backgroundRun";
+const CHAT_PENDING_LAUNCH_STORAGE_KEY = "agentark.chat.pendingLaunch";
+const CHAT_WORKSPACE_SNAPSHOTS_STORAGE_KEY = "agentark.chat.workspaceSnapshots";
+const CHAT_PENDING_RUN_TTL_MS = 45 * 60 * 1000;
+const CHAT_WORKING_CHATS_MAX = 3;
+const CHAT_BACKGROUND_RUN_SNAPSHOTS_MAX = 12;
+const CHAT_WORKSPACE_SNAPSHOT_TTL_MS = 12 * 60 * 60 * 1000;
+const CHAT_WORKSPACE_SNAPSHOT_MAX_CONVERSATIONS = 10;
+const CHAT_WORKSPACE_SNAPSHOT_MAX_FILES = 24;
+const CHAT_WORKSPACE_SNAPSHOT_MAX_FILE_CHARS = 60_000;
+const CHAT_WORKSPACE_SNAPSHOT_MAX_TOTAL_CHARS = 240_000;
+const CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS = 16000;
+const CHAT_PENDING_STREAM_STEPS_MAX = 48;
+const CHAT_STREAMING_STEPS_UI_MAX = 240;
+const CHAT_STREAMING_STEP_FLUSH_MS = 180;
+const CHAT_PENDING_RUN_SNAPSHOT_FLUSH_MS = 1200;
+const CHAT_WORKSPACE_SNAPSHOT_FLUSH_MS = 1800;
+const CHAT_TRACE_STATE_CACHE_MAX = 24;
+const CHAT_PROGRESS_MEMORY_MAX_CONVERSATIONS = 12;
+const CHAT_PENDING_RUN_RECOVERY_GRACE_MS = 12_000;
+const CHAT_INLINE_CONVERSATIONS_MIN_WIDTH = 1600;
+const CHAT_INLINE_ACTIVITY_MIN_WIDTH = 1820;
+const RESTART_NOTICE_DURATION_MS = 10_000;
+const UPDATE_NOTICE_DURATION_MS = 120_000;
+const CHAT_LAUNCH_RUN_EVENT = "agentark.chat.launch-run";
+const CHAT_RUN_STATUS_EVENT = "agentark.chat.run-status";
+const CHAT_CONVERSATIONS_PAGE_SIZE = 20;
+const CHAT_STARRED_LIMIT = 3;
+
+type RestartNoticeState = {
+  text: string;
+  durationMs: number;
+  etaLabel: string;
+};
+const AUTO_APPROVE_BLOCKED_ACTIONS = [
+  "shell",
+  "bash",
+  "code_execute",
+  "file_write",
+  "file_delete",
+  "file_move",
+  "docker_exec",
+  "http_request",
+  "lan_discover",
+  "gmail_send",
+] as const;
+const AUTO_APPROVE_ACTION_OPTIONS = [
+  "web_search",
+  "research",
+  "generate_image",
+  "generate_video",
+  "browse",
+  "file_read",
+  "http_get",
+  "schedule_task",
+  "list_tasks",
+  "clipboard_read",
+  "clipboard_write",
+  "gmail_scan",
+  "gmail_reply",
+] as const;
+type ChatPendingRunMode = "fresh" | "resume";
+type ChatPendingRunPhase = "running" | "interrupted" | "awaiting_confirmation";
+
+type ChatTurnAttachment = {
+  name: string;
+  kind: "document" | "visual" | "file";
+  id?: string;
+  detail?: string;
+};
+
+type ChatPendingRunSnapshot = {
+  conversationId: string;
+  message: string;
+  projectId: string;
+  startedAt: number;
+  initialMessageCount?: number;
+  runId?: string;
+  mode?: ChatPendingRunMode;
+  phase?: ChatPendingRunPhase;
+  taskId?: string;
+  streamingResponse?: string;
+  streamingSteps?: JsonRecord[];
+  failedUserMessage?: string;
+  lastRunSeq?: number;
+  attachments?: ChatTurnAttachment[];
+};
+
+type ChatPendingRunSnapshotMap = Record<string, ChatPendingRunSnapshot>;
+
+type ChatWorkspaceSnapshot = {
+  conversationId: string;
+  updatedAt: number;
+  deployedFiles: WorkspaceFileEntry[];
+  liveFileWrites: Record<string, LiveFileWriteState>;
+  streamedWorkspaceApp?: JsonRecord | null;
+  codeViewerFileIdx?: number;
+};
+
+type ChatLaunchRunDetail = {
+  message: string;
+  conversationId?: string;
+  projectId?: string;
+  taskId?: string;
+  launchMode?: "message" | "resume_task";
+  navigateToChat?: boolean;
+  source?: string;
+  resolve?: (started: boolean) => void;
+  reject?: (message: string) => void;
+};
+
+type ChatPendingLaunch = {
+  createdAt: number;
+  launchMode: "message" | "resume_task";
+  message?: string;
+  conversationId?: string;
+  projectId?: string;
+  taskId?: string;
+  source?: string;
+};
+
+type ChatRunStatusDetail = {
+  conversationId: string;
+  status: "completed" | "error";
+  source?: string;
+  message: string;
+};
+
+type ChatExecutionMode = "auto" | "chat" | "task";
+
+type WorkspaceFileEntry = {
+  name: string;
+  content: string;
+};
+
+type WorkspaceSnippetEntry = {
+  id: string;
+  name: string;
+  displayName: string;
+  content: string;
+  languageHint: string;
+  sourceMessageId: string;
+  sourceLabel: string;
+};
+
+type CodePreviewOpenRequest = {
+  snippetId?: string;
+  fileName?: string;
+  code?: string;
+  languageHint?: string;
+};
+
+type ResearchReportPreview = {
+  title: string;
+  summary: string;
+  summaryPreview: string;
+  keyFindings: string[];
+  keyFindingCount: number;
+  sourceCount: number;
+  openQuestionCount: number;
+  contradictionCount: number;
+  content: string;
+};
+
+type ResearchReportDialogState = {
+  report: ResearchReportPreview;
+  messageId: string;
+  previousUserPrompt: string;
+  timestamp?: string;
+  traceId?: string;
+};
+
+const MODEL_FALLBACKS_BY_PROVIDER: Record<string, string[]> = {
+  openai: ["gpt-5", "gpt-5-mini", "gpt-4.1", "o4-mini", "o3"],
+  anthropic: [
+    "claude-opus-4-20250514",
+    "claude-sonnet-4-20250514",
+    "claude-3-7-sonnet-latest",
+    "claude-3-5-haiku-latest",
+  ],
+  openrouter: [
+    "openai/gpt-5",
+    "anthropic/claude-sonnet-4",
+    "google/gemini-2.5-pro",
+  ],
+  "openai-compatible": [],
+  ollama: [],
+};
+
+const MODEL_PROVIDER_OPTIONS = [
+  { value: "ollama", label: "ollama" },
+  { value: "anthropic", label: "anthropic" },
+  { value: "openai", label: "openai" },
+  { value: "openrouter", label: "openrouter" },
+  { value: "huggingface", label: "huggingface inference" },
+  { value: "openai-compatible", label: "openai-compatible" },
+];
+
+function getDeveloperModeEnabled(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    return window.localStorage.getItem(DEVELOPER_MODE_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function setDeveloperModeEnabled(next: boolean): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(DEVELOPER_MODE_STORAGE_KEY, next ? "1" : "0");
+  } catch {
+    // Ignore storage write errors and still emit event for current session.
+  }
+  window.dispatchEvent(
+    new CustomEvent(DEVELOPER_MODE_EVENT, { detail: { enabled: next } }),
+  );
+}
+
+type JsonRecord = Record<string, unknown>;
+
+function pruneRecordToAllowedKeys<T>(
+  value: Record<string, T>,
+  allowedKeys: Set<string>,
+): Record<string, T> {
+  const entries = Object.entries(value);
+  if (entries.every(([key]) => allowedKeys.has(key))) return value;
+  const nextEntries = entries.filter(([key]) => allowedKeys.has(key));
+  if (nextEntries.length === entries.length) return value;
+  return Object.fromEntries(nextEntries) as Record<string, T>;
+}
+
+type ChatClarificationChoice = {
+  label: string;
+  submitText: string;
+};
+type ChatRunMetrics = {
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+  totalTokens?: number | null;
+  durationMs?: number | null;
+  timeToFirstTokenMs?: number | null;
+};
+type PasswordDialogMode = "set" | "change" | "remove";
+type RowMenuAction = {
+  label: string;
+  onClick: () => void | Promise<void>;
+  disabled?: boolean;
+  tone?: "default" | "warning" | "error";
+  divider?: boolean;
+};
+
+type LiveFileWriteState = {
+  content: string;
+  line: number;
+  totalLines: number;
+  done: boolean;
+};
+
+type StreamPhaseStatus = {
+  toolName: string;
+  phase: string;
+  label: string;
+  detail: string;
+  status: string;
+  elapsedSecs: number;
+  streamKey: string;
+  planStepId: number | null;
+  planStepTitle: string;
+};
+
+type CodeLanguage =
+  | "markup"
+  | "script"
+  | "css"
+  | "json"
+  | "python"
+  | "sql"
+  | "shell"
+  | "markdown"
+  | "config"
+  | "text";
+
+type CodeToken = {
+  text: string;
+  className?: string;
+};
+
+function guessCodeLanguage(fileName = "", content = ""): CodeLanguage {
+  const normalizedName = fileName.trim().toLowerCase();
+  if (/\.(html?|xml|svg)$/.test(normalizedName)) return "markup";
+  if (/\.(css|scss|less)$/.test(normalizedName)) return "css";
+  if (/\.(json)$/.test(normalizedName)) return "json";
+  if (/\.(py|pyw)$/.test(normalizedName)) return "python";
+  if (/\.(sql)$/.test(normalizedName)) return "sql";
+  if (/\.(sh|bash|zsh|fish|ps1)$/.test(normalizedName)) return "shell";
+  if (/\.(md|markdown)$/.test(normalizedName)) return "markdown";
+  if (/\.(ya?ml|toml|ini|env)$/.test(normalizedName)) return "config";
+  if (
+    /\.(js|jsx|ts|tsx|mjs|cjs|java|kt|go|rs|php|rb|c|cc|cpp|cs)$/.test(
+      normalizedName,
+    )
+  ) {
+    return "script";
+  }
+
+  const trimmed = content.trim();
+  if (!trimmed) return "text";
+  if (
+    trimmed.startsWith("<!DOCTYPE") ||
+    trimmed.startsWith("<html") ||
+    /^<[\w-]+/.test(trimmed)
+  )
+    return "markup";
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) return "json";
+  if (/^\s*#\s/.test(trimmed) || /^\s*[-*+]\s/.test(trimmed)) return "markdown";
+  if (/^\s*(def |class |import |from )/.test(trimmed)) return "python";
+  if (
+    /^\s*SELECT\b|^\s*WITH\b|^\s*INSERT\b|^\s*UPDATE\b|^\s*CREATE\b/i.test(
+      trimmed,
+    )
+  )
+    return "sql";
+  if (/^\s*(const |let |var |function |import |export )/.test(trimmed))
+    return "script";
+  return "text";
+}
+
+function tokenizeByPattern(
+  line: string,
+  pattern: RegExp,
+  classify: (value: string) => string | undefined,
+): CodeToken[] {
+  const tokens: CodeToken[] = [];
+  let lastIndex = 0;
+  pattern.lastIndex = 0;
+  for (const match of line.matchAll(pattern)) {
+    const value = match[0];
+    const start = match.index ?? 0;
+    if (start > lastIndex) {
+      tokens.push({ text: line.slice(lastIndex, start) });
+    }
+    tokens.push({ text: value, className: classify(value) });
+    lastIndex = start + value.length;
+  }
+  if (lastIndex < line.length) {
+    tokens.push({ text: line.slice(lastIndex) });
+  }
+  return tokens.length > 0 ? tokens : [{ text: line }];
+}
+
+function highlightMarkupLine(line: string): CodeToken[] {
+  return tokenizeByPattern(
+    line,
+    /<!--.*?-->|<\/?[A-Za-z][\w:-]*|\/?>|[A-Za-z_:][-A-Za-z0-9_:.]*(?==)|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g,
+    (value) => {
+      if (value.startsWith("<!--")) return "comment";
+      if (
+        value.startsWith("</") ||
+        value.startsWith("<") ||
+        value === "/>" ||
+        value === ">"
+      )
+        return "tag";
+      if (value.startsWith('"') || value.startsWith("'")) return "string";
+      return "attr";
+    },
+  );
+}
+
+function highlightCssLine(line: string): CodeToken[] {
+  return tokenizeByPattern(
+    line,
+    /\/\*.*?\*\/|@[A-Za-z-]+|--?[\w-]+(?=\s*:)|#[0-9a-fA-F]{3,8}\b|\b\d+(?:\.\d+)?(?:px|rem|em|vh|vw|%|s|ms|deg)?\b|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[{}():;,.]/g,
+    (value) => {
+      if (value.startsWith("/*")) return "comment";
+      if (value.startsWith("@")) return "keyword";
+      if (value.startsWith("--") || /^[A-Za-z-]+$/.test(value)) return "attr";
+      if (value.startsWith("#")) return "number";
+      if (value.startsWith('"') || value.startsWith("'")) return "string";
+      if (/^\d/.test(value)) return "number";
+      return "punctuation";
+    },
+  );
+}
+
+function highlightJsonLine(line: string): CodeToken[] {
+  return tokenizeByPattern(
+    line,
+    /"(?:[^"\\]|\\.)*"(?=\s*:)|"(?:[^"\\]|\\.)*"|\b(?:true|false|null)\b|-?\b\d+(?:\.\d+)?\b|[{}\[\],:]/g,
+    (value) => {
+      if (value.startsWith('"')) return value.endsWith(":") ? "attr" : "string";
+      if (/^(true|false|null)$/.test(value)) return "keyword";
+      if (/^-?\d/.test(value)) return "number";
+      return "punctuation";
+    },
+  );
+}
+
+function highlightPythonLine(line: string): CodeToken[] {
+  return tokenizeByPattern(
+    line,
+    /#.*$|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\b(?:def|class|import|from|return|if|elif|else|for|while|try|except|finally|with|as|pass|break|continue|lambda|yield|async|await|True|False|None|in|is|and|or|not)\b|\b(?:print|len|range|dict|list|set|tuple|str|int|float|bool)\b|-?\b\d+(?:\.\d+)?\b/g,
+    (value) => {
+      if (value.startsWith("#")) return "comment";
+      if (value.startsWith('"') || value.startsWith("'")) return "string";
+      if (/^-?\d/.test(value)) return "number";
+      if (
+        /^(print|len|range|dict|list|set|tuple|str|int|float|bool)$/.test(value)
+      )
+        return "builtin";
+      return "keyword";
+    },
+  );
+}
+
+function highlightSqlLine(line: string): CodeToken[] {
+  return tokenizeByPattern(
+    line,
+    /--.*$|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\b(?:SELECT|FROM|WHERE|GROUP BY|ORDER BY|INSERT|INTO|VALUES|UPDATE|SET|DELETE|CREATE|TABLE|JOIN|LEFT|RIGHT|INNER|OUTER|ON|AND|OR|NOT|NULL|AS|LIMIT|OFFSET|WITH|UNION|DISTINCT)\b|-?\b\d+(?:\.\d+)?\b/gi,
+    (value) => {
+      if (value.startsWith("--")) return "comment";
+      if (value.startsWith('"') || value.startsWith("'")) return "string";
+      if (/^-?\d/.test(value)) return "number";
+      return "keyword";
+    },
+  );
+}
+
+function highlightShellLine(line: string): CodeToken[] {
+  return tokenizeByPattern(
+    line,
+    /#.*$|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\$(?:\w+|{[^}]+})|\b(?:if|then|else|fi|for|do|done|case|esac|export|sudo|echo|cd|ls|cat|grep|find|curl|npm|node|python|pip|cargo|git|docker)\b|-?\b\d+(?:\.\d+)?\b/g,
+    (value) => {
+      if (value.startsWith("#")) return "comment";
+      if (value.startsWith('"') || value.startsWith("'")) return "string";
+      if (value.startsWith("$")) return "builtin";
+      if (/^-?\d/.test(value)) return "number";
+      return "keyword";
+    },
+  );
+}
+
+function highlightMarkdownLine(line: string): CodeToken[] {
+  return tokenizeByPattern(
+    line,
+    /^#{1,6}\s.*$|^\s*[-*+]\s.*$|`[^`]+`|\*\*[^*]+\*\*|__[^_]+__|\[[^\]]+\]\([^)]+\)/g,
+    (value) => {
+      if (value.startsWith("#")) return "keyword";
+      if (/^\s*[-*+]\s/.test(value)) return "punctuation";
+      if (value.startsWith("`")) return "string";
+      if (
+        value.startsWith("[") ||
+        value.startsWith("**") ||
+        value.startsWith("__")
+      )
+        return "builtin";
+      return undefined;
+    },
+  );
+}
+
+function highlightConfigLine(line: string): CodeToken[] {
+  return tokenizeByPattern(
+    line,
+    /#.*$|;.*$|[A-Za-z_][\w.-]*(?=\s*[:=])|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\b(?:true|false|null)\b|-?\b\d+(?:\.\d+)?\b/g,
+    (value) => {
+      if (value.startsWith("#") || value.startsWith(";")) return "comment";
+      if (value.startsWith('"') || value.startsWith("'")) return "string";
+      if (/^(true|false|null)$/i.test(value)) return "keyword";
+      if (/^-?\d/.test(value)) return "number";
+      return "attr";
+    },
+  );
+}
+
+function highlightScriptLine(line: string): CodeToken[] {
+  return tokenizeByPattern(
+    line,
+    /\/\/.*$|\/\*.*?\*\/|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`|\b(?:const|let|var|function|return|if|else|for|while|switch|case|break|continue|async|await|class|new|import|export|from|try|catch|finally|throw|extends|implements|interface|type|public|private|protected|static|readonly|true|false|null|undefined)\b|\b(?:document|window|fetch|console|Math|Date|Promise|JSON|Array|Object|String|Number|Boolean|DOMParser|setTimeout|setInterval|clearTimeout|clearInterval)\b|=>|-?\b\d+(?:\.\d+)?\b/g,
+    (value) => {
+      if (value.startsWith("//") || value.startsWith("/*")) return "comment";
+      if (
+        value.startsWith('"') ||
+        value.startsWith("'") ||
+        value.startsWith("`")
+      )
+        return "string";
+      if (value === "=>") return "operator";
+      if (/^-?\d/.test(value)) return "number";
+      if (
+        /^(document|window|fetch|console|Math|Date|Promise|JSON|Array|Object|String|Number|Boolean|DOMParser|setTimeout|setInterval|clearTimeout|clearInterval)$/.test(
+          value,
+        )
+      ) {
+        return "builtin";
+      }
+      return "keyword";
+    },
+  );
+}
+
+function highlightCodeLine(line: string, language: CodeLanguage): CodeToken[] {
+  switch (language) {
+    case "markup":
+      return highlightMarkupLine(line);
+    case "css":
+      return highlightCssLine(line);
+    case "json":
+      return highlightJsonLine(line);
+    case "python":
+      return highlightPythonLine(line);
+    case "sql":
+      return highlightSqlLine(line);
+    case "shell":
+      return highlightShellLine(line);
+    case "markdown":
+      return highlightMarkdownLine(line);
+    case "config":
+      return highlightConfigLine(line);
+    case "script":
+      return highlightScriptLine(line);
+    default:
+      return [{ text: line }];
+  }
+}
+
+function renderCodeBlockLines(
+  content: string,
+  options?: {
+    fileName?: string;
+    startLine?: number;
+    activeLine?: number | null;
+  },
+): ReactNode[] {
+  const language = guessCodeLanguage(options?.fileName, content);
+  const startLine = options?.startLine ?? 1;
+  const activeLine = options?.activeLine ?? null;
+  return content.split(/\r?\n/).map((line, index) => {
+    const lineNumber = startLine + index;
+    const tokens = highlightCodeLine(line, language);
+    return (
+      <span
+        key={`${options?.fileName || "code"}-${lineNumber}`}
+        className={`code-line${activeLine === lineNumber ? " code-line-active" : ""}`}
+      >
+        <span className="code-line-number">{lineNumber}</span>
+        <span className="code-line-content">
+          {tokens.map((token, tokenIndex) => (
+            <span
+              key={`${lineNumber}-${tokenIndex}`}
+              className={
+                token.className
+                  ? `code-token code-token-${token.className}`
+                  : undefined
+              }
+            >
+              {token.text}
+            </span>
+          ))}
+        </span>
+        {"\n"}
+      </span>
+    );
+  });
+}
+
+const CODE_PREVIEW_LANGUAGE_LABELS: Record<string, string> = {
+  bash: "Bash",
+  c: "C",
+  cpp: "C++",
+  csharp: "C#",
+  css: "CSS",
+  go: "Go",
+  html: "HTML",
+  java: "Java",
+  javascript: "JavaScript",
+  json: "JSON",
+  jsx: "JSX",
+  kotlin: "Kotlin",
+  less: "Less",
+  markdown: "Markdown",
+  php: "PHP",
+  powershell: "PowerShell",
+  python: "Python",
+  ruby: "Ruby",
+  rust: "Rust",
+  scss: "SCSS",
+  sql: "SQL",
+  toml: "TOML",
+  tsx: "TSX",
+  typescript: "TypeScript",
+  xml: "XML",
+  yaml: "YAML",
+};
+
+function normalizeCodeFenceLanguage(raw = ""): string {
+  const normalized = raw
+    .trim()
+    .replace(/^language-/i, "")
+    .toLowerCase();
+  if (!normalized) return "";
+  const aliases: Record<string, string> = {
+    cjs: "javascript",
+    env: "toml",
+    htm: "html",
+    js: "javascript",
+    md: "markdown",
+    ps1: "powershell",
+    py: "python",
+    rs: "rust",
+    sh: "bash",
+    shell: "bash",
+    ts: "typescript",
+    yml: "yaml",
+    zsh: "bash",
+  };
+  return aliases[normalized] || normalized;
+}
+
+function inferCodePreviewFileName(languageHint = "", code = ""): string {
+  const normalized = normalizeCodeFenceLanguage(languageHint);
+  switch (normalized) {
+    case "html":
+    case "xml":
+      return "index.html";
+    case "css":
+      return "styles.css";
+    case "scss":
+      return "styles.scss";
+    case "less":
+      return "styles.less";
+    case "json":
+      return "data.json";
+    case "python":
+      return "main.py";
+    case "sql":
+      return "query.sql";
+    case "bash":
+      return "script.sh";
+    case "powershell":
+      return "script.ps1";
+    case "markdown":
+      return "README.md";
+    case "yaml":
+      return "config.yml";
+    case "toml":
+      return "config.toml";
+    case "typescript":
+      return "main.ts";
+    case "tsx":
+      return "App.tsx";
+    case "javascript":
+      return "main.js";
+    case "jsx":
+      return "App.jsx";
+    case "go":
+      return "main.go";
+    case "java":
+      return "Main.java";
+    case "kotlin":
+      return "Main.kt";
+    case "php":
+      return "index.php";
+    case "ruby":
+      return "main.rb";
+    case "rust":
+      return "main.rs";
+    case "c":
+      return "main.c";
+    case "cpp":
+      return "main.cpp";
+    case "csharp":
+      return "Program.cs";
+    default:
+      break;
+  }
+
+  switch (guessCodeLanguage("", code)) {
+    case "markup":
+      return "index.html";
+    case "css":
+      return "styles.css";
+    case "json":
+      return "data.json";
+    case "python":
+      return "main.py";
+    case "sql":
+      return "query.sql";
+    case "shell":
+      return "script.sh";
+    case "markdown":
+      return "README.md";
+    case "config":
+      return "config.toml";
+    case "script":
+      return "main.ts";
+    default:
+      return "snippet.txt";
+  }
+}
+
+function formatCodePreviewLanguage(
+  languageHint = "",
+  fileName = "",
+  code = "",
+): string {
+  const normalized = normalizeCodeFenceLanguage(languageHint);
+  if (normalized)
+    return CODE_PREVIEW_LANGUAGE_LABELS[normalized] || normalized.toUpperCase();
+
+  switch (guessCodeLanguage(fileName, code)) {
+    case "markup":
+      return "HTML";
+    case "css":
+      return "CSS";
+    case "json":
+      return "JSON";
+    case "python":
+      return "Python";
+    case "sql":
+      return "SQL";
+    case "shell":
+      return "Shell";
+    case "markdown":
+      return "Markdown";
+    case "config":
+      return "Config";
+    case "script":
+      return "Code";
+    default:
+      return "Text";
+  }
+}
+
+function reactNodeToPlainText(node: ReactNode): string {
+  if (node == null || typeof node === "boolean") return "";
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node))
+    return node.map((child) => reactNodeToPlainText(child)).join("");
+  return "";
+}
+
+function extractMarkdownCodeBlock(
+  children: ReactNode,
+): { className?: string; code: string } | null {
+  const nodes = Array.isArray(children) ? children : [children];
+  for (const node of nodes) {
+    if (!isValidElement<{ className?: string; children?: ReactNode }>(node))
+      continue;
+    const code = reactNodeToPlainText(node.props.children)
+      .replace(/\r\n/g, "\n")
+      .replace(/\n$/, "");
+    if (!code) continue;
+    return {
+      className: str(node.props.className, ""),
+      code,
+    };
+  }
+  return null;
+}
+
+function InlineCodePreview({
+  code,
+  languageHint,
+  fileName,
+  snippetId,
+  onOpenInWorkspace,
+}: {
+  code: string;
+  languageHint?: string;
+  fileName?: string;
+  snippetId?: string;
+  onOpenInWorkspace?: (request: CodePreviewOpenRequest) => void;
+}) {
+  const normalizedCode = (code || "").replace(/\r\n/g, "\n").replace(/\n$/, "");
+  if (!normalizedCode) return null;
+
+  const resolvedFileName =
+    fileName || inferCodePreviewFileName(languageHint, normalizedCode);
+  const languageLabel = formatCodePreviewLanguage(
+    languageHint,
+    resolvedFileName,
+    normalizedCode,
+  );
+
+  return (
+    <Box className="chat-md-ide">
+      <Box className="chat-md-ide-bar">
+        <Box className="chat-md-ide-controls" aria-hidden="true">
+          <span className="chat-md-ide-dot chat-md-ide-dot-close" />
+          <span className="chat-md-ide-dot chat-md-ide-dot-minimize" />
+          <span className="chat-md-ide-dot chat-md-ide-dot-expand" />
+        </Box>
+        <span className="chat-md-ide-tab" title={resolvedFileName}>
+          {resolvedFileName}
+        </span>
+        <span className="chat-md-ide-meta">{languageLabel}</span>
+        {onOpenInWorkspace ? (
+          <button
+            type="button"
+            className="chat-md-ide-open"
+            onClick={() =>
+              onOpenInWorkspace({
+                snippetId,
+                fileName: resolvedFileName,
+                code: normalizedCode,
+                languageHint,
+              })
+            }
+          >
+            Open in workspace
+          </button>
+        ) : null}
+      </Box>
+      <pre className="code-viewer-pre chat-md-ide-pre">
+        <code>
+          {renderCodeBlockLines(normalizedCode, { fileName: resolvedFileName })}
+        </code>
+      </pre>
+    </Box>
+  );
+}
+
+function canonicalizeLiveFileWrites(
+  current: Record<string, LiveFileWriteState>,
+  appDir = "",
+): Record<string, LiveFileWriteState> {
+  const next: Record<string, LiveFileWriteState> = {};
+  for (const [name, state] of Object.entries(current)) {
+    const normalizedName = normalizeWorkspaceFileName(name, appDir);
+    if (!normalizedName || !isLikelyWorkspaceFileName(normalizedName)) continue;
+    const existing = next[normalizedName];
+    if (!existing) {
+      next[normalizedName] = {
+        ...state,
+        content: choosePreferredWorkspaceFileContent("", state.content),
+      };
+      continue;
+    }
+    next[normalizedName] = {
+      content: choosePreferredWorkspaceFileContent(
+        existing.content,
+        state.content,
+      ),
+      line: Math.max(existing.line, state.line),
+      totalLines: Math.max(existing.totalLines, state.totalLines),
+      done: existing.done || state.done,
+    };
+  }
+  return next;
+}
+
+type ExecutionPlanItem = {
+  id: number;
+  title: string;
+  description: string;
+  status: string;
+  action?: string | null;
+  arguments?: JsonRecord | null;
+  tool_hint: string | null;
+  substeps: ExecutionPlanSubstepItem[];
+};
+
+type ExecutionPlanSubstepItem = {
+  id: number;
+  title: string;
+  description: string;
+  status: string;
+  tool_hint: string | null;
+};
+
+type ExecutionPlanState = {
+  plan_id: string;
+  revision: number;
+  summary: string;
+  steps: ExecutionPlanItem[];
+};
+
+type PlanConfirmationStage =
+  | "planning"
+  | "awaiting_confirmation"
+  | "running"
+  | "completed"
+  | "failed"
+  | "interrupted";
+
+type PlanConfirmationStepDraft = ExecutionPlanItem & {
+  draft_id: string;
+  enabled: boolean;
+};
+
+type PlanConfirmationDraft = {
+  summary: string;
+  steps: PlanConfirmationStepDraft[];
+};
+
+type PlanConfirmationState = {
+  stage: PlanConfirmationStage;
+  taskId: string | null;
+  source: string;
+  originalPlan: ExecutionPlanState | null;
+  draft: PlanConfirmationDraft | null;
+  editing: boolean;
+  messageId: string | null;
+};
+
+function isDeepResearchPlanSource(source: string | null | undefined): boolean {
+  return str(source, "").trim().toLowerCase() === "deep_research";
+}
+
+function planConfirmationSourceValue(
+  source: string | null | undefined,
+): string {
+  return isDeepResearchPlanSource(source) ? "deep_research" : "execution";
+}
+
+function planConfirmationDisplayLabel(
+  source: string | null | undefined,
+): string {
+  return isDeepResearchPlanSource(source)
+    ? "Deep research plan"
+    : "Execution plan";
+}
+
+function planConfirmationOutlineLabel(
+  source: string | null | undefined,
+): string {
+  return isDeepResearchPlanSource(source)
+    ? "Research outline"
+    : "Execution outline";
+}
+
+function planConfirmationPlanningNote(
+  source: string | null | undefined,
+): string {
+  return isDeepResearchPlanSource(source)
+    ? "Building the outline before any research starts."
+    : "Building the outline before any work starts.";
+}
+
+type ToolProgressPresentation = {
+  title: string;
+  detail: string;
+  streamKey?: string;
+};
+
+type TrustApprovalPreset = {
+  id: string;
+  label: string;
+  actionKind: string;
+  detailLabel: string;
+  detailPlaceholder: string;
+  buildPayload: (detail: string) => JsonRecord;
+};
+
+const TRUST_APPROVAL_PRESETS: TrustApprovalPreset[] = [
+  {
+    id: "run_terminal_command",
+    label: "Run a terminal command",
+    actionKind: "shell",
+    detailLabel: "Command",
+    detailPlaceholder: "ls -la",
+    buildPayload: (detail) => ({ command: detail }),
+  },
+  {
+    id: "read_file",
+    label: "Read a file",
+    actionKind: "file_read",
+    detailLabel: "File path",
+    detailPlaceholder: "/app/data/report.txt",
+    buildPayload: (detail) => ({ path: detail }),
+  },
+  {
+    id: "write_file",
+    label: "Create or edit a file",
+    actionKind: "file_write",
+    detailLabel: "File path",
+    detailPlaceholder: "/app/data/notes.txt",
+    buildPayload: (detail) => ({ path: detail, operation: "write" }),
+  },
+  {
+    id: "open_url",
+    label: "Open a URL or call an API",
+    actionKind: "http_get",
+    detailLabel: "URL",
+    detailPlaceholder: "https://api.example.com/status",
+    buildPayload: (detail) => ({ url: detail }),
+  },
+  {
+    id: "run_code",
+    label: "Run generated code",
+    actionKind: "code_execute",
+    detailLabel: "What should the code do?",
+    detailPlaceholder: "Summarize CSV rows and return totals",
+    buildPayload: (detail) => ({ instruction: detail }),
+  },
+  {
+    id: "email_action",
+    label: "Read or send an email",
+    actionKind: "gmail_reply",
+    detailLabel: "Email task",
+    detailPlaceholder: "Reply with a short status update",
+    buildPayload: (detail) => ({ message: detail }),
+  },
+];
+
+function normalizeExecutionPlanSubsteps(
+  rawSubsteps: unknown[],
+): ExecutionPlanSubstepItem[] {
+  return rawSubsteps.map((value, index) => {
+    const record =
+      value && typeof value === "object"
+        ? (value as Record<string, unknown>)
+        : {};
+    const id = typeof record.id === "number" ? record.id : index + 1;
+    return {
+      id,
+      title: typeof record.title === "string" ? record.title : `Substep ${id}`,
+      description:
+        typeof record.description === "string" ? record.description : "",
+      status: typeof record.status === "string" ? record.status : "pending",
+      tool_hint: typeof record.tool_hint === "string" ? record.tool_hint : null,
+    };
+  });
+}
+
+function deriveExecutionPlanStepStatus(
+  rawStatus: unknown,
+  substeps: ExecutionPlanSubstepItem[],
+): string {
+  const normalized =
+    str(rawStatus, "pending").trim().toLowerCase() || "pending";
+  if (["completed", "failed", "skipped"].includes(normalized)) {
+    return normalized;
+  }
+  if (substeps.length === 0) {
+    return normalized;
+  }
+
+  const substepStatuses = substeps.map(
+    (substep) =>
+      str(substep.status, "pending").trim().toLowerCase() || "pending",
+  );
+  if (substepStatuses.some((status) => status === "running")) {
+    return "running";
+  }
+  if (
+    substepStatuses.every(
+      (status) => status === "completed" || status === "skipped",
+    )
+  ) {
+    return "completed";
+  }
+  if (
+    substepStatuses.some((status) => status === "failed") &&
+    !substepStatuses.some((status) => status === "pending")
+  ) {
+    return "failed";
+  }
+  if (
+    substepStatuses.some((status) =>
+      ["completed", "failed", "skipped"].includes(status),
+    )
+  ) {
+    return "running";
+  }
+  return normalized;
+}
+
+function normalizeExecutionPlanSteps(rawSteps: unknown[]): ExecutionPlanItem[] {
+  const steps = rawSteps.map((value, index) => {
+    const record =
+      value && typeof value === "object"
+        ? (value as Record<string, unknown>)
+        : {};
+    const id = typeof record.id === "number" ? record.id : index + 1;
+    const rawSubsteps = Array.isArray(record.substeps) ? record.substeps : [];
+    const substeps = normalizeExecutionPlanSubsteps(rawSubsteps);
+    return {
+      id,
+      title: typeof record.title === "string" ? record.title : `Step ${id}`,
+      description:
+        typeof record.description === "string" ? record.description : "",
+      status: deriveExecutionPlanStepStatus(record.status, substeps),
+      action: typeof record.action === "string" ? record.action : null,
+      arguments:
+        record.arguments &&
+        typeof record.arguments === "object" &&
+        !Array.isArray(record.arguments)
+          ? (record.arguments as JsonRecord)
+          : null,
+      tool_hint: typeof record.tool_hint === "string" ? record.tool_hint : null,
+      substeps,
+    };
+  });
+
+  return steps;
+}
+function normalizeExecutionPlanState(
+  rawPlan: unknown,
+): ExecutionPlanState | null {
+  const record =
+    rawPlan && typeof rawPlan === "object" ? (rawPlan as JsonRecord) : {};
+  const rawSteps = Array.isArray(record.steps) ? record.steps : [];
+  if (rawSteps.length === 0) return null;
+  return {
+    plan_id: str(record.plan_id, ""),
+    revision: num(record.revision, 0),
+    summary: str(record.summary, ""),
+    steps: normalizeExecutionPlanSteps(rawSteps),
+  };
+}
+
+function createPlanConfirmationDraft(
+  plan: ExecutionPlanState | null,
+): PlanConfirmationDraft | null {
+  if (!plan) return null;
+  return {
+    summary: plan.summary,
+    steps: plan.steps.map((step, index) => ({
+      ...step,
+      draft_id: `${plan.plan_id || "plan"}:${index}:${step.id}`,
+      enabled: true,
+    })),
+  };
+}
+
+function buildExecutionPlanFromDraft(
+  draft: PlanConfirmationDraft | null,
+  basePlan: ExecutionPlanState | null,
+): ExecutionPlanState | null {
+  if (!draft) return null;
+  const enabledSteps = draft.steps.filter((step) => step.enabled);
+  if (enabledSteps.length === 0) return null;
+  return {
+    plan_id: basePlan?.plan_id || "",
+    revision: basePlan?.revision || 1,
+    summary: draft.summary.trim() || basePlan?.summary || "",
+    steps: enabledSteps.map((step, index) => ({
+      id: index + 1,
+      title: step.title,
+      description: step.description,
+      status: "pending",
+      action: step.action ?? null,
+      arguments: step.arguments ?? null,
+      tool_hint: step.tool_hint ?? null,
+      substeps: step.substeps ?? [],
+    })),
+  };
+}
+
+function describeExecutionPlanStep(
+  step: Pick<ExecutionPlanItem, "title" | "description">,
+  fallbackTitle: string,
+): { title: string; description: string } {
+  const rawTitle = str(step.title, "").trim() || fallbackTitle;
+  const description = str(step.description, "").trim();
+  return {
+    title: rawTitle,
+    description: description && description !== rawTitle ? description : "",
+  };
+}
+
+function describeExecutionPlanSubstep(
+  substep: Pick<
+    ExecutionPlanSubstepItem,
+    "title" | "description" | "tool_hint"
+  >,
+  fallbackTitle: string,
+): { title: string; description: string } {
+  const rawTitle = str(substep.title, "").trim() || fallbackTitle;
+  const description = str(substep.description, "").trim();
+  const normalizedTitle = rawTitle.toLowerCase().replace(/[_-]+/g, " ").trim();
+  const normalizedToolHint = str(substep.tool_hint, "")
+    .trim()
+    .toLowerCase()
+    .replace(/[_-]+/g, " ");
+  const title =
+    description && normalizedToolHint && normalizedTitle === normalizedToolHint
+      ? description
+      : rawTitle;
+  return {
+    title,
+    description: description && description !== title ? description : "",
+  };
+}
+
+function mergeExecutionPlanProgress(
+  basePlan: ExecutionPlanState | null,
+  livePlan: ExecutionPlanState | null,
+): ExecutionPlanState | null {
+  if (!basePlan) return livePlan;
+  if (!livePlan) return basePlan;
+
+  const stepIdentity = (
+    step: Pick<ExecutionPlanItem, "title" | "tool_hint" | "description">,
+  ) => {
+    const title = step.title.trim().toLowerCase();
+    if (title) return title;
+    const description = str(step.description, "").trim().toLowerCase();
+    if (description) return description;
+    return str(step.tool_hint, "").trim().toLowerCase();
+  };
+  const matchedLiveIndexes = new Set<number>();
+  const mergedStepIdentities = new Set<string>();
+  const mergedSteps = basePlan.steps.map((step, index) => {
+    const liveIndex = livePlan.steps.findIndex((candidate, candidateIndex) => {
+      if (matchedLiveIndexes.has(candidateIndex)) return false;
+      if (candidate.id === step.id) return true;
+      if (
+        step.tool_hint &&
+        candidate.tool_hint &&
+        candidate.tool_hint === step.tool_hint
+      )
+        return true;
+      return (
+        candidate.title.trim().toLowerCase() === step.title.trim().toLowerCase()
+      );
+    });
+    const liveStep =
+      liveIndex >= 0
+        ? livePlan.steps[liveIndex]
+        : livePlan.steps[index] || null;
+    if (liveIndex >= 0) matchedLiveIndexes.add(liveIndex);
+    if (!liveStep) return step;
+    if (liveIndex < 0 && livePlan.steps[index]) matchedLiveIndexes.add(index);
+    const mergedStep = {
+      ...step,
+      status: liveStep.status || step.status,
+      substeps:
+        liveStep.substeps.length > 0 ? liveStep.substeps : step.substeps,
+    };
+    mergedStepIdentities.add(stepIdentity(mergedStep));
+    return mergedStep;
+  });
+  mergedSteps.forEach((step) => {
+    mergedStepIdentities.add(stepIdentity(step));
+  });
+
+  const appendedLiveSteps = livePlan.steps
+    .filter((_step, index) => !matchedLiveIndexes.has(index))
+    .filter((step) => {
+      const identity = stepIdentity(step);
+      if (mergedStepIdentities.has(identity)) return false;
+      mergedStepIdentities.add(identity);
+      return true;
+    })
+    .map((step, index) => ({
+      ...step,
+      id: mergedSteps.length + index + 1,
+    }));
+
+  return {
+    ...basePlan,
+    revision: livePlan.revision || basePlan.revision,
+    steps: [...mergedSteps, ...appendedLiveSteps],
+  };
+}
+
+function executionPlanHasStarted(plan: ExecutionPlanState | null): boolean {
+  if (!plan) return false;
+  return plan.steps.some((step) => {
+    const stepStatus = str(step.status, "pending").trim().toLowerCase();
+    if (["running", "completed", "failed", "skipped"].includes(stepStatus)) {
+      return true;
+    }
+    return step.substeps.some((substep) => {
+      const substepStatus = str(substep.status, "pending").trim().toLowerCase();
+      return ["running", "completed", "failed", "skipped"].includes(
+        substepStatus,
+      );
+    });
+  });
+}
+
+function activityStepIndicatesPlanExecution(step: JsonRecord): boolean {
+  const stepType = str(step.step_type, "").trim().toLowerCase();
+  if (stepType === "plan_step_update") {
+    const status = str(step.status, "").trim().toLowerCase();
+    return ["running", "completed", "failed", "skipped"].includes(status);
+  }
+  return (
+    stepType === "tool_start" ||
+    stepType === "tool_progress" ||
+    stepType === "tool_result"
+  );
+}
+
+function activityStepIsHeartbeatLike(step: JsonRecord): boolean {
+  const stepType = str(step.step_type, str(step.type, ""))
+    .trim()
+    .toLowerCase();
+  const icon = str(step.icon, "").trim().toLowerCase();
+  const data = asRecord(step.data);
+  return (
+    stepType === "heartbeat" ||
+    icon === "wait" ||
+    toBool(step.is_heartbeat) ||
+    str(data.kind, "").trim().toLowerCase() === "heartbeat"
+  );
+}
+
+function shouldKeepPlanInApprovalState(
+  plan: ExecutionPlanState | null,
+  steps: JsonRecord[],
+  pendingMode: ChatPendingRunMode,
+): boolean {
+  if (!plan || pendingMode === "resume") return false;
+  if (executionPlanHasStarted(plan)) return false;
+  const trimmedSteps = [...steps];
+  while (trimmedSteps.length > 0) {
+    const candidate = trimmedSteps[trimmedSteps.length - 1];
+    if (!activityStepIsHeartbeatLike(candidate)) break;
+    trimmedSteps.pop();
+  }
+  let latestPlanReadyIndex = -1;
+  for (let index = trimmedSteps.length - 1; index >= 0; index -= 1) {
+    if (
+      str(trimmedSteps[index]?.step_type, "").trim().toLowerCase() ===
+      "plan_ready_for_confirmation"
+    ) {
+      latestPlanReadyIndex = index;
+      break;
+    }
+  }
+  if (latestPlanReadyIndex >= 0) {
+    for (
+      let index = latestPlanReadyIndex + 1;
+      index < trimmedSteps.length;
+      index += 1
+    ) {
+      if (activityStepIndicatesPlanExecution(trimmedSteps[index])) {
+        return false;
+      }
+    }
+    return true;
+  }
+  return activityStepsHaveExecutionPlanContext(trimmedSteps);
+}
+
+function extractExecutionPlanFromTraceSteps(
+  steps: JsonRecord[],
+): ExecutionPlanState | null {
+  for (const step of [...steps].reverse()) {
+    const title =
+      typeof step.title === "string" ? step.title.trim().toLowerCase() : "";
+    const stepType =
+      typeof step.step_type === "string"
+        ? step.step_type.trim().toLowerCase()
+        : "";
+    if (stepType !== "plan" && title !== "execution plan") continue;
+
+    const rawData = step.data;
+    if (rawData && typeof rawData === "object") {
+      const parsed = normalizeExecutionPlanState(rawData);
+      if (parsed) return parsed;
+    }
+
+    if (typeof rawData === "string" && rawData.trim()) {
+      try {
+        const parsed = JSON.parse(rawData) as unknown;
+        const normalized = normalizeExecutionPlanState(parsed);
+        if (normalized) return normalized;
+      } catch {
+        // Ignore malformed trace payloads and continue scanning.
+      }
+    }
+  }
+
+  return null;
+}
+
+function activityStepsRepresentAwaitingPlanConfirmation(
+  steps: JsonRecord[],
+): boolean {
+  const trimmedSteps = [...steps];
+  while (trimmedSteps.length > 0) {
+    const candidate = trimmedSteps[trimmedSteps.length - 1];
+    if (!activityStepIsHeartbeatLike(candidate)) break;
+    trimmedSteps.pop();
+  }
+  return shouldKeepPlanInApprovalState(
+    extractExecutionPlanFromTraceSteps(trimmedSteps),
+    trimmedSteps,
+    "fresh",
+  );
+}
+
+function extractPlanConfirmationSourceFromSteps(steps: JsonRecord[]): string {
+  for (const step of [...steps].reverse()) {
+    const stepType = str(step.step_type, str(step.type, ""))
+      .trim()
+      .toLowerCase();
+    if (stepType !== "plan_ready_for_confirmation") continue;
+    const source = str(step.source, "").trim();
+    if (source) return planConfirmationSourceValue(source);
+  }
+  return "";
+}
+
+function activityStepsHaveExecutionPlanContext(steps: JsonRecord[]): boolean {
+  return steps.some((step) => {
+    const title = str(step.title, "").trim().toLowerCase();
+    const stepType = str(step.step_type, "").trim().toLowerCase();
+    return (
+      stepType === "plan_generated" ||
+      stepType === "plan_revised" ||
+      stepType === "plan_ready_for_confirmation" ||
+      stepType === "plan_step_update" ||
+      stepType === "plan_unavailable" ||
+      title === "execution plan" ||
+      title === "execution plan revised" ||
+      title === "execution plan unavailable"
+    );
+  });
+}
+
+function extractExecutionPlanFailureFromTraceSteps(
+  steps: JsonRecord[],
+): string {
+  for (const step of [...steps].reverse()) {
+    const title = str(step.title, "").trim().toLowerCase();
+    const stepType = str(step.step_type, "").trim().toLowerCase();
+    if (
+      stepType === "plan_unavailable" ||
+      title === "execution plan unavailable"
+    ) {
+      return str(step.detail, "");
+    }
+  }
+  if (!activityStepsHaveExecutionPlanContext(steps)) return "";
+  return "";
+}
+
+function extractLatestRunStatusSummary(
+  steps: JsonRecord[],
+): { status: string; detail: string } | null {
+  for (const step of [...steps].reverse()) {
+    const stepType = str(step.step_type, "").trim().toLowerCase();
+    const title = str(step.title, "").trim();
+    const payload = asRecord(step.data);
+    const nested = asRecord(payload.payload);
+    const userOutcome = asRecord(payload.user_outcome ?? nested.user_outcome);
+    const runStatus = str(
+      payload.run_status,
+      str(payload.status, str(nested.status, str(payload.stage, ""))),
+    )
+      .trim()
+      .toLowerCase();
+    const requestState = str(
+      userOutcome.request_state,
+      str(nested.request_state, ""),
+    )
+      .trim()
+      .toLowerCase();
+    const outcomeStatus = str(
+      userOutcome.status,
+      str(nested.user_outcome_status, ""),
+    )
+      .trim()
+      .toLowerCase();
+    const normalizedStatus =
+      outcomeStatus === "service_unavailable" ||
+      requestState === "hard_service_outage"
+        ? "service_unavailable"
+        : requestState || runStatus || outcomeStatus;
+    if (!normalizedStatus) {
+      if (
+        stepType !== "run_status" &&
+        !title.toLowerCase().startsWith("run status:")
+      ) {
+        continue;
+      }
+    }
+    const fallbackTitleStatus = title
+      .split(":")
+      .slice(1)
+      .join(":")
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, "_");
+    return {
+      status: normalizedStatus || fallbackTitleStatus || "updated",
+      detail: str(step.detail, "").trim(),
+    };
+  }
+  return null;
+}
+
+function isTerminalDeepResearchFailureStatus(status: string): boolean {
+  const normalized = (status || "").trim().toLowerCase();
+  if (!normalized) return false;
+  return [
+    "failed",
+    "platform_failed",
+    "service_unavailable",
+    "degraded",
+    "hard_service_outage",
+  ].includes(normalized);
+}
+
+function isSearchBackendSetupIssue(text: string): boolean {
+  const normalized = (text || "").replace(/\s+/g, " ").trim().toLowerCase();
+  if (!normalized) return false;
+  const searchContext =
+    /\b(search|research|sources?|backend|provider)\b/.test(normalized) ||
+    normalized.includes("no usable sources");
+  if (!searchContext) return false;
+  return (
+    normalized.includes("no search backend") ||
+    (normalized.includes("search backend") &&
+      normalized.includes("not configured")) ||
+    normalized.includes("no usable sources") ||
+    normalized.includes("all search angles failed") ||
+    normalized.includes("available search backends") ||
+    normalized.includes("configure serper") ||
+    normalized.includes("brave search api") ||
+    normalized.includes("searxng")
+  );
+}
+
+export type WorkspaceView =
+  | "chat"
+  | "connections"
+  | "channels"
+  | "routing"
+  | "webhooks"
+  | "devices"
+  | "browser"
+  | "gatewayops"
+  | "failover"
+  | "tasks"
+  | "sessions"
+  | "skills"
+  | "apps"
+  | "goals"
+  | "autonomy"
+  | "evolution"
+  | "arkmemory"
+  | "sentinel"
+  | "documents"
+  | "projects"
+  | "swarm"
+  | "trace"
+  | "status"
+  | "analytics"
+  | "arkpulse"
+  | "search"
+  | "settings";
+
+const SEARCH_API_PROVIDER_OPTIONS = [
+  {
+    id: "serper",
+    label: "Serper",
+    keyField: "search_serper_key",
+    configuredField: "search_serper_configured",
+    editingField: "search_serper_editing",
+    clearField: "search_serper_clear",
+  },
+  {
+    id: "brave_api",
+    label: "Brave API",
+    keyField: "search_brave_key",
+    configuredField: "search_brave_configured",
+    editingField: "search_brave_editing",
+    clearField: "search_brave_clear",
+  },
+  {
+    id: "exa",
+    label: "Exa",
+    keyField: "search_exa_key",
+    configuredField: "search_exa_configured",
+    editingField: "search_exa_editing",
+    clearField: "search_exa_clear",
+  },
+  {
+    id: "tavily",
+    label: "Tavily",
+    keyField: "search_tavily_key",
+    configuredField: "search_tavily_configured",
+    editingField: "search_tavily_editing",
+    clearField: "search_tavily_clear",
+  },
+  {
+    id: "perplexity",
+    label: "Perplexity",
+    keyField: "search_perplexity_key",
+    configuredField: "search_perplexity_configured",
+    editingField: "search_perplexity_editing",
+    clearField: "search_perplexity_clear",
+  },
+  {
+    id: "firecrawl",
+    label: "Firecrawl",
+    keyField: "search_firecrawl_key",
+    configuredField: "search_firecrawl_configured",
+    editingField: "search_firecrawl_editing",
+    clearField: "search_firecrawl_clear",
+  },
+] as const;
+
+const SEARCH_PROVIDER_OPTIONS = [
+  ...SEARCH_API_PROVIDER_OPTIONS,
+  { id: "searxng", label: "SearXNG" },
+] as const;
+
+function isRecord(value: unknown): value is JsonRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function asRecord(value: unknown): JsonRecord {
+  return isRecord(value) ? value : {};
+}
+
+function asRecords(value: unknown): JsonRecord[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter(isRecord);
+}
+
+function clarificationChoices(value: unknown): ChatClarificationChoice[] {
+  return asRecords(value)
+    .map((choice) => {
+      const label = str(choice.label, "").trim();
+      const submitText = str(
+        choice.submit_text,
+        str(choice.submitText, ""),
+      ).trim();
+      if (!label || !submitText) return null;
+      return { label, submitText };
+    })
+    .filter((choice): choice is ChatClarificationChoice => choice !== null);
+}
+
+function pickRecords(value: unknown, ...keys: string[]): JsonRecord[] {
+  if (Array.isArray(value)) return asRecords(value);
+  const obj = asRecord(value);
+  for (const key of keys) {
+    if (Array.isArray(obj[key])) return asRecords(obj[key]);
+  }
+  return [];
+}
+
+function str(value: unknown, fallback = "-"): string {
+  if (typeof value === "string" && value.trim()) return value;
+  if (typeof value === "number" || typeof value === "boolean")
+    return String(value);
+  return fallback;
+}
+
+function num(value: unknown, fallback = 0): number {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return fallback;
+}
+
+function normalizeProjectId(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function withProjectScope(path: string, projectId: string): string {
+  const normalizedProjectId = normalizeProjectId(projectId);
+  if (!normalizedProjectId) return path;
+  const [pathname, rawSearch = ""] = path.split("?");
+  const params = new URLSearchParams(rawSearch);
+  params.set("project_id", normalizedProjectId);
+  const search = params.toString();
+  return search ? `${pathname}?${search}` : pathname;
+}
+
+function buildProjectNameById(projects: JsonRecord[]): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const project of projects) {
+    const id = normalizeProjectId(project.id);
+    if (!id) continue;
+    map.set(id, str(project.name, id));
+  }
+  return map;
+}
+
+function projectScopeLabel(
+  projectId: string,
+  projectNameById: Map<string, string>,
+): string {
+  const normalizedProjectId = normalizeProjectId(projectId);
+  if (!normalizedProjectId) return "Global workspace";
+  return projectNameById.get(normalizedProjectId) || normalizedProjectId;
+}
+
+function boolText(value: unknown): string {
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "string") return value;
+  if (typeof value === "number") return value === 0 ? "false" : "true";
+  return "false";
+}
+
+function toBool(value: unknown): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    return normalized === "true" || normalized === "1" || normalized === "yes";
+  }
+  return false;
+}
+
+function workspaceAppRootName(appDir = ""): string {
+  const normalized = appDir.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+  if (!normalized) return "";
+  const parts = normalized.split("/").filter(Boolean);
+  return parts[parts.length - 1] || "";
+}
+
+const WORKSPACE_EXTENSIONLESS_FILE_NAMES = new Set([
+  "cname",
+  "dockerfile",
+  "gemfile",
+  "license",
+  "makefile",
+  "procfile",
+  "rakefile",
+  "readme",
+]);
+
+const WORKSPACE_METADATA_FIELD_NAMES = new Set([
+  "app_id",
+  "cid",
+  "conversation_id",
+  "description",
+  "entry_command",
+  "project_id",
+  "runtime_mode",
+  "session_id",
+  "slug",
+  "start_command",
+  "title",
+  "trace_id",
+]);
+
+function isLikelyWorkspaceFileName(pathOrName: string): boolean {
+  const normalized = (pathOrName || "")
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\/+/, "")
+    .replace(/\/+$/, "");
+  if (!normalized) return false;
+  const parts = normalized.split("/").filter(Boolean);
+  if (parts.length === 0) return false;
+  const base = parts[parts.length - 1].trim();
+  const lowerBase = base.toLowerCase();
+  if (!base || base === "." || base === "..") return false;
+  if (WORKSPACE_METADATA_FIELD_NAMES.has(lowerBase)) return false;
+  if (/[<>:"|?*]/.test(base)) return false;
+  if (parts.length > 1) return true;
+  if (base.startsWith(".")) return true;
+  if (base.includes(".")) return true;
+  return WORKSPACE_EXTENSIONLESS_FILE_NAMES.has(lowerBase);
+}
+
+function isLikelyWorkspaceFileContent(value: string): boolean {
+  const trimmed = (value || "").trim();
+  if (!trimmed) return false;
+  if (
+    /^(written|saved|created|updated|deleted|moved|renamed)\b/i.test(trimmed) &&
+    trimmed.split(/\r?\n/).length <= 3
+  ) {
+    return false;
+  }
+  if (
+    /^(file|app)\s+(saved|written|created|updated)\b/i.test(trimmed) &&
+    trimmed.length < 240
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function choosePreferredWorkspaceFileContent(
+  current = "",
+  incoming = "",
+): string {
+  const currentContent = isLikelyWorkspaceFileContent(current) ? current : "";
+  const incomingContent = isLikelyWorkspaceFileContent(incoming)
+    ? incoming
+    : "";
+  if (!currentContent) return incomingContent;
+  if (!incomingContent) return currentContent;
+  return incomingContent.length >= currentContent.length
+    ? incomingContent
+    : currentContent;
+}
+
+function normalizeWorkspaceFileName(pathOrName: unknown, appDir = ""): string {
+  const raw = str(pathOrName, "").trim();
+  if (!raw) return "";
+  let normalized = raw.replace(/\\/g, "/");
+  const normalizedAppDir = appDir
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/\/+$/, "");
+  if (
+    normalizedAppDir &&
+    normalized.toLowerCase().startsWith(`${normalizedAppDir.toLowerCase()}/`)
+  ) {
+    normalized = normalized.slice(normalizedAppDir.length + 1);
+  }
+  normalized = normalized.replace(/^.*\/apps\/[^/]+\//i, "");
+  const appRootName = workspaceAppRootName(normalizedAppDir);
+  if (
+    appRootName &&
+    normalized.toLowerCase().startsWith(`${appRootName.toLowerCase()}/`)
+  ) {
+    normalized = normalized.slice(appRootName.length + 1);
+  }
+  normalized = normalized.replace(/^\/+/, "");
+  return normalized || raw;
+}
+
+function mergeWorkspaceFiles(
+  current: WorkspaceFileEntry[],
+  incoming: WorkspaceFileEntry[],
+  appDir = "",
+): WorkspaceFileEntry[] {
+  const merged = new Map<string, WorkspaceFileEntry>();
+  for (const file of [...current, ...incoming]) {
+    const name = normalizeWorkspaceFileName(file.name, appDir);
+    if (!name || !isLikelyWorkspaceFileName(name)) continue;
+    const existing = merged.get(name);
+    if (!existing) {
+      merged.set(name, {
+        name,
+        content: choosePreferredWorkspaceFileContent("", file.content),
+      });
+      continue;
+    }
+    merged.set(name, {
+      name,
+      content: choosePreferredWorkspaceFileContent(
+        existing.content,
+        file.content,
+      ),
+    });
+  }
+  return Array.from(merged.values());
+}
+
+function extractWorkspaceAppFromStreamPayload(
+  name: string,
+  payload: unknown,
+): JsonRecord | null {
+  const obj = asRecord(payload);
+  const source = name === "app_inspect" ? asRecord(obj.matched_app) : obj;
+  const appId = str(source.app_id, str(source.id, "")).trim();
+  const appDir = str(source.app_dir, "").trim();
+  const url = str(source.local_url, str(source.url, "")).trim();
+  const accessUrl = str(
+    source.local_access_url,
+    str(source.access_url, ""),
+  ).trim();
+  if (!appId && !appDir && !accessUrl) return null;
+  return {
+    id: appId,
+    app_id: appId,
+    title: str(source.title, "App"),
+    url: str(source.url, url),
+    access_url: str(source.access_url, accessUrl),
+    local_url: url,
+    local_access_url: accessUrl,
+    app_dir: appDir,
+    enabled: source.enabled ?? true,
+    running: source.running ?? true,
+    is_static: source.is_static ?? true,
+    expose_public: source.expose_public ?? false,
+    runtime_mode: str(
+      source.runtime_mode,
+      toBool(source.is_static) ? "static" : "unknown",
+    ),
+  };
+}
+
+function extractWorkspaceFilesFromStreamPayload(
+  name: string,
+  payload: unknown,
+): WorkspaceFileEntry[] {
+  const obj = asRecord(payload);
+  const source = name === "app_inspect" ? asRecord(obj.matched_app) : obj;
+  const appDir = str(source.app_dir, str(obj.app_dir, "")).trim();
+  const filesValue = source.files ?? obj.files;
+  if (Array.isArray(filesValue)) {
+    return filesValue
+      .map((row) => {
+        const entry = asRecord(row);
+        return {
+          name: normalizeWorkspaceFileName(entry.path, appDir),
+          content: "",
+        };
+      })
+      .filter((file) => !!file.name);
+  }
+
+  const filesMap = asRecord(filesValue);
+  const mappedFiles = Object.entries(filesMap)
+    .filter(([, value]) => typeof value === "string")
+    .map(([path, value]) => ({
+      name: normalizeWorkspaceFileName(path, appDir),
+      content: value as string,
+    }))
+    .filter((file) => !!file.name);
+  if (mappedFiles.length > 0) {
+    return mappedFiles;
+  }
+
+  const singleFilePath = source.path ?? source.file ?? obj.path ?? obj.file;
+  const singleFileName = normalizeWorkspaceFileName(singleFilePath, appDir);
+  if (singleFileName) {
+    const structuredContent = str(
+      source.content_snapshot,
+      str(
+        source.file_content,
+        str(
+          source.raw_content,
+          str(
+            obj.content_snapshot,
+            str(obj.file_content, str(obj.raw_content, "")),
+          ),
+        ),
+      ),
+    );
+    const fallbackContent = str(
+      source.content_delta,
+      str(source.content, str(obj.content_delta, str(obj.content, ""))),
+    );
+    return [
+      {
+        name: singleFileName,
+        content: choosePreferredWorkspaceFileContent(
+          structuredContent,
+          fallbackContent,
+        ),
+      },
+    ];
+  }
+
+  const fileNames = Array.isArray(source.file_names)
+    ? source.file_names
+    : Array.isArray(obj.file_names)
+      ? obj.file_names
+      : [];
+  return fileNames
+    .map((value) => ({
+      name: normalizeWorkspaceFileName(value, appDir),
+      content: "",
+    }))
+    .filter((file) => !!file.name);
+}
+
+function tunnelCheckAlertSeverity(
+  status: unknown,
+): "success" | "info" | "warning" | "error" {
+  const normalized = str(status, "info").trim().toLowerCase();
+  if (normalized === "pass" || normalized === "healthy" || normalized === "ok")
+    return "success";
+  if (normalized === "fail" || normalized === "error" || normalized === "down")
+    return "error";
+  if (
+    normalized === "warn" ||
+    normalized === "warning" ||
+    normalized === "degraded"
+  )
+    return "warning";
+  return "info";
+}
+
+function tunnelCheckChipColor(
+  status: unknown,
+): "success" | "info" | "warning" | "error" | "default" {
+  const normalized = str(status, "info").trim().toLowerCase();
+  if (normalized === "pass" || normalized === "healthy" || normalized === "ok")
+    return "success";
+  if (normalized === "fail" || normalized === "error" || normalized === "down")
+    return "error";
+  if (
+    normalized === "warn" ||
+    normalized === "warning" ||
+    normalized === "degraded"
+  )
+    return "warning";
+  if (normalized === "info") return "info";
+  return "default";
+}
+
+function tunnelCheckLabel(status: unknown): string {
+  const normalized = str(status, "info").trim().toLowerCase();
+  if (normalized === "pass") return "Ready";
+  if (normalized === "fail") return "Needs action";
+  if (normalized === "warn") return "Check";
+  if (!normalized) return "Info";
+  return normalized.charAt(0).toUpperCase() + normalized.slice(1);
+}
+
+type ActivityPayloadView = {
+  kind: "json" | "text";
+  badgeLabel: string;
+  headerLabel: string;
+  preview: string;
+  body: string;
+  lineCount: number;
+};
+
+type ActivityTimelineCard = {
+  id: string;
+  index: number;
+  stepType: string;
+  rawTitle: string;
+  tone: string;
+  kind: string;
+  label: string;
+  detail: string;
+  detailFull: string;
+  summary: string;
+  rawDetailFull: string;
+  payloadView: ActivityPayloadView | null;
+  isHeartbeat: boolean;
+  time: string;
+};
+
+const ACTIVITY_PAYLOAD_PREVIEW_PRIORITY = [
+  "kind",
+  "status",
+  "tool_name",
+  "name",
+  "agent_name",
+  "agent_role",
+  "task",
+  "title",
+  "file",
+  "path",
+  "url",
+  "summary",
+  "error",
+];
+
+const ACTIVITY_PAYLOAD_INTERNAL_KEYS = new Set([
+  "__streamKey",
+  "conversation_id",
+  "conversationId",
+  "cid",
+  "run_id",
+  "runId",
+  "task_id",
+  "taskId",
+  "trace_id",
+  "traceId",
+  "time",
+  "timestamp",
+  "ts",
+  "plan_id",
+  "plan_revision",
+  "plan_step_id",
+  "plan_step_title",
+]);
+
+const ACTIVITY_PAYLOAD_FORCE_SHOW_KEYS = new Set([
+  "kind",
+  "payload",
+  "result",
+  "degradation",
+  "response",
+  "steps",
+  "files",
+  "content",
+  "raw_content",
+  "text",
+  "error",
+]);
+
+function formatActivityToolName(name: string): string {
+  const normalized = (name || "").trim().toLowerCase();
+  if (!normalized) return "Tool";
+  const direct: Record<string, string> = {
+    app_deploy: "App deploy",
+    build_check: "Build check",
+    run_tests: "Test run",
+    lint_check: "Lint check",
+    source_read: "Read files",
+    source_write: "Write files",
+    source_edit: "Edit files",
+    source_list: "List files",
+    source_search: "Search files",
+    frontend_build: "Frontend build",
+    schedule_task: "Schedule task",
+    browse: "Open web page",
+    web_search: "Web search",
+    agent_turn_loop: "Agent planning",
+  };
+  if (direct[normalized]) return direct[normalized];
+  return normalized
+    .replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, (ch) => ch.toUpperCase());
+}
+
+function tryParseActivityJson(raw: string): unknown | null {
+  const trimmed = (raw || "").trim();
+  if (!trimmed) return null;
+  if (
+    !(
+      (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+      (trimmed.startsWith("[") && trimmed.endsWith("]"))
+    )
+  ) {
+    return null;
+  }
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+}
+
+function formatActivityPayloadValue(value: unknown): string {
+  if (value == null) return "null";
+  if (typeof value === "string") {
+    const trimmed = value.trim().replace(/\s+/g, " ");
+    if (!trimmed) return '""';
+    return trimmed.length > 44
+      ? `${trimmed.slice(0, 41).trimEnd()}...`
+      : trimmed;
+  }
+  if (typeof value === "number" || typeof value === "boolean")
+    return String(value);
+  return "";
+}
+
+function summarizeActivityPayloadPreview(value: unknown): string {
+  if (Array.isArray(value)) {
+    if (value.length === 0) return "Empty list";
+    const first = value[0];
+    const firstRecord = asRecord(first);
+    if (Object.keys(firstRecord).length > 0) {
+      const preview = summarizeActivityPayloadPreview(firstRecord);
+      return `${value.length} item${value.length === 1 ? "" : "s"}${preview ? ` - ${preview}` : ""}`;
+    }
+    const firstValue = formatActivityPayloadValue(first);
+    return `${value.length} item${value.length === 1 ? "" : "s"}${firstValue ? ` - ${firstValue}` : ""}`;
+  }
+  const record = asRecord(value);
+  const keys = Object.keys(record);
+  if (keys.length === 0) return formatActivityPayloadValue(value);
+  const ordered = [
+    ...ACTIVITY_PAYLOAD_PREVIEW_PRIORITY.filter((key) => key in record),
+    ...keys.filter((key) => !ACTIVITY_PAYLOAD_PREVIEW_PRIORITY.includes(key)),
+  ];
+  const parts: string[] = [];
+  for (const key of ordered) {
+    if (parts.length >= 3) break;
+    if (ACTIVITY_PAYLOAD_INTERNAL_KEYS.has(key)) continue;
+    const formatted = formatActivityPayloadValue(record[key]);
+    if (!formatted) continue;
+    parts.push(`${key}: ${formatted}`);
+  }
+  const remaining =
+    keys.filter((key) => !ACTIVITY_PAYLOAD_INTERNAL_KEYS.has(key)).length -
+    parts.length;
+  if (remaining > 0) {
+    parts.push(`+${remaining} more`);
+  }
+  return parts.join(" | ");
+}
+
+function shouldTreatAsRawActivityText(text: string): boolean {
+  const trimmed = (text || "").trim();
+  if (!trimmed) return false;
+  if (tryParseActivityJson(trimmed) != null) return true;
+  if (looksLikeHtmlPayload(trimmed) || looksLikeSourcePayload(trimmed))
+    return true;
+  if (trimmed.length >= 220) return true;
+  return (
+    trimmed.length >= 140 &&
+    (/[\r\n]/.test(trimmed) || /[{}[\]<>;]/.test(trimmed))
+  );
+}
+
+function buildActivityPayloadView(value: unknown): ActivityPayloadView | null {
+  if (value == null) return null;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const parsed = tryParseActivityJson(trimmed);
+    if (parsed != null) {
+      return buildActivityPayloadView(parsed);
+    }
+    if (!shouldTreatAsRawActivityText(trimmed)) return null;
+    return {
+      kind: "text",
+      badgeLabel: "Output",
+      headerLabel: "Detailed output",
+      preview: summarizeActivityPayloadPreview(trimmed),
+      body: trimmed,
+      lineCount: trimmed.split(/\r?\n/).length,
+    };
+  }
+
+  const asArray = Array.isArray(value) ? value : null;
+  const asObject = asRecord(value);
+  const hasObjectContent = Object.keys(asObject).length > 0;
+  if (!asArray && !hasObjectContent) return null;
+
+  const body = JSON.stringify(value, null, 2);
+  if (!body) return null;
+  const keys = hasObjectContent ? Object.keys(asObject) : [];
+  const visibleKeys = keys.filter(
+    (key) => !ACTIVITY_PAYLOAD_INTERNAL_KEYS.has(key),
+  );
+  const hasNested =
+    (asArray?.length ?? 0) > 0 ||
+    visibleKeys.some((key) => {
+      const entry = asObject[key];
+      return Array.isArray(entry) || (!!entry && typeof entry === "object");
+    });
+  const shouldShow =
+    Boolean(asArray) ||
+    hasNested ||
+    visibleKeys.length > 4 ||
+    body.length > 220 ||
+    keys.some((key) => ACTIVITY_PAYLOAD_FORCE_SHOW_KEYS.has(key));
+  if (!shouldShow) return null;
+
+  return {
+    kind: "json",
+    badgeLabel: "Data",
+    headerLabel: "Structured data",
+    preview: summarizeActivityPayloadPreview(value),
+    body,
+    lineCount: body.split(/\r?\n/).length,
+  };
+}
+
+function buildActivityPayloadViewFromSources(
+  ...values: unknown[]
+): ActivityPayloadView | null {
+  for (const value of values) {
+    const payloadView = buildActivityPayloadView(value);
+    if (payloadView) return payloadView;
+  }
+  return null;
+}
+
+function compactUnknown(value: unknown, maxLen = 2200): string {
+  if (value == null) return "";
+  if (typeof value === "string") return value.trim().slice(0, maxLen);
+  if (typeof value === "number" || typeof value === "boolean")
+    return String(value);
+  try {
+    const serialized = JSON.stringify(value, null, 2);
+    if (!serialized) return "";
+    if (serialized.length <= maxLen) return serialized;
+    return `${serialized.slice(0, maxLen)}...`;
+  } catch {
+    return "";
+  }
+}
+
+function extractStepDetailText(step: JsonRecord, maxLen = 2200): string {
+  const detail = str(step.detail, "").trim();
+  if (detail) return detail.slice(0, maxLen);
+  const dataText = compactUnknown(step.data, maxLen);
+  if (dataText) return dataText;
+  const titleData = compactUnknown(step.title, maxLen);
+  return titleData;
+}
+
+function normalizeHeartbeatDetailText(detail: string): string {
+  let text = (detail || "").trim();
+  text = text.replace(/^still working:\s*/i, "");
+  text = text.replace(/\bno new output yet\b\.?/gi, "");
+  text = text.replace(/\(\s*\d+\s*s\s+idle\s*\)/gi, "");
+  text = text.replace(/\s+\./g, ".");
+  text = text.replace(/([.!?])\s*[.!?]+/g, "$1");
+  text = text.replace(/\s+/g, " ").trim();
+  if (!text) return "Working on the current step.";
+  if (!/[.!?]$/.test(text)) text += ".";
+  return text;
+}
+
+function looksLikeHtmlPayload(text: string): boolean {
+  const trimmed = text.trim();
+  return (
+    /^<!doctype html/i.test(trimmed) ||
+    /^<html\b/i.test(trimmed) ||
+    (/<(html|head|body|title|div|script|main)\b/i.test(trimmed) &&
+      /<\/(html|body|div|script|main)>/i.test(trimmed))
+  );
+}
+
+function looksLikeSourcePayload(text: string): boolean {
+  const sample = text.trim().split(/\r?\n/).slice(0, 10).join("\n");
+  if (!sample) return false;
+  return (
+    /^(from\s+\w+\s+import|import\s+[\w.{},* ]+|def\s+\w+\(|class\s+\w+|async\s+def\s+\w+\()/m.test(
+      sample,
+    ) ||
+    /^(const|let|var|function|export|import)\s/m.test(sample) ||
+    /^\s*#include\s+[<"]/m.test(sample) ||
+    /^package\s+[\w.]+;$/m.test(sample)
+  );
+}
+
+function summarizeJsonActivityPayload(value: unknown): string {
+  if (Array.isArray(value)) {
+    return value.length === 0
+      ? "No items were returned."
+      : `Collected ${value.length} item${value.length === 1 ? "" : "s"}.`;
+  }
+  const obj = asRecord(value);
+  const keys = Object.keys(obj);
+  if (keys.length === 0) return "Received an empty result.";
+
+  const kind = str(obj.kind, "").trim().toLowerCase();
+  const status = str(obj.status, "").trim();
+  const summary = str(obj.summary, "").trim();
+  const error = str(obj.error, "").trim();
+  const toolName = str(obj.tool_name, str(obj.name, "")).trim();
+  if (kind === "tool_dispatch") {
+    const toolLabel = formatActivityToolName(toolName);
+    const preview = summarizeActivityPayloadPreview(obj);
+    return preview
+      ? `Prepared ${toolLabel} input. ${preview}.`
+      : `Prepared ${toolLabel} input.`;
+  }
+  if (kind === "phase_status") {
+    const label = str(obj.label, "Working").trim() || "Working";
+    const detail = str(obj.detail, "").trim();
+    return detail ? `${label}. ${detail}` : `${label}.`;
+  }
+  if (kind === "console_chunk") {
+    const stream = str(obj.stream, "console").trim() || "console";
+    const stage = str(obj.stage, "").trim();
+    return `${stage ? `${stage} ` : ""}${stream} output received.`;
+  }
+  if (kind === "argument_stream") {
+    const stage = str(obj.stage, "").trim();
+    const toolLabel = formatActivityToolName(toolName);
+    const stageLabel = stage.replace(/[_-]+/g, " ").trim();
+    if (stageLabel) return `Preparing ${toolLabel} input (${stageLabel}).`;
+    return `Preparing ${toolLabel} input.`;
+  }
+  if (kind.startsWith("delegation_")) {
+    const agentName = str(obj.agent_name, "Agent").trim() || "Agent";
+    const agentRole = str(obj.agent_role, "").trim();
+    const subject = agentRole ? `${agentName} - ${agentRole}` : agentName;
+    if (summary) return `${subject}. ${summary}`;
+    return `${subject} shared a progress update.`;
+  }
+  if (status && summary) {
+    return `${status.charAt(0).toUpperCase()}${status.slice(1)}. ${summary}`;
+  }
+  if (error) {
+    return summarizeActivityDetail(error) || "Returned error details.";
+  }
+
+  const apps = Array.isArray(obj.apps) ? asRecords(obj.apps) : [];
+  const matchedApp = asRecord(obj.matched_app);
+  if (apps.length > 0 || Object.keys(matchedApp).length > 0) {
+    const matchedTitle = str(matchedApp.title, "").trim();
+    if (matchedTitle) {
+      return `Found ${Math.max(apps.length, 1)} app match${Math.max(apps.length, 1) === 1 ? "" : "es"} and selected ${matchedTitle}.`;
+    }
+    return `Found ${apps.length} app match${apps.length === 1 ? "" : "es"} and loaded the app details.`;
+  }
+
+  const title = str(obj.title, "").trim();
+  const fileBytes = num(obj.file_bytes, -1);
+  if (title && fileBytes >= 0) {
+    return `Loaded ${title} details (${formatBytes(fileBytes)}).`;
+  }
+
+  const preview = summarizeActivityPayloadPreview(obj);
+  if (preview) return `Collected details: ${preview}.`;
+  const visibleKeys = keys.slice(0, 4).join(", ");
+  const remaining = keys.length > 4 ? `, +${keys.length - 4} more` : "";
+  return `Collected details: ${visibleKeys}${remaining}.`;
+}
+
+function summarizeActivityDetail(detail: string): string {
+  const trimmed = (detail || "").trim();
+  if (!trimmed) return "";
+
+  if (
+    /^still working:/i.test(trimmed) ||
+    /\bno new output yet\b/i.test(trimmed)
+  ) {
+    return normalizeHeartbeatDetailText(trimmed);
+  }
+
+  if (
+    (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+    (trimmed.startsWith("[") && trimmed.endsWith("]"))
+  ) {
+    try {
+      return summarizeJsonActivityPayload(JSON.parse(trimmed));
+    } catch {
+      // Fall through to other heuristics.
+    }
+  }
+
+  if (looksLikeHtmlPayload(trimmed)) {
+    const titleMatch = trimmed.match(/<title[^>]*>([^<]+)<\/title>/i);
+    const title = titleMatch?.[1]?.trim();
+    return title
+      ? `Reviewed HTML document: ${title}.`
+      : "Reviewed HTML document.";
+  }
+
+  if (looksLikeSourcePayload(trimmed)) {
+    const lineCount = trimmed.split(/\r?\n/).length;
+    return `Reviewed source contents (${lineCount} line${lineCount === 1 ? "" : "s"}).`;
+  }
+
+  if (trimmed.length > 240 && /[{}[\]<>;]/.test(trimmed)) {
+    return "Received detailed output.";
+  }
+
+  return trimmed;
+}
+
+function providerStreamIssueDetailFromStep(step: JsonRecord): string {
+  const data = asRecord(step.data);
+  if (str(data.kind, "").trim() !== "provider_stream_error") return "";
+  const error = str(data.error, "").trim();
+  const model = str(data.model, "").trim();
+  const fallback = str(data.fallback, "").trim();
+  const prefix = model ? `Provider stream issue on ${model}:` : "Provider stream issue:";
+  const retry = fallback ? `Retrying with ${fallback}.` : "";
+  return [prefix, error, retry].filter(Boolean).join(" ");
+}
+
+function interruptedRunDetailFromSteps(steps: JsonRecord[]): string {
+  for (const step of [...steps].reverse()) {
+    const providerDetail = providerStreamIssueDetailFromStep(step);
+    if (providerDetail) return providerDetail;
+
+    const stepType = str(step.step_type, str(step.type, ""))
+      .trim()
+      .toLowerCase();
+    const title = str(step.title, "").trim();
+    const detail = str(step.detail, "").trim();
+    const data = asRecord(step.data);
+    const reason = str(data.reason, str(data.error, "")).trim();
+    if (stepType === "run_status" && (detail || reason || title)) {
+      return detail || reason || title;
+    }
+  }
+  return "";
+}
+
+function activityDataRecord(value: unknown): JsonRecord {
+  if (isRecord(value)) return value;
+  if (typeof value !== "string") return {};
+  const trimmed = value.trim();
+  if (!trimmed || !trimmed.startsWith("{")) return {};
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    return isRecord(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function agentLoopProgressPresentation(
+  payload: JsonRecord,
+  fallbackDetail = "",
+): ToolProgressPresentation | null {
+  if (str(payload.kind, "").trim() !== "agent_loop_progress") return null;
+  const phase = str(payload.phase, "").trim();
+  const titleFromPayload = str(payload.title, "").trim();
+  const titleByPhase: Record<string, string> = {
+    context: "Preparing context",
+    turn_plan: "Preparing turn plan",
+    intent_plan: "Preparing intent plan",
+    action_scope: "Selecting actions",
+    model_call: "Calling model",
+    tool_execution: "Running actions",
+    tool_result: "Processing action output",
+  };
+  const title = titleByPhase[phase] || titleFromPayload || "Working";
+  return {
+    title,
+    detail: fallbackDetail || str(payload.content, "").trim(),
+    streamKey: phase ? `agent-loop:${phase}` : "agent-loop",
+  };
+}
+
+function buildToolProgressPresentation(
+  name: string,
+  content: string,
+  payload: unknown,
+  appDir = "",
+): ToolProgressPresentation {
+  const preview = (content || "").trim().slice(0, 1600);
+  const detail = summarizeActivityDetail(preview);
+  const payloadObj = asRecord(payload);
+  const delegationKind = str(payloadObj.kind, "");
+  const isFileWriteProgress =
+    (name === "app_deploy" && str(payloadObj.kind, "") === "file_write") ||
+    name === "file_write";
+  const isArgumentStream = str(payloadObj.kind, "") === "argument_stream";
+  const isDraftFile = str(payloadObj.kind, "") === "draft_file";
+  const isPhaseStatus = str(payloadObj.kind, "") === "phase_status";
+  const isConsoleChunk = str(payloadObj.kind, "") === "console_chunk";
+
+  const agentLoopPresentation = agentLoopProgressPresentation(
+    payloadObj,
+    detail || preview,
+  );
+  if (agentLoopPresentation) return agentLoopPresentation;
+
+  if (str(payloadObj.kind, "") === "provider_stream_error") {
+    const error = str(payloadObj.error, "").trim();
+    const model = str(payloadObj.model, "").trim();
+    const fallback = str(payloadObj.fallback, "").trim();
+    const retry = fallback ? `Retrying with ${fallback}.` : "";
+    return {
+      title: "Provider stream issue",
+      detail:
+        [error || detail || preview, retry].filter(Boolean).join(" ") ||
+        "The provider stream stalled before usable output arrived.",
+      streamKey: `provider-stream-error:${model || "model"}`,
+    };
+  }
+
+  if (name === "delegation" && delegationKind.startsWith("delegation_")) {
+    const agentName = str(payloadObj.agent_name, "").trim();
+    const agentRole = str(payloadObj.agent_role, "").trim();
+    const taskSummary = str(payloadObj.task, "").trim();
+    const streamKey = agentName
+      ? `delegation:${str(payloadObj.delegation_id, "run")}:${str(payloadObj.agent_id, agentName)}`
+      : `delegation:${str(payloadObj.delegation_id, "run")}`;
+    const roleLabel = agentRole
+      ? `${agentName || "Agent"} / ${agentRole}`
+      : agentName || "Delegation";
+    if (delegationKind === "delegation_started") {
+      const count = Math.max(0, num(payloadObj.agent_count, 0));
+      return {
+        title: "Launching agent swarm",
+        detail:
+          count > 0
+            ? `Starting ${count} delegated agent${count === 1 ? "" : "s"}.`
+            : detail || "Starting delegated work.",
+        streamKey,
+      };
+    }
+    if (delegationKind === "delegation_assignment") {
+      return {
+        title: `Assigned ${roleLabel}`,
+        detail: taskSummary || detail || "Prepared delegated assignment.",
+        streamKey,
+      };
+    }
+    if (delegationKind === "delegation_agent_started") {
+      return {
+        title: `${roleLabel} is working`,
+        detail:
+          taskSummary || detail ||
+          "Delegated work started.",
+        streamKey,
+      };
+    }
+    if (delegationKind === "delegation_agent_progress") {
+      return {
+        title: `${roleLabel} is working`,
+        detail: detail || taskSummary || "Delegated work is still running.",
+        streamKey,
+      };
+    }
+    if (delegationKind === "delegation_agent_completed") {
+      return {
+        title: `${roleLabel} finished`,
+        detail: detail || taskSummary || "Delegated work completed.",
+        streamKey,
+      };
+    }
+    if (delegationKind === "delegation_agent_failed") {
+      return {
+        title: `${roleLabel} needs attention`,
+        detail: detail || taskSummary || "Delegated work failed.",
+        streamKey,
+      };
+    }
+    if (delegationKind === "delegation_synthesis_started") {
+      return {
+        title: "Synthesizing agent results",
+        detail: detail || "Combining delegated results into one response.",
+        streamKey,
+      };
+    }
+    if (delegationKind === "delegation_completed") {
+      return {
+        title: "Agent swarm completed",
+        detail: detail || "Delegated work completed.",
+        streamKey,
+      };
+    }
+  }
+
+  if (isArgumentStream) {
+    const stage = str(payloadObj.stage, "");
+    const chars = Math.max(0, num(payloadObj.chars, 0));
+    const streamKey = str(
+      payloadObj.stream_key,
+      `argument-stream:${name || "tool"}`,
+    );
+    const toolLabel = formatActivityToolName(name || "tool");
+    let title = `Preparing ${toolLabel} input`;
+    if (stage === "payload_build" && name === "app_deploy") {
+      title = "Generating deploy payload";
+    } else if (stage === "payload_repair" && name === "app_deploy") {
+      title = "Repairing deploy payload";
+    }
+    const detailParts: string[] = [];
+    if (chars > 0) detailParts.push(`${chars.toLocaleString()} chars`);
+    return {
+      title,
+      detail: detailParts.join(" - ") || detail || preview || "Working...",
+      streamKey,
+    };
+  }
+
+  if (isPhaseStatus) {
+    const label = str(payloadObj.label, "").trim() || "Working";
+    const phaseDetail = str(payloadObj.detail, preview).trim();
+    const streamKey = str(
+      payloadObj.stream_key,
+      `phase-status:${name || "tool"}`,
+    );
+    return {
+      title: label,
+      detail: phaseDetail,
+      streamKey,
+    };
+  }
+
+  if (isDraftFile) {
+    const fileName = normalizeWorkspaceFileName(
+      payloadObj.file ?? payloadObj.path,
+      appDir,
+    );
+    const snapshot = str(
+      payloadObj.content_snapshot,
+      str(payloadObj.content_delta, ""),
+    ).trim();
+    const lineNo = Math.max(
+      0,
+      num(payloadObj.line, snapshot ? snapshot.split(/\r?\n/).length : 0),
+    );
+    const totalLines = Math.max(0, num(payloadObj.total_lines, 0));
+    const lineLabel =
+      totalLines > 0
+        ? `Line ${Math.min(lineNo, totalLines)}/${totalLines}`
+        : lineNo > 0
+          ? `${lineNo} line${lineNo === 1 ? "" : "s"}`
+          : "Draft ready";
+    return {
+      title: `Drafting ${fileName || "file"}`,
+      detail: snapshot
+        ? `${lineLabel}: ${snapshot.split(/\r?\n/).slice(-1)[0]}`
+        : lineLabel,
+      streamKey: str(
+        payloadObj.stream_key,
+        fileName ? `draft-file:${fileName}` : "draft-file",
+      ),
+    };
+  }
+
+  if (isFileWriteProgress) {
+    const fileName = normalizeWorkspaceFileName(
+      payloadObj.file ?? payloadObj.path,
+      appDir,
+    );
+    const lineNo = Math.max(0, num(payloadObj.line, 0));
+    const totalLines = Math.max(0, num(payloadObj.total_lines, 0));
+    const text = str(payloadObj.text, "").trim();
+    const lineLabel =
+      totalLines > 0
+        ? `Line ${Math.min(lineNo, totalLines)}/${totalLines}`
+        : lineNo > 0
+          ? `Line ${lineNo}`
+          : "Preparing file";
+    return {
+      title: `Writing ${fileName || "file"}`,
+      detail: text ? `${lineLabel}: ${text}` : lineLabel,
+      streamKey: fileName ? `file-write:${fileName}` : "file-write",
+    };
+  }
+
+  if (isConsoleChunk) {
+    const stage = str(payloadObj.stage, "").trim();
+    const stream = str(payloadObj.stream, "").trim();
+    const text = str(payloadObj.text, content).trim();
+    return {
+      title: `${stage ? `${stage} ` : ""}${stream || "console"}`.trim(),
+      detail: text || detail || "Console output",
+      streamKey: str(
+        payloadObj.stream_key,
+        `console:${name || "tool"}:${stage || "stage"}:${stream || "stream"}`,
+      ),
+    };
+  }
+
+  return {
+    title: `Running ${formatActivityToolName(name || "tool")}`,
+    detail: detail || preview,
+  };
+}
+
+type SwarmChatAgent = {
+  id: string;
+  agentName: string;
+  agentRole: string;
+  modelName: string;
+  task: string;
+  status: string;
+  summary: string;
+  latestUpdate: string;
+  isSpecialist: boolean;
+  dependsOn: number[];
+  elapsedMs?: number;
+  sequence: number;
+};
+
+type SwarmChatRun = {
+  id: string;
+  request: string;
+  status: string;
+  summary: string;
+  agentCount: number;
+  updatedAtIndex: number;
+  agents: SwarmChatAgent[];
+};
+
+function activityToneColor(kind: string, tone: string): string {
+  if (kind === "Issue") return "var(--activity-tone-issue)";
+  if (kind === "Done") return "var(--activity-tone-done)";
+  if (kind === "Running") return "var(--activity-tone-running)";
+  if (kind === "Planning") return "var(--activity-tone-planning)";
+  if (tone === "tone-error") return "var(--activity-tone-issue)";
+  if (tone === "tone-success") return "var(--activity-tone-done)";
+  if (tone === "tone-action") return "var(--activity-tone-running)";
+  if (tone === "tone-thinking") return "var(--activity-tone-planning)";
+  return "var(--activity-tone-default)";
+}
+
+function activityKindDisplayLabel(kind: string): string {
+  const normalized = (kind || "").trim().toLowerCase();
+  if (normalized === "running") return "Working";
+  if (normalized === "planning") return "Thinking";
+  if (normalized === "issue") return "Attention";
+  return kind || "Update";
+}
+
+function ActivityPayloadDisclosure({
+  payload,
+  expanded,
+  onToggle,
+  controlsId,
+}: {
+  payload: ActivityPayloadView;
+  expanded: boolean;
+  onToggle: () => void;
+  controlsId: string;
+}) {
+  return (
+    <Box className={`activity-payload-shell${expanded ? " is-expanded" : ""}`}>
+      <Stack
+        direction={{ xs: "column", sm: "row" }}
+        className="activity-payload-head"
+        sx={{
+          alignItems: { xs: "stretch", sm: "center" },
+          justifyContent: "space-between",
+          gap: 0.75,
+        }}
+      >
+        <Stack
+          direction="row"
+          spacing={0.75}
+          className="activity-payload-preview"
+          sx={{ alignItems: "center", minWidth: 0 }}
+        >
+          <span
+            className={`activity-payload-chip activity-payload-chip-${payload.kind}`}
+          >
+            {payload.badgeLabel}
+          </span>
+          <Typography
+            variant="caption"
+            className="activity-payload-preview-text"
+            title={payload.preview || payload.headerLabel}
+          >
+            {payload.preview || payload.headerLabel}
+          </Typography>
+        </Stack>
+        <Button
+          size="small"
+          variant="text"
+          className="activity-payload-toggle"
+          aria-expanded={expanded}
+          aria-controls={controlsId}
+          onClick={onToggle}
+          endIcon={
+            <ArrowDropDownRoundedIcon
+              className={`activity-payload-toggle-icon${expanded ? " is-expanded" : ""}`}
+            />
+          }
+        >
+          {expanded ? "Hide data" : "Show data"}
+        </Button>
+      </Stack>
+      <Collapse in={expanded} mountOnEnter unmountOnExit>
+        <Box id={controlsId} className="activity-payload-body">
+          <Typography variant="caption" className="activity-payload-body-label">
+            {payload.headerLabel} - {payload.lineCount} line
+            {payload.lineCount === 1 ? "" : "s"}
+          </Typography>
+          <Box component="pre" className="activity-payload-pre">
+            {payload.body}
+          </Box>
+        </Box>
+      </Collapse>
+    </Box>
+  );
+}
+
+function ActivityTimelineRow({
+  row,
+  isActive,
+  payloadExpanded,
+  onTogglePayload,
+  detailed = false,
+}: {
+  row: ActivityTimelineCard;
+  isActive: boolean;
+  payloadExpanded: boolean;
+  onTogglePayload: () => void;
+  detailed?: boolean;
+}) {
+  const lineTone = activityToneColor(row.kind, row.tone);
+  const summary = row.summary || row.detailFull || row.detail || "";
+  const stepTypeLabel = row.stepType.replace(/[_-]+/g, " ").trim();
+  const rawTitle = row.rawTitle.trim();
+  const detailBody =
+    detailed && row.rawDetailFull && row.rawDetailFull !== summary
+      ? row.rawDetailFull
+      : summary;
+  const payloadId = `activity-payload-${row.id}`.replace(
+    /[^a-zA-Z0-9_-]+/g,
+    "-",
+  );
+  return (
+    <Box
+      className={`term-line activity-timeline-row${isActive ? " term-line-active" : ""}${detailed ? " activity-timeline-row-detailed" : ""}`}
+    >
+      <span className="term-prompt" style={{ color: lineTone }}>
+        -
+      </span>
+      <Box className="term-content activity-row-content">
+        <Stack
+          direction={{ xs: "column", sm: "row" }}
+          className="activity-row-head"
+          sx={{
+            alignItems: { xs: "flex-start", sm: "flex-start" },
+            justifyContent: "space-between",
+            gap: 0.75,
+          }}
+        >
+          <Box className="activity-row-copy">
+            <div className="term-label activity-row-label">{row.label}</div>
+            <Stack
+              direction="row"
+              spacing={0.75}
+              useFlexGap
+              className="activity-row-meta"
+              sx={{ flexWrap: "wrap" }}
+            >
+              <span
+                className={`activity-kind-pill activity-kind-pill-${(row.kind || "update").toLowerCase()}`}
+              >
+                {activityKindDisplayLabel(row.kind)}
+              </span>
+              {row.time ? (
+                <span className="activity-row-time">
+                  {formatTraceStepTime(row.time)}
+                </span>
+              ) : null}
+              {detailed && stepTypeLabel ? (
+                <span className="activity-row-time activity-row-step-type">
+                  {stepTypeLabel}
+                </span>
+              ) : null}
+              {detailed ? (
+                <span className="activity-row-time">#{row.index + 1}</span>
+              ) : null}
+            </Stack>
+          </Box>
+        </Stack>
+        {detailed && rawTitle && rawTitle !== row.label ? (
+          <div className="term-detail activity-row-raw-title">
+            Source title: {rawTitle}
+          </div>
+        ) : null}
+        {detailBody ? (
+          <div className="term-detail activity-row-summary">{detailBody}</div>
+        ) : null}
+        {row.payloadView ? (
+          <ActivityPayloadDisclosure
+            payload={row.payloadView}
+            expanded={payloadExpanded}
+            onToggle={onTogglePayload}
+            controlsId={payloadId}
+          />
+        ) : null}
+      </Box>
+    </Box>
+  );
+}
+
+function InlineActivityCard({
+  row,
+  isActive,
+  showPayload,
+  payloadExpanded,
+  onTogglePayload,
+  payloadKey,
+  onOpenConsole,
+}: {
+  row: ActivityTimelineCard;
+  isActive: boolean;
+  showPayload: boolean;
+  payloadExpanded: boolean;
+  onTogglePayload: () => void;
+  payloadKey: string;
+  onOpenConsole?: () => void;
+}) {
+  const summary = row.summary || row.detailFull || row.detail || "";
+  const toneStyle = {
+    "--inline-activity-tone": activityToneColor(row.kind, row.tone),
+  } as CSSProperties;
+  const payloadId = `inline-activity-payload-${payloadKey}`.replace(
+    /[^a-zA-Z0-9_-]+/g,
+    "-",
+  );
+
+  return (
+    <Box
+      className={`chat-inline-activity-card${isActive ? " is-active" : ""}`}
+      style={toneStyle}
+      role={onOpenConsole ? "button" : undefined}
+      tabIndex={onOpenConsole ? 0 : undefined}
+      onClick={onOpenConsole}
+      onKeyDown={(event) => {
+        if (!onOpenConsole) return;
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        onOpenConsole();
+      }}
+    >
+      <Box className="chat-inline-activity-status" aria-hidden="true" />
+      <Box className="chat-inline-activity-card-main">
+        <Stack
+          direction="row"
+          spacing={0.75}
+          className="chat-inline-activity-card-head"
+          sx={{ alignItems: "center", minWidth: 0 }}
+        >
+          <Typography
+            component="span"
+            className="chat-inline-activity-kind"
+          >
+            {activityKindDisplayLabel(row.kind)}
+          </Typography>
+          <Typography
+            component="span"
+            className="chat-inline-activity-title"
+            title={row.label}
+          >
+            {row.label}
+          </Typography>
+        </Stack>
+        {summary ? (
+          <Typography
+            component="div"
+            className="chat-inline-activity-detail"
+            title={summary}
+          >
+            {summary}
+          </Typography>
+        ) : null}
+        <Stack
+          direction="row"
+          spacing={0.75}
+          className="chat-inline-activity-meta"
+          sx={{ alignItems: "center", flexWrap: "wrap" }}
+        >
+          {row.time ? <span>{formatTraceStepTime(row.time)}</span> : null}
+        </Stack>
+        {showPayload && row.payloadView ? (
+          <ActivityPayloadDisclosure
+            payload={row.payloadView}
+            expanded={payloadExpanded}
+            onToggle={onTogglePayload}
+            controlsId={payloadId}
+          />
+        ) : null}
+      </Box>
+    </Box>
+  );
+}
+
+function buildInitialThinkingActivityCard(keyPrefix: string): ActivityTimelineCard {
+  return {
+    id: `${keyPrefix}:initial-thinking`,
+    index: -1,
+    stepType: "thinking",
+    rawTitle: "Thinking",
+    tone: "tone-thinking",
+    kind: "Planning",
+    label: "Thinking",
+    detail: "Understanding the request and preparing the first action.",
+    detailFull: "Understanding the request and preparing the first action.",
+    summary: "Understanding the request and preparing the first action.",
+    rawDetailFull: "",
+    payloadView: null,
+    isHeartbeat: false,
+    time: "",
+  };
+}
+
+function activityCardIsPlanning(card: ActivityTimelineCard): boolean {
+  return card.kind === "Planning" || card.tone === "tone-thinking";
+}
+
+function activityCardIsRunning(card: ActivityTimelineCard): boolean {
+  return (
+    card.kind === "Running" ||
+    card.tone === "tone-action" ||
+    card.tone === "tone-tool"
+  );
+}
+
+function countPublicActivityCards(cards: ActivityTimelineCard[]): number {
+  return cards.filter((card) => !card.isHeartbeat).length || cards.length;
+}
+
+function publicActivityKicker(cards: ActivityTimelineCard[], live: boolean): string {
+  const count = countPublicActivityCards(cards);
+  if (live) return count > 1 ? "Current step" : "Starting";
+  return count > 1 ? "Run summary" : "Activity";
+}
+
+function withInitialThinkingActivityCard(
+  cards: ActivityTimelineCard[],
+  keyPrefix: string,
+): ActivityTimelineCard[] {
+  const meaningful = cards.filter((card) => !card.isHeartbeat);
+  const firstMeaningful = meaningful[0];
+  if (firstMeaningful && activityCardIsPlanning(firstMeaningful)) {
+    return cards;
+  }
+  return [buildInitialThinkingActivityCard(keyPrefix), ...cards];
+}
+
+function pickPublicActivityCard(
+  cards: ActivityTimelineCard[],
+  live: boolean,
+): ActivityTimelineCard {
+  const meaningful = cards.filter((card) => !card.isHeartbeat);
+  if (meaningful.length === 0) return buildInitialThinkingActivityCard("empty");
+  if (live) {
+    return (
+      [...meaningful]
+        .reverse()
+        .find(
+          (card) =>
+            activityCardIsRunning(card) || activityCardIsPlanning(card),
+        ) || meaningful[meaningful.length - 1]
+    );
+  }
+  return meaningful[0];
+}
+
+function InlineActivityFeed({
+  cards,
+  live = false,
+  expandedPayloads,
+  onTogglePayload,
+  keyPrefix,
+  onOpenConsole,
+}: {
+  cards: ActivityTimelineCard[];
+  live?: boolean;
+  expandedPayloads: Set<string>;
+  onTogglePayload: (id: string) => void;
+  keyPrefix: string;
+  onOpenConsole?: () => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const displayCards = withInitialThinkingActivityCard(cards, keyPrefix);
+  const activeId = live ? displayCards[displayCards.length - 1]?.id : "";
+  const latestCards = displayCards.slice(-7);
+  const firstCard = displayCards[0];
+  const visibleCards =
+    displayCards.length > 8
+      ? [
+          firstCard,
+          ...latestCards.filter((card) => card.id !== firstCard.id),
+        ]
+      : displayCards;
+  const hiddenCount = Math.max(0, displayCards.length - visibleCards.length);
+  const publicCard = pickPublicActivityCard(displayCards, live);
+  const publicSummary =
+    publicCard.summary || publicCard.detailFull || publicCard.detail || "";
+  const progressKicker = publicActivityKicker(displayCards, live);
+
+  if (cards.length === 0) return null;
+
+  return (
+    <Box
+      className={`chat-inline-activity${live ? " is-live" : ""}${expanded ? " is-expanded" : " is-collapsed"}`}
+    >
+      <Box
+        className={`chat-public-progress${live ? " is-live" : ""}`}
+        role={live ? "status" : undefined}
+        aria-live={live ? "polite" : undefined}
+      >
+        <Box className="chat-public-progress-dot" aria-hidden="true" />
+        <Box className="chat-public-progress-copy">
+          <Typography
+            component="div"
+            className="chat-public-progress-title"
+            title={publicCard.label}
+          >
+            {publicCard.label}
+          </Typography>
+          {publicSummary ? (
+            <Typography
+              component="div"
+              className="chat-public-progress-detail"
+              title={publicSummary}
+            >
+              {publicSummary}
+            </Typography>
+          ) : null}
+        </Box>
+      </Box>
+      <Button
+        size="small"
+        className="chat-inline-activity-toggle chat-inline-task-toggle"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((current) => !current)}
+        endIcon={<ExpandMoreIcon className="chat-inline-activity-toggle-icon" />}
+      >
+        <Box className="chat-inline-task-toggle-main">
+          <span className="chat-inline-task-toggle-kicker">
+            {progressKicker}
+          </span>
+          <span className="chat-inline-task-toggle-title">
+            {publicCard.kind} | {publicCard.label}
+          </span>
+        </Box>
+        <span className="chat-inline-task-toggle-action">
+          {expanded ? "Hide" : "Expand"}
+        </span>
+      </Button>
+      <Collapse in={expanded} mountOnEnter unmountOnExit>
+        <Stack spacing={0.7} className="chat-inline-activity-list">
+          {hiddenCount > 0 ? (
+            <Typography variant="caption" className="chat-inline-activity-meta-note">
+              Showing first step and latest {visibleCards.length - 1} of {displayCards.length}. Full details are in AgentArk Console.
+            </Typography>
+          ) : null}
+          {visibleCards.map((row) => {
+            const payloadKey = `${keyPrefix}:${row.id}`;
+            return (
+              <InlineActivityCard
+                key={payloadKey}
+                row={row}
+                isActive={live && row.id === activeId}
+                showPayload={false}
+                payloadExpanded={expandedPayloads.has(payloadKey)}
+                onTogglePayload={() => onTogglePayload(payloadKey)}
+                payloadKey={payloadKey}
+                onOpenConsole={onOpenConsole}
+              />
+            );
+          })}
+        </Stack>
+      </Collapse>
+    </Box>
+  );
+}
+
+function normalizeSwarmStatus(status: unknown): string {
+  const normalized = str(status, "").trim().toLowerCase();
+  if (!normalized) return "running";
+  if (normalized === "cancelled" || normalized === "canceled")
+    return "interrupted";
+  if (normalized === "degraded") return "partial";
+  return normalized;
+}
+
+function swarmStatusChipColor(
+  status: string,
+): "default" | "success" | "warning" | "error" {
+  switch (normalizeSwarmStatus(status)) {
+    case "completed":
+      return "success";
+    case "partial":
+    case "running":
+    case "assigned":
+    case "synthesizing":
+      return "warning";
+    case "failed":
+    case "timed_out":
+    case "panicked":
+    case "interrupted":
+      return "error";
+    default:
+      return "default";
+  }
+}
+
+function swarmStatusLabel(status: string): string {
+  switch (normalizeSwarmStatus(status)) {
+    case "assigned":
+      return "Assigned";
+    case "running":
+      return "Running";
+    case "synthesizing":
+      return "Synthesizing";
+    case "completed":
+      return "Completed";
+    case "partial":
+      return "Partial";
+    case "timed_out":
+      return "Timed out";
+    case "panicked":
+      return "Panicked";
+    case "failed":
+      return "Failed";
+    case "interrupted":
+      return "Stopped";
+    default:
+      return "Queued";
+  }
+}
+
+function formatSwarmElapsedMs(value: unknown): string {
+  const ms = Math.max(0, num(value, 0));
+  if (!ms) return "";
+  if (ms < 1000) return `${ms}ms`;
+  const secs = ms / 1000;
+  if (secs < 60) return `${secs.toFixed(secs >= 10 ? 0 : 1)}s`;
+  const mins = Math.floor(secs / 60);
+  const remSecs = Math.round(secs % 60);
+  return remSecs > 0 ? `${mins}m ${remSecs}s` : `${mins}m`;
+}
+
+function deriveSwarmRunStatus(
+  agents: SwarmChatAgent[],
+  fallback = "running",
+): string {
+  if (
+    agents.some((agent) =>
+      ["assigned", "running", "synthesizing"].includes(
+        normalizeSwarmStatus(agent.status),
+      ),
+    )
+  ) {
+    return "running";
+  }
+  if (
+    agents.every((agent) => normalizeSwarmStatus(agent.status) === "completed")
+  ) {
+    return "completed";
+  }
+  if (
+    agents.some((agent) => normalizeSwarmStatus(agent.status) === "interrupted")
+  ) {
+    return "interrupted";
+  }
+  if (
+    agents.some((agent) => normalizeSwarmStatus(agent.status) === "completed")
+  ) {
+    return "partial";
+  }
+  if (
+    agents.some((agent) => normalizeSwarmStatus(agent.status) === "timed_out")
+  ) {
+    return "timed_out";
+  }
+  if (
+    agents.some((agent) => normalizeSwarmStatus(agent.status) === "panicked")
+  ) {
+    return "panicked";
+  }
+  if (agents.some((agent) => normalizeSwarmStatus(agent.status) === "failed")) {
+    return "failed";
+  }
+  return normalizeSwarmStatus(fallback);
+}
+
+function buildSwarmRunsFromStreamingSteps(
+  steps: JsonRecord[],
+  options?: { interrupted?: boolean },
+): SwarmChatRun[] {
+  const interrupted = Boolean(options?.interrupted);
+  const runs = new Map<
+    string,
+    {
+      id: string;
+      request: string;
+      status: string;
+      summary: string;
+      agentCount: number;
+      updatedAtIndex: number;
+      agents: Map<string, SwarmChatAgent>;
+      order: string[];
+    }
+  >();
+
+  steps.forEach((step, index) => {
+    const payload = asRecord(step.data);
+    const kind = str(payload.kind, "");
+    if (!kind.startsWith("delegation_")) return;
+    const runId = str(payload.delegation_id, "").trim();
+    if (!runId) return;
+
+    let run = runs.get(runId);
+    if (!run) {
+      run = {
+        id: runId,
+        request: "",
+        status: "running",
+        summary: "",
+        agentCount: 0,
+        updatedAtIndex: index,
+        agents: new Map<string, SwarmChatAgent>(),
+        order: [],
+      };
+      runs.set(runId, run);
+    }
+
+    run.updatedAtIndex = index;
+    run.summary =
+      str(payload.summary, str(step.detail, run.summary)).trim() || run.summary;
+    run.request = str(payload.request, run.request).trim() || run.request;
+    run.agentCount = Math.max(
+      run.agentCount,
+      Math.max(0, num(payload.agent_count, 0)),
+    );
+
+    if (kind === "delegation_started") {
+      run.status = normalizeSwarmStatus(str(payload.status, "running"));
+    } else if (kind === "delegation_synthesis_started") {
+      run.status = normalizeSwarmStatus(str(payload.status, "synthesizing"));
+    } else if (kind === "delegation_completed") {
+      run.status = normalizeSwarmStatus(str(payload.status, "completed"));
+    }
+
+    const agentId = str(payload.agent_id, "").trim();
+    if (!agentId) return;
+
+    let agent = run.agents.get(agentId);
+    if (!agent) {
+      agent = {
+        id: agentId,
+        agentName: str(payload.agent_name, "Agent").trim() || "Agent",
+        agentRole: str(payload.agent_role, "").trim(),
+        modelName: str(payload.model_name, "").trim(),
+        task: str(payload.task, "").trim(),
+        status: "assigned",
+        summary: str(payload.summary, "").trim(),
+        latestUpdate: str(step.detail, "").trim(),
+        isSpecialist: toBool(payload.is_specialist),
+        dependsOn: Array.isArray(payload.depends_on)
+          ? payload.depends_on
+              .map((value) => num(value, -1))
+              .filter((value) => value >= 0)
+          : [],
+        elapsedMs: undefined,
+        sequence: Math.max(1, num(payload.sequence, run.order.length + 1)),
+      };
+      run.agents.set(agentId, agent);
+      run.order.push(agentId);
+    }
+
+    agent.agentName =
+      str(payload.agent_name, agent.agentName).trim() || agent.agentName;
+    agent.agentRole =
+      str(payload.agent_role, agent.agentRole).trim() || agent.agentRole;
+    agent.modelName =
+      str(payload.model_name, agent.modelName).trim() || agent.modelName;
+    agent.task = str(payload.task, agent.task).trim() || agent.task;
+    agent.summary = str(payload.summary, agent.summary).trim() || agent.summary;
+    agent.latestUpdate =
+      str(step.detail, str(payload.summary, agent.latestUpdate)).trim() ||
+      agent.latestUpdate;
+    agent.isSpecialist = toBool(payload.is_specialist) || agent.isSpecialist;
+    if (Array.isArray(payload.depends_on)) {
+      agent.dependsOn = payload.depends_on
+        .map((value) => num(value, -1))
+        .filter((value) => value >= 0);
+    }
+    const elapsedMs = num(payload.elapsed_ms, 0);
+    if (elapsedMs > 0) {
+      agent.elapsedMs = elapsedMs;
+    }
+
+    if (kind === "delegation_assignment") {
+      agent.status = "assigned";
+    } else if (kind === "delegation_agent_started") {
+      agent.status = normalizeSwarmStatus(str(payload.status, "running"));
+    } else if (kind === "delegation_agent_progress") {
+      agent.status = normalizeSwarmStatus(str(payload.status, "running"));
+    } else if (kind === "delegation_agent_completed") {
+      agent.status = normalizeSwarmStatus(str(payload.status, "completed"));
+    } else if (kind === "delegation_agent_failed") {
+      agent.status = normalizeSwarmStatus(str(payload.status, "failed"));
+    }
+  });
+
+  const out = Array.from(runs.values()).map((run) => {
+    const agents = run.order
+      .map((agentId) => run.agents.get(agentId))
+      .filter((agent): agent is SwarmChatAgent => Boolean(agent))
+      .sort((left, right) => left.sequence - right.sequence);
+
+    let status = deriveSwarmRunStatus(agents, run.status);
+    if (
+      interrupted &&
+      ["running", "assigned", "synthesizing"].includes(status)
+    ) {
+      status = "interrupted";
+    }
+    const normalizedAgents = agents.map((agent) => {
+      const next = { ...agent };
+      if (
+        interrupted &&
+        ["assigned", "running", "synthesizing"].includes(
+          normalizeSwarmStatus(next.status),
+        )
+      ) {
+        next.status = "interrupted";
+        next.latestUpdate =
+          next.latestUpdate || "Stopped before this delegated step finished.";
+      }
+      return next;
+    });
+
+    return {
+      id: run.id,
+      request: run.request,
+      status,
+      summary: run.summary,
+      agentCount: Math.max(run.agentCount, normalizedAgents.length),
+      updatedAtIndex: run.updatedAtIndex,
+      agents: normalizedAgents,
+    };
+  });
+
+  return out.sort((left, right) => right.updatedAtIndex - left.updatedAtIndex);
+}
+
+function SwarmActivityPanel({
+  runs,
+  interrupted = false,
+  expandedPayloads,
+  onTogglePayload,
+}: {
+  runs: SwarmChatRun[];
+  interrupted?: boolean;
+  expandedPayloads: Set<string>;
+  onTogglePayload: (id: string) => void;
+}) {
+  if (runs.length === 0) return null;
+  const totalAgents = runs.reduce(
+    (sum, run) => sum + Math.max(run.agentCount, run.agents.length),
+    0,
+  );
+
+  return (
+    <Box
+      sx={{
+        mt: 1.5,
+        p: 1.5,
+        borderRadius: "var(--surface-radius-lg)",
+        border: interrupted
+          ? "1px solid var(--activity-panel-border-warning)"
+          : "1px solid var(--activity-panel-border)",
+        background: "var(--activity-panel-bg)",
+        boxShadow: "var(--surface-shadow-soft)",
+      }}
+    >
+      <Stack spacing={1.4}>
+        <Stack
+          direction={{ xs: "column", sm: "row" }}
+          sx={{
+            alignItems: { xs: "flex-start", sm: "center" },
+            justifyContent: "space-between",
+            gap: 1,
+          }}
+        >
+          <Box>
+            <Typography
+              variant="overline"
+              sx={{
+                letterSpacing: 0,
+                color: interrupted ? "warning.light" : "info.light",
+              }}
+            >
+              Agent activity
+            </Typography>
+            <Typography variant="body2" sx={{ fontWeight: 700 }}>
+              {interrupted
+                ? "Delegated work was paused with live state preserved."
+                : "Delegated specialists are working in parallel."}
+            </Typography>
+          </Box>
+          <Stack
+            direction="row"
+            spacing={0.75}
+            useFlexGap
+            sx={{
+              flexWrap: "wrap",
+            }}
+          >
+            <Chip
+              size="small"
+              color={interrupted ? "warning" : "info"}
+              variant={interrupted ? "filled" : "outlined"}
+              label={`${runs.length} run${runs.length === 1 ? "" : "s"}`}
+            />
+            <Chip
+              size="small"
+              variant="outlined"
+              label={`${totalAgents} agent${totalAgents === 1 ? "" : "s"}`}
+            />
+          </Stack>
+        </Stack>
+
+        {runs.map((run) => {
+          const runSummary = summarizeActivityDetail(
+            run.summary || `${run.agents.length} delegated agents tracked.`,
+          );
+          return (
+            <Box
+              key={run.id}
+              sx={{
+                p: 1.25,
+                borderRadius: "var(--surface-radius)",
+                background: "var(--activity-subpanel-bg)",
+                border: "1px solid var(--surface-border)",
+                boxShadow: "var(--micro-surface-shadow)",
+              }}
+            >
+              <Stack spacing={1.2}>
+                <Stack
+                  direction={{ xs: "column", md: "row" }}
+                  sx={{
+                    alignItems: { xs: "flex-start", md: "center" },
+                    justifyContent: "space-between",
+                    gap: 1,
+                  }}
+                >
+                  <Box sx={{ minWidth: 0 }}>
+                    <Typography
+                      variant="body2"
+                      sx={{ fontWeight: 700 }}
+                      className="swarm-run-request"
+                    >
+                      {run.request || "Delegated run"}
+                    </Typography>
+                    <Typography
+                      variant="caption"
+                      className="swarm-run-summary"
+                      sx={{
+                        color: "text.secondary",
+                        display: "block",
+                        mt: 0.35,
+                      }}
+                    >
+                      {runSummary ||
+                        `${run.agents.length} delegated agents tracked.`}
+                    </Typography>
+                  </Box>
+                  <Stack
+                    direction="row"
+                    spacing={0.75}
+                    useFlexGap
+                    sx={{
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <Chip
+                      size="small"
+                      color={swarmStatusChipColor(run.status)}
+                      label={swarmStatusLabel(run.status)}
+                    />
+                    <Chip
+                      size="small"
+                      variant="outlined"
+                      label={`${Math.max(run.agentCount, run.agents.length)} agent${Math.max(run.agentCount, run.agents.length) === 1 ? "" : "s"}`}
+                    />
+                  </Stack>
+                </Stack>
+
+                <Grid2 container spacing={1}>
+                  {run.agents.map((agent) => {
+                    const agentPayloadId = `swarm:${run.id}:${agent.id}`;
+                    const agentPayloadView =
+                      buildActivityPayloadViewFromSources(
+                        agent.latestUpdate,
+                        agent.summary,
+                      );
+                    const agentUpdate = summarizeActivityDetail(
+                      agent.latestUpdate ||
+                        agent.summary ||
+                        "Waiting for the next update.",
+                    );
+                    const payloadControlsId =
+                      `swarm-payload-${agentPayloadId}`.replace(
+                        /[^a-zA-Z0-9_-]+/g,
+                        "-",
+                      );
+                    return (
+                      <Grid2 key={agent.id} size={{ xs: 12, xl: 6 }}>
+                        <Box
+                          sx={{
+                            height: "100%",
+                            p: 1.1,
+                            borderRadius: "var(--surface-radius)",
+                            border: "1px solid var(--surface-border)",
+                            background: "var(--micro-surface-item-bg)",
+                          }}
+                        >
+                          <Stack spacing={0.8}>
+                            <Stack
+                              direction={{ xs: "column", sm: "row" }}
+                              sx={{
+                                alignItems: { xs: "flex-start", sm: "center" },
+                                justifyContent: "space-between",
+                                gap: 0.8,
+                              }}
+                            >
+                              <Box sx={{ minWidth: 0 }}>
+                                <Typography
+                                  variant="body2"
+                                  sx={{ fontWeight: 700 }}
+                                >
+                                  {agent.agentRole
+                                    ? `${agent.agentName} / ${agent.agentRole}`
+                                    : agent.agentName}
+                                </Typography>
+                                <Typography
+                                  variant="caption"
+                                  sx={{
+                                    color: "text.secondary",
+                                  }}
+                                >
+                                  {agent.modelName ||
+                                    (agent.isSpecialist
+                                      ? "Specialist model"
+                                      : "Auto agent")}
+                                </Typography>
+                              </Box>
+                              <Stack
+                                direction="row"
+                                spacing={0.75}
+                                useFlexGap
+                                sx={{
+                                  flexWrap: "wrap",
+                                }}
+                              >
+                                <Chip
+                                  size="small"
+                                  color={swarmStatusChipColor(agent.status)}
+                                  label={swarmStatusLabel(agent.status)}
+                                  sx={{ height: 22 }}
+                                />
+                                {agent.elapsedMs ? (
+                                  <Chip
+                                    size="small"
+                                    variant="outlined"
+                                    label={formatSwarmElapsedMs(
+                                      agent.elapsedMs,
+                                    )}
+                                    sx={{ height: 22 }}
+                                  />
+                                ) : null}
+                              </Stack>
+                            </Stack>
+                            {agent.task ? (
+                              <Typography
+                                variant="body2"
+                                className="swarm-agent-task"
+                                sx={{ color: "var(--button-text)" }}
+                              >
+                                {agent.task}
+                              </Typography>
+                            ) : null}
+                            <Typography
+                              variant="caption"
+                              className="swarm-agent-update"
+                              sx={{
+                                color: "text.secondary",
+                              }}
+                            >
+                              {agentUpdate || "Waiting for the next update."}
+                            </Typography>
+                            {agentPayloadView ? (
+                              <ActivityPayloadDisclosure
+                                payload={agentPayloadView}
+                                expanded={expandedPayloads.has(agentPayloadId)}
+                                onToggle={() => onTogglePayload(agentPayloadId)}
+                                controlsId={payloadControlsId}
+                              />
+                            ) : null}
+                          </Stack>
+                        </Box>
+                      </Grid2>
+                    );
+                  })}
+                </Grid2>
+              </Stack>
+            </Box>
+          );
+        })}
+      </Stack>
+    </Box>
+  );
+}
+
+function extractPhaseStatusFromProgress(
+  name: string,
+  payload: unknown,
+  fallbackDetail = "",
+): StreamPhaseStatus | null {
+  const payloadObj = asRecord(payload);
+  if (str(payloadObj.kind, "") !== "phase_status") return null;
+  const phase = str(payloadObj.phase, "").trim();
+  const label = str(payloadObj.label, "").trim() || "Working";
+  const detail = str(payloadObj.detail, fallbackDetail).trim();
+  const status = str(payloadObj.status, "running").trim().toLowerCase();
+  const planStepId =
+    typeof payloadObj.plan_step_id === "number"
+      ? payloadObj.plan_step_id
+      : num(payloadObj.plan_step_id, 0);
+  return {
+    toolName: name,
+    phase,
+    label,
+    detail,
+    status: ["completed", "failed", "skipped", "running"].includes(status)
+      ? status
+      : "running",
+    elapsedSecs: Math.max(0, num(payloadObj.elapsed_secs, 0)),
+    streamKey: str(
+      payloadObj.stream_key,
+      `phase-status:${name || "tool"}:${phase || "unknown"}`,
+    ),
+    planStepId: planStepId > 0 ? planStepId : null,
+    planStepTitle: str(payloadObj.plan_step_title, "").trim(),
+  };
+}
+
+function extractPhaseStatusFromActivityStep(
+  step: JsonRecord,
+): StreamPhaseStatus | null {
+  if (str(step.step_type, "").trim().toLowerCase() !== "tool_progress")
+    return null;
+  const payloadObj = parseTraceDataRecord(step.data);
+  const toolName = str(payloadObj.tool_name, "").trim();
+  if (!toolName) return null;
+  return extractPhaseStatusFromProgress(
+    toolName,
+    payloadObj,
+    str(step.detail, ""),
+  );
+}
+
+function summarizeRunStatusDegradation(notes: unknown): string {
+  if (!Array.isArray(notes)) return "";
+  const unique = Array.from(
+    new Set(
+      notes
+        .map((entry) => asRecord(entry))
+        .flatMap((entry) => [
+          str(entry.summary, "").trim(),
+          str(entry.detail, "").trim(),
+        ])
+        .filter(Boolean),
+    ),
+  );
+  return summarizeActivityDetail(unique.slice(0, 2).join(" "));
+}
+
+function shouldSurfaceRunStatusStep(
+  runStatus: string,
+  requestState: string,
+  outcomeStatus: string,
+): boolean {
+  return [runStatus, requestState, outcomeStatus].some((value) =>
+    [
+      "completed",
+      "degraded",
+      "blocked",
+      "cancelled",
+      "platform_failed",
+      "service_unavailable",
+      "hard_service_outage",
+      "needs_input",
+      "needs_stronger_model",
+      "needs_credentials",
+      "needs_permission",
+      "needs_integration",
+      "needs_clarification",
+    ].includes(value),
+  );
+}
+
+function buildRunStatusActivityStep(
+  payloadValue: unknown,
+  timestamp = "",
+): JsonRecord | null {
+  const payload = asRecord(payloadValue);
+  const nested = asRecord(payload.payload);
+  const userOutcome = asRecord(payload.user_outcome ?? nested.user_outcome);
+  const runStatus = str(
+    payload.run_status,
+    str(payload.status, str(nested.status, str(payload.stage, ""))),
+  )
+    .trim()
+    .toLowerCase();
+  const requestState = str(
+    userOutcome.request_state,
+    str(nested.request_state, ""),
+  )
+    .trim()
+    .toLowerCase();
+  const outcomeStatus = str(
+    userOutcome.status,
+    str(nested.user_outcome_status, ""),
+  )
+    .trim()
+    .toLowerCase();
+
+  if (!shouldSurfaceRunStatusStep(runStatus, requestState, outcomeStatus)) {
+    return null;
+  }
+
+  const effectiveStatus =
+    outcomeStatus === "service_unavailable" ||
+    requestState === "hard_service_outage"
+      ? "service_unavailable"
+      : requestState === "needs_credentials"
+        ? requestState
+        : runStatus || requestState || outcomeStatus;
+  const detail =
+    summarizeActivityDetail(
+      str(userOutcome.message, "").trim() ||
+        str(nested.error, "").trim() ||
+        str(payload.error, "").trim() ||
+        summarizeRunStatusDegradation(
+          payload.degradation ?? nested.degradation ?? userOutcome.degradation,
+        ) ||
+        str(nested.response_preview, "").trim() ||
+        str(payload.summary, "").trim() ||
+        str(payload.detail, "").trim(),
+    ) || "Run status updated.";
+
+  return {
+    step_type: "run_status",
+    title: `Run status: ${(effectiveStatus || "updated").replace(/_/g, " ")}`,
+    detail,
+    data: payload,
+    timestamp,
+  };
+}
+
+function buildPersistedRunSteps(events: JsonRecord[]): JsonRecord[] {
+  const steps: JsonRecord[] = [];
+  for (const rawEvent of events) {
+    const event = asRecord(rawEvent);
+    const kind = str(event.kind, "").trim().toLowerCase();
+    const payload = asRecord(event.payload);
+    const timestamp = str(event.ts, "");
+    if (!kind) continue;
+
+    if (kind === "thinking") {
+      const stepType = str(payload.step_type, "thinking").trim() || "thinking";
+      steps.push({
+        step_type: stepType,
+        title:
+          str(payload.title, "").trim() ||
+          (stepType === "heartbeat" ? "Working" : "Thinking"),
+        detail: normalizeHeartbeatDetailText(str(payload.detail, "")),
+        data: payload,
+        timestamp,
+      });
+      continue;
+    }
+
+    if (kind === "tool_start") {
+      const name = str(payload.name, "");
+      const inner = asRecord(payload.payload);
+      steps.push({
+        step_type: "tool_start",
+        title: `Tool started: ${name || "tool"}`,
+        detail: compactUnknown(inner, 240) || `Starting ${name || "tool"}.`,
+        data: Object.keys(inner).length > 0 ? inner : payload,
+        timestamp,
+      });
+      continue;
+    }
+
+    if (kind === "tool_progress") {
+      const name = str(payload.name, "");
+      const content = str(payload.content, "");
+      const inner = asRecord(payload.payload);
+      const presentation = buildToolProgressPresentation(
+        name,
+        content,
+        inner,
+        "",
+      );
+      steps.push({
+        step_type: "tool_progress",
+        title: presentation.title,
+        detail: presentation.detail,
+        data: Object.keys(inner).length > 0 ? inner : payload,
+        ...(presentation.streamKey
+          ? { __streamKey: presentation.streamKey }
+          : {}),
+        timestamp,
+      });
+      continue;
+    }
+
+    if (kind === "tool_result") {
+      const name = str(payload.name, "");
+      const content = str(payload.content, "");
+      steps.push({
+        step_type: "tool_result",
+        title: `Tool finished: ${name || "tool"}`,
+        detail: summarizeActivityDetail(content),
+        data: payload,
+        timestamp,
+      });
+      continue;
+    }
+
+    if (kind === "plan_generated" || kind === "plan_revised") {
+      const normalizedPlan = normalizeExecutionPlanState(payload.plan);
+      steps.push({
+        step_type: kind,
+        title:
+          kind === "plan_generated"
+            ? "Execution Plan"
+            : "Execution Plan Revised",
+        detail:
+          kind === "plan_generated"
+            ? `${normalizedPlan?.steps.length || 0} steps planned`
+            : str(payload.reason, "Execution plan revised."),
+        plan: payload.plan,
+        data: payload,
+        timestamp,
+      });
+      continue;
+    }
+
+    if (kind === "plan_unavailable" || kind === "plan_step_update") {
+      steps.push({
+        step_type: kind,
+        title:
+          kind === "plan_unavailable"
+            ? "Execution Plan Unavailable"
+            : "Plan Step Update",
+        detail:
+          kind === "plan_unavailable"
+            ? str(payload.reason, "Structured planning was unavailable.")
+            : str(payload.detail, `Updated step ${num(payload.step_id, 0)}`),
+        data: payload,
+        timestamp,
+      });
+      continue;
+    }
+
+    if (kind === "run_status") {
+      const runStatusStep = buildRunStatusActivityStep(payload, timestamp);
+      if (runStatusStep) steps.push(runStatusStep);
+    }
+  }
+  return steps;
+}
+
+function isHumanReadableStatus(detail: string): boolean {
+  const trimmed = (detail || "").trim();
+  if (!trimmed || trimmed.length > 120) return false;
+  if (looksLikeHtmlPayload(trimmed) || looksLikeSourcePayload(trimmed))
+    return false;
+  if (
+    (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+    (trimmed.startsWith("[") && trimmed.endsWith("]"))
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function isSafetyPolicyBlockedText(text: string): boolean {
+  return /blocked by safety policy/i.test(text || "");
+}
+
+function formatBytes(value: unknown): string {
+  const bytes = num(value, -1);
+  if (bytes < 0) return "-";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024)
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+function sanitizeWorkspaceAppSnapshot(value: unknown): JsonRecord | null {
+  const source = asRecord(value);
+  const next: JsonRecord = {};
+  for (const key of [
+    "id",
+    "app_id",
+    "title",
+    "url",
+    "access_url",
+    "local_url",
+    "local_access_url",
+    "app_dir",
+    "runtime_mode",
+    "created_at",
+  ]) {
+    const text = str(source[key], "").trim();
+    if (text) next[key] = text;
+  }
+  for (const key of [
+    "enabled",
+    "running",
+    "is_static",
+    "access_guard_enabled",
+    "expose_public",
+  ]) {
+    if (typeof source[key] === "boolean") next[key] = source[key];
+  }
+  if (typeof source.port === "number" && Number.isFinite(source.port)) {
+    next.port = source.port;
+  }
+  return Object.keys(next).length > 0 ? next : null;
+}
+
+function compactWorkspaceFilesForSnapshot(
+  files: WorkspaceFileEntry[],
+  options?: { includeContent?: boolean },
+): WorkspaceFileEntry[] {
+  const out: WorkspaceFileEntry[] = [];
+  let totalChars = 0;
+  const includeContent = options?.includeContent !== false;
+  for (const file of files) {
+    const name = str(file?.name, "").trim();
+    if (!name) continue;
+    const remaining = CHAT_WORKSPACE_SNAPSHOT_MAX_TOTAL_CHARS - totalChars;
+    if (remaining <= 0 || out.length >= CHAT_WORKSPACE_SNAPSHOT_MAX_FILES)
+      break;
+    const content = includeContent
+      ? str(file?.content, "").slice(
+          0,
+          Math.min(CHAT_WORKSPACE_SNAPSHOT_MAX_FILE_CHARS, remaining),
+        )
+      : "";
+    totalChars += content.length;
+    out.push({ name, content });
+  }
+  return out;
+}
+
+function compactLiveFileWritesForSnapshot(
+  liveFileWrites: Record<string, LiveFileWriteState>,
+  options?: { includeContent?: boolean },
+): Record<string, LiveFileWriteState> {
+  const out: Record<string, LiveFileWriteState> = {};
+  let totalChars = 0;
+  const includeContent = options?.includeContent !== false;
+  for (const [name, state] of Object.entries(liveFileWrites)) {
+    const fileName = str(name, "").trim();
+    if (!fileName) continue;
+    const remaining = CHAT_WORKSPACE_SNAPSHOT_MAX_TOTAL_CHARS - totalChars;
+    if (
+      remaining <= 0 ||
+      Object.keys(out).length >= CHAT_WORKSPACE_SNAPSHOT_MAX_FILES
+    )
+      break;
+    const content = includeContent
+      ? str(state?.content, "").slice(
+          0,
+          Math.min(CHAT_WORKSPACE_SNAPSHOT_MAX_FILE_CHARS, remaining),
+        )
+      : "";
+    totalChars += content.length;
+    out[fileName] = {
+      content,
+      line: Math.max(0, num(state?.line, 0)),
+      totalLines: Math.max(0, num(state?.totalLines, 0)),
+      done: toBool(state?.done),
+    };
+  }
+  return out;
+}
+
+function loadStoredChatWorkspaceSnapshots(): Record<
+  string,
+  ChatWorkspaceSnapshot
+> {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = window.sessionStorage.getItem(
+      CHAT_WORKSPACE_SNAPSHOTS_STORAGE_KEY,
+    );
+    if (!raw) return {};
+    const parsed = asRecord(JSON.parse(raw));
+    const now = Date.now();
+    const next: Record<string, ChatWorkspaceSnapshot> = {};
+    for (const [conversationId, value] of Object.entries(parsed)) {
+      const entry = asRecord(value);
+      const updatedAt = num(entry.updatedAt, 0);
+      if (
+        !conversationId.trim() ||
+        updatedAt <= 0 ||
+        now - updatedAt > CHAT_WORKSPACE_SNAPSHOT_TTL_MS
+      ) {
+        continue;
+      }
+      const deployedFiles = Array.isArray(entry.deployedFiles)
+        ? compactWorkspaceFilesForSnapshot(
+            entry.deployedFiles.map((row) => ({
+              name: str(asRecord(row).name, ""),
+              content: str(asRecord(row).content, ""),
+            })),
+          )
+        : [];
+      const liveFileWrites = compactLiveFileWritesForSnapshot(
+        Object.fromEntries(
+          Object.entries(asRecord(entry.liveFileWrites)).map(([name, row]) => {
+            const state = asRecord(row);
+            return [
+              name,
+              {
+                content: str(state.content, ""),
+                line: Math.max(0, num(state.line, 0)),
+                totalLines: Math.max(0, num(state.totalLines, 0)),
+                done: toBool(state.done),
+              } satisfies LiveFileWriteState,
+            ];
+          }),
+        ),
+      );
+      const streamedWorkspaceApp = sanitizeWorkspaceAppSnapshot(
+        entry.streamedWorkspaceApp,
+      );
+      next[conversationId] = {
+        conversationId,
+        updatedAt,
+        deployedFiles,
+        liveFileWrites,
+        streamedWorkspaceApp,
+        codeViewerFileIdx: Math.max(0, num(entry.codeViewerFileIdx, 0)),
+      };
+    }
+    return next;
+  } catch {
+    return {};
+  }
+}
+
+function saveStoredChatWorkspaceSnapshots(
+  snapshots: Record<string, ChatWorkspaceSnapshot>,
+): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.sessionStorage.setItem(
+      CHAT_WORKSPACE_SNAPSHOTS_STORAGE_KEY,
+      JSON.stringify(snapshots),
+    );
+  } catch {
+    // Ignore storage quota failures.
+  }
+}
+
+function loadChatWorkspaceSnapshot(
+  conversationId: string,
+): ChatWorkspaceSnapshot | null {
+  if (!conversationId) return null;
+  return loadStoredChatWorkspaceSnapshots()[conversationId] || null;
+}
+
+function storeChatWorkspaceSnapshot(snapshot: ChatWorkspaceSnapshot): void {
+  if (!snapshot.conversationId) return;
+  const snapshots = loadStoredChatWorkspaceSnapshots();
+  snapshots[snapshot.conversationId] = snapshot;
+  const trimmedEntries = Object.entries(snapshots)
+    .sort((a, b) => b[1].updatedAt - a[1].updatedAt)
+    .slice(0, CHAT_WORKSPACE_SNAPSHOT_MAX_CONVERSATIONS);
+  saveStoredChatWorkspaceSnapshots(Object.fromEntries(trimmedEntries));
+}
+
+function clearChatWorkspaceSnapshot(conversationId: string): void {
+  if (!conversationId || typeof window === "undefined") return;
+  const snapshots = loadStoredChatWorkspaceSnapshots();
+  if (!snapshots[conversationId]) return;
+  delete snapshots[conversationId];
+  saveStoredChatWorkspaceSnapshots(snapshots);
+}
+
+function sanitizeChatTurnAttachments(raw: unknown): ChatTurnAttachment[] {
+  const seen = new Set<string>();
+  const out: ChatTurnAttachment[] = [];
+  if (!Array.isArray(raw)) return out;
+  for (const item of raw) {
+    const record = asRecord(item);
+    const name = str(record.name, str(record.filename, "")).trim();
+    if (!name) continue;
+    const kindRaw = str(record.kind, "").trim().toLowerCase();
+    const kind =
+      kindRaw === "document" || kindRaw === "visual" ? kindRaw : "file";
+    const id = str(record.id, "").trim();
+    const detail = str(record.detail, str(record.contentType, "")).trim();
+    const key = `${kind}:${id || name}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      name: name.slice(0, 220),
+      kind,
+      ...(id ? { id: id.slice(0, 160) } : {}),
+      ...(detail ? { detail: detail.slice(0, 160) } : {}),
+    });
+  }
+  return out.slice(0, 12);
+}
+
+function chatTurnAttachmentsFromFiles(files: File[]): ChatTurnAttachment[] {
+  return sanitizeChatTurnAttachments(
+    files.map((file) => ({
+      name: file.name,
+      kind: isVisualChatAttachment(file) ? "visual" : "file",
+      detail: file.type || "",
+    })),
+  );
+}
+
+function normalizeChatPendingRunSnapshot(
+  raw: unknown,
+): ChatPendingRunSnapshot | null {
+  if (!raw || typeof raw !== "object") return null;
+  const parsed = raw as Partial<ChatPendingRunSnapshot>;
+  const conversationId =
+    typeof parsed.conversationId === "string"
+      ? parsed.conversationId.trim()
+      : "";
+  const startedAt = typeof parsed.startedAt === "number" ? parsed.startedAt : 0;
+  if (!conversationId || startedAt <= 0) return null;
+  if (Date.now() - startedAt > CHAT_PENDING_RUN_TTL_MS) return null;
+  const streamingResponse =
+    typeof parsed.streamingResponse === "string"
+      ? parsed.streamingResponse.slice(
+          0,
+          CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS,
+        )
+      : "";
+  const streamingSteps = Array.isArray(parsed.streamingSteps)
+    ? asRecords(parsed.streamingSteps)
+        .slice(-CHAT_PENDING_STREAM_STEPS_MAX)
+        .map((rawStep) => {
+          const normalized: JsonRecord = {};
+          const icon = str(rawStep.icon, "").trim();
+          const title = str(rawStep.title, "").trim();
+          const detail = str(rawStep.detail, "").trim();
+          const stepType = str(rawStep.step_type, "").trim();
+          const source = str(rawStep.source, "").trim();
+          const data = compactUnknown(rawStep.data, 800);
+          if (icon) normalized.icon = icon.slice(0, 64);
+          if (title) normalized.title = title.slice(0, 220);
+          if (detail) normalized.detail = detail.slice(0, 900);
+          if (stepType) normalized.step_type = stepType.slice(0, 80);
+          if (source) normalized.source = source.slice(0, 80);
+          if (data) normalized.data = data;
+          return normalized;
+        })
+    : [];
+  const runId = typeof parsed.runId === "string" ? parsed.runId : "";
+  const lastRunSeq =
+    typeof parsed.lastRunSeq === "number" && Number.isFinite(parsed.lastRunSeq)
+      ? Math.max(0, Math.floor(parsed.lastRunSeq))
+      : 0;
+  const initialMessageCount =
+    typeof parsed.initialMessageCount === "number" &&
+    Number.isFinite(parsed.initialMessageCount)
+      ? Math.max(0, Math.floor(parsed.initialMessageCount))
+      : undefined;
+  const parsedPhase =
+    parsed.phase === "interrupted"
+      ? "interrupted"
+      : parsed.phase === "awaiting_confirmation"
+        ? "awaiting_confirmation"
+        : "running";
+  const phase =
+    parsedPhase === "running" &&
+    !runId.trim() &&
+    Date.now() - startedAt > CHAT_PENDING_RUN_RECOVERY_GRACE_MS
+      ? "interrupted"
+      : parsedPhase;
+  return {
+    conversationId,
+    message: typeof parsed.message === "string" ? parsed.message : "",
+    projectId: typeof parsed.projectId === "string" ? parsed.projectId : "",
+    startedAt,
+    ...(initialMessageCount !== undefined ? { initialMessageCount } : {}),
+    runId,
+    mode: parsed.mode === "resume" ? "resume" : "fresh",
+    phase,
+    taskId: typeof parsed.taskId === "string" ? parsed.taskId : "",
+    streamingResponse,
+    streamingSteps,
+    failedUserMessage:
+      typeof parsed.failedUserMessage === "string"
+        ? parsed.failedUserMessage
+        : "",
+    lastRunSeq,
+    attachments: sanitizeChatTurnAttachments(parsed.attachments),
+  };
+}
+
+function loadChatStoredRunSnapshot(
+  storageKey: string,
+): ChatPendingRunSnapshot | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw =
+      window.localStorage.getItem(storageKey) ??
+      window.sessionStorage.getItem(storageKey);
+    if (!raw) return null;
+    const normalized = normalizeChatPendingRunSnapshot(JSON.parse(raw));
+    if (normalized) return normalized;
+    window.localStorage.removeItem(storageKey);
+    window.sessionStorage.removeItem(storageKey);
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function loadChatPendingLaunch(): ChatPendingLaunch | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.sessionStorage.getItem(CHAT_PENDING_LAUNCH_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<ChatPendingLaunch>;
+    const createdAt =
+      typeof parsed.createdAt === "number" ? parsed.createdAt : 0;
+    if (createdAt <= 0 || Date.now() - createdAt > CHAT_PENDING_RUN_TTL_MS) {
+      window.sessionStorage.removeItem(CHAT_PENDING_LAUNCH_STORAGE_KEY);
+      return null;
+    }
+    const launchMode =
+      parsed.launchMode === "resume_task" ? "resume_task" : "message";
+    const message = typeof parsed.message === "string" ? parsed.message : "";
+    const taskId =
+      typeof parsed.taskId === "string" ? parsed.taskId.trim() : "";
+    if (launchMode === "resume_task" && !taskId) {
+      window.sessionStorage.removeItem(CHAT_PENDING_LAUNCH_STORAGE_KEY);
+      return null;
+    }
+    if (launchMode === "message" && !message.trim()) {
+      window.sessionStorage.removeItem(CHAT_PENDING_LAUNCH_STORAGE_KEY);
+      return null;
+    }
+    return {
+      createdAt,
+      launchMode,
+      message,
+      conversationId:
+        typeof parsed.conversationId === "string" ? parsed.conversationId : "",
+      projectId: typeof parsed.projectId === "string" ? parsed.projectId : "",
+      taskId,
+      source: typeof parsed.source === "string" ? parsed.source : "",
+    };
+  } catch {
+    return null;
+  }
+}
+
+function loadChatPendingRunSnapshot(): ChatPendingRunSnapshot | null {
+  return loadChatStoredRunSnapshot(CHAT_PENDING_RUN_STORAGE_KEY);
+}
+
+function loadChatBackgroundRunSnapshots(): ChatPendingRunSnapshotMap {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw =
+      window.localStorage.getItem(CHAT_BACKGROUND_RUN_STORAGE_KEY) ??
+      window.sessionStorage.getItem(CHAT_BACKGROUND_RUN_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as unknown;
+    const snapshots: ChatPendingRunSnapshotMap = {};
+    const addSnapshot = (candidate: unknown, fallbackConversationId = "") => {
+      const normalized = normalizeChatPendingRunSnapshot(candidate);
+      const conversationId =
+        normalized?.conversationId || fallbackConversationId.trim();
+      if (!normalized || !conversationId) return;
+      snapshots[conversationId] = {
+        ...normalized,
+        conversationId,
+      };
+    };
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const record = parsed as Record<string, unknown>;
+      if (typeof record.conversationId === "string") {
+        addSnapshot(parsed);
+      } else {
+        for (const [conversationId, value] of Object.entries(record)) {
+          addSnapshot(value, conversationId);
+        }
+      }
+    }
+    return snapshots;
+  } catch {
+    return {};
+  }
+}
+
+function storeChatPendingRunSnapshot(
+  snapshot: ChatPendingRunSnapshot | null,
+): void {
+  storeChatStoredRunSnapshot(CHAT_PENDING_RUN_STORAGE_KEY, snapshot);
+}
+
+function storeChatBackgroundRunSnapshots(
+  snapshots: ChatPendingRunSnapshotMap,
+): void {
+  if (typeof window === "undefined") return;
+  try {
+    const trimmedEntries = Object.entries(snapshots)
+      .filter(([conversationId, snapshot]) => {
+        const normalizedConversationId = conversationId.trim();
+        return (
+          !!normalizedConversationId &&
+          !!snapshot &&
+          snapshot.conversationId.trim() === normalizedConversationId
+        );
+      })
+      .sort((a, b) => b[1].startedAt - a[1].startedAt)
+      .slice(0, CHAT_BACKGROUND_RUN_SNAPSHOTS_MAX);
+    if (trimmedEntries.length === 0) {
+      window.localStorage.removeItem(CHAT_BACKGROUND_RUN_STORAGE_KEY);
+      window.sessionStorage.removeItem(CHAT_BACKGROUND_RUN_STORAGE_KEY);
+      return;
+    }
+    window.localStorage.setItem(
+      CHAT_BACKGROUND_RUN_STORAGE_KEY,
+      JSON.stringify(Object.fromEntries(trimmedEntries)),
+    );
+    window.sessionStorage.removeItem(CHAT_BACKGROUND_RUN_STORAGE_KEY);
+  } catch {
+    // Ignore storage failures.
+  }
+}
+
+function storeChatStoredRunSnapshot(
+  storageKey: string,
+  snapshot: ChatPendingRunSnapshot | null,
+): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (!snapshot) {
+      window.localStorage.removeItem(storageKey);
+      window.sessionStorage.removeItem(storageKey);
+      return;
+    }
+    const serialized = JSON.stringify(snapshot);
+    window.localStorage.setItem(storageKey, serialized);
+    window.sessionStorage.removeItem(storageKey);
+  } catch {
+    // Ignore storage failures.
+  }
+}
+
+function clearChatStoredRunSnapshotForConversation(
+  storageKey: string,
+  conversationId: string,
+): void {
+  if (!conversationId || typeof window === "undefined") return;
+  const snapshot = loadChatStoredRunSnapshot(storageKey);
+  if (!snapshot || snapshot.conversationId !== conversationId) return;
+  try {
+    window.localStorage.removeItem(storageKey);
+    window.sessionStorage.removeItem(storageKey);
+  } catch {
+    // Ignore storage failures.
+  }
+}
+
+function clearChatStoredBackgroundRunSnapshot(conversationId: string): void {
+  if (!conversationId || typeof window === "undefined") return;
+  const snapshots = loadChatBackgroundRunSnapshots();
+  if (!snapshots[conversationId]) return;
+  delete snapshots[conversationId];
+  storeChatBackgroundRunSnapshots(snapshots);
+}
+
+function storeChatPendingLaunch(snapshot: ChatPendingLaunch | null): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (!snapshot) {
+      window.sessionStorage.removeItem(CHAT_PENDING_LAUNCH_STORAGE_KEY);
+      return;
+    }
+    window.sessionStorage.setItem(
+      CHAT_PENDING_LAUNCH_STORAGE_KEY,
+      JSON.stringify(snapshot),
+    );
+  } catch {
+    // Ignore storage failures.
+  }
+}
+
+function extractChatTurnAttachments(text: string): ChatTurnAttachment[] {
+  const source = str(text, "");
+  if (!source) return [];
+  const out: ChatTurnAttachment[] = [];
+  const docMatch = source.match(
+    /\[Attached documents indexed for retrieval:\s*([\s\S]*?)\]/i,
+  );
+  if (docMatch) {
+    const body = docMatch[1] || "";
+    const filesPart = body.match(/(?:^|;)\s*files:\s*([\s\S]*)$/i)?.[1] || "";
+    const refsPart = body.split(/;\s*files:/i)[0] || "";
+    const ids = Array.from(refsPart.matchAll(/\bdoc:([A-Za-z0-9_-]+)/g)).map(
+      (match) => match[1],
+    );
+    filesPart
+      .split(/\s*,\s*/)
+      .map((name) => name.trim())
+      .filter(Boolean)
+      .forEach((name, idx) => {
+        out.push({
+          name,
+          kind: "document",
+          ...(ids[idx] ? { id: ids[idx] } : {}),
+        });
+      });
+  }
+  const visualMatch = source.match(
+    /\[Attached visual files available to vision\/OCR tools:\s*([\s\S]*?)\]/i,
+  );
+  if (visualMatch) {
+    const body = visualMatch[1] || "";
+    for (const match of body.matchAll(/\bupload_id:([^\s,]+)\s*\(([^)]*)\)/g)) {
+      const id = match[1] || "";
+      const rawMeta = match[2] || "";
+      const splitAt = rawMeta.lastIndexOf(",");
+      const name =
+        splitAt >= 0 ? rawMeta.slice(0, splitAt).trim() : rawMeta.trim();
+      const detail = splitAt >= 0 ? rawMeta.slice(splitAt + 1).trim() : "";
+      if (!name) continue;
+      out.push({
+        name,
+        kind: "visual",
+        ...(id ? { id } : {}),
+        ...(detail ? { detail } : {}),
+      });
+    }
+  }
+  return sanitizeChatTurnAttachments(out);
+}
+
+function stripAttachmentContextMarker(text: string): string {
+  return text
+    .replace(
+      /\n\n\[Attached documents indexed for retrieval:[\s\S]*?\]/gi,
+      "",
+    )
+    .replace(
+      /\n\n\[Attached visual files available to vision\/OCR tools:[\s\S]*?\]/gi,
+      "",
+    )
+    .trimEnd();
+}
+
+type ChatMarkdownBlock =
+  | { type: "heading"; level: number; text: string }
+  | { type: "code"; language: string; content: string }
+  | { type: "ul"; items: string[] }
+  | { type: "ol"; items: string[] }
+  | { type: "paragraph"; text: string };
+
+function lineStartsMarkdownBlock(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return true;
+  if (/^#{1,6}\s+/.test(trimmed)) return true;
+  if (/^```/.test(trimmed)) return true;
+  if (/^[-*]\s+/.test(trimmed)) return true;
+  if (/^\d+\.\s+/.test(trimmed)) return true;
+  return false;
+}
+
+function formatCompactValue(value: unknown): {
+  text: string;
+  tooltip?: string;
+} {
+  if (value == null) return { text: "-" };
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (looksLikeIsoTimestamp(trimmed)) {
+      const meta = formatUiDateTimeMeta(trimmed, { fallback: "-" });
+      return { text: meta.label, tooltip: meta.tip };
+    }
+    if (looksLikeIsoDateOnly(trimmed)) {
+      const text = formatUiDateOnly(trimmed, { fallback: "-" });
+      const tooltip = formatUiDateOnly(trimmed, {
+        fallback: "-",
+        includeYear: true,
+      });
+      return { text, tooltip };
+    }
+    return { text: value };
+  }
+  if (typeof value === "number")
+    return { text: Number.isFinite(value) ? String(value) : "-" };
+  if (typeof value === "boolean") return { text: value ? "true" : "false" };
+
+  if (Array.isArray(value)) {
+    const items = value
+      .slice(0, 5)
+      .map((v) =>
+        typeof v === "string"
+          ? v
+          : typeof v === "number"
+            ? String(v)
+            : typeof v === "boolean"
+              ? v
+                ? "true"
+                : "false"
+              : "...",
+      )
+      .join(", ");
+    const suffix = value.length > 5 ? ` +${value.length - 5} more` : "";
+    return {
+      text: items ? `${items}${suffix}` : `${value.length} items`,
+      tooltip: items || undefined,
+    };
+  }
+
+  if (typeof value === "object") {
+    const rec = asRecord(value);
+    const title =
+      str(rec.title, "") ||
+      str(rec.name, "") ||
+      str(rec.label, "") ||
+      str(rec.description, "");
+    const id = str(rec.id, "");
+    if (title) return { text: title, tooltip: id ? `ID: ${id}` : undefined };
+    // Summarise scalar fields as readable text
+    const scalars = Object.entries(rec)
+      .filter(
+        ([, v]) =>
+          typeof v === "string" ||
+          typeof v === "number" ||
+          typeof v === "boolean",
+      )
+      .slice(0, 4)
+      .map(
+        ([k, v]) =>
+          `${k}: ${typeof v === "string" && String(v).length > 30 ? `${String(v).slice(0, 30)}...` : String(v)}`,
+      );
+    if (scalars.length > 0) {
+      const keys = Object.keys(rec);
+      const more =
+        keys.length > scalars.length
+          ? ` (+${keys.length - scalars.length} fields)`
+          : "";
+      return {
+        text: scalars.join(", ") + more,
+        tooltip: `Fields: ${keys.join(", ")}`,
+      };
+    }
+    const keys = Object.keys(rec);
+    return {
+      text: keys.length ? `${keys.length} fields` : "-",
+      tooltip: keys.length ? `Fields: ${keys.join(", ")}` : undefined,
+    };
+  }
+
+  return { text: String(value) };
+}
+
+function looksLikeUrl(value: string): boolean {
+  const v = (value || "").trim();
+  return v.startsWith("http://") || v.startsWith("https://");
+}
+
+function normalizeOutboundHref(value?: string): string | null {
+  const trimmed = (value || "").trim();
+  if (!trimmed) return null;
+  const lower = trimmed.toLowerCase();
+  if (
+    lower.startsWith("javascript:") ||
+    lower.startsWith("data:") ||
+    lower.startsWith("vbscript:")
+  ) {
+    return null;
+  }
+  if (looksLikeUrl(trimmed)) return trimmed;
+  if (trimmed.startsWith("//")) return `https:${trimmed}`;
+  if (/^[a-z0-9.-]+\.[a-z]{2,}(?:[/:?#]|$)/i.test(trimmed)) {
+    return `https://${trimmed}`;
+  }
+  return null;
+}
+
+function renderInlineMarkdown(text: string): ReactNode[] {
+  const source = text || "";
+  if (!source) return [];
+  const tokenRegex =
+    /(`[^`\n]+`|\*\*[^*]+?\*\*|__[^_]+?__|\*[^*\n]+?\*|_[^_\n]+?_|(?:https?:\/\/[^\s<>()]+)|\[[^\]]+\]\(([^)\s]+)\))/g;
+  const nodes: ReactNode[] = [];
+  let index = 0;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null = null;
+
+  const pushText = (value: string) => {
+    if (!value) return;
+    nodes.push(<span key={`t-${index++}`}>{value}</span>);
+  };
+
+  while ((match = tokenRegex.exec(source)) !== null) {
+    const token = match[0];
+    const start = match.index;
+    if (start > lastIndex) pushText(source.slice(lastIndex, start));
+
+    if (token.startsWith("`") && token.endsWith("`")) {
+      nodes.push(
+        <code key={`c-${index++}`} className="chat-md-inline-code">
+          {token.slice(1, -1)}
+        </code>,
+      );
+    } else if (
+      (token.startsWith("**") && token.endsWith("**")) ||
+      (token.startsWith("__") && token.endsWith("__"))
+    ) {
+      nodes.push(<strong key={`b-${index++}`}>{token.slice(2, -2)}</strong>);
+    } else if (
+      (token.startsWith("*") && token.endsWith("*")) ||
+      (token.startsWith("_") && token.endsWith("_"))
+    ) {
+      nodes.push(<em key={`i-${index++}`}>{token.slice(1, -1)}</em>);
+    } else if (token.startsWith("[")) {
+      const linkMatch = token.match(/^\[([^\]]+)\]\(([^)\s]+)\)$/);
+      if (linkMatch) {
+        const rawHref = linkMatch[2].trim();
+        const normalizedHref = normalizeOutboundHref(rawHref);
+        if (!normalizedHref) {
+          pushText(token);
+          lastIndex = tokenRegex.lastIndex;
+          continue;
+        }
+        nodes.push(
+          <a
+            key={`l-${index++}`}
+            href={normalizedHref}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="chat-md-link"
+            onClick={handleChatLinkClick}
+          >
+            {linkMatch[1]}
+          </a>,
+        );
+      } else {
+        pushText(token);
+      }
+    } else if (token.startsWith("http://") || token.startsWith("https://")) {
+      const { href, trailing } = splitUrlTrailingPunctuation(token);
+      const normalizedHref = normalizeOutboundHref(href);
+      if (!normalizedHref) {
+        pushText(token);
+        lastIndex = tokenRegex.lastIndex;
+        continue;
+      }
+      nodes.push(
+        <a
+          key={`u-${index++}`}
+          href={normalizedHref}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="chat-md-link"
+          onClick={handleChatLinkClick}
+        >
+          {normalizedHref}
+        </a>,
+      );
+      if (trailing) pushText(trailing);
+    } else {
+      pushText(token);
+    }
+
+    lastIndex = tokenRegex.lastIndex;
+  }
+
+  if (lastIndex < source.length) pushText(source.slice(lastIndex));
+  return nodes;
+}
+
+function renderMarkdownLineBreaks(text: string): ReactNode[] {
+  const lines = (text || "").split("\n");
+  const out: ReactNode[] = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    out.push(
+      <span key={`line-${i}`}>{renderInlineMarkdown(lines[i] || "")}</span>,
+    );
+    if (i < lines.length - 1) out.push(<br key={`br-${i}`} />);
+  }
+  return out;
+}
+
+function splitUrlTrailingPunctuation(
+  value: string,
+): { href: string; trailing: string } {
+  let href = value;
+  let trailing = "";
+  while (href.length > 0 && /[.,!?;:)]/.test(href[href.length - 1] || "")) {
+    trailing = `${href[href.length - 1]}${trailing}`;
+    href = href.slice(0, -1);
+  }
+  return { href, trailing };
+}
+
+function handleChatLinkClick(event: React.MouseEvent<HTMLElement>): void {
+  // Keep the click from bubbling to any parent bubble/list-row handler, but
+  // let the native anchor (`target="_blank"` with `rel="noopener noreferrer"`)
+  // handle the actual navigation. An earlier implementation called
+  // preventDefault + window.open here, which broke clicks in contexts where
+  // window.open was blocked (PWA shells, strict popup policies, some feature
+  // string parsing quirks) - the native fallback was suppressed and nothing
+  // happened on click.
+  event.stopPropagation();
+}
+
+// Async-loaded react-markdown for proper GFM rendering
+let _ReactMarkdown: React.ComponentType<{
+  children: string;
+  remarkPlugins?: unknown[];
+  components?: Record<string, unknown>;
+}> | null = null;
+let _remarkGfm: unknown = null;
+let _mdReady = false;
+let _mdLoadPromise: Promise<void> | null = null;
+
+function ensureMarkdownLoaded(): Promise<void> {
+  if (_mdReady) return Promise.resolve();
+  if (_mdLoadPromise) return _mdLoadPromise;
+  _mdLoadPromise = Promise.all([
+    import("react-markdown").then((m) => {
+      _ReactMarkdown = m.default as typeof _ReactMarkdown;
+    }),
+    import("remark-gfm").then((m) => {
+      _remarkGfm = m.default;
+    }),
+  ]).then(() => {
+    _mdReady = true;
+  });
+  return _mdLoadPromise;
+}
+
+// Eagerly start loading
+ensureMarkdownLoaded();
+
+function MarkdownBody({
+  text,
+  snippetNamespace,
+  onOpenSnippet,
+}: {
+  text: string;
+  snippetNamespace?: string;
+  onOpenSnippet?: (request: CodePreviewOpenRequest) => void;
+}) {
+  const [ready, setReady] = useState(_mdReady);
+  useEffect(() => {
+    if (!ready) ensureMarkdownLoaded().then(() => setReady(true));
+  }, [ready]);
+
+  if (!ready || !_ReactMarkdown) {
+    return (
+      <Typography
+        component="div"
+        variant="body2"
+        sx={{ whiteSpace: "pre-wrap" }}
+      >
+        {renderMarkdownLineBreaks(text)}
+      </Typography>
+    );
+  }
+
+  const Md = _ReactMarkdown;
+  let blockIndex = 0;
+  return (
+    <Md
+      remarkPlugins={_remarkGfm ? [_remarkGfm as never] : []}
+      components={
+        {
+          h1: ({ children }: { children?: React.ReactNode }) => (
+            <Typography component="h1" className="chat-md-heading chat-md-h1">
+              {children}
+            </Typography>
+          ),
+          h2: ({ children }: { children?: React.ReactNode }) => (
+            <Typography component="h2" className="chat-md-heading chat-md-h2">
+              {children}
+            </Typography>
+          ),
+          h3: ({ children }: { children?: React.ReactNode }) => (
+            <Typography component="h3" className="chat-md-heading chat-md-h3">
+              {children}
+            </Typography>
+          ),
+          h4: ({ children }: { children?: React.ReactNode }) => (
+            <Typography component="h4" className="chat-md-heading chat-md-h4">
+              {children}
+            </Typography>
+          ),
+          p: ({ children }: { children?: React.ReactNode }) => (
+            <Typography variant="body2" className="chat-md-paragraph">
+              {children}
+            </Typography>
+          ),
+          a: ({
+            href,
+            children,
+          }: {
+            href?: string;
+            children?: React.ReactNode;
+          }) => {
+            const normalizedHref = normalizeOutboundHref(href);
+            if (!normalizedHref) return <span>{children}</span>;
+            return (
+              <a
+                className="chat-md-link"
+                href={normalizedHref}
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={handleChatLinkClick}
+              >
+                {children}
+              </a>
+            );
+          },
+          pre: ({ children }: { children?: React.ReactNode }) => {
+            const extracted = extractMarkdownCodeBlock(children);
+            if (!extracted) {
+              return (
+                <pre className="chat-md-code">
+                  {reactNodeToPlainText(children)}
+                </pre>
+              );
+            }
+            const snippetIndex = blockIndex++;
+            const fileName = inferCodePreviewFileName(
+              extracted.className,
+              extracted.code,
+            );
+            const snippetId = snippetNamespace
+              ? `${snippetNamespace}::snippet::${snippetIndex}`
+              : undefined;
+            return (
+              <InlineCodePreview
+                code={extracted.code}
+                languageHint={extracted.className}
+                fileName={fileName}
+                snippetId={snippetId}
+                onOpenInWorkspace={onOpenSnippet}
+              />
+            );
+          },
+          code: ({ children }: { children?: React.ReactNode }) => (
+            <code className="chat-md-inline-code">{children}</code>
+          ),
+          ul: ({ children }: { children?: React.ReactNode }) => (
+            <Box component="ul" className="chat-md-list">
+              {children}
+            </Box>
+          ),
+          ol: ({ children }: { children?: React.ReactNode }) => (
+            <Box component="ol" className="chat-md-list">
+              {children}
+            </Box>
+          ),
+          table: ({ children }: { children?: React.ReactNode }) => (
+            <Box sx={{ overflowX: "auto", my: 1 }}>
+              <table
+                style={{
+                  borderCollapse: "collapse",
+                  width: "100%",
+                  fontSize: "0.85rem",
+                }}
+              >
+                {children}
+              </table>
+            </Box>
+          ),
+          th: ({ children }: { children?: React.ReactNode }) => (
+            <th
+              style={{
+                border: "1px solid var(--ui-rgba-255-255-255-120)",
+                padding: "6px 10px",
+                textAlign: "left",
+                fontWeight: 600,
+              }}
+            >
+              {children}
+            </th>
+          ),
+          td: ({ children }: { children?: React.ReactNode }) => (
+            <td
+              style={{
+                border: "1px solid var(--ui-rgba-255-255-255-080)",
+                padding: "6px 10px",
+              }}
+            >
+              {children}
+            </td>
+          ),
+          blockquote: ({ children }: { children?: React.ReactNode }) => (
+            <Box
+              sx={{
+                borderLeft: "3px solid var(--ui-rgba-47-212-255-400)",
+                pl: 1.5,
+                my: 0.5,
+                color: "text.secondary",
+              }}
+            >
+              {children}
+            </Box>
+          ),
+          hr: () => (
+            <Box
+              component="hr"
+              sx={{
+                border: "none",
+                borderTop: "1px solid var(--ui-rgba-255-255-255-080)",
+                my: 1,
+              }}
+            />
+          ),
+        } as Record<string, unknown>
+      }
+    >
+      {text}
+    </Md>
+  );
+}
+
+function extractCodeFences(
+  text: string,
+): Array<{ languageHint: string; code: string }> {
+  const source = (text || "").trim();
+  if (!source) return [];
+  const out: Array<{ languageHint: string; code: string }> = [];
+  const regex = /```([^\n`]*)\n([\s\S]*?)```/g;
+  let match: RegExpExecArray | null = null;
+  while ((match = regex.exec(source)) !== null) {
+    const code = str(match[2], "").replace(/\r\n/g, "\n").replace(/\n$/, "");
+    if (!code.trim()) continue;
+    out.push({
+      languageHint: str(match[1], "").trim(),
+      code,
+    });
+  }
+  return out;
+}
+
+function extractFirstCodeFence(text: string): string {
+  const first = extractCodeFences(text)[0];
+  return first?.code.trim() || "";
+}
+
+function buildWorkspaceSnippetFiles(
+  messages: unknown[],
+): WorkspaceSnippetEntry[] {
+  const out: WorkspaceSnippetEntry[] = [];
+  let replyIndex = 0;
+  let globalSnippetIndex = 0;
+  messages.forEach((message, idx) => {
+    const record = asRecord(message);
+    if (str(record.role, "").toLowerCase() !== "assistant") return;
+    const messageId = str(record.id, String(idx));
+    const snippets = extractCodeFences(str(record.content, ""));
+    if (snippets.length === 0) return;
+    replyIndex += 1;
+    snippets.forEach((snippet, snippetIndex) => {
+      globalSnippetIndex += 1;
+      const displayName = inferCodePreviewFileName(
+        snippet.languageHint,
+        snippet.code,
+      );
+      out.push({
+        id: `${messageId}::snippet::${snippetIndex}`,
+        name: `snippet-${globalSnippetIndex}-${displayName}`,
+        displayName,
+        content: snippet.code,
+        languageHint: normalizeCodeFenceLanguage(snippet.languageHint),
+        sourceMessageId: messageId,
+        sourceLabel:
+          snippets.length > 1
+            ? `Reply ${replyIndex} / block ${snippetIndex + 1}`
+            : `Reply ${replyIndex}`,
+      });
+    });
+  });
+  return out;
+}
+
+function renderChatMarkdown(
+  text: string,
+  options?: {
+    snippetNamespace?: string;
+    onOpenSnippet?: (request: CodePreviewOpenRequest) => void;
+  },
+): ReactNode {
+  if (!text?.trim()) return null;
+  return (
+    <Box className="chat-markdown">
+      <MarkdownBody
+        text={text}
+        snippetNamespace={options?.snippetNamespace}
+        onOpenSnippet={options?.onOpenSnippet}
+      />
+    </Box>
+  );
+}
+
+function renderStreamingChatMarkdown(text: string): ReactNode {
+  if (!text?.trim()) return null;
+  return (
+    <Box className="chat-markdown chat-markdown-streaming">
+      <Typography component="div" variant="body2" className="chat-md-paragraph">
+        {renderMarkdownLineBreaks(text)}
+      </Typography>
+    </Box>
+  );
+}
+
+function stripMarkdownDecorations(text: string): string {
+  return (text || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/^\s*#{1,6}\s+/gm, "")
+    .replace(/^\s*[-+*]\s+/gm, "")
+    .replace(/^\s*\d+\.\s+/gm, "")
+    .replace(/[*_~]/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function extractMarkdownSection(text: string, heading: string): string {
+  const lines = (text || "").replace(/\r\n/g, "\n").split("\n");
+  const target = `## ${heading}`.replace(/\s+/g, " ").trim().toLowerCase();
+  let collecting = false;
+  const collected: string[] = [];
+  for (const line of lines) {
+    const normalized = line.replace(/\s+/g, " ").trim().toLowerCase();
+    if (normalized.startsWith("## ")) {
+      if (collecting) break;
+      collecting = normalized === target;
+      continue;
+    }
+    if (collecting) {
+      collected.push(line);
+    }
+  }
+  return collected.join("\n").trim();
+}
+
+function countMarkdownItems(section: string): number {
+  const lines = (section || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const itemCount = lines.filter((line) =>
+    /^(\d+\.\s+|[-+*]\s+)/.test(line),
+  ).length;
+  if (itemCount > 0) return itemCount;
+  return lines.length > 0 ? lines.filter((line) => line.length > 20).length : 0;
+}
+
+function isPlaceholderResearchReportContent(
+  normalized: string,
+  summary: string,
+  keyFindingCount: number,
+  sourceCount: number,
+): boolean {
+  const lowerSummary = (summary || "").trim().toLowerCase();
+  const lowerNormalized = (normalized || "").trim().toLowerCase();
+  const noEvidence = keyFindingCount === 0 && sourceCount === 0;
+  if (!noEvidence) return false;
+  return (
+    lowerSummary.startsWith("no relevant information found for:") ||
+    lowerNormalized.includes("no relevant information found for:") ||
+    lowerNormalized.includes(
+      "i gathered tool evidence, but the final response could not be formatted cleanly",
+    )
+  );
+}
+
+function looksLikeDiscardableResearchFailureMessage(content: string): boolean {
+  const normalized = (content || "")
+    .replace(/\r\n/g, "\n")
+    .trim()
+    .toLowerCase();
+  if (!normalized.startsWith("# research")) return false;
+  return normalized.includes("no relevant information found for:");
+}
+
+function trimResearchReportTail(text: string): string {
+  const lines = (text || "").replace(/\r\n/g, "\n").split("\n");
+  const out: string[] = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (
+      out.length > 0 &&
+      (trimmed.startsWith(
+        "I completed the tool work, but the follow-up model",
+      ) ||
+        trimmed.startsWith(
+          "I completed the tool work, but the follow-up models",
+        ) ||
+        trimmed.startsWith("I gathered tool evidence") ||
+        trimmed.startsWith("Research report:") ||
+        trimmed.startsWith("Web search gathered "))
+    ) {
+      break;
+    }
+    out.push(line);
+  }
+  return out.join("\n").trim();
+}
+
+function parseResearchReport(text: string): ResearchReportPreview | null {
+  const normalized = trimResearchReportTail(text);
+  if (!normalized) return null;
+  const lines = normalized.split("\n");
+  const firstHeadingIndex = lines.findIndex((line) => line.trim().length > 0);
+  if (firstHeadingIndex < 0) return null;
+  const headingLine = lines[firstHeadingIndex].trim();
+  const titleMatch = headingLine.match(/^#\s*Research(?: Summary)?:\s*(.+)$/i);
+  if (!titleMatch) return null;
+
+  const firstSectionIndex = lines.findIndex(
+    (line, idx) => idx > firstHeadingIndex && /^##\s+/.test(line.trim()),
+  );
+  const summaryBlock = lines
+    .slice(
+      firstHeadingIndex + 1,
+      firstSectionIndex >= 0 ? firstSectionIndex : lines.length,
+    )
+    .join("\n")
+    .trim();
+  const summary = stripMarkdownDecorations(summaryBlock);
+  const summaryPreview =
+    summary.length > 520 ? `${summary.slice(0, 517).trimEnd()}...` : summary;
+  const keyFindingsSection = extractMarkdownSection(normalized, "Key Findings");
+  const keyFindingCount = countMarkdownItems(keyFindingsSection);
+  const keyFindings = keyFindingsSection
+    .split("\n")
+    .map((line) => stripMarkdownDecorations(line).trim())
+    .filter(Boolean)
+    .slice(0, 3);
+  const sourceCount = countMarkdownItems(
+    extractMarkdownSection(normalized, "Sources"),
+  );
+  const openQuestionCount = countMarkdownItems(
+    extractMarkdownSection(normalized, "Open Questions"),
+  );
+  const contradictionCount = countMarkdownItems(
+    extractMarkdownSection(normalized, "Contradictions To Verify"),
+  );
+  if (
+    isPlaceholderResearchReportContent(
+      normalized,
+      summary,
+      keyFindingCount,
+      sourceCount,
+    )
+  ) {
+    return null;
+  }
+
+  return {
+    title: str(titleMatch[1], "Research report").trim() || "Research report",
+    summary,
+    summaryPreview,
+    keyFindings,
+    keyFindingCount,
+    sourceCount,
+    openQuestionCount,
+    contradictionCount,
+    content: normalized,
+  };
+}
+
+function collectAssistantExportParagraphs(text: string): string[] {
+  return stripMarkdownDecorations(text)
+    .split(/\n{2,}/)
+    .map((block) => block.replace(/\s+/g, " ").trim())
+    .filter((block) => block.length > 0);
+}
+
+function shortenAssistantExportText(text: string, maxChars = 220): string {
+  const normalized = (text || "").replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxChars - 3)).trimEnd()}...`;
+}
+
+function deriveAssistantExportHeading(
+  content: string,
+  report: ResearchReportPreview | null,
+  headingHint: string,
+  prompt: string,
+  conversationTitle: string,
+): string {
+  const explicitHeading = str(report?.title, headingHint).trim();
+  if (explicitHeading) return explicitHeading;
+
+  const lines = (content || "").replace(/\r\n/g, "\n").split("\n");
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const markdownHeading = trimmed.match(/^#{1,6}\s+(.+)$/);
+    if (markdownHeading) {
+      const candidate = markdownHeading[1].trim();
+      if (candidate.length >= 8 && candidate.length <= 140) {
+        return candidate;
+      }
+      continue;
+    }
+    if (
+      trimmed.length >= 8 &&
+      trimmed.length <= 120 &&
+      !/[.!?]$/.test(trimmed) &&
+      !trimmed.includes("|")
+    ) {
+      return trimmed;
+    }
+  }
+
+  const fallback = prompt || conversationTitle || "AgentArk report";
+  return shortenAssistantExportText(fallback, 110) || "AgentArk report";
+}
+
+function buildAssistantExportSummaryBullets(
+  content: string,
+  report: ResearchReportPreview | null,
+  plan: ExecutionPlanState | null,
+  planFailure: string,
+): string[] {
+  const seen = new Set<string>();
+  const bullets: string[] = [];
+  const push = (value: string) => {
+    const cleaned = shortenAssistantExportText(value, 240);
+    if (!cleaned) return;
+    const key = cleaned.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    bullets.push(cleaned);
+  };
+
+  if (report) {
+    push(report.summaryPreview || report.summary);
+    report.keyFindings.slice(0, 3).forEach(push);
+  } else {
+    const paragraphs = collectAssistantExportParagraphs(content);
+    paragraphs.slice(0, 2).forEach(push);
+    const recommendationParagraph = paragraphs.find((paragraph) =>
+      /\brecommend/i.test(paragraph),
+    );
+    if (recommendationParagraph) {
+      push(recommendationParagraph);
+    }
+  }
+
+  if (plan?.steps.length) {
+    push(
+      `${plan.steps.length} execution step${plan.steps.length === 1 ? "" : "s"} captured before or during the run.`,
+    );
+  } else if (planFailure) {
+    push(`Execution planning was unavailable: ${planFailure}`);
+  }
+
+  return bullets.slice(0, 4);
+}
+
+function stripDuplicateAssistantExportHeading(
+  content: string,
+  heading: string,
+): string {
+  const lines = (content || "").replace(/\r\n/g, "\n").split("\n");
+  const headingKey = stripMarkdownDecorations(heading)
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  let firstNonEmptyIndex = -1;
+  for (let idx = 0; idx < lines.length; idx += 1) {
+    if (lines[idx].trim()) {
+      firstNonEmptyIndex = idx;
+      break;
+    }
+  }
+  if (firstNonEmptyIndex < 0) return "";
+  const firstLineKey = stripMarkdownDecorations(lines[firstNonEmptyIndex])
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  if (headingKey && headingKey === firstLineKey) {
+    lines.splice(firstNonEmptyIndex, 1);
+  }
+  return lines.join("\n").trim();
+}
+
+function formatAssistantExportBody(content: string, heading: string): string {
+  const deduped = stripDuplicateAssistantExportHeading(content, heading);
+  const lines = deduped.replace(/\r\n/g, "\n").split("\n");
+  const formatted = lines.map((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return "";
+    const numberedSection = trimmed.match(/^(\d+)\.\s+(.{3,140})$/);
+    if (numberedSection) {
+      return `## ${numberedSection[2].trim()}`;
+    }
+    return line;
+  });
+  return formatted
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function formatExecutionPlanStatusLabel(status: string): string {
+  const normalized = str(status, "").trim().toLowerCase();
+  if (!normalized) return "pending";
+  return normalized.replace(/_/g, " ");
+}
+
+function buildExecutionPlanExportSection(
+  plan: ExecutionPlanState | null,
+  planFailure: string,
+  traceId: string,
+): string[] {
+  const lines: string[] = ["## Execution Plan", ""];
+  if (plan?.steps.length) {
+    if (plan.summary.trim()) {
+      lines.push(plan.summary.trim(), "");
+    }
+    plan.steps.forEach((step, index) => {
+      const title = step.title.trim() || `Step ${index + 1}`;
+      const status = formatExecutionPlanStatusLabel(step.status);
+      lines.push(`${index + 1}. **${title}** (${status})`);
+      if (step.description.trim()) {
+        lines.push(`   ${step.description.trim()}`);
+      }
+      step.substeps.forEach((substep) => {
+        const subTitle = substep.title.trim() || `Substep ${substep.id}`;
+        const subStatus = formatExecutionPlanStatusLabel(substep.status);
+        const subDescription = substep.description.trim();
+        lines.push(`   - ${subTitle}${subStatus ? ` (${subStatus})` : ""}`);
+        if (subDescription) {
+          lines.push(`     ${subDescription}`);
+        }
+      });
+      lines.push("");
+    });
+    return lines;
+  }
+  if (planFailure) {
+    lines.push(planFailure, "");
+    return lines;
+  }
+  lines.push(
+    traceId
+      ? "No pre-execution plan was captured in the trace for this reply."
+      : "No trace id was attached to this reply, so plan details were unavailable.",
+    "",
+  );
+  return lines;
+}
+
+function researchReportMetaLabel(report: ResearchReportPreview): string {
+  const parts = ["Research report"];
+  if (report.sourceCount > 0) {
+    parts.push(
+      `${report.sourceCount} source${report.sourceCount === 1 ? "" : "s"}`,
+    );
+  }
+  if (report.keyFindingCount > 0) {
+    parts.push(
+      `${report.keyFindingCount} key finding${report.keyFindingCount === 1 ? "" : "s"}`,
+    );
+  }
+  if (report.openQuestionCount > 0) {
+    parts.push(
+      `${report.openQuestionCount} open question${report.openQuestionCount === 1 ? "" : "s"}`,
+    );
+  }
+  if (report.contradictionCount > 0) {
+    parts.push(
+      `${report.contradictionCount} contradiction${report.contradictionCount === 1 ? "" : "s"}`,
+    );
+  }
+  return parts.join(" | ");
+}
+
+const CHAT_ATTACHMENT_EXTENSIONS = new Set([
+  "txt",
+  "md",
+  "markdown",
+  "json",
+  "csv",
+  "tsv",
+  "xml",
+  "yaml",
+  "yml",
+  "pdf",
+  "docx",
+  "log",
+  "html",
+  "htm",
+]);
+
+const CHAT_VISUAL_ATTACHMENT_EXTENSIONS = new Set([
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "webp",
+  "bmp",
+  "tif",
+  "tiff",
+  "svg",
+]);
+
+function chatAttachmentExtension(file: File): string {
+  const name = (file.name || "").trim();
+  const dotIdx = name.lastIndexOf(".");
+  return dotIdx >= 0 ? name.slice(dotIdx + 1).toLowerCase() : "";
+}
+
+function isVisualChatAttachment(file: File): boolean {
+  const contentType = (file.type || "").trim().toLowerCase();
+  return (
+    contentType.startsWith("image/") ||
+    CHAT_VISUAL_ATTACHMENT_EXTENSIONS.has(chatAttachmentExtension(file))
+  );
+}
+
+function isKnowledgeChatAttachment(file: File): boolean {
+  return CHAT_ATTACHMENT_EXTENSIONS.has(chatAttachmentExtension(file));
+}
+
+function splitSupportedChatAttachments(files: File[]): {
+  accepted: File[];
+  rejected: string[];
+} {
+  const accepted: File[] = [];
+  const rejected: string[] = [];
+  for (const file of files) {
+    const name = (file.name || "").trim();
+    if (isKnowledgeChatAttachment(file) || isVisualChatAttachment(file)) {
+      accepted.push(file);
+    } else {
+      rejected.push(name || "unnamed-file");
+    }
+  }
+  return { accepted, rejected };
+}
+
+function formatDurationClock(totalSeconds: number): string {
+  const seconds = Math.max(0, Math.floor(totalSeconds));
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = seconds % 60;
+  if (days > 0) return `${days}d ${hours}h ${minutes}m`;
+  if (hours > 0) return `${hours}h ${minutes}m ${secs}s`;
+  if (minutes > 0) return `${minutes}m ${secs}s`;
+  return `${secs}s`;
+}
+
+function errMessage(error: unknown): string {
+  const normalize = (raw: string): string => {
+    const msg = (raw || "").trim();
+    if (!msg) return "Request failed";
+    if (msg.startsWith("{") && msg.endsWith("}")) {
+      try {
+        const parsed = JSON.parse(msg) as Record<string, unknown>;
+        const nested =
+          str(parsed.error, "").trim() || str(parsed.message, "").trim();
+        if (nested) return nested;
+      } catch {
+        // Fall through to raw message.
+      }
+    }
+    return msg;
+  };
+
+  if (error instanceof Error) return normalize(error.message);
+  if (typeof error === "string") return normalize(error);
+  return "Request failed";
+}
+
+function extractPreviewImageUrl(text: string): string {
+  const source = text || "";
+  if (!source) return "";
+  const appPreviewMatch = source.match(/!\[App Preview\]\(([^)\s]+)\)/i);
+  if (appPreviewMatch?.[1]) return appPreviewMatch[1].trim();
+  const genericMatch = source.match(/!\[[^\]]*\]\(([^)\s]+)\)/);
+  if (genericMatch?.[1]) return genericMatch[1].trim();
+  return "";
+}
+
+function toAbsoluteAppUrl(pathOrUrl: string, baseOrigin: string): string {
+  const value = (pathOrUrl || "").trim();
+  if (!value) return "";
+  if (looksLikeUrl(value)) return value;
+  const base = (baseOrigin || "").trim().replace(/\/+$/, "");
+  if (!base) return value;
+  if (value.startsWith("/")) return `${base}${value}`;
+  return `${base}/${value}`;
+}
+
+function looksLikeUuid(value: string): boolean {
+  const v = (value || "").trim();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    v,
+  );
+}
+
+function looksLikeIsoTimestamp(value: string): boolean {
+  const v = (value || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}T/.test(v)) return false;
+  const dt = new Date(v);
+  return !Number.isNaN(dt.getTime());
+}
+
+function looksLikeIsoDateOnly(value: string): boolean {
+  const v = (value || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return false;
+  const dt = new Date(`${v}T00:00:00`);
+  return !Number.isNaN(dt.getTime());
+}
+
+function formatTimestampForHumans(value: string): {
+  label: string;
+  tooltip: string;
+} {
+  const meta = formatUiDateTimeMeta(value, { fallback: value || "-" });
+  return { label: meta.label, tooltip: meta.tip };
+}
+
+/** Format a trace step time string to local human-readable.
+ *  Input: ISO timestamp like "2026-03-16T09:02:40Z" or "2026-03-16T09:02:40Z (1396ms)"
+ *  Output: "12 Mar, 2:32 PM (1396ms)" - local time with optional duration
+ */
+function formatTraceStepTime(raw: string): string {
+  if (!raw) return "";
+  // Split off optional "(Xms)" suffix
+  const match = raw.match(/^(.+?)(\s*\(\d+ms\))?$/);
+  if (!match) return raw;
+  const isopart = match[1].trim();
+  const durationPart = match[2]?.trim() || "";
+  const dt = new Date(isopart);
+  if (Number.isNaN(dt.getTime())) return raw;
+  const time = dt
+    .toLocaleTimeString(undefined, {
+      hour: "numeric",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: true,
+    })
+    .replace(/\b(am|pm)\b/g, (value) => value.toUpperCase());
+  return durationPart ? `${time} ${durationPart}` : time;
+}
+
+function formatChatTimestamp(value: string): {
+  label: string;
+  tooltip: string;
+} {
+  const absolute = formatUiDateTimeMeta(value, { fallback: value || "-" });
+  const relative = formatUiRelativeDateTimeMeta(value, {
+    fallback: value || "-",
+  });
+  return {
+    label: `${absolute.label} | ${relative.label}`,
+    tooltip: absolute.tip || relative.tip,
+  };
+}
+
+/** Format any ISO timestamp string into a human-readable relative label with absolute tooltip. */
+function humanTs(raw: string): { label: string; tip: string } {
+  return formatUiRelativeDateTimeMeta(raw, { fallback: "-" });
+}
+
+function formatDurationFromSeconds(value: unknown): string {
+  const total = num(value, -1);
+  if (total < 0) return "-";
+  const sec = Math.floor(total);
+  if (sec < 60) return `${sec}s`;
+  const mins = Math.floor(sec / 60);
+  const remSec = sec % 60;
+  if (mins < 60) return remSec > 0 ? `${mins}m ${remSec}s` : `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  const remMins = mins % 60;
+  if (hours < 24) return remMins > 0 ? `${hours}h ${remMins}m` : `${hours}h`;
+  const days = Math.floor(hours / 24);
+  const remHours = hours % 24;
+  return remHours > 0 ? `${days}d ${remHours}h` : `${days}d`;
+}
+
+function charsLabel(value: unknown): string {
+  const amount = num(value, -1);
+  if (amount < 0) return "-";
+  return `${Math.round(amount).toLocaleString()} chars`;
+}
+
+function positiveRunMetric(value: unknown): number | null {
+  const amount = num(value, Number.NaN);
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+  return amount;
+}
+
+function buildChatRunMetricItems(metrics: ChatRunMetrics): Array<{
+  label: string;
+  value: string;
+}> {
+  const items: Array<{ label: string; value: string }> = [];
+  const inputTokens = positiveRunMetric(metrics.inputTokens);
+  const outputTokens = positiveRunMetric(metrics.outputTokens);
+  const explicitTotalTokens = positiveRunMetric(metrics.totalTokens);
+  const totalTokens =
+    explicitTotalTokens ??
+    (inputTokens != null || outputTokens != null
+      ? (inputTokens ?? 0) + (outputTokens ?? 0)
+      : null);
+  const timeToFirstTokenMs = positiveRunMetric(metrics.timeToFirstTokenMs);
+
+  if (timeToFirstTokenMs != null) {
+    items.push({ label: "TTFT", value: formatTraceDuration(timeToFirstTokenMs) });
+  }
+  if (totalTokens != null && totalTokens > 0) {
+    items.push({ label: "Total tokens", value: Math.round(totalTokens).toLocaleString() });
+  }
+  return items;
+}
+
+function promptProposalStatusColor(
+  status: string,
+): "default" | "success" | "warning" | "error" {
+  const normalized = status.trim().toLowerCase();
+  if (normalized === "approved") return "success";
+  if (normalized === "rejected") return "error";
+  return "warning";
+}
+
+function promptCanarySafetyStatusColor(
+  status: string,
+): "default" | "success" | "warning" | "error" {
+  const normalized = status.trim().toLowerCase();
+  if (normalized === "auto_reverted" || normalized === "disabled_by_user")
+    return "success";
+  if (normalized === "kept_active") return "default";
+  return "warning";
+}
+
+function humanizeStatusLabel(value: string): string {
+  const normalized = value.trim();
+  if (!normalized) return "-";
+  return normalized.replace(/_/g, " ");
+}
+
+function promptProposalRiskColor(
+  risk: string,
+): "default" | "success" | "warning" | "error" {
+  const normalized = risk.trim().toLowerCase();
+  if (normalized === "high") return "error";
+  if (normalized === "medium") return "warning";
+  if (normalized === "low") return "success";
+  return "default";
+}
+
+function boolLabelForKey(
+  key: string,
+  value: boolean,
+): { label: string; color: "success" | "warning" | "default" } {
+  const k = (key || "").toLowerCase();
+  if (k.includes("enabled"))
+    return {
+      label: value ? "Enabled" : "Disabled",
+      color: value ? "success" : "warning",
+    };
+  if (k.includes("active"))
+    return {
+      label: value ? "Active" : "Inactive",
+      color: value ? "success" : "warning",
+    };
+  if (k.includes("connected"))
+    return {
+      label: value ? "Connected" : "Not connected",
+      color: value ? "success" : "warning",
+    };
+  return { label: value ? "Yes" : "No", color: value ? "success" : "default" };
+}
+
+function DataTable({
+  rows,
+  columns,
+}: {
+  rows: JsonRecord[];
+  columns: string[];
+}) {
+  return (
+    <TableContainer className="table-shell">
+      <Table size="small">
+        <TableHead>
+          <TableRow>
+            {columns.map((column) => (
+              <TableCell key={column}>{column}</TableCell>
+            ))}
+          </TableRow>
+        </TableHead>
+        <TableBody>
+          {rows.map((row, index) => (
+            <TableRow key={str(row.id, String(index))}>
+              {columns.map((column) => (
+                <TableCell key={`${index}-${column}`}>
+                  <Typography variant="caption" sx={{ whiteSpace: "pre-wrap" }}>
+                    {(() => {
+                      const v = row[column];
+                      const out = formatCompactValue(v);
+                      return <span title={out.tooltip || ""}>{out.text}</span>;
+                    })()}
+                  </Typography>
+                </TableCell>
+              ))}
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </TableContainer>
+  );
+}
+
+function KeyValuePanel({
+  title,
+  data,
+  emptyLabel,
+  maxRows,
+}: {
+  title: string;
+  data: JsonRecord;
+  emptyLabel?: string;
+  maxRows?: number;
+}) {
+  const entries = Object.entries(data || {});
+  const shown = entries.slice(0, maxRows ?? 14);
+  return (
+    <Box
+      sx={{
+        borderRadius: "8px",
+        border: "1px solid var(--ui-rgba-255-255-255-080)",
+        background: "var(--ui-rgba-255-255-255-025)",
+        p: 1.25,
+      }}
+    >
+      <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+        {title}
+      </Typography>
+      <Stack spacing={0} sx={{ mt: 0.9 }}>
+        {shown.length === 0 ? (
+          <Typography
+            variant="body2"
+            sx={{
+              color: "text.secondary",
+            }}
+          >
+            {emptyLabel || "No details available."}
+          </Typography>
+        ) : (
+          shown.map(([k, v], index) => {
+            const out = formatCompactValue(v);
+            const keyLower = (k || "").toLowerCase();
+            const renderValue = () => {
+              if (typeof v === "string" && looksLikeUrl(v)) {
+                const trimmed = v.trim();
+                const label =
+                  trimmed.length > 54 ? `${trimmed.slice(0, 54)}...` : trimmed;
+                return (
+                  <Typography
+                    variant="body2"
+                    sx={{ wordBreak: "break-all" }}
+                    title={trimmed}
+                  >
+                    <a
+                      href={trimmed}
+                      target="_blank"
+                      rel="noreferrer"
+                      style={{ color: "inherit", textDecoration: "underline" }}
+                    >
+                      {label}
+                    </a>
+                  </Typography>
+                );
+              }
+              if (
+                typeof v === "string" &&
+                (looksLikeIsoTimestamp(v) ||
+                  looksLikeIsoDateOnly(v) ||
+                  keyLower.endsWith("_at") ||
+                  keyLower.endsWith("_date") ||
+                  keyLower.includes("timestamp"))
+              ) {
+                const t =
+                  looksLikeIsoDateOnly(v) || keyLower.endsWith("_date")
+                    ? {
+                        label: formatUiDateOnly(v, { fallback: "-" }),
+                        tooltip: formatUiDateOnly(v, {
+                          fallback: "-",
+                          includeYear: true,
+                        }),
+                      }
+                    : formatTimestampForHumans(v);
+                return (
+                  <Chip
+                    size="small"
+                    variant="outlined"
+                    label={t.label}
+                    title={t.tooltip}
+                  />
+                );
+              }
+              if (typeof v === "boolean") {
+                const b = boolLabelForKey(k, v);
+                return (
+                  <Chip
+                    size="small"
+                    label={b.label}
+                    color={b.color}
+                    variant={v ? "filled" : "outlined"}
+                  />
+                );
+              }
+              if (typeof v === "number" && Number.isFinite(v)) {
+                if (keyLower.includes("ms") || keyLower.includes("duration")) {
+                  return (
+                    <Chip
+                      size="small"
+                      variant="outlined"
+                      label={`${Math.round(v)} ms`}
+                    />
+                  );
+                }
+                if (
+                  keyLower.includes("count") ||
+                  keyLower.includes("total") ||
+                  keyLower.includes("remaining")
+                ) {
+                  return (
+                    <Chip size="small" variant="outlined" label={String(v)} />
+                  );
+                }
+              }
+              if (
+                typeof v === "string" &&
+                (looksLikeUuid(v) ||
+                  keyLower.endsWith("_id") ||
+                  keyLower === "id")
+              ) {
+                const trimmed = v.trim();
+                const label =
+                  trimmed.length > 22
+                    ? `${trimmed.slice(0, 8)}...${trimmed.slice(-6)}`
+                    : trimmed;
+                return (
+                  <Chip
+                    size="small"
+                    variant="outlined"
+                    label={label}
+                    title={trimmed}
+                    onClick={async () => {
+                      try {
+                        await navigator.clipboard.writeText(trimmed);
+                      } catch {
+                        // ignore
+                      }
+                    }}
+                    sx={{ cursor: "pointer" }}
+                  />
+                );
+              }
+              return (
+                <Typography
+                  variant="body2"
+                  sx={{
+                    minWidth: 0,
+                    flex: "1 1 auto",
+                    wordBreak: "break-word",
+                  }}
+                  title={out.tooltip || ""}
+                >
+                  {out.text}
+                </Typography>
+              );
+            };
+            return (
+              <Box
+                key={k}
+                sx={{
+                  display: "grid",
+                  gridTemplateColumns: {
+                    xs: "1fr",
+                    md: "160px minmax(0, 1fr)",
+                  },
+                  gap: { xs: 0.35, md: 1.1 },
+                  py: 0.9,
+                  borderTop:
+                    index === 0 ? "none" : "1px solid var(--ui-rgba-255-255-255-060)",
+                }}
+              >
+                <Typography
+                  variant="caption"
+                  sx={{
+                    color: "var(--ui-rgba-188-198-212-680)",
+                    minWidth: 0,
+                  }}
+                >
+                  {k}
+                </Typography>
+                {renderValue()}
+              </Box>
+            );
+          })
+        )}
+        {entries.length > shown.length ? (
+          <Typography
+            variant="caption"
+            sx={{
+              color: "text.secondary",
+              pt: 0.9,
+            }}
+          >
+            {entries.length - shown.length} more field(s) not shown.
+          </Typography>
+        ) : null}
+      </Stack>
+    </Box>
+  );
+}
+
+function WorkspaceScopeMenuButton({
+  activeProjectId,
+  projects,
+  onNavigateToView,
+}: {
+  activeProjectId: string;
+  projects: JsonRecord[];
+  onNavigateToView?: (view: string, replace?: boolean) => void;
+}) {
+  const setActiveProjectId = useUiStore((s) => s.setActiveProjectId);
+  const projectNameById = useMemo(
+    () => buildProjectNameById(projects),
+    [projects],
+  );
+  const activeScopeLabel = projectScopeLabel(activeProjectId, projectNameById);
+  const hasProjects = projects.length > 0;
+  const [anchorEl, setAnchorEl] = useState<HTMLElement | null>(null);
+  const open = Boolean(anchorEl);
+
+  return (
+    <>
+      <Button
+        size="small"
+        variant="outlined"
+        className="workspace-scope-menu-trigger"
+        endIcon={<ArrowDropDownRoundedIcon sx={{ fontSize: 18 }} />}
+        onClick={(event) => setAnchorEl(event.currentTarget)}
+        title={`Scope: ${activeScopeLabel}`}
+        aria-label={`Change scope. Current scope: ${activeScopeLabel}`}
+      >
+        {activeScopeLabel}
+      </Button>
+      <Menu anchorEl={anchorEl} open={open} onClose={() => setAnchorEl(null)}>
+        <MenuItem
+          selected={!activeProjectId}
+          onClick={() => {
+            setActiveProjectId("");
+            setAnchorEl(null);
+          }}
+        >
+          Global workspace
+        </MenuItem>
+        {projects.map((project) => {
+          const id = normalizeProjectId(project.id);
+          if (!id) return null;
+          return (
+            <MenuItem
+              key={id}
+              selected={id === activeProjectId}
+              onClick={() => {
+                setActiveProjectId(id);
+                setAnchorEl(null);
+              }}
+            >
+              {projectScopeLabel(id, projectNameById)}
+            </MenuItem>
+          );
+        })}
+        <Divider />
+        <MenuItem
+          onClick={() => {
+            setAnchorEl(null);
+            onNavigateToView?.("projects");
+          }}
+        >
+          {hasProjects ? "Manage projects" : "New project"}
+        </MenuItem>
+      </Menu>
+    </>
+  );
+}
+
+type ChatStarterCategoryId =
+  | "build"
+  | "watch"
+  | "background"
+  | "research"
+  | "swarm"
+  | "browser"
+  | "security"
+  | "advanced";
+
+type ChatStarterExample = {
+  id: string;
+  title: string;
+  summary: string;
+  prompt: string;
+  category: ChatStarterCategoryId;
+  defaultVisible?: boolean;
+  deepResearch?: boolean;
+};
+
+type ChatComposerPrefillRequest = {
+  text: string;
+  seq: number;
+};
+
+const CHAT_STARTER_CATEGORY_META: Record<
+  ChatStarterCategoryId,
+  { label: string; description: string }
+> = {
+  build: {
+    label: "Build & deploy",
+    description:
+      "Ship apps, dashboards, pages, and local deployments from chat.",
+  },
+  watch: {
+    label: "Watchers & dashboards",
+    description:
+      "Monitor live sources, refresh feeds, and publish useful views.",
+  },
+  background: {
+    label: "Background sessions",
+    description:
+      "Keep reminders, follow-ups, and monitoring in one durable session.",
+  },
+  research: {
+    label: "Deep research",
+    description:
+      "Run slower, source-backed analysis with a reviewable research plan.",
+  },
+  swarm: {
+    label: "Swarm",
+    description:
+      "Split structured work across multiple agents and return one answer.",
+  },
+  browser: {
+    label: "Playwright browser automation",
+    description:
+      "Drive the browser, pause for user choices, and inspect pages step by step.",
+  },
+  security: {
+    label: "Access & permissions",
+    description:
+      "Check granted tools, connected access, and fallback behavior without overreaching.",
+  },
+  advanced: {
+    label: "Advanced",
+    description:
+      "Internal operator prompts for ArkPulse, ArkSentinel, ArkEvolve, trace diagnostics, and system inspection.",
+  },
+};
+
+const CHAT_STARTER_CATEGORY_ORDER: ChatStarterCategoryId[] = [
+  "build",
+  "watch",
+  "background",
+  "research",
+  "swarm",
+  "browser",
+  "security",
+];
+
+const CHAT_STARTER_EXAMPLES: ChatStarterExample[] = [
+  {
+    id: "finance-dashboard",
+    title: "Build a finance tracker",
+    summary:
+      "Create a personal finance dashboard with budgets, charts, CSV import/export, SQLite, and a local link.",
+    prompt:
+      "Build me a personal finance tracker dashboard with budgets, charts, CSV import/export, dark mode, mobile support, local SQLite storage, and deploy it locally with a link.",
+    category: "build",
+    defaultVisible: true,
+  },
+  {
+    id: "deploy-github-repo",
+    title: "Deploy a GitHub repo locally",
+    summary:
+      "Clone a public repo, run it, and make it available from this machine.",
+    prompt:
+      "Deploy this GitHub repo locally and make it available with a working link: https://github.com/mdn/beginner-html-site-styled",
+    category: "build",
+  },
+  {
+    id: "hn-ai-dashboard",
+    title: "Monitor Hacker News AI stories",
+    summary:
+      "Check top stories every few minutes, summarize strong AI items, and keep a live dashboard updated.",
+    prompt:
+      "Monitor Hacker News top stories every 5 minutes. For stories with 100+ points that mention AI, LLM, or agents, summarize them in 2 sentences, save them to a feed page, and deploy a live dashboard with links.",
+    category: "watch",
+  },
+  {
+    id: "arxiv-rl-feed",
+    title: "Track arXiv ML papers",
+    summary:
+      "Watch recent ML, reinforcement learning, and time-series papers and keep a public feed fresh.",
+    prompt:
+      "Build a static page that refreshes every 10 seconds, pulls the latest arXiv papers, and highlights machine learning, reinforcement learning, time series modeling, and novel approaches.",
+    category: "watch",
+  },
+  {
+    id: "pricing-monitor",
+    title: "Track model pricing changes",
+    summary:
+      "Keep an ongoing session that checks major AI pricing and notifies me only if something changes.",
+    prompt:
+      "Keep monitoring OpenAI, Anthropic, Google AI, and Perplexity pricing in the background. Check twice a day and notify me in app only if pricing or plan tiers change.",
+    category: "background",
+    defaultVisible: true,
+  },
+  {
+    id: "reply-tracker",
+    title: "Track replies in one session",
+    summary:
+      "Follow a thread, keep reminders together, and summarize status in the same background session.",
+    prompt:
+      "Track replies from Acme about the partnership proposal in the background. Keep all follow-ups, reminders, and status in one session.",
+    category: "background",
+  },
+  {
+    id: "india-ai-research",
+    title: "Research India AI strategy",
+    summary:
+      "Produce a source-backed view on AI investment, compute, risks, and policy options.",
+    prompt:
+      "Research whether India should aggressively expand domestic AI research investment, frontier-model infrastructure, and public AI compute between 2026 and 2040, including capacity, strategy choices, economic upside, risks, global comparisons, and realistic policy options.",
+    category: "research",
+    defaultVisible: true,
+    deepResearch: true,
+  },
+  {
+    id: "next-feature-research",
+    title: "Compare what to build next",
+    summary:
+      "Evaluate product directions with market reasoning, delivery risk, customer impact, and one recommendation.",
+    prompt:
+      "Compare whether we should build invoice OCR, approval workflows, or audit trails next. I want market reasoning, delivery risk, customer impact, and a final recommendation.",
+    category: "research",
+    deepResearch: true,
+  },
+  {
+    id: "approval-workflows-launch",
+    title: "Plan a launch with multiple agents",
+    summary:
+      "Break buyer pain points, positioning, rollout, risks, and metrics into a single operator-ready plan.",
+    prompt:
+      "Use multiple agents for this. We run a B2B SaaS for finance teams and need a launch plan for approval workflows, including buyer pain points, positioning, rollout, risks, and success metrics.",
+    category: "swarm",
+  },
+  {
+    id: "trial-to-paid-swarm",
+    title: "Improve trial-to-paid conversion",
+    summary:
+      "Use swarm to find likely causes, propose experiments, define metrics, and call out implementation risks.",
+    prompt:
+      "Use swarm. We need a plan to improve trial-to-paid conversion for our SaaS. Analyze likely causes, propose experiments, define metrics, and identify implementation risks.",
+    category: "swarm",
+  },
+  {
+    id: "wikipedia-pause",
+    title: "Drive the browser and pause",
+    summary:
+      "Navigate a site, stop at the right point, and wait for my choice before continuing.",
+    prompt:
+      "Open https://www.wikipedia.org, search for OpenAI, go to the article, and when you get there stop and ask me whether I should inspect the History section or the Products section.",
+    category: "browser",
+  },
+  {
+    id: "hn-login",
+    title: "Open a login flow",
+    summary:
+      "Go to a login page and handle the browser steps directly inside the task.",
+    prompt: "Go to https://news.ycombinator.com/login and log in for me.",
+    category: "browser",
+  },
+  {
+    id: "kaggle-skill",
+    title: "Read a skill page first",
+    summary:
+      "Fetch a skill file, inspect the flow, and tell me what it requires before taking action.",
+    prompt:
+      "Fetch and read https://www.kaggle.com/static/experimental/sae/SKILL.md, then tell me what the registration and exam flow requires before you continue.",
+    category: "browser",
+  },
+  {
+    id: "google-workspace-tools",
+    title: "Check Google Workspace access",
+    summary:
+      "Inspect which Google Workspace tools are actually available right now.",
+    prompt: "What tools do you currently have for Google Workspace?",
+    category: "security",
+  },
+  {
+    id: "drive-roadmap",
+    title: "Find a Drive file if granted",
+    summary:
+      "Search Drive for a file by name and only succeed if access is really available.",
+    prompt: "Find my Drive file named roadmap.",
+    category: "security",
+  },
+  {
+    id: "places-fallback",
+    title: "Check fallback routing",
+    summary:
+      "Use public search when a connected Places integration is not available.",
+    prompt: "List flight schools near Madhyamgram, Kolkata.",
+    category: "security",
+  },
+  {
+    id: "arkpulse-latest-run",
+    title: "What was ArkPulse latest run?",
+    summary: "Inspect the latest ArkPulse run and summarize the main result.",
+    prompt: "What was ArkPulse latest run?",
+    category: "advanced",
+  },
+  {
+    id: "recent-evolution",
+    title: "What does recent evolution say?",
+    summary:
+      "Summarize recent evolution activity and how the current state looks.",
+    prompt: "What does recent evolution say and how does it look?",
+    category: "advanced",
+  },
+  {
+    id: "sentinel-observations",
+    title: "Show recent sentinel observations",
+    summary:
+      "Inspect recent sentinel observations and call out anything worth attention.",
+    prompt:
+      "Show me recent sentinel observations and anything worth attention.",
+    category: "advanced",
+  },
+  {
+    id: "latest-trace",
+    title: "Inspect the latest trace",
+    summary: "Read the newest trace and tell me what failed or looks odd.",
+    prompt: "Show me the latest trace and tell me what failed or looks odd.",
+    category: "advanced",
+  },
+  {
+    id: "last-5-traces",
+    title: "Compare the last 5 traces",
+    summary:
+      "Check recent execution traces and identify which tool is failing most.",
+    prompt:
+      "Look at the last 5 execution traces and tell me which tool is failing most.",
+    category: "advanced",
+  },
+  {
+    id: "duplicate-reminders",
+    title: "Find duplicate reminder tasks",
+    summary: "Inspect recent reminder tasks and tell me if duplicates exist.",
+    prompt: "Find recent reminder tasks and tell me if there are duplicates.",
+    category: "advanced",
+  },
+  {
+    id: "arkpulse-running",
+    title: "Check whether ArkPulse is running",
+    summary:
+      "Inspect AgentArk directly and determine whether ArkPulse is running right now.",
+    prompt:
+      "Without guessing, inspect AgentArk and tell me whether ArkPulse is running right now.",
+    category: "advanced",
+  },
+  {
+    id: "trace-by-id",
+    title: "Inspect a trace by ID",
+    summary:
+      "Take a specific trace ID and summarize the failure path precisely.",
+    prompt:
+      "Inspect the trace with id <paste-id-from-trace-page> and summarize the failure path.",
+    category: "advanced",
+  },
+  {
+    id: "schedule-task-logs",
+    title: "Find failed schedule_task logs",
+    summary:
+      "Use the live database if needed and avoid guessing table names while tracing failures.",
+    prompt:
+      "Use the live database if needed, but do not guess table names: find the newest failed operational logs related to schedule_task.",
+    category: "advanced",
+  },
+  {
+    id: "evolution-awaiting-review",
+    title: "Find learning awaiting review",
+    summary: "Inspect what evolution learned recently that still needs review.",
+    prompt:
+      "What has evolution learned recently that is still awaiting review?",
+    category: "advanced",
+  },
+  {
+    id: "arkpulse-vs-traces",
+    title: "Compare ArkPulse warnings with traces",
+    summary:
+      "Check whether recent ArkPulse warnings line up with recent trace failures.",
+    prompt:
+      "Compare recent ArkPulse warnings with recent trace failures and tell me if they line up.",
+    category: "advanced",
+  },
+];
+
+const CHAT_STARTER_DEFAULT_EXAMPLES = CHAT_STARTER_EXAMPLES.filter(
+  (example) => example.defaultVisible,
+);
+
+const CHAT_STARTER_EXPANDED_SECTIONS = CHAT_STARTER_CATEGORY_ORDER.map(
+  (categoryId) => ({
+    id: categoryId,
+    ...CHAT_STARTER_CATEGORY_META[categoryId],
+    items: CHAT_STARTER_EXAMPLES.filter(
+      (example) => example.category === categoryId && !example.defaultVisible,
+    ),
+  }),
+).filter((section) => section.items.length > 0);
+
+const CHAT_STARTER_ADVANCED_EXAMPLES = CHAT_STARTER_EXAMPLES.filter(
+  (example) => example.category === "advanced",
+);
+const CHAT_SECRET_WARNING =
+  "Never paste secrets, API keys, passwords, or sensitive data into normal chat. Use the secure credential form shown in this conversation.";
+
+const ChatComposerInput = memo(function ChatComposerInput({
+  attachedFilesCount,
+  composerLocked,
+  deepResearchEnabled,
+  isStoppingStream,
+  isStreaming,
+  onAttachFiles,
+  onStopStreaming,
+  onSubmit,
+  onToggleDeepResearch,
+  placeholder,
+  prefillRequest,
+}: {
+  attachedFilesCount: number;
+  composerLocked: boolean;
+  deepResearchEnabled: boolean;
+  isStoppingStream: boolean;
+  isStreaming: boolean;
+  onAttachFiles: () => void;
+  onStopStreaming: () => void;
+  onSubmit: (draft: string) => Promise<boolean>;
+  onToggleDeepResearch: () => void;
+  placeholder: string;
+  prefillRequest: ChatComposerPrefillRequest | null;
+}) {
+  const [draft, setDraft] = useState("");
+  const [optionsAnchor, setOptionsAnchor] = useState<HTMLElement | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const lastAppliedPrefillSeqRef = useRef<number | null>(null);
+  const optionsOpen = Boolean(optionsAnchor);
+
+  const resizeComposerTextarea = (el: HTMLTextAreaElement | null) => {
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 150)}px`;
+  };
+
+  useLayoutEffect(() => {
+    resizeComposerTextarea(textareaRef.current);
+  }, [draft]);
+
+  useEffect(() => {
+    if (!prefillRequest) return;
+    if (prefillRequest.seq === lastAppliedPrefillSeqRef.current) return;
+    setDraft(prefillRequest.text);
+    lastAppliedPrefillSeqRef.current = prefillRequest.seq;
+    if (typeof window === "undefined") return;
+    window.requestAnimationFrame(() => {
+      const el = textareaRef.current;
+      if (!el) return;
+      el.focus();
+      const end = prefillRequest.text.length;
+      try {
+        el.setSelectionRange(end, end);
+      } catch {
+        // Ignore selection errors on browsers that do not support it here.
+      }
+      resizeComposerTextarea(el);
+    });
+  }, [prefillRequest]);
+
+  const submitCurrentDraft = async () => {
+    if (
+      composerLocked ||
+      isStreaming ||
+      (!draft.trim() && attachedFilesCount === 0)
+    ) {
+      return;
+    }
+    const accepted = await onSubmit(draft);
+    if (!accepted) return;
+    setDraft("");
+    const el = textareaRef.current;
+    if (el) {
+      el.style.height = "auto";
+    }
+  };
+  const closeComposerOptions = () => setOptionsAnchor(null);
+  const attachFilesFromMenu = () => {
+    closeComposerOptions();
+    onAttachFiles();
+  };
+  const toggleDeepResearchFromMenu = () => {
+    if (isStreaming || composerLocked) return;
+    onToggleDeepResearch();
+    closeComposerOptions();
+  };
+
+  return (
+    <>
+      <textarea
+        ref={textareaRef}
+        className="chat-composer-textarea"
+        placeholder={placeholder}
+        aria-label="Message"
+        value={draft}
+        onChange={(e) => {
+          setDraft(e.target.value);
+          resizeComposerTextarea(e.target);
+        }}
+        onKeyDown={(e) => {
+          if (
+            e.key === "Enter" &&
+            !e.shiftKey &&
+            !e.nativeEvent.isComposing
+          ) {
+            e.preventDefault();
+            void submitCurrentDraft();
+          }
+        }}
+        rows={1}
+        disabled={composerLocked}
+      />
+      <div className="chat-composer-actions">
+        <Tooltip title="Options">
+          <IconButton
+            size="small"
+            className={`chat-composer-action-btn chat-composer-options-btn${optionsOpen || deepResearchEnabled ? " active" : ""}`}
+            aria-label="Composer options"
+            aria-controls={optionsOpen ? "chat-composer-options-menu" : undefined}
+            aria-haspopup="menu"
+            aria-expanded={optionsOpen ? "true" : undefined}
+            onClick={(event) => setOptionsAnchor(event.currentTarget)}
+            disabled={isStreaming || composerLocked}
+          >
+            <AddRoundedIcon fontSize="small" />
+          </IconButton>
+        </Tooltip>
+        <Menu
+          id="chat-composer-options-menu"
+          className="chat-composer-options-menu"
+          anchorEl={optionsAnchor}
+          open={optionsOpen}
+          onClose={closeComposerOptions}
+          anchorOrigin={{ vertical: "bottom", horizontal: "left" }}
+          transformOrigin={{ vertical: "top", horizontal: "left" }}
+        >
+          <MenuItem
+            className="chat-composer-menu-item"
+            onClick={attachFilesFromMenu}
+            disabled={isStreaming || composerLocked}
+          >
+            <AttachFileRoundedIcon fontSize="small" />
+            <span>Upload files</span>
+          </MenuItem>
+          <MenuItem
+            className="chat-composer-menu-item"
+            onClick={toggleDeepResearchFromMenu}
+            disabled={isStreaming || composerLocked}
+          >
+            <Checkbox
+              size="small"
+              checked={deepResearchEnabled}
+              tabIndex={-1}
+              disableRipple
+              className="chat-composer-menu-check"
+            />
+            <span>Deep research</span>
+          </MenuItem>
+        </Menu>
+        {isStreaming ? (
+          <IconButton
+            size="small"
+            className="chat-composer-stop-btn"
+            disabled={isStoppingStream}
+            onClick={onStopStreaming}
+          >
+            <StopRoundedIcon fontSize="small" />
+          </IconButton>
+        ) : (
+          <IconButton
+            id="chat-send-btn"
+            size="small"
+            className="chat-composer-send-btn"
+            disabled={composerLocked || (!draft.trim() && attachedFilesCount === 0)}
+            onClick={() => {
+              void submitCurrentDraft();
+            }}
+          >
+            <ArrowUpwardRoundedIcon fontSize="small" />
+          </IconButton>
+        )}
+      </div>
+    </>
+  );
+});
+
+function ChatPageInner({
+  autoRefresh,
+  isActive,
+  projects,
+  activeProjectId,
+  onNavigateToView,
+}: {
+  autoRefresh: boolean;
+  isActive: boolean;
+  projects: JsonRecord[];
+  activeProjectId: string;
+  onNavigateToView?: (view: string, replace?: boolean) => void;
+}) {
+  const queryClient = useQueryClient();
+  const chatAutoRefresh = autoRefresh && isActive;
+  const [conversationId, setConversationId] = useState<string | null>(null);
+  const [deepResearchEnabled, setDeepResearchEnabled] = useState(false);
+  const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
+  const [chatError, setChatError] = useState<string | null>(null);
+  const [chatNotice, setChatNotice] = useState<string | null>(null);
+  const [chatCredentialValues, setChatCredentialValues] = useState<
+    Record<string, string>
+  >({});
+  const [chatCredentialError, setChatCredentialError] = useState<string | null>(
+    null,
+  );
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [liveRunStreamOpen, setLiveRunStreamOpen] = useState(false);
+  const [isStoppingStream, setIsStoppingStream] = useState(false);
+  const [pendingUserMessage, setPendingUserMessage] = useState<string | null>(
+    null,
+  );
+  const [failedUserMessage, setFailedUserMessage] = useState<string | null>(
+    null,
+  );
+  const [streamingResponse, setStreamingResponse] = useState("");
+  const [streamingResponseChoices, setStreamingResponseChoices] = useState<
+    ChatClarificationChoice[]
+  >([]);
+  const [streamingRunMetrics, setStreamingRunMetrics] =
+    useState<ChatRunMetrics | null>(null);
+  const [streamingSteps, setStreamingSteps] = useState<JsonRecord[]>([]);
+  const [executionPlan, setExecutionPlan] = useState<ExecutionPlanState | null>(
+    null,
+  );
+  const [planConfirmation, setPlanConfirmation] =
+    useState<PlanConfirmationState | null>(null);
+  const [executionPlanFailure, setExecutionPlanFailure] = useState("");
+  const [executionPlanExpanded, setExecutionPlanExpanded] = useState(false);
+  const [streamingProgressMessages, setStreamingProgressMessages] = useState<
+    string[]
+  >([]);
+  const [
+    completedProgressMessagesByConversation,
+    setCompletedProgressMessagesByConversation,
+  ] = useState<Record<string, { messages: string[]; beforeMessageId: string }>>(
+    {},
+  );
+  const [streamTraceOpen, setStreamTraceOpen] = useState(false);
+  const [viewportWidth, setViewportWidth] = useState(() =>
+    typeof window !== "undefined"
+      ? window.innerWidth
+      : CHAT_INLINE_ACTIVITY_MIN_WIDTH,
+  );
+  const [workspaceOpen, setWorkspaceOpen] = useState(false);
+  const [conversationSidebarOpen, setConversationSidebarOpen] = useState(false);
+  const [starterLibraryExpanded, setStarterLibraryExpanded] = useState(false);
+  const [starterAdvancedExpanded, setStarterAdvancedExpanded] = useState(false);
+  const [conversationPage, setConversationPage] = useState(0);
+  const [activityAutoFollow, setActivityAutoFollow] = useState(true);
+  const [expandedActivityPayloads, setExpandedActivityPayloads] = useState<
+    Set<string>
+  >(new Set());
+  const [secretHelperMode, setSecretHelperMode] = useState<"reuse" | "manual">(
+    "reuse",
+  );
+  const [secretHelperKey, setSecretHelperKey] = useState("OPENAI_API_KEY");
+  const [secretHelperValue, setSecretHelperValue] = useState("");
+  const [secretHelperBusy, setSecretHelperBusy] = useState(false);
+  const [isDragOverChat, setIsDragOverChat] = useState(false);
+  const [deployedFiles, setDeployedFiles] = useState<WorkspaceFileEntry[]>([]);
+  const [streamedWorkspaceApp, setStreamedWorkspaceApp] =
+    useState<JsonRecord | null>(null);
+  const [liveFileWrites, setLiveFileWrites] = useState<
+    Record<string, LiveFileWriteState>
+  >({});
+  const [streamPhaseStatus, setStreamPhaseStatus] =
+    useState<StreamPhaseStatus | null>(null);
+  const [codeViewerOpen, setCodeViewerOpen] = useState(false);
+  const [codeViewerFileIdx, setCodeViewerFileIdx] = useState(0);
+  const [selectedSnippetId, setSelectedSnippetId] = useState<string | null>(
+    null,
+  );
+  const [previewDialogOpen, setPreviewDialogOpen] = useState(false);
+  const [researchReportDialog, setResearchReportDialog] =
+    useState<ResearchReportDialogState | null>(null);
+  const [messageTraceOpen, setMessageTraceOpen] = useState<
+    Record<string, boolean>
+  >({});
+  const [submittedClarificationChoices, setSubmittedClarificationChoices] =
+    useState<Record<string, boolean>>({});
+  const [traceStepsById, setTraceStepsById] = useState<
+    Record<string, JsonRecord[]>
+  >({});
+  const [traceLoadingById, setTraceLoadingById] = useState<
+    Record<string, boolean>
+  >({});
+  const [traceErrorById, setTraceErrorById] = useState<Record<string, string>>(
+    {},
+  );
+  const [lastRunSteps, setLastRunSteps] = useState<JsonRecord[]>([]);
+  const [conversationMenuAnchor, setConversationMenuAnchor] =
+    useState<HTMLElement | null>(null);
+  const [conversationMenuTarget, setConversationMenuTarget] =
+    useState<JsonRecord | null>(null);
+  const [postDeleteConversationFallback, setPostDeleteConversationFallback] =
+    useState<{
+      deletedId: string;
+      preferredId: string | null;
+    } | null>(null);
+  const [pendingRunSnapshot, setPendingRunSnapshot] =
+    useState<ChatPendingRunSnapshot | null>(() => loadChatPendingRunSnapshot());
+  const [backgroundRunSnapshots, setBackgroundRunSnapshots] =
+    useState<ChatPendingRunSnapshotMap>(() => loadChatBackgroundRunSnapshots());
+  const [composerPrefillRequest, setComposerPrefillRequest] =
+    useState<ChatComposerPrefillRequest | null>(null);
+  const activeRunUsesLiveStream =
+    liveRunStreamOpen && (isStreaming || pendingRunSnapshot !== null);
+  const chatBackgroundRefresh =
+    (!activeRunUsesLiveStream && (isStreaming || pendingRunSnapshot !== null)) ||
+    Object.keys(backgroundRunSnapshots).length > 0;
+  const chatPassiveRefresh = chatAutoRefresh && !activeRunUsesLiveStream;
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const dragDepthRef = useRef(0);
+  const threadRef = useRef<HTMLDivElement | null>(null);
+  const streamLockRef = useRef(false);
+  const streamAbortRef = useRef<AbortController | null>(null);
+  const streamGenerationRef = useRef(0);
+  const backgroundDetachGenerationsRef = useRef<Set<number>>(new Set());
+  const activeChatTaskIdRef = useRef<string | null>(null);
+  const stopRequestedRef = useRef(false);
+  const recentSendRef = useRef<{ fingerprint: string; at: number } | null>(
+    null,
+  );
+  const streamingStepsRef = useRef<JsonRecord[]>([]);
+  const streamingStepKeySeqRef = useRef(1);
+  const queuedStreamingStepsRef = useRef<JsonRecord[] | null>(null);
+  const streamingStepsFlushTimerRef = useRef<number | null>(null);
+  const pendingRunSnapshotStoreRef = useRef<ChatPendingRunSnapshot | null>(
+    pendingRunSnapshot,
+  );
+  const pendingRunSnapshotStoreTimerRef = useRef<number | null>(null);
+  const workspaceSnapshotStoreRef = useRef<ChatWorkspaceSnapshot | null>(null);
+  const workspaceSnapshotStoreTimerRef = useRef<number | null>(null);
+  const workspaceActivityRef = useRef<HTMLDivElement | null>(null);
+  const conversationIdRef = useRef<string | null>(conversationId);
+  const pendingRunSnapshotRef = useRef<ChatPendingRunSnapshot | null>(
+    pendingRunSnapshot,
+  );
+  const streamingResponseRef = useRef(streamingResponse);
+  const latestRunEventSeqRef = useRef(pendingRunSnapshot?.lastRunSeq ?? 0);
+  const previousInlineSidebarsRef = useRef({
+    conversations: viewportWidth >= CHAT_INLINE_CONVERSATIONS_MIN_WIDTH,
+    activity: viewportWidth >= CHAT_INLINE_ACTIVITY_MIN_WIDTH,
+  });
+  const pendingFileReadPathRef = useRef("");
+  const pendingFileWritePathRef = useRef("");
+  const lastProgressBubbleCategoryRef = useRef("");
+  const lastProgressBubbleAtRef = useRef(0);
+  const streamedWorkspaceAppRef = useRef<JsonRecord | null>(null);
+  const streamingTokenBufferRef = useRef("");
+  const streamingTokenFlushTimerRef = useRef<number | null>(null);
+  const lastWorkspaceRestoreSeedRef = useRef("");
+  const reattachedRunIdRef = useRef("");
+  const conversationOffset = conversationPage * CHAT_CONVERSATIONS_PAGE_SIZE;
+  const queueComposerPrefill = (text: string) => {
+    setComposerPrefillRequest((prev) => ({
+      text,
+      seq: (prev?.seq ?? 0) + 1,
+    }));
+  };
+  const cancelStreamingTokenFlush = () => {
+    if (
+      typeof window !== "undefined" &&
+      streamingTokenFlushTimerRef.current !== null
+    ) {
+      window.clearTimeout(streamingTokenFlushTimerRef.current);
+    }
+    streamingTokenFlushTimerRef.current = null;
+  };
+  const flushStreamingTokenBuffer = () => {
+    const buffered = streamingTokenBufferRef.current;
+    if (!buffered) return;
+    streamingTokenBufferRef.current = "";
+    setStreamingResponse((prev) => {
+      const next = `${prev}${buffered}`;
+      streamingResponseRef.current = next;
+      return next;
+    });
+  };
+  const scheduleStreamingTokenFlush = () => {
+    if (typeof window === "undefined") {
+      flushStreamingTokenBuffer();
+      return;
+    }
+    if (streamingTokenFlushTimerRef.current !== null) return;
+    streamingTokenFlushTimerRef.current = window.setTimeout(() => {
+      streamingTokenFlushTimerRef.current = null;
+      flushStreamingTokenBuffer();
+    }, 80);
+  };
+  const appendStreamingToken = (token: string) => {
+    if (!token) return;
+    streamingTokenBufferRef.current += token;
+    streamingResponseRef.current += token;
+    scheduleStreamingTokenFlush();
+  };
+  const recordRunEventSeq = (payload: unknown) => {
+    const seq = num(asRecord(payload).seq, 0);
+    if (seq > latestRunEventSeqRef.current) {
+      latestRunEventSeqRef.current = Math.floor(seq);
+    }
+  };
+  const setStreamingResponseNow = (next: string) => {
+    cancelStreamingTokenFlush();
+    streamingTokenBufferRef.current = "";
+    streamingResponseRef.current = next;
+    setStreamingResponse(next);
+  };
+  const setLiveRunStreamOpenNow = (open: boolean) => {
+    setLiveRunStreamOpen((prev) => (prev === open ? prev : open));
+  };
+  const flushQueuedStreamingSteps = () => {
+    if (
+      typeof window !== "undefined" &&
+      streamingStepsFlushTimerRef.current !== null
+    ) {
+      window.clearTimeout(streamingStepsFlushTimerRef.current);
+    }
+    streamingStepsFlushTimerRef.current = null;
+    const queued = queuedStreamingStepsRef.current;
+    queuedStreamingStepsRef.current = null;
+    if (!queued) return;
+    setStreamingSteps(queued);
+  };
+  const scheduleStreamingStepsFlush = () => {
+    if (typeof window === "undefined") {
+      flushQueuedStreamingSteps();
+      return;
+    }
+    if (streamingStepsFlushTimerRef.current !== null) return;
+    streamingStepsFlushTimerRef.current = window.setTimeout(() => {
+      streamingStepsFlushTimerRef.current = null;
+      const queued = queuedStreamingStepsRef.current;
+      queuedStreamingStepsRef.current = null;
+      if (queued) setStreamingSteps(queued);
+    }, CHAT_STREAMING_STEP_FLUSH_MS);
+  };
+  const setStreamingStepsNow = (next: JsonRecord[]) => {
+    if (
+      typeof window !== "undefined" &&
+      streamingStepsFlushTimerRef.current !== null
+    ) {
+      window.clearTimeout(streamingStepsFlushTimerRef.current);
+    }
+    streamingStepsFlushTimerRef.current = null;
+    queuedStreamingStepsRef.current = null;
+    streamingStepsRef.current = next;
+    setStreamingSteps(next);
+  };
+  const scheduleChatPendingRunSnapshotStore = (
+    snapshot: ChatPendingRunSnapshot | null,
+  ) => {
+    pendingRunSnapshotStoreRef.current = snapshot;
+    if (typeof window === "undefined") {
+      storeChatPendingRunSnapshot(snapshot);
+      return;
+    }
+    if (!snapshot) {
+      if (pendingRunSnapshotStoreTimerRef.current !== null) {
+        window.clearTimeout(pendingRunSnapshotStoreTimerRef.current);
+      }
+      pendingRunSnapshotStoreTimerRef.current = null;
+      storeChatPendingRunSnapshot(null);
+      return;
+    }
+    if (pendingRunSnapshotStoreTimerRef.current !== null) return;
+    pendingRunSnapshotStoreTimerRef.current = window.setTimeout(() => {
+      pendingRunSnapshotStoreTimerRef.current = null;
+      storeChatPendingRunSnapshot(pendingRunSnapshotStoreRef.current);
+    }, CHAT_PENDING_RUN_SNAPSHOT_FLUSH_MS);
+  };
+  const storeChatPendingRunSnapshotNow = (
+    snapshot: ChatPendingRunSnapshot | null,
+  ) => {
+    pendingRunSnapshotStoreRef.current = snapshot;
+    if (
+      typeof window !== "undefined" &&
+      pendingRunSnapshotStoreTimerRef.current !== null
+    ) {
+      window.clearTimeout(pendingRunSnapshotStoreTimerRef.current);
+    }
+    pendingRunSnapshotStoreTimerRef.current = null;
+    storeChatPendingRunSnapshot(snapshot);
+  };
+  const flushChatPendingRunSnapshotStore = () => {
+    if (
+      typeof window !== "undefined" &&
+      pendingRunSnapshotStoreTimerRef.current !== null
+    ) {
+      window.clearTimeout(pendingRunSnapshotStoreTimerRef.current);
+    }
+    pendingRunSnapshotStoreTimerRef.current = null;
+    storeChatPendingRunSnapshot(pendingRunSnapshotStoreRef.current);
+  };
+  const scheduleChatWorkspaceSnapshotStore = (
+    snapshot: ChatWorkspaceSnapshot,
+  ) => {
+    workspaceSnapshotStoreRef.current = snapshot;
+    if (typeof window === "undefined") {
+      storeChatWorkspaceSnapshot(snapshot);
+      return;
+    }
+    if (workspaceSnapshotStoreTimerRef.current !== null) return;
+    workspaceSnapshotStoreTimerRef.current = window.setTimeout(() => {
+      workspaceSnapshotStoreTimerRef.current = null;
+      const queued = workspaceSnapshotStoreRef.current;
+      if (queued) storeChatWorkspaceSnapshot(queued);
+    }, CHAT_WORKSPACE_SNAPSHOT_FLUSH_MS);
+  };
+  const flushChatWorkspaceSnapshotStore = () => {
+    if (
+      typeof window !== "undefined" &&
+      workspaceSnapshotStoreTimerRef.current !== null
+    ) {
+      window.clearTimeout(workspaceSnapshotStoreTimerRef.current);
+    }
+    workspaceSnapshotStoreTimerRef.current = null;
+    const queued = workspaceSnapshotStoreRef.current;
+    if (queued) storeChatWorkspaceSnapshot(queued);
+  };
+  const canInlineConversationSidebar =
+    viewportWidth >= CHAT_INLINE_CONVERSATIONS_MIN_WIDTH;
+  const canInlineWorkspacePanel =
+    viewportWidth >= CHAT_INLINE_ACTIVITY_MIN_WIDTH;
+  const scopedConversationPath = useMemo(
+    () =>
+      withProjectScope(
+        `/conversations?sidebar=1&limit=${CHAT_CONVERSATIONS_PAGE_SIZE}&offset=${conversationOffset}`,
+        activeProjectId,
+      ),
+    [activeProjectId, conversationOffset],
+  );
+
+  const convQ = useQuery({
+    queryKey: ["chat-conversations", activeProjectId, conversationPage],
+    queryFn: () => api.rawGet(scopedConversationPath),
+    refetchInterval:
+      chatPassiveRefresh || chatBackgroundRefresh ? REFRESH_MS : false,
+    refetchIntervalInBackground: chatBackgroundRefresh,
+  });
+
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+    const handleResize = () => setViewportWidth(window.innerWidth);
+    handleResize();
+    window.addEventListener("resize", handleResize, { passive: true });
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
+
+  useEffect(() => {
+    const previous = previousInlineSidebarsRef.current;
+    if (
+      previous.conversations &&
+      !canInlineConversationSidebar &&
+      conversationSidebarOpen
+    ) {
+      setConversationSidebarOpen(false);
+    }
+    if (previous.activity && !canInlineWorkspacePanel && workspaceOpen) {
+      setWorkspaceOpen(false);
+    }
+    previousInlineSidebarsRef.current = {
+      conversations: canInlineConversationSidebar,
+      activity: canInlineWorkspacePanel,
+    };
+  }, [
+    canInlineConversationSidebar,
+    canInlineWorkspacePanel,
+    conversationSidebarOpen,
+    workspaceOpen,
+  ]);
+
+  const conversationsPayload = asRecord(convQ.data);
+  const conversations = pickRecords(conversationsPayload, "conversations");
+  const starredConversations = pickRecords(
+    conversationsPayload,
+    "starred_conversations",
+  ).slice(0, CHAT_STARRED_LIMIT);
+  const orderedSidebarConversationIds = useMemo(
+    () =>
+      [...starredConversations, ...conversations]
+        .map((conv) => str(conv.id, "").trim())
+        .filter(Boolean),
+    [starredConversations, conversations],
+  );
+  const sidebarConversationIds = useMemo(
+    () => new Set(orderedSidebarConversationIds),
+    [orderedSidebarConversationIds],
+  );
+  const conversationListTotal = Math.max(
+    0,
+    num(conversationsPayload.total, conversations.length),
+  );
+  const conversationListLimit = Math.max(
+    1,
+    num(conversationsPayload.limit, CHAT_CONVERSATIONS_PAGE_SIZE),
+  );
+  const conversationPageCount = Math.max(
+    1,
+    Math.ceil(conversationListTotal / conversationListLimit),
+  );
+  const conversationPageLabel = `${Math.min(conversationPage + 1, conversationPageCount)}/${conversationPageCount}`;
+  const selectedConversationQ = useQuery({
+    queryKey: ["chat-conversation", conversationId],
+    queryFn: () =>
+      api.rawGet(`/conversations/${encodeURIComponent(conversationId || "")}`),
+    enabled: !!conversationId,
+    refetchInterval: chatPassiveRefresh ? REFRESH_MS : false,
+  });
+  const selectedConversation = useMemo(() => {
+    const sidebarMatch =
+      [...starredConversations, ...conversations].find(
+        (conv) => str(conv.id, "") === conversationId,
+      ) ?? null;
+    const fetched = asRecord(selectedConversationQ.data);
+    if (str(fetched.id, "").trim()) {
+      return sidebarMatch ? { ...sidebarMatch, ...fetched } : fetched;
+    }
+    return sidebarMatch;
+  }, [
+    starredConversations,
+    conversations,
+    conversationId,
+    selectedConversationQ.data,
+  ]);
+  const backgroundSessionsQ = useQuery({
+    queryKey: ["chat-background-sessions"],
+    queryFn: api.getBackgroundSessions,
+    refetchInterval: chatPassiveRefresh ? REFRESH_MS : false,
+  });
+  const backgroundSessions = useMemo(
+    () =>
+      pickRecords(backgroundSessionsQ.data, "sessions").filter((session) =>
+        isBackgroundSessionVisibleInUi(
+          session as unknown as BackgroundSessionSummary,
+        ),
+      ),
+    [backgroundSessionsQ.data],
+  );
+  const activeConversationSession = useMemo(
+    () =>
+      backgroundSessions.find((session) => {
+        const sessionConversationId = str(session.conversation_id, "").trim();
+        const status = str(session.status, "").trim().toLowerCase();
+        return (
+          !!conversationId &&
+          sessionConversationId === conversationId &&
+          !["completed", "failed", "cancelled"].includes(status)
+        );
+      }) || null,
+    [backgroundSessions, conversationId],
+  );
+  const workingConversationIds = useMemo(() => {
+    const ids = new Set<string>();
+    const addWorkingId = (id: string, fallback: string) => {
+      const normalized = id.trim();
+      ids.add(normalized || fallback);
+    };
+    if (
+      pendingRunSnapshot &&
+      (pendingRunSnapshot.phase ?? "running") === "running"
+    ) {
+      addWorkingId(
+        str(pendingRunSnapshot?.conversationId, ""),
+        "__active_pending_chat__",
+      );
+    }
+    Object.values(backgroundRunSnapshots).forEach((snapshot, idx) => {
+      if ((snapshot.phase ?? "running") !== "running") return;
+      addWorkingId(
+        str(snapshot.conversationId, ""),
+        `__background_pending_chat_${idx}__`,
+      );
+    });
+    backgroundSessions.forEach((session, idx) => {
+      const status = str(session.status, "").trim().toLowerCase();
+      if (!["active", "working", "running"].includes(status)) return;
+      const sessionConversationId = str(session.conversation_id, "").trim();
+      if (!sessionConversationId) return;
+      addWorkingId(sessionConversationId, `__background_session_${idx}__`);
+    });
+    return ids;
+  }, [backgroundRunSnapshots, backgroundSessions, pendingRunSnapshot]);
+  const workingChatCount = workingConversationIds.size;
+  const selectedMessageCount = num(selectedConversation?.message_count, 0);
+  const selectedConversationUpdatedAtMs = Date.parse(
+    str(selectedConversation?.updated_at, ""),
+  );
+  const recentlyTouchedEmptyConversation =
+    selectedMessageCount === 0 &&
+    Number.isFinite(selectedConversationUpdatedAtMs) &&
+    Date.now() - selectedConversationUpdatedAtMs < 10 * 60 * 1000;
+  const hasPendingSnapshotForConversation =
+    !!conversationId && pendingRunSnapshot?.conversationId === conversationId;
+  const isStreamingForCurrentConversation =
+    isStreaming && hasPendingSnapshotForConversation;
+  const liveStreamOpenForCurrentConversation =
+    liveRunStreamOpen && hasPendingSnapshotForConversation;
+  const shouldPollMessages =
+    !!conversationId &&
+    ((!liveStreamOpenForCurrentConversation &&
+      (isStreamingForCurrentConversation || hasPendingSnapshotForConversation)) ||
+      recentlyTouchedEmptyConversation);
+  const shouldPreparePersistedThread =
+    !!conversationId && (isActive || shouldPollMessages);
+  const messagesQ = useQuery({
+    queryKey: ["chat-messages", conversationId],
+    queryFn: () =>
+      api.rawGet(
+        `/conversations/${encodeURIComponent(conversationId || "")}/messages?limit=100`,
+      ),
+    enabled: !!conversationId && (isActive || shouldPollMessages),
+    refetchInterval: shouldPollMessages
+      ? 2000
+      : chatPassiveRefresh
+        ? REFRESH_MS
+        : false,
+    refetchIntervalInBackground: shouldPollMessages,
+  });
+  const chatCredentialPromptQ = useQuery({
+    queryKey: ["chat-credential-prompt", conversationId],
+    queryFn: () =>
+      api.rawGet(
+        `/chat/credential-prompt?conversation_id=${encodeURIComponent(conversationId || "")}`,
+      ),
+    enabled:
+      !!conversationId &&
+      (isActive || shouldPollMessages || isStreamingForCurrentConversation),
+    refetchInterval: shouldPollMessages
+      ? 2000
+      : chatPassiveRefresh
+        ? REFRESH_MS
+        : false,
+    refetchIntervalInBackground: shouldPollMessages,
+  });
+
+  const messages = useMemo(
+    () =>
+      shouldPreparePersistedThread
+        ? pickRecords(messagesQ.data, "messages")
+        : [],
+    [shouldPreparePersistedThread, messagesQ.data],
+  );
+  useEffect(() => {
+    const visibleMessageIds = new Set(
+      messages.map((message, idx) => str(message.id, String(idx)).trim()),
+    );
+    setMessageTraceOpen((prev) =>
+      pruneRecordToAllowedKeys(prev, visibleMessageIds),
+    );
+
+    const visibleTraceIds = messages
+      .map((message) => str(message.trace_id, "").trim())
+      .filter(Boolean);
+    const recentTraceIds = visibleTraceIds.slice(-CHAT_TRACE_STATE_CACHE_MAX);
+    const expandedTraceIds = messages
+      .filter((message, idx) => {
+        const messageId = str(message.id, String(idx)).trim();
+        return Boolean(messageTraceOpen[messageId]);
+      })
+      .map((message) => str(message.trace_id, "").trim())
+      .filter(Boolean);
+    const traceIdsToKeep = new Set([...recentTraceIds, ...expandedTraceIds]);
+    setTraceStepsById((prev) =>
+      pruneRecordToAllowedKeys(prev, traceIdsToKeep),
+    );
+    setTraceLoadingById((prev) =>
+      pruneRecordToAllowedKeys(prev, traceIdsToKeep),
+    );
+    setTraceErrorById((prev) =>
+      pruneRecordToAllowedKeys(prev, traceIdsToKeep),
+    );
+  }, [messages, messageTraceOpen]);
+  const previousUserPromptByIndex = useMemo(() => {
+    const map = new Map<number, string>();
+    let lastUserPrompt = "";
+    for (let i = 0; i < messages.length; i += 1) {
+      const m = asRecord(messages[i]);
+      const role = str(m.role, "").toLowerCase();
+      if (role === "user") {
+        map.set(i, "");
+        lastUserPrompt = stripAttachmentContextMarker(str(m.content, ""));
+      } else {
+        map.set(i, lastUserPrompt);
+      }
+    }
+    return map;
+  }, [messages]);
+  const chatCredentialPromptPayload = asRecord(chatCredentialPromptQ.data);
+  const chatCredentialPrompt = asRecord(chatCredentialPromptPayload.prompt);
+  const chatCredentialPromptFields = pickRecords(chatCredentialPrompt, "fields");
+  const chatCredentialPromptModeKind = str(
+    chatCredentialPrompt.mode_kind,
+    "",
+  )
+    .trim()
+    .toLowerCase();
+  const chatCredentialPromptIsOAuthShape =
+    chatCredentialPromptModeKind === "oauth2_authorization_code" ||
+    chatCredentialPromptModeKind === "oauth2_device_code" ||
+    chatCredentialPromptModeKind === "hybrid";
+  const chatCredentialPromptDocsUrl = str(
+    chatCredentialPrompt.docs_url,
+    "",
+  ).trim();
+  const chatCredentialPromptVisible =
+    toBool(chatCredentialPromptPayload.present) &&
+    chatCredentialPromptFields.length > 0;
+  const chatCredentialPromptFingerprint = chatCredentialPromptVisible
+    ? `${str(chatCredentialPrompt.kind, "")}:${str(chatCredentialPrompt.title, "")}:${chatCredentialPromptFields.map((field) => `${str(field.key, "")}:${toBool(field.required)}`).join("|")}`
+    : "";
+  const submitChatCredentialPromptMutation = useMutation({
+    mutationFn: (values: Record<string, string>) =>
+      api.rawPost("/chat/credential-prompt/submit", {
+        conversation_id: conversationId,
+        values,
+      }),
+    onSuccess: async (data) => {
+      const payload = asRecord(data);
+      const followup = str(payload.followup, "").trim();
+      setChatCredentialError(null);
+      setChatCredentialValues({});
+      if (followup) {
+        setChatNotice(followup);
+      }
+      await queryClient.invalidateQueries({
+        queryKey: ["chat-credential-prompt", conversationId],
+      });
+      await queryClient.invalidateQueries({
+        queryKey: ["chat-messages", conversationId],
+      });
+    },
+    onError: (err) => {
+      setChatCredentialError(normalizeChatError(errMessage(err)));
+    },
+  });
+  const selectedConversationErrorText = errMessage(selectedConversationQ.error)
+    .replace(/^error:\s*/i, "")
+    .trim()
+    .toLowerCase();
+  const selectedConversationNotFound =
+    !!conversationId &&
+    !sidebarConversationIds.has(conversationId) &&
+    selectedConversationErrorText === "conversation not found";
+  const latestAssistantTraceId = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const candidate = messages[i];
+      if (str(candidate.role, "").toLowerCase() !== "assistant") continue;
+      const traceId = str(candidate.trace_id, "").trim();
+      if (traceId) return traceId;
+    }
+    return "";
+  }, [messages]);
+  const projectNameById = useMemo(
+    () => buildProjectNameById(projects),
+    [projects],
+  );
+  const selectedConversationProjectId = normalizeProjectId(
+    selectedConversation?.project_id,
+  );
+  const effectiveProjectId = selectedConversationProjectId || activeProjectId;
+  const selectedConversationWorkspace = asRecord(
+    selectedConversation?.workspace,
+  );
+  const restoredConversationWorkspaceApp = useMemo(
+    () =>
+      extractWorkspaceAppFromStreamPayload("app_inspect", {
+        matched_app: selectedConversationWorkspace,
+      }),
+    [selectedConversationWorkspace],
+  );
+  const restoredConversationWorkspaceFiles = useMemo(
+    () =>
+      extractWorkspaceFilesFromStreamPayload("app_inspect", {
+        matched_app: selectedConversationWorkspace,
+      }),
+    [selectedConversationWorkspace],
+  );
+
+  useEffect(() => {
+    if (!chatCredentialPromptVisible) {
+      setChatCredentialValues({});
+      setChatCredentialError(null);
+      return;
+    }
+    setChatCredentialValues((prev) => {
+      const next: Record<string, string> = {};
+      for (const field of chatCredentialPromptFields) {
+        const key = str(field.key, "").trim();
+        if (!key) continue;
+        next[key] = prev[key] || "";
+      }
+      const prevKeys = Object.keys(prev);
+      const nextKeys = Object.keys(next);
+      if (
+        prevKeys.length === nextKeys.length &&
+        nextKeys.every((key) => prev[key] === next[key])
+      ) {
+        return prev;
+      }
+      return next;
+    });
+    setChatCredentialError(null);
+  }, [
+    chatCredentialPromptFields,
+    chatCredentialPromptFingerprint,
+    chatCredentialPromptVisible,
+  ]);
+
+  useEffect(() => {
+    if (!pendingRunSnapshot) {
+      scheduleChatPendingRunSnapshotStore(null);
+      return;
+    }
+    const snapshotSteps = streamingSteps
+      .slice(-CHAT_PENDING_STREAM_STEPS_MAX)
+      .map((step) => {
+        const compacted: JsonRecord = {};
+        const icon = str(step.icon, "").trim();
+        const title = str(step.title, "").trim();
+        const detail = str(step.detail, "").trim();
+        const stepType = str(step.step_type, "").trim();
+        const source = str(step.source, "").trim();
+        const data = compactUnknown(step.data, 800);
+        if (icon) compacted.icon = icon.slice(0, 64);
+        if (title) compacted.title = title.slice(0, 220);
+        if (detail) compacted.detail = detail.slice(0, 900);
+        if (stepType) compacted.step_type = stepType.slice(0, 80);
+        if (source) compacted.source = source.slice(0, 80);
+        if (data) compacted.data = data;
+        return compacted;
+      });
+    scheduleChatPendingRunSnapshotStore({
+      ...pendingRunSnapshot,
+      message: pendingUserMessage ?? pendingRunSnapshot.message,
+      projectId: effectiveProjectId || pendingRunSnapshot.projectId || "",
+      streamingResponse: streamingResponse.slice(
+        0,
+        CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS,
+      ),
+      streamingSteps: snapshotSteps,
+      failedUserMessage: failedUserMessage ?? "",
+      lastRunSeq: Math.max(
+        pendingRunSnapshot.lastRunSeq ?? 0,
+        latestRunEventSeqRef.current,
+      ),
+    });
+  }, [
+    pendingRunSnapshot,
+    pendingUserMessage,
+    failedUserMessage,
+    streamingResponse,
+    streamingSteps,
+    effectiveProjectId,
+  ]);
+
+  useEffect(() => {
+    conversationIdRef.current = conversationId;
+  }, [conversationId]);
+
+  useEffect(() => {
+    pendingRunSnapshotRef.current = pendingRunSnapshot;
+    latestRunEventSeqRef.current = Math.max(
+      latestRunEventSeqRef.current,
+      pendingRunSnapshot?.lastRunSeq ?? 0,
+    );
+  }, [pendingRunSnapshot]);
+
+  useEffect(() => {
+    streamingResponseRef.current = streamingResponse;
+  }, [streamingResponse]);
+  useEffect(
+    () => () => {
+      if (
+        typeof window !== "undefined" &&
+        streamingTokenFlushTimerRef.current !== null
+      ) {
+        window.clearTimeout(streamingTokenFlushTimerRef.current);
+      }
+      streamingTokenFlushTimerRef.current = null;
+      streamingTokenBufferRef.current = "";
+      if (
+        typeof window !== "undefined" &&
+        streamingStepsFlushTimerRef.current !== null
+      ) {
+        window.clearTimeout(streamingStepsFlushTimerRef.current);
+      }
+      streamingStepsFlushTimerRef.current = null;
+      if (
+        typeof window !== "undefined" &&
+        pendingRunSnapshotStoreTimerRef.current !== null
+      ) {
+        window.clearTimeout(pendingRunSnapshotStoreTimerRef.current);
+      }
+      pendingRunSnapshotStoreTimerRef.current = null;
+      storeChatPendingRunSnapshot(pendingRunSnapshotStoreRef.current);
+      if (
+        typeof window !== "undefined" &&
+        workspaceSnapshotStoreTimerRef.current !== null
+      ) {
+        window.clearTimeout(workspaceSnapshotStoreTimerRef.current);
+      }
+      workspaceSnapshotStoreTimerRef.current = null;
+      if (workspaceSnapshotStoreRef.current) {
+        storeChatWorkspaceSnapshot(workspaceSnapshotStoreRef.current);
+      }
+    },
+    [],
+  );
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof document === "undefined") {
+      return undefined;
+    }
+    const flushBufferedChatState = () => {
+      flushStreamingTokenBuffer();
+      flushQueuedStreamingSteps();
+      flushChatPendingRunSnapshotStore();
+      flushChatWorkspaceSnapshotStore();
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        flushBufferedChatState();
+      }
+    };
+    window.addEventListener("pagehide", flushBufferedChatState);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      window.removeEventListener("pagehide", flushBufferedChatState);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, []);
+  useEffect(() => {
+    if (!streamingResponse.trim()) {
+      setStreamingResponseChoices([]);
+    }
+  }, [streamingResponse]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !conversationId) return;
+    try {
+      window.sessionStorage.setItem(
+        CHAT_LAST_CONVERSATION_STORAGE_KEY,
+        conversationId,
+      );
+    } catch {
+      // Ignore storage failures.
+    }
+  }, [conversationId]);
+
+  useEffect(() => {
+    if (!conversationId) {
+      lastWorkspaceRestoreSeedRef.current = "";
+      return;
+    }
+    if (isStreamingForCurrentConversation) return;
+    const cachedSnapshot = loadChatWorkspaceSnapshot(conversationId);
+    const mergedWorkspaceApp = sanitizeWorkspaceAppSnapshot({
+      ...(cachedSnapshot?.streamedWorkspaceApp || {}),
+      ...(restoredConversationWorkspaceApp || {}),
+    });
+    const appDir = str(
+      mergedWorkspaceApp?.app_dir,
+      str(cachedSnapshot?.streamedWorkspaceApp?.app_dir, ""),
+    ).trim();
+    const mergedFiles = mergeWorkspaceFiles(
+      restoredConversationWorkspaceFiles,
+      cachedSnapshot?.deployedFiles || [],
+      appDir,
+    );
+    const mergedLiveWrites = canonicalizeLiveFileWrites(
+      cachedSnapshot?.liveFileWrites || {},
+      appDir,
+    );
+    const restoreSeed = JSON.stringify({
+      conversationId,
+      updatedAt: str(selectedConversation?.updated_at, ""),
+      appId: str(mergedWorkspaceApp?.id, str(mergedWorkspaceApp?.app_id, "")),
+      files: mergedFiles.map((file) => file.name),
+      snapshotUpdatedAt: cachedSnapshot?.updatedAt || 0,
+      liveWrites: Object.keys(mergedLiveWrites),
+    });
+    if (lastWorkspaceRestoreSeedRef.current === restoreSeed) return;
+    lastWorkspaceRestoreSeedRef.current = restoreSeed;
+    if (
+      !mergedWorkspaceApp &&
+      mergedFiles.length === 0 &&
+      Object.keys(mergedLiveWrites).length === 0
+    ) {
+      return;
+    }
+    if (mergedWorkspaceApp) {
+      streamedWorkspaceAppRef.current = mergedWorkspaceApp;
+      setStreamedWorkspaceApp(mergedWorkspaceApp);
+    }
+    if (mergedFiles.length > 0) {
+      setDeployedFiles(mergedFiles);
+      const requestedIndex = Math.max(
+        0,
+        num(cachedSnapshot?.codeViewerFileIdx, 0),
+      );
+      setCodeViewerFileIdx(
+        Math.min(requestedIndex, Math.max(0, mergedFiles.length - 1)),
+      );
+    }
+    if (Object.keys(mergedLiveWrites).length > 0) {
+      setLiveFileWrites(mergedLiveWrites);
+    }
+  }, [
+    conversationId,
+    isStreamingForCurrentConversation,
+    restoredConversationWorkspaceApp,
+    restoredConversationWorkspaceFiles,
+    selectedConversation?.updated_at,
+  ]);
+
+  useEffect(() => {
+    if (!conversationId) return;
+    const includeWorkspaceContent =
+      !hasPendingSnapshotForConversation ||
+      (pendingRunSnapshot?.phase ?? "running") !== "running";
+    const compactedFiles = compactWorkspaceFilesForSnapshot(deployedFiles, {
+      includeContent: includeWorkspaceContent,
+    });
+    const compactedLiveWrites = compactLiveFileWritesForSnapshot(
+      liveFileWrites,
+      { includeContent: includeWorkspaceContent },
+    );
+    const compactedApp = sanitizeWorkspaceAppSnapshot(streamedWorkspaceApp);
+    if (
+      !compactedApp &&
+      compactedFiles.length === 0 &&
+      Object.keys(compactedLiveWrites).length === 0
+    ) {
+      return;
+    }
+    scheduleChatWorkspaceSnapshotStore({
+      conversationId,
+      updatedAt: Date.now(),
+      deployedFiles: compactedFiles,
+      liveFileWrites: compactedLiveWrites,
+      streamedWorkspaceApp: compactedApp,
+      codeViewerFileIdx: Math.max(0, num(codeViewerFileIdx, 0)),
+    });
+  }, [
+    conversationId,
+    deployedFiles,
+    hasPendingSnapshotForConversation,
+    liveFileWrites,
+    pendingRunSnapshot?.phase,
+    streamedWorkspaceApp,
+    codeViewerFileIdx,
+  ]);
+
+  useEffect(() => {
+    const maxPage = Math.max(0, conversationPageCount - 1);
+    if (conversationPage > maxPage) {
+      setConversationPage(maxPage);
+    }
+  }, [conversationPage, conversationPageCount]);
+
+  useEffect(() => {
+    setConversationPage(0);
+  }, [activeProjectId]);
+
+  useEffect(() => {
+    const pending = pendingRunSnapshot ?? loadChatPendingRunSnapshot();
+    if (pending) {
+      const shouldSelectPendingConversation = !conversationId;
+      const viewingPendingConversation =
+        conversationId === pending.conversationId;
+      if (shouldSelectPendingConversation) {
+        setConversationPage(0);
+        setConversationId(pending.conversationId);
+      }
+      if (shouldSelectPendingConversation || viewingPendingConversation) {
+        if (pending.message && !pendingUserMessage) {
+          setPendingUserMessage(pending.message);
+        }
+        if (pending.failedUserMessage && !failedUserMessage) {
+          setFailedUserMessage(pending.failedUserMessage);
+        }
+        if (pending.streamingResponse && !streamingResponse) {
+          setStreamingResponseNow(pending.streamingResponse);
+        }
+        if (
+          Array.isArray(pending.streamingSteps) &&
+          pending.streamingSteps.length > 0 &&
+          streamingStepsRef.current.length === 0
+        ) {
+          const restoredSteps = pending.streamingSteps.map((step) =>
+            ensureActivityStepTime(asRecord(step)),
+          );
+          setStreamingStepsNow(restoredSteps);
+        }
+        return;
+      }
+    }
+
+    if (
+      conversationId ||
+      (starredConversations.length === 0 && conversations.length === 0) ||
+      typeof window === "undefined"
+    ) {
+      return;
+    }
+    try {
+      const lastSelected = window.sessionStorage
+        .getItem(CHAT_LAST_CONVERSATION_STORAGE_KEY)
+        ?.trim();
+      if (lastSelected && sidebarConversationIds.has(lastSelected)) {
+        setConversationId(lastSelected);
+      }
+    } catch {
+      // Ignore storage failures.
+    }
+  }, [
+    conversationId,
+    conversations,
+    starredConversations,
+    sidebarConversationIds,
+    pendingRunSnapshot,
+    pendingUserMessage,
+    failedUserMessage,
+    streamingResponse,
+    streamingSteps.length,
+  ]);
+
+  useEffect(() => {
+    if (!postDeleteConversationFallback) return;
+    if (
+      conversationId &&
+      conversationId !== postDeleteConversationFallback.deletedId
+    ) {
+      setPostDeleteConversationFallback(null);
+      return;
+    }
+    if (conversationId) return;
+    const availableIds = orderedSidebarConversationIds.filter(
+      (id) => id !== postDeleteConversationFallback.deletedId,
+    );
+    if (availableIds.length > 0) {
+      const nextConversationId =
+        postDeleteConversationFallback.preferredId &&
+        availableIds.includes(postDeleteConversationFallback.preferredId)
+          ? postDeleteConversationFallback.preferredId
+          : availableIds[0];
+      setPostDeleteConversationFallback(null);
+      openConversationById(nextConversationId);
+      return;
+    }
+    if (!convQ.isFetching && conversationListTotal === 0) {
+      setPostDeleteConversationFallback(null);
+    }
+  }, [
+    postDeleteConversationFallback,
+    conversationId,
+    orderedSidebarConversationIds,
+    convQ.isFetching,
+    conversationListTotal,
+  ]);
+
+  useEffect(() => {
+    if (!conversationId || pendingRunSnapshot) return;
+    const restoredSnapshot = backgroundRunSnapshots[conversationId];
+    if (!restoredSnapshot) return;
+    const nextBackgroundSnapshots = { ...backgroundRunSnapshots };
+    delete nextBackgroundSnapshots[conversationId];
+    setBackgroundRunSnapshots(nextBackgroundSnapshots);
+    storeChatBackgroundRunSnapshots(nextBackgroundSnapshots);
+    setPendingRunSnapshot(restoredSnapshot);
+    storeChatPendingRunSnapshotNow(restoredSnapshot);
+  }, [conversationId, pendingRunSnapshot, backgroundRunSnapshots]);
+
+  useEffect(() => {
+    if (!pendingRunSnapshot) return;
+    if (conversationId !== pendingRunSnapshot.conversationId) return;
+    if (
+      pendingRunSnapshot.phase === "awaiting_confirmation" ||
+      pendingRunSnapshot.phase === "interrupted"
+    )
+      return;
+    const latestMessage = messages[messages.length - 1];
+    if (str(latestMessage?.role, "").toLowerCase() !== "assistant") return;
+    const latestTimestampMs = Date.parse(str(latestMessage?.timestamp, ""));
+    if (
+      Number.isFinite(latestTimestampMs) &&
+      latestTimestampMs + 1000 < pendingRunSnapshot.startedAt
+    ) {
+      return;
+    }
+    const preservedSteps =
+      streamingStepsRef.current.length > 0
+        ? trimTrailingHeartbeatSteps(streamingStepsRef.current)
+        : trimTrailingHeartbeatSteps(streamingSteps);
+    const restoredPlan =
+      executionPlan ?? extractExecutionPlanFromTraceSteps(preservedSteps);
+    if (
+      shouldKeepPlanInApprovalState(
+        restoredPlan,
+        preservedSteps,
+        pendingRunSnapshot.mode === "resume" ? "resume" : "fresh",
+      )
+    ) {
+      return;
+    }
+    if (preservedSteps.length > 0) {
+      setLastRunSteps(preservedSteps);
+    }
+    if (streamingProgressMessages.length > 0) {
+      setCompletedProgressMessagesByConversation((prev) => {
+        const next = {
+          ...prev,
+          [pendingRunSnapshot.conversationId]: {
+            messages: streamingProgressMessages.slice(-5),
+            beforeMessageId: str(latestMessage?.id, ""),
+          },
+        };
+        const entries = Object.entries(next);
+        if (entries.length <= CHAT_PROGRESS_MEMORY_MAX_CONVERSATIONS) {
+          return next;
+        }
+        return Object.fromEntries(
+          entries.slice(-CHAT_PROGRESS_MEMORY_MAX_CONVERSATIONS),
+        ) as Record<string, { messages: string[]; beforeMessageId: string }>;
+      });
+    }
+    clearPendingRunPresentation(preservedSteps);
+  }, [
+    pendingRunSnapshot,
+    conversationId,
+    messages,
+    executionPlan,
+    streamingSteps,
+    streamingProgressMessages,
+  ]);
+
+  useEffect(() => {
+    setCompletedProgressMessagesByConversation((prev) => {
+      const entries = Object.entries(prev);
+      if (entries.length <= CHAT_PROGRESS_MEMORY_MAX_CONVERSATIONS) return prev;
+      const keepIds = new Set(
+        [
+          ...entries
+            .slice(-(CHAT_PROGRESS_MEMORY_MAX_CONVERSATIONS - 1))
+            .map(([id]) => id),
+          conversationId,
+        ].filter((id): id is string => Boolean(id)),
+      );
+      return Object.fromEntries(
+        entries.filter(([id]) => keepIds.has(id)),
+      ) as Record<string, { messages: string[]; beforeMessageId: string }>;
+    });
+  }, [conversationId]);
+
+  useEffect(() => {
+    const snapshot = pendingRunSnapshot;
+    if (!snapshot) return;
+    if (conversationId !== snapshot.conversationId) return;
+    if (
+      snapshot.phase === "awaiting_confirmation" ||
+      snapshot.phase === "interrupted"
+    ) {
+      return;
+    }
+    if (isStreaming || streamLockRef.current) return;
+    if (str(snapshot.runId, "").trim()) return;
+
+    let cancelled = false;
+    let retryHandle: number | null = null;
+
+    const pollLatestRun = async () => {
+      try {
+        const outcome = await syncPendingRunFromLatestRun(
+          snapshot.conversationId,
+          snapshot,
+          { allowTerminalClear: true },
+        );
+        if (cancelled || outcome !== "none") return;
+      } catch {
+        if (cancelled) return;
+      }
+      if (Date.now() - snapshot.startedAt > CHAT_PENDING_RUN_RECOVERY_GRACE_MS) {
+        pushStreamingStep({
+          step_type: "run_status",
+          title: "Run status: interrupted",
+          detail:
+            "The browser had a saved pending run, but the backend no longer has an active matching run after reconnect.",
+          data: {
+            interruption_kind: "lost_backend_run",
+            reason: "backend_run_missing_after_reconnect",
+          },
+        });
+        markPendingRunInterrupted(
+          snapshot.taskId,
+          snapshot.streamingResponse || streamingResponseRef.current,
+        );
+        setPendingUserMessage(null);
+        return;
+      }
+      retryHandle = window.setTimeout(() => {
+        void pollLatestRun();
+      }, 1500);
+    };
+
+    void pollLatestRun();
+    return () => {
+      cancelled = true;
+      if (retryHandle !== null) {
+        window.clearTimeout(retryHandle);
+      }
+    };
+  }, [
+    conversationId,
+    pendingRunSnapshot,
+    isStreaming,
+  ]);
+
+  useEffect(() => {
+    if (
+      !latestAssistantTraceId ||
+      isStreaming ||
+      hasPendingSnapshotForConversation
+    )
+      return;
+    if (
+      traceStepsById[latestAssistantTraceId] ||
+      traceLoadingById[latestAssistantTraceId] ||
+      traceErrorById[latestAssistantTraceId]
+    )
+      return;
+    void loadTraceForId(latestAssistantTraceId);
+  }, [
+    latestAssistantTraceId,
+    isStreaming,
+    hasPendingSnapshotForConversation,
+    traceStepsById,
+    traceLoadingById,
+    traceErrorById,
+  ]);
+
+  useEffect(() => {
+    if (!conversationId || isStreaming || hasPendingSnapshotForConversation)
+      return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const payload = asRecord(
+          await api.rawGet(
+            `/conversations/${encodeURIComponent(conversationId)}/latest-run`,
+          ),
+        );
+        if (cancelled) return;
+        const events = asRecords(payload.events);
+        setLastRunSteps(buildPersistedRunSteps(events));
+      } catch {
+        if (!cancelled) {
+          setLastRunSteps([]);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [conversationId, isStreaming, hasPendingSnapshotForConversation]);
+
+  const toHumanToolName = (name: string): string => {
+    const normalized = (name || "").trim().toLowerCase();
+    if (!normalized) return "Tool";
+    const direct: Record<string, string> = {
+      app_deploy: "App deploy",
+      build_check: "Build check",
+      run_tests: "Test run",
+      lint_check: "Lint check",
+      source_read: "Read files",
+      source_write: "Write files",
+      source_edit: "Edit files",
+      source_list: "List files",
+      source_search: "Search files",
+      frontend_build: "Frontend build",
+      schedule_task: "Schedule task",
+      browse: "Open web page",
+      web_search: "Web search",
+    };
+    if (direct[normalized]) return direct[normalized];
+    return normalized
+      .replace(/[_-]+/g, " ")
+      .replace(/\b\w/g, (ch) => ch.toUpperCase());
+  };
+
+  const toggleExpandedActivityPayload = (id: string) => {
+    setExpandedActivityPayloads((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
+
+  const followActivityConsole = () => {
+    setActivityAutoFollow(true);
+  };
+
+  const openActivityConsole = () => {
+    if (canInlineWorkspacePanel) {
+      setWorkspaceOpen(true);
+    } else {
+      setWorkspaceOpen(true);
+    }
+    setActivityAutoFollow(true);
+  };
+
+  const toolStartCopy = (name: string): { label: string; detail: string } => {
+    const normalized = (name || "").trim().toLowerCase();
+    const byTool: Record<string, { label: string; detail: string }> = {
+      app_deploy: {
+        label: "Deploying access link",
+        detail: "Starting deployment and publishing access link.",
+      },
+      build_check: {
+        label: "Running checks",
+        detail: "Checking compile and build health.",
+      },
+      run_tests: {
+        label: "Running checks",
+        detail: "Running tests to validate behavior.",
+      },
+      lint_check: {
+        label: "Running checks",
+        detail: "Checking code quality and style.",
+      },
+      source_read: {
+        label: "Reading project files",
+        detail: "Reviewing existing code before changes.",
+      },
+      source_write: {
+        label: "Creating project files",
+        detail: "Creating or updating project files.",
+      },
+      source_edit: {
+        label: "Creating project files",
+        detail: "Applying code changes in project files.",
+      },
+      source_list: {
+        label: "Scanning project files",
+        detail: "Checking project structure.",
+      },
+      source_search: {
+        label: "Searching project files",
+        detail: "Looking for the right place to edit.",
+      },
+      web_search: {
+        label: "Searching sources",
+        detail: "Looking up relevant online sources.",
+      },
+      browse: {
+        label: "Opening source page",
+        detail: "Trying to open the requested web page.",
+      },
+      schedule_task: {
+        label: "Setting recurring monitor",
+        detail: "Creating the schedule for automatic runs.",
+      },
+      frontend_build: {
+        label: "Installing dependencies",
+        detail: "Preparing dependencies and building dashboard UI.",
+      },
+    };
+    return (
+      byTool[normalized] || {
+        label: `Running ${toHumanToolName(name).toLowerCase()}`,
+        detail: "Executing this action.",
+      }
+    );
+  };
+
+  const resetStreamingProgressBubbleState = () => {
+    lastProgressBubbleCategoryRef.current = "";
+    lastProgressBubbleAtRef.current = 0;
+  };
+
+  const normalizeStreamingProgressBubbleText = (value: string): string =>
+    (value || "")
+      .replace(/\r\n/g, "\n")
+      .split("\n")
+      .map((line) => line.replace(/[ \t]+/g, " ").trim())
+      .join("\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+
+  const pushStreamingProgressBubble = (
+    message: string,
+    options?: { category?: string; replace?: boolean; minIntervalMs?: number },
+  ) => {
+    const text = normalizeStreamingProgressBubbleText(message);
+    if (!text) return;
+    const category = str(options?.category, "").trim();
+    const replace = Boolean(options?.replace && category);
+    const minIntervalMs = Math.max(0, num(options?.minIntervalMs, 0));
+    const now = Date.now();
+    setStreamingProgressMessages((prev) => {
+      if (replace && category) {
+        const sameCategory = lastProgressBubbleCategoryRef.current === category;
+        if (
+          sameCategory &&
+          now - lastProgressBubbleAtRef.current < minIntervalMs
+        ) {
+          return prev;
+        }
+        if (sameCategory && prev.length > 0) {
+          if (prev[prev.length - 1] === text) return prev;
+          lastProgressBubbleAtRef.current = now;
+          return [...prev.slice(0, -1), text];
+        }
+      }
+      if (prev.some((entry) => entry === text)) {
+        if (replace && category) {
+          lastProgressBubbleCategoryRef.current = category;
+          lastProgressBubbleAtRef.current = now;
+        }
+        return prev;
+      }
+      if (replace && category) {
+        lastProgressBubbleCategoryRef.current = category;
+        lastProgressBubbleAtRef.current = now;
+      }
+      return [...prev.slice(-4), text];
+    });
+  };
+
+  const maybeSurfaceThinkingProgressBubble = (step: JsonRecord) => {
+    if (isHeartbeatStreamingStep(step)) return;
+    const detail = simplifyConsoleDetail(
+      summarizeActivityDetail(extractStepDetailText(step, 900)),
+    );
+    if (!detail) return;
+    const presentation = humanizeStep(
+      str(step.title, ""),
+      detail,
+      str(step.step_type, str(step.type, "thinking")),
+    );
+    const label = str(presentation.label, "").trim();
+    const message =
+      label && detail && label.toLowerCase() !== detail.toLowerCase()
+        ? `${label}: ${detail}`
+        : detail || label;
+    if (!message) return;
+    pushStreamingProgressBubble(message, {
+      category: "thinking",
+      replace: true,
+      minIntervalMs: 2500,
+    });
+  };
+
+  const maybeSurfaceToolStartProgressBubble = (name: string) => {
+    const copy = toolStartCopy(name);
+    const message = (
+      copy.detail ||
+      copy.label ||
+      `Starting ${toHumanToolName(name)}.`
+    ).trim();
+    if (!message) return;
+    pushStreamingProgressBubble(message, {
+      category: `tool-start:${str(name, "").trim().toLowerCase() || "tool"}`,
+      replace: true,
+      minIntervalMs: 4000,
+    });
+  };
+
+  const maybeSurfaceToolProgressBubble = (
+    name: string,
+    content: string,
+    payloadObj: JsonRecord,
+    progressPresentation: ToolProgressPresentation,
+  ) => {
+    const kind = str(payloadObj.kind, "");
+    if (kind === "file_write" || name === "file_write") return;
+
+    if (kind === "argument_stream") {
+      const stage = str(payloadObj.stage, "");
+      const toolLabel = toHumanToolName(name).toLowerCase();
+      let message = `I'm preparing ${toolLabel} inputs now.`;
+      if (stage === "payload_build" && name === "app_deploy") {
+        message = "I'm assembling the deploy payload now.";
+      } else if (stage === "payload_repair" && name === "app_deploy") {
+        message = "I'm repairing the deploy payload now.";
+      }
+      pushStreamingProgressBubble(message, {
+        category: str(
+          payloadObj.stream_key,
+          `argument-stream:${name || "tool"}`,
+        ),
+        replace: true,
+        minIntervalMs: 6000,
+      });
+      return;
+    }
+
+    if (/^writing\s+/i.test(progressPresentation.title)) return;
+    const message = (
+      progressPresentation.detail ||
+      simplifyConsoleDetail(
+        summarizeActivityDetail(content.trim().slice(0, 1600)),
+      ) ||
+      `I'm still running ${toHumanToolName(name).toLowerCase()}.`
+    ).trim();
+    if (!message || /^working\.{0,3}$/i.test(message)) return;
+    pushStreamingProgressBubble(message, {
+      category: `tool-progress:${str(name, "").trim().toLowerCase() || "tool"}`,
+      replace: true,
+      minIntervalMs: 8000,
+    });
+  };
+
+  const simplifyConsoleDetail = (detail: string): string => {
+    let text = (detail || "").replace(/\s+/g, " ").trim();
+    if (!text) return "";
+
+    if (/^loaded \d+ messages?, packed \d+/i.test(text))
+      return "Collected recent chat context.";
+    if (/channel:\s*\w+\s*\|\s*length:\s*\d+\s*chars/i.test(text))
+      return "Reading your request.";
+    if (/found \d+ relevant memories/i.test(text)) {
+      const m = text.match(/found\s+(\d+)\s+relevant memories/i);
+      const count = m?.[1] || "0";
+      return `Found ${count} related memory item${count === "1" ? "" : "s"}.`;
+    }
+    if (/complex\s*[-=]?>\s*direct llm/i.test(text))
+      return "Using a direct execution strategy.";
+    if (/using primary model/i.test(text))
+      return "Selected the best available model.";
+    if (
+      /response length:\s*\d+\s*chars/i.test(text) ||
+      /tool calls:\s*\d+/i.test(text)
+    ) {
+      return "Prepared the next response.";
+    }
+    if (/proof id:|verification id:/i.test(text))
+      return "Saved a verifiable execution record.";
+    if (/running in sandboxed environment/i.test(text))
+      return "Running this action in a safe workspace.";
+    if (
+      /install(ing)? dependencies|npm install|pnpm install|yarn install|cargo fetch/i.test(
+        text,
+      )
+    ) {
+      return "Installing dependencies.";
+    }
+    if (isSafetyPolicyBlockedText(text)) {
+      return "Blocked by safety policy. The agent needs a different approach.";
+    }
+    if (
+      /approval required|needs approval|awaiting approval|requires approval/i.test(
+        text,
+      )
+    ) {
+      return "Waiting for your approval/input.";
+    }
+    if (/browse failed; used search fallback/i.test(text)) {
+      return "Could not open the page directly, switched to web search.";
+    }
+    if (/http error 404/i.test(text) || /\b404\b.*not found/i.test(text)) {
+      return "Page not found (404). Trying alternate sources.";
+    }
+    if (/search results for:/i.test(text))
+      return "Found search results and selected relevant sources.";
+    if (/^\{\s*"name"\s*:\s*"[^"]+"\s*\}$/i.test(text)) {
+      const toolMatch = text.match(/"name"\s*:\s*"([^"]+)"/i);
+      if (toolMatch?.[1]) return `${toHumanToolName(toolMatch[1])} started.`;
+    }
+
+    if (text.length > 170) text = `${text.slice(0, 167).trimEnd()}...`;
+    return text;
+  };
+
+  const normalizeStatusText = (value: string): string =>
+    (value || "")
+      .toLowerCase()
+      .replace(/[`"'.,:;!?()[\]{}<>/_\\-]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  const isRedundantStatusDetail = (label: string, detail: string): boolean => {
+    const a = normalizeStatusText(label);
+    const b = normalizeStatusText(detail);
+    if (!a || !b) return false;
+    if (a === b) return true;
+    if (a.length >= 16 && b.includes(a)) return true;
+    if (b.length >= 16 && a.includes(b)) return true;
+    return false;
+  };
+
+  const planStepUpdateTitle = (status: string): string => {
+    switch ((status || "").trim().toLowerCase()) {
+      case "completed":
+        return "Plan Step Completed";
+      case "failed":
+        return "Plan Step Failed";
+      case "skipped":
+        return "Plan Step Skipped";
+      case "running":
+        return "Plan Step Started";
+      default:
+        return "Plan Step Updated";
+    }
+  };
+
+  const planStepUpdateDetail = (
+    status: string,
+    stepId: number,
+    stepTitle: string,
+  ): string => {
+    const subject = stepTitle || (stepId > 0 ? `step ${stepId}` : "plan step");
+    switch ((status || "").trim().toLowerCase()) {
+      case "completed":
+        return `Completed ${subject}.`;
+      case "failed":
+        return `Failed ${subject}.`;
+      case "skipped":
+        return `Skipped ${subject}.`;
+      case "running":
+        return `Started ${subject}.`;
+      default:
+        return `Updated ${subject}.`;
+    }
+  };
+
+  const normalizePlanStepUpdateStep = (step: JsonRecord): JsonRecord => {
+    const stepType = str(step.step_type, "");
+    if (stepType !== "plan_step_update") return step;
+    const status = str(step.status, "pending");
+    const stepId =
+      typeof step.step_id === "number" ? step.step_id : num(step.step_id, 0);
+    const stepTitle = str(step.step_title, "").trim();
+    const title = str(step.title, "").trim() || planStepUpdateTitle(status);
+    const detail =
+      str(step.detail, "").trim() ||
+      planStepUpdateDetail(status, stepId, stepTitle);
+    return {
+      ...step,
+      title,
+      detail,
+      step_title: stepTitle,
+    };
+  };
+
+  const maybeSurfacePlanStepProgressBubble = (step: JsonRecord) => {
+    const stepType = str(step.step_type, "");
+    if (stepType !== "plan_step_update") return;
+    if (
+      !!str(planConfirmation?.source, "").trim() ||
+      pendingRunSnapshot?.phase === "running" ||
+      pendingRunSnapshot?.phase === "awaiting_confirmation"
+    ) {
+      return;
+    }
+    const status = str(step.status, "").trim().toLowerCase();
+    if (!["running", "completed", "failed", "skipped"].includes(status)) return;
+    const stepId =
+      typeof step.step_id === "number" ? step.step_id : num(step.step_id, 0);
+    const stepTitle = str(step.step_title, "").trim();
+    const message = planStepUpdateDetail(status, stepId, stepTitle);
+    if (!message) return;
+    pushStreamingProgressBubble(message, {
+      category: `plan-step:${str(step.plan_id, "")}:${num(step.revision, 0)}:${stepId}:${status}`,
+      minIntervalMs: 0,
+    });
+  };
+
+  const currentExecutionPlanStepMeta = () => {
+    const planForMeta =
+      executionPlan ??
+      extractExecutionPlanFromTraceSteps(
+        trimTrailingHeartbeatSteps(streamingStepsRef.current),
+      );
+    if (!planForMeta) return null;
+    const activeStep =
+      planForMeta.steps.find((step) => step.status === "running") ||
+      planForMeta.steps.find((step) => step.status === "pending");
+    if (!activeStep) return null;
+    return {
+      planId: planForMeta.plan_id,
+      revision: planForMeta.revision,
+      stepId: activeStep.id,
+      stepTitle: activeStep.title,
+    };
+  };
+
+  const attachCurrentPlanStepPayload = (payload: JsonRecord): JsonRecord => {
+    const meta = currentExecutionPlanStepMeta();
+    if (!meta) return payload;
+    return {
+      ...payload,
+      plan_id: str(payload.plan_id, "") || meta.planId,
+      plan_revision: num(payload.plan_revision, 0) || meta.revision,
+      plan_step_id:
+        typeof payload.plan_step_id === "number"
+          ? payload.plan_step_id
+          : meta.stepId,
+      plan_step_title:
+        str(payload.plan_step_title, "").trim() || meta.stepTitle,
+    };
+  };
+
+  const decorateActivityDetailWithPlanStep = (
+    detail: string,
+    payloadObj: JsonRecord,
+  ): string => {
+    const planStepTitle = str(payloadObj.plan_step_title, "").trim();
+    if (!planStepTitle) return detail;
+    const prefix = `Plan step: ${planStepTitle}.`;
+    if (!detail) return prefix;
+    return isRedundantStatusDetail(prefix, detail)
+      ? detail
+      : `${prefix} ${detail}`;
+  };
+
+  const markPendingRunAwaitingPlanConfirmation = (taskId = "") => {
+    setPendingRunSnapshot((prev) => {
+      if (!prev) return prev;
+      const next = {
+        ...prev,
+        taskId: taskId || prev.taskId || "",
+        phase: "awaiting_confirmation" as ChatPendingRunPhase,
+      };
+      storeChatPendingRunSnapshotNow(next);
+      return next;
+    });
+  };
+
+  const markPendingRunInterrupted = (
+    taskId = "",
+    streamingResponseOverride = "",
+  ) => {
+    setPendingRunSnapshot((prev) => {
+      if (!prev) return prev;
+      const interruptedSteps = trimTrailingHeartbeatSteps(
+        streamingStepsRef.current,
+      ).slice(-CHAT_PENDING_STREAM_STEPS_MAX);
+      const next = {
+        ...prev,
+        taskId: taskId || prev.taskId || "",
+        phase: "interrupted" as ChatPendingRunPhase,
+        streamingResponse: (
+          streamingResponseOverride ||
+          prev.streamingResponse ||
+          ""
+        ).slice(0, CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS),
+        streamingSteps: interruptedSteps,
+      };
+      storeChatPendingRunSnapshotNow(next);
+      return next;
+    });
+  };
+
+  function clearPendingRunPresentation(completedSteps: JsonRecord[] = []) {
+    if (completedSteps.length > 0) {
+      setLastRunSteps(completedSteps);
+    }
+    storeChatPendingRunSnapshotNow(null);
+    setPendingRunSnapshot(null);
+    setPendingUserMessage(null);
+    setStreamingResponseNow("");
+    setStreamingStepsNow([]);
+    setStreamingProgressMessages([]);
+    resetStreamingProgressBubbleState();
+  }
+
+  function isActiveExecutionRunStatus(raw: string): boolean {
+    switch ((raw || "").trim().toLowerCase()) {
+      case "accepted":
+      case "routing":
+      case "model_selection":
+      case "planning":
+      case "tool_dispatch":
+      case "synthesis":
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  async function syncPendingRunFromLatestRun(
+    pendingConversationId: string,
+    snapshot: ChatPendingRunSnapshot,
+    options?: { expectedRunId?: string; allowTerminalClear?: boolean },
+  ): Promise<"none" | "active" | "terminal"> {
+    if (!pendingConversationId) return "none";
+    const payload = asRecord(
+      await api.rawGet(
+        `/conversations/${encodeURIComponent(pendingConversationId)}/latest-run`,
+      ),
+    );
+    const run = asRecord(payload.run);
+    if (Object.keys(run).length === 0) return "none";
+    const runConversationId = str(
+      run.conversation_id,
+      str(run.conversationId, pendingConversationId),
+    ).trim();
+    if (runConversationId && runConversationId !== pendingConversationId) {
+      return "none";
+    }
+    const expectedRunId = str(options?.expectedRunId, "").trim();
+    const runId = str(run.id, "").trim();
+    if (expectedRunId && runId && runId !== expectedRunId) {
+      return "none";
+    }
+    const runTimestampMs = Date.parse(
+      str(run.updated_at, str(run.created_at, "")),
+    );
+    if (
+      Number.isFinite(runTimestampMs) &&
+      runTimestampMs + 1000 < snapshot.startedAt
+    ) {
+      return "none";
+    }
+    const persistedSteps = trimTrailingHeartbeatSteps(
+      buildPersistedRunSteps(asRecords(payload.events)),
+    );
+    if (persistedSteps.length > 0) {
+      setStreamingStepsNow(persistedSteps);
+    }
+    if (runId) {
+      setPendingRunSnapshot((prev) => {
+        const base = prev ?? pendingRunSnapshotRef.current ?? snapshot;
+        if (
+          base.conversationId &&
+          base.conversationId !== pendingConversationId
+        ) {
+          return base;
+        }
+        const next: ChatPendingRunSnapshot = {
+          ...base,
+          conversationId: pendingConversationId,
+          runId,
+          ...(persistedSteps.length > 0 ? { streamingSteps: persistedSteps } : {}),
+        };
+        storeChatPendingRunSnapshotNow(next);
+        return next;
+      });
+    }
+    const status = str(run.status, str(run.run_status, "")).trim().toLowerCase();
+    const terminal =
+      !!str(run.completed_at, "").trim() ||
+      (!!status && !isActiveExecutionRunStatus(status));
+    if (!terminal) {
+      return runId ? "active" : "none";
+    }
+    if (!options?.allowTerminalClear) {
+      return "terminal";
+    }
+    clearPendingRunPresentation(persistedSteps);
+    await queryClient.invalidateQueries({
+      queryKey: ["chat-conversations"],
+    });
+    await queryClient.invalidateQueries({
+      queryKey: ["chat-messages", pendingConversationId],
+    });
+    return "terminal";
+  }
+
+  const humanizeStep = (
+    title: string,
+    detail: string,
+    stepType: string,
+  ): { label: string; detail: string; kind?: string; tone?: string } => {
+    const t = title.toLowerCase();
+    if (stepType === "run_status" || t.startsWith("run status:")) {
+      const runStatus = title
+        .split(":")
+        .slice(1)
+        .join(":")
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, "_");
+      if (runStatus === "completed") {
+        return {
+          label: "Run completed",
+          detail: detail || "Delivered the final response.",
+          kind: "Done",
+          tone: "tone-success",
+        };
+      }
+      if (runStatus === "degraded") {
+        return {
+          label: "Run degraded",
+          detail: detail || "Some model attempts or execution paths failed.",
+          kind: "Issue",
+          tone: "tone-error",
+        };
+      }
+      if (runStatus === "cancelled") {
+        return {
+          label: "Run cancelled",
+          detail: detail || "This run was cancelled before completion.",
+          kind: "Issue",
+          tone: "tone-error",
+        };
+      }
+      if (runStatus === "blocked") {
+        return {
+          label: "Run blocked",
+          detail:
+            detail || "This request is blocked and needs operator attention.",
+          kind: "Issue",
+          tone: "tone-error",
+        };
+      }
+      if (runStatus === "platform_failed") {
+        return {
+          label: "Run failed",
+          detail:
+            detail ||
+            "The framework hit an internal failure before completion.",
+          kind: "Issue",
+          tone: "tone-error",
+        };
+      }
+      if (
+        runStatus === "service_unavailable" ||
+        runStatus === "hard_service_outage"
+      ) {
+        return {
+          label: "Run failed",
+          detail:
+            detail ||
+            "The model service failed before this run could continue.",
+          kind: "Issue",
+          tone: "tone-error",
+        };
+      }
+      if (runStatus === "needs_input" || runStatus === "needs_clarification") {
+        return {
+          label: "Needs input",
+          detail:
+            detail || "The agent needs more information before continuing.",
+          kind: "Issue",
+          tone: "tone-thinking",
+        };
+      }
+      if (runStatus === "needs_credentials") {
+        return {
+          label: "Needs credentials",
+          detail:
+            detail ||
+            "Valid credentials are required before this run can continue.",
+          kind: "Issue",
+          tone: "tone-error",
+        };
+      }
+      if (runStatus === "needs_permission") {
+        return {
+          label: "Needs permission",
+          detail: detail || "Operator approval is required before continuing.",
+          kind: "Issue",
+          tone: "tone-thinking",
+        };
+      }
+      if (runStatus === "needs_integration") {
+        return {
+          label: "Needs integration",
+          detail: detail || "A missing integration is blocking this run.",
+          kind: "Issue",
+          tone: "tone-error",
+        };
+      }
+      if (runStatus === "needs_stronger_model") {
+        return {
+          label: "Needs stronger model",
+          detail:
+            detail ||
+            "The configured model pool could not handle this request.",
+          kind: "Issue",
+          tone: "tone-error",
+        };
+      }
+    }
+    if (stepType === "plan_step_update" || t.startsWith("plan step ")) {
+      if (t.includes("failed")) {
+        return {
+          label: title || "Plan step failed",
+          detail: detail || "",
+          kind: "Issue",
+          tone: "tone-error",
+        };
+      }
+      if (t.includes("completed") || t.includes("skipped")) {
+        return {
+          label: title || "Plan step completed",
+          detail: detail || "",
+          kind: "Done",
+          tone: "tone-success",
+        };
+      }
+      if (
+        t.includes("started") ||
+        t.includes("running") ||
+        t.includes("queued") ||
+        t.includes("updated")
+      ) {
+        return {
+          label: title || "Plan step updated",
+          detail: detail || "",
+          kind: "Running",
+          tone: "tone-action",
+        };
+      }
+    }
+    // Log-style: short typed label + actual detail from the step data
+    if (
+      t === "message received" ||
+      t.startsWith("message received") ||
+      t === "request received" ||
+      t.startsWith("request received")
+    ) {
+      return { label: "Reading your request", detail: detail || "" };
+    }
+    if (t === "memory layer" || t.startsWith("memory layer")) {
+      return {
+        label: "Loading memory",
+        detail: detail || "Checking saved context and preferences",
+      };
+    }
+    if (t === "memory retrieval" || t.startsWith("memory retrieval")) {
+      return {
+        label: "Searching memory",
+        detail: detail || "Looking for related past conversations",
+      };
+    }
+    if (t === "context packing" || t.startsWith("context packing")) {
+      return {
+        label: "Building context",
+        detail: detail || "Assembling conversation history",
+      };
+    }
+    if (t === "llm routing decision" || t.startsWith("llm routing decision")) {
+      return {
+        label: "Choosing strategy",
+        detail: detail || "Deciding the best execution approach",
+      };
+    }
+    if (t === "model selection" || t.startsWith("model selection")) {
+      return {
+        label: "Selecting model",
+        detail: detail || "Picking the best available model",
+      };
+    }
+    if (t === "llm request" || t.startsWith("llm request")) {
+      return {
+        label: "Thinking",
+        detail: detail || "Sending request to AI model",
+      };
+    }
+    if (t === "autopilot proceed" || t.startsWith("autopilot proceed")) {
+      return {
+        label: "Running autonomously",
+        detail: detail || "Proceeding without user input",
+      };
+    }
+    if (t.startsWith("tool started:")) {
+      const rawName = title.split(":").slice(1).join(":").trim();
+      const humanName = toHumanToolName(rawName);
+      return {
+        label: `Running ${humanName}`,
+        detail: detail || "",
+        kind: "Running",
+        tone: "tone-action",
+      };
+    }
+    if (t.startsWith("tool finished:")) {
+      const rawName = title.split(":").slice(1).join(":").trim();
+      const summarized = summarizeActivityDetail(detail);
+      if (
+        isSafetyPolicyBlockedText(detail) ||
+        isSafetyPolicyBlockedText(summarized)
+      ) {
+        return {
+          label: `${toHumanToolName(rawName)} blocked`,
+          detail:
+            "Blocked by safety policy. The agent needs a different approach.",
+          kind: "Issue",
+          tone: "tone-error",
+        };
+      }
+      return {
+        label: `${toHumanToolName(rawName)} completed`,
+        detail:
+          summarized && !isHumanReadableStatus(summarized)
+            ? summarized
+            : summarized &&
+                summarized !== `${toHumanToolName(rawName)} completed`
+              ? summarized
+              : "",
+        kind: "Done",
+        tone: "tone-success",
+      };
+    }
+    if (t.startsWith("tool progress:")) {
+      const rawName = title.split(":").slice(1).join(":").trim();
+      return {
+        label: `Running ${toHumanToolName(rawName)}`,
+        detail: detail || "Working...",
+        kind: "Running",
+        tone: "tone-action",
+      };
+    }
+    if (stepType.includes("tool_progress") && title.trim()) {
+      return {
+        label: title.trim(),
+        detail: detail || "Working...",
+        kind: "Running",
+        tone: "tone-action",
+      };
+    }
+    if (stepType.includes("tool_start")) {
+      return {
+        label: "Executing action",
+        detail: detail || "",
+        kind: "Running",
+        tone: "tone-action",
+      };
+    }
+    if (stepType.includes("tool_progress")) {
+      return {
+        label: "Action in progress",
+        detail: detail || "",
+        kind: "Running",
+        tone: "tone-action",
+      };
+    }
+    if (stepType.includes("tool_result")) {
+      return {
+        label: "Action completed",
+        detail: detail || "",
+        kind: "Done",
+        tone: "tone-success",
+      };
+    }
+    if (t.includes("approval")) {
+      return {
+        label: "Waiting for approval",
+        detail: detail || "",
+        tone: "tone-thinking",
+      };
+    }
+    if (t === "response complete" || t.startsWith("response complete")) {
+      return {
+        label: "Response delivered",
+        detail: detail || "",
+        kind: "Done",
+        tone: "tone-success",
+      };
+    }
+    if (
+      t === "llm response received" ||
+      t.startsWith("llm response received")
+    ) {
+      return {
+        label: "Response received",
+        detail: detail || "Model finished generating",
+        kind: "Update",
+      };
+    }
+    if (
+      t === "self evolve" ||
+      t.startsWith("self evolve") ||
+      t.startsWith("running self evolve")
+    ) {
+      return {
+        label: "Self-evolving",
+        detail: detail || "Autonomous code modification started",
+        kind: "Running",
+        tone: "tone-action",
+      };
+    }
+    // Fallback: use raw title as-is
+    const fallbackLabel = title || stepType.replace(/[_-]+/g, " ").trim();
+    return { label: fallbackLabel, detail };
+  };
+
+  const toolProgressPresentationFromStep = (
+    step: JsonRecord,
+    stepType: string,
+    fallbackDetail: string,
+  ): ToolProgressPresentation | null => {
+    if (!stepType.includes("tool_progress")) return null;
+    const data = activityDataRecord(step.data);
+    if (Object.keys(data).length === 0) return null;
+
+    if (str(data.kind, "").trim() === "agent_loop_progress") {
+      return agentLoopProgressPresentation(data, fallbackDetail);
+    }
+
+    const name = str(data.tool_name, str(data.name, "")).trim();
+    if (!name) return null;
+    const content = str(data.content, fallbackDetail).trim();
+    return buildToolProgressPresentation(name, content, data, "");
+  };
+
+  const isHeartbeatStreamingStep = (value: JsonRecord): boolean => {
+    const icon = normalizeStatusText(str(value.icon, ""));
+    const stepType = normalizeStatusText(
+      str(value.step_type, str(value.type, "")),
+    );
+    return (
+      icon === "wait" ||
+      stepType.includes("heartbeat") ||
+      toBool(value.is_heartbeat)
+    );
+  };
+
+  const streamingStepDedupKey = (value: JsonRecord): string => {
+    const stepType = normalizeStatusText(
+      str(value.step_type, str(value.type, "step")),
+    );
+    const title = normalizeStatusText(str(value.title, ""));
+    const detail = normalizeStatusText(str(value.detail, ""));
+    return `${stepType}|${title}|${detail}`;
+  };
+
+  const streamingStepDisplayKey = (value: JsonRecord): string => {
+    const title = normalizeStatusText(str(value.title, ""));
+    const detail = normalizeStatusText(str(value.detail, ""));
+    return `${title}|${detail}`;
+  };
+
+  const getStreamingStepStableKey = (value: JsonRecord): string =>
+    str(value.__streamKey, str(value.id, ""));
+
+  const attachStreamingStepStableKey = (
+    value: JsonRecord,
+    preferredKey?: string,
+  ): JsonRecord => {
+    const existing = getStreamingStepStableKey(value);
+    if (existing) return value;
+    return {
+      ...value,
+      __streamKey:
+        preferredKey || `stream-step-${streamingStepKeySeqRef.current++}`,
+    };
+  };
+
+  const buildStepCard = (
+    step: JsonRecord,
+    index: number,
+  ): ActivityTimelineCard => {
+    const stepType = str(step.step_type, str(step.type, "step")).toLowerCase();
+    const title = str(step.title, "").trim();
+    const fullDetail = extractStepDetailText(step, 2800);
+    const rawDetail = fullDetail.slice(0, 900);
+    const progressPresentation = toolProgressPresentationFromStep(
+      step,
+      stepType,
+      rawDetail,
+    );
+    const human = humanizeStep(
+      progressPresentation?.title || title,
+      progressPresentation?.detail || rawDetail,
+      stepType,
+    );
+    const humanDetailRaw = str(human.detail, "").trim();
+    const summarizedDetail = humanDetailRaw
+      ? summarizeActivityDetail(humanDetailRaw)
+      : "";
+    let detail = summarizedDetail
+      ? simplifyConsoleDetail(summarizedDetail)
+      : "";
+    const time = str(step.time, "");
+    const baseLabel = stepType.replace(/[_-]+/g, " ").trim() || "step";
+    const rawLabel = human.label || title || baseLabel;
+    // Only capitalize if label doesn't contain file paths/extensions
+    const label = /\.\w{1,5}\b|\//.test(rawLabel)
+      ? rawLabel
+      : rawLabel.replace(/\b\w/g, (ch) => ch.toUpperCase());
+    let tone = "tone-neutral";
+    let kind = "Update";
+    const labelLower = label.toLowerCase();
+    if (stepType.includes("tool_start")) {
+      tone = "tone-tool";
+      kind = "Running";
+    } else if (stepType.includes("tool_progress")) {
+      tone = "tone-action";
+      kind = "Running";
+    } else if (
+      stepType.includes("tool_result") ||
+      stepType.includes("result") ||
+      stepType.includes("complete") ||
+      stepType.includes("success")
+    ) {
+      tone = "tone-success";
+      kind = "Done";
+    } else if (stepType === "info") {
+      tone = "tone-neutral";
+      kind = "Done";
+    } else if (stepType.includes("error") || stepType.includes("fail")) {
+      tone = "tone-error";
+      kind = "Issue";
+    } else if (
+      stepType.includes("think") ||
+      stepType.includes("plan") ||
+      stepType.includes("reason")
+    ) {
+      tone = "tone-thinking";
+      kind = "Planning";
+    } else if (stepType.includes("action") || stepType.includes("execute")) {
+      tone = "tone-action";
+      kind = "Running";
+    } else if (
+      stepType.includes("response") ||
+      stepType.includes("final") ||
+      stepType.includes("summary")
+    ) {
+      tone = "tone-synthesis";
+      kind = "Done";
+    } else if (
+      /start|running|loading|checking|choosing|selecting|generating/.test(
+        labelLower,
+      )
+    ) {
+      tone = "tone-action";
+      kind = "Running";
+    } else if (/finished|complete|done|recorded|generated/.test(labelLower)) {
+      tone = "tone-success";
+      kind = "Done";
+    } else if (/issue|error|failed|blocked/.test(labelLower)) {
+      tone = "tone-error";
+      kind = "Issue";
+    }
+    if (isSafetyPolicyBlockedText(`${label} ${detail}`)) {
+      tone = "tone-error";
+      kind = "Issue";
+    }
+    if (human.tone) tone = human.tone;
+    if (human.kind) kind = human.kind;
+    let detailFull = summarizedDetail;
+    if (isRedundantStatusDetail(label, detail)) {
+      detail = "";
+    }
+    if (
+      detailFull &&
+      (isRedundantStatusDetail(label, detailFull) ||
+        (detail && isRedundantStatusDetail(detail, detailFull)))
+    ) {
+      detailFull = "";
+    }
+    const stableId = getStreamingStepStableKey(step);
+    const rawDetailFull = humanDetailRaw ? fullDetail || rawDetail : "";
+    const payloadView = buildActivityPayloadViewFromSources(
+      rawDetailFull,
+      step.data,
+    );
+    const summary = detailFull || detail;
+    return {
+      id: stableId || `${time || "live"}-${index}-${label}`,
+      index,
+      stepType,
+      rawTitle: title || baseLabel,
+      tone,
+      kind,
+      label,
+      detail,
+      detailFull,
+      summary,
+      rawDetailFull,
+      payloadView,
+      isHeartbeat: isHeartbeatStreamingStep(step),
+      time,
+    };
+  };
+
+  const safeBuildStepCard = (step: unknown, index: number) => {
+    const record = asRecord(step);
+    try {
+      return buildStepCard(record, index);
+    } catch {
+      const stepType = str(
+        record.step_type,
+        str(record.type, "step"),
+      ).toLowerCase();
+      const title = str(record.title, "").trim();
+      const rawDetail = extractStepDetailText(record, 600);
+      const label =
+        title || stepType.replace(/[_-]+/g, " ").trim() || "Activity update";
+      const stableId = getStreamingStepStableKey(record);
+      return {
+        id:
+          stableId || `${str(record.time, "live") || "live"}-${index}-${label}`,
+        index,
+        stepType,
+        rawTitle: title || label,
+        tone: "tone-neutral",
+        kind: "Update",
+        label,
+        detail: rawDetail ? simplifyConsoleDetail(rawDetail) : "",
+        detailFull: "",
+        summary: rawDetail ? simplifyConsoleDetail(rawDetail) : "",
+        rawDetailFull: rawDetail,
+        payloadView: buildActivityPayloadViewFromSources(
+          rawDetail,
+          record.data,
+        ),
+        isHeartbeat: false,
+        time: str(record.time, ""),
+      };
+    }
+  };
+
+  const streamingTraceCards = useMemo(
+    () =>
+      streamingSteps
+        .map((step, idx) => safeBuildStepCard(step, idx))
+        .slice(-24),
+    [streamingSteps],
+  );
+  const pickPrimaryActivityCard = (
+    cards: ActivityTimelineCard[],
+  ): ActivityTimelineCard | null => {
+    if (cards.length === 0) return null;
+    const last = cards[cards.length - 1];
+    if (!last.isHeartbeat) return last;
+    return [...cards].reverse().find((card) => !card.isHeartbeat) || last;
+  };
+  const streamingActivity = useMemo(() => {
+    const last = pickPrimaryActivityCard(streamingTraceCards);
+    if (!last) return "Thinking...";
+    const kind = (last.kind || "").toLowerCase();
+    if (kind.includes("planning") || kind.includes("thinking"))
+      return "Thinking...";
+    if (kind.includes("memory") || kind.includes("loading"))
+      return "Recalling context...";
+    if (kind.includes("done") || kind.includes("update"))
+      return "Writing response...";
+    return "Working...";
+  }, [streamingTraceCards]);
+
+  const traceSummaryText = (
+    cards: ActivityTimelineCard[],
+    opts?: { loading?: boolean; streaming?: boolean; error?: string },
+  ) => {
+    if (opts?.error) return "Activity details unavailable.";
+    if (opts?.loading && cards.length === 0) return "View activity";
+    if (cards.length === 0)
+      return opts?.streaming
+        ? "Waiting for first activity update..."
+        : "View activity";
+    const last = pickPrimaryActivityCard(cards) || cards[cards.length - 1];
+    const count = countMeaningfulActivityCards(cards);
+    return `${count} update${count === 1 ? "" : "s"} | Now: ${last.label}`;
+  };
+
+  const traceSummaryFromSteps = (
+    steps: JsonRecord[],
+    opts?: { loading?: boolean; streaming?: boolean; error?: string },
+  ) => {
+    if (opts?.error) return "Activity details unavailable.";
+    if (opts?.loading && steps.length === 0) return "View activity";
+    if (steps.length === 0)
+      return opts?.streaming
+        ? "Waiting for first activity update..."
+        : "View activity";
+    const normalizedSteps = compressActivitySteps(steps);
+    let normalizedPrimaryIndex = normalizedSteps.length - 1;
+    for (let i = normalizedSteps.length - 1; i >= 0; i -= 1) {
+      if (!isHeartbeatStreamingStep(normalizedSteps[i])) {
+        normalizedPrimaryIndex = i;
+        break;
+      }
+    }
+    const normalizedPrimaryCard = safeBuildStepCard(
+      normalizedSteps[normalizedPrimaryIndex],
+      normalizedPrimaryIndex,
+    );
+    const normalizedCount =
+      normalizedSteps.filter((step) => !isHeartbeatStreamingStep(step))
+        .length || normalizedSteps.length;
+    return `${normalizedCount} update${normalizedCount === 1 ? "" : "s"} | Now: ${normalizedPrimaryCard.label}`;
+    let primaryIndex = steps.length - 1;
+    for (let i = steps.length - 1; i >= 0; i -= 1) {
+      if (!isHeartbeatStreamingStep(steps[i])) {
+        primaryIndex = i;
+        break;
+      }
+    }
+    const primaryCard = safeBuildStepCard(steps[primaryIndex], primaryIndex);
+    return `${steps.length} update${steps.length === 1 ? "" : "s"} - Now: ${primaryCard.label}`;
+  };
+
+  const parseTraceSteps = (payload: unknown): JsonRecord[] => {
+    const rec = asRecord(payload);
+    const raw = Array.isArray(rec.steps)
+      ? rec.steps
+      : Array.isArray(rec.trace)
+        ? rec.trace
+        : [];
+    const steps = compressActivitySteps(
+      raw
+        .filter((x) => x && typeof x === "object")
+        .map((x) => normalizeActivityStepTime(asRecord(x))),
+    );
+    return steps.length > CHAT_STREAMING_STEPS_UI_MAX
+      ? steps.slice(-CHAT_STREAMING_STEPS_UI_MAX)
+      : steps;
+  };
+
+  const loadTraceForId = async (traceId: string) => {
+    if (!traceId) return;
+    if (
+      traceStepsById[traceId] ||
+      traceLoadingById[traceId] ||
+      traceErrorById[traceId]
+    )
+      return;
+    setTraceLoadingById((prev) => ({ ...prev, [traceId]: true }));
+    setTraceErrorById((prev) => ({ ...prev, [traceId]: "" }));
+    try {
+      const payload = await api.rawGet(`/trace/${encodeURIComponent(traceId)}`);
+      const steps = parseTraceSteps(payload);
+      setTraceStepsById((prev) => ({ ...prev, [traceId]: steps }));
+    } catch (err) {
+      const raw = errMessage(err);
+      let normalized = raw;
+      try {
+        const parsed = JSON.parse(raw) as { error?: string; message?: string };
+        normalized = parsed.error || parsed.message || raw;
+      } catch {
+        // keep raw
+      }
+      if (/trace/i.test(normalized) && /not found/i.test(normalized)) {
+        normalized = "Detailed activity is not available for this response.";
+      }
+      setTraceErrorById((prev) => ({ ...prev, [traceId]: normalized }));
+    } finally {
+      setTraceLoadingById((prev) => ({ ...prev, [traceId]: false }));
+    }
+  };
+
+  const getTraceStepsForExport = async (
+    traceId: string,
+  ): Promise<JsonRecord[]> => {
+    if (!traceId) return [];
+    if (traceStepsById[traceId]) {
+      return traceStepsById[traceId];
+    }
+    try {
+      const payload = await api.rawGet(`/trace/${encodeURIComponent(traceId)}`);
+      const steps = parseTraceSteps(payload);
+      setTraceStepsById((prev) => ({ ...prev, [traceId]: steps }));
+      return steps;
+    } catch {
+      return [];
+    }
+  };
+
+  const detachStreamingRunToBackground = () => {
+    if ((!isStreaming && !streamLockRef.current) || !pendingRunSnapshot)
+      return false;
+    const backgroundSnapshot = movePendingRunSnapshotToBackground();
+    if (!backgroundSnapshot) {
+      setChatError(
+        "This chat has not been attached to a conversation yet. Wait a moment, then try again.",
+      );
+      return false;
+    }
+    const streamGeneration = streamGenerationRef.current;
+    if (streamGeneration > 0) {
+      backgroundDetachGenerationsRef.current.add(streamGeneration);
+    }
+    streamAbortRef.current?.abort();
+    setPendingRunSnapshot(null);
+    storeChatPendingRunSnapshotNow(null);
+    setChatNotice(
+      "Moved the active research run to the background. You can keep chatting elsewhere.",
+    );
+    setPendingUserMessage(null);
+    setFailedUserMessage(null);
+    setStreamingResponseNow("");
+    setStreamingStepsNow([]);
+    setExecutionPlan(null);
+    setExecutionPlanFailure("");
+    setExecutionPlanExpanded(false);
+    setStreamingProgressMessages([]);
+    resetStreamingProgressBubbleState();
+    setStreamPhaseStatus(null);
+    setLiveFileWrites({});
+    setDeployedFiles([]);
+    setIsStreaming(false);
+    setLiveRunStreamOpenNow(false);
+    setIsStoppingStream(false);
+    streamLockRef.current = false;
+    activeChatTaskIdRef.current = null;
+    return true;
+  };
+
+  const startNewConversation = (options?: { preserveCurrentRun?: boolean }) => {
+    const preserveCurrentRun = options?.preserveCurrentRun ?? true;
+    let detachedCurrentRun = false;
+    if (
+      preserveCurrentRun &&
+      (isStreaming || streamLockRef.current) &&
+      pendingRunSnapshot
+    ) {
+      if (!detachStreamingRunToBackground()) return;
+      detachedCurrentRun = true;
+    } else if (preserveCurrentRun && (isStreaming || streamLockRef.current)) {
+      setChatError(
+        "This run is still attaching to a conversation. Try New chat again in a moment.",
+      );
+      return;
+    } else if (preserveCurrentRun && pendingRunSnapshot?.conversationId) {
+      movePendingRunSnapshotToBackground();
+    }
+    if (!detachedCurrentRun) {
+      streamAbortRef.current?.abort();
+    }
+    streamAbortRef.current = null;
+    stopRequestedRef.current = false;
+    activeChatTaskIdRef.current = null;
+    reattachedRunIdRef.current = "";
+    streamLockRef.current = false;
+    setIsStreaming(false);
+    setLiveRunStreamOpenNow(false);
+    setIsStoppingStream(false);
+    setPendingRunSnapshot(null);
+    storeChatPendingRunSnapshotNow(null);
+    if (typeof window !== "undefined") {
+      try {
+        window.sessionStorage.removeItem(CHAT_LAST_CONVERSATION_STORAGE_KEY);
+      } catch {
+        // Ignore storage failures.
+      }
+    }
+    dragDepthRef.current = 0;
+    setIsDragOverChat(false);
+    setConversationId(null);
+    setConversationPage(0);
+    queueComposerPrefill("");
+    setDeepResearchEnabled(false);
+    setAttachedFiles([]);
+    setChatError(null);
+    setChatNotice(null);
+    setPlanConfirmation(null);
+    setResearchReportDialog(null);
+    lastWorkspaceRestoreSeedRef.current = "";
+    setPendingUserMessage(null);
+    setFailedUserMessage(null);
+    setStreamingResponseNow("");
+    setStreamingStepsNow([]);
+    setExecutionPlan(null);
+    setExecutionPlanFailure("");
+    setExecutionPlanExpanded(false);
+    setStreamingProgressMessages([]);
+    resetStreamingProgressBubbleState();
+    setTraceStepsById({});
+    setTraceLoadingById({});
+    setTraceErrorById({});
+    setLastRunSteps([]);
+    setCompletedProgressMessagesByConversation({});
+    setLiveFileWrites({});
+    setDeployedFiles([]);
+    setSelectedSnippetId(null);
+    setStreamPhaseStatus(null);
+    setStreamedWorkspaceApp(null);
+    streamedWorkspaceAppRef.current = null;
+    setCodeViewerFileIdx(0);
+    setStreamTraceOpen(false);
+    setMessageTraceOpen({});
+    pendingFileReadPathRef.current = "";
+    pendingFileWritePathRef.current = "";
+    if (
+      typeof window !== "undefined" &&
+      window.innerWidth < CHAT_INLINE_CONVERSATIONS_MIN_WIDTH
+    ) {
+      setConversationSidebarOpen(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!conversationId || !activeProjectId || !selectedConversation) return;
+    if (selectedConversationProjectId === activeProjectId) return;
+    startNewConversation();
+  }, [
+    activeProjectId,
+    conversationId,
+    selectedConversation,
+    selectedConversationProjectId,
+  ]);
+
+  const openConversationById = (id: string) => {
+    if (!id) return;
+    setChatError(null);
+    if (conversationId === id) return;
+    if ((isStreaming || streamLockRef.current) && pendingRunSnapshot) {
+      if (!detachStreamingRunToBackground()) return;
+    } else if (isStreaming || streamLockRef.current) {
+      setChatError(
+        "This run is still attaching to a conversation. Try switching chats again in a moment.",
+      );
+      return;
+    } else if (
+      pendingRunSnapshot?.conversationId &&
+      pendingRunSnapshot.conversationId !== id
+    ) {
+      movePendingRunSnapshotToBackground();
+    }
+    lastWorkspaceRestoreSeedRef.current = "";
+    setPlanConfirmation(null);
+    setResearchReportDialog(null);
+    setPendingUserMessage(null);
+    setFailedUserMessage(null);
+    setStreamingResponseNow("");
+    setStreamingStepsNow([]);
+    setExecutionPlan(null);
+    setExecutionPlanFailure("");
+    setExecutionPlanExpanded(false);
+    setStreamingProgressMessages([]);
+    resetStreamingProgressBubbleState();
+    setTraceStepsById({});
+    setTraceLoadingById({});
+    setTraceErrorById({});
+    setLastRunSteps([]);
+    setLiveFileWrites({});
+    setDeployedFiles([]);
+    setSelectedSnippetId(null);
+    setStreamPhaseStatus(null);
+    setStreamedWorkspaceApp(null);
+    streamedWorkspaceAppRef.current = null;
+    setCodeViewerFileIdx(0);
+    setStreamTraceOpen(false);
+    setMessageTraceOpen({});
+    pendingFileReadPathRef.current = "";
+    pendingFileWritePathRef.current = "";
+    setConversationId(id);
+    if (
+      typeof window !== "undefined" &&
+      window.innerWidth < CHAT_INLINE_CONVERSATIONS_MIN_WIDTH
+    ) {
+      setConversationSidebarOpen(false);
+    }
+    const restoredSnapshot =
+      pendingRunSnapshot?.conversationId === id
+        ? pendingRunSnapshot
+        : backgroundRunSnapshots[id]
+          ? backgroundRunSnapshots[id]
+          : null;
+    if (restoredSnapshot && backgroundRunSnapshots[id]) {
+      const nextBackgroundSnapshots = { ...backgroundRunSnapshots };
+      delete nextBackgroundSnapshots[id];
+      setBackgroundRunSnapshots(nextBackgroundSnapshots);
+      storeChatBackgroundRunSnapshots(nextBackgroundSnapshots);
+      setPendingRunSnapshot(restoredSnapshot);
+      storeChatPendingRunSnapshotNow(restoredSnapshot);
+    }
+    if (restoredSnapshot?.conversationId === id) {
+      if (restoredSnapshot.message) {
+        setPendingUserMessage(restoredSnapshot.message);
+      }
+      if (restoredSnapshot.failedUserMessage) {
+        setFailedUserMessage(restoredSnapshot.failedUserMessage);
+      }
+      if (restoredSnapshot.streamingResponse) {
+        setStreamingResponseNow(restoredSnapshot.streamingResponse);
+      }
+      if (
+        Array.isArray(restoredSnapshot.streamingSteps) &&
+        restoredSnapshot.streamingSteps.length > 0
+      ) {
+        setStreamingStepsNow(restoredSnapshot.streamingSteps);
+      }
+    }
+  };
+
+  const getConversationFallbackAfterDelete = (
+    deletedId: string,
+  ): string | null => {
+    const orderedIds = orderedSidebarConversationIds.filter(Boolean);
+    if (orderedIds.length === 0) return null;
+    const deletedIndex = orderedIds.findIndex((id) => id === deletedId);
+    const remainingIds = orderedIds.filter((id) => id !== deletedId);
+    if (remainingIds.length === 0) return null;
+    if (deletedIndex < 0) return remainingIds[0];
+    return (
+      remainingIds[Math.min(deletedIndex, remainingIds.length - 1)] ||
+      remainingIds[0]
+    );
+  };
+
+  useEffect(() => {
+    if (
+      !selectedConversationNotFound ||
+      !conversationId ||
+      postDeleteConversationFallback
+    )
+      return;
+    if (
+      pendingRunSnapshot ||
+      isStreaming ||
+      pendingUserMessage ||
+      failedUserMessage ||
+      streamingResponse ||
+      messages.length > 0
+    ) {
+      return;
+    }
+    const preferredFallbackId =
+      getConversationFallbackAfterDelete(conversationId);
+    setPostDeleteConversationFallback({
+      deletedId: conversationId,
+      preferredId: preferredFallbackId,
+    });
+    startNewConversation({ preserveCurrentRun: false });
+    setChatNotice(
+      preferredFallbackId
+        ? "That chat is no longer available. Loaded another conversation."
+        : "That chat is no longer available.",
+    );
+  }, [
+    selectedConversationNotFound,
+    conversationId,
+    postDeleteConversationFallback,
+    pendingRunSnapshot,
+    isStreaming,
+    pendingUserMessage,
+    failedUserMessage,
+    streamingResponse,
+    messages.length,
+  ]);
+
+  const queueAttachedFiles = (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    const incoming = Array.from(files);
+    const { accepted, rejected } = splitSupportedChatAttachments(incoming);
+    if (rejected.length > 0) {
+      const preview = rejected.slice(0, 3).join(", ");
+      const extra =
+        rejected.length > 3 ? ` (+${rejected.length - 3} more)` : "";
+      setChatNotice(`Skipped unsupported files: ${preview}${extra}`);
+    }
+    if (accepted.length === 0) return;
+    setAttachedFiles((prev) => {
+      const merged = [...prev];
+      for (const file of accepted) {
+        const exists = merged.some(
+          (f) =>
+            f.name === file.name &&
+            f.size === file.size &&
+            f.lastModified === file.lastModified,
+        );
+        if (!exists) merged.push(file);
+      }
+      return merged.slice(0, 8);
+    });
+  };
+
+  const handleChatDragEnter = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    dragDepthRef.current += 1;
+    if (!isStreaming) setIsDragOverChat(true);
+  };
+
+  const handleChatDragOver = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+    if (!isStreaming && !isDragOverChat) setIsDragOverChat(true);
+  };
+
+  const handleChatDragLeave = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setIsDragOverChat(false);
+  };
+
+  const handleChatDrop = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    dragDepthRef.current = 0;
+    setIsDragOverChat(false);
+    if (isStreaming) return;
+    queueAttachedFiles(event.dataTransfer?.files ?? null);
+  };
+
+  const removeAttachedFile = (idx: number) => {
+    setAttachedFiles((prev) => prev.filter((_, i) => i !== idx));
+  };
+
+  type IndexedKnowledgeAttachment = {
+    id: string;
+    filename: string;
+    chunks: number;
+  };
+  type UploadedVisualAttachment = {
+    id: string;
+    filename: string;
+    path: string;
+    size: number;
+    contentType: string;
+  };
+  const uploadAttachmentsForKnowledge = async (files: File[]) => {
+    if (files.length === 0)
+      return {
+        documents: [] as IndexedKnowledgeAttachment[],
+        visuals: [] as UploadedVisualAttachment[],
+      };
+    const projectId = effectiveProjectId.trim();
+    const documents: IndexedKnowledgeAttachment[] = [];
+    const visuals: UploadedVisualAttachment[] = [];
+    for (const file of files) {
+      const formData = new FormData();
+      formData.append("file", file, file.name);
+      if (isVisualChatAttachment(file) && !isKnowledgeChatAttachment(file)) {
+        const out = asRecord(await api.rawPostForm("/api/upload", formData));
+        const rows = pickRecords(out, "files");
+        const uploadedFile = rows[0] ?? {};
+        const id = str(uploadedFile.id, "");
+        if (!id) {
+          throw new Error(`Failed to upload '${file.name}'.`);
+        }
+        visuals.push({
+          id,
+          filename: str(uploadedFile.name, file.name),
+          path: str(uploadedFile.path, ""),
+          size: num(uploadedFile.size, file.size),
+          contentType: file.type || "image",
+        });
+        continue;
+      }
+
+      if (projectId) formData.append("project_id", projectId);
+      const out = asRecord(
+        await api.rawPostForm("/documents/upload-file", formData),
+      );
+      const id = str(out.id, "");
+      if (!id) {
+        throw new Error(`Failed to index '${file.name}'.`);
+      }
+      documents.push({
+        id,
+        filename: str(out.filename, file.name),
+        chunks: num(out.chunks, 0),
+      });
+    }
+    return { documents, visuals };
+  };
+
+  const copyText = async (value: string) => {
+    const text = value.trim();
+    if (!text) throw new Error("Nothing to copy.");
+    const nav = typeof navigator !== "undefined" ? navigator : null;
+    if (nav && nav.clipboard?.writeText) {
+      await nav.clipboard.writeText(text);
+      return;
+    }
+    const doc = typeof document !== "undefined" ? document : null;
+    if (!doc) throw new Error("Clipboard is not available.");
+    const ta = doc.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.left = "-9999px";
+    doc.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok = doc.execCommand("copy");
+    doc.body.removeChild(ta);
+    if (!ok) throw new Error("Copy failed.");
+  };
+
+  const normalizeChatError = (raw: string): string => {
+    let message = (raw || "").trim();
+    if (!message) return "Something went wrong while running this request.";
+
+    for (let i = 0; i < 3; i += 1) {
+      const withoutPrefix = message.replace(/^error:\s*/i, "").trim();
+      if (withoutPrefix !== message) {
+        message = withoutPrefix;
+        continue;
+      }
+      try {
+        const parsed = JSON.parse(message) as unknown;
+        if (typeof parsed === "string") {
+          const next = parsed.trim();
+          if (next && next !== message) {
+            message = next;
+            continue;
+          }
+          break;
+        }
+        const obj = asRecord(parsed);
+        const extracted = [
+          str(obj.error, ""),
+          str(obj.message, ""),
+          str(obj.detail, ""),
+          str(obj.reason, ""),
+        ]
+          .map((v) => v.trim())
+          .find(Boolean);
+        if (extracted && extracted !== message) {
+          message = extracted;
+          continue;
+        }
+      } catch {
+        // keep raw text when it is not JSON
+      }
+      break;
+    }
+
+    if (
+      (/localhost:11434/i.test(message) ||
+        /127\.0\.0\.1:11434/i.test(message)) &&
+      (/error sending request for url/i.test(message) ||
+        /connection refused/i.test(message) ||
+        /provider instability/i.test(message))
+    ) {
+      return "No working local model is available. If you want Ollama, start it and load a model. Otherwise configure a model in Settings > Models.";
+    }
+    if (
+      /missing ['"`]?files['"`]?/i.test(message) ||
+      /object mapping filename to content/i.test(message)
+    ) {
+      return "Deploy payload was malformed - the LLM did not provide a valid `files` object. The agent has been given details to self-correct on retry.";
+    }
+    if (
+      /error decoding response body/i.test(message) ||
+      /error deserializing response body/i.test(message)
+    ) {
+      return "Model/provider response format mismatch. For GLM, use OpenAI-compatible Chat Completions in Settings > Models (correct base URL + model), or switch to a known-compatible model.";
+    }
+    if (
+      /openai-compatible response schema mismatch/i.test(message) ||
+      /openai-compatible response was not valid json/i.test(message) ||
+      /openai-compatible api returned an error payload/i.test(message) ||
+      /no response from openai/i.test(message)
+    ) {
+      return "Model/provider response format mismatch. For GLM, confirm OpenAI-compatible Chat Completions support in Settings > Models, or switch to a known-compatible model.";
+    }
+    if (/syntaxerror/i.test(message) && /(app\.py|python)/i.test(message)) {
+      const lineMatch = message.match(/line\s+(\d+)/i);
+      const lineHint = lineMatch?.[1] ? ` at line ${lineMatch[1]}` : "";
+      return `Generated app code has a Python syntax error${lineHint}. Ask AgentArk to fix the generated file and redeploy.`;
+    }
+    if (
+      /stopped shortly after launch/i.test(message) ||
+      /runtime is not active/i.test(message)
+    ) {
+      return "The deployed app process crashed after startup. Check the validation/error details for runtime logs, then retry deploy with a corrected entry/install command.";
+    }
+    if (
+      /missing authorization:\s*bearer/i.test(message) ||
+      /bearer\s*<api_key>/i.test(message) ||
+      /api authentication is not configured/i.test(message) ||
+      /^unauthorized\b/i.test(message)
+    ) {
+      return "HTTP API auth is missing or expired. Open Settings > Advanced > API Key (HTTP), regenerate/copy the key, then retry.";
+    }
+    if (
+      /openai api error/i.test(message) ||
+      /anthropic api error/i.test(message)
+    ) {
+      const lower = message.toLowerCase();
+      if (
+        /missing.*api[_\s-]?key/.test(lower) ||
+        /invalid.*api[_\s-]?key/.test(lower) ||
+        /authentication/.test(lower) ||
+        /unauthorized/.test(lower)
+      ) {
+        return "A provider API key is missing. Set it in Settings > Models (LLM) or Settings > Integrations (tool-specific keys), then retry.";
+      }
+      return message;
+    }
+    if (
+      /missing.*api[_\s-]?key/i.test(message) ||
+      /no api key available/i.test(message) ||
+      /api key.*not configured/i.test(message)
+    ) {
+      return "A provider API key is missing. Set it in Settings > Models (LLM) or Settings > Integrations (tool-specific keys), then retry.";
+    }
+    if (/missing.*auth/i.test(message)) {
+      return "Authentication is missing for this action. Check Settings > Models and Settings > Advanced > API Key (HTTP).";
+    }
+    if (
+      /http error 404/i.test(message) ||
+      /\b404\b.*not found/i.test(message)
+    ) {
+      return "A page request returned 404 (not found). The agent should switch to another source automatically.";
+    }
+    if (
+      /error executing 'browse'/i.test(message) ||
+      /failed to fetch url/i.test(message) ||
+      /\bbrowse\b.*\bfailed\b/i.test(message)
+    ) {
+      return "The web page lookup failed. The agent can continue by searching alternative sources.";
+    }
+    return message;
+  };
+
+  const exportConversationById = async (
+    targetId: string,
+    titleHint?: string,
+  ) => {
+    if (!targetId) return;
+    setChatError(null);
+    try {
+      let exportMessages = messages;
+      if (conversationId !== targetId || exportMessages.length === 0) {
+        const payload = await api.rawGet(
+          `/conversations/${encodeURIComponent(targetId)}/messages?limit=200`,
+        );
+        exportMessages = pickRecords(payload, "messages");
+      }
+      const title =
+        (titleHint || str(selectedConversation?.title, "chat")).trim() ||
+        "chat";
+      const safe =
+        title
+          .replace(/[^\w.-]+/g, "_")
+          .replace(/^_+|_+$/g, "")
+          .toLowerCase() || "chat";
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const lines: string[] = [];
+      lines.push(`# ${title}`);
+      lines.push(`conversation_id: ${targetId}`);
+      lines.push(`exported_at: ${new Date().toISOString()}`);
+      lines.push("");
+      for (const message of exportMessages) {
+        const role = str(message.role, "assistant");
+        const ts = str(message.timestamp, "");
+        const content = str(message.content, "");
+        lines.push(`${role.toUpperCase()}${ts ? ` (${ts})` : ""}`);
+        lines.push(content);
+        lines.push("");
+      }
+      downloadTextFile(
+        `${safe}-${stamp}.txt`,
+        lines.join("\n"),
+        "text/plain;charset=utf-8",
+      );
+      setChatNotice("Chat exported.");
+    } catch (err) {
+      setChatError(normalizeChatError(errMessage(err)));
+    }
+  };
+
+  const downloadTextFile = (
+    filename: string,
+    content: string,
+    mimeType = "text/plain;charset=utf-8",
+  ) => {
+    const blob = new Blob([content], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const exportAssistantMarkdown = async ({
+    content,
+    headingHint,
+    previousUserPrompt,
+    timestamp,
+    traceId,
+  }: {
+    content: string;
+    headingHint?: string;
+    previousUserPrompt?: string;
+    timestamp?: string;
+    traceId?: string;
+  }) => {
+    try {
+      const normalizedContent = str(content, "").trim();
+      if (!normalizedContent) throw new Error("Nothing to export.");
+      const report = parseResearchReport(normalizedContent);
+      const prompt = (previousUserPrompt || "").trim();
+      const conversationTitle =
+        str(selectedConversation?.title, "").trim() || "research";
+      const cleanTraceId = str(traceId, "").trim();
+      const traceSteps = cleanTraceId
+        ? await getTraceStepsForExport(cleanTraceId)
+        : [];
+      const exportPlan = extractExecutionPlanFromTraceSteps(traceSteps);
+      const exportPlanFailure =
+        extractExecutionPlanFailureFromTraceSteps(traceSteps).trim();
+      const heading = deriveAssistantExportHeading(
+        normalizedContent,
+        report,
+        str(headingHint, "").trim(),
+        prompt,
+        conversationTitle,
+      );
+      const summaryBullets = buildAssistantExportSummaryBullets(
+        normalizedContent,
+        report,
+        exportPlan,
+        exportPlanFailure,
+      );
+      const detailedResponse = formatAssistantExportBody(
+        normalizedContent,
+        heading,
+      );
+      const safe =
+        heading
+          .replace(/[^\w.-]+/g, "_")
+          .replace(/^_+|_+$/g, "")
+          .toLowerCase()
+          .slice(0, 96) || "research";
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const cleanTimestamp = str(timestamp, "").trim();
+      const lines: string[] = [];
+      lines.push(`# ${heading}`);
+      lines.push("");
+      lines.push("> Exported from AgentArk.");
+      lines.push("");
+      if (summaryBullets.length > 0) {
+        lines.push("## Executive Summary");
+        lines.push("");
+        summaryBullets.forEach((bullet) => lines.push(`- ${bullet}`));
+        lines.push("");
+      }
+      lines.push(
+        ...buildExecutionPlanExportSection(
+          exportPlan,
+          exportPlanFailure,
+          cleanTraceId,
+        ),
+      );
+      if (prompt) {
+        lines.push("## Request");
+        lines.push(prompt);
+        lines.push("");
+      }
+      lines.push("## Report Details");
+      lines.push("");
+      lines.push("| Field | Value |");
+      lines.push("| --- | --- |");
+      lines.push(`| Conversation | ${conversationId || "Not available"} |`);
+      lines.push(`| Assistant time | ${cleanTimestamp || "Not available"} |`);
+      lines.push(`| Trace id | ${cleanTraceId || "Not available"} |`);
+      lines.push(`| Exported at | ${new Date().toISOString()} |`);
+      lines.push("");
+      lines.push("## Detailed Response");
+      lines.push("");
+      lines.push(detailedResponse || normalizedContent);
+      lines.push("");
+      downloadTextFile(
+        `${safe}-${stamp}.md`,
+        lines.join("\n"),
+        "text/markdown;charset=utf-8",
+      );
+      setChatNotice("Report exported.");
+    } catch (err) {
+      setChatError(normalizeChatError(errMessage(err)));
+    }
+  };
+
+  const exportAssistantMessage = async (
+    message: JsonRecord,
+    previousUserPrompt?: string,
+  ) => {
+    await exportAssistantMarkdown({
+      content: str(message.content, "").trim(),
+      previousUserPrompt,
+      timestamp: str(message.timestamp, "").trim(),
+      traceId: str(message.trace_id, "").trim(),
+    });
+  };
+
+  const openResearchReportPreview = ({
+    report,
+    previousUserPrompt,
+    messageId,
+    timestamp,
+    traceId,
+  }: {
+    report: ResearchReportPreview;
+    previousUserPrompt: string;
+    messageId: string;
+    timestamp?: string;
+    traceId?: string;
+  }) => {
+    setResearchReportDialog({
+      report,
+      messageId,
+      previousUserPrompt,
+      timestamp,
+      traceId,
+    });
+  };
+
+  const copyMessage = async (message: JsonRecord) => {
+    try {
+      const role = str(message.role, "").toLowerCase();
+      const content = str(message.content, "");
+      await copyText(
+        role === "user" ? stripAttachmentContextMarker(content) : content,
+      );
+      setChatNotice("Message copied.");
+    } catch (err) {
+      setChatError(normalizeChatError(errMessage(err)));
+    }
+  };
+
+  const renderResearchReportCard = ({
+    report,
+    previousUserPrompt,
+    messageId,
+    timestamp,
+    traceId,
+    isStreaming = false,
+  }: {
+    report: ResearchReportPreview;
+    previousUserPrompt: string;
+    messageId: string;
+    timestamp?: string;
+    traceId?: string;
+    isStreaming?: boolean;
+  }) => {
+    const metaLabel = isStreaming
+      ? `Streaming report preview | ${researchReportMetaLabel(report)}`
+      : researchReportMetaLabel(report);
+    const summaryText =
+      report.summaryPreview ||
+      report.keyFindings[0] ||
+      "Open the report to review the full research write-up.";
+    return (
+      <Box className="chat-research-report-shell">
+        <Typography variant="caption" className="chat-research-report-meta">
+          {metaLabel}
+        </Typography>
+        <Box
+          className="chat-research-report-card"
+          role="button"
+          tabIndex={0}
+          onClick={() =>
+            openResearchReportPreview({
+              report,
+              previousUserPrompt,
+              messageId,
+              timestamp,
+              traceId,
+            })
+          }
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              openResearchReportPreview({
+                report,
+                previousUserPrompt,
+                messageId,
+                timestamp,
+                traceId,
+              });
+            }
+          }}
+        >
+          <Stack
+            direction="row"
+            spacing={1.5}
+            sx={{
+              justifyContent: "space-between",
+              alignItems: "flex-start",
+            }}
+          >
+            <Box sx={{ minWidth: 0, flex: 1 }}>
+              <Typography
+                variant="body1"
+                className="chat-research-report-title"
+              >
+                {report.title}
+              </Typography>
+            </Box>
+            <Stack
+              direction="row"
+              spacing={0.5}
+              sx={{
+                alignItems: "center",
+              }}
+            >
+              <Tooltip
+                title={
+                  isStreaming
+                    ? "Download current report draft"
+                    : "Download report"
+                }
+              >
+                <IconButton
+                  size="small"
+                  className="chat-research-report-action"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    void exportAssistantMarkdown({
+                      content: report.content,
+                      headingHint: report.title,
+                      previousUserPrompt,
+                      timestamp,
+                      traceId,
+                    });
+                  }}
+                >
+                  <FileDownloadRoundedIcon fontSize="small" />
+                </IconButton>
+              </Tooltip>
+              <Tooltip
+                title={
+                  isStreaming ? "Open current report draft" : "Open report"
+                }
+              >
+                <IconButton
+                  size="small"
+                  className="chat-research-report-action"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    openResearchReportPreview({
+                      report,
+                      previousUserPrompt,
+                      messageId,
+                      timestamp,
+                      traceId,
+                    });
+                  }}
+                >
+                  <OpenInFullRoundedIcon fontSize="small" />
+                </IconButton>
+              </Tooltip>
+            </Stack>
+          </Stack>
+          <Typography
+            variant="caption"
+            className="chat-research-report-eyebrow"
+          >
+            Executive summary
+          </Typography>
+          <Typography variant="body2" className="chat-research-report-summary">
+            {summaryText}
+          </Typography>
+          <Stack
+            direction="row"
+            spacing={0.75}
+            useFlexGap
+            className="chat-research-report-chips"
+            sx={{
+              flexWrap: "wrap",
+            }}
+          >
+            {report.sourceCount > 0 ? (
+              <Chip
+                size="small"
+                label={`${report.sourceCount} source${report.sourceCount === 1 ? "" : "s"}`}
+              />
+            ) : null}
+            {report.openQuestionCount > 0 ? (
+              <Chip
+                size="small"
+                label={`${report.openQuestionCount} open question${report.openQuestionCount === 1 ? "" : "s"}`}
+              />
+            ) : null}
+            {report.contradictionCount > 0 ? (
+              <Chip
+                size="small"
+                label={`${report.contradictionCount} contradiction${report.contradictionCount === 1 ? "" : "s"}`}
+              />
+            ) : null}
+          </Stack>
+          {report.keyFindings.length > 0 ? (
+            <Stack spacing={0.35} className="chat-research-report-findings">
+              {report.keyFindings.map((finding, index) => (
+                <Typography
+                  key={`${report.title}-finding-${index}`}
+                  variant="body2"
+                  className="chat-research-report-finding"
+                >
+                  {index + 1}. {finding}
+                </Typography>
+              ))}
+            </Stack>
+          ) : null}
+        </Box>
+      </Box>
+    );
+  };
+
+  const renderPlanConfirmationCard = ({
+    threadMode = false,
+  }: { threadMode?: boolean } = {}) => (
+    <Box
+      className={`chat-plan-confirmation-card${threadMode ? " thread" : ""}${planConfirmation?.editing ? " editing" : ""}`}
+    >
+      {isPlanningDeepResearch ? (
+        <Stack spacing={1.1}>
+          <Stack
+            direction="row"
+            spacing={0.9}
+            sx={{
+              alignItems: "center",
+            }}
+          >
+            <CircularProgress
+              size={16}
+              thickness={5}
+              className="chat-plan-confirmation-spinner"
+            />
+            <Box sx={{ minWidth: 0 }}>
+              <Typography
+                variant="body2"
+                className="chat-plan-confirmation-title"
+              >
+                Preparing{" "}
+                {planConfirmationDisplayLabel(
+                  planConfirmation?.source,
+                ).toLowerCase()}
+              </Typography>
+            </Box>
+          </Stack>
+          <Typography
+            variant="caption"
+            className="chat-plan-confirmation-inline-note"
+          >
+            {planConfirmationPlanningNote(planConfirmation?.source)}
+          </Typography>
+        </Stack>
+      ) : isAwaitingPlanConfirmation ? (
+        <Stack spacing={1.5}>
+          <Box sx={{ minWidth: 0 }}>
+            {planConfirmation?.editing ? (
+              <TextField
+                size="small"
+                multiline
+                minRows={2}
+                value={planConfirmationSummaryText}
+                onChange={(e) =>
+                  updatePlanConfirmationDraft((draft) => ({
+                    ...draft,
+                    summary: e.target.value,
+                  }))
+                }
+                placeholder="Add a short plan title"
+                fullWidth
+              />
+            ) : (
+              <Typography
+                variant="body1"
+                className="chat-plan-confirmation-headline"
+              >
+                {planConfirmationSummaryText ||
+                  planConfirmationOutlineLabel(planConfirmation?.source)}
+              </Typography>
+            )}
+          </Box>
+
+          <Stack spacing={1} className="chat-plan-confirmation-step-list">
+            {planConfirmationVisibleSteps.map((step, index) => {
+              const stepCopy = describeExecutionPlanStep(
+                step,
+                `Step ${index + 1}`,
+              );
+              return (
+                <Box
+                  key={step.draft_id}
+                  className={`chat-plan-confirmation-step${step.enabled ? "" : " disabled"}${planConfirmation?.editing ? " editing" : ""}`}
+                >
+                  <Box
+                    className={`chat-plan-confirmation-step-marker pending${step.enabled ? "" : " disabled"}${planConfirmation?.editing ? " editing" : ""}`}
+                  >
+                    {!planConfirmation?.editing && step.enabled ? (
+                      <span className="chat-plan-confirmation-step-dot" />
+                    ) : step.enabled ? (
+                      index + 1
+                    ) : (
+                      "-"
+                    )}
+                  </Box>
+                  <Box sx={{ minWidth: 0, flex: 1 }}>
+                    {planConfirmation?.editing ? (
+                      <Stack spacing={0.9}>
+                        <Stack
+                          direction={{ xs: "column", sm: "row" }}
+                          spacing={1}
+                          sx={{
+                            alignItems: { sm: "center" },
+                          }}
+                        >
+                          <Checkbox
+                            checked={step.enabled}
+                            onChange={(e) =>
+                              updatePlanConfirmationDraft((draft) => ({
+                                ...draft,
+                                steps: draft.steps.map((candidate) =>
+                                  candidate.draft_id === step.draft_id
+                                    ? {
+                                        ...candidate,
+                                        enabled: e.target.checked,
+                                      }
+                                    : candidate,
+                                ),
+                              }))
+                            }
+                            size="small"
+                            sx={{ p: 0.25 }}
+                          />
+                          <TextField
+                            size="small"
+                            value={step.title}
+                            onChange={(e) =>
+                              updatePlanConfirmationDraft((draft) => ({
+                                ...draft,
+                                steps: draft.steps.map((candidate) =>
+                                  candidate.draft_id === step.draft_id
+                                    ? { ...candidate, title: e.target.value }
+                                    : candidate,
+                                ),
+                              }))
+                            }
+                            fullWidth
+                            placeholder={`Step ${index + 1}`}
+                          />
+                        </Stack>
+                        <TextField
+                          size="small"
+                          multiline
+                          minRows={2}
+                          value={step.description}
+                          onChange={(e) =>
+                            updatePlanConfirmationDraft((draft) => ({
+                              ...draft,
+                              steps: draft.steps.map((candidate) =>
+                                candidate.draft_id === step.draft_id
+                                  ? {
+                                      ...candidate,
+                                      description: e.target.value,
+                                    }
+                                  : candidate,
+                              ),
+                            }))
+                          }
+                          fullWidth
+                          placeholder="Describe what this step should verify or produce"
+                        />
+                        <Stack
+                          direction="row"
+                          spacing={0.75}
+                          useFlexGap
+                          sx={{
+                            flexWrap: "wrap",
+                          }}
+                        >
+                          <Button
+                            size="small"
+                            variant="outlined"
+                            disabled={index === 0}
+                            onClick={() =>
+                              updatePlanConfirmationDraft((draft) => {
+                                if (index === 0) return draft;
+                                const steps = [...draft.steps];
+                                [steps[index - 1], steps[index]] = [
+                                  steps[index],
+                                  steps[index - 1],
+                                ];
+                                return { ...draft, steps };
+                              })
+                            }
+                          >
+                            Move up
+                          </Button>
+                          <Button
+                            size="small"
+                            variant="outlined"
+                            disabled={
+                              index === planConfirmationVisibleSteps.length - 1
+                            }
+                            onClick={() =>
+                              updatePlanConfirmationDraft((draft) => {
+                                if (index >= draft.steps.length - 1)
+                                  return draft;
+                                const steps = [...draft.steps];
+                                [steps[index], steps[index + 1]] = [
+                                  steps[index + 1],
+                                  steps[index],
+                                ];
+                                return { ...draft, steps };
+                              })
+                            }
+                          >
+                            Move down
+                          </Button>
+                        </Stack>
+                      </Stack>
+                    ) : (
+                      <>
+                        <Typography
+                          variant="body2"
+                          className="chat-plan-confirmation-step-title"
+                        >
+                          {stepCopy.title}
+                        </Typography>
+                        {stepCopy.description ? (
+                          <Typography
+                            variant="caption"
+                            className="chat-plan-confirmation-step-detail"
+                          >
+                            {stepCopy.description}
+                          </Typography>
+                        ) : null}
+                      </>
+                    )}
+                  </Box>
+                </Box>
+              );
+            })}
+          </Stack>
+
+          {!planConfirmation?.editing ? (
+            <Typography
+              variant="caption"
+              className="chat-plan-confirmation-inline-note"
+            >
+              {planConfirmationEnabledCount} step
+              {planConfirmationEnabledCount === 1 ? "" : "s"} selected
+              {planConfirmationDisabledCount > 0
+                ? `, ${planConfirmationDisabledCount} hidden`
+                : ""}
+            </Typography>
+          ) : null}
+
+          <Stack
+            direction="row"
+            spacing={1}
+            useFlexGap
+            className="chat-plan-confirmation-actions"
+            sx={{
+              justifyContent: "space-between",
+              alignItems: "center",
+              flexWrap: "wrap",
+            }}
+          >
+            <Stack
+              direction="row"
+              spacing={1}
+              useFlexGap
+              sx={{
+                flexWrap: "wrap",
+              }}
+            >
+              <Button
+                size="small"
+                variant="outlined"
+                className="chat-plan-confirmation-action ghost"
+                onClick={() =>
+                  setPlanConfirmation((prev) =>
+                    prev
+                      ? {
+                          ...prev,
+                          editing: !prev.editing,
+                        }
+                      : prev,
+                  )
+                }
+              >
+                {planConfirmation?.editing ? "Done editing" : "Edit"}
+              </Button>
+              {planConfirmation?.editing ? (
+                <Button
+                  size="small"
+                  variant="text"
+                  className="chat-plan-confirmation-action text"
+                  onClick={resetPlanConfirmationDraft}
+                >
+                  Reset
+                </Button>
+              ) : null}
+            </Stack>
+            <Stack
+              direction="row"
+              spacing={1}
+              useFlexGap
+              sx={{
+                flexWrap: "wrap",
+              }}
+            >
+              <Button
+                size="small"
+                variant="outlined"
+                className="chat-plan-confirmation-action ghost"
+                onClick={() => void handlePlanConfirmationCancel()}
+              >
+                Cancel
+              </Button>
+              <Button
+                size="small"
+                variant="contained"
+                className="chat-plan-confirmation-action primary"
+                disabled={
+                  !planConfirmationDraftPlan ||
+                  planConfirmationEnabledCount === 0 ||
+                  isStreaming
+                }
+                onClick={() => void handlePlanConfirmationStart()}
+              >
+                Start
+              </Button>
+            </Stack>
+          </Stack>
+        </Stack>
+      ) : (
+        (() => {
+          const livePlan = activePlanConfirmationState;
+          const liveSteps = livePlan?.steps || [];
+          const completedCount = liveSteps.filter(
+            (step) => step.status === "completed",
+          ).length;
+          const runningCount = liveSteps.filter(
+            (step) => step.status === "running",
+          ).length;
+          const failedCount = liveSteps.filter(
+            (step) => step.status === "failed",
+          ).length;
+          const pendingCount = Math.max(
+            0,
+            liveSteps.length - completedCount - runningCount - failedCount,
+          );
+          const badgeLabel = isInterruptedPlanConfirmation
+            ? "Interrupted"
+            : isFailedPlanConfirmation
+              ? "Failed"
+              : isCompletedPlanConfirmation
+                ? "Completed"
+                : "Working";
+          const failureDetail =
+            isInterruptedPlanConfirmation || isFailedPlanConfirmation
+              ? latestRunStatusSummary?.detail ||
+                chatError ||
+                "This research run cannot be resumed. The last saved plan and progress are preserved here."
+              : "";
+          return (
+            <Stack spacing={1.4}>
+              <Stack
+                direction="row"
+                spacing={1}
+                useFlexGap
+                sx={{
+                  justifyContent: "space-between",
+                  alignItems: "flex-start",
+                  flexWrap: "wrap",
+                }}
+              >
+                <Box sx={{ minWidth: 0, flex: 1 }}>
+                  <Typography
+                    variant="body1"
+                    className="chat-plan-confirmation-headline"
+                  >
+                    {str(
+                      livePlan?.summary,
+                      planConfirmationSummaryText ||
+                        planConfirmationOutlineLabel(planConfirmation?.source),
+                    )}
+                  </Typography>
+                </Box>
+                <Typography
+                  variant="caption"
+                  className={`chat-plan-confirmation-inline-status ${
+                    isInterruptedPlanConfirmation || isFailedPlanConfirmation
+                      ? "failed"
+                      : isCompletedPlanConfirmation
+                        ? "completed"
+                        : "running"
+                  }`}
+                >
+                  {badgeLabel}
+                </Typography>
+              </Stack>
+              <Typography
+                variant="caption"
+                className="chat-plan-confirmation-inline-note"
+              >
+                {completedCount} done
+                {runningCount > 0 ? `, ${runningCount} running` : ""}
+                {pendingCount > 0 ? `, ${pendingCount} pending` : ""}
+                {failedCount > 0 ? `, ${failedCount} failed` : ""}
+              </Typography>
+              {failureDetail ? (
+                <Stack spacing={0.75}>
+                  <Typography
+                    variant="caption"
+                    className="chat-plan-confirmation-inline-note"
+                  >
+                    {failureDetail}
+                  </Typography>
+                  {/configure serper or brave search api for reliable research/i.test(
+                    failureDetail,
+                  ) ? (
+                    <Box>
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        onClick={() => onNavigateToView?.("search")}
+                      >
+                        Open Search Settings
+                      </Button>
+                    </Box>
+                  ) : null}
+                </Stack>
+              ) : null}
+              <Stack
+                spacing={0.9}
+                className="chat-plan-confirmation-step-list live"
+              >
+                {liveSteps.map((step, index) => {
+                  const stepStatus =
+                    str(step.status, "pending").trim() || "pending";
+                  const stepCopy = describeExecutionPlanStep(
+                    step,
+                    `Step ${index + 1}`,
+                  );
+                  const phaseDrivenSubsteps =
+                    stepStatus === "running"
+                      ? livePlanPhaseStatuses.map(
+                          (phaseStatus, phaseIndex) => ({
+                            id: phaseIndex + 1,
+                            title: phaseStatus.label,
+                            description: phaseStatus.detail,
+                            status: phaseStatus.status,
+                            tool_hint: phaseStatus.toolName,
+                          }),
+                        )
+                      : [];
+                  const displayedSubsteps =
+                    phaseDrivenSubsteps.length > 0
+                      ? phaseDrivenSubsteps
+                      : step.substeps;
+                  return (
+                    <Box
+                      key={`${step.id}-${step.title}`}
+                      className={`chat-plan-confirmation-step live ${stepStatus}`}
+                    >
+                      <Box
+                        className={`chat-plan-confirmation-step-marker live ${stepStatus}`}
+                      >
+                        {renderExecutionPlanStatusIcon(
+                          stepStatus,
+                          `chat-plan-confirmation-status-icon${stepStatus === "running" ? " spin" : ""}`,
+                        )}
+                      </Box>
+                      <Box sx={{ minWidth: 0, flex: 1 }}>
+                        <Typography
+                          variant="body2"
+                          className="chat-plan-confirmation-step-title"
+                        >
+                          {stepCopy.title}
+                        </Typography>
+                        {stepCopy.description ? (
+                          <Typography
+                            variant="caption"
+                            className="chat-plan-confirmation-step-detail"
+                          >
+                            {stepCopy.description}
+                          </Typography>
+                        ) : null}
+                        {displayedSubsteps.length > 0 ? (
+                          <Stack
+                            spacing={0.55}
+                            className="chat-plan-confirmation-substeps"
+                          >
+                            {displayedSubsteps.map((substep, substepIndex) => {
+                              const substepStatus =
+                                str(substep.status, "pending").trim() ||
+                                "pending";
+                              const substepCopy = describeExecutionPlanSubstep(
+                                substep,
+                                `Substep ${substepIndex + 1}`,
+                              );
+                              return (
+                                <Box
+                                  key={`${substep.id || substepIndex}-${substep.title}`}
+                                  className={`chat-plan-confirmation-substep ${substepStatus}`}
+                                >
+                                  <Box
+                                    className={`chat-plan-confirmation-substep-marker ${substepStatus}`}
+                                  >
+                                    {renderExecutionPlanStatusIcon(
+                                      substepStatus,
+                                      `chat-plan-confirmation-status-icon${substepStatus === "running" ? " spin" : ""}`,
+                                    )}
+                                  </Box>
+                                  <Box sx={{ minWidth: 0, flex: 1 }}>
+                                    <Typography
+                                      variant="caption"
+                                      className="chat-plan-confirmation-substep-title"
+                                    >
+                                      {substepCopy.title}
+                                    </Typography>
+                                    {substepCopy.description ? (
+                                      <Typography
+                                        variant="caption"
+                                        className="chat-plan-confirmation-substep-detail"
+                                      >
+                                        {substepCopy.description}
+                                      </Typography>
+                                    ) : null}
+                                  </Box>
+                                </Box>
+                              );
+                            })}
+                          </Stack>
+                        ) : null}
+                      </Box>
+                    </Box>
+                  );
+                })}
+              </Stack>
+            </Stack>
+          );
+        })()
+      )}
+    </Box>
+  );
+
+  const toggleConversationStarMutation = useMutation({
+    mutationFn: ({ id, starred }: { id: string; starred: boolean }) =>
+      api.rawPatch(`/conversations/${encodeURIComponent(id)}`, { starred }),
+    onSuccess: async (_data, vars) => {
+      await queryClient.invalidateQueries({ queryKey: ["chat-conversations"] });
+      await queryClient.invalidateQueries({
+        queryKey: ["chat-conversation", vars.id],
+      });
+      setChatNotice(vars.starred ? "Chat starred." : "Chat unstarred.");
+    },
+    onError: (err) => {
+      setChatError(normalizeChatError(errMessage(err)));
+    },
+  });
+
+  const toggleConversationStar = async (id: string, starred: boolean) => {
+    if (!id || toggleConversationStarMutation.isPending) return;
+    setChatError(null);
+    await toggleConversationStarMutation.mutateAsync({ id, starred });
+  };
+
+  const deleteConversationMutation = useMutation({
+    mutationFn: (id: string) =>
+      api.rawDelete(`/conversations/${encodeURIComponent(id)}`),
+    onSuccess: async (_data, id) => {
+      const deletedActiveConversation = conversationId === id;
+      const preferredFallbackId = deletedActiveConversation
+        ? getConversationFallbackAfterDelete(id)
+        : null;
+      clearChatWorkspaceSnapshot(id);
+      clearChatStoredRunSnapshotForConversation(
+        CHAT_PENDING_RUN_STORAGE_KEY,
+        id,
+      );
+      clearChatStoredBackgroundRunSnapshot(id);
+      setPendingRunSnapshot((prev) =>
+        prev?.conversationId === id ? null : prev,
+      );
+      setBackgroundRunSnapshots((prev) => {
+        if (!prev[id]) return prev;
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+      if (deletedActiveConversation) {
+        setPostDeleteConversationFallback({
+          deletedId: id,
+          preferredId: preferredFallbackId,
+        });
+        startNewConversation({ preserveCurrentRun: false });
+      }
+      await queryClient.invalidateQueries({ queryKey: ["chat-conversations"] });
+      await queryClient.invalidateQueries({ queryKey: ["chat-messages", id] });
+      setChatNotice("Chat deleted.");
+    },
+    onError: (err) => {
+      setChatError(normalizeChatError(errMessage(err)));
+    },
+  });
+
+  const deleteConversation = async (id: string) => {
+    if (!id || isStreaming || deleteConversationMutation.isPending) return;
+    const shouldDelete =
+      typeof window === "undefined"
+        ? true
+        : window.confirm("Delete this chat and all its messages?");
+    if (!shouldDelete) return;
+    setChatError(null);
+    const taskIds = [pendingRunSnapshot, backgroundRunSnapshots[id] || null]
+      .flatMap((snapshot) =>
+        snapshot && snapshot.conversationId === id
+          ? [str(snapshot.taskId, "").trim()]
+          : [],
+      )
+      .filter(Boolean);
+    for (const taskId of [...new Set(taskIds)]) {
+      try {
+        await api.cancelTask(taskId);
+      } catch {
+        // Ignore cancellation failures and continue with the destructive delete.
+      }
+    }
+    await deleteConversationMutation.mutateAsync(id);
+  };
+
+  const openConversationMenu = (
+    event: MouseEvent<HTMLElement>,
+    conv: JsonRecord,
+  ) => {
+    event.stopPropagation();
+    setConversationMenuAnchor(event.currentTarget);
+    setConversationMenuTarget(conv);
+  };
+
+  const closeConversationMenu = () => {
+    setConversationMenuAnchor(null);
+    setConversationMenuTarget(null);
+  };
+
+  const renderConversationCard = (conv: JsonRecord) => {
+    const id = str(conv.id, "");
+    const active = conversationId === id;
+    const starred = toBool(conv.starred);
+    const title =
+      str(conv.title, "Untitled").replace(/\s+/g, " ").trim() || "Untitled";
+    return (
+      <Box
+        key={id}
+        className={`${active ? "conversation-card active" : "conversation-card"}${starred ? " conversation-card-starred" : ""}`}
+        onClick={() => {
+          openConversationById(id);
+        }}
+        role="button"
+        tabIndex={0}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            openConversationById(id);
+          }
+        }}
+      >
+        <Stack
+          direction="row"
+          spacing={0.5}
+          sx={{
+            justifyContent: "space-between",
+            alignItems: "center",
+          }}
+        >
+          <Tooltip title={title} placement="top-start" enterDelay={250}>
+            <Box sx={{ minWidth: 0, flex: 1 }}>
+              <div className="conversation-card-title">{title}</div>
+              {(() => {
+                const updatedAt = str(conv.updated_at, "");
+                if (!updatedAt) return null;
+                const parsed = formatChatTimestamp(updatedAt);
+                return (
+                  <Typography
+                    variant="caption"
+                    title={parsed.tooltip}
+                    sx={{
+                      color: "text.secondary",
+                      display: "block",
+                      mt: 0.15,
+                      opacity: 0.88,
+                    }}
+                  >
+                    {parsed.label}
+                  </Typography>
+                );
+              })()}
+            </Box>
+          </Tooltip>
+          <Stack
+            direction="row"
+            spacing={0.25}
+            sx={{
+              alignItems: "center",
+            }}
+          >
+            <Tooltip title={starred ? "Unstar chat" : "Star chat"}>
+              <span>
+                <IconButton
+                  size="small"
+                  className={`conversation-card-star-btn${starred ? " active" : ""}`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void toggleConversationStar(id, !starred);
+                  }}
+                  disabled={toggleConversationStarMutation.isPending}
+                >
+                  {starred ? (
+                    <StarRoundedIcon fontSize="small" />
+                  ) : (
+                    <StarBorderRoundedIcon fontSize="small" />
+                  )}
+                </IconButton>
+              </span>
+            </Tooltip>
+            <Tooltip title="Chat options">
+              <span>
+                <IconButton
+                  size="small"
+                  className="conversation-card-menu"
+                  onClick={(e) => {
+                    openConversationMenu(e, conv);
+                  }}
+                  disabled={
+                    deleteConversationMutation.isPending ||
+                    toggleConversationStarMutation.isPending
+                  }
+                >
+                  <MoreVertIcon fontSize="small" />
+                </IconButton>
+              </span>
+            </Tooltip>
+          </Stack>
+        </Stack>
+      </Box>
+    );
+  };
+
+  const normalizeActivityStepTime = (step: JsonRecord): JsonRecord => {
+    const directTime =
+      str(step.time, "").trim() ||
+      str(step.timestamp, "").trim() ||
+      str(step.created_at, "").trim() ||
+      str(step.createdAt, "").trim() ||
+      str(step.at, "").trim();
+    if (!directTime) return step;
+    if (str(step.time, "").trim() === directTime) return step;
+    return {
+      ...step,
+      time: directTime,
+    };
+  };
+
+  const ensureActivityStepTime = (
+    step: JsonRecord,
+    fallbackTime?: string,
+  ): JsonRecord => {
+    const normalized = normalizeActivityStepTime(step);
+    if (str(normalized.time, "").trim()) return normalized;
+    const stamp = (fallbackTime || new Date().toISOString()).trim();
+    if (!stamp) return normalized;
+    return {
+      ...normalized,
+      time: stamp,
+    };
+  };
+
+  const normalizeActivityStepForDisplay = (step: JsonRecord): JsonRecord => {
+    const timedStep = normalizeActivityStepTime(
+      normalizePlanStepUpdateStep(step),
+    );
+    if (isHeartbeatStreamingStep(timedStep)) {
+      return {
+        ...timedStep,
+        step_type: "heartbeat",
+        title: "Working",
+        detail: normalizeHeartbeatDetailText(str(timedStep.detail, "")),
+      };
+    }
+
+    const title = str(timedStep.title, "");
+    const stepType = normalizeStatusText(
+      str(timedStep.step_type, str(timedStep.type, "")),
+    );
+    const detail = str(timedStep.detail, "").trim();
+    const lowerTitle = title.toLowerCase();
+    const isToolActivity =
+      stepType.includes("tool_progress") ||
+      stepType.includes("tool_result") ||
+      lowerTitle.startsWith("tool progress:") ||
+      lowerTitle.startsWith("tool finished:");
+
+    if (!isToolActivity || !detail) return timedStep;
+    const summarized = simplifyConsoleDetail(summarizeActivityDetail(detail));
+    if (!summarized || summarized === detail) return timedStep;
+    return {
+      ...timedStep,
+      detail: summarized,
+    };
+  };
+
+  const compressActivitySteps = (steps: JsonRecord[]): JsonRecord[] => {
+    const out: JsonRecord[] = [];
+    for (const raw of steps) {
+      const step = normalizeActivityStepForDisplay(raw);
+      const incomingHeartbeat = isHeartbeatStreamingStep(step);
+      if (incomingHeartbeat) {
+        const lastIdx = out.length - 1;
+        if (lastIdx >= 0 && isHeartbeatStreamingStep(out[lastIdx])) {
+          if (
+            streamingStepDisplayKey(out[lastIdx]) ===
+            streamingStepDisplayKey(step)
+          ) {
+            continue;
+          }
+          out[lastIdx] = step;
+        } else {
+          out.push(step);
+        }
+        continue;
+      }
+      if (out.length > 0 && isHeartbeatStreamingStep(out[out.length - 1])) {
+        out.pop();
+      }
+      out.push(step);
+    }
+    return out;
+  };
+
+  const trimTrailingHeartbeatSteps = (steps: JsonRecord[]): JsonRecord[] => {
+    const next = [...steps];
+    while (
+      next.length > 0 &&
+      isHeartbeatStreamingStep(asRecord(next[next.length - 1]))
+    ) {
+      next.pop();
+    }
+    return next;
+  };
+
+  const limitStreamingStepsForUi = (steps: JsonRecord[]): JsonRecord[] => {
+    if (steps.length <= CHAT_STREAMING_STEPS_UI_MAX) return steps;
+    const heartbeat = steps.find((row) => isHeartbeatStreamingStep(row));
+    const next = steps
+      .filter((row) => !isHeartbeatStreamingStep(row))
+      .slice(-CHAT_STREAMING_STEPS_UI_MAX);
+    if (
+      heartbeat &&
+      next.length < CHAT_STREAMING_STEPS_UI_MAX &&
+      !next.some((row) => isHeartbeatStreamingStep(row))
+    ) {
+      return [...next, heartbeat];
+    }
+    return next;
+  };
+
+  const countMeaningfulActivityCards = (
+    cards: ActivityTimelineCard[],
+  ): number => {
+    const nonHeartbeat = cards.filter((card) => !card.isHeartbeat).length;
+    return nonHeartbeat > 0 ? nonHeartbeat : cards.length;
+  };
+
+  const summarizeToolStartPayload = (
+    name: string,
+    payload: unknown,
+  ): string => {
+    const normalizedName = (name || "").trim().toLowerCase();
+    if (normalizedName === "app_deploy") {
+      const root = asRecord(payload);
+      const nested = asRecord(root.payload);
+      // The backend summary uses file_names (array) + file_count (number);
+      // fall back to counting keys in a files object when present.
+      const rootFiles = asRecord(root.files);
+      const nestedFiles = asRecord(nested.files);
+      const filesObj =
+        Object.keys(rootFiles).length > 0 ? rootFiles : nestedFiles;
+      const summaryNames: string[] = Array.isArray(root.file_names)
+        ? (root.file_names as string[])
+        : [];
+      const fileCount =
+        typeof root.file_count === "number"
+          ? (root.file_count as number)
+          : summaryNames.length > 0
+            ? summaryNames.length
+            : Object.keys(filesObj).length;
+      const fileNames =
+        summaryNames.length > 0 ? summaryNames : Object.keys(filesObj);
+      const entryCommand = str(
+        root.entry_command,
+        str(nested.entry_command, ""),
+      ).trim();
+      if (fileCount > 0) {
+        const namePreview = fileNames.slice(0, 6).join(", ");
+        const overflow = fileCount > 6 ? ` +${fileCount - 6} more` : "";
+        return `Deploying ${fileCount} file${fileCount === 1 ? "" : "s"}: ${namePreview}${overflow}${entryCommand ? " (dynamic runtime)" : " (static)"}.`;
+      }
+      return "Preparing deployment package.";
+    }
+    if (normalizedName === "file_write") {
+      const root = asRecord(payload);
+      const fileName = normalizeWorkspaceFileName(
+        root.path ?? root.file,
+        str(streamedWorkspaceAppRef.current?.app_dir, ""),
+      );
+      const lineCount = Math.max(0, num(root.line_count, 0));
+      if (fileName) {
+        return lineCount > 0
+          ? `Preparing ${fileName} (${lineCount} line${lineCount === 1 ? "" : "s"}).`
+          : `Preparing ${fileName}.`;
+      }
+    }
+    const compact = compactUnknown(payload, 320);
+    if (!compact) return `Starting ${toHumanToolName(name)}.`;
+    return simplifyConsoleDetail(compact);
+  };
+
+  const pushStreamingStep = (step: JsonRecord) => {
+    const normalizedIncomingStep = normalizePlanStepUpdateStep(step);
+    // Handle execution plan events
+    const stepType = str(normalizedIncomingStep.step_type, "");
+    if (stepType === "plan_generated") {
+      const nextPlan = normalizeExecutionPlanState(normalizedIncomingStep.plan);
+      setExecutionPlan(nextPlan);
+      setExecutionPlanFailure("");
+      setExecutionPlanExpanded(
+        (prev) => prev || planConfirmation?.stage === "running",
+      );
+      setPlanConfirmation((prev) =>
+        prev?.stage === "planning"
+          ? {
+              ...prev,
+              originalPlan: nextPlan,
+              draft: createPlanConfirmationDraft(nextPlan),
+            }
+          : prev,
+      );
+    }
+    if (stepType === "plan_revised") {
+      const nextPlan = normalizeExecutionPlanState(normalizedIncomingStep.plan);
+      if (nextPlan) {
+        setExecutionPlan(nextPlan);
+        setExecutionPlanFailure("");
+        setPlanConfirmation((prev) =>
+          prev?.stage === "awaiting_confirmation"
+            ? {
+                ...prev,
+                originalPlan: nextPlan,
+                draft: createPlanConfirmationDraft(nextPlan),
+              }
+            : prev,
+        );
+      }
+      setExecutionPlanExpanded(
+        (prev) => prev || planConfirmation?.stage === "running",
+      );
+    }
+    if (stepType === "plan_ready_for_confirmation") {
+      const nextPlan = normalizeExecutionPlanState(normalizedIncomingStep.plan);
+      const taskId = str(normalizedIncomingStep.task_id, "").trim();
+      const planSource = planConfirmationSourceValue(
+        str(normalizedIncomingStep.source, "").trim(),
+      );
+      setExecutionPlan(nextPlan);
+      setExecutionPlanFailure("");
+      setExecutionPlanExpanded(false);
+      setPlanConfirmation({
+        stage: "awaiting_confirmation",
+        taskId: taskId || null,
+        source: planSource,
+        originalPlan: nextPlan,
+        draft: createPlanConfirmationDraft(nextPlan),
+        editing: false,
+        messageId: null,
+      });
+      markPendingRunAwaitingPlanConfirmation(taskId);
+      setChatNotice(
+        `${planConfirmationDisplayLabel(planSource)} ready. Review it, then Start or Cancel.`,
+      );
+    }
+    if (stepType === "plan_unavailable") {
+      setExecutionPlan(null);
+      setExecutionPlanFailure(
+        str(
+          normalizedIncomingStep.detail,
+          "Structured planning was unavailable.",
+        ),
+      );
+      setPlanConfirmation(null);
+    }
+    if (
+      stepType === "plan_step_update" &&
+      typeof normalizedIncomingStep.step_id === "number"
+    ) {
+      const sid = normalizedIncomingStep.step_id as number;
+      const newStatus =
+        typeof normalizedIncomingStep.status === "string"
+          ? normalizedIncomingStep.status
+          : "running";
+      const planId = str(normalizedIncomingStep.plan_id, "");
+      const revision = num(normalizedIncomingStep.revision, 0);
+      const nextSubsteps = Array.isArray(normalizedIncomingStep.substeps)
+        ? normalizeExecutionPlanSubsteps(normalizedIncomingStep.substeps)
+        : null;
+      setPlanConfirmation((prev) =>
+        prev
+          ? {
+              ...prev,
+              stage: "running",
+              editing: false,
+            }
+          : executionPlan
+            ? {
+                stage: "running",
+                taskId: str(pendingRunSnapshot?.taskId, "").trim() || null,
+                source: "deep_research",
+                originalPlan: executionPlan,
+                draft: createPlanConfirmationDraft(executionPlan),
+                editing: false,
+                messageId: null,
+              }
+            : prev,
+      );
+      setExecutionPlanExpanded(true);
+      setExecutionPlan((prev) => {
+        if (!prev) return prev;
+        if (planId && prev.plan_id && planId !== prev.plan_id) return prev;
+        if (revision > 0 && prev.revision > 0 && revision !== prev.revision)
+          return prev;
+        return {
+          ...prev,
+          steps: prev.steps.map((s) =>
+            s.id === sid
+              ? (() => {
+                  const nextStepSubsteps = nextSubsteps ?? s.substeps;
+                  return {
+                    ...s,
+                    status: deriveExecutionPlanStepStatus(
+                      newStatus,
+                      nextStepSubsteps,
+                    ),
+                    substeps: nextStepSubsteps,
+                  };
+                })()
+              : s,
+          ),
+        };
+      });
+      maybeSurfacePlanStepProgressBubble(normalizedIncomingStep);
+    }
+
+    const prevSteps = streamingStepsRef.current;
+    const normalizedStep = ensureActivityStepTime(
+      normalizeActivityStepForDisplay(normalizedIncomingStep),
+    );
+    const incomingHeartbeat = isHeartbeatStreamingStep(normalizedStep);
+    const incomingStableKey = getStreamingStepStableKey(normalizedStep);
+    let next: JsonRecord[];
+    if (incomingHeartbeat) {
+      const existingIndex = prevSteps.findIndex((row) =>
+        isHeartbeatStreamingStep(row),
+      );
+      if (existingIndex >= 0) {
+        if (
+          streamingStepDisplayKey(prevSteps[existingIndex]) ===
+          streamingStepDisplayKey(normalizedStep)
+        ) {
+          return;
+        }
+        next = [...prevSteps];
+        next[existingIndex] = attachStreamingStepStableKey(
+          normalizedStep,
+          getStreamingStepStableKey(prevSteps[existingIndex]),
+        );
+      } else {
+        next = [...prevSteps, attachStreamingStepStableKey(normalizedStep)];
+      }
+    } else {
+      next = [...prevSteps];
+      const heartbeatIndex = next.findIndex((row) =>
+        isHeartbeatStreamingStep(row),
+      );
+      if (heartbeatIndex >= 0) {
+        next.splice(heartbeatIndex, 1);
+      }
+      if (incomingStableKey) {
+        const existingIndex = next.findIndex(
+          (row) => getStreamingStepStableKey(row) === incomingStableKey,
+        );
+        if (existingIndex >= 0) {
+          next.splice(existingIndex, 1);
+          next.push(
+            attachStreamingStepStableKey(normalizedStep, incomingStableKey),
+          );
+          next = limitStreamingStepsForUi(next);
+          streamingStepsRef.current = next;
+          queuedStreamingStepsRef.current = next;
+          scheduleStreamingStepsFlush();
+          return;
+        }
+      }
+      const lastIdx = next.length - 1;
+      const incomingKey = streamingStepDedupKey(normalizedStep);
+      if (
+        lastIdx >= 0 &&
+        streamingStepDedupKey(next[lastIdx]) === incomingKey
+      ) {
+        next[lastIdx] = attachStreamingStepStableKey(
+          normalizedStep,
+          getStreamingStepStableKey(next[lastIdx]),
+        );
+      } else {
+        next.push(attachStreamingStepStableKey(normalizedStep));
+      }
+    }
+    next = limitStreamingStepsForUi(next);
+    streamingStepsRef.current = next;
+    queuedStreamingStepsRef.current = next;
+    scheduleStreamingStepsFlush();
+  };
+
+  const rememberStreamedWorkspaceApp = (nextApp: JsonRecord | null) => {
+    if (!nextApp) return;
+    const merged = { ...(streamedWorkspaceAppRef.current || {}), ...nextApp };
+    const appDir = str(merged.app_dir, "");
+    streamedWorkspaceAppRef.current = merged;
+    setStreamedWorkspaceApp(merged);
+    if (appDir) {
+      setDeployedFiles((prev) => mergeWorkspaceFiles(prev, [], appDir));
+      setLiveFileWrites((prev) => canonicalizeLiveFileWrites(prev, appDir));
+    }
+  };
+
+  const handleStreamThinking = (step: JsonRecord) => {
+    maybeSurfaceThinkingProgressBubble(step);
+    pushStreamingStep(step);
+  };
+
+  const handleStreamToolStart = (
+    name: string,
+    payload?: Record<string, unknown>,
+  ) => {
+    followActivityConsole();
+    maybeSurfaceToolStartProgressBubble(name);
+    const payloadObj = attachCurrentPlanStepPayload(asRecord(payload));
+    const payloadSummary = decorateActivityDetailWithPlanStep(
+      summarizeToolStartPayload(name, payloadObj),
+      payloadObj,
+    );
+    pushStreamingStep({
+      step_type: "tool_start",
+      title: `Tool started: ${name}`,
+      detail: payloadSummary || `Starting ${toHumanToolName(name)}.`,
+      data: Object.keys(payloadObj).length > 0 ? payloadObj : name,
+    });
+    if (name === "file_read") {
+      pendingFileReadPathRef.current = normalizeWorkspaceFileName(
+        payloadObj.path ?? payloadObj.file,
+        str(streamedWorkspaceAppRef.current?.app_dir, ""),
+      );
+    }
+    if (name === "file_write") {
+      pendingFileWritePathRef.current = normalizeWorkspaceFileName(
+        payloadObj.path ?? payloadObj.file,
+        str(streamedWorkspaceAppRef.current?.app_dir, ""),
+      );
+    }
+    const capturedApp = extractWorkspaceAppFromStreamPayload(name, payload);
+    rememberStreamedWorkspaceApp(capturedApp);
+    const workspaceAppDir = str(
+      capturedApp?.app_dir,
+      str(streamedWorkspaceAppRef.current?.app_dir, ""),
+    );
+    const capturedFiles = extractWorkspaceFilesFromStreamPayload(name, payload);
+    if (capturedFiles.length > 0) {
+      setDeployedFiles((prev) =>
+        mergeWorkspaceFiles(prev, capturedFiles, workspaceAppDir),
+      );
+      setLiveFileWrites((prev) => {
+        const next = { ...prev };
+        for (const file of capturedFiles) {
+          const normalizedName = normalizeWorkspaceFileName(
+            file.name,
+            workspaceAppDir,
+          );
+          if (!normalizedName) continue;
+          if (!next[normalizedName]) {
+            const totalLines =
+              file.content.length > 0 ? file.content.split(/\r?\n/).length : 0;
+            next[normalizedName] = {
+              content: choosePreferredWorkspaceFileContent("", file.content),
+              line: 0,
+              totalLines,
+              done: false,
+            };
+          } else if (file.content && !next[normalizedName].content) {
+            const totalLines = file.content.split(/\r?\n/).length;
+            next[normalizedName] = {
+              ...next[normalizedName],
+              content: choosePreferredWorkspaceFileContent(
+                next[normalizedName].content,
+                file.content,
+              ),
+              totalLines: next[normalizedName].totalLines || totalLines,
+            };
+          }
+        }
+        return canonicalizeLiveFileWrites(next, workspaceAppDir);
+      });
+      setCodeViewerFileIdx(0);
+    }
+  };
+
+  const handleStreamToolResult = (
+    name: string,
+    content: string,
+    payload?: Record<string, unknown>,
+  ) => {
+    followActivityConsole();
+    const preview = content.trim().slice(0, 1600);
+    const payloadObj = attachCurrentPlanStepPayload(asRecord(payload));
+    const detail = decorateActivityDetailWithPlanStep(
+      simplifyConsoleDetail(summarizeActivityDetail(preview)),
+      payloadObj,
+    );
+    const capturedApp = extractWorkspaceAppFromStreamPayload(name, payloadObj);
+    rememberStreamedWorkspaceApp(capturedApp);
+    const workspaceAppDir = str(
+      capturedApp?.app_dir,
+      str(streamedWorkspaceAppRef.current?.app_dir, ""),
+    );
+    const capturedFiles = extractWorkspaceFilesFromStreamPayload(
+      name,
+      payloadObj,
+    );
+    if (capturedFiles.length > 0) {
+      setDeployedFiles((prev) =>
+        mergeWorkspaceFiles(prev, capturedFiles, workspaceAppDir),
+      );
+    }
+    if (name === "file_read") {
+      const rawContent = str(payloadObj.raw_content, "").trim();
+      const fileName = normalizeWorkspaceFileName(
+        payloadObj.path ?? payloadObj.file ?? pendingFileReadPathRef.current,
+        workspaceAppDir,
+      );
+      if (fileName && rawContent) {
+        setDeployedFiles((prev) =>
+          mergeWorkspaceFiles(
+            prev,
+            [{ name: fileName, content: rawContent }],
+            workspaceAppDir,
+          ),
+        );
+      }
+      pendingFileReadPathRef.current = "";
+    }
+    if (name === "file_write") {
+      const resultPathMatch = content.match(/written to\s+(.+)$/i);
+      const fileName = normalizeWorkspaceFileName(
+        payloadObj.path ??
+          payloadObj.file ??
+          resultPathMatch?.[1] ??
+          pendingFileWritePathRef.current,
+        workspaceAppDir,
+      );
+      const resultContent = choosePreferredWorkspaceFileContent(
+        str(payloadObj.file_content, str(payloadObj.raw_content, "")),
+        str(payloadObj.content, ""),
+      );
+      if (fileName) {
+        setDeployedFiles((prev) => {
+          const existing = prev.find((file) => file.name === fileName);
+          const fallbackContent = existing?.content || "";
+          return mergeWorkspaceFiles(
+            prev,
+            [
+              {
+                name: fileName,
+                content: resultContent || fallbackContent,
+              },
+            ],
+            workspaceAppDir,
+          );
+        });
+        setLiveFileWrites((prev) => {
+          const existing = prev[fileName];
+          const mergedContent = choosePreferredWorkspaceFileContent(
+            existing?.content || "",
+            resultContent,
+          );
+          const totalLines = mergedContent
+            ? mergedContent.split(/\r?\n/).length
+            : Math.max(existing?.totalLines ?? 0, 0);
+          return canonicalizeLiveFileWrites(
+            {
+              ...prev,
+              [fileName]: {
+                content: mergedContent,
+                line:
+                  totalLines > 0
+                    ? totalLines
+                    : Math.max(existing?.line ?? 0, 0),
+                totalLines,
+                done: true,
+              },
+            },
+            workspaceAppDir,
+          );
+        });
+      }
+      pendingFileWritePathRef.current = "";
+    }
+    if (name === "app_deploy" || name === "app_restart") {
+      setLiveFileWrites((prev) => {
+        const next: Record<string, LiveFileWriteState> = {};
+        for (const [file, state] of Object.entries(prev)) {
+          next[file] = { ...state, done: true };
+        }
+        return next;
+      });
+    }
+    pushStreamingStep({
+      step_type: "tool_result",
+      title: `Tool finished: ${name || "tool"}`,
+      detail: detail || preview,
+      data: payload || detail || preview,
+    });
+  };
+
+  const handleStreamToolProgress = (
+    name: string,
+    content: string,
+    payload?: Record<string, unknown>,
+  ) => {
+    followActivityConsole();
+    const payloadObj = attachCurrentPlanStepPayload(asRecord(payload));
+    const workspaceAppDir = str(streamedWorkspaceAppRef.current?.app_dir, "");
+    const progressPresentation = buildToolProgressPresentation(
+      name,
+      content,
+      payloadObj,
+      workspaceAppDir,
+    );
+    const phaseStatus = extractPhaseStatusFromProgress(
+      name,
+      payloadObj,
+      progressPresentation.detail,
+    );
+    if (phaseStatus) {
+      setStreamPhaseStatus(phaseStatus);
+    }
+    maybeSurfaceToolProgressBubble(
+      name,
+      content,
+      payloadObj,
+      progressPresentation,
+    );
+
+    const isDraftFile = str(payloadObj.kind, "") === "draft_file";
+    if (isDraftFile) {
+      const fileName = normalizeWorkspaceFileName(
+        payloadObj.file ?? payloadObj.path,
+        workspaceAppDir,
+      );
+      if (fileName) {
+        const snapshot = str(payloadObj.content_snapshot, "");
+        const delta = str(payloadObj.content_delta, "");
+        const done = toBool(payloadObj.done);
+        const derivedLines = snapshot
+          ? snapshot.split(/\r?\n/).length
+          : delta
+            ? delta.split(/\r?\n/).length
+            : 0;
+        const lineNo = Math.max(0, num(payloadObj.line, derivedLines));
+        const totalLines = Math.max(0, num(payloadObj.total_lines, 0));
+        const currentContentHint = liveFileWrites[fileName]?.content || "";
+        setLiveFileWrites((prev) => {
+          const current = prev[fileName];
+          let nextContent = current?.content ?? "";
+          if (snapshot) {
+            nextContent = choosePreferredWorkspaceFileContent(
+              nextContent,
+              snapshot,
+            );
+          } else if (delta) {
+            nextContent = `${nextContent}${delta}`;
+          }
+          const nextDerivedLines = nextContent
+            ? nextContent.split(/\r?\n/).length
+            : derivedLines;
+          const nextLine = Math.max(
+            current?.line ?? 0,
+            lineNo || nextDerivedLines,
+          );
+          const nextTotalLines =
+            totalLines > 0
+              ? totalLines
+              : Math.max(current?.totalLines ?? 0, nextDerivedLines);
+          const nextDone =
+            done || (nextTotalLines > 0 && nextLine >= nextTotalLines);
+          if (
+            current &&
+            current.content === nextContent &&
+            current.line === nextLine &&
+            current.totalLines === nextTotalLines &&
+            current.done === nextDone
+          ) {
+            return prev;
+          }
+          return canonicalizeLiveFileWrites(
+            {
+              ...prev,
+              [fileName]: {
+                content: nextContent,
+                line: nextLine,
+                totalLines: nextTotalLines,
+                done: nextDone,
+              },
+            },
+            workspaceAppDir,
+          );
+        });
+        setDeployedFiles((prev) => {
+          const existing = prev.find((file) => file.name === fileName);
+          const baseContent = currentContentHint || existing?.content || "";
+          const mergedContent = snapshot
+            ? choosePreferredWorkspaceFileContent(baseContent, snapshot)
+            : delta
+              ? `${baseContent}${delta}`
+              : baseContent;
+          if (existing && existing.content === mergedContent) return prev;
+          return mergeWorkspaceFiles(
+            prev,
+            [{ name: fileName, content: mergedContent }],
+            workspaceAppDir,
+          );
+        });
+      }
+    }
+
+    const isFileWriteProgress =
+      (name === "app_deploy" && str(payloadObj.kind, "") === "file_write") ||
+      name === "file_write";
+    if (isFileWriteProgress) {
+      const fileName = normalizeWorkspaceFileName(
+        payloadObj.file ?? payloadObj.path,
+        workspaceAppDir,
+      );
+      if (fileName) {
+        const lineNo = Math.max(0, num(payloadObj.line, 0));
+        const totalLines = Math.max(0, num(payloadObj.total_lines, 0));
+        const done =
+          toBool(payloadObj.done) || (totalLines > 0 && lineNo >= totalLines);
+        const text = str(payloadObj.text, "");
+        setLiveFileWrites((prev) => {
+          const current = prev[fileName];
+          const currentLine = current?.line ?? 0;
+          let nextContent = current?.content ?? "";
+          if (lineNo > currentLine) {
+            if (lineNo > 0) nextContent += `${text}\n`;
+          } else if (!current && text) {
+            nextContent = `${text}\n`;
+          }
+          const nextLine = Math.max(currentLine, lineNo);
+          const nextTotalLines =
+            totalLines > 0 ? totalLines : (current?.totalLines ?? 0);
+          if (
+            current &&
+            current.content === nextContent &&
+            current.line === nextLine &&
+            current.totalLines === nextTotalLines &&
+            current.done === done
+          ) {
+            return prev;
+          }
+          return canonicalizeLiveFileWrites(
+            {
+              ...prev,
+              [fileName]: {
+                content: nextContent,
+                line: nextLine,
+                totalLines: nextTotalLines,
+                done,
+              },
+            },
+            workspaceAppDir,
+          );
+        });
+        setDeployedFiles((prev) => {
+          if (prev.some((file) => file.name === fileName)) return prev;
+          return mergeWorkspaceFiles(
+            prev,
+            [{ name: fileName, content: "" }],
+            workspaceAppDir,
+          );
+        });
+      }
+    }
+
+    const progressData = {
+      ...payloadObj,
+      tool_name: name,
+    };
+    pushStreamingStep({
+      step_type: "tool_progress",
+      title: progressPresentation.title,
+      detail: decorateActivityDetailWithPlanStep(
+        progressPresentation.detail,
+        payloadObj,
+      ),
+      data: progressData,
+      ...(progressPresentation.streamKey
+        ? { __streamKey: progressPresentation.streamKey }
+        : {}),
+    });
+  };
+
+  const reattachToolHandlersRef = useRef({
+    onToolStart: handleStreamToolStart,
+    onToolResult: handleStreamToolResult,
+    onToolProgress: handleStreamToolProgress,
+  });
+
+  useEffect(() => {
+    reattachToolHandlersRef.current = {
+      onToolStart: handleStreamToolStart,
+      onToolResult: handleStreamToolResult,
+      onToolProgress: handleStreamToolProgress,
+    };
+  }, [handleStreamToolStart, handleStreamToolResult, handleStreamToolProgress]);
+
+  const buildArchivedPendingRunSnapshot = (): ChatPendingRunSnapshot | null => {
+    if (!pendingRunSnapshot?.conversationId) return null;
+    return {
+      ...pendingRunSnapshot,
+      projectId: effectiveProjectId || pendingRunSnapshot.projectId || "",
+      taskId: activeChatTaskIdRef.current || pendingRunSnapshot.taskId || "",
+      streamingResponse: (
+        streamingResponse ||
+        pendingRunSnapshot.streamingResponse ||
+        ""
+      ).slice(0, CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS),
+      streamingSteps: trimTrailingHeartbeatSteps(
+        streamingStepsRef.current.length > 0
+          ? streamingStepsRef.current
+          : streamingSteps,
+      ).slice(-CHAT_PENDING_STREAM_STEPS_MAX),
+    };
+  };
+
+  const movePendingRunSnapshotToBackground =
+    (): ChatPendingRunSnapshot | null => {
+      const archivedSnapshot = buildArchivedPendingRunSnapshot();
+      if (!archivedSnapshot) return null;
+      const nextBackgroundSnapshots = {
+        ...backgroundRunSnapshots,
+        [archivedSnapshot.conversationId]: archivedSnapshot,
+      };
+      setBackgroundRunSnapshots(nextBackgroundSnapshots);
+      storeChatBackgroundRunSnapshots(nextBackgroundSnapshots);
+      return archivedSnapshot;
+    };
+
+  const runStreamingChat = async (
+    message: string,
+    files: File[] = [],
+    opts?: {
+      sensitive?: boolean;
+      conversationIdOverride?: string;
+      projectIdOverride?: string;
+      statusSource?: string;
+      deepResearch?: boolean;
+      resumeTaskId?: string;
+      planOverride?: ExecutionPlanState | null;
+    },
+  ): Promise<boolean> => {
+    const resumeTaskId = (opts?.resumeTaskId || "").trim();
+    const isResumeMode = !!resumeTaskId;
+    const requestedConversationOverride = (
+      opts?.conversationIdOverride || ""
+    ).trim();
+    const requestedProjectOverride = (opts?.projectIdOverride || "").trim();
+    const targetConversationId =
+      requestedConversationOverride || conversationId || "";
+    const targetProjectId =
+      requestedProjectOverride || effectiveProjectId || "";
+    const preservedResumeSnapshot =
+      isResumeMode && targetConversationId
+        ? (() => {
+            const activeSnapshot = pendingRunSnapshotRef.current;
+            if (
+              activeSnapshot &&
+              activeSnapshot.conversationId === targetConversationId &&
+              (!resumeTaskId ||
+                !activeSnapshot.taskId ||
+                activeSnapshot.taskId === resumeTaskId)
+            ) {
+              return activeSnapshot;
+            }
+            const backgroundSnapshot =
+              backgroundRunSnapshots[targetConversationId];
+            if (
+              backgroundSnapshot &&
+              backgroundSnapshot.conversationId === targetConversationId &&
+              (!resumeTaskId ||
+                !backgroundSnapshot.taskId ||
+                backgroundSnapshot.taskId === resumeTaskId)
+            ) {
+              return backgroundSnapshot;
+            }
+            return null;
+          })()
+        : null;
+    const preservedResumeResponse = preservedResumeSnapshot
+      ? str(preservedResumeSnapshot.streamingResponse, "").slice(
+          0,
+          CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS,
+        )
+      : "";
+    const preservedResumeSteps = preservedResumeSnapshot
+      ? trimTrailingHeartbeatSteps(
+          asRecords(preservedResumeSnapshot.streamingSteps).map((step) =>
+            ensureActivityStepTime(step),
+          ),
+        ).slice(-CHAT_PENDING_STREAM_STEPS_MAX)
+      : [];
+    let activeMessage = isResumeMode
+      ? ""
+      : message.trim() ||
+        (files.length > 0
+          ? "Please analyze the attached documents and answer using them."
+          : "");
+    if (
+      (!activeMessage && !isResumeMode) ||
+      isStreaming ||
+      streamLockRef.current
+    )
+      return false;
+    if (isResumeMode && !targetConversationId) {
+      setChatError(
+        "This stopped task is missing its conversation, so it cannot be resumed.",
+      );
+      return false;
+    }
+    const now = Date.now();
+    const deepResearch = Boolean(opts?.deepResearch);
+    const planOverride = opts?.planOverride ?? null;
+    const executionMode: ChatExecutionMode = "auto";
+    const fingerprint = isResumeMode
+      ? `resume::${resumeTaskId}::${targetConversationId || "__no_conversation__"}`
+      : `${targetConversationId || "__new__"}::${targetProjectId || "__no_project__"}::${activeMessage
+          .toLowerCase()
+          .replace(/\s+/g, " ")
+          .trim()}::${deepResearch ? "research" : "chat"}::${executionMode}`;
+    const lastSend = recentSendRef.current;
+    if (
+      lastSend &&
+      lastSend.fingerprint === fingerprint &&
+      now - lastSend.at < 1500
+    ) {
+      setChatNotice("Duplicate send ignored.");
+      return false;
+    }
+    if (!isResumeMode && workingChatCount >= CHAT_WORKING_CHATS_MAX) {
+      setChatError(
+        `You already have ${CHAT_WORKING_CHATS_MAX} working chats. Wait for one to finish or stop one before starting another.`,
+      );
+      return false;
+    }
+    recentSendRef.current = { fingerprint, at: now };
+    streamLockRef.current = true;
+    stopRequestedRef.current = false;
+    const streamGeneration = streamGenerationRef.current + 1;
+    streamGenerationRef.current = streamGeneration;
+    activeChatTaskIdRef.current = isResumeMode ? resumeTaskId : null;
+    const abortController = new AbortController();
+    streamAbortRef.current = abortController;
+    setLiveRunStreamOpenNow(false);
+
+    setChatError(null);
+    if (!isResumeMode && deepResearch) {
+      setPlanConfirmation({
+        stage: "planning",
+        taskId: null,
+        source: "deep_research",
+        originalPlan: null,
+        draft: null,
+        editing: false,
+        messageId: null,
+      });
+    } else if (isResumeMode && planOverride) {
+      setPlanConfirmation((prev) =>
+        prev
+          ? {
+              ...prev,
+              stage: "running",
+              editing: false,
+            }
+          : prev,
+      );
+    } else if (!isResumeMode) {
+      setPlanConfirmation(null);
+    }
+    const sensitiveMessage = !isResumeMode && Boolean(opts?.sensitive);
+    setPendingUserMessage(
+      !isResumeMode && !sensitiveMessage ? activeMessage : null,
+    );
+    setFailedUserMessage(null);
+    setStreamingResponseNow(preservedResumeResponse);
+    setStreamingResponseChoices([]);
+    setStreamingRunMetrics(null);
+    setStreamingStepsNow(preservedResumeSteps);
+    if (isResumeMode && planOverride) {
+      setExecutionPlan(planOverride);
+      setExecutionPlanFailure("");
+      setExecutionPlanExpanded(true);
+    } else {
+      setExecutionPlan(null);
+      setExecutionPlanFailure("");
+      setExecutionPlanExpanded(false);
+    }
+    setStreamingProgressMessages(
+      isResumeMode ? [] : ["Thinking."],
+    );
+    resetStreamingProgressBubbleState();
+    setCompletedProgressMessagesByConversation((prev) => {
+      if (!targetConversationId || !prev[targetConversationId]) return prev;
+      const next = { ...prev };
+      delete next[targetConversationId];
+      return next;
+    });
+    setLiveFileWrites({});
+    setDeployedFiles([]);
+    setStreamPhaseStatus(null);
+    setStreamedWorkspaceApp(null);
+    streamedWorkspaceAppRef.current = null;
+    latestRunEventSeqRef.current = 0;
+    setCodeViewerFileIdx(0);
+    setStreamTraceOpen(false);
+    setIsStreaming(true);
+    pendingFileReadPathRef.current = "";
+    pendingFileWritePathRef.current = "";
+
+    if (targetConversationId && conversationId !== targetConversationId) {
+      setConversationId(targetConversationId);
+    }
+    const initialPendingSnapshot: ChatPendingRunSnapshot = {
+      conversationId: targetConversationId,
+      message:
+        !isResumeMode && !sensitiveMessage
+          ? activeMessage
+          : str(preservedResumeSnapshot?.message, ""),
+      projectId: targetProjectId,
+      startedAt: Date.now(),
+      initialMessageCount: messages.length,
+      runId: "",
+      mode: isResumeMode ? "resume" : "fresh",
+      phase: "running",
+      taskId: resumeTaskId,
+      streamingResponse: preservedResumeResponse,
+      streamingSteps: preservedResumeSteps,
+      failedUserMessage: "",
+      lastRunSeq: 0,
+      attachments: isResumeMode
+        ? sanitizeChatTurnAttachments(preservedResumeSnapshot?.attachments)
+        : chatTurnAttachmentsFromFiles(files),
+    };
+    storeChatPendingRunSnapshotNow(initialPendingSnapshot);
+    setPendingRunSnapshot(initialPendingSnapshot);
+
+    let resolvedConversationId = targetConversationId;
+    let payloadMessage = activeMessage;
+    let attachmentPayloads: Array<{
+      upload_id?: string;
+      document_id?: string;
+      kind: string;
+      content_type?: string | null;
+    }> = [];
+    let streamError: string | null = null;
+    let latestStreamingResponse = preservedResumeResponse;
+    const streamStartedAt = Date.now();
+    let firstTokenMs: number | null = null;
+    const absorbRunMetrics = (payload: unknown) => {
+      const obj = asRecord(payload);
+      const next: ChatRunMetrics = {};
+      const inputTokens = positiveRunMetric(obj.input_tokens);
+      const outputTokens = positiveRunMetric(obj.output_tokens);
+      const totalTokens = positiveRunMetric(obj.total_tokens);
+      const durationMs = positiveRunMetric(obj.duration_ms);
+      const timeToFirstTokenMs = positiveRunMetric(obj.time_to_first_token_ms);
+      if (inputTokens != null) next.inputTokens = inputTokens;
+      if (outputTokens != null) next.outputTokens = outputTokens;
+      if (totalTokens != null) next.totalTokens = totalTokens;
+      if (durationMs != null) next.durationMs = durationMs;
+      if (timeToFirstTokenMs != null) {
+        next.timeToFirstTokenMs = timeToFirstTokenMs;
+        firstTokenMs = timeToFirstTokenMs;
+      } else if (firstTokenMs != null) {
+        next.timeToFirstTokenMs = firstTokenMs;
+      }
+      if (Object.keys(next).length === 0) return;
+      setStreamingRunMetrics((prev) => ({ ...(prev ?? {}), ...next }));
+    };
+    const markFirstStreamingToken = () => {
+      if (firstTokenMs != null) return;
+      firstTokenMs = Math.max(1, Date.now() - streamStartedAt);
+      setStreamingRunMetrics((prev) => ({
+        ...(prev ?? {}),
+        timeToFirstTokenMs: firstTokenMs,
+      }));
+    };
+    const absorbConversationId = (payload: unknown) => {
+      const obj = asRecord(payload);
+      const cid = str(
+        obj.conversation_id,
+        str(obj.cid, str(obj.conversationId, "")),
+      );
+      const runId = str(obj.run_id, "");
+      if (cid) {
+        resolvedConversationId = cid;
+        setPendingRunSnapshot((prev) => {
+          const base = prev ?? initialPendingSnapshot;
+          const next = {
+            ...base,
+            conversationId: cid,
+            ...(runId ? { runId } : {}),
+          };
+          if (
+            prev &&
+            next.conversationId === base.conversationId &&
+            next.runId === base.runId
+          ) {
+            return prev;
+          }
+          scheduleChatPendingRunSnapshotStore(next);
+          return next;
+        });
+        if (!conversationIdRef.current) {
+          setConversationPage(0);
+          setConversationId(cid);
+        }
+        return;
+      }
+      if (runId) {
+        setPendingRunSnapshot((prev) => {
+          const base = prev ?? initialPendingSnapshot;
+          const next = { ...base, runId };
+          if (prev && next.runId === base.runId) {
+            return prev;
+          }
+          scheduleChatPendingRunSnapshotStore(next);
+          return next;
+        });
+      }
+    };
+    const handlePlanStreamEvent = (eventName: string, payload: unknown) => {
+      recordRunEventSeq(payload);
+      absorbConversationId(payload);
+      if (eventName === "run_status") {
+        absorbRunMetrics(payload);
+        const runStatusStep = buildRunStatusActivityStep(payload);
+        if (runStatusStep) pushStreamingStep(runStatusStep);
+        return;
+      }
+      if (
+        eventName === "plan_generated" ||
+        eventName === "plan_revised" ||
+        eventName === "plan_step_update" ||
+        eventName === "plan_unavailable" ||
+        eventName === "plan_ready_for_confirmation"
+      ) {
+        const planPayload = asRecord(payload);
+        if (Object.keys(planPayload).length > 0) {
+          pushStreamingStep(planPayload);
+        }
+      }
+    };
+
+    try {
+      if (!isResumeMode && files.length > 0) {
+        setChatNotice(
+          `Indexing ${files.length} attachment${files.length === 1 ? "" : "s"}...`,
+        );
+        const uploaded = await uploadAttachmentsForKnowledge(files);
+        attachmentPayloads = [
+          ...uploaded.documents.map((item) => ({
+            document_id: item.id,
+            kind: "document",
+            content_type: "application/octet-stream",
+          })),
+          ...uploaded.visuals.map((item) => ({
+            upload_id: item.id,
+            kind: "visual",
+            content_type: item.contentType || "image",
+          })),
+        ];
+        if (attachmentPayloads.length > 0) {
+          const totalUploaded =
+            uploaded.documents.length + uploaded.visuals.length;
+          setChatNotice(
+            `Prepared ${totalUploaded} attachment${totalUploaded === 1 ? "" : "s"} for this request.`,
+          );
+        }
+      }
+      await (isResumeMode
+        ? api.resumeChatTaskStream(
+            resumeTaskId,
+            planOverride
+              ? { plan_override: planOverride as Record<string, unknown> }
+              : undefined,
+            {
+              signal: abortController.signal,
+              onOpen: () => setLiveRunStreamOpenNow(true),
+              onEvent: handlePlanStreamEvent,
+              onToken: (token) => {
+                markFirstStreamingToken();
+                latestStreamingResponse += token;
+                appendStreamingToken(token);
+              },
+              onThinking: (step) => {
+                absorbConversationId(step);
+                handleStreamThinking(step);
+              },
+              onToolStart: handleStreamToolStart,
+              onToolResult: handleStreamToolResult,
+              onToolProgress: handleStreamToolProgress,
+              onTaskStarted: (payload) => {
+                const taskId = str(payload.task_id, "");
+                const description = str(payload.description, "Task");
+                if (!taskId) return;
+                activeChatTaskIdRef.current = taskId;
+                setPendingRunSnapshot((prev) => {
+                  const next = {
+                    ...(prev ?? initialPendingSnapshot),
+                    taskId,
+                    mode: (isResumeMode
+                      ? "resume"
+                      : "fresh") as ChatPendingRunMode,
+                    phase:
+                      prev?.phase === "awaiting_confirmation"
+                        ? ("awaiting_confirmation" as ChatPendingRunPhase)
+                        : ("running" as ChatPendingRunPhase),
+                  };
+                  storeChatPendingRunSnapshotNow(next);
+                  return next;
+                });
+                setChatNotice(`Task started: ${description}`);
+                void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+                void queryClient.invalidateQueries({
+                  queryKey: ["tasks-manager"],
+                });
+                void queryClient.invalidateQueries({
+                  queryKey: ["swarm-status"],
+                });
+                void queryClient.invalidateQueries({
+                  queryKey: ["swarm-agents"],
+                });
+                void queryClient.invalidateQueries({
+                  queryKey: ["swarm-delegations"],
+                });
+              },
+              onTaskStatus: (payload) => {
+                const taskId = str(payload.task_id, "");
+                const description = str(payload.description, "Task");
+                const status = str(payload.status, "");
+                if (!taskId || !status) return;
+                const statusLabel =
+                  status === "completed"
+                    ? "completed"
+                    : status === "failed"
+                      ? "failed"
+                      : status === "paused"
+                        ? "paused"
+                        : status === "awaiting_approval"
+                          ? "awaiting approval"
+                          : status.replace(/_/g, " ");
+                setChatNotice(`Task ${statusLabel}: ${description}`);
+                if (
+                  (status === "paused" || status === "awaiting_approval") &&
+                  (deepResearch ||
+                    Boolean(planOverride) ||
+                    !!str(planConfirmation?.source, "").trim())
+                ) {
+                  markPendingRunAwaitingPlanConfirmation(taskId);
+                }
+                void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+                void queryClient.invalidateQueries({
+                  queryKey: ["tasks-manager"],
+                });
+                void queryClient.invalidateQueries({
+                  queryKey: ["swarm-status"],
+                });
+                void queryClient.invalidateQueries({
+                  queryKey: ["swarm-agents"],
+                });
+                void queryClient.invalidateQueries({
+                  queryKey: ["swarm-delegations"],
+                });
+              },
+              onContent: (payload) => {
+                const text = str(payload.content, "");
+                if (text) {
+                  latestStreamingResponse = text;
+                  setStreamingResponseNow(text);
+                }
+                setStreamingResponseChoices(clarificationChoices(payload.choices));
+                absorbRunMetrics(payload);
+                absorbConversationId(payload);
+              },
+              onError: (messageText) => {
+                streamError = normalizeChatError(messageText);
+              },
+            },
+          )
+        : api.chatStream(
+            {
+              message: payloadMessage,
+              channel: "web",
+              conversation_id: targetConversationId || undefined,
+              project_id: targetProjectId || undefined,
+              deep_research: deepResearch,
+              plan_confirmation_mode: deepResearch
+                ? "before_execution"
+                : undefined,
+              execution_mode: executionMode,
+              attachments_present: attachmentPayloads.length > 0,
+              attachments: attachmentPayloads,
+            },
+            {
+              signal: abortController.signal,
+              onOpen: () => setLiveRunStreamOpenNow(true),
+              onEvent: handlePlanStreamEvent,
+              onToken: (token) => {
+                markFirstStreamingToken();
+                latestStreamingResponse += token;
+                appendStreamingToken(token);
+              },
+              onThinking: (step) => {
+                absorbConversationId(step);
+                handleStreamThinking(step);
+              },
+              onToolStart: handleStreamToolStart,
+              onToolResult: handleStreamToolResult,
+              onToolProgress: handleStreamToolProgress,
+              onTaskStarted: (payload) => {
+                const taskId = str(payload.task_id, "");
+                const description = str(payload.description, "Task");
+                if (!taskId) return;
+                activeChatTaskIdRef.current = taskId;
+                setPendingRunSnapshot((prev) => {
+                  const next = {
+                    ...(prev ?? initialPendingSnapshot),
+                    taskId,
+                    mode: "fresh" as ChatPendingRunMode,
+                    phase:
+                      prev?.phase === "awaiting_confirmation"
+                        ? ("awaiting_confirmation" as ChatPendingRunPhase)
+                        : ("running" as ChatPendingRunPhase),
+                  };
+                  storeChatPendingRunSnapshotNow(next);
+                  return next;
+                });
+                setChatNotice(`Task started: ${description}`);
+                void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+                void queryClient.invalidateQueries({
+                  queryKey: ["tasks-manager"],
+                });
+                void queryClient.invalidateQueries({
+                  queryKey: ["swarm-status"],
+                });
+                void queryClient.invalidateQueries({
+                  queryKey: ["swarm-agents"],
+                });
+                void queryClient.invalidateQueries({
+                  queryKey: ["swarm-delegations"],
+                });
+              },
+              onTaskStatus: (payload) => {
+                const taskId = str(payload.task_id, "");
+                const description = str(payload.description, "Task");
+                const status = str(payload.status, "");
+                if (!taskId || !status) return;
+                const statusLabel =
+                  status === "completed"
+                    ? "completed"
+                    : status === "failed"
+                      ? "failed"
+                      : status === "paused"
+                        ? "paused"
+                        : status === "awaiting_approval"
+                          ? "awaiting approval"
+                          : status.replace(/_/g, " ");
+                setChatNotice(`Task ${statusLabel}: ${description}`);
+                if (
+                  (status === "paused" || status === "awaiting_approval") &&
+                  (deepResearch ||
+                    Boolean(planOverride) ||
+                    !!str(planConfirmation?.source, "").trim())
+                ) {
+                  markPendingRunAwaitingPlanConfirmation(taskId);
+                }
+                void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+                void queryClient.invalidateQueries({
+                  queryKey: ["tasks-manager"],
+                });
+                void queryClient.invalidateQueries({
+                  queryKey: ["swarm-status"],
+                });
+                void queryClient.invalidateQueries({
+                  queryKey: ["swarm-agents"],
+                });
+                void queryClient.invalidateQueries({
+                  queryKey: ["swarm-delegations"],
+                });
+              },
+              onContent: (payload) => {
+                const text = str(payload.content, "");
+                if (text) {
+                  latestStreamingResponse = text;
+                  setStreamingResponseNow(text);
+                }
+                setStreamingResponseChoices(clarificationChoices(payload.choices));
+                absorbRunMetrics(payload);
+                absorbConversationId(payload);
+              },
+              onError: (messageText) => {
+                streamError = normalizeChatError(messageText);
+              },
+            },
+          ));
+    } catch (err) {
+      const detachedAbort =
+        backgroundDetachGenerationsRef.current.has(streamGeneration);
+      const aborted =
+        (stopRequestedRef.current || detachedAbort) &&
+        ((err instanceof DOMException && err.name === "AbortError") ||
+          errMessage(err).toLowerCase().includes("abort"));
+      if (!aborted) {
+        streamError = normalizeChatError(errMessage(err));
+      }
+    } finally {
+      const detachedToBackground =
+        backgroundDetachGenerationsRef.current.has(streamGeneration);
+      if (detachedToBackground) {
+        backgroundDetachGenerationsRef.current.delete(streamGeneration);
+      }
+      const isCurrentStreamGeneration =
+        streamGenerationRef.current === streamGeneration;
+      const wasStopped = stopRequestedRef.current && !streamError;
+      const finalTaskId = activeChatTaskIdRef.current || resumeTaskId || "";
+      const completedStreamingSteps = trimTrailingHeartbeatSteps(
+        streamingStepsRef.current,
+      );
+      const latestRunStatusFromStream = extractLatestRunStatusSummary(
+        completedStreamingSteps,
+      );
+      const hadUsablePlanInStream =
+        completedStreamingSteps.some((step) => {
+          const stepType = str(step.step_type, "").trim().toLowerCase();
+          return (
+            stepType === "plan_generated" ||
+            stepType === "plan_revised" ||
+            stepType === "plan_ready_for_confirmation" ||
+            stepType === "plan_step_update"
+          );
+        }) || !!extractExecutionPlanFromTraceSteps(completedStreamingSteps);
+      const explicitPlanningFailure = extractExecutionPlanFailureFromTraceSteps(
+        completedStreamingSteps,
+      ).trim();
+      const terminalPlanningFailure =
+        !detachedToBackground &&
+        !wasStopped &&
+        deepResearch &&
+        !isResumeMode &&
+        !planOverride &&
+        !hadUsablePlanInStream &&
+        (Boolean(streamError) ||
+          Boolean(explicitPlanningFailure) ||
+          isTerminalDeepResearchFailureStatus(
+            str(latestRunStatusFromStream?.status, ""),
+          ));
+      const terminalPlanningFailureDetail =
+        explicitPlanningFailure ||
+        str(latestRunStatusFromStream?.detail, "").trim() ||
+        streamError ||
+        "Deep research could not prepare a usable plan.";
+      if (streamError) {
+        setChatError(streamError);
+        setPlanConfirmation((prev) => {
+          if (!prev) return prev;
+          if (terminalPlanningFailure) {
+            return null;
+          }
+          if (isResumeMode && planOverride) {
+            return {
+              ...prev,
+              stage: "awaiting_confirmation",
+              editing: false,
+            };
+          }
+          return {
+            ...prev,
+            stage: "failed",
+            editing: false,
+          };
+        });
+        if (!sensitiveMessage && !isResumeMode) {
+          setFailedUserMessage(activeMessage);
+        }
+      } else if (terminalPlanningFailure) {
+        setExecutionPlanFailure(terminalPlanningFailureDetail);
+        setPlanConfirmation(null);
+      }
+      await queryClient.invalidateQueries({ queryKey: ["chat-conversations"] });
+      await queryClient.invalidateQueries({
+        queryKey: ["chat-credential-prompt"],
+      });
+      await queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      await queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
+      await queryClient.invalidateQueries({ queryKey: ["swarm-status"] });
+      await queryClient.invalidateQueries({ queryKey: ["swarm-agents"] });
+      await queryClient.invalidateQueries({ queryKey: ["swarm-delegations"] });
+      if (!detachedToBackground && !streamError && !wasStopped) {
+        setFailedUserMessage(null);
+        if (
+          !!str(planConfirmation?.source, "").trim() &&
+          pendingSnapshotPhase !== "awaiting_confirmation" &&
+          pendingSnapshotPhase !== "interrupted"
+        ) {
+          setPlanConfirmation(null);
+        }
+        const candidateConversationId =
+          resolvedConversationId || targetConversationId;
+        if (candidateConversationId) {
+          try {
+            await api.rawGet(
+              `/conversations/${encodeURIComponent(candidateConversationId)}`,
+            );
+            resolvedConversationId = candidateConversationId;
+          } catch {
+            resolvedConversationId = "";
+          }
+        }
+        if (!resolvedConversationId) {
+          try {
+            const latest = await api.rawGet(
+              withProjectScope("/conversations?limit=1", targetProjectId),
+            );
+            const newest = pickRecords(latest, "conversations")[0];
+            const newestId = str(newest?.id, "");
+            if (newestId) resolvedConversationId = newestId;
+          } catch {
+            // Ignore fallback lookup failures; chat can still be selected manually.
+          }
+        }
+        if (resolvedConversationId) {
+          setConversationPage(0);
+          setConversationId(resolvedConversationId);
+          await queryClient.invalidateQueries({
+            queryKey: ["chat-messages", resolvedConversationId],
+          });
+        }
+      }
+      if (!detachedToBackground && !streamError && !wasStopped)
+        setAttachedFiles([]);
+      if (
+        !detachedToBackground &&
+        !streamError &&
+        !wasStopped &&
+        streamingStepsRef.current.length > 0
+      ) {
+        setLastRunSteps(trimTrailingHeartbeatSteps(streamingStepsRef.current));
+      }
+      if (
+        typeof window !== "undefined" &&
+        opts?.statusSource &&
+        !wasStopped &&
+        !detachedToBackground
+      ) {
+        window.dispatchEvent(
+          new CustomEvent<ChatRunStatusDetail>(CHAT_RUN_STATUS_EVENT, {
+            detail: {
+              conversationId: resolvedConversationId || targetConversationId,
+              source: opts.statusSource,
+              status: streamError ? "error" : "completed",
+              message: streamError
+                ? streamError
+                : "ArkPulse fix completed. Review Chat for the result.",
+            },
+          }),
+        );
+      }
+      if (detachedToBackground) {
+        setFailedUserMessage(null);
+      } else if (wasStopped) {
+        setFailedUserMessage(null);
+        if (finalTaskId) {
+          const interruptedSteps = trimTrailingHeartbeatSteps(
+            streamingStepsRef.current,
+          ).slice(-CHAT_PENDING_STREAM_STEPS_MAX);
+          const interruptedSnapshot: ChatPendingRunSnapshot = {
+            ...initialPendingSnapshot,
+            conversationId: resolvedConversationId || targetConversationId,
+            projectId:
+              targetProjectId || initialPendingSnapshot.projectId || "",
+            runId: str(
+              pendingRunSnapshot?.runId,
+              initialPendingSnapshot.runId || "",
+            ),
+            taskId: finalTaskId,
+            mode: isResumeMode ? "resume" : "fresh",
+            phase: "interrupted",
+            streamingResponse: latestStreamingResponse.slice(
+              0,
+              CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS,
+            ),
+            streamingSteps: interruptedSteps,
+            failedUserMessage: "",
+          };
+          storeChatPendingRunSnapshotNow(interruptedSnapshot);
+          setPendingRunSnapshot(interruptedSnapshot);
+          setPendingUserMessage(null);
+          setStreamingResponseNow(interruptedSnapshot.streamingResponse || "");
+          setStreamingStepsNow(interruptedSteps);
+        } else {
+          storeChatPendingRunSnapshotNow(null);
+          setPendingRunSnapshot(null);
+          setPendingUserMessage(null);
+          setStreamingStepsNow([]);
+          setExecutionPlan(null);
+          setExecutionPlanFailure("");
+          setExecutionPlanExpanded(false);
+          setStreamingResponseNow("");
+        }
+      } else if (streamError || terminalPlanningFailure) {
+        if (streamError && isResumeMode && preservedResumeSnapshot) {
+          const restoredInterruptedSnapshot: ChatPendingRunSnapshot = {
+            ...preservedResumeSnapshot,
+            conversationId: resolvedConversationId || targetConversationId,
+            projectId:
+              targetProjectId || preservedResumeSnapshot.projectId || "",
+            taskId: finalTaskId || preservedResumeSnapshot.taskId || "",
+            phase: "interrupted",
+            streamingResponse: preservedResumeResponse,
+            streamingSteps: preservedResumeSteps,
+          };
+          storeChatPendingRunSnapshotNow(restoredInterruptedSnapshot);
+          setPendingRunSnapshot(restoredInterruptedSnapshot);
+          setPendingUserMessage(null);
+          setStreamingStepsNow(preservedResumeSteps);
+          setExecutionPlan(null);
+          setExecutionPlanFailure("");
+          setExecutionPlanExpanded(false);
+          setStreamingResponseNow(preservedResumeResponse);
+        } else if (streamError && !isResumeMode && !sensitiveMessage) {
+          const interruptedSteps = trimTrailingHeartbeatSteps(
+            streamingStepsRef.current,
+          ).slice(-CHAT_PENDING_STREAM_STEPS_MAX);
+          const activeSnapshot = pendingRunSnapshotRef.current;
+          const interruptedSnapshot: ChatPendingRunSnapshot = {
+            ...initialPendingSnapshot,
+            conversationId:
+              resolvedConversationId ||
+              targetConversationId ||
+              activeSnapshot?.conversationId ||
+              "",
+            projectId:
+              targetProjectId ||
+              activeSnapshot?.projectId ||
+              initialPendingSnapshot.projectId ||
+              "",
+            runId: str(
+              activeSnapshot?.runId,
+              initialPendingSnapshot.runId || "",
+            ),
+            taskId: finalTaskId || activeSnapshot?.taskId || "",
+            mode: "fresh",
+            phase: "interrupted",
+            message: activeMessage,
+            failedUserMessage: activeMessage,
+            streamingResponse: latestStreamingResponse.slice(
+              0,
+              CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS,
+            ),
+            streamingSteps: interruptedSteps,
+            ...(typeof activeSnapshot?.lastRunSeq === "number"
+              ? { lastRunSeq: activeSnapshot.lastRunSeq }
+              : {}),
+          };
+          storeChatPendingRunSnapshotNow(interruptedSnapshot);
+          setPendingRunSnapshot(interruptedSnapshot);
+          setPendingUserMessage(activeMessage);
+          setStreamingStepsNow(interruptedSteps);
+          setExecutionPlan(null);
+          setExecutionPlanFailure("");
+          setExecutionPlanExpanded(false);
+          setStreamingResponseNow(interruptedSnapshot.streamingResponse || "");
+        } else {
+          storeChatPendingRunSnapshotNow(null);
+          setPendingRunSnapshot(null);
+          setPendingUserMessage(null);
+          setStreamingStepsNow([]);
+          setExecutionPlan(null);
+          if (terminalPlanningFailure) {
+            setExecutionPlanFailure(terminalPlanningFailureDetail);
+          } else {
+            setExecutionPlanFailure("");
+          }
+          setExecutionPlanExpanded(false);
+          setStreamingResponseNow("");
+        }
+      }
+      if (isCurrentStreamGeneration) {
+        streamAbortRef.current = null;
+        activeChatTaskIdRef.current = null;
+        stopRequestedRef.current = false;
+        setIsStreaming(false);
+        setLiveRunStreamOpenNow(false);
+        setIsStoppingStream(false);
+        streamLockRef.current = false;
+      }
+    }
+    return !streamError;
+  };
+
+  const reattachRunId = str(pendingRunSnapshot?.runId, "").trim();
+  const reattachConversationId = str(
+    pendingRunSnapshot?.conversationId,
+    "",
+  ).trim();
+  const reattachPhase = str(pendingRunSnapshot?.phase, "").trim().toLowerCase();
+  const reattachTaskId = str(pendingRunSnapshot?.taskId, "").trim();
+
+  useEffect(() => {
+    const runId = reattachRunId;
+    const pendingConversationId = reattachConversationId;
+    if (!runId || !pendingConversationId) return;
+    if (
+      reattachPhase === "interrupted" ||
+      reattachPhase === "awaiting_confirmation"
+    )
+      return;
+    if (!conversationId || conversationId !== pendingConversationId) return;
+    if (isStreaming || streamLockRef.current) return;
+    if (reattachedRunIdRef.current === runId) return;
+
+    reattachedRunIdRef.current = runId;
+    const abortController = new AbortController();
+    let latestStreamingResponse = streamingResponseRef.current;
+    let runCompleted = false;
+    let runInterrupted = false;
+    let recoveredFromLatestRun = false;
+    setLiveRunStreamOpenNow(false);
+    const reattachSinceSeq = Math.max(
+      0,
+      Math.floor(
+        num(
+          pendingRunSnapshotRef.current?.lastRunSeq ??
+            pendingRunSnapshot?.lastRunSeq,
+          0,
+        ),
+      ),
+    );
+
+    const absorbRunPayload = (payload: unknown) => {
+      const obj = asRecord(payload);
+      const cid = str(
+        obj.conversation_id,
+        str(obj.cid, str(obj.conversationId, pendingConversationId)),
+      );
+      const nextRunId = str(obj.run_id, runId);
+      setPendingRunSnapshot((prev) => {
+        const base = prev ??
+          pendingRunSnapshotRef.current ?? {
+            conversationId: cid,
+            message: "",
+            projectId: effectiveProjectId || "",
+            startedAt: Date.now(),
+          };
+        const next = {
+          ...base,
+          conversationId: cid || base.conversationId,
+          runId: nextRunId || base.runId || runId,
+        };
+        if (
+          prev &&
+          next.conversationId === base.conversationId &&
+          next.runId === base.runId
+        ) {
+          return prev;
+        }
+        scheduleChatPendingRunSnapshotStore(next);
+        return next;
+      });
+    };
+
+    const recoverFromLatestRun = async () => {
+      const snapshot =
+        pendingRunSnapshotRef.current &&
+        pendingRunSnapshotRef.current.conversationId === pendingConversationId
+          ? pendingRunSnapshotRef.current
+          : {
+              conversationId: pendingConversationId,
+              message: "",
+              projectId: effectiveProjectId || "",
+              startedAt: Date.now(),
+              runId,
+              phase: "running" as ChatPendingRunPhase,
+              taskId: reattachTaskId,
+              streamingResponse: latestStreamingResponse,
+              streamingSteps: [],
+              failedUserMessage: "",
+            };
+      try {
+        const outcome = await syncPendingRunFromLatestRun(
+          pendingConversationId,
+          snapshot,
+          {
+            expectedRunId: runId,
+            allowTerminalClear: true,
+          },
+        );
+        return outcome !== "none";
+      } catch {
+        return false;
+      }
+    };
+
+    void api
+      .runStream(runId, reattachSinceSeq, {
+        signal: abortController.signal,
+        onOpen: () => setLiveRunStreamOpenNow(true),
+        onEvent: (eventName, payload) => {
+          recordRunEventSeq(payload);
+          absorbRunPayload(payload);
+          if (eventName === "run_status") {
+            const runStatusStep = buildRunStatusActivityStep(payload);
+            if (runStatusStep) pushStreamingStep(runStatusStep);
+            return;
+          }
+          if (
+            eventName === "plan_generated" ||
+            eventName === "plan_revised" ||
+            eventName === "plan_step_update" ||
+            eventName === "plan_unavailable" ||
+            eventName === "plan_ready_for_confirmation"
+          ) {
+            const planPayload = asRecord(payload);
+            if (Object.keys(planPayload).length > 0) {
+              pushStreamingStep(planPayload);
+            }
+          }
+        },
+        onToken: (token) => {
+          latestStreamingResponse += token;
+          appendStreamingToken(token);
+        },
+        onThinking: (step) => {
+          absorbRunPayload(step);
+          handleStreamThinking(step);
+        },
+        onToolStart: (name, payload) =>
+          reattachToolHandlersRef.current.onToolStart(name, payload),
+        onToolResult: (name, content, payload) =>
+          reattachToolHandlersRef.current.onToolResult(name, content, payload),
+        onToolProgress: (name, content, payload) =>
+          reattachToolHandlersRef.current.onToolProgress(
+            name,
+            content,
+            payload,
+          ),
+        onContent: (payload) => {
+          const text = str(payload.content, "");
+          if (text) {
+            latestStreamingResponse = text;
+            setStreamingResponseNow(text);
+          }
+          setStreamingResponseChoices(clarificationChoices(payload.choices));
+          absorbRunPayload(payload);
+        },
+        onError: (messageText) => {
+          if (!abortController.signal.aborted) {
+            runInterrupted = true;
+            const normalizedError = normalizeChatError(messageText);
+            setChatError(normalizedError);
+            const detail = `Chat run could not be reattached: ${normalizedError}`;
+            pushStreamingStep({
+              step_type: "run_status",
+              title: "Run status: interrupted",
+              detail,
+              data: {
+                reason: normalizedError,
+              },
+            });
+            markPendingRunInterrupted(
+              reattachTaskId || str(pendingRunSnapshotRef.current?.taskId, ""),
+              latestStreamingResponse,
+            );
+            setPlanConfirmation((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    stage: "interrupted",
+                    editing: false,
+                  }
+                : prev,
+            );
+          }
+        },
+        onDone: () => {
+          runCompleted = true;
+          clearPendingRunPresentation(
+            trimTrailingHeartbeatSteps(streamingStepsRef.current),
+          );
+          void queryClient.invalidateQueries({
+            queryKey: ["chat-conversations"],
+          });
+          void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+          void queryClient.invalidateQueries({
+            queryKey: ["chat-messages", pendingConversationId],
+          });
+        },
+      })
+      .catch(async (error) => {
+        if (abortController.signal.aborted) return;
+        recoveredFromLatestRun = await recoverFromLatestRun();
+        if (recoveredFromLatestRun) return;
+        runInterrupted = true;
+        const normalizedError = normalizeChatError(errMessage(error));
+        setChatError(normalizedError);
+        pushStreamingStep({
+          step_type: "run_status",
+          title: "Run status: interrupted",
+          detail: `Chat run could not be reattached: ${normalizedError}`,
+          data: {
+            reason: normalizedError,
+          },
+        });
+        markPendingRunInterrupted(
+          reattachTaskId || str(pendingRunSnapshotRef.current?.taskId, ""),
+          latestStreamingResponse,
+        );
+        setPlanConfirmation((prev) =>
+          prev
+            ? {
+                ...prev,
+                stage: "interrupted",
+                editing: false,
+              }
+            : prev,
+        );
+      })
+      .finally(() => {
+        if (!abortController.signal.aborted) {
+          setLiveRunStreamOpenNow(false);
+        }
+        if (!abortController.signal.aborted) {
+          if (!runCompleted && !runInterrupted && !recoveredFromLatestRun) {
+            void recoverFromLatestRun().then((recovered) => {
+              if (recovered) return;
+              const preservedResponse = str(
+                pendingRunSnapshotRef.current?.streamingResponse,
+                "",
+              );
+              if (!latestStreamingResponse && preservedResponse) {
+                setStreamingResponseNow(preservedResponse);
+              }
+            });
+          } else {
+            const preservedResponse = str(
+              pendingRunSnapshotRef.current?.streamingResponse,
+              "",
+            );
+            if (!latestStreamingResponse && preservedResponse) {
+              setStreamingResponseNow(preservedResponse);
+            }
+          }
+        }
+      });
+
+    return () => {
+      abortController.abort();
+      setLiveRunStreamOpenNow(false);
+      if (reattachedRunIdRef.current === runId) {
+        reattachedRunIdRef.current = "";
+      }
+    };
+  }, [
+    reattachRunId,
+    reattachConversationId,
+    reattachPhase,
+    reattachTaskId,
+    conversationId,
+    isStreaming,
+    effectiveProjectId,
+    queryClient,
+  ]);
+
+  const handleStopStreaming = async () => {
+    if (!isStreaming && !streamLockRef.current) return;
+    stopRequestedRef.current = true;
+    setIsStoppingStream(true);
+    setChatError(null);
+    setChatNotice("Stopping...");
+    const activeRunId = str(
+      pendingRunSnapshotRef.current?.runId ?? pendingRunSnapshot?.runId,
+      "",
+    ).trim();
+    const activeTaskId = activeChatTaskIdRef.current;
+    let stopError = "";
+    if (activeRunId) {
+      try {
+        await api.rawPost(`/runs/${encodeURIComponent(activeRunId)}/cancel`, {});
+      } catch (err) {
+        stopError = `run cancel failed: ${errMessage(err)}`;
+      }
+    }
+    streamAbortRef.current?.abort();
+    if (activeTaskId) {
+      try {
+        await api.rawPost(
+          `/tasks/${encodeURIComponent(activeTaskId)}/cancel`,
+          {},
+        );
+        setChatNotice("Stopped.");
+      } catch (err) {
+        const taskError = `task cancel failed: ${errMessage(err)}`;
+        setChatNotice(`Stop requested, but ${stopError || taskError}`);
+      }
+    } else if (stopError) {
+      setChatNotice(`Stop requested, but ${stopError}`);
+    } else {
+      setChatNotice("Stopped.");
+    }
+    void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+    void queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
+    void queryClient.invalidateQueries({ queryKey: ["swarm-status"] });
+    void queryClient.invalidateQueries({ queryKey: ["swarm-agents"] });
+    void queryClient.invalidateQueries({ queryKey: ["swarm-delegations"] });
+  };
+
+  const updatePlanConfirmationDraft = (
+    updater: (draft: PlanConfirmationDraft) => PlanConfirmationDraft,
+  ) => {
+    setPlanConfirmation((prev) => {
+      if (!prev?.draft) return prev;
+      return {
+        ...prev,
+        draft: updater(prev.draft),
+      };
+    });
+  };
+
+  const resetPlanConfirmationDraft = () => {
+    setPlanConfirmation((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        draft: createPlanConfirmationDraft(prev.originalPlan),
+        editing: false,
+      };
+    });
+  };
+
+  const clearPlanConfirmationPreviewState = () => {
+    setPlanConfirmation(null);
+    setExecutionPlan(null);
+    setExecutionPlanFailure("");
+    setExecutionPlanExpanded(false);
+    storeChatPendingRunSnapshotNow(null);
+    setPendingRunSnapshot(null);
+    setPendingUserMessage(null);
+    setFailedUserMessage(null);
+    setStreamingResponseNow("");
+    setStreamingStepsNow([]);
+    setStreamingProgressMessages([]);
+    resetStreamingProgressBubbleState();
+  };
+
+  const handlePlanConfirmationCancel = async () => {
+    const taskId = str(planConfirmation?.taskId, "").trim();
+    if (!taskId) {
+      clearPlanConfirmationPreviewState();
+      return;
+    }
+    try {
+      await api.cancelTask(taskId);
+      setChatNotice(
+        `${planConfirmationDisplayLabel(planConfirmation?.source)} canceled.`,
+      );
+      clearPlanConfirmationPreviewState();
+      await queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      await queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
+      await queryClient.invalidateQueries({ queryKey: ["chat-conversations"] });
+    } catch (err) {
+      setChatError(normalizeChatError(errMessage(err)));
+    }
+  };
+
+  const handlePlanConfirmationStart = async () => {
+    const taskId = str(planConfirmation?.taskId, "").trim();
+    const overridePlan = buildExecutionPlanFromDraft(
+      planConfirmation?.draft ?? null,
+      planConfirmation?.originalPlan ?? null,
+    );
+    const anchorCandidate =
+      planConfirmationMessageIndex >= 0
+        ? str(
+            asRecord(messages[planConfirmationMessageIndex]).id,
+            String(planConfirmationMessageIndex),
+          ).trim()
+        : str(planConfirmation?.messageId, "").trim();
+    if (!taskId || !overridePlan) {
+      setChatError("Select at least one research step before starting.");
+      return;
+    }
+
+    setPlanConfirmation((prev) =>
+      prev
+        ? {
+            ...prev,
+            stage: "running",
+            editing: false,
+            messageId:
+              str(prev.messageId, "").trim() || anchorCandidate || null,
+          }
+        : prev,
+    );
+
+    const ok = await runStreamingChat("", [], {
+      conversationIdOverride: conversationId || undefined,
+      projectIdOverride: effectiveProjectId || undefined,
+      resumeTaskId: taskId,
+      planOverride: overridePlan,
+    });
+
+    if (!ok) {
+      setPlanConfirmation((prev) =>
+        prev
+          ? {
+              ...prev,
+              stage: "awaiting_confirmation",
+            }
+          : prev,
+      );
+    }
+  };
+
+  const submitComposerMessage = async (
+    messageText: string,
+    files: File[] = [],
+  ): Promise<boolean> => {
+    const trimmed = messageText.trim();
+    if (
+      isStreaming ||
+      composerLockedForPlanConfirmation ||
+      (!trimmed && files.length === 0)
+    )
+      return false;
+
+    if (isAwaitingPlanConfirmation) {
+      const pausedTaskId = str(planConfirmation?.taskId, "").trim();
+      if (pausedTaskId) {
+        try {
+          await api.cancelTask(pausedTaskId);
+        } catch {
+          setChatNotice(
+            "Starting a new message, but the earlier paused plan may still remain in Tasks.",
+          );
+        }
+      }
+      clearPlanConfirmationPreviewState();
+      setChatNotice(
+        deepResearchEnabled
+          ? `Updating the ${planConfirmationDisplayLabel(planConfirmation?.source).toLowerCase()}...`
+          : `Discarding the paused ${planConfirmationDisplayLabel(planConfirmation?.source).toLowerCase()} and sending your message...`,
+      );
+    }
+
+    setChatError(null);
+    void runStreamingChat(trimmed, files, {
+      deepResearch: deepResearchEnabled,
+    });
+    return true;
+  };
+
+  useEffect(() => {
+    setSubmittedClarificationChoices({});
+  }, [conversationId]);
+
+  const submitClarificationChoice = async (
+    messageKey: string,
+    submitText: string,
+  ): Promise<void> => {
+    const trimmed = submitText.trim();
+    if (!trimmed || submittedClarificationChoices[messageKey]) return;
+    setSubmittedClarificationChoices((prev) => ({
+      ...prev,
+      [messageKey]: true,
+    }));
+    await submitComposerMessage(trimmed, []);
+  };
+
+  const renderClarificationChoiceGroup = (
+    messageKey: string,
+    choices: ChatClarificationChoice[],
+    forceDisabled = false,
+  ) => {
+    if (choices.length === 0) return null;
+    const disabled =
+      forceDisabled ||
+      isStreaming ||
+      Boolean(submittedClarificationChoices[messageKey]);
+    return (
+      <Stack
+        direction="row"
+        spacing={0.75}
+        useFlexGap
+        sx={{
+          flexWrap: "wrap",
+          mt: 1.25,
+        }}
+      >
+        {choices.map((choice, idx) => (
+          <Button
+            key={`${messageKey}-${choice.submitText}-${idx}`}
+            size="small"
+            variant="outlined"
+            disabled={disabled}
+            onClick={() => {
+              void submitClarificationChoice(messageKey, choice.submitText);
+            }}
+            sx={{
+              borderRadius: 1,
+              textTransform: "none",
+            }}
+          >
+            {choice.label}
+          </Button>
+        ))}
+      </Stack>
+    );
+  };
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handleLaunchRun = (event: Event) => {
+      const detail = (event as CustomEvent<ChatLaunchRunDetail>).detail;
+      if (isStreaming || streamLockRef.current) {
+        detail?.reject?.(
+          "Chat is already busy with another run. Wait for it to finish, then retry this fix.",
+        );
+        return;
+      }
+      const resumeTaskId = str(detail?.taskId, "").trim();
+      const launchMode =
+        !!resumeTaskId || detail?.launchMode === "resume_task"
+          ? "resume_task"
+          : "message";
+      const message = str(detail?.message, "").trim();
+      if (launchMode === "message" && !message) {
+        detail?.reject?.("No message provided.");
+        return;
+      }
+      if (launchMode === "resume_task" && !resumeTaskId) {
+        detail?.reject?.("No resumable task was provided.");
+        return;
+      }
+      detail?.resolve?.(true);
+      void runStreamingChat(launchMode === "resume_task" ? "" : message, [], {
+        conversationIdOverride:
+          str(detail?.conversationId, "").trim() || undefined,
+        projectIdOverride: str(detail?.projectId, "").trim() || undefined,
+        statusSource: str(detail?.source, "").trim() || undefined,
+        resumeTaskId: launchMode === "resume_task" ? resumeTaskId : undefined,
+      }).catch((err) => {
+        if (typeof window !== "undefined" && detail?.source) {
+          window.dispatchEvent(
+            new CustomEvent<ChatRunStatusDetail>(CHAT_RUN_STATUS_EVENT, {
+              detail: {
+                conversationId: str(detail?.conversationId, "").trim(),
+                source: detail.source,
+                status: "error",
+                message: errMessage(err),
+              },
+            }),
+          );
+        }
+      });
+    };
+    window.addEventListener(
+      CHAT_LAUNCH_RUN_EVENT,
+      handleLaunchRun as EventListener,
+    );
+    return () => {
+      window.removeEventListener(
+        CHAT_LAUNCH_RUN_EVENT,
+        handleLaunchRun as EventListener,
+      );
+    };
+  }, [isStreaming, runStreamingChat]);
+
+  useEffect(() => {
+    if (!isActive || isStreaming || streamLockRef.current) return;
+    const pendingLaunch = loadChatPendingLaunch();
+    if (!pendingLaunch) return;
+    storeChatPendingLaunch(null);
+    void runStreamingChat(
+      pendingLaunch.launchMode === "resume_task"
+        ? ""
+        : str(pendingLaunch.message, ""),
+      [],
+      {
+        conversationIdOverride:
+          str(pendingLaunch.conversationId, "").trim() || undefined,
+        projectIdOverride: str(pendingLaunch.projectId, "").trim() || undefined,
+        statusSource: str(pendingLaunch.source, "").trim() || undefined,
+        resumeTaskId:
+          pendingLaunch.launchMode === "resume_task"
+            ? str(pendingLaunch.taskId, "").trim() || undefined
+            : undefined,
+      },
+    ).catch(() => {
+      // The normal chat error UI will surface the failure.
+    });
+  }, [isActive, isStreaming, runStreamingChat]);
+
+  // Pin scroll to bottom during streaming - useLayoutEffect runs before paint
+  // so the user never sees the intermediate jank position.
+  const stickToBottom = useRef(true);
+  useLayoutEffect(() => {
+    const thread = threadRef.current;
+    if (!thread) return;
+    if (stickToBottom.current) {
+      thread.scrollTop = thread.scrollHeight;
+    }
+  }, [
+    messages.length,
+    pendingUserMessage,
+    failedUserMessage,
+    Math.floor(streamingResponse.length / 36),
+    streamingProgressMessages.length,
+    isStreaming,
+  ]);
+  // Track whether user is near bottom to decide if we should auto-stick
+  useEffect(() => {
+    const thread = threadRef.current;
+    if (!thread) return;
+    const onScroll = () => {
+      const nearBottom =
+        thread.scrollHeight - thread.scrollTop - thread.clientHeight < 80;
+      stickToBottom.current = nearBottom;
+    };
+    thread.addEventListener("scroll", onScroll, { passive: true });
+    return () => thread.removeEventListener("scroll", onScroll);
+  }, []);
+
+  useEffect(() => {
+    if (!pendingUserMessage) return;
+    if (isStreaming) return;
+    const pendingNormalized =
+      stripAttachmentContextMarker(pendingUserMessage).trim();
+    if (!pendingNormalized) {
+      setPendingUserMessage(null);
+    }
+  }, [pendingUserMessage, isStreaming]);
+
+  useEffect(() => {
+    if (!chatNotice) return;
+    const timer = window.setTimeout(() => setChatNotice(null), 2200);
+    return () => window.clearTimeout(timer);
+  }, [chatNotice]);
+
+  const pendingSnapshotPhase =
+    pendingRunSnapshot?.phase === "interrupted"
+      ? "interrupted"
+      : pendingRunSnapshot?.phase === "awaiting_confirmation"
+        ? "awaiting_confirmation"
+        : "running";
+  const pendingSnapshotMode =
+    pendingRunSnapshot?.mode === "resume" ? "resume" : "fresh";
+  const hasFocusedDraftStream =
+    !conversationId &&
+    pendingSnapshotMode === "fresh" &&
+    pendingSnapshotPhase === "running" &&
+    Boolean(pendingRunSnapshot) &&
+    (isStreaming ||
+      !!pendingUserMessage ||
+      !!streamingResponse.trim() ||
+      streamingProgressMessages.length > 0 ||
+      streamingSteps.length > 0);
+  const hasFocusedDraftInterruptedRun =
+    !conversationId &&
+    pendingSnapshotMode === "fresh" &&
+    pendingSnapshotPhase === "interrupted" &&
+    Boolean(pendingRunSnapshot) &&
+    (!!pendingUserMessage ||
+      !!failedUserMessage ||
+      !!str(pendingRunSnapshot?.message, "").trim() ||
+      !!str(pendingRunSnapshot?.failedUserMessage, "").trim() ||
+      !!streamingResponse.trim() ||
+      streamingSteps.length > 0);
+  const hasLivePendingThread =
+    hasPendingSnapshotForConversation ||
+    hasFocusedDraftStream ||
+    hasFocusedDraftInterruptedRun;
+  const hasRecoveredStream =
+    !isStreamingForCurrentConversation &&
+    hasPendingSnapshotForConversation &&
+    pendingSnapshotPhase === "running";
+  const showInterruptedRunCard =
+    (hasPendingSnapshotForConversation || hasFocusedDraftInterruptedRun) &&
+    pendingSnapshotPhase === "interrupted" &&
+    !isStreamingForCurrentConversation;
+  // Track the messages count when streaming started so we can detect when the
+  // final assistant message has actually landed in the messages list.
+  const streamStartMsgCount = useRef(messages.length);
+  const prevIsStreaming = useRef(false);
+  if (isStreamingForCurrentConversation && !prevIsStreaming.current) {
+    streamStartMsgCount.current = messages.length;
+  }
+  prevIsStreaming.current = isStreamingForCurrentConversation;
+  // The final message has arrived if messages grew AND the latest is from assistant
+  const lastMsg = messages[messages.length - 1];
+  const finalMessageLanded =
+    !isStreamingForCurrentConversation &&
+    messages.length > streamStartMsgCount.current &&
+    str(lastMsg?.role, "").toLowerCase() === "assistant";
+  // Show streaming bubble while streaming OR while waiting for final message to land
+  const showStreamingAssistant =
+    isStreamingForCurrentConversation ||
+    hasFocusedDraftStream ||
+    (hasRecoveredStream && !finalMessageLanded);
+  useEffect(() => {
+    if (
+      !hasPendingSnapshotForConversation ||
+      pendingSnapshotPhase !== "running" ||
+      !finalMessageLanded
+    ) {
+      return;
+    }
+    const pendingSteps =
+      streamingStepsRef.current.length > 0
+        ? trimTrailingHeartbeatSteps(streamingStepsRef.current)
+        : trimTrailingHeartbeatSteps(streamingSteps);
+    const restoredPlan =
+      executionPlan ?? extractExecutionPlanFromTraceSteps(pendingSteps);
+    if (
+      shouldKeepPlanInApprovalState(
+        restoredPlan,
+        pendingSteps,
+        pendingSnapshotMode,
+      )
+    ) {
+      markPendingRunAwaitingPlanConfirmation(
+        str(pendingRunSnapshot?.taskId, "").trim(),
+      );
+      return;
+    }
+    storeChatPendingRunSnapshotNow(null);
+    setPendingRunSnapshot(null);
+    setPendingUserMessage(null);
+    setFailedUserMessage(null);
+    setStreamingResponseNow("");
+    setStreamingStepsNow([]);
+    setStreamingProgressMessages([]);
+    resetStreamingProgressBubbleState();
+    setPlanConfirmation((prev) =>
+      prev?.stage === "running"
+        ? {
+            ...prev,
+            stage: "completed",
+            editing: false,
+          }
+        : prev,
+    );
+  }, [
+    executionPlan,
+    finalMessageLanded,
+    hasPendingSnapshotForConversation,
+    lastMsg,
+    pendingRunSnapshot?.taskId,
+    pendingSnapshotMode,
+    pendingSnapshotPhase,
+    streamingSteps,
+    resetStreamingProgressBubbleState,
+  ]);
+  const visiblePendingUserMessage =
+    hasLivePendingThread &&
+    pendingSnapshotMode === "fresh" &&
+    (pendingSnapshotPhase === "running" ||
+      pendingSnapshotPhase === "interrupted")
+      ? pendingUserMessage ||
+        str(pendingRunSnapshot?.message, "").trim() ||
+        str(pendingRunSnapshot?.failedUserMessage, "").trim() ||
+        null
+      : null;
+  const pendingUserMessageAccepted =
+    pendingSnapshotPhase === "interrupted" ||
+    Boolean(str(pendingRunSnapshot?.runId, "").trim()) ||
+    streamingSteps.length > 0 ||
+    streamingProgressMessages.length > 0 ||
+    streamingResponse.trim().length > 0;
+  const pendingUserMessageLabel = pendingUserMessageAccepted
+    ? "You"
+    : "You | sending...";
+  const pendingSnapshotStartedAt = pendingRunSnapshot?.startedAt ?? 0;
+  const pendingSnapshotInitialMessageCount =
+    typeof pendingRunSnapshot?.initialMessageCount === "number" &&
+    Number.isFinite(pendingRunSnapshot.initialMessageCount)
+      ? Math.max(0, Math.floor(pendingRunSnapshot.initialMessageCount))
+      : null;
+  const latestPendingUserMessageIndex = useMemo(() => {
+    if (!hasLivePendingThread) return -1;
+    if (
+      pendingSnapshotInitialMessageCount !== null &&
+      pendingSnapshotInitialMessageCount < messages.length
+    ) {
+      for (
+        let idx = messages.length - 1;
+        idx >= pendingSnapshotInitialMessageCount;
+        idx -= 1
+      ) {
+        const candidate = asRecord(messages[idx]);
+        if (str(candidate.role, "").toLowerCase() === "user") {
+          return idx;
+        }
+      }
+    }
+    if (pendingSnapshotStartedAt <= 0) return -1;
+    for (let idx = messages.length - 1; idx >= 0; idx -= 1) {
+      const candidate = asRecord(messages[idx]);
+      if (str(candidate.role, "").toLowerCase() !== "user") continue;
+      const tsMs = Date.parse(str(candidate.timestamp, ""));
+      if (!Number.isFinite(tsMs)) continue;
+      if (tsMs + 1000 < pendingSnapshotStartedAt) continue;
+      return idx;
+    }
+    return -1;
+  }, [
+    hasLivePendingThread,
+    messages,
+    pendingSnapshotInitialMessageCount,
+    pendingSnapshotStartedAt,
+  ]);
+  const pendingUserMessageAlreadyPersisted = latestPendingUserMessageIndex !== -1;
+  const visibleFailedUserMessage =
+    !pendingUserMessageAlreadyPersisted &&
+    !hasPendingSnapshotForConversation &&
+    !conversationId &&
+    !isStreaming &&
+    !!failedUserMessage &&
+    messages.length === 0
+      ? failedUserMessage
+      : null;
+  useEffect(() => {
+    if (!pendingUserMessageAlreadyPersisted) return;
+    if (pendingUserMessage) {
+      setPendingUserMessage(null);
+    }
+    if (failedUserMessage) {
+      setFailedUserMessage(null);
+    }
+    if (pendingRunSnapshot?.message || pendingRunSnapshot?.failedUserMessage) {
+      setPendingRunSnapshot((prev) => {
+        if (!prev) return prev;
+        const next = {
+          ...prev,
+          message: "",
+          failedUserMessage: "",
+        };
+        storeChatPendingRunSnapshotNow(next);
+        return next;
+      });
+    }
+  }, [
+    failedUserMessage,
+    pendingRunSnapshot?.failedUserMessage,
+    pendingRunSnapshot?.message,
+    pendingUserMessage,
+    pendingUserMessageAlreadyPersisted,
+  ]);
+  const visibleStreamingResponse = hasLivePendingThread
+    ? streamingResponse
+    : "";
+  const interruptedRunDetail = useMemo(
+    () =>
+      interruptedRunDetailFromSteps(
+        trimTrailingHeartbeatSteps(
+          streamingSteps.length > 0
+            ? streamingSteps
+            : (pendingRunSnapshot?.streamingSteps ?? []),
+        ),
+      ),
+    [pendingRunSnapshot?.streamingSteps, streamingSteps],
+  );
+  const streamingResearchReport = showStreamingAssistant
+    ? parseResearchReport(visibleStreamingResponse)
+    : null;
+  const streamingResearchPrompt =
+    visiblePendingUserMessage ||
+    (() => {
+      for (let cursor = messages.length - 1; cursor >= 0; cursor -= 1) {
+        const candidate = asRecord(messages[cursor]);
+        if (str(candidate.role, "").toLowerCase() !== "user") continue;
+        return stripAttachmentContextMarker(str(candidate.content, ""));
+      }
+      return "";
+    })();
+  const completedProgressSnapshot =
+    !hasPendingSnapshotForConversation && conversationId
+      ? completedProgressMessagesByConversation[conversationId] || null
+      : null;
+  const suppressInChatPlanInterimUpdates =
+    planConfirmation?.stage === "awaiting_confirmation" ||
+    planConfirmation?.stage === "running" ||
+    planConfirmation?.stage === "completed" ||
+    planConfirmation?.stage === "interrupted";
+  const visibleStreamingProgressMessages = hasLivePendingThread
+    ? suppressInChatPlanInterimUpdates
+      ? []
+      : streamingProgressMessages
+    : completedProgressSnapshot?.messages || [];
+  const completedProgressBeforeMessageId =
+    completedProgressSnapshot?.beforeMessageId || "";
+  const latestStreamingAssistantIndex = useMemo(() => {
+    if (!showStreamingAssistant || pendingSnapshotStartedAt <= 0) return -1;
+    for (let idx = messages.length - 1; idx >= 0; idx -= 1) {
+      const candidate = asRecord(messages[idx]);
+      if (str(candidate.role, "").toLowerCase() !== "assistant") continue;
+      const tsMs = Date.parse(str(candidate.timestamp, ""));
+      if (Number.isFinite(tsMs) && tsMs + 1000 < pendingSnapshotStartedAt) {
+        continue;
+      }
+      return idx;
+    }
+    return -1;
+  }, [messages, pendingSnapshotStartedAt, showStreamingAssistant]);
+  const planConfirmationMessageIndex = useMemo(() => {
+    if (!planConfirmation || planConfirmation.stage === "planning") return -1;
+    const anchoredMessageId = str(planConfirmation.messageId, "").trim();
+    if (anchoredMessageId) {
+      for (let idx = messages.length - 1; idx >= 0; idx -= 1) {
+        const candidate = asRecord(messages[idx]);
+        const candidateId = str(candidate.id, String(idx));
+        if (candidateId === anchoredMessageId) return idx;
+      }
+    }
+    const shouldAnchorBeforeRunStart =
+      planConfirmation.stage === "running" ||
+      planConfirmation.stage === "completed" ||
+      planConfirmation.stage === "failed";
+    for (let idx = messages.length - 1; idx >= 0; idx -= 1) {
+      const candidate = asRecord(messages[idx]);
+      if (str(candidate.role, "").toLowerCase() !== "assistant") continue;
+      const tsMs = Date.parse(str(candidate.timestamp, ""));
+      if (Number.isFinite(tsMs) && pendingSnapshotStartedAt > 0) {
+        if (shouldAnchorBeforeRunStart) {
+          if (tsMs > pendingSnapshotStartedAt + 1000) {
+            continue;
+          }
+        } else if (tsMs + 1000 < pendingSnapshotStartedAt) {
+          continue;
+        }
+      }
+      return idx;
+    }
+    return -1;
+  }, [messages, pendingSnapshotStartedAt, planConfirmation]);
+  const hasLiveThreadActivity = Boolean(
+    visiblePendingUserMessage ||
+    visibleFailedUserMessage ||
+    isStreamingForCurrentConversation ||
+    hasLivePendingThread ||
+    visibleStreamingResponse.trim(),
+  );
+  const hasRenderableThread = messages.length > 0 || hasLiveThreadActivity;
+  const showEmptyHero =
+    !hasRenderableThread &&
+    !showStreamingAssistant &&
+    !visiblePendingUserMessage &&
+    !visibleFailedUserMessage;
+  const shouldInlineCompletedProgressBeforeAssistant =
+    !showStreamingAssistant &&
+    visibleStreamingProgressMessages.length > 0 &&
+    !!completedProgressBeforeMessageId;
+  const renderAgentAvatar = (extraClassName = "") => (
+    <Avatar
+      variant="rounded"
+      className={`chat-avatar chat-avatar-agent${extraClassName ? ` ${extraClassName}` : ""}`}
+      sx={{ width: 44, height: 44 }}
+    >
+      <Box
+        component="img"
+        src={AgentLogo}
+        alt="AgentArk"
+        className="chat-avatar-agent-logo"
+      />
+    </Avatar>
+  );
+  const renderUserAvatar = (extraClassName = "") => (
+    <Avatar
+      className={`chat-avatar chat-avatar-user${extraClassName ? ` ${extraClassName}` : ""}`}
+      sx={{ width: 38, height: 38 }}
+    >
+      <Box className="chat-avatar-user-shell">
+        <UserRound className="chat-avatar-user-icon" aria-hidden="true" />
+        <Sparkles className="chat-avatar-user-accent" aria-hidden="true" />
+      </Box>
+    </Avatar>
+  );
+  const renderProgressRows = (_keyPrefix: string) => null;
+  const origin = typeof window !== "undefined" ? window.location.origin : "";
+  const latestAssistantMessageText = str(
+    [...messages]
+      .reverse()
+      .find((m) => str(m.role, "").toLowerCase() === "assistant")?.content,
+    "",
+  );
+  const workspaceSnippetFiles = useMemo(
+    () => buildWorkspaceSnippetFiles(messages),
+    [messages],
+  );
+  useEffect(() => {
+    if (!selectedSnippetId) return;
+    if (
+      workspaceSnippetFiles.some((snippet) => snippet.id === selectedSnippetId)
+    )
+      return;
+    setSelectedSnippetId(null);
+  }, [selectedSnippetId, workspaceSnippetFiles]);
+  // Keep this callback stable so messageRenderBundle memoization only busts
+  // when message data changes.
+  const openCodePreviewInWorkspace = useCallback(
+    (request: CodePreviewOpenRequest) => {
+      setWorkspaceOpen(true);
+      if (request.snippetId) {
+        setSelectedSnippetId(request.snippetId);
+        return;
+      }
+      setSelectedSnippetId(null);
+    },
+    [],
+  );
+  const messageRenderBundle = useMemo(() => {
+    let firstChoicesSeen = false;
+    return messages.map((raw, idx) => {
+      const message = asRecord(raw);
+      const role = str(message.role, "").toLowerCase();
+      const isUser = role === "user";
+      const isAssistant = role === "assistant";
+      const messageId = str(message.id, String(idx));
+      const tsRaw = str(message.timestamp, "");
+      const ts = tsRaw ? formatChatTimestamp(tsRaw) : null;
+      const content = str(message.content);
+      const renderedContent = isUser
+        ? stripAttachmentContextMarker(content)
+        : content;
+      const attachments = isUser ? extractChatTurnAttachments(content) : [];
+      const rawMessageChoices = isAssistant
+        ? clarificationChoices(message.choices)
+        : [];
+      // Only render choice buttons on the FIRST assistant message in the
+      // thread that carries choices from the original clarification. Choices
+      // attached to later assistant messages (e.g., via over-permissive
+      // trace_id persistence) are treated as stale and suppressed.
+      let messageChoices: ChatClarificationChoice[] = [];
+      if (rawMessageChoices.length > 0 && !firstChoicesSeen) {
+        messageChoices = rawMessageChoices;
+        firstChoicesSeen = true;
+      }
+      const researchReport = isAssistant
+        ? parseResearchReport(renderedContent)
+        : null;
+      const previousUserPrompt = previousUserPromptByIndex.get(idx) || "";
+      const traceId = str(message.trace_id, "").trim();
+      const hasTrace = !isUser && !!traceId;
+      const messageInputTokens = !isUser ? num(message.input_tokens, 0) : 0;
+      const messageOutputTokens = !isUser ? num(message.output_tokens, 0) : 0;
+      const messageTotalTokens = !isUser ? num(message.total_tokens, 0) : 0;
+      const messageDurationMs = !isUser ? num(message.duration_ms, 0) : 0;
+      const messageTimeToFirstTokenMs = !isUser
+        ? num(message.time_to_first_token_ms, 0)
+        : 0;
+      const markdownNode =
+        !isUser && !researchReport
+          ? renderChatMarkdown(renderedContent, {
+              snippetNamespace: messageId,
+              onOpenSnippet: openCodePreviewInWorkspace,
+            })
+          : null;
+      return {
+        message,
+        idx,
+        messageId,
+        role,
+        isUser,
+        isAssistant,
+        tsRaw,
+        ts,
+        renderedContent,
+        attachments,
+        messageChoices,
+        researchReport,
+        previousUserPrompt,
+        traceId,
+        hasTrace,
+        messageInputTokens,
+        messageOutputTokens,
+        messageTotalTokens,
+        messageDurationMs,
+        messageTimeToFirstTokenMs,
+        markdownNode,
+      };
+    });
+  }, [messages, previousUserPromptByIndex, openCodePreviewInWorkspace]);
+  const latestAssistantTraceSteps = latestAssistantTraceId
+    ? traceStepsById[latestAssistantTraceId] || []
+    : [];
+  const completedLastRunSteps = trimTrailingHeartbeatSteps(lastRunSteps);
+  const completedPersistedTraceSteps = trimTrailingHeartbeatSteps(
+    latestAssistantTraceSteps,
+  );
+  const persistedExecutionPlan = useMemo(
+    () =>
+      showStreamingAssistant || hasPendingSnapshotForConversation
+        ? null
+        : extractExecutionPlanFromTraceSteps(completedPersistedTraceSteps),
+    [
+      showStreamingAssistant,
+      hasPendingSnapshotForConversation,
+      completedPersistedTraceSteps,
+    ],
+  );
+  const persistedExecutionPlanFailure = useMemo(
+    () =>
+      showStreamingAssistant || hasPendingSnapshotForConversation
+        ? ""
+        : extractExecutionPlanFailureFromTraceSteps(
+            completedPersistedTraceSteps,
+          ),
+    [
+      showStreamingAssistant,
+      hasPendingSnapshotForConversation,
+      completedPersistedTraceSteps,
+    ],
+  );
+  const displayedExecutionPlanState = executionPlan ?? persistedExecutionPlan;
+  const displayedExecutionPlan = displayedExecutionPlanState?.steps || [];
+  const displayedExecutionPlanSummary = str(
+    displayedExecutionPlanState?.summary,
+    "",
+  );
+  const displayedExecutionPlanFailure =
+    executionPlanFailure || persistedExecutionPlanFailure;
+  const hasVisibleExecutionPlanContext =
+    displayedExecutionPlan.length > 0 ||
+    !!displayedExecutionPlanFailure ||
+    (planConfirmation?.originalPlan?.steps?.length ?? 0) > 0 ||
+    (persistedExecutionPlan?.steps?.length ?? 0) > 0;
+  const visibleExecutionPlanFailure = hasVisibleExecutionPlanContext
+    ? displayedExecutionPlanFailure
+    : "";
+  const planConfirmationDraftPlan = useMemo(
+    () =>
+      buildExecutionPlanFromDraft(
+        planConfirmation?.draft ?? null,
+        planConfirmation?.originalPlan ?? null,
+      ),
+    [planConfirmation],
+  );
+  const isPlanningDeepResearch = planConfirmation?.stage === "planning";
+  const isAwaitingPlanConfirmation =
+    planConfirmation?.stage === "awaiting_confirmation";
+  const isRunningPlanConfirmation = planConfirmation?.stage === "running";
+  const isCompletedPlanConfirmation = planConfirmation?.stage === "completed";
+  const isFailedPlanConfirmation = planConfirmation?.stage === "failed";
+  const isInterruptedPlanConfirmation =
+    planConfirmation?.stage === "interrupted";
+  const isLivePlanConfirmation =
+    isRunningPlanConfirmation ||
+    isCompletedPlanConfirmation ||
+    isFailedPlanConfirmation ||
+    isInterruptedPlanConfirmation;
+  const activePlanConfirmationState = useMemo(
+    () =>
+      isLivePlanConfirmation
+        ? mergeExecutionPlanProgress(
+            planConfirmationDraftPlan ?? planConfirmation?.originalPlan ?? null,
+            displayedExecutionPlanState,
+          )
+        : null,
+    [
+      displayedExecutionPlanState,
+      isLivePlanConfirmation,
+      planConfirmation,
+      planConfirmationDraftPlan,
+    ],
+  );
+  const showPlanConfirmationCard =
+    isPlanningDeepResearch ||
+    isAwaitingPlanConfirmation ||
+    isRunningPlanConfirmation ||
+    isCompletedPlanConfirmation ||
+    isFailedPlanConfirmation ||
+    isInterruptedPlanConfirmation;
+  const planConfirmationEnabledCount =
+    planConfirmation?.draft?.steps.filter((step) => step.enabled).length ?? 0;
+  const planConfirmationDisabledCount =
+    (planConfirmation?.draft?.steps.length ?? 0) - planConfirmationEnabledCount;
+  const planConfirmationVisibleSteps = planConfirmation?.draft?.steps || [];
+  const planConfirmationSummaryText = str(
+    planConfirmation?.draft?.summary,
+    str(planConfirmation?.originalPlan?.summary, ""),
+  );
+  const planConfirmationDepthCue = isAwaitingPlanConfirmation
+    ? planConfirmationEnabledCount > 0
+      ? `Will expand these ${planConfirmationEnabledCount} approved step${planConfirmationEnabledCount === 1 ? "" : "s"} into live execution after you press Start.`
+      : "Select at least one step to continue."
+    : isRunningPlanConfirmation
+      ? "This is the approved plan. Live substeps and status updates should stay attached here while the run executes."
+      : isCompletedPlanConfirmation
+        ? "This is the approved plan with the final execution progress merged into it."
+        : isFailedPlanConfirmation
+          ? "This is the approved plan with the latest execution state preserved from the failed run."
+          : isInterruptedPlanConfirmation
+            ? "This run was interrupted. The approved plan and the last saved progress are preserved here."
+            : "Preparing a structured execution outline.";
+
+  const applyStarterExample = (example: ChatStarterExample) => {
+    queueComposerPrefill(example.prompt);
+    setDeepResearchEnabled(Boolean(example.deepResearch));
+    setChatError(null);
+    setChatNotice(null);
+  };
+
+  useEffect(() => {
+    if (starterLibraryExpanded) return;
+    setStarterAdvancedExpanded(false);
+  }, [starterLibraryExpanded]);
+
+  useEffect(() => {
+    if (!planConfirmation || planConfirmation.stage === "planning") return;
+    if (str(planConfirmation.messageId, "").trim()) return;
+    if (planConfirmationMessageIndex < 0) return;
+    const candidate = asRecord(messages[planConfirmationMessageIndex]);
+    const candidateId = str(
+      candidate.id,
+      String(planConfirmationMessageIndex),
+    ).trim();
+    if (!candidateId) return;
+    setPlanConfirmation((prev) =>
+      prev && !str(prev.messageId, "").trim()
+        ? {
+            ...prev,
+            messageId: candidateId,
+          }
+        : prev,
+    );
+  }, [messages, planConfirmation, planConfirmationMessageIndex]);
+
+  useEffect(() => {
+    if (executionPlan || streamingSteps.length === 0) return;
+    const restoredPlan = extractExecutionPlanFromTraceSteps(
+      trimTrailingHeartbeatSteps(streamingSteps),
+    );
+    if (!restoredPlan) return;
+    setExecutionPlan(restoredPlan);
+    setExecutionPlanFailure("");
+  }, [executionPlan, streamingSteps]);
+
+  const approvalRepairSourceSteps = useMemo(
+    () =>
+      trimTrailingHeartbeatSteps(
+        streamingSteps.length > 0
+          ? streamingSteps
+          : (pendingRunSnapshot?.streamingSteps ?? []),
+      ),
+    [pendingRunSnapshot?.streamingSteps, streamingSteps],
+  );
+  const shouldRepairApprovalState = useMemo(
+    () =>
+      hasPendingSnapshotForConversation &&
+      pendingSnapshotPhase === "awaiting_confirmation" &&
+      pendingSnapshotMode !== "resume" &&
+      shouldKeepPlanInApprovalState(
+        executionPlan,
+        approvalRepairSourceSteps,
+        pendingSnapshotMode,
+      ),
+    [
+      approvalRepairSourceSteps,
+      executionPlan,
+      hasPendingSnapshotForConversation,
+      pendingSnapshotMode,
+      pendingSnapshotPhase,
+    ],
+  );
+
+  useEffect(() => {
+    if (!shouldRepairApprovalState || !executionPlan) return;
+    const resolvedTaskId = str(pendingRunSnapshot?.taskId, "").trim() || null;
+    if (pendingSnapshotPhase !== "awaiting_confirmation") {
+      markPendingRunAwaitingPlanConfirmation(str(resolvedTaskId, ""));
+    }
+    const needsRepair =
+      !planConfirmation ||
+      planConfirmation.stage !== "awaiting_confirmation" ||
+      !planConfirmation.originalPlan ||
+      !planConfirmation.draft ||
+      (!!resolvedTaskId && planConfirmation.taskId !== resolvedTaskId);
+    if (!needsRepair) return;
+    setPlanConfirmation((prev) => {
+      const nextOriginalPlan = prev?.originalPlan ?? executionPlan;
+      const nextDraft =
+        prev?.draft ?? createPlanConfirmationDraft(nextOriginalPlan);
+      return {
+        stage: "awaiting_confirmation",
+        taskId: str(prev?.taskId, resolvedTaskId || "").trim() || null,
+        source:
+          prev?.source ||
+          extractPlanConfirmationSourceFromSteps(approvalRepairSourceSteps) ||
+          "execution",
+        originalPlan: nextOriginalPlan,
+        draft: nextDraft,
+        editing: false,
+        messageId: prev?.messageId ?? null,
+      };
+    });
+  }, [
+    approvalRepairSourceSteps,
+    executionPlan,
+    pendingRunSnapshot?.taskId,
+    pendingSnapshotPhase,
+    planConfirmation,
+    shouldRepairApprovalState,
+  ]);
+
+  useEffect(() => {
+    if (!executionPlan || pendingSnapshotPhase !== "awaiting_confirmation")
+      return;
+    const resolvedTaskId = str(pendingRunSnapshot?.taskId, "").trim() || null;
+    const inferredSource =
+      planConfirmation?.source ||
+      extractPlanConfirmationSourceFromSteps(approvalRepairSourceSteps) ||
+      "execution";
+    const needsRepair =
+      !planConfirmation ||
+      planConfirmation.stage === "planning" ||
+      !planConfirmation.originalPlan ||
+      !planConfirmation.draft ||
+      (!!resolvedTaskId && planConfirmation.taskId !== resolvedTaskId);
+    if (!needsRepair) return;
+    setPlanConfirmation((prev) => {
+      const nextOriginalPlan = prev?.originalPlan ?? executionPlan;
+      const nextDraft =
+        prev?.draft ?? createPlanConfirmationDraft(nextOriginalPlan);
+      return {
+        stage: "awaiting_confirmation",
+        taskId: str(prev?.taskId, resolvedTaskId || "").trim() || null,
+        source: prev?.source || inferredSource,
+        originalPlan: nextOriginalPlan,
+        draft: nextDraft,
+        editing: false,
+        messageId: prev?.messageId ?? null,
+      };
+    });
+    if (planConfirmation?.stage !== "awaiting_confirmation") {
+      setChatNotice(
+        `${planConfirmationDisplayLabel(inferredSource)} ready. Review it, edit it, or ask for changes below.`,
+      );
+    }
+  }, [
+    approvalRepairSourceSteps,
+    executionPlan,
+    pendingRunSnapshot?.taskId,
+    pendingSnapshotPhase,
+    planConfirmation,
+  ]);
+
+  useEffect(() => {
+    if (
+      !executionPlan ||
+      pendingSnapshotPhase !== "interrupted" ||
+      !hasPendingSnapshotForConversation
+    ) {
+      return;
+    }
+    const resolvedTaskId = str(pendingRunSnapshot?.taskId, "").trim() || null;
+    const needsRepair =
+      !planConfirmation ||
+      planConfirmation.stage !== "interrupted" ||
+      !planConfirmation.originalPlan ||
+      !planConfirmation.draft ||
+      (!!resolvedTaskId && planConfirmation.taskId !== resolvedTaskId);
+    if (!needsRepair) return;
+    setPlanConfirmation((prev) => {
+      const nextOriginalPlan = prev?.originalPlan ?? executionPlan;
+      const nextDraft =
+        prev?.draft ?? createPlanConfirmationDraft(nextOriginalPlan);
+      return {
+        stage: "interrupted",
+        taskId: str(prev?.taskId, resolvedTaskId || "").trim() || null,
+        source:
+          prev?.source ||
+          extractPlanConfirmationSourceFromSteps(approvalRepairSourceSteps) ||
+          "execution",
+        originalPlan: nextOriginalPlan,
+        draft: nextDraft,
+        editing: false,
+        messageId: prev?.messageId ?? null,
+      };
+    });
+  }, [
+    executionPlan,
+    hasPendingSnapshotForConversation,
+    pendingRunSnapshot?.taskId,
+    pendingSnapshotPhase,
+    planConfirmation,
+  ]);
+
+  useEffect(() => {
+    if (
+      !executionPlan ||
+      pendingSnapshotPhase !== "running" ||
+      !hasPendingSnapshotForConversation ||
+      shouldRepairApprovalState
+    ) {
+      return;
+    }
+    const resolvedTaskId = str(pendingRunSnapshot?.taskId, "").trim() || null;
+    const needsRepair =
+      !planConfirmation ||
+      !["running", "completed", "failed"].includes(planConfirmation.stage) ||
+      !planConfirmation.originalPlan ||
+      !planConfirmation.draft ||
+      (!!resolvedTaskId && planConfirmation.taskId !== resolvedTaskId);
+    if (!needsRepair) return;
+    setPlanConfirmation((prev) => {
+      const nextOriginalPlan = prev?.originalPlan ?? executionPlan;
+      return {
+        stage: "running",
+        taskId: str(prev?.taskId, resolvedTaskId || "").trim() || null,
+        source:
+          prev?.source ||
+          extractPlanConfirmationSourceFromSteps(approvalRepairSourceSteps) ||
+          "execution",
+        originalPlan: nextOriginalPlan,
+        draft: createPlanConfirmationDraft(nextOriginalPlan),
+        editing: false,
+        messageId: prev?.messageId ?? null,
+      };
+    });
+  }, [
+    approvalRepairSourceSteps,
+    executionPlan,
+    hasPendingSnapshotForConversation,
+    pendingRunSnapshot?.taskId,
+    pendingSnapshotPhase,
+    planConfirmation,
+    shouldRepairApprovalState,
+  ]);
+
+  const completedWorkspaceSteps =
+    completedPersistedTraceSteps.length >= completedLastRunSteps.length &&
+    completedPersistedTraceSteps.length > 0
+      ? completedPersistedTraceSteps
+      : completedLastRunSteps;
+
+  const workspaceStepsSource =
+    (showStreamingAssistant || hasPendingSnapshotForConversation) &&
+    streamingSteps.length > 0
+      ? trimTrailingHeartbeatSteps(streamingSteps)
+      : completedWorkspaceSteps;
+  const livePlanPhaseStatuses = useMemo(() => {
+    const plan =
+      activePlanConfirmationState ??
+      executionPlan ??
+      persistedExecutionPlan ??
+      null;
+    const activeStep =
+      plan?.steps.find((step) => step.status === "running") || null;
+    if (!activeStep) return [] as StreamPhaseStatus[];
+    const latestByKey = new Map<string, StreamPhaseStatus>();
+    const sourceSteps = trimTrailingHeartbeatSteps(
+      streamingSteps.length > 0 ? streamingSteps : workspaceStepsSource,
+    );
+    for (const step of sourceSteps) {
+      const phaseStatus = extractPhaseStatusFromActivityStep(step);
+      if (!phaseStatus) continue;
+      if (phaseStatus.planStepId && phaseStatus.planStepId !== activeStep.id)
+        continue;
+      if (
+        !phaseStatus.planStepId &&
+        phaseStatus.planStepTitle &&
+        phaseStatus.planStepTitle.trim().toLowerCase() !==
+          activeStep.title.trim().toLowerCase()
+      ) {
+        continue;
+      }
+      latestByKey.set(phaseStatus.streamKey, phaseStatus);
+    }
+    const phaseOrder = [
+      "planning",
+      "searching",
+      "ranking",
+      "reading",
+      "synthesis",
+    ];
+    return Array.from(latestByKey.values()).sort((left, right) => {
+      const leftIndex = phaseOrder.indexOf(left.phase.toLowerCase());
+      const rightIndex = phaseOrder.indexOf(right.phase.toLowerCase());
+      if (leftIndex === rightIndex)
+        return left.label.localeCompare(right.label);
+      if (leftIndex === -1) return 1;
+      if (rightIndex === -1) return -1;
+      return leftIndex - rightIndex;
+    });
+  }, [
+    activePlanConfirmationState,
+    executionPlan,
+    persistedExecutionPlan,
+    streamingSteps,
+    workspaceStepsSource,
+  ]);
+  const restoredPhaseStatus = useMemo(() => {
+    const sourceSteps = trimTrailingHeartbeatSteps(
+      streamingSteps.length > 0 ? streamingSteps : workspaceStepsSource,
+    );
+    const statuses = sourceSteps
+      .map((step) => extractPhaseStatusFromActivityStep(step))
+      .filter((status): status is StreamPhaseStatus => Boolean(status));
+    if (statuses.length === 0) return null;
+    const latestRunning = [...statuses]
+      .reverse()
+      .find((status) => status.status === "running");
+    return latestRunning || statuses[statuses.length - 1];
+  }, [streamingSteps, workspaceStepsSource]);
+  const latestRunStatusSummary = useMemo(
+    () => extractLatestRunStatusSummary(workspaceStepsSource),
+    [workspaceStepsSource],
+  );
+  const deepResearchPlanPreviewMessageId = useMemo(() => {
+    for (let idx = messages.length - 1; idx >= 0; idx -= 1) {
+      const candidate = asRecord(messages[idx]);
+      if (str(candidate.role, "").toLowerCase() !== "assistant") continue;
+      const traceId = str(candidate.trace_id, "").trim();
+      const traceSteps = traceId ? traceStepsById[traceId] || [] : [];
+      if (traceSteps.length === 0) continue;
+      if (!activityStepsRepresentAwaitingPlanConfirmation(traceSteps)) continue;
+      return str(candidate.id, String(idx)).trim() || null;
+    }
+    return null;
+  }, [messages, traceStepsById]);
+  const workspaceSteps = useMemo(() => {
+    const compressed = compressActivitySteps(workspaceStepsSource);
+    if (
+      pendingSnapshotPhase === "awaiting_confirmation" ||
+      planConfirmation?.stage === "awaiting_confirmation"
+    ) {
+      return compressed.filter((step) => !isHeartbeatStreamingStep(step));
+    }
+    return compressed;
+  }, [workspaceStepsSource, pendingSnapshotPhase, planConfirmation?.stage]);
+  const workspaceConsoleSteps = useMemo(() => {
+    const raw = trimTrailingHeartbeatSteps(workspaceStepsSource).map((step) =>
+      normalizeActivityStepTime(normalizePlanStepUpdateStep(step)),
+    );
+    if (
+      pendingSnapshotPhase === "awaiting_confirmation" ||
+      planConfirmation?.stage === "awaiting_confirmation"
+    ) {
+      return raw.filter((step) => !isHeartbeatStreamingStep(step));
+    }
+    return raw;
+  }, [workspaceStepsSource, pendingSnapshotPhase, planConfirmation?.stage]);
+  const hasDeepResearchPlanContext = Boolean(
+    !!str(planConfirmation?.source, "").trim() ||
+    pendingSnapshotPhase === "awaiting_confirmation" ||
+    (displayedExecutionPlan.length > 0 &&
+      (activityStepsHaveExecutionPlanContext(workspaceStepsSource) ||
+        pendingSnapshotPhase === "interrupted")) ||
+    deepResearchPlanPreviewMessageId,
+  );
+  const swarmActivityRuns = useMemo(
+    () =>
+      buildSwarmRunsFromStreamingSteps(workspaceSteps, {
+        interrupted: showInterruptedRunCard,
+      }),
+    [workspaceSteps, showInterruptedRunCard],
+  );
+  const workspaceCards = useMemo(() => {
+    return workspaceSteps.map((step, idx) => safeBuildStepCard(step, idx));
+  }, [workspaceSteps]);
+  const workspaceConsoleCards = useMemo(() => {
+    return workspaceConsoleSteps.map((step, idx) => safeBuildStepCard(step, idx));
+  }, [workspaceConsoleSteps]);
+  const inlineWorkspaceCards = useMemo(() => {
+    if (!showStreamingAssistant && !hasPendingSnapshotForConversation) {
+      return [];
+    }
+    const meaningful = workspaceCards.filter((card) => !card.isHeartbeat);
+    return meaningful.length > 0 ? meaningful : workspaceCards;
+  }, [hasPendingSnapshotForConversation, showStreamingAssistant, workspaceCards]);
+  const expandedTraceCardsById = useMemo(() => {
+    const expanded = new Set<string>();
+    messages.forEach((message, idx) => {
+      const messageId = str(message.id, String(idx));
+      if (!messageTraceOpen[messageId]) return;
+      const traceId = str(message.trace_id, "").trim();
+      if (traceId) expanded.add(traceId);
+    });
+    const out: Record<string, ActivityTimelineCard[]> = {};
+    expanded.forEach((traceId) => {
+      const steps = traceStepsById[traceId] || [];
+      out[traceId] = steps.map((step, idx) => safeBuildStepCard(step, idx));
+    });
+    return out;
+  }, [messages, messageTraceOpen, traceStepsById]);
+  const latestWorkspaceCard = pickPrimaryActivityCard(workspaceCards);
+  const progressRows = useMemo(() => {
+    const seen = new Set<string>();
+    const rows: Array<{
+      label: string;
+      status: "done" | "running" | "update";
+      detail: string;
+      time: string;
+      tone: string;
+    }> = [];
+    for (const row of workspaceCards) {
+      const key = row.label.trim().toLowerCase();
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      const status =
+        row.kind === "Done"
+          ? "done"
+          : row.kind === "Running"
+            ? "running"
+            : "update";
+      rows.push({
+        label: row.label,
+        status,
+        detail: row.summary || row.detail || "",
+        time: row.time || "",
+        tone: row.tone,
+      });
+    }
+    return rows.slice(-16);
+  }, [workspaceCards]);
+
+  const codeFromCards = (() => {
+    for (let i = workspaceCards.length - 1; i >= 0; i -= 1) {
+      const detail = str(
+        workspaceCards[i]?.rawDetailFull,
+        workspaceCards[i]?.detail || "",
+      ).trim();
+      const fenced = extractFirstCodeFence(detail);
+      if (fenced) return fenced;
+      if (
+        detail.length > 80 &&
+        /(import |const |function |class |=>|<div|SELECT |INSERT |CREATE )/i.test(
+          detail,
+        )
+      ) {
+        return detail;
+      }
+    }
+    return "";
+  })();
+  const codeSnapshot =
+    codeFromCards ||
+    extractFirstCodeFence(streamingResponse) ||
+    extractFirstCodeFence(latestAssistantMessageText);
+  const activeCodeFile = deployedFiles[codeViewerFileIdx] ?? null;
+  const activeSnippetFile = useMemo(() => {
+    if (workspaceSnippetFiles.length === 0) return null;
+    if (selectedSnippetId) {
+      return (
+        workspaceSnippetFiles.find(
+          (snippet) => snippet.id === selectedSnippetId,
+        ) || null
+      );
+    }
+    return deployedFiles.length === 0
+      ? workspaceSnippetFiles[workspaceSnippetFiles.length - 1] || null
+      : null;
+  }, [workspaceSnippetFiles, selectedSnippetId, deployedFiles.length]);
+  const activePhaseStatus =
+    isStreamingForCurrentConversation || pendingSnapshotPhase === "running"
+      ? (streamPhaseStatus ?? restoredPhaseStatus)
+      : null;
+  const streamingRunMetricItems = streamingRunMetrics
+    ? buildChatRunMetricItems(streamingRunMetrics)
+    : [];
+  const resolvedActiveFileContent = choosePreferredWorkspaceFileContent(
+    activeCodeFile ? liveFileWrites[activeCodeFile.name]?.content || "" : "",
+    activeCodeFile?.content || "",
+  );
+  const codeViewerContent = activeCodeFile
+    ? resolvedActiveFileContent ||
+      `Preview unavailable for ${activeCodeFile.name} until file contents are captured.`
+    : "";
+  const activeWorkspaceCodeEntry = activeSnippetFile ?? activeCodeFile;
+  const activeWorkspaceCodePath =
+    activeSnippetFile?.displayName || activeCodeFile?.name || "";
+  const activeWorkspaceCodeContent =
+    activeSnippetFile?.content || codeViewerContent;
+  const activeWorkspaceCodeSourceLabel = activeSnippetFile?.sourceLabel || "";
+  const isShowingSnippetPreview = Boolean(activeSnippetFile);
+
+  const appsWorkspaceQ = useQuery({
+    queryKey: ["chat-workspace-apps"],
+    queryFn: () => api.rawGet("/api/apps"),
+    enabled: workspaceOpen,
+    refetchInterval:
+      workspaceOpen && autoRefresh && !activeRunUsesLiveStream
+        ? REFRESH_MS
+        : false,
+  });
+  const tunnelWorkspaceQ = useQuery({
+    queryKey: ["chat-workspace-tunnel"],
+    queryFn: () => api.rawGet("/tunnel/status"),
+    enabled: workspaceOpen,
+    refetchInterval:
+      workspaceOpen && autoRefresh && !activeRunUsesLiveStream
+        ? REFRESH_MS
+        : false,
+  });
+  const workspaceApps = pickRecords(appsWorkspaceQ.data, "apps");
+  const workspaceTunnel = asRecord(tunnelWorkspaceQ.data);
+  const workspaceTunnelMeta = getTunnelAccessMeta(workspaceTunnel);
+  const workspaceTunnelBaseUrl = str(workspaceTunnel.url, "")
+    .trim()
+    .replace(/\/+$/, "");
+  const workspaceSelectedPublicAppId = str(
+    workspaceTunnel.selected_app_id,
+    "",
+  ).trim();
+  const activeWorkspaceApp = useMemo(() => {
+    const workspaceAppSeed =
+      streamedWorkspaceApp || restoredConversationWorkspaceApp;
+    const hintedAppId = str(
+      workspaceAppSeed?.id,
+      str(workspaceAppSeed?.app_id, ""),
+    ).trim();
+    if (hintedAppId) {
+      const matched = workspaceApps.find(
+        (app) => str(app.id, "").trim() === hintedAppId,
+      );
+      if (matched) {
+        return { ...matched, ...(workspaceAppSeed || {}) };
+      }
+    }
+    if (workspaceAppSeed) {
+      return workspaceAppSeed;
+    }
+    // No app deployed in this conversation - don't show stale preview from previous ones.
+    return null;
+  }, [workspaceApps, streamedWorkspaceApp, restoredConversationWorkspaceApp]);
+  const activeWorkspaceAppId = str(
+    activeWorkspaceApp?.id,
+    str(activeWorkspaceApp?.app_id, ""),
+  ).trim();
+  const previewPath = str(
+    activeWorkspaceApp?.local_access_url,
+    str(
+      activeWorkspaceApp?.access_url,
+      str(activeWorkspaceApp?.local_url, str(activeWorkspaceApp?.url, "")),
+    ),
+  ).trim();
+  const publicAccessPath = str(
+    activeWorkspaceApp?.access_url,
+    str(activeWorkspaceApp?.url, ""),
+  ).trim();
+  const previewUrl = toAbsoluteAppUrl(previewPath, origin);
+  const previewImagePath = useMemo(() => {
+    const streamImage = extractPreviewImageUrl(streamingResponse);
+    if (streamImage) return streamImage;
+    return extractPreviewImageUrl(latestAssistantMessageText);
+  }, [streamingResponse, latestAssistantMessageText]);
+  const previewImageUrl = toAbsoluteAppUrl(previewImagePath, origin);
+  const publicPreviewUrl =
+    workspaceTunnelBaseUrl &&
+    workspaceTunnelBaseUrl !== origin &&
+    workspaceSelectedPublicAppId &&
+    activeWorkspaceAppId &&
+    workspaceSelectedPublicAppId === activeWorkspaceAppId &&
+    publicAccessPath
+      ? toAbsoluteAppUrl(publicAccessPath, workspaceTunnelBaseUrl)
+      : "";
+  const showWorkspacePanel = workspaceOpen;
+  const showConversationSidebar = conversationSidebarOpen;
+  const showWorkspacePanelInline =
+    showWorkspacePanel && canInlineWorkspacePanel;
+  const showConversationSidebarInline =
+    showConversationSidebar && canInlineConversationSidebar;
+  const showWorkspacePanelDrawer =
+    showWorkspacePanel && !canInlineWorkspacePanel;
+  const showConversationSidebarDrawer =
+    showConversationSidebar && !canInlineConversationSidebar;
+  const conversationListError = convQ.error;
+  const messagesError = messagesQ.error;
+  const messagesErrorText = errMessage(messagesError);
+  const draftConversationMissing =
+    !!conversationId &&
+    !messages.length &&
+    !sidebarConversationIds.has(conversationId) &&
+    normalizeChatError(messagesErrorText).toLowerCase() ===
+      "conversation not found";
+  const visibleConversationListError = conversationListError;
+  const visibleMessagesError = draftConversationMissing ? null : messagesError;
+  const latestRunStatus = str(latestRunStatusSummary?.status, "")
+    .trim()
+    .toLowerCase();
+  const credentialActionNeeded =
+    latestRunStatus === "needs_credentials" && !chatCredentialPromptVisible;
+  const credentialUiActive =
+    chatCredentialPromptVisible || credentialActionNeeded;
+  const searchIssueText = [
+    chatError || "",
+    executionPlanFailure || "",
+    latestRunStatusSummary?.detail || "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+  const searchSetupActionNeeded = isSearchBackendSetupIssue(searchIssueText);
+  const visibleConversationError =
+    visibleConversationListError ||
+    visibleMessagesError ||
+    (chatError && !credentialUiActive);
+  const suggestedSecretKey =
+    str(chatCredentialPromptFields[0]?.key, "").trim().toUpperCase() ||
+    secretHelperKey ||
+    "OPENAI_API_KEY";
+  const latestRunningCard = useMemo(
+    () =>
+      [...workspaceCards]
+        .reverse()
+        .find((row) => row.kind === "Running" || row.kind === "Planning") ||
+      null,
+    [workspaceCards],
+  );
+  const latestCompletedCard = useMemo(
+    () =>
+      [...workspaceCards].reverse().find((row) => row.kind === "Done") || null,
+    [workspaceCards],
+  );
+  const currentStatusCard = useMemo(
+    () => latestRunningCard || latestWorkspaceCard || null,
+    [latestRunningCard, latestWorkspaceCard],
+  );
+  const currentWorkspaceIssue = currentStatusCard?.kind === "Issue";
+  const safetyPolicyBlocked =
+    currentWorkspaceIssue &&
+    isSafetyPolicyBlockedText(
+      `${currentStatusCard?.label || ""} ${currentStatusCard?.detail || ""} ${currentStatusCard?.detailFull || ""}`,
+    );
+  const hasCompletedWorkspaceRun =
+    !showStreamingAssistant &&
+    !currentWorkspaceIssue &&
+    workspaceCards.length > 0 &&
+    latestWorkspaceCard?.kind === "Done";
+  const activityUpdateCountLabel = `${workspaceCards.length} update${workspaceCards.length === 1 ? "" : "s"}`;
+  const consoleEventCountLabel = `${workspaceConsoleCards.length} event${workspaceConsoleCards.length === 1 ? "" : "s"}`;
+  const progressSummary = !progressRows.length
+    ? "No activity yet"
+    : showStreamingAssistant
+      ? activityUpdateCountLabel
+      : hasCompletedWorkspaceRun
+        ? `Run completed - ${activityUpdateCountLabel}`
+        : activityUpdateCountLabel;
+  const consoleProgressSummary = workspaceConsoleCards.length
+    ? consoleEventCountLabel
+    : progressSummary;
+  const executionPlanCompletedCount = displayedExecutionPlan.filter(
+    (step) => step.status === "completed",
+  ).length;
+  const executionPlanActiveCount = displayedExecutionPlan.filter(
+    (step) => step.status === "running",
+  ).length;
+  const executionPlanFailedCount = displayedExecutionPlan.filter(
+    (step) => step.status === "failed",
+  ).length;
+  const executionPlanPendingCount = Math.max(
+    0,
+    displayedExecutionPlan.length -
+      executionPlanCompletedCount -
+      executionPlanActiveCount -
+      executionPlanFailedCount,
+  );
+  const executionPlanNeedsAttention = credentialUiActive || safetyPolicyBlocked;
+  const hasLiveSwarmRun = swarmActivityRuns.some((run) =>
+    ["assigned", "running", "synthesizing"].includes(
+      normalizeSwarmStatus(run.status),
+    ),
+  );
+  const isExecutionPlanFinalizing =
+    displayedExecutionPlan.length > 0 &&
+    executionPlanCompletedCount === displayedExecutionPlan.length &&
+    (showStreamingAssistant || hasPendingSnapshotForConversation) &&
+    !finalMessageLanded;
+  const isExecutionPlanTransitioning =
+    displayedExecutionPlan.length > 0 &&
+    executionPlanCompletedCount > 0 &&
+    executionPlanPendingCount > 0 &&
+    executionPlanActiveCount === 0 &&
+    (showStreamingAssistant || hasPendingSnapshotForConversation) &&
+    !isExecutionPlanFinalizing &&
+    !hasLiveSwarmRun;
+  const workspaceStatusCopy = useMemo(() => {
+    if (credentialUiActive) {
+      return {
+        line1: "Status: Waiting for secure input",
+        line2:
+          str(chatCredentialPrompt.title, "").trim() ||
+          "A secure credential is needed before this run can continue.",
+        tone: "warning",
+      };
+    }
+    if (safetyPolicyBlocked) {
+      return {
+        line1: "Status: Blocked by safety policy",
+        line2:
+          "The agent tried a disallowed tool and needs a different approach.",
+        tone: "warning",
+      };
+    }
+    if (isExecutionPlanFinalizing) {
+      return {
+        line1: "Status: Finalizing answer",
+        line2:
+          "All approved research steps are complete. AgentArk is composing the final response.",
+        tone: "info",
+      };
+    }
+    if (isExecutionPlanTransitioning) {
+      return {
+        line1: "Status: Starting next branch",
+        line2: `${executionPlanCompletedCount} of ${displayedExecutionPlan.length} plan steps are complete. Waiting for the next branch to start.`,
+        tone: "info",
+      };
+    }
+    if (isStreamingForCurrentConversation) {
+      const active = latestRunningCard || latestWorkspaceCard;
+      return {
+        line1: `Status: ${activePhaseStatus?.label || "Running"}`,
+        line2:
+          activePhaseStatus?.detail ||
+          active?.detail ||
+          "Agent is actively running actions.",
+        tone: "info",
+      };
+    }
+    if (latestWorkspaceCard?.kind === "Done") {
+      return {
+        line1: "Status: Completed",
+        line2: latestWorkspaceCard.detail || latestWorkspaceCard.label,
+        tone: "default",
+      };
+    }
+    if (latestWorkspaceCard) {
+      return {
+        line1: "Status: Stopped",
+        line2: latestWorkspaceCard.detail || latestWorkspaceCard.label,
+        tone: "default",
+      };
+    }
+    return {
+      line1: "Status: Stopped",
+      line2: "Send a request to start a run.",
+      tone: "default",
+    };
+  }, [
+    activePhaseStatus?.detail,
+    activePhaseStatus?.label,
+    chatCredentialPrompt.title,
+    credentialUiActive,
+    displayedExecutionPlan.length,
+    executionPlanCompletedCount,
+    isExecutionPlanFinalizing,
+    isExecutionPlanTransitioning,
+    isStreamingForCurrentConversation,
+    latestRunningCard,
+    latestWorkspaceCard,
+    safetyPolicyBlocked,
+  ]);
+  const nowDoingLabel = useMemo(() => {
+    if (credentialUiActive) return "Waiting for secure input";
+    if (safetyPolicyBlocked) return "Blocked by safety policy";
+    if (isExecutionPlanFinalizing) return "Finalizing answer";
+    if (isExecutionPlanTransitioning) return "Starting next branch";
+    if (activePhaseStatus?.label) return activePhaseStatus.label;
+    const active = latestRunningCard || latestWorkspaceCard;
+    return active?.label || "Waiting for next step";
+  }, [
+    activePhaseStatus?.label,
+    credentialUiActive,
+    isExecutionPlanFinalizing,
+    isExecutionPlanTransitioning,
+    latestRunningCard,
+    latestWorkspaceCard,
+    safetyPolicyBlocked,
+  ]);
+  const liveWriteEntries = useMemo(
+    () =>
+      Object.entries(liveFileWrites).sort((a, b) => {
+        const aDone = a[1].done ? 1 : 0;
+        const bDone = b[1].done ? 1 : 0;
+        return aDone - bDone;
+      }),
+    [liveFileWrites],
+  );
+  const activeLiveWriteEntry = useMemo(
+    () =>
+      liveWriteEntries.find(([, state]) => !state.done) ||
+      liveWriteEntries[0] ||
+      null,
+    [liveWriteEntries],
+  );
+  const executionPlanStatusLabel = executionPlanNeedsAttention
+    ? "Needs attention"
+    : visibleExecutionPlanFailure
+      ? "Planner offline"
+      : isExecutionPlanFinalizing
+        ? "Finalizing"
+        : isExecutionPlanTransitioning
+          ? "Starting next branch"
+          : executionPlanActiveCount > 0
+            ? "Working"
+            : displayedExecutionPlan.length > 0 &&
+                executionPlanCompletedCount === displayedExecutionPlan.length
+              ? "Completed"
+              : executionPlanFailedCount > 0 && executionPlanCompletedCount > 0
+                ? "Completed"
+                : "Ready";
+  const executionPlanSummaryText =
+    displayedExecutionPlan.length > 0
+      ? [
+          displayedExecutionPlanSummary ||
+            `${displayedExecutionPlan.length} step${displayedExecutionPlan.length === 1 ? "" : "s"}`,
+          `${executionPlanCompletedCount} done`,
+          isExecutionPlanFinalizing ? "final answer in progress" : null,
+          isExecutionPlanTransitioning ? "next branch starting" : null,
+          executionPlanActiveCount > 0
+            ? `${executionPlanActiveCount} running`
+            : null,
+          executionPlanPendingCount > 0
+            ? `${executionPlanPendingCount} pending`
+            : null,
+        ]
+          .filter(Boolean)
+          .join(" - ")
+      : visibleExecutionPlanFailure;
+  const executionPlanTone = executionPlanNeedsAttention
+    ? "failed"
+    : visibleExecutionPlanFailure
+      ? "failed"
+      : isExecutionPlanFinalizing || isExecutionPlanTransitioning
+        ? "running"
+        : executionPlanActiveCount > 0
+          ? "running"
+          : displayedExecutionPlan.length > 0 &&
+              executionPlanCompletedCount === displayedExecutionPlan.length
+            ? "done"
+            : "pending";
+  const restoredDeepResearchStage =
+    useMemo<PlanConfirmationStage | null>(() => {
+      if (
+        !hasDeepResearchPlanContext ||
+        !displayedExecutionPlanState ||
+        displayedExecutionPlan.length === 0
+      ) {
+        return null;
+      }
+      const normalizedRunStatus = str(latestRunStatusSummary?.status, "")
+        .trim()
+        .toLowerCase();
+      if (pendingSnapshotPhase === "awaiting_confirmation")
+        return "awaiting_confirmation";
+      if (
+        normalizedRunStatus === "interrupted" ||
+        normalizedRunStatus === "cancelled" ||
+        normalizedRunStatus === "canceled"
+      ) {
+        return "interrupted";
+      }
+      if (
+        visibleExecutionPlanFailure ||
+        normalizedRunStatus === "platform_failed" ||
+        normalizedRunStatus === "failed" ||
+        executionPlanFailedCount > 0
+      ) {
+        return "failed";
+      }
+      if (executionPlanActiveCount > 0) return "running";
+      if (
+        displayedExecutionPlan.length > 0 &&
+        executionPlanCompletedCount === displayedExecutionPlan.length
+      ) {
+        return "completed";
+      }
+      if (executionPlanPendingCount === displayedExecutionPlan.length) {
+        return "awaiting_confirmation";
+      }
+      return null;
+    }, [
+      displayedExecutionPlan,
+      visibleExecutionPlanFailure,
+      displayedExecutionPlanState,
+      executionPlanActiveCount,
+      executionPlanCompletedCount,
+      executionPlanFailedCount,
+      executionPlanPendingCount,
+      hasDeepResearchPlanContext,
+      latestRunStatusSummary?.status,
+      pendingSnapshotPhase,
+    ]);
+  const shouldPreferDeepResearchPlanCard =
+    hasDeepResearchPlanContext && displayedExecutionPlan.length > 0;
+  const shouldSuppressCompactExecutionPlan =
+    (hasPendingSnapshotForConversation &&
+      ["running", "awaiting_confirmation", "interrupted"].includes(
+        pendingSnapshotPhase,
+      ) &&
+      displayedExecutionPlan.length > 0) ||
+    shouldPreferDeepResearchPlanCard;
+  const shouldShowCompactExecutionPlan =
+    !showPlanConfirmationCard &&
+    displayedExecutionPlan.length > 0 &&
+    !shouldSuppressCompactExecutionPlan;
+  const shouldShowExecutionPlanWarning =
+    !showPlanConfirmationCard && !!visibleExecutionPlanFailure;
+
+  useEffect(() => {
+    if (
+      !restoredDeepResearchStage ||
+      !displayedExecutionPlanState ||
+      !hasDeepResearchPlanContext
+    ) {
+      return;
+    }
+    const anchoredMessageId =
+      str(deepResearchPlanPreviewMessageId, "").trim() || null;
+    const needsRepair =
+      !planConfirmation ||
+      planConfirmation.stage !== restoredDeepResearchStage ||
+      !planConfirmation.originalPlan ||
+      !planConfirmation.draft ||
+      (anchoredMessageId &&
+        str(planConfirmation.messageId, "").trim() !== anchoredMessageId);
+    if (!needsRepair) return;
+    setPlanConfirmation((prev) => {
+      const nextOriginalPlan =
+        prev?.originalPlan ?? displayedExecutionPlanState;
+      return {
+        stage: restoredDeepResearchStage,
+        taskId: str(prev?.taskId, "").trim() || null,
+        source:
+          prev?.source ||
+          extractPlanConfirmationSourceFromSteps(workspaceStepsSource) ||
+          "execution",
+        originalPlan: nextOriginalPlan,
+        draft: createPlanConfirmationDraft(nextOriginalPlan),
+        editing: false,
+        messageId: anchoredMessageId || prev?.messageId || null,
+      };
+    });
+  }, [
+    deepResearchPlanPreviewMessageId,
+    displayedExecutionPlanState,
+    hasDeepResearchPlanContext,
+    planConfirmation,
+    restoredDeepResearchStage,
+    workspaceStepsSource,
+  ]);
+
+  const composerLockedForPlanConfirmation = isPlanningDeepResearch;
+  const renderExecutionPlanStatusIcon = (status: string, className = "") => {
+    if (status === "completed") {
+      return <CheckCircleRoundedIcon className={className} />;
+    }
+    if (status === "failed") {
+      return <ErrorOutlineRoundedIcon className={className} />;
+    }
+    if (status === "running") {
+      return <AutorenewRoundedIcon className={className} />;
+    }
+    return <RadioButtonUncheckedRoundedIcon className={className} />;
+  };
+
+  const renderConversationSidebarContent = (drawer = false) => (
+    <Box
+      className="list-shell chat-sidebar"
+      sx={{
+        minHeight: 0,
+        height: "100%",
+        display: "flex",
+        flexDirection: "column",
+        maxHeight: drawer ? "none" : { xs: 260, lg: "none" },
+      }}
+    >
+      <Stack
+        direction="row"
+        sx={{
+          justifyContent: "space-between",
+          alignItems: "center",
+          mb: 1.5,
+        }}
+      >
+        <Typography variant="h6">Conversations</Typography>
+        <Stack
+          direction="row"
+          spacing={0.75}
+          sx={{
+            alignItems: "center",
+          }}
+        >
+          <Button
+            size="small"
+            variant="outlined"
+            className="chat-toolbar-btn"
+            onClick={() => startNewConversation()}
+          >
+            New chat
+          </Button>
+          {drawer ? (
+            <IconButton
+              size="small"
+              onClick={() => setConversationSidebarOpen(false)}
+            >
+              <CloseIcon fontSize="small" />
+            </IconButton>
+          ) : null}
+        </Stack>
+      </Stack>
+
+      <Box sx={{ flex: 1, minHeight: 0, overflow: "auto", pr: 0.5 }}>
+        <Stack spacing={0.9} className="conversation-list">
+          {starredConversations.length === 0 && conversations.length === 0 ? (
+            <Typography
+              variant="body2"
+              sx={{
+                color: "text.secondary",
+              }}
+            >
+              No conversations yet.
+            </Typography>
+          ) : (
+            <>
+              {starredConversations.length > 0 ? (
+                <Box className="conversation-group">
+                  <Typography
+                    variant="caption"
+                    className="conversation-group-label"
+                  >
+                    Starred
+                  </Typography>
+                  <Stack spacing={0.9}>
+                    {starredConversations.map((conv) =>
+                      renderConversationCard(conv),
+                    )}
+                  </Stack>
+                </Box>
+              ) : null}
+              {conversations.length > 0 ? (
+                <Box className="conversation-group">
+                  <Stack
+                    direction="row"
+                    sx={{
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      px: 0.25,
+                    }}
+                  >
+                    <Typography
+                      variant="caption"
+                      className="conversation-group-label"
+                    >
+                      All Chats
+                    </Typography>
+                    <Typography
+                      variant="caption"
+                      className="conversation-page-indicator"
+                    >
+                      Page {conversationPageLabel}
+                    </Typography>
+                  </Stack>
+                  <Stack spacing={0.9}>
+                    {conversations.map((conv) => renderConversationCard(conv))}
+                  </Stack>
+                </Box>
+              ) : null}
+            </>
+          )}
+        </Stack>
+      </Box>
+      <Stack
+        direction="row"
+        spacing={0.5}
+        sx={{
+          alignItems: "center",
+          justifyContent: "space-between",
+          mt: 0.75,
+          px: 0.25,
+        }}
+      >
+        <Typography variant="caption" className="conversation-pagination-copy">
+          {conversationListTotal} chat{conversationListTotal === 1 ? "" : "s"}
+        </Typography>
+        <Stack
+          direction="row"
+          spacing={0.5}
+          sx={{
+            alignItems: "center",
+          }}
+        >
+          <IconButton
+            size="small"
+            onClick={() => setConversationPage((prev) => Math.max(0, prev - 1))}
+            disabled={conversationPage <= 0}
+            sx={{ p: 0.35 }}
+          >
+            <ChevronLeftRoundedIcon sx={{ fontSize: 16 }} />
+          </IconButton>
+          <Typography variant="caption" className="conversation-page-indicator">
+            {conversationPageLabel}
+          </Typography>
+          <IconButton
+            size="small"
+            onClick={() =>
+              setConversationPage((prev) =>
+                Math.min(Math.max(0, conversationPageCount - 1), prev + 1),
+              )
+            }
+            disabled={conversationPage >= conversationPageCount - 1}
+            sx={{ p: 0.35 }}
+          >
+            <ChevronRightRoundedIcon sx={{ fontSize: 16 }} />
+          </IconButton>
+        </Stack>
+      </Stack>
+      <Menu
+        anchorEl={conversationMenuAnchor}
+        open={Boolean(conversationMenuAnchor)}
+        onClose={closeConversationMenu}
+      >
+        <MenuItem
+          disabled={toggleConversationStarMutation.isPending}
+          onClick={() => {
+            const id = str(conversationMenuTarget?.id, "");
+            const starred = toBool(conversationMenuTarget?.starred);
+            closeConversationMenu();
+            if (id) void toggleConversationStar(id, !starred);
+          }}
+        >
+          {toBool(conversationMenuTarget?.starred)
+            ? "Unstar chat"
+            : "Star chat"}
+        </MenuItem>
+        <MenuItem
+          onClick={() => {
+            const id = str(conversationMenuTarget?.id, "");
+            const title = str(conversationMenuTarget?.title, "chat");
+            closeConversationMenu();
+            if (id) void exportConversationById(id, title);
+          }}
+        >
+          Export chat
+        </MenuItem>
+        <MenuItem
+          disabled={isStreaming || deleteConversationMutation.isPending}
+          onClick={() => {
+            const id = str(conversationMenuTarget?.id, "");
+            closeConversationMenu();
+            if (id) void deleteConversation(id);
+          }}
+        >
+          Delete chat
+        </MenuItem>
+      </Menu>
+    </Box>
+  );
+
+  const renderActivityPanelContent = (_drawer = false) => (
+    <Box
+      className="list-shell chat-workspace-shell"
+      sx={{
+        minHeight: 0,
+        height: "100%",
+        display: "flex",
+        flexDirection: "column",
+        p: 0.7,
+        alignSelf: "start",
+      }}
+    >
+      <Stack
+        direction="row"
+        className="chat-console-toolbar"
+        sx={{
+          justifyContent: "space-between",
+          alignItems: "center",
+          px: 0.5,
+          pt: 0.25,
+          pb: 0.75,
+        }}
+      >
+        <Typography variant="subtitle2">AgentArk Console</Typography>
+        <Tooltip title="Close console">
+          <IconButton
+            size="small"
+            aria-label="Close AgentArk Console"
+            onClick={() => setWorkspaceOpen(false)}
+          >
+            <CloseIcon fontSize="small" />
+          </IconButton>
+        </Tooltip>
+      </Stack>
+      <Box
+        sx={{ flex: 1, minHeight: 0, overflowY: "auto", overflowX: "hidden" }}
+        className="chat-workspace-sections"
+      >
+        <Box className="chat-activity-intro">
+          <Typography variant="caption" className="chat-activity-intro-kicker">
+            Live console
+          </Typography>
+          <Typography variant="subtitle2" className="chat-activity-intro-title">
+            AgentArk Console
+          </Typography>
+          <Typography variant="caption" className="chat-activity-intro-copy">
+            Current focus: {nowDoingLabel}. Tool output and runtime activity stay here.
+          </Typography>
+        </Box>
+        <Box className="term-shell">
+          <Box className="term-titlebar">
+            <Typography variant="caption" className="term-titlebar-text">
+              Activity
+            </Typography>
+            <Box sx={{ flex: 1 }} />
+            <Typography variant="caption" className="term-titlebar-stats">
+              {consoleProgressSummary}
+            </Typography>
+          </Box>
+          <Box
+            className="term-body"
+            ref={workspaceActivityRef}
+            onScroll={() => {
+              const node = workspaceActivityRef.current;
+              if (!node) return;
+              const nearBottom =
+                node.scrollHeight - node.scrollTop - node.clientHeight < 22;
+              if (nearBottom && !activityAutoFollow)
+                setActivityAutoFollow(true);
+              if (!nearBottom && activityAutoFollow)
+                setActivityAutoFollow(false);
+            }}
+          >
+            {workspaceConsoleCards.length === 0 ? (
+              <Box className="term-empty-state">
+                <Typography variant="overline" className="term-empty-kicker">
+                  Quiet for now
+                </Typography>
+                <Typography variant="body2" className="term-empty-copy">
+                  Activity updates appear here when AgentArk starts a run,
+                  emits a preview, or records a runtime step.
+                </Typography>
+              </Box>
+            ) : (
+              workspaceConsoleCards.map((row, idx) => {
+                const isLast = idx === workspaceConsoleCards.length - 1;
+                const isActive = isLast && isStreamingForCurrentConversation;
+                const payloadKey = `live:${row.id}`;
+                return (
+                  <ActivityTimelineRow
+                    key={`activity-${row.id}`}
+                    row={row}
+                    isActive={isActive}
+                    payloadExpanded={expandedActivityPayloads.has(payloadKey)}
+                    onTogglePayload={() =>
+                      toggleExpandedActivityPayload(payloadKey)
+                    }
+                    detailed
+                  />
+                );
+              })
+            )}
+          </Box>
+        </Box>
+        {workspaceSnippetFiles.length > 0 ? (
+          <Accordion className="chat-workspace-section" disableGutters>
+            <AccordionSummary
+              expandIcon={<ExpandMoreIcon />}
+              sx={{ minHeight: 34 }}
+            >
+              <Typography variant="subtitle2">
+                Snippets ({workspaceSnippetFiles.length})
+              </Typography>
+            </AccordionSummary>
+            <AccordionDetails sx={{ p: "4px 8px 8px" }}>
+              <Stack spacing={0.5}>
+                {workspaceSnippetFiles.map((snippet) => (
+                  <Box
+                    key={snippet.id}
+                    className={`deployed-file-row${activeSnippetFile?.id === snippet.id ? " is-selected" : ""}`}
+                    onClick={() => {
+                      setWorkspaceOpen(true);
+                      setSelectedSnippetId(snippet.id);
+                    }}
+                  >
+                    <span className="deployed-file-icon">&lt;/&gt;</span>
+                    <span
+                      className="deployed-file-name"
+                      title={snippet.displayName}
+                    >
+                      {snippet.displayName}
+                    </span>
+                    <span className="deployed-file-size">
+                      {snippet.sourceLabel}
+                    </span>
+                  </Box>
+                ))}
+              </Stack>
+            </AccordionDetails>
+          </Accordion>
+        ) : null}
+
+        {isShowingSnippetPreview && activeWorkspaceCodeEntry ? (
+          <Accordion
+            className="chat-workspace-section"
+            disableGutters
+            defaultExpanded
+          >
+            <AccordionSummary
+              expandIcon={<ExpandMoreIcon />}
+              sx={{ minHeight: 34 }}
+            >
+              <Stack
+                direction="row"
+                spacing={1}
+                className="chat-workspace-code-summary"
+                sx={{
+                  alignItems: "center",
+                }}
+              >
+                <Stack
+                  direction="row"
+                  spacing={1}
+                  className="chat-workspace-code-heading"
+                  sx={{
+                    alignItems: "center",
+                  }}
+                >
+                  <Typography variant="subtitle2">Snippet preview</Typography>
+                  <Typography
+                    variant="caption"
+                    className="chat-workspace-code-path"
+                    title={activeWorkspaceCodePath}
+                  >
+                    {activeWorkspaceCodePath}
+                  </Typography>
+                </Stack>
+                <Box sx={{ flex: 1, minWidth: 0 }} />
+                <Stack
+                  direction="row"
+                  spacing={1}
+                  className="chat-workspace-code-actions"
+                  sx={{
+                    alignItems: "center",
+                  }}
+                >
+                  <Typography
+                    variant="caption"
+                    className="chat-workspace-code-meta"
+                    title={activeWorkspaceCodeSourceLabel}
+                    sx={{
+                      color: "text.secondary",
+                    }}
+                  >
+                    {activeWorkspaceCodeSourceLabel}
+                  </Typography>
+                  <Button
+                    size="small"
+                    variant="text"
+                    className="chat-workspace-code-open"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setCodeViewerOpen(true);
+                    }}
+                  >
+                    Open full screen
+                  </Button>
+                </Stack>
+              </Stack>
+            </AccordionSummary>
+            <AccordionDetails>
+              {workspaceSnippetFiles.length > 1 ? (
+                <Box className="code-file-tabs chat-workspace-file-tabs">
+                  {workspaceSnippetFiles.map((snippet) => (
+                    <button
+                      key={snippet.id}
+                      className={`code-file-tab${activeSnippetFile?.id === snippet.id ? " code-file-tab-active" : ""}`}
+                      onClick={() => setSelectedSnippetId(snippet.id)}
+                    >
+                      {snippet.displayName}
+                    </button>
+                  ))}
+                </Box>
+              ) : null}
+              <pre className="code-viewer-pre chat-workspace-code-inline">
+                <code>
+                  {renderCodeBlockLines(activeWorkspaceCodeContent || "", {
+                    fileName: activeWorkspaceCodePath,
+                  })}
+                </code>
+              </pre>
+              <Typography
+                variant="caption"
+                sx={{
+                  color: "text.secondary",
+                  display: "block",
+                  mt: 0.75,
+                }}
+              >
+                Referenced from {activeWorkspaceCodeSourceLabel}.
+              </Typography>
+            </AccordionDetails>
+          </Accordion>
+        ) : codeSnapshot ? (
+          <Accordion className="chat-workspace-section" disableGutters>
+            <AccordionSummary
+              expandIcon={<ExpandMoreIcon />}
+              sx={{ minHeight: 34 }}
+            >
+              <Typography variant="subtitle2">Code</Typography>
+            </AccordionSummary>
+            <AccordionDetails>
+              <pre className="code-viewer-pre chat-workspace-pre">
+                <code>{renderCodeBlockLines(codeSnapshot)}</code>
+              </pre>
+            </AccordionDetails>
+          </Accordion>
+        ) : null}
+
+        {previewUrl ? (
+          <Accordion
+            className="chat-workspace-section chat-workspace-section-preview"
+            disableGutters
+          >
+            <AccordionSummary
+              expandIcon={<ExpandMoreIcon />}
+              sx={{ minHeight: 34 }}
+            >
+              <Typography variant="subtitle2">Preview</Typography>
+            </AccordionSummary>
+            <AccordionDetails>
+              <Box className="chat-workspace-preview">
+                <Typography
+                  variant="caption"
+                  noWrap
+                  title={previewUrl}
+                  sx={{
+                    color: "text.secondary",
+                    display: "block",
+                    mb: 0.7,
+                  }}
+                >
+                  Local:{" "}
+                  <Link
+                    href={previewUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    underline="hover"
+                  >
+                    {previewUrl}
+                  </Link>
+                </Typography>
+                {publicPreviewUrl ? (
+                  <Typography
+                    variant="caption"
+                    noWrap
+                    title={publicPreviewUrl}
+                    sx={{
+                      color: "info.main",
+                      display: "block",
+                      mb: 0.7,
+                    }}
+                  >
+                    {workspaceTunnelMeta.isPrivate
+                      ? "Private access:"
+                      : "Public:"}{" "}
+                    <Link
+                      href={publicPreviewUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      underline="hover"
+                    >
+                      {publicPreviewUrl}
+                    </Link>
+                  </Typography>
+                ) : null}
+                <Stack direction="row" spacing={0.8} sx={{ mt: 0.7 }}>
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    onClick={() =>
+                      window.open(previewUrl, "_blank", "noopener,noreferrer")
+                    }
+                  >
+                    Open live app
+                  </Button>
+                  <Button
+                    size="small"
+                    variant="contained"
+                    onClick={() => setPreviewDialogOpen(true)}
+                    disabled={!previewImageUrl}
+                  >
+                    Open preview popup
+                  </Button>
+                </Stack>
+                {!previewImageUrl ? (
+                  <Typography
+                    variant="caption"
+                    sx={{
+                      color: "text.secondary",
+                      display: "block",
+                      mt: 0.7,
+                    }}
+                  >
+                    Screenshot preview will appear after deployment validation
+                    captures it.
+                  </Typography>
+                ) : null}
+              </Box>
+            </AccordionDetails>
+          </Accordion>
+        ) : null}
+      </Box>
+    </Box>
+  );
+
+  const submitSecretHelper = async (modeOverride?: "reuse" | "manual") => {
+    if (secretHelperBusy || isStreaming) return;
+    const key = (secretHelperKey || "").trim().toUpperCase();
+    const mode = modeOverride || secretHelperMode;
+    if (!key) {
+      setChatError(
+        "Enter which key name to set first (example: OPENAI_API_KEY).",
+      );
+      return;
+    }
+    setSecretHelperBusy(true);
+    setChatError(null);
+    setChatNotice(null);
+    try {
+      if (mode === "reuse") {
+        const payload = asRecord(
+          await api.rawPost(
+            "/chat/credential/raw-secret/reuse-model-credential",
+            {
+              conversation_id: conversationId,
+              key,
+            },
+          ),
+        );
+        const followup = str(payload.followup, "").trim();
+        setChatNotice(followup || `${key} saved securely.`);
+        await queryClient.invalidateQueries({
+          queryKey: ["chat-credential-prompt", conversationId],
+        });
+        await queryClient.invalidateQueries({
+          queryKey: ["chat-messages", conversationId],
+        });
+        await queryClient.invalidateQueries({ queryKey: ["settings-secrets"] });
+        return;
+      }
+      if (!secretHelperValue.trim()) {
+        setChatError("Enter the key value first.");
+        return;
+      }
+      const payload = asRecord(
+        await api.rawPost("/chat/credential/raw-secret/submit", {
+          conversation_id: conversationId,
+          key,
+          value: secretHelperValue,
+        }),
+      );
+      const followup = str(payload.followup, "").trim();
+      setSecretHelperValue("");
+      setChatNotice(followup || `${key} saved securely.`);
+      await queryClient.invalidateQueries({
+        queryKey: ["chat-credential-prompt", conversationId],
+      });
+      await queryClient.invalidateQueries({
+        queryKey: ["chat-messages", conversationId],
+      });
+      await queryClient.invalidateQueries({ queryKey: ["settings-secrets"] });
+    } catch (error) {
+      setChatError(normalizeChatError(errMessage(error)));
+    } finally {
+      setSecretHelperBusy(false);
+    }
+  };
+
+  const submitChatCredentialPrompt = async () => {
+    if (
+      !conversationId ||
+      !chatCredentialPromptVisible ||
+      submitChatCredentialPromptMutation.isPending
+    ) {
+      return;
+    }
+    const values: Record<string, string> = {};
+    const missingLabels: string[] = [];
+    for (const field of chatCredentialPromptFields) {
+      const key = str(field.key, "").trim();
+      if (!key) continue;
+      const value = (chatCredentialValues[key] || "").trim();
+      const label = str(field.label, key).trim() || key;
+      if (!value) {
+        if (toBool(field.required)) {
+          missingLabels.push(label);
+        }
+        continue;
+      }
+      values[key] = value;
+    }
+    if (missingLabels.length > 0) {
+      setChatCredentialError(
+        `Enter the required value${missingLabels.length > 1 ? "s" : ""}: ${missingLabels.join(", ")}`,
+      );
+      return;
+    }
+    if (Object.keys(values).length === 0) {
+      setChatCredentialError("Enter at least one credential value.");
+      return;
+    }
+    setChatCredentialError(null);
+    setChatError(null);
+    await submitChatCredentialPromptMutation.mutateAsync(values);
+  };
+
+  useEffect(() => {
+    if (!credentialUiActive) return;
+    if (!secretHelperKey || secretHelperKey === "OPENAI_API_KEY") {
+      setSecretHelperKey(suggestedSecretKey);
+    }
+  }, [credentialUiActive, suggestedSecretKey, secretHelperKey]);
+
+  useEffect(() => {
+    if (!activityAutoFollow) return;
+    const node = workspaceActivityRef.current;
+    if (!node) return;
+    node.scrollTop = node.scrollHeight;
+  }, [workspaceConsoleCards.length, activityAutoFollow, isStreaming]);
+
+  const composerPlaceholder =
+    composerLockedForPlanConfirmation
+      ? `Preparing the ${planConfirmationDisplayLabel(planConfirmation?.source).toLowerCase()}...`
+      : isAwaitingPlanConfirmation
+        ? "Ask for changes to the plan, or press Start / Cancel."
+        : "Message (Enter to send, Shift+Enter for newline)";
+
+  const emptyComposerPlaceholder =
+    composerLockedForPlanConfirmation || isAwaitingPlanConfirmation
+      ? composerPlaceholder
+      : "How can I help you today?";
+
+  const pendingTurnAttachments = useMemo(() => {
+    const fromSnapshot = sanitizeChatTurnAttachments(
+      pendingRunSnapshot?.attachments,
+    );
+    if (fromSnapshot.length > 0) return fromSnapshot;
+    return isStreaming ? chatTurnAttachmentsFromFiles(attachedFiles) : [];
+  }, [attachedFiles, isStreaming, pendingRunSnapshot?.attachments]);
+
+  const renderAttachedFileChips = (className = "") =>
+    !isStreaming && attachedFiles.length > 0 ? (
+      <Stack
+        className={className || undefined}
+        direction="row"
+        spacing={0.75}
+        useFlexGap
+        sx={{
+          flexWrap: "wrap",
+          mb: 0.5,
+        }}
+      >
+        {attachedFiles.map((file, idx) => (
+          <Chip
+            key={`${file.name}-${file.size}-${file.lastModified}-${idx}`}
+            size="small"
+            label={file.name}
+            onDelete={isStreaming ? undefined : () => removeAttachedFile(idx)}
+          />
+        ))}
+      </Stack>
+    ) : null;
+
+  const renderTurnAttachmentChips = (
+    attachments: ChatTurnAttachment[],
+    keyPrefix: string,
+  ) =>
+    attachments.length > 0 ? (
+      <Box className="chat-turn-attachments" aria-label="Attached files">
+        {attachments.map((attachment, idx) => {
+          const detail =
+            attachment.kind === "document"
+              ? "Indexed document"
+              : attachment.kind === "visual"
+                ? "Attached visual"
+                : "Attached file";
+          return (
+            <Tooltip
+              key={`${keyPrefix}:${attachment.kind}:${attachment.id || attachment.name}:${idx}`}
+              title={attachment.detail ? `${detail} - ${attachment.detail}` : detail}
+            >
+              <Chip
+                className="chat-turn-attachment-chip"
+                icon={<AttachFileRoundedIcon />}
+                label={attachment.name}
+                size="small"
+                variant="outlined"
+              />
+            </Tooltip>
+          );
+        })}
+      </Box>
+    ) : null;
+
+  const renderComposerInput = (placeholder: string) => (
+    <ChatComposerInput
+      attachedFilesCount={attachedFiles.length}
+      composerLocked={composerLockedForPlanConfirmation}
+      deepResearchEnabled={deepResearchEnabled}
+      isStoppingStream={isStoppingStream}
+      isStreaming={isStreaming}
+      onAttachFiles={() => fileInputRef.current?.click()}
+      onStopStreaming={() => {
+        void handleStopStreaming();
+      }}
+      onSubmit={(draft) => submitComposerMessage(draft, attachedFiles)}
+      onToggleDeepResearch={() => setDeepResearchEnabled((prev) => !prev)}
+      placeholder={placeholder}
+      prefillRequest={composerPrefillRequest}
+    />
+  );
+
+  return (
+    <Box
+      sx={{
+        flex: 1,
+        width: "100%",
+        height: "100%",
+        minHeight: 0,
+        minWidth: 0,
+        display: "grid",
+        gridTemplateColumns: {
+          xs: "1fr",
+          md: showConversationSidebarInline
+            ? "clamp(190px, 18vw, 220px) minmax(0,1fr)"
+            : "1fr",
+          lg: showWorkspacePanelInline
+            ? showConversationSidebarInline
+              ? "clamp(188px, 13vw, 220px) minmax(0,1fr) clamp(340px, 26vw, 460px)"
+              : "minmax(0,1fr) clamp(360px, 30vw, 500px)"
+            : showConversationSidebarInline
+              ? "clamp(192px, 13vw, 224px) minmax(0,1fr)"
+              : "minmax(0,1fr)",
+          xl: showWorkspacePanelInline
+            ? showConversationSidebarInline
+              ? "clamp(192px, 12.5vw, 224px) minmax(0,1fr) clamp(400px, 30vw, 560px)"
+              : "minmax(0,1fr) clamp(420px, 32vw, 600px)"
+            : showConversationSidebarInline
+              ? "clamp(196px, 12.5vw, 228px) minmax(0,1fr)"
+              : "minmax(0,1fr)",
+        },
+        gap: { xs: 1, md: 1.15 },
+      }}
+    >
+      {showConversationSidebarInline
+        ? renderConversationSidebarContent()
+        : null}
+      <Box
+        data-tour-target="chat-workspace"
+        className={`list-shell chat-shell chat-density-immersive${isDragOverChat ? " chat-shell-drop-active" : ""}`}
+        sx={{
+          minHeight: 0,
+          display: "flex",
+          flexDirection: "column",
+          position: "relative",
+        }}
+        onDragEnter={handleChatDragEnter}
+        onDragOver={handleChatDragOver}
+        onDragLeave={handleChatDragLeave}
+        onDrop={handleChatDrop}
+      >
+        <Stack
+          direction={{ xs: "column", sm: "row" }}
+          spacing={0.75}
+          sx={{
+            justifyContent: "space-between",
+            alignItems: { xs: "stretch", sm: "center" },
+            mb: 0.75,
+          }}
+        >
+          <Stack
+            direction="row"
+            spacing={1}
+            useFlexGap
+            sx={{
+              alignItems: "center",
+              minWidth: 0,
+              flexWrap: "wrap",
+            }}
+          >
+            <Button
+              size="small"
+              variant="outlined"
+              className={`chat-toolbar-btn${showConversationSidebarInline || showConversationSidebarDrawer ? " active" : ""}`}
+              startIcon={
+                showConversationSidebarInline ? (
+                  <ChevronLeftRoundedIcon fontSize="small" />
+                ) : (
+                  <ChevronRightRoundedIcon fontSize="small" />
+                )
+              }
+              onClick={() => {
+                if (canInlineConversationSidebar) {
+                  setConversationSidebarOpen((prev) => !prev);
+                } else {
+                  setConversationSidebarOpen(true);
+                }
+              }}
+            >
+              {showConversationSidebarInline
+                ? "Hide conversations"
+                : "Conversations"}
+            </Button>
+            {!showConversationSidebarInline ? (
+              <Button
+                size="small"
+                variant="outlined"
+                className="chat-toolbar-btn"
+                onClick={() => startNewConversation()}
+              >
+                New chat
+              </Button>
+            ) : null}
+            <Avatar
+              src={AgentLogo}
+              variant="rounded"
+              sx={{ width: 18, height: 18, bgcolor: "var(--ui-rgba-12-22-40-850)" }}
+            />
+            <Typography variant="caption" className="chat-toolbar-context">
+              Workspace
+            </Typography>
+          </Stack>
+          <Stack
+            direction="row"
+            spacing={1}
+            useFlexGap
+            sx={{
+              alignItems: "center",
+              minWidth: 0,
+              flexWrap: "wrap",
+              justifyContent: { xs: "flex-start", sm: "flex-end" },
+            }}
+          >
+            <WorkspaceScopeMenuButton
+              activeProjectId={activeProjectId}
+              projects={projects}
+              onNavigateToView={onNavigateToView}
+            />
+            {activeConversationSession ? (
+              <Chip
+                size="small"
+                variant="outlined"
+                color="info"
+                clickable={!!onNavigateToView}
+                onClick={() => onNavigateToView?.("sessions")}
+                label={`Session: ${str(activeConversationSession.title, "Background session")}`}
+                sx={{ maxWidth: 280 }}
+              />
+            ) : null}
+            <Tooltip
+              title={
+                showWorkspacePanelInline || showWorkspacePanelDrawer
+                  ? "Hide Run Details"
+                  : "Show Run Details"
+              }
+            >
+              <span
+                className={`activity-toggle-pill${showWorkspacePanelInline || showWorkspacePanelDrawer ? " active" : ""}${isStreamingForCurrentConversation ? " streaming" : ""}`}
+                onClick={() => {
+                  if (canInlineWorkspacePanel) {
+                    setWorkspaceOpen((prev) => !prev);
+                  } else {
+                    setWorkspaceOpen(true);
+                  }
+                }}
+                style={{ display: "inline-flex" }}
+              >
+                <span className="toggle-dot" />
+                Run Details
+              </span>
+            </Tooltip>
+          </Stack>
+        </Stack>
+        <Box
+          className="chat-main-column"
+          sx={{
+            flex: 1,
+            minHeight: 0,
+            width: "100%",
+            display: "flex",
+            flexDirection: "column",
+          }}
+        >
+          <Box className="chat-reading-column">
+            {selectedConversationProjectId ? (
+              <Stack
+                direction="row"
+                spacing={0.9}
+                useFlexGap
+                sx={{
+                  alignItems: "center",
+                  flexWrap: "wrap",
+                  mb: 0.5,
+                }}
+              >
+                <Chip
+                  size="small"
+                  variant="outlined"
+                  label={`Project: ${projectNameById.get(selectedConversationProjectId) || selectedConversationProjectId}`}
+                />
+              </Stack>
+            ) : null}
+
+            <Box
+              ref={threadRef}
+              sx={{ flex: 1, minHeight: 0, overflow: "auto" }}
+              className={`chat-thread chat-thread-immersive${showEmptyHero ? " chat-thread-empty" : ""}`}
+            >
+              {showEmptyHero ? (
+                <Box className="chat-empty-state">
+                  <Box className="chat-empty-brand">
+                    <Box
+                      component="img"
+                      src={AgentLogo}
+                      alt=""
+                      className="chat-empty-logo"
+                    />
+                    <Typography variant="h4" className="chat-empty-title">
+                      {conversationId ? "Draft chat" : "AgentArk"}
+                    </Typography>
+                  </Box>
+                  <Box className="chat-empty-composer-wrap">
+                    {renderAttachedFileChips("chat-empty-attachments")}
+                    <Box
+                      className={`chat-composer-shell chat-composer-shell-centered${shouldShowExecutionPlanWarning ? " has-plan" : ""}`}
+                    >
+                      {renderComposerInput(emptyComposerPlaceholder)}
+                    </Box>
+                  </Box>
+                  <Box className="chat-starter-shell">
+                    <Typography
+                      variant="caption"
+                      className="chat-starter-caption"
+                    >
+                      Common starts
+                    </Typography>
+                    <Box className="chat-starter-grid">
+                      {CHAT_STARTER_DEFAULT_EXAMPLES.map((item) => {
+                        const categoryMeta =
+                          CHAT_STARTER_CATEGORY_META[item.category];
+                        return (
+                          <Button
+                            key={item.id}
+                            variant="outlined"
+                            className="chat-starter-card"
+                            onClick={() => applyStarterExample(item)}
+                          >
+                            <Box className="chat-starter-card-body">
+                              <Box className="chat-starter-card-meta">
+                                <span className="chat-starter-tag">
+                                  {categoryMeta.label}
+                                </span>
+                                {item.deepResearch &&
+                                item.category !== "research" ? (
+                                  <span className="chat-starter-tag research">
+                                    Deep research
+                                  </span>
+                                ) : null}
+                              </Box>
+                              <Typography
+                                component="span"
+                                className="chat-starter-card-title"
+                              >
+                                {item.title}
+                              </Typography>
+                              <Typography
+                                component="span"
+                                className="chat-starter-card-copy"
+                              >
+                                {item.summary}
+                              </Typography>
+                            </Box>
+                          </Button>
+                        );
+                      })}
+                    </Box>
+                    <Box className="chat-starter-actions">
+                      <Button
+                        size="small"
+                        variant="text"
+                        className="chat-starter-toggle"
+                        endIcon={
+                          <ExpandMoreIcon
+                            sx={{
+                              transform: starterLibraryExpanded
+                                ? "rotate(180deg)"
+                                : "rotate(0deg)",
+                              transition: "transform 0.16s ease",
+                            }}
+                          />
+                        }
+                        onClick={() =>
+                          setStarterLibraryExpanded((prev) => !prev)
+                        }
+                      >
+                        {starterLibraryExpanded
+                          ? "Show fewer"
+                          : "More examples"}
+                      </Button>
+                    </Box>
+                    {starterLibraryExpanded ? (
+                      <Box className="chat-starter-library">
+                        {CHAT_STARTER_EXPANDED_SECTIONS.map((section) => (
+                          <Box
+                            key={section.id}
+                            className="chat-starter-section"
+                          >
+                            <Box className="chat-starter-section-head">
+                              <Typography
+                                variant="overline"
+                                className="chat-starter-section-title"
+                              >
+                                {section.label}
+                              </Typography>
+                              <Typography
+                                variant="caption"
+                                className="chat-starter-section-copy"
+                              >
+                                {section.description}
+                              </Typography>
+                            </Box>
+                            <Box className="chat-starter-grid chat-starter-grid-expanded">
+                              {section.items.map((item) => (
+                                <Button
+                                  key={item.id}
+                                  variant="outlined"
+                                  className="chat-starter-card"
+                                  onClick={() => applyStarterExample(item)}
+                                >
+                                  <Box className="chat-starter-card-body">
+                                    {item.deepResearch ? (
+                                      <Box className="chat-starter-card-meta">
+                                        <span className="chat-starter-tag research">
+                                          Deep research
+                                        </span>
+                                      </Box>
+                                    ) : null}
+                                    <Typography
+                                      component="span"
+                                      className="chat-starter-card-title"
+                                    >
+                                      {item.title}
+                                    </Typography>
+                                    <Typography
+                                      component="span"
+                                      className="chat-starter-card-copy"
+                                    >
+                                      {item.summary}
+                                    </Typography>
+                                  </Box>
+                                </Button>
+                              ))}
+                            </Box>
+                          </Box>
+                        ))}
+                        {CHAT_STARTER_ADVANCED_EXAMPLES.length > 0 ? (
+                          <Box className="chat-starter-advanced">
+                            <Box className="chat-starter-section-head">
+                              <Typography
+                                variant="overline"
+                                className="chat-starter-section-title"
+                              >
+                                {CHAT_STARTER_CATEGORY_META.advanced.label}
+                              </Typography>
+                              <Typography
+                                variant="caption"
+                                className="chat-starter-section-copy"
+                              >
+                                {
+                                  CHAT_STARTER_CATEGORY_META.advanced
+                                    .description
+                                }
+                              </Typography>
+                            </Box>
+                            <Box className="chat-starter-advanced-actions">
+                              <Button
+                                size="small"
+                                variant="text"
+                                className="chat-starter-toggle"
+                                endIcon={
+                                  <ExpandMoreIcon
+                                    sx={{
+                                      transform: starterAdvancedExpanded
+                                        ? "rotate(180deg)"
+                                        : "rotate(0deg)",
+                                      transition: "transform 0.16s ease",
+                                    }}
+                                  />
+                                }
+                                onClick={() =>
+                                  setStarterAdvancedExpanded((prev) => !prev)
+                                }
+                              >
+                                {starterAdvancedExpanded
+                                  ? "Hide advanced"
+                                  : "Show advanced"}
+                              </Button>
+                            </Box>
+                            {starterAdvancedExpanded ? (
+                              <Box className="chat-starter-grid chat-starter-grid-expanded">
+                                {CHAT_STARTER_ADVANCED_EXAMPLES.map((item) => (
+                                  <Button
+                                    key={item.id}
+                                    variant="outlined"
+                                    className="chat-starter-card"
+                                    onClick={() => applyStarterExample(item)}
+                                  >
+                                    <Box className="chat-starter-card-body">
+                                      <Typography
+                                        component="span"
+                                        className="chat-starter-card-title"
+                                      >
+                                        {item.title}
+                                      </Typography>
+                                      <Typography
+                                        component="span"
+                                        className="chat-starter-card-copy"
+                                      >
+                                        {item.summary}
+                                      </Typography>
+                                    </Box>
+                                  </Button>
+                                ))}
+                              </Box>
+                            ) : null}
+                          </Box>
+                        ) : null}
+                      </Box>
+                    ) : null}
+                  </Box>
+                </Box>
+              ) : (
+                <Stack spacing={1.5}>
+                  {messageRenderBundle.map((bundle) => {
+                    const {
+                      message,
+                      idx,
+                      messageId,
+                      isUser,
+                      isAssistant,
+                      tsRaw,
+                      ts,
+                      renderedContent,
+                      attachments,
+                      messageChoices,
+                      researchReport,
+                      previousUserPrompt,
+                      traceId,
+                      hasTrace,
+                      messageInputTokens,
+                      messageOutputTokens,
+                      messageTotalTokens,
+                      messageDurationMs,
+                      messageTimeToFirstTokenMs,
+                      markdownNode,
+                    } = bundle;
+                    const runMetricItems = isAssistant
+                      ? buildChatRunMetricItems({
+                          inputTokens: messageInputTokens,
+                          outputTokens: messageOutputTokens,
+                          totalTokens: messageTotalTokens,
+                          durationMs: messageDurationMs,
+                          timeToFirstTokenMs: messageTimeToFirstTokenMs,
+                        })
+                      : [];
+                    const isPlanConfirmationMessage =
+                      isAssistant &&
+                      showPlanConfirmationCard &&
+                      idx === planConfirmationMessageIndex;
+                    const traceLoading = hasTrace
+                      ? Boolean(traceLoadingById[traceId])
+                      : false;
+                    const traceError = hasTrace
+                      ? str(traceErrorById[traceId], "").trim()
+                      : "";
+                    const rawTraceSteps = hasTrace
+                      ? traceStepsById[traceId] || []
+                      : [];
+                    const traceShowsAwaitingPlanConfirmation =
+                      rawTraceSteps.length > 0 &&
+                      activityStepsRepresentAwaitingPlanConfirmation(
+                        rawTraceSteps,
+                      );
+                    const traceExpanded = Boolean(messageTraceOpen[messageId]);
+                    const traceCards =
+                      rawTraceSteps.length > 0
+                        ? rawTraceSteps.map((step, stepIdx) =>
+                            safeBuildStepCard(step, stepIdx),
+                          )
+                        : traceExpanded && hasTrace
+                          ? expandedTraceCardsById[traceId] || []
+                          : [];
+                    const inlineTraceCards = traceExpanded
+                      ? traceCards.filter((card) => !card.isHeartbeat).length >
+                        0
+                        ? traceCards.filter((card) => !card.isHeartbeat)
+                        : traceCards
+                      : [];
+                    const shouldInsertCompletedProgressBeforeMessage =
+                      shouldInlineCompletedProgressBeforeAssistant &&
+                      messageId === completedProgressBeforeMessageId;
+                    if (
+                      showPlanConfirmationCard &&
+                      !isPlanConfirmationMessage &&
+                      isAssistant &&
+                      traceShowsAwaitingPlanConfirmation
+                    ) {
+                      return null;
+                    }
+                    if (
+                      isAssistant &&
+                      (showPlanConfirmationCard ||
+                        shouldPreferDeepResearchPlanCard) &&
+                      looksLikeDiscardableResearchFailureMessage(
+                        renderedContent,
+                      )
+                    ) {
+                      return null;
+                    }
+                    return (
+                      <Fragment key={messageId}>
+                        {shouldInsertCompletedProgressBeforeMessage
+                          ? renderProgressRows("completed-progress")
+                          : null}
+                        <Box
+                          className={
+                            isUser
+                              ? "chat-row chat-row-user"
+                              : `chat-row${isPlanConfirmationMessage ? " chat-row-plan-confirmation" : ""}`
+                          }
+                        >
+                          {!isUser ? renderAgentAvatar() : null}
+                          <Box
+                            className={
+                              isUser
+                                ? "chat-bubble chat-bubble-user"
+                                : `chat-bubble chat-bubble-assistant${isPlanConfirmationMessage ? " chat-bubble-plan-confirmation" : ""}`
+                            }
+                          >
+                            {isPlanConfirmationMessage ? (
+                              renderPlanConfirmationCard({ threadMode: true })
+                            ) : (
+                              <>
+                                <Stack
+                                  direction="row"
+                                  spacing={0.5}
+                                  sx={{
+                                    justifyContent: "space-between",
+                                    alignItems: "center",
+                                  }}
+                                >
+                                  <Typography
+                                    variant="caption"
+                                    title={ts?.tooltip || undefined}
+                                    sx={{
+                                      color: "text.secondary",
+                                    }}
+                                  >
+                                    {isUser ? "You" : "AgentArk"}
+                                    {ts ? ` | ${ts.label}` : ""}
+                                  </Typography>
+                                  <Stack
+                                    direction="row"
+                                    spacing={0.25}
+                                    sx={{
+                                      alignItems: "center",
+                                    }}
+                                  >
+                                    {!isUser ? (
+                                      <Tooltip title="Download reply">
+                                        <IconButton
+                                          size="small"
+                                          onClick={() => {
+                                            void exportAssistantMessage(
+                                              message,
+                                              previousUserPrompt,
+                                            );
+                                          }}
+                                          sx={{
+                                            color: "var(--ui-rgba-189-216-249-900)",
+                                          }}
+                                        >
+                                          <FileDownloadRoundedIcon fontSize="small" />
+                                        </IconButton>
+                                      </Tooltip>
+                                    ) : null}
+                                    <Tooltip title="Copy message">
+                                      <IconButton
+                                        size="small"
+                                        onClick={() => {
+                                          void copyMessage(message);
+                                        }}
+                                        sx={{
+                                          color: "var(--ui-rgba-189-216-249-900)",
+                                        }}
+                                      >
+                                        <ContentCopyRoundedIcon fontSize="small" />
+                                      </IconButton>
+                                    </Tooltip>
+                                  </Stack>
+                                </Stack>
+                                {/* Trace steps are rendered inline from normalized run events. */}
+                                {!isUser &&
+                                inlineTraceCards.length > 0 &&
+                                !traceShowsAwaitingPlanConfirmation ? (
+                                  <InlineActivityFeed
+                                    cards={inlineTraceCards}
+                                    expandedPayloads={expandedActivityPayloads}
+                                    onTogglePayload={toggleExpandedActivityPayload}
+                                    keyPrefix={`trace:${messageId}`}
+                                    onOpenConsole={openActivityConsole}
+                                  />
+                                ) : null}
+                                {isUser ? (
+                                  <>
+                                    <Typography
+                                      variant="body2"
+                                      sx={{ whiteSpace: "pre-wrap" }}
+                                    >
+                                      {renderedContent}
+                                    </Typography>
+                                    {renderTurnAttachmentChips(
+                                      attachments,
+                                      messageId,
+                                    )}
+                                  </>
+                                ) : researchReport ? (
+                                  renderResearchReportCard({
+                                    report: researchReport,
+                                    previousUserPrompt,
+                                    messageId,
+                                    timestamp: tsRaw,
+                                    traceId,
+                                  })
+                                ) : (
+                                  markdownNode
+                                )}
+                                {runMetricItems.length > 0 ? (
+                                  <Box
+                                    className="chat-run-metrics"
+                                    aria-label="Run metrics"
+                                  >
+                                    {runMetricItems.map((item) => (
+                                      <span
+                                        className="chat-run-metric"
+                                        key={`${messageId}:${item.label}`}
+                                      >
+                                        <span className="chat-run-metric-label">
+                                          {item.label}
+                                        </span>
+                                        <span className="chat-run-metric-value">
+                                          {item.value}
+                                        </span>
+                                      </span>
+                                    ))}
+                                  </Box>
+                                ) : null}
+                                {!isUser
+                                  ? renderClarificationChoiceGroup(
+                                      messageId,
+                                      messageChoices,
+                                      idx < messages.length - 1,
+                                    )
+                                  : null}
+                              </>
+                            )}
+                          </Box>
+                          {isUser ? renderUserAvatar() : null}
+                        </Box>
+                      </Fragment>
+                    );
+                  })}
+
+                  {visiblePendingUserMessage &&
+                  (showStreamingAssistant || showInterruptedRunCard) &&
+                  latestPendingUserMessageIndex === -1 ? (
+                    <Box className="chat-row chat-row-user">
+                      <Box className="chat-bubble chat-bubble-user">
+                        <Typography
+                          variant="caption"
+                          sx={{
+                            color: "text.secondary",
+                          }}
+                        >
+                          {pendingUserMessageLabel}
+                        </Typography>
+                        <Typography
+                          variant="body2"
+                          sx={{ whiteSpace: "pre-wrap" }}
+                        >
+                          {visiblePendingUserMessage}
+                        </Typography>
+                        {renderTurnAttachmentChips(
+                          pendingTurnAttachments,
+                          "pending-user-message",
+                        )}
+                      </Box>
+                      {renderUserAvatar("chat-avatar-pending")}
+                    </Box>
+                  ) : null}
+
+                  {visibleFailedUserMessage &&
+                  !isStreamingForCurrentConversation ? (
+                    <Box className="chat-row chat-row-user">
+                      <Box className="chat-bubble chat-bubble-user">
+                        <Typography
+                          variant="caption"
+                          sx={{
+                            color: "warning.main",
+                          }}
+                        >
+                          You | not sent
+                        </Typography>
+                        <Typography
+                          variant="body2"
+                          sx={{ whiteSpace: "pre-wrap" }}
+                        >
+                          {visibleFailedUserMessage}
+                        </Typography>
+                        {renderTurnAttachmentChips(
+                          pendingTurnAttachments,
+                          "failed-user-message",
+                        )}
+                      </Box>
+                      {renderUserAvatar()}
+                    </Box>
+                  ) : null}
+
+                  {visibleStreamingProgressMessages.length > 0 &&
+                  inlineWorkspaceCards.length === 0 &&
+                  !showStreamingAssistant &&
+                  (showStreamingAssistant || !completedProgressBeforeMessageId)
+                    ? renderProgressRows(
+                        showStreamingAssistant
+                          ? "stream-progress-live"
+                          : "stream-progress-fallback",
+                      )
+                    : null}
+
+                  {showPlanConfirmationCard &&
+                  !showStreamingAssistant &&
+                  planConfirmationMessageIndex === -1 ? (
+                    <Box className="chat-row chat-row-plan-confirmation">
+                      {renderAgentAvatar()}
+                      <Box className="chat-bubble chat-bubble-assistant chat-bubble-plan-confirmation">
+                        {renderPlanConfirmationCard({ threadMode: true })}
+                      </Box>
+                    </Box>
+                  ) : null}
+
+                  {showInterruptedRunCard ? (
+                    <Box className="chat-row">
+                      {renderAgentAvatar()}
+                      <Box className="chat-bubble chat-bubble-assistant">
+                        <Stack spacing={1}>
+                          <Typography
+                            variant="caption"
+                            sx={{
+                              color: "warning.main",
+                            }}
+                          >
+                            AgentArk | interrupted
+                          </Typography>
+                          {visibleStreamingResponse.trim() ? (
+                            streamingResearchReport ? (
+                              renderResearchReportCard({
+                                report: streamingResearchReport,
+                                previousUserPrompt: streamingResearchPrompt,
+                                messageId: "streaming-interrupted-report",
+                                isStreaming: true,
+                              })
+                            ) : (
+                              renderChatMarkdown(visibleStreamingResponse)
+                            )
+                          ) : (
+                            <Typography
+                              variant="body2"
+                              sx={{
+                                color: "text.secondary",
+                              }}
+                            >
+                              {interruptedRunDetail ||
+                                "This run was interrupted before a full reply was sent."}
+                            </Typography>
+                          )}
+                          {inlineWorkspaceCards.length > 0 ? (
+                            <InlineActivityFeed
+                              cards={inlineWorkspaceCards}
+                              expandedPayloads={expandedActivityPayloads}
+                              onTogglePayload={toggleExpandedActivityPayload}
+                              keyPrefix="interrupted-run"
+                              onOpenConsole={openActivityConsole}
+                            />
+                          ) : null}
+                          <SwarmActivityPanel
+                            runs={swarmActivityRuns}
+                            interrupted
+                            expandedPayloads={expandedActivityPayloads}
+                            onTogglePayload={toggleExpandedActivityPayload}
+                          />
+                          <Box>
+                            <Button
+                              size="small"
+                              variant="outlined"
+                              disabled={
+                                !str(pendingRunSnapshot?.taskId, "").trim() ||
+                                isStreaming
+                              }
+                              onClick={() => {
+                                const taskId = str(
+                                  pendingRunSnapshot?.taskId,
+                                  "",
+                                ).trim();
+                                if (!taskId) return;
+                                void runStreamingChat("", [], {
+                                  conversationIdOverride:
+                                    conversationId || undefined,
+                                  projectIdOverride:
+                                    effectiveProjectId || undefined,
+                                  resumeTaskId: taskId,
+                                });
+                              }}
+                            >
+                              Resume
+                            </Button>
+                          </Box>
+                        </Stack>
+                      </Box>
+                    </Box>
+                  ) : null}
+
+                  {showStreamingAssistant &&
+                  latestStreamingAssistantIndex === -1 ? (
+                    !visibleStreamingResponse.trim() &&
+                    !isPlanningDeepResearch &&
+                    visibleStreamingProgressMessages.length === 0 &&
+                    inlineWorkspaceCards.length === 0 &&
+                    swarmActivityRuns.length === 0 ? (
+                    <Box className="chat-row chat-thinking-inline">
+                      {renderAgentAvatar("chat-avatar-working")}
+                      <span className="chat-thinking-text">
+                        {streamingActivity}
+                      </span>
+                    </Box>
+                  ) : (
+                    <Box className="chat-row">
+                      {renderAgentAvatar("chat-avatar-working")}
+                      <Box
+                        className={`chat-bubble chat-bubble-assistant${isPlanningDeepResearch && !visibleStreamingResponse.trim() ? " chat-bubble-plan-confirmation" : " chat-bubble-streaming"}`}
+                      >
+                        {isPlanningDeepResearch &&
+                        !visibleStreamingResponse.trim() ? (
+                          renderPlanConfirmationCard({ threadMode: true })
+                        ) : (
+                          <Stack className="chat-stream-section-stack" spacing={1}>
+                            <Typography
+                              variant="caption"
+                              className="chat-streaming-status"
+                              sx={{
+                                color: "text.secondary",
+                              }}
+                            >
+                              {streamingResearchReport
+                                ? "Deep research report is streaming..."
+                                : nowDoingLabel || streamingActivity}
+                            </Typography>
+                            {visibleStreamingResponse.trim() ? (
+                              <Box className="chat-stream-section chat-stream-section-reply">
+                                <Typography
+                                  variant="caption"
+                                  className="chat-stream-section-kicker"
+                                >
+                                  Reply
+                                </Typography>
+                                {streamingResearchReport ? (
+                                  <Box sx={{ position: "relative" }}>
+                                    {renderResearchReportCard({
+                                      report: streamingResearchReport,
+                                      previousUserPrompt: streamingResearchPrompt,
+                                      messageId: "streaming-report",
+                                      isStreaming: true,
+                                    })}
+                                    <span className="stream-caret" />
+                                  </Box>
+                                ) : (
+                                  <Box sx={{ position: "relative" }}>
+                                    {renderStreamingChatMarkdown(visibleStreamingResponse)}
+                                    <span className="stream-caret" />
+                                  </Box>
+                                )}
+                              </Box>
+                            ) : null}
+                            {inlineWorkspaceCards.length > 0 &&
+                            !isPlanningDeepResearch ? (
+                              <Box className="chat-stream-section chat-stream-section-work">
+                                <Typography
+                                  variant="caption"
+                                  className="chat-stream-section-kicker"
+                                >
+                                  Work
+                                </Typography>
+                                <InlineActivityFeed
+                                  cards={inlineWorkspaceCards}
+                                  live={isStreamingForCurrentConversation}
+                                  expandedPayloads={expandedActivityPayloads}
+                                  onTogglePayload={toggleExpandedActivityPayload}
+                                  keyPrefix="live-run"
+                                  onOpenConsole={openActivityConsole}
+                                />
+                              </Box>
+                            ) : null}
+                            {!visibleStreamingResponse.trim() &&
+                            inlineWorkspaceCards.length === 0 ? (
+                              <div className="typing-dots" aria-label="typing">
+                                <span />
+                                <span />
+                                <span />
+                              </div>
+                            ) : null}
+                            {streamingRunMetricItems.length > 0 ? (
+                              <Box
+                                className="chat-run-metrics chat-run-metrics-live"
+                                aria-label="Live run metrics"
+                              >
+                                {streamingRunMetricItems.map((item) => (
+                                  <span
+                                    className="chat-run-metric"
+                                    key={`streaming:${item.label}`}
+                                  >
+                                    <span className="chat-run-metric-label">
+                                      {item.label}
+                                    </span>
+                                    <span className="chat-run-metric-value">
+                                      {item.value}
+                                    </span>
+                                  </span>
+                                ))}
+                              </Box>
+                            ) : null}
+                            {visibleStreamingResponse.trim()
+                              ? renderClarificationChoiceGroup(
+                                  `streaming-clarification:${str(
+                                    pendingRunSnapshot?.runId,
+                                    visibleStreamingResponse.slice(0, 80),
+                                  )}`,
+                                  streamingResponseChoices,
+                                )
+                              : null}
+                            <SwarmActivityPanel
+                              runs={swarmActivityRuns}
+                              expandedPayloads={expandedActivityPayloads}
+                              onTogglePayload={toggleExpandedActivityPayload}
+                            />
+                          </Stack>
+                        )}
+                      </Box>
+                    </Box>
+                  )
+                  ) : null}
+                </Stack>
+              )}
+            </Box>
+
+            {visibleConversationError ? (
+              <Alert severity="error" sx={{ mt: 1 }}>
+                <Stack spacing={1}>
+                  <Typography variant="body2">
+                    {normalizeChatError(
+                      chatError ||
+                        errMessage(
+                          visibleConversationListError || visibleMessagesError,
+                        ),
+                    )}
+                  </Typography>
+                  {searchSetupActionNeeded ? (
+                    <Box>
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        onClick={() => onNavigateToView?.("search")}
+                      >
+                        Open Search Settings
+                      </Button>
+                    </Box>
+                  ) : null}
+                </Stack>
+              </Alert>
+            ) : null}
+            {credentialActionNeeded ? (
+              <Box className="chat-action-required" sx={{ mt: 1 }}>
+                <Stack spacing={1}>
+                  <Typography variant="subtitle2">
+                    Waiting for your input
+                  </Typography>
+                  <Typography
+                    variant="body2"
+                    sx={{
+                      color: "text.secondary",
+                    }}
+                  >
+                    A secure credential is required before I can continue. If
+                    this should reuse the current model key, use that option.
+                    Otherwise enter the key name and save the value here.
+                  </Typography>
+                  <Stack
+                    direction={{ xs: "column", md: "row" }}
+                    spacing={1}
+                    className="chat-action-options"
+                  >
+                    <Button
+                      size="small"
+                      variant={
+                        secretHelperMode === "reuse" ? "contained" : "outlined"
+                      }
+                      onClick={async () => {
+                        setSecretHelperMode("reuse");
+                        await submitSecretHelper("reuse");
+                      }}
+                    >
+                      Use current model key
+                    </Button>
+                    <Button
+                      size="small"
+                      variant={
+                        secretHelperMode === "manual" ? "contained" : "outlined"
+                      }
+                      onClick={() => setSecretHelperMode("manual")}
+                    >
+                      Add secret manually
+                    </Button>
+                  </Stack>
+                  <Stack
+                    direction={{ xs: "column", md: "row" }}
+                    spacing={1}
+                    sx={{
+                      alignItems: { md: "center" },
+                    }}
+                  >
+                    <TextField
+                      size="small"
+                      label="Key name"
+                      value={secretHelperKey}
+                      onChange={(e) =>
+                        setSecretHelperKey(e.target.value.toUpperCase())
+                      }
+                      placeholder="OPENAI_API_KEY"
+                      sx={{ minWidth: 210 }}
+                    />
+                    {secretHelperMode === "manual" ? (
+                      <TextField
+                        size="small"
+                        label="Key value"
+                        type="password"
+                        value={secretHelperValue}
+                        onChange={(e) => setSecretHelperValue(e.target.value)}
+                        placeholder="Paste key"
+                        sx={{ flex: 1 }}
+                      />
+                    ) : (
+                      <Typography
+                        variant="caption"
+                        sx={{
+                          color: "text.secondary",
+                          flex: 1,
+                        }}
+                      >
+                        Reuses your current model key and stores it encrypted
+                        for this app.
+                      </Typography>
+                    )}
+                    <Button
+                      size="small"
+                      variant="contained"
+                      disabled={secretHelperBusy || isStreaming}
+                      onClick={() => {
+                        void submitSecretHelper();
+                      }}
+                    >
+                      {secretHelperBusy ? "Saving..." : "Save and continue"}
+                    </Button>
+                  </Stack>
+                </Stack>
+              </Box>
+            ) : null}
+            {chatCredentialPromptVisible ? (
+              <Box className="list-shell" sx={{ mt: 1 }}>
+                <Stack spacing={1.25}>
+                  <Box>
+                    <Typography variant="subtitle2">
+                      {str(
+                        chatCredentialPrompt.title,
+                        "Secure credentials required",
+                      )}
+                    </Typography>
+                    <Typography
+                      variant="body2"
+                      sx={{
+                        color: "text.secondary",
+                        mt: 0.4,
+                      }}
+                    >
+                      {str(chatCredentialPrompt.description, "").trim() ||
+                        "Provide the requested credential values here so AgentArk can store them encrypted and continue."}
+                    </Typography>
+                  </Box>
+                  <Alert severity="warning" sx={{ py: 0.5 }}>
+                    {str(chatCredentialPrompt.warning, "").trim() ||
+                      CHAT_SECRET_WARNING}
+                  </Alert>
+                  {chatCredentialPromptDocsUrl ? (
+                    <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                      Where do I get this?{" "}
+                      <a
+                        href={chatCredentialPromptDocsUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        onClick={handleChatLinkClick}
+                      >
+                        Open integration docs
+                      </a>
+                    </Typography>
+                  ) : null}
+                  {chatCredentialPromptIsOAuthShape ? (
+                    <Alert severity="info" sx={{ py: 0.5 }}>
+                      This integration uses an OAuth browser handoff. Save any
+                      client values below, then click the connect button to
+                      finish signing in.
+                    </Alert>
+                  ) : null}
+                  <Grid2 container spacing={1}>
+                    {chatCredentialPromptFields.map((field, index) => {
+                      const key = str(field.key, "").trim();
+                      if (!key) return null;
+                      const required = toBool(field.required);
+                      const inputType = str(field.input_type, "password")
+                        .trim()
+                        .toLowerCase();
+                      const isTextarea = inputType === "textarea";
+                      const isPlainText = inputType === "text";
+                      const placeholder = str(field.placeholder, "");
+                      const help = str(field.help, "").trim();
+                      const helperText = help
+                        ? help
+                        : required
+                          ? "Required"
+                          : "Optional";
+                      return (
+                        <Grid2
+                          key={`${key}-${index}`}
+                          size={{
+                            xs: 12,
+                            md:
+                              chatCredentialPromptFields.length > 1 &&
+                              !isTextarea
+                                ? 6
+                                : 12,
+                          }}
+                        >
+                          <TextField
+                            fullWidth
+                            size="small"
+                            type={isPlainText || isTextarea ? "text" : "password"}
+                            multiline={isTextarea}
+                            minRows={isTextarea ? 3 : undefined}
+                            autoComplete="off"
+                            label={str(field.label, key)}
+                            placeholder={placeholder || undefined}
+                            value={chatCredentialValues[key] || ""}
+                            onChange={(e) => {
+                              const value = e.target.value;
+                              setChatCredentialValues((prev) => ({
+                                ...prev,
+                                [key]: value,
+                              }));
+                              if (chatCredentialError) {
+                                setChatCredentialError(null);
+                              }
+                            }}
+                            helperText={helperText}
+                          />
+                        </Grid2>
+                      );
+                    })}
+                  </Grid2>
+                  {chatCredentialError ? (
+                    <Alert severity="error" sx={{ py: 0.5 }}>
+                      {chatCredentialError}
+                    </Alert>
+                  ) : null}
+                  <Stack
+                    direction={{ xs: "column", md: "row" }}
+                    spacing={1}
+                    sx={{ alignItems: { md: "center" } }}
+                  >
+                    <Button
+                      size="small"
+                      variant="contained"
+                      disabled={
+                        submitChatCredentialPromptMutation.isPending ||
+                        isStreaming
+                      }
+                      onClick={() => {
+                        void submitChatCredentialPrompt();
+                      }}
+                    >
+                      {submitChatCredentialPromptMutation.isPending
+                        ? "Saving..."
+                        : str(
+                            chatCredentialPrompt.submit_label,
+                            "Save securely",
+                          )}
+                    </Button>
+                    {str(chatCredentialPrompt.fallback_command, "").trim() ? (
+                      <Typography
+                        variant="caption"
+                        sx={{
+                          color: "text.secondary",
+                        }}
+                      >
+                        <code>
+                          {str(chatCredentialPrompt.fallback_command, "")}
+                        </code>
+                      </Typography>
+                    ) : null}
+                  </Stack>
+                </Stack>
+              </Box>
+            ) : null}
+            {chatNotice &&
+            !visibleConversationListError &&
+            !visibleMessagesError &&
+            !chatError ? (
+              <Alert severity="info" sx={{ mt: 1 }}>
+                {chatNotice}
+              </Alert>
+            ) : null}
+            {isDragOverChat ? (
+              <Box className="chat-drop-overlay">
+                <Typography variant="subtitle2">
+                  Drop files to attach
+                </Typography>
+                <Typography
+                  variant="caption"
+                  sx={{
+                    color: "text.secondary",
+                  }}
+                >
+                  Supported: TXT, MD, JSON, CSV, XML, YAML, PDF, DOCX, LOG,
+                  HTML, PNG, JPG, WEBP, GIF
+                </Typography>
+              </Box>
+            ) : null}
+
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              accept=".txt,.md,.markdown,.json,.csv,.tsv,.xml,.yaml,.yml,.pdf,.docx,.log,.html,.htm,.png,.jpg,.jpeg,.gif,.webp,.bmp,.tif,.tiff,.svg,image/*"
+              style={{ display: "none" }}
+              onChange={(e) => {
+                queueAttachedFiles(e.target.files);
+                e.currentTarget.value = "";
+              }}
+            />
+            {!showEmptyHero ? renderAttachedFileChips() : null}
+            {shouldShowCompactExecutionPlan ? (
+              <Accordion
+                expanded={executionPlanExpanded}
+                onChange={(_, expanded) => setExecutionPlanExpanded(expanded)}
+                disableGutters
+                elevation={0}
+                className={`chat-plan-strip${executionPlanExpanded ? " expanded" : ""}`}
+              >
+                <AccordionSummary
+                  expandIcon={
+                    <ExpandMoreIcon
+                      sx={{ color: "var(--ui-rgba-196-223-255-820)" }}
+                    />
+                  }
+                  className="chat-plan-summary"
+                >
+                  <Stack
+                    direction="row"
+                    spacing={1}
+                    sx={{
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      width: "100%",
+                      minWidth: 0,
+                    }}
+                  >
+                    <Box sx={{ minWidth: 0 }}>
+                      <Stack
+                        direction="row"
+                        spacing={0.8}
+                        useFlexGap
+                        sx={{
+                          alignItems: "center",
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <Typography
+                          variant="caption"
+                          className="chat-plan-kicker"
+                        >
+                          Planner
+                        </Typography>
+                        {executionPlanActiveCount > 0 ||
+                        isExecutionPlanFinalizing ||
+                        isExecutionPlanTransitioning ? (
+                          <CircularProgress
+                            size={12}
+                            thickness={6}
+                            className="chat-plan-spinner"
+                          />
+                        ) : null}
+                        <Typography
+                          variant="body2"
+                          className="chat-plan-status"
+                        >
+                          {executionPlanStatusLabel}
+                        </Typography>
+                      </Stack>
+                      <Typography
+                        variant="caption"
+                        className="chat-plan-summary-copy"
+                      >
+                        {executionPlanSummaryText}
+                      </Typography>
+                    </Box>
+                  </Stack>
+                </AccordionSummary>
+                <AccordionDetails className="chat-plan-details">
+                  <Stack spacing={0.75}>
+                    {displayedExecutionPlan.map((step) => {
+                      const isCompleted = step.status === "completed";
+                      const isRunning = step.status === "running";
+                      const isFailed = step.status === "failed";
+                      const stepCopy = describeExecutionPlanStep(
+                        step,
+                        `Step ${step.id}`,
+                      );
+                      return (
+                        <Box
+                          key={step.id}
+                          className={`chat-plan-step${isCompleted ? " done" : ""}${isRunning ? " running" : ""}${isFailed ? " failed" : ""}`}
+                        >
+                          <Box className="chat-plan-step-marker">
+                            {isCompleted ? (
+                              "\u2713"
+                            ) : isFailed ? (
+                              "\u2715"
+                            ) : (
+                              <span className="chat-plan-step-dot" />
+                            )}
+                          </Box>
+                          <Box sx={{ minWidth: 0, flex: 1 }}>
+                            <Typography
+                              variant="body2"
+                              className="chat-plan-step-title"
+                            >
+                              {step.id}. {stepCopy.title}
+                            </Typography>
+                            {stepCopy.description ? (
+                              <Typography
+                                variant="caption"
+                                className="chat-plan-step-detail"
+                              >
+                                {stepCopy.description}
+                              </Typography>
+                            ) : null}
+                            {step.substeps.length > 0 ? (
+                              <Stack
+                                spacing={0.55}
+                                className="chat-plan-substeps"
+                              >
+                                {step.substeps.map((substep) => {
+                                  const isSubCompleted =
+                                    substep.status === "completed";
+                                  const isSubRunning =
+                                    substep.status === "running";
+                                  const isSubFailed =
+                                    substep.status === "failed";
+                                  return (
+                                    <Box
+                                      key={`${step.id}:${substep.id}`}
+                                      className={`chat-plan-substep${isSubCompleted ? " done" : ""}${isSubRunning ? " running" : ""}${isSubFailed ? " failed" : ""}`}
+                                    >
+                                      <Box className="chat-plan-substep-marker">
+                                        {isSubCompleted ? (
+                                          "\u2713"
+                                        ) : isSubFailed ? (
+                                          "\u2715"
+                                        ) : (
+                                          <span className="chat-plan-substep-dot" />
+                                        )}
+                                      </Box>
+                                      <Typography
+                                        variant="caption"
+                                        className="chat-plan-substep-title"
+                                      >
+                                        {step.id}.{substep.id} {substep.title}
+                                      </Typography>
+                                    </Box>
+                                  );
+                                })}
+                              </Stack>
+                            ) : null}
+                          </Box>
+                        </Box>
+                      );
+                    })}
+                  </Stack>
+                </AccordionDetails>
+              </Accordion>
+            ) : null}
+            {!showEmptyHero ? (
+              <Box
+                className={`chat-composer-shell${shouldShowExecutionPlanWarning ? " has-plan" : ""}`}
+              >
+                {shouldShowExecutionPlanWarning ? (
+                  <Box className="chat-composer-plan-warning">
+                    <Stack spacing={1}>
+                      <Stack
+                        direction="row"
+                        spacing={1.1}
+                        sx={{
+                          alignItems: "flex-start",
+                        }}
+                      >
+                        <Box className="chat-composer-plan-icon status-failed">
+                          {renderExecutionPlanStatusIcon("failed")}
+                        </Box>
+                        <Box sx={{ minWidth: 0, flex: 1 }}>
+                          <Stack
+                            direction="row"
+                            spacing={0.8}
+                            useFlexGap
+                            sx={{
+                              alignItems: "center",
+                              flexWrap: "wrap",
+                            }}
+                          >
+                            <Typography
+                              variant="caption"
+                              className="chat-composer-plan-kicker"
+                            >
+                              Planner
+                            </Typography>
+                            <Typography
+                              variant="caption"
+                              className="chat-composer-plan-status"
+                            >
+                              Planner offline
+                            </Typography>
+                          </Stack>
+                          <Typography
+                            variant="caption"
+                            className="chat-composer-plan-summary"
+                          >
+                            {visibleExecutionPlanFailure}
+                          </Typography>
+                        </Box>
+                      </Stack>
+                      {searchSetupActionNeeded ? (
+                        <Box>
+                          <Button
+                            size="small"
+                            variant="outlined"
+                            onClick={() => onNavigateToView?.("search")}
+                          >
+                            Open Search Settings
+                          </Button>
+                        </Box>
+                      ) : null}
+                    </Stack>
+                  </Box>
+                ) : null}
+                {renderComposerInput(composerPlaceholder)}
+              </Box>
+            ) : null}
+          </Box>
+        </Box>
+      </Box>
+      {showWorkspacePanelInline ? (
+        <Box sx={{ minHeight: 0, display: { xs: "none", lg: "contents" } }}>
+          {renderActivityPanelContent()}
+        </Box>
+      ) : null}
+      <Drawer
+        anchor="left"
+        open={showConversationSidebarDrawer}
+        onClose={() => setConversationSidebarOpen(false)}
+        ModalProps={{ keepMounted: true }}
+        slotProps={{
+          paper: { className: "chat-mobile-drawer chat-mobile-drawer-left" },
+        }}
+      >
+        {renderConversationSidebarContent(true)}
+      </Drawer>
+      <Drawer
+        anchor="right"
+        open={showWorkspacePanelDrawer}
+        onClose={() => setWorkspaceOpen(false)}
+        ModalProps={{ keepMounted: true }}
+        slotProps={{
+          paper: { className: "chat-mobile-drawer chat-mobile-drawer-right" },
+        }}
+      >
+        {renderActivityPanelContent(true)}
+      </Drawer>
+      {/* Code Viewer Dialog */}
+      <Dialog
+        open={codeViewerOpen && isShowingSnippetPreview}
+        onClose={() => setCodeViewerOpen(false)}
+        maxWidth="lg"
+        fullWidth
+        slotProps={{
+          paper: { className: "code-viewer-dialog" },
+        }}
+      >
+        <DialogTitle
+          sx={{
+            p: "10px 16px",
+            borderBottom: "1px solid var(--ui-rgba-100-160-230-180)",
+          }}
+        >
+          <Stack
+            direction="row"
+            sx={{
+              justifyContent: "space-between",
+              alignItems: "center",
+            }}
+          >
+            <Box>
+              <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>
+                Assistant Snippets
+              </Typography>
+              <Typography
+                variant="caption"
+                sx={{
+                  color: "text.secondary",
+                }}
+              >
+                {activeWorkspaceCodeSourceLabel}
+              </Typography>
+            </Box>
+            <IconButton size="small" onClick={() => setCodeViewerOpen(false)}>
+              <CloseIcon fontSize="small" />
+            </IconButton>
+          </Stack>
+          {workspaceSnippetFiles.length > 1 ? (
+            <Box className="code-file-tabs" sx={{ mt: 0.5 }}>
+              {workspaceSnippetFiles.map((snippet) => (
+                <button
+                  key={snippet.id}
+                  className={`code-file-tab${activeSnippetFile?.id === snippet.id ? " code-file-tab-active" : ""}`}
+                  onClick={() => setSelectedSnippetId(snippet.id)}
+                >
+                  {snippet.displayName}
+                </button>
+              ))}
+            </Box>
+          ) : null}
+        </DialogTitle>
+        <DialogContent sx={{ p: 0 }}>
+          {activeWorkspaceCodeEntry && (
+            <>
+              <pre className="code-viewer-pre">
+                <code>
+                  {renderCodeBlockLines(activeWorkspaceCodeContent || "", {
+                    fileName: activeWorkspaceCodePath,
+                  })}
+                </code>
+              </pre>
+              <Box sx={{ px: 1.5, pb: 1 }}>
+                <Typography
+                  variant="caption"
+                  sx={{
+                    color: "text.secondary",
+                  }}
+                >
+                  Referenced from {activeWorkspaceCodeSourceLabel}.
+                </Typography>
+              </Box>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
+      <Dialog
+        open={previewDialogOpen}
+        onClose={() => setPreviewDialogOpen(false)}
+        maxWidth="md"
+        fullWidth
+      >
+        <DialogTitle
+          sx={{
+            p: "10px 16px",
+            borderBottom: "1px solid var(--ui-rgba-100-160-230-180)",
+          }}
+        >
+          Deployment Preview
+        </DialogTitle>
+        <DialogContent sx={{ p: 2 }}>
+          <Stack spacing={1}>
+            <Typography variant="body2">
+              Local:{" "}
+              <Link
+                href={previewUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                underline="hover"
+              >
+                {previewUrl}
+              </Link>
+            </Typography>
+            {publicPreviewUrl ? (
+              <Typography variant="body2">
+                {workspaceTunnelMeta.isPrivate ? "Private access:" : "Public:"}{" "}
+                <Link
+                  href={publicPreviewUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  underline="hover"
+                >
+                  {publicPreviewUrl}
+                </Link>
+              </Typography>
+            ) : null}
+            {previewImageUrl ? (
+              <Box
+                component="img"
+                src={previewImageUrl}
+                alt="Deployed app screenshot"
+                sx={{
+                  width: "100%",
+                  borderRadius: 1,
+                  border: "1px solid var(--ui-rgba-255-255-255-080)",
+                  background: "var(--ui-rgba-20-20-24-880)",
+                }}
+              />
+            ) : (
+              <Alert severity="info">
+                No screenshot is available yet for this deployment.
+              </Alert>
+            )}
+          </Stack>
+        </DialogContent>
+      </Dialog>
+      <Dialog
+        open={!!researchReportDialog}
+        onClose={() => setResearchReportDialog(null)}
+        maxWidth="lg"
+        fullWidth
+        slotProps={{
+          paper: { className: "chat-research-report-dialog" },
+        }}
+      >
+        <DialogTitle className="chat-research-report-dialog-title">
+          <Stack
+            direction="row"
+            spacing={1.5}
+            sx={{
+              justifyContent: "space-between",
+              alignItems: "flex-start",
+            }}
+          >
+            <Box sx={{ minWidth: 0, flex: 1 }}>
+              <Typography
+                variant="subtitle1"
+                className="chat-research-report-dialog-heading"
+              >
+                {researchReportDialog?.report.title || "Research report"}
+              </Typography>
+              <Typography
+                variant="caption"
+                className="chat-research-report-dialog-meta"
+              >
+                {researchReportDialog
+                  ? researchReportMetaLabel(researchReportDialog.report)
+                  : "Research report"}
+              </Typography>
+            </Box>
+            <Stack direction="row" spacing={0.5}>
+              <Tooltip title="Download report">
+                <span>
+                  <IconButton
+                    size="small"
+                    onClick={() => {
+                      if (!researchReportDialog) return;
+                      void exportAssistantMarkdown({
+                        content: researchReportDialog.report.content,
+                        headingHint: researchReportDialog.report.title,
+                        previousUserPrompt:
+                          researchReportDialog.previousUserPrompt,
+                        timestamp: researchReportDialog.timestamp,
+                        traceId: researchReportDialog.traceId,
+                      });
+                    }}
+                  >
+                    <FileDownloadRoundedIcon fontSize="small" />
+                  </IconButton>
+                </span>
+              </Tooltip>
+              <IconButton
+                size="small"
+                onClick={() => setResearchReportDialog(null)}
+              >
+                <CloseIcon fontSize="small" />
+              </IconButton>
+            </Stack>
+          </Stack>
+        </DialogTitle>
+        <DialogContent dividers className="chat-research-report-dialog-content">
+          {researchReportDialog
+            ? renderChatMarkdown(researchReportDialog.report.content, {
+                snippetNamespace: `research-report-${researchReportDialog.messageId || "dialog"}`,
+                onOpenSnippet: openCodePreviewInWorkspace,
+              })
+            : null}
+        </DialogContent>
+        <DialogActions className="chat-research-report-dialog-actions">
+          <Button
+            variant="outlined"
+            onClick={() => {
+              if (!researchReportDialog) return;
+              void exportAssistantMarkdown({
+                content: researchReportDialog.report.content,
+                headingHint: researchReportDialog.report.title,
+                previousUserPrompt: researchReportDialog.previousUserPrompt,
+                timestamp: researchReportDialog.timestamp,
+                traceId: researchReportDialog.traceId,
+              });
+            }}
+          >
+            Download
+          </Button>
+          <Button
+            variant="contained"
+            onClick={() => setResearchReportDialog(null)}
+          >
+            Close
+          </Button>
+        </DialogActions>
+      </Dialog>
+    </Box>
+  );
+}
+
+const ChatPage = memo(ChatPageInner);
+ChatPage.displayName = "ChatPage";
+
+export default ChatPage;
+function formatTraceDuration(durationMs: unknown): string {
+  const ms = num(durationMs, -1);
+  if (ms < 0) return "pending";
+  if (ms < 1000) return `${ms}ms`;
+  const totalSeconds = ms / 1000;
+  if (totalSeconds < 60)
+    return `${totalSeconds >= 10 ? totalSeconds.toFixed(0) : totalSeconds.toFixed(1)}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = Math.round(totalSeconds % 60);
+  return `${minutes}m ${seconds}s`;
+}
+
+function buildEvolutionFocusCaseLabel(row: JsonRecord): string {
+  const surface = str(row.surface, "case").trim();
+  const delta = num(row.score_delta, Number.NaN);
+  const preview = str(row.prompt_preview, "").trim();
+  const invalidBefore = toBool(row.invalid_json_before);
+  const invalidAfter = toBool(row.invalid_json_after);
+  const parts = [surface];
+  if (Number.isFinite(delta))
+    parts.push(`${delta >= 0 ? "+" : ""}${(delta * 100).toFixed(0)} pts`);
+  if (invalidBefore !== invalidAfter)
+    parts.push(invalidAfter ? "JSON regressed" : "JSON stabilized");
+  if (preview) parts.push(preview);
+  return parts.join(" / ");
+}
+
+function traceStatusColor(
+  status: string,
+): "default" | "success" | "warning" | "error" {
+  switch (status.trim().toLowerCase()) {
+    case "completed":
+      return "success";
+    case "warning":
+      return "warning";
+    case "failed":
+      return "error";
+    default:
+      return "default";
+  }
+}
+
+function traceStepColor(
+  stepType: string,
+): "default" | "success" | "warning" | "error" {
+  switch (stepType.trim().toLowerCase()) {
+    case "success":
+      return "success";
+    case "warning":
+      return "warning";
+    case "error":
+      return "error";
+    default:
+      return "default";
+  }
+}
+
+function formatTraceData(value: unknown): string {
+  if (typeof value !== "string") return str(value, "");
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  try {
+    return JSON.stringify(JSON.parse(trimmed), null, 2);
+  } catch {
+    return trimmed;
+  }
+}
+
+type TraceEvidenceItem = {
+  title: string;
+  detail: string;
+  type: string;
+};
+
+type TraceStepConsoleView = {
+  detail: string;
+  dataText: string;
+};
+
+function pickTraceStepArtifacts(step: JsonRecord): JsonRecord[] {
+  return pickRecords(step, "artifacts");
+}
+
+function traceArtifactLabel(artifact: JsonRecord): string {
+  const explicit = str(artifact.label, "").trim();
+  if (explicit) return explicit;
+  const kind = str(artifact.kind, "").trim();
+  return kind ? titleCaseLabel(kind) : "Artifact";
+}
+
+function traceArtifactKindLabel(artifact: JsonRecord): string {
+  const kind = str(artifact.kind, "").trim();
+  return kind ? titleCaseLabel(kind) : "Artifact";
+}
+
+function traceArtifactFormat(artifact: JsonRecord): string {
+  return str(artifact.format, "").trim().toUpperCase();
+}
+
+function traceArtifactBody(artifact: JsonRecord): string {
+  const raw = artifact.data;
+  if (typeof raw === "string") return formatTraceData(raw);
+  if (raw == null) return "";
+  try {
+    return JSON.stringify(raw, null, 2);
+  } catch {
+    return str(raw, "");
+  }
+}
+
+function traceArtifactSummary(artifact: JsonRecord): string {
+  const explicit = str(artifact.summary, "").trim();
+  if (explicit) return explicit;
+  const body = collapseInlineWhitespace(traceArtifactBody(artifact));
+  return body ? truncateTraceEvidence(body, 180) : "";
+}
+
+function traceArtifactChipLabel(artifact: JsonRecord): string {
+  const label = traceArtifactLabel(artifact);
+  const summary = traceArtifactSummary(artifact);
+  if (summary && summary.length <= 56) {
+    return `${label}: ${summary}`;
+  }
+  return label;
+}
+
+function summarizeTraceArtifactsInline(artifacts: JsonRecord[]): string {
+  return uniqueNonEmptyStrings(
+    artifacts.map(
+      (artifact) =>
+        traceArtifactSummary(artifact) || traceArtifactLabel(artifact),
+    ),
+  )
+    .slice(0, 2)
+    .map((value) => truncateTraceEvidence(value, 120))
+    .join(" | ");
+}
+
+function buildTraceArtifactBlocks(artifacts: JsonRecord[]): string {
+  return artifacts
+    .map((artifact) => {
+      const label = traceArtifactLabel(artifact);
+      const format = traceArtifactFormat(artifact);
+      const summary = traceArtifactSummary(artifact);
+      const body = traceArtifactBody(artifact);
+      const lines = [
+        format ? `${label} (${format})` : label,
+        summary ? `Summary: ${summary}` : "",
+        body,
+      ].filter(Boolean);
+      return lines.join("\n");
+    })
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function truncateTraceEvidence(value: string, max = 240): string {
+  const trimmed = value.trim();
+  if (trimmed.length <= max) return trimmed;
+  return `${trimmed.slice(0, Math.max(0, max - 3)).trimEnd()}...`;
+}
+
+function summarizeTraceOutcome(trace: JsonRecord): string {
+  const status = str(trace.status, "").trim().toLowerCase();
+  if (status === "completed") {
+    return `Outcome: completed successfully in ${formatTraceDuration(trace.duration_ms)}`;
+  }
+  if (status === "failed" || status === "error" || status === "warning") {
+    return `Outcome: failed after ${formatTraceDuration(trace.duration_ms)}`;
+  }
+  if (!status || status === "running") {
+    return "Outcome: still running";
+  }
+  return `Outcome: ${status}`;
+}
+
+function isExecutionProofStep(step: JsonRecord): boolean {
+  const combined =
+    `${str(step.title, "")}\n${str(step.detail, "")}\n${formatTraceData(step.data)}`.toLowerCase();
+  return /execution record saved|execution proof generated|verification id:|proof id:/.test(
+    combined,
+  );
+}
+
+function buildTraceEvidenceItems(steps: JsonRecord[]): TraceEvidenceItem[] {
+  return steps
+    .map((step) => {
+      const title = str(step.title, "").trim();
+      const detail = str(step.detail, "").trim();
+      const dataText = formatTraceData(step.data);
+      const type = str(step.type, str(step.step_type, "step")).trim() || "step";
+      const combined = `${title}\n${detail}\n${dataText}`.toLowerCase();
+      if (!title && !detail && !dataText) return null;
+      if (
+        /execution record saved|execution proof generated|verification id:|proof id:/.test(
+          combined,
+        )
+      )
+        return null;
+      if (
+        /memory available|context packing|selected the best available model|using a direct execution strategy|prepared the next response/.test(
+          combined,
+        ) &&
+        !dataText
+      ) {
+        return null;
+      }
+      const summary = detail || dataText || title;
+      return {
+        title: title || "Step",
+        detail: truncateTraceEvidence(summary),
+        type,
+      };
+    })
+    .filter((item): item is TraceEvidenceItem => Boolean(item))
+    .slice(-4);
+}
+
+function extractTraceArtifacts(
+  trace: JsonRecord,
+  steps: JsonRecord[],
+): string[] {
+  const artifactLabels = uniqueNonEmptyStrings(
+    steps.flatMap((step) =>
+      pickTraceStepArtifacts(step).map((artifact) =>
+        traceArtifactChipLabel(artifact),
+      ),
+    ),
+  );
+  if (artifactLabels.length > 0) {
+    return artifactLabels.slice(0, 6);
+  }
+  const sources = [
+    str(trace.response, ""),
+    ...steps.flatMap((step) => [
+      str(step.detail, ""),
+      formatTraceData(step.data),
+    ]),
+  ];
+  const found = new Set<string>();
+  for (const source of sources) {
+    const text = source.trim();
+    if (!text) continue;
+    for (const match of text.match(/https?:\/\/[^\s"'<>]+/g) || []) {
+      found.add(match);
+    }
+    for (const match of text.match(/[A-Za-z]:\\[^\s"'<>]+/g) || []) {
+      found.add(match);
+    }
+  }
+  return Array.from(found).slice(0, 6);
+}
+
+function buildExecutionProofConsoleEvidence(
+  trace: JsonRecord,
+  steps: JsonRecord[],
+): string {
+  const lines: string[] = [];
+  const action = truncateTraceEvidence(str(trace.message, ""), 180);
+  const outcome = summarizeTraceOutcome(trace);
+  const finalResult = truncateTraceEvidence(str(trace.response, ""), 220);
+  const artifacts = extractTraceArtifacts(trace, steps).slice(0, 3);
+  const keyEvidence = buildTraceEvidenceItems(steps).slice(-3);
+
+  if (action) lines.push(`Action attempted: ${action}`);
+  lines.push(outcome);
+  if (finalResult) lines.push(`Final result: ${finalResult}`);
+  if (artifacts.length > 0) {
+    lines.push(`Artifacts or outputs: ${artifacts.join(" | ")}`);
+  }
+  for (const item of keyEvidence) {
+    lines.push(`${item.title}: ${item.detail}`);
+  }
+  lines.push(
+    "Open Trace Detail for the verification record and the full evidence.",
+  );
+
+  return lines.join("\n");
+}
+
+function buildTraceStepConsoleView(
+  trace: JsonRecord,
+  steps: JsonRecord[],
+  step: JsonRecord,
+): TraceStepConsoleView {
+  const detail = str(step.detail, "").trim();
+  const rawDataText = formatTraceData(step.data);
+  const artifactText = buildTraceArtifactBlocks(pickTraceStepArtifacts(step));
+  const dataText =
+    artifactText && rawDataText.trim() === artifactText.trim()
+      ? artifactText
+      : [rawDataText, artifactText].filter(Boolean).join("\n\n");
+
+  if (!isExecutionProofStep(step)) {
+    return { detail, dataText };
+  }
+
+  return {
+    detail:
+      "Verifiable execution record saved. The evidence for this run is summarized below.",
+    dataText: buildExecutionProofConsoleEvidence(trace, steps),
+  };
+}
+
+function parseTraceDataRecord(value: unknown): JsonRecord {
+  if (isRecord(value)) return value;
+  if (typeof value !== "string") return {};
+  const trimmed = value.trim();
+  if (!trimmed) return {};
+  try {
+    return asRecord(JSON.parse(trimmed));
+  } catch {
+    return {};
+  }
+}
+
+function stringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => str(item, "").trim()).filter(Boolean);
+}
+
+function percentageLabel(value: unknown, digits = 1): string {
+  const parsed = num(value, Number.NaN);
+  if (!Number.isFinite(parsed)) return "";
+  return `${(parsed * 100).toFixed(digits)}%`;
+}
+
+type EvolutionReviewCard = {
+  key: string;
+  title: string;
+  status: string;
+  detail: string;
+  chips: string[];
+  rationale?: string;
+  example?: string;
+  evidence?: string;
+};
+
+type EvolutionPatternCard = EvolutionReviewCard & {
+  runs: JsonRecord[];
+  latestSeen?: string;
+  toolSummary?: string;
+  completedCount: number;
+  failedCount: number;
+  acceptedCount: number;
+};
+
+function collapseInlineWhitespace(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function truncateUiText(value: string, maxChars = 120): string {
+  const normalized = collapseInlineWhitespace(value);
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxChars - 1)).trimEnd()}...`;
+}
+
+function titleCaseLabel(value: string): string {
+  return value
+    .split(/[\s_-]+/)
+    .filter(Boolean)
+    .map((token) => token.charAt(0).toUpperCase() + token.slice(1))
+    .join(" ");
+}
+
+function learningEvidenceStatusColor(
+  status: string,
+): "default" | "success" | "warning" | "error" | "info" {
+  const normalized = status.trim().toLowerCase();
+  if (
+    normalized === "completed" ||
+    normalized === "success" ||
+    normalized === "succeeded"
+  )
+    return "success";
+  if (normalized === "failed" || normalized === "error") return "error";
+  if (normalized === "accepted") return "info";
+  if (normalized === "repeating successfully") return "success";
+  if (normalized === "mixed results") return "warning";
+  if (normalized === "needs review") return "error";
+  if (normalized === "user preference captured" || normalized === "seen once")
+    return "info";
+  return "default";
+}
+
+function learningEvidenceTimestampMs(value: string): number {
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function latestLearningEvidenceTimestamp(runs: JsonRecord[]): number {
+  return runs.reduce(
+    (latest, run) =>
+      Math.max(latest, learningEvidenceTimestampMs(str(run.created_at, ""))),
+    0,
+  );
+}
+
+function learningEvidenceToolLabel(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "schedule_task") return "Scheduled task";
+  if (normalized === "calendar_create") return "Calendar event";
+  return titleCaseLabel(normalized);
+}
+
+function summarizeLearningEvidenceTools(values: string[]): string {
+  if (values.length === 0) return "";
+  const counts = new Map<string, number>();
+  values.forEach((value) => {
+    const key = value.trim().toLowerCase();
+    if (!key) return;
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  });
+  return Array.from(counts.entries())
+    .sort(
+      (left, right) => right[1] - left[1] || left[0].localeCompare(right[0]),
+    )
+    .slice(0, 3)
+    .map(
+      ([name, count]) =>
+        `${learningEvidenceToolLabel(name)}${count > 1 ? ` x${count}` : ""}`,
+    )
+    .join(", ");
+}
+
+function uniqueNonEmptyStrings(values: Array<unknown>): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  values.forEach((value) => {
+    const normalized = collapseInlineWhitespace(str(value, "").trim());
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    out.push(normalized);
+  });
+  return out;
+}
+
+function summarizeEvolutionPatternRun(run: JsonRecord): string {
+  const decision = asRecord(run.decision_summary);
+  const executionStatus = asRecord(run.execution_status);
+  const summary = collapseInlineWhitespace(
+    str(
+      run.failure_reason,
+      str(
+        run.outcome_summary,
+        str(
+          decision.summary,
+          str(decision.completion_status, str(executionStatus.status, "")),
+        ),
+      ),
+    ),
+  );
+  return summary || "No summary recorded.";
+}
+
+function evolutionPatternStatusExplanation(card: EvolutionPatternCard): string {
+  const normalized = card.status.trim().toLowerCase();
+  if (normalized === "user preference captured") {
+    return "A direct user correction was recorded here. That kind of signal is strong and can steer similar requests in the future.";
+  }
+  if (normalized === "repeating successfully") {
+    return "Similar requests have been finishing through the same path. AgentArk is checking whether that path is stable enough to reuse by default.";
+  }
+  if (normalized === "mixed results") {
+    return "Similar requests have both worked and failed. AgentArk is comparing the difference before changing behavior.";
+  }
+  if (normalized === "needs review") {
+    return "Similar requests are running into issues often enough that AgentArk may need a guardrail or a different route.";
+  }
+  if (normalized === "seen once") {
+    return "This has only been seen once so far. One example is useful context, but not enough to change behavior yet.";
+  }
+  return "AgentArk is collecting a few more examples before it decides whether this pattern should change how future requests are handled.";
+}
+
+function normalizeLearningEvidenceState(run: JsonRecord): string {
+  const decision = asRecord(run.decision_summary);
+  return collapseInlineWhitespace(
+    str(
+      run.correction_state,
+      str(decision.completion_status, str(run.success_state, "observed")),
+    ),
+  ).toLowerCase();
+}
+
+function inferLearningEvidenceTitle(
+  runs: JsonRecord[],
+  requestPreview: string,
+  taskType: string,
+): string {
+  const combinedRequest = requestPreview.toLowerCase();
+  const allTools = new Set<string>();
+  runs.forEach((run) => {
+    stringList(run.tool_names).forEach((toolName) => {
+      const normalized = toolName.trim().toLowerCase();
+      if (normalized) allTools.add(normalized);
+    });
+  });
+
+  if (
+    /dont use|don't use|do not use/.test(combinedRequest) &&
+    /(calendar|calender)/.test(combinedRequest)
+  ) {
+    return "Operator correction: avoid Calendar";
+  }
+  if (
+    /meeting/.test(combinedRequest) &&
+    /(notify|remind|arrive)/.test(combinedRequest)
+  ) {
+    return "Meeting-date reminder requests";
+  }
+  if (
+    /(notify|remind)/.test(combinedRequest) &&
+    /(date|today|tomorrow|january|february|march|april|may|june|july|august|september|october|november|december|\d{4})/.test(
+      combinedRequest,
+    )
+  ) {
+    return "Date-based reminder requests";
+  }
+  if (
+    allTools.has("calendar_create") ||
+    /(calendar|event)/.test(combinedRequest)
+  ) {
+    return "Calendar event creation requests";
+  }
+  if (allTools.has("schedule_task")) {
+    return "Scheduled follow-up requests";
+  }
+  if (taskType) return `${titleCaseLabel(taskType)} requests`;
+  if (requestPreview) return truncateUiText(requestPreview, 80);
+  return "Observed request pattern";
+}
+
+function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewCard[] {
+  const cards: EvolutionReviewCard[] = [];
+  steps.forEach((step, idx) => {
+    const data = parseTraceDataRecord(step.data);
+    const traceKind = str(data.trace_kind, "").trim().toLowerCase();
+    if (!traceKind.startsWith("self_evolve.")) return;
+
+    const status = str(step.type, str(step.step_type, "info")).trim() || "info";
+    const title = str(step.title, "ArkEvolve").trim();
+    const detail = str(step.detail, "").trim();
+    const chips: string[] = [];
+    const evidence: string[] = [];
+    let rationale = "";
+
+    if (traceKind === "self_evolve.request") {
+      const mode = str(data.mode, "policy");
+      const request = str(data.request, "").trim();
+      chips.push(`Mode ${mode}`);
+      if (toBool(data.apply_promotion)) chips.push("Promotion enabled");
+      if (toBool(data.allow_code_writes)) chips.push("Code writes allowed");
+      const canaryRollout = num(data.canary_rollout_percent, -1);
+      if (canaryRollout > 0) chips.push(`Canary ${canaryRollout}%`);
+      rationale = request;
+    } else if (traceKind === "self_evolve.policy.result") {
+      const evaluatedCandidates = num(data.evaluated_candidates, 0);
+      const baselineAccuracy = percentageLabel(data.baseline_accuracy, 0);
+      const candidateAccuracy = percentageLabel(
+        data.best_candidate_accuracy,
+        0,
+      );
+      const gain = num(data.accuracy_gain, Number.NaN);
+      const candidateSource = str(data.candidate_source, "").trim();
+      const changedFields = stringList(data.changed_fields);
+      const notes = stringList(data.notes);
+      chips.push(
+        `${evaluatedCandidates} candidate${evaluatedCandidates === 1 ? "" : "s"}`,
+      );
+      if (baselineAccuracy || candidateAccuracy) {
+        chips.push(`${baselineAccuracy || "?"} -> ${candidateAccuracy || "?"}`);
+      }
+      if (Number.isFinite(gain))
+        chips.push(
+          `Gain ${gain >= 0 ? "+" : ""}${(gain * 100).toFixed(1)} pts`,
+        );
+      if (candidateSource) chips.push(candidateSource);
+      rationale = `Gate: ${str(data.promotion_gate, "unknown")}`;
+      if (num(data.wins, -1) >= 0 || num(data.losses, -1) >= 0) {
+        evidence.push(
+          `Wins/Losses: ${num(data.wins, 0)} / ${num(data.losses, 0)}`,
+        );
+      }
+      const pValue = num(data.p_value, Number.NaN);
+      if (Number.isFinite(pValue))
+        evidence.push(`P-value: ${pValue.toFixed(4)}`);
+      if (changedFields.length)
+        evidence.push(`Changed fields: ${changedFields.join(", ")}`);
+      if (notes.length) evidence.push(`Why: ${notes.join(" | ")}`);
+      const lineageId = str(data.lineage_entry_id, "").trim();
+      if (lineageId) evidence.push(`Lineage: ${lineageId}`);
+    } else if (traceKind === "self_evolve.policy.promotion") {
+      const promotionMode = str(data.promotion_mode, "none").trim();
+      const canaryState = asRecord(data.canary_state);
+      const replay = asRecord(data.replay_evaluation);
+      chips.push(`Promotion ${promotionMode}`);
+      if (toBool(data.promotion_applied)) chips.push("Applied");
+      const rollout = num(canaryState.rollout_percent, -1);
+      if (rollout > 0) chips.push(`Rollout ${rollout}%`);
+      const baselineVersion = str(canaryState.baseline_version, "").trim();
+      const candidateVersion = str(canaryState.candidate_version, "").trim();
+      if (baselineVersion || candidateVersion) {
+        evidence.push(
+          `Versions: ${baselineVersion || "baseline"} -> ${candidateVersion || "candidate"}`,
+        );
+      }
+      const replayReason = str(replay.reason, "").trim();
+      if (replayReason) rationale = replayReason;
+      const baselineSamples = num(asRecord(replay.baseline).samples, -1);
+      const candidateSamples = num(asRecord(replay.candidate).samples, -1);
+      if (baselineSamples >= 0 || candidateSamples >= 0) {
+        evidence.push(
+          `Replay samples: baseline ${Math.max(0, baselineSamples)} | candidate ${Math.max(0, candidateSamples)}`,
+        );
+      }
+      const successGain = num(replay.success_gain, Number.NaN);
+      if (Number.isFinite(successGain))
+        evidence.push(`Replay gain: ${(successGain * 100).toFixed(1)} pts`);
+    } else if (traceKind === "self_evolve.prompt.result") {
+      const evaluatedCandidates = num(data.evaluated_candidates, 0);
+      const baselineScore = percentageLabel(data.baseline_score, 0);
+      const candidateScore = percentageLabel(data.best_candidate_score, 0);
+      const gain = num(data.score_gain, Number.NaN);
+      const candidateSource = str(data.candidate_source, "").trim();
+      const optimizedSurfaces = stringList(data.optimized_surfaces);
+      const notes = stringList(data.notes);
+      const diffSummary = asRecord(data.diff_summary);
+      const routerChanged = stringList(diffSummary.router_changed_fields);
+      const primaryResponseChanged = stringList(
+        diffSummary.primary_response_changed_fields,
+      );
+      const synthesisChanged = stringList(
+        diffSummary.delegation_synthesis_changed_fields,
+      );
+      chips.push(
+        `${evaluatedCandidates} candidate${evaluatedCandidates === 1 ? "" : "s"}`,
+      );
+      if (baselineScore || candidateScore) {
+        chips.push(`${baselineScore || "?"} -> ${candidateScore || "?"}`);
+      }
+      if (optimizedSurfaces.length) chips.push(optimizedSurfaces.join(" + "));
+      if (Number.isFinite(gain))
+        chips.push(
+          `Gain ${gain >= 0 ? "+" : ""}${(gain * 100).toFixed(1)} pts`,
+        );
+      if (candidateSource) chips.push(candidateSource);
+      rationale = `Gate: ${str(data.promotion_gate, "unknown")}`;
+      if (routerChanged.length)
+        evidence.push(`Router changes: ${routerChanged.join(", ")}`);
+      if (primaryResponseChanged.length)
+        evidence.push(
+          `Primary response changes: ${primaryResponseChanged.join(", ")}`,
+        );
+      if (synthesisChanged.length)
+        evidence.push(`Synthesis changes: ${synthesisChanged.join(", ")}`);
+      if (num(data.wins, -1) >= 0 || num(data.losses, -1) >= 0) {
+        evidence.push(
+          `Wins/Losses: ${num(data.wins, 0)} / ${num(data.losses, 0)}`,
+        );
+      }
+      const pValue = num(data.p_value, Number.NaN);
+      if (Number.isFinite(pValue))
+        evidence.push(`P-value: ${pValue.toFixed(4)}`);
+      const invalidRateBefore = num(
+        data.baseline_router_invalid_json_rate,
+        Number.NaN,
+      );
+      const invalidRateAfter = num(
+        data.candidate_router_invalid_json_rate,
+        Number.NaN,
+      );
+      if (
+        Number.isFinite(invalidRateBefore) &&
+        Number.isFinite(invalidRateAfter)
+      ) {
+        evidence.push(
+          `Router invalid JSON: ${(invalidRateBefore * 100).toFixed(1)}% -> ${(invalidRateAfter * 100).toFixed(1)}%`,
+        );
+      }
+      if (notes.length) evidence.push(`Why: ${notes.join(" | ")}`);
+      const lineageId = str(data.lineage_entry_id, "").trim();
+      if (lineageId) evidence.push(`Lineage: ${lineageId}`);
+    } else if (traceKind === "self_evolve.prompt.promotion") {
+      const promotionMode = str(data.promotion_mode, "none").trim();
+      const canaryState = asRecord(data.canary_state);
+      const replay = asRecord(data.replay_evaluation);
+      const optimizedSurfaces = stringList(data.optimized_surfaces);
+      chips.push(`Promotion ${promotionMode}`);
+      if (optimizedSurfaces.length) chips.push(optimizedSurfaces.join(" + "));
+      if (toBool(data.promotion_applied)) chips.push("Applied");
+      const rollout = num(canaryState.rollout_percent, -1);
+      if (rollout > 0) chips.push(`Rollout ${rollout}%`);
+      const baselineVersion = str(canaryState.baseline_version, "").trim();
+      const candidateVersion = str(canaryState.candidate_version, "").trim();
+      if (baselineVersion || candidateVersion) {
+        evidence.push(
+          `Versions: ${baselineVersion || "baseline"} -> ${candidateVersion || "candidate"}`,
+        );
+      }
+      const replayReason = str(replay.reason, "").trim();
+      if (replayReason) rationale = replayReason;
+      const baselineSamples = num(asRecord(replay.baseline).samples, -1);
+      const candidateSamples = num(asRecord(replay.candidate).samples, -1);
+      if (baselineSamples >= 0 || candidateSamples >= 0) {
+        evidence.push(
+          `Experience samples: baseline ${Math.max(0, baselineSamples)} | candidate ${Math.max(0, candidateSamples)}`,
+        );
+      }
+      const successGain = num(replay.success_gain, Number.NaN);
+      if (Number.isFinite(successGain))
+        evidence.push(`Experience gain: ${(successGain * 100).toFixed(1)} pts`);
+    } else if (
+      traceKind === "self_evolve.classifier_prompt.result" ||
+      traceKind === "self_evolve.specialist_prompt.result"
+    ) {
+      const evaluatedCandidates = num(data.evaluated_candidates, 0);
+      const baselineScore = percentageLabel(data.baseline_score, 0);
+      const candidateScore = percentageLabel(data.best_candidate_score, 0);
+      const gain = num(data.score_gain, Number.NaN);
+      const candidateSource = str(data.candidate_source, "").trim();
+      const optimizedSurfaces = stringList(data.optimized_surfaces);
+      const notes = stringList(data.notes);
+      const diffSummary = asRecord(data.diff_summary);
+      const changedItems = stringList(diffSummary.changed_surfaces).concat(
+        stringList(diffSummary.changed_roles),
+      );
+      const changePreview = stringList(diffSummary.change_preview);
+      const focusCases = pickRecords(data, "focus_cases");
+      chips.push(
+        `${evaluatedCandidates} candidate${evaluatedCandidates === 1 ? "" : "s"}`,
+      );
+      if (baselineScore || candidateScore)
+        chips.push(`${baselineScore || "?"} -> ${candidateScore || "?"}`);
+      if (optimizedSurfaces.length) chips.push(optimizedSurfaces.join(" + "));
+      if (Number.isFinite(gain))
+        chips.push(
+          `Gain ${gain >= 0 ? "+" : ""}${(gain * 100).toFixed(1)} pts`,
+        );
+      if (candidateSource) chips.push(candidateSource);
+      rationale = `Gate: ${str(data.promotion_gate, "unknown")}`;
+      if (changedItems.length)
+        evidence.push(`Changed: ${changedItems.join(", ")}`);
+      if (changePreview.length)
+        evidence.push(`Preview: ${changePreview.join(" | ")}`);
+      if (num(data.wins, -1) >= 0 || num(data.losses, -1) >= 0) {
+        evidence.push(
+          `Wins/Losses: ${num(data.wins, 0)} / ${num(data.losses, 0)}`,
+        );
+      }
+      const pValue = num(data.p_value, Number.NaN);
+      if (Number.isFinite(pValue))
+        evidence.push(`P-value: ${pValue.toFixed(4)}`);
+      if (focusCases.length) {
+        evidence.push(
+          `Focus cases: ${focusCases.slice(0, 3).map(buildEvolutionFocusCaseLabel).join(" | ")}`,
+        );
+      }
+      if (notes.length) evidence.push(`Why: ${notes.join(" | ")}`);
+      const lineageId = str(data.lineage_entry_id, "").trim();
+      if (lineageId) evidence.push(`Lineage: ${lineageId}`);
+    } else if (
+      traceKind === "self_evolve.classifier_prompt.promotion" ||
+      traceKind === "self_evolve.specialist_prompt.promotion"
+    ) {
+      const promotionMode = str(data.promotion_mode, "none").trim();
+      const canaryState = asRecord(data.canary_state);
+      const replay = asRecord(data.replay_evaluation);
+      const optimizedSurfaces = stringList(data.optimized_surfaces);
+      chips.push(`Promotion ${promotionMode}`);
+      if (optimizedSurfaces.length) chips.push(optimizedSurfaces.join(" + "));
+      if (toBool(data.promotion_applied)) chips.push("Applied");
+      const rollout = num(canaryState.rollout_percent, -1);
+      if (rollout > 0) chips.push(`Rollout ${rollout}%`);
+      const baselineVersion = str(canaryState.baseline_version, "").trim();
+      const candidateVersion = str(canaryState.candidate_version, "").trim();
+      if (baselineVersion || candidateVersion) {
+        evidence.push(
+          `Versions: ${baselineVersion || "baseline"} -> ${candidateVersion || "candidate"}`,
+        );
+      }
+      const replayReason = str(replay.reason, "").trim();
+      if (replayReason) rationale = replayReason;
+      const baselineSamples = num(asRecord(replay.baseline).samples, -1);
+      const candidateSamples = num(asRecord(replay.candidate).samples, -1);
+      if (baselineSamples >= 0 || candidateSamples >= 0) {
+        evidence.push(
+          `Experience samples: baseline ${Math.max(0, baselineSamples)} | candidate ${Math.max(0, candidateSamples)}`,
+        );
+      }
+      const successGain = num(replay.success_gain, Number.NaN);
+      if (Number.isFinite(successGain))
+        evidence.push(`Experience gain: ${(successGain * 100).toFixed(1)} pts`);
+    } else if (traceKind === "self_evolve.code.blocked") {
+      chips.push("Code evolution");
+      chips.push("Blocked");
+      rationale = str(data.request, "").trim();
+    } else if (traceKind === "self_evolve.code.result") {
+      const filesChanged = stringList(data.files_changed);
+      const securityWarnings = stringList(data.security_warnings);
+      const iterations = num(data.iterations_used, 0);
+      chips.push(
+        `${filesChanged.length} file${filesChanged.length === 1 ? "" : "s"}`,
+      );
+      chips.push(`${iterations} iteration${iterations === 1 ? "" : "s"}`);
+      if (toBool(data.push_recommended)) chips.push("Push suggested");
+      rationale = str(data.diff_summary, "").trim();
+      if (filesChanged.length)
+        evidence.push(`Files changed: ${filesChanged.join(", ")}`);
+      if (securityWarnings.length)
+        evidence.push(`Security warnings: ${securityWarnings.join(" | ")}`);
+      const error = str(data.error, "").trim();
+      if (error) evidence.push(`Error: ${error}`);
+    } else if (
+      traceKind === "self_evolve.manual_action.result" ||
+      traceKind === "self_evolve.manual_action.request"
+    ) {
+      const action = str(data.action, "").trim().replace(/_/g, " ");
+      const canaryState = asRecord(data.canary_state);
+      chips.push(action || "Manual action");
+      if (Object.keys(canaryState).length > 0) {
+        chips.push(
+          toBool(canaryState.enabled) ? "Canary enabled" : "Canary disabled",
+        );
+      }
+      rationale = str(data.message, detail).trim();
+      const baselineVersion = str(canaryState.baseline_version, "").trim();
+      const candidateVersion = str(canaryState.candidate_version, "").trim();
+      if (baselineVersion || candidateVersion) {
+        evidence.push(
+          `Versions: ${baselineVersion || "baseline"} -> ${candidateVersion || "candidate"}`,
+        );
+      }
+      const rollout = num(canaryState.rollout_percent, -1);
+      if (rollout > 0) evidence.push(`Rollout: ${rollout}%`);
+    }
+
+    cards.push({
+      key: `${traceKind}-${idx}`,
+      title,
+      status,
+      detail,
+      chips,
+      rationale: rationale || undefined,
+      evidence: evidence.join("\n") || undefined,
+    });
+  });
+  return cards;
+}
+
+function evolutionTraceIdHint(payload: unknown): string {
+  const traceId = str(asRecord(payload).trace_id, "").trim();
+  return traceId ? ` Trace ${traceId.slice(0, 8)} recorded.` : "";
+}
+
+function syncRunStatusColor(
+  status: string,
+): "success" | "warning" | "error" | "default" {
+  const normalized = status.trim().toLowerCase();
+  if (normalized === "completed") return "success";
+  if (normalized === "failed") return "error";
+  if (normalized === "blocked") return "warning";
+  return "default";
+}
+
+function syncRunTriggerLabel(trigger: string): string {
+  const normalized = trigger.trim().toLowerCase();
+  if (normalized === "manual") return "Manual";
+  if (normalized === "background") return "Background";
+  return normalized ? normalized.replace(/_/g, " ") : "Unknown";
+}
+
+type TraceRange = "1h" | "6h" | "24h" | "7d" | "14d" | "30d";
+const TRACE_RANGE_PRESETS: {
+  value: TraceRange;
+  label: string;
+  hours: number;
+}[] = [
+  { value: "1h", label: "1 hour", hours: 1 },
+  { value: "6h", label: "6 hours", hours: 6 },
+  { value: "24h", label: "24 hours", hours: 24 },
+  { value: "7d", label: "7 days", hours: 168 },
+  { value: "14d", label: "14 days", hours: 336 },
+  { value: "30d", label: "30 days", hours: 720 },
+];
+
+function traceRangeHours(range: TraceRange): number {
+  return TRACE_RANGE_PRESETS.find((p) => p.value === range)?.hours || 168;
+}
+
+function traceRangeSinceISO(range: TraceRange): string {
+  const ms = traceRangeHours(range) * 3600 * 1000;
+  return new Date(Date.now() - ms).toISOString();
+}
+
+type TraceBucket = { label: string; ts: number };
+
+function buildTraceTrendBuckets(range: TraceRange): TraceBucket[] {
+  const hours = traceRangeHours(range);
+  const bucketCount = Math.min(
+    hours <= 6 ? hours : hours <= 24 ? 12 : hours <= 168 ? 7 : 14,
+    14,
+  );
+  const spanMs = hours * 3600 * 1000;
+  const bucketMs = spanMs / bucketCount;
+  const now = Date.now();
+  const buckets: TraceBucket[] = [];
+  for (let i = 0; i < bucketCount; i++) {
+    const ts = now - spanMs + (i + 1) * bucketMs;
+    const d = new Date(ts);
+    const label =
+      hours <= 24
+        ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+        : d.toLocaleDateString([], { month: "short", day: "numeric" });
+    buckets.push({ label, ts });
+  }
+  return buckets;
+}
+
+function bucketizeTraceItems<T>(
+  items: T[],
+  getTs: (item: T) => string,
+  buckets: TraceBucket[],
+): number[] {
+  const counts = new Array(buckets.length).fill(0) as number[];
+  for (const item of items) {
+    const ts = new Date(getTs(item)).getTime();
+    if (!ts || isNaN(ts)) continue;
+    for (let i = buckets.length - 1; i >= 0; i--) {
+      const lo = i === 0 ? 0 : buckets[i - 1].ts;
+      if (ts > lo && ts <= buckets[i].ts) {
+        counts[i]++;
+        break;
+      }
+    }
+  }
+  return counts;
+}
+
+function traceSecurityEventTypeLabel(eventType: string): string {
+  const normalized = (eventType || "").trim().toLowerCase();
+  if (!normalized) return "Unknown";
+  return normalized
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (m) => m.toUpperCase());
+}
+
+
+function buildEvolutionEvidenceCards(
+  runs: JsonRecord[],
+): EvolutionPatternCard[] {
+  const groupedRuns = new Map<string, JsonRecord[]>();
+  runs.forEach((run, idx) => {
+    const requestText = collapseInlineWhitespace(str(run.request_text, ""));
+    const intentKey = collapseInlineWhitespace(str(run.intent_key, ""));
+    const key = requestText
+      ? `request:${requestText.toLowerCase()}`
+      : intentKey
+        ? `intent:${intentKey.toLowerCase()}`
+        : `run:${str(run.id, String(idx))}`;
+    const existing = groupedRuns.get(key);
+    if (existing) {
+      existing.push(run);
+    } else {
+      groupedRuns.set(key, [run]);
+    }
+  });
+
+  return Array.from(groupedRuns.values())
+    .sort(
+      (left, right) =>
+        latestLearningEvidenceTimestamp(right) -
+        latestLearningEvidenceTimestamp(left),
+    )
+    .map((groupRuns, idx): EvolutionPatternCard | null => {
+      const latestRun = groupRuns.reduce((best, current) => {
+        return learningEvidenceTimestampMs(str(current.created_at, "")) >=
+          learningEvidenceTimestampMs(str(best.created_at, ""))
+          ? current
+          : best;
+      }, groupRuns[0]);
+      const taskType = str(latestRun.task_type, "").trim();
+      const requestPreview = collapseInlineWhitespace(
+        str(latestRun.request_text, ""),
+      );
+      const title = inferLearningEvidenceTitle(
+        groupRuns,
+        requestPreview,
+        taskType,
+      );
+      const latestSeen = humanTs(str(latestRun.created_at, "")).label;
+
+      const allToolNames: string[] = [];
+      const successfulToolNames: string[] = [];
+      const failedToolNames: string[] = [];
+      const failureReasons: string[] = [];
+      let completedCount = 0;
+      let failedCount = 0;
+      let acceptedCount = 0;
+
+      groupRuns.forEach((run) => {
+        const state = normalizeLearningEvidenceState(run);
+        const toolNames = stringList(run.tool_names);
+        const failureReason = collapseInlineWhitespace(
+          str(run.failure_reason, str(run.outcome_summary, "")),
+        );
+        toolNames.forEach((toolName) => {
+          allToolNames.push(toolName);
+          if (
+            state === "completed" ||
+            state === "success" ||
+            state === "succeeded"
+          )
+            successfulToolNames.push(toolName);
+          if (state === "failed" || state === "error")
+            failedToolNames.push(toolName);
+        });
+        if (
+          state === "completed" ||
+          state === "success" ||
+          state === "succeeded"
+        )
+          completedCount += 1;
+        else if (state === "failed" || state === "error") {
+          failedCount += 1;
+          if (failureReason) failureReasons.push(failureReason);
+        } else if (state === "accepted") acceptedCount += 1;
+      });
+
+      if (!title && !requestPreview && allToolNames.length === 0) return null;
+
+      const runCount = groupRuns.length;
+      const allToolSet = new Set(
+        allToolNames.map((name) => name.trim().toLowerCase()).filter(Boolean),
+      );
+      const successfulToolSet = new Set(
+        successfulToolNames
+          .map((name) => name.trim().toLowerCase())
+          .filter(Boolean),
+      );
+      const failedToolSet = new Set(
+        failedToolNames
+          .map((name) => name.trim().toLowerCase())
+          .filter(Boolean),
+      );
+      const dominantBlocker = failureReasons[0]
+        ? truncateUiText(failureReasons[0], 110)
+        : "";
+      const isPreferencePattern =
+        acceptedCount > 0 && completedCount === 0 && failedCount === 0;
+      const recoveredReminderPath =
+        completedCount > 0 &&
+        failedCount > 0 &&
+        (allToolSet.has("schedule_task") ||
+          successfulToolSet.has("schedule_task")) &&
+        (allToolSet.has("calendar_create") ||
+          failedToolSet.has("calendar_create"));
+
+      let status = "Collecting examples";
+      if (isPreferencePattern) status = "User preference captured";
+      else if (completedCount > 0 && failedCount > 0) status = "Mixed results";
+      else if (completedCount > 1) status = "Repeating successfully";
+      else if (completedCount === 1) status = "Seen once";
+      else if (failedCount > 0) status = "Needs review";
+
+      let detail = `Captured ${runCount} related run${runCount === 1 ? "" : "s"} for comparison.`;
+      let rationale =
+        "ArkEvolve is still collecting enough examples to decide whether a product change is warranted.";
+
+      if (isPreferencePattern) {
+        detail = `Captured an explicit user correction that should steer similar requests from the start.`;
+        rationale =
+          "Direct user constraints are stronger evidence than a default integration guess or a broad tool match.";
+      } else if (recoveredReminderPath) {
+        detail = `Observed ${runCount} similar reminder requests. Earlier attempts went through Calendar and failed. Later runs completed by creating scheduled in-app reminders instead.`;
+        rationale =
+          "This is concrete evidence that date-based 'notify me' requests do not need Calendar when a local reminder already satisfies the request.";
+      } else if (completedCount > 1 && failedCount === 0) {
+        detail = `Observed ${runCount} similar runs completing with a repeatable path.`;
+        rationale =
+          "Repeated success is strong enough to keep the current routing and tool-selection choice under watch.";
+      } else if (completedCount > 0 && failedCount > 0) {
+        detail = `Observed ${runCount} related runs with mixed outcomes. The latest path completed, but earlier attempts show the routing still needs refinement.`;
+        rationale =
+          "ArkEvolve can use the failures to narrow when the alternate path should be avoided.";
+      } else if (failedCount > 0) {
+        detail = `Observed ${runCount} failed run${runCount === 1 ? "" : "s"}${dominantBlocker ? `, mostly blocked by ${dominantBlocker}` : ""}.`;
+        rationale =
+          "This is evidence for a guardrail or tighter trigger before retrying the same path.";
+      } else if (completedCount === 1) {
+        detail =
+          "Observed one completed run. ArkEvolve usually waits for repetition before treating it as a stable lesson.";
+        rationale =
+          "A single success is useful context, but not enough to claim that behavior improved.";
+      }
+
+      const chips = [`${runCount} run${runCount === 1 ? "" : "s"}`];
+      if (completedCount > 0) chips.push(`${completedCount} completed`);
+      if (failedCount > 0) chips.push(`${failedCount} failed`);
+      if (acceptedCount > 0)
+        chips.push(
+          `${acceptedCount} correction${acceptedCount === 1 ? "" : "s"}`,
+        );
+
+      const evidence: string[] = [];
+      const toolSummary = summarizeLearningEvidenceTools(allToolNames);
+      if (toolSummary) evidence.push(`Tools used: ${toolSummary}`);
+      if (failedCount > 0 && dominantBlocker)
+        evidence.push(`Main blocker: ${dominantBlocker}`);
+
+      return {
+        key: `${str(latestRun.id, "run")}-${idx}`,
+        title,
+        status,
+        detail,
+        chips,
+        rationale,
+        example: requestPreview
+          ? truncateUiText(requestPreview, 120)
+          : undefined,
+        evidence: evidence.join(" | "),
+        runs: groupRuns,
+        latestSeen: latestSeen !== "-" ? latestSeen : undefined,
+        toolSummary,
+        completedCount,
+        failedCount,
+        acceptedCount,
+      };
+    })
+    .filter((card): card is EvolutionPatternCard => card !== null)
+    .slice(0, 4);
+}
+
+function skillEvolutionChipColor(
+  status: string,
+): "default" | "success" | "warning" | "error" | "info" {
+  const normalized = status.trim().toLowerCase();
+  if (normalized === "approved" || normalized === "improved") return "success";
+  if (
+    normalized === "draft" ||
+    normalized === "pending" ||
+    normalized === "inconclusive"
+  )
+    return "warning";
+  if (normalized === "regressed" || normalized === "rejected") return "error";
+  if (normalized === "unchanged") return "info";
+  return "default";
+}
+
+function skillEvolutionAlertSeverity(
+  status: string,
+): "success" | "warning" | "error" | "info" {
+  const normalized = status.trim().toLowerCase();
+  if (normalized === "approved" || normalized === "improved") return "success";
+  if (normalized === "regressed" || normalized === "rejected") return "error";
+  if (normalized === "unchanged") return "info";
+  return "warning";
+}
+
+function skillEvolutionActionLabel(action: string): string {
+  const normalized = action.trim().toLowerCase();
+  if (normalized === "create_skill") return "Create skill";
+  if (normalized === "optimize_description") return "Tune trigger";
+  if (normalized === "improve_skill") return "Improve skill";
+  return action || "Skill change";
+}
+
+function canonicalSkillIdentifier(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  const compact = trimmed.toLowerCase().replace(/[^a-z0-9]+/g, "");
+  if (compact === "trendprophet") return "trend-prophet";
+  return trimmed;
+}
+
+function skillEvolutionMetricRows(
+  row: JsonRecord,
+): Array<{
+  label: string;
+  before: string;
+  after: string;
+  delta: string;
+  positive: boolean | null;
+}> {
+  const baseline = asRecord(row.impact_baseline);
+  const observed = asRecord(row.impact_observed);
+  const successDelta =
+    num(observed.success_rate, 0) - num(baseline.success_rate, 0);
+  const failureDelta =
+    num(baseline.failure_rate, 0) - num(observed.failure_rate, 0);
+  const toolErrorDelta =
+    num(baseline.tool_error_rate, 0) - num(observed.tool_error_rate, 0);
+  return [
+    {
+      label: "Success",
+      before: percentageLabel(baseline.success_rate, 1) || "-",
+      after: percentageLabel(observed.success_rate, 1) || "-",
+      delta: evolutionGainLabel(successDelta),
+      positive: Number.isFinite(successDelta) ? successDelta >= 0 : null,
+    },
+    {
+      label: "Failure",
+      before: percentageLabel(baseline.failure_rate, 1) || "-",
+      after: percentageLabel(observed.failure_rate, 1) || "-",
+      delta: evolutionGainLabel(failureDelta),
+      positive: Number.isFinite(failureDelta) ? failureDelta >= 0 : null,
+    },
+    {
+      label: "Tool errors",
+      before: percentageLabel(baseline.tool_error_rate, 1) || "-",
+      after: percentageLabel(observed.tool_error_rate, 1) || "-",
+      delta: evolutionGainLabel(toolErrorDelta),
+      positive: Number.isFinite(toolErrorDelta) ? toolErrorDelta >= 0 : null,
+    },
+  ];
+}
+
+function evolutionSurfaceAudienceLabel(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "routing policy") return "Reply routing";
+  if (normalized === "main prompt bundle") return "Main replies";
+  if (normalized === "request classifier") return "Request understanding";
+  if (normalized === "specialist prompts") return "Specialist helpers";
+  return value || "Experiment";
+}
+
+function evolutionSurfaceSummary(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "routing policy")
+    return "Tests how often the assistant should answer directly versus handing work off.";
+  if (normalized === "main prompt bundle")
+    return "Tests a different set of reply instructions for the main assistant response.";
+  if (normalized === "request classifier")
+    return "Tests a different way to classify incoming requests before choosing a path.";
+  if (normalized === "specialist prompts")
+    return "Tests different instructions for helper specialists used during delegated work.";
+  return "Tests a candidate behavior against the current stable setup.";
+}
+
+function evolutionSurfaceBenefit(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "routing policy")
+    return "Can reduce unnecessary handoffs and keep simple requests faster.";
+  if (normalized === "main prompt bundle")
+    return "Can make replies clearer, more reliable, or less repetitive.";
+  if (normalized === "request classifier")
+    return "Can improve how quickly the assistant recognizes the right handling path.";
+  if (normalized === "specialist prompts")
+    return "Can make delegated specialist work more accurate and consistent.";
+  return "Can improve how future requests are handled if the candidate keeps performing well.";
+}
+
+function evolutionSurfaceStableSummary(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "routing policy")
+    return "Reply routing is using the current stable logic.";
+  if (normalized === "main prompt bundle")
+    return "Main replies are using the current stable prompt bundle.";
+  if (normalized === "request classifier")
+    return "Request understanding is using the current stable classifier.";
+  if (normalized === "specialist prompts")
+    return "Specialist helpers are using the current stable prompt bundle.";
+  return "This area is currently on the stable baseline.";
+}
+
+function evolutionExperimentStatusText(item: {
+  gate: string;
+  last: string;
+  enabled: boolean;
+}): string {
+  const gate = str(item.gate, "").trim();
+  const last = str(item.last, "").trim();
+  if (!item.enabled) return "No active experiment is running here.";
+  if (gate && gate !== "-") return `Current gate signal: ${gate}.`;
+  if (last && !/^no .* runs yet$/i.test(last)) return last;
+  return "This experiment is running against the current stable behavior.";
+}
+
+function promptProposalScopeLabel(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "prompt_profile") return "Main replies";
+  if (normalized === "classifier_prompt_profile") return "Request understanding";
+  if (normalized === "specialist_prompt_profile") return "Specialist helpers";
+  return humanizeStatusLabel(value || "prompt profile");
+}
+
+function promptCanaryActionSummary(row: JsonRecord): string {
+  const baselineSuccessRate = num(row.baseline_success_rate, 0) * 100;
+  const candidateSuccessRate = num(row.candidate_success_rate, 0) * 100;
+  const baselineSamples = num(row.baseline_samples, 0);
+  const candidateSamples = num(row.candidate_samples, 0);
+  return `Stable behavior is at ${baselineSuccessRate.toFixed(1)}% over ${baselineSamples.toLocaleString()} recent runs. The experiment is at ${candidateSuccessRate.toFixed(1)}% over ${candidateSamples.toLocaleString()} runs.`;
+}
+
+type EvolutionReviewEvidence = {
+  metrics: Array<{ label: string; value: string }>;
+  current: string[];
+  proposed: string[];
+  impact: string[];
+};
+
+function formatSignedPoints(value: number): string {
+  if (!Number.isFinite(value)) return "-";
+  return `${value >= 0 ? "+" : ""}${value.toFixed(1)} pts`;
+}
+
+function cleanEvidenceLines(lines: unknown[], limit = 3): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of lines) {
+    const line = str(raw, "").trim();
+    if (!line || seen.has(line)) continue;
+    seen.add(line);
+    out.push(line);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+function EvolutionReviewEvidenceStrip({
+  evidence,
+}: {
+  evidence: EvolutionReviewEvidence;
+}): JSX.Element | null {
+  const metrics = evidence.metrics
+    .filter((item) => str(item.label, "").trim() && str(item.value, "").trim())
+    .slice(0, 4);
+  const sections = [
+    { label: "Current", lines: cleanEvidenceLines(evidence.current, 3) },
+    { label: "Proposed", lines: cleanEvidenceLines(evidence.proposed, 3) },
+    { label: "Expected effect", lines: cleanEvidenceLines(evidence.impact, 3) },
+  ].filter((section) => section.lines.length > 0);
+  if (metrics.length === 0 && sections.length === 0) return null;
+  return (
+    <Box
+      sx={{
+        mt: 1,
+        pt: 1,
+        borderTop: "1px solid var(--ui-rgba-145-170-205-120)",
+      }}
+    >
+      {metrics.length > 0 ? (
+        <Box
+          sx={{
+            display: "grid",
+            gridTemplateColumns: {
+              xs: "1fr 1fr",
+              md: "repeat(4, minmax(0,1fr))",
+            },
+            gap: 1,
+            mb: sections.length > 0 ? 1 : 0,
+          }}
+        >
+          {metrics.map((item) => (
+            <Box key={`${item.label}-${item.value}`} sx={{ minWidth: 0 }}>
+              <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                {item.label}
+              </Typography>
+              <Typography variant="body2">{item.value}</Typography>
+            </Box>
+          ))}
+        </Box>
+      ) : null}
+      {sections.length > 0 ? (
+        <Box
+          sx={{
+            display: "grid",
+            gridTemplateColumns: {
+              xs: "1fr",
+              md: "repeat(auto-fit, minmax(0,1fr))",
+            },
+            gap: 1,
+          }}
+        >
+          {sections.map((section) => (
+            <Box key={section.label} sx={{ minWidth: 0 }}>
+              <Typography
+                variant="caption"
+                sx={{ color: "text.secondary", display: "block", mb: 0.35 }}
+              >
+                {section.label}
+              </Typography>
+              <Stack spacing={0.35}>
+                {section.lines.map((line, idx) => (
+                  <Typography
+                    key={`${section.label}-${idx}`}
+                    variant="caption"
+                    sx={{ color: "#d8edff", display: "block" }}
+                  >
+                    - {line}
+                  </Typography>
+                ))}
+              </Stack>
+            </Box>
+          ))}
+        </Box>
+      ) : null}
+    </Box>
+  );
+}
+
+function promptCanaryReviewEvidence(row: JsonRecord): EvolutionReviewEvidence {
+  const baselineSuccessRate = num(row.baseline_success_rate, 0) * 100;
+  const candidateSuccessRate = num(row.candidate_success_rate, 0) * 100;
+  const baselineSamples = num(row.baseline_samples, 0);
+  const candidateSamples = num(row.candidate_samples, 0);
+  const successDelta = candidateSuccessRate - baselineSuccessRate;
+  return {
+    metrics: [
+      { label: "Stable", value: `${baselineSuccessRate.toFixed(1)}%` },
+      { label: "Experiment", value: `${candidateSuccessRate.toFixed(1)}%` },
+      { label: "Gap", value: formatSignedPoints(successDelta) },
+      {
+        label: "Samples",
+        value: `${baselineSamples.toLocaleString()} / ${candidateSamples.toLocaleString()}`,
+      },
+    ],
+    current: [
+      `Stable version ${str(row.baseline_version, "-")} is carrying ${baselineSamples.toLocaleString()} recent runs.`,
+    ],
+    proposed: [
+      `Experiment version ${str(row.candidate_version, "-")} is still active on ${candidateSamples.toLocaleString()} runs.`,
+    ],
+    impact: [
+      successDelta < 0
+        ? `The experiment is currently down ${Math.abs(successDelta).toFixed(1)} points versus stable.`
+        : `The experiment is currently up ${successDelta.toFixed(1)} points versus stable.`,
+      `Wins versus losses: ${num(row.wins, 0).toLocaleString()} / ${num(row.losses, 0).toLocaleString()}.`,
+      num(row.regression_p_value, Number.NaN) >= 0
+        ? `Regression check p-value: ${num(row.regression_p_value, 0).toFixed(4)}.`
+        : "",
+    ],
+  };
+}
+
+function promptOptimizationReviewEvidence(
+  row: JsonRecord,
+): EvolutionReviewEvidence {
+  const preview = asRecord(row.change_preview);
+  const current = stringList(preview.before);
+  const proposed = stringList(preview.after);
+  const impact = stringList(preview.impact_estimate);
+  const targetArea = promptProposalScopeLabel(str(row.target_scope, "prompt_profile"));
+  const riskLevel = str(row.risk_level, "default");
+  const reviewStatus = str(row.review_status, "open");
+  return {
+    metrics: [
+      { label: "Area", value: targetArea },
+      { label: "Risk", value: `${riskLevel || "unknown"} risk` },
+      {
+        label: "Decision",
+        value:
+          reviewStatus === "open"
+            ? "Needs decision"
+            : humanizeStatusLabel(reviewStatus),
+      },
+    ],
+    current:
+      current.length > 0
+        ? current
+        : stringList(row.evidence).slice(0, 2),
+    proposed:
+      proposed.length > 0
+        ? proposed
+        : stringList(row.expected_benefit).slice(0, 2),
+    impact:
+      impact.length > 0
+        ? impact
+        : [
+            ...stringList(row.expected_benefit).slice(0, 2),
+            ...stringList(row.caveats).slice(0, 1),
+          ],
+  };
+}
+
+function skillReviewEvidence(row: JsonRecord): EvolutionReviewEvidence {
+  const diffPreview = asRecord(row.diff_preview);
+  const baseline = asRecord(row.impact_baseline);
+  const evidence = asRecord(row.evidence);
+  const added = stringList(diffPreview.added);
+  const removed = stringList(diffPreview.removed);
+  const failureReasons = stringList(evidence.recent_failure_reasons);
+  const selectedExamples = stringList(evidence.selected_failure_examples);
+  return {
+    metrics: [
+      {
+        label: "Confidence",
+        value: `${ratioPercent(row.confidence).toFixed(0)}%`,
+      },
+      {
+        label: "Matched runs",
+        value: num(baseline.matched_runs, 0).toLocaleString(),
+      },
+      {
+        label: "Baseline success",
+        value: percentageLabel(baseline.success_rate, 1) || "-",
+      },
+      {
+        label: "Baseline failure",
+        value: percentageLabel(baseline.failure_rate, 1) || "-",
+      },
+    ],
+    current:
+      removed.length > 0
+        ? removed.slice(0, 2).map((line) => `Replace: ${line}`)
+        : failureReasons.slice(0, 2).map((line) => `Current failure: ${line}`),
+    proposed:
+      added.length > 0
+        ? added.slice(0, 2)
+        : cleanEvidenceLines([
+            str(row.diff_summary, ""),
+            str(row.summary, ""),
+          ]),
+    impact: cleanEvidenceLines([
+      `Targets ${num(baseline.matched_runs, 0).toLocaleString()} matched runs with ${percentageLabel(baseline.failure_rate, 1) || "-"} failure and ${percentageLabel(baseline.tool_error_rate, 1) || "-"} tool errors.`,
+      ...failureReasons.slice(0, 1).map((line) => `Focus area: ${line}`),
+      ...selectedExamples.slice(0, 1).map((line) => `Recent mismatch: ${line}`),
+    ]),
+  };
+}
+
+function learningCandidateReviewEvidence(
+  row: JsonRecord,
+  context: {
+    strategyBaselineVersion: string;
+    patternById: Map<string, JsonRecord>;
+    itemById: Map<string, JsonRecord>;
+  },
+): EvolutionReviewEvidence {
+  const type = str(row.candidate_type, "");
+  const preview = asRecord(row.proposed_content_preview);
+  const confidence = `${ratioPercent(row.confidence).toFixed(0)}%`;
+  if (type === "strategy") {
+    const pattern = context.patternById.get(str(row.pattern_id, ""));
+    const defaultGuidance = stringList(preview.default_guidance);
+    const taskGuidance = stringList(preview.task_guidance);
+    const toolSequence = stringList(asRecord(pattern).tool_sequence);
+    return {
+      metrics: [
+        { label: "Confidence", value: confidence },
+        {
+          label: "Pattern runs",
+          value: num(asRecord(pattern).sample_count, 0).toLocaleString(),
+        },
+        {
+          label: "Pattern success",
+          value: percentageLabel(asRecord(pattern).success_rate, 1) || "-",
+        },
+        {
+          label: "Candidate",
+          value: str(preview.strategy_version, "-"),
+        },
+      ],
+      current: cleanEvidenceLines([
+        context.strategyBaselineVersion
+          ? `Matching requests still use stable strategy ${context.strategyBaselineVersion}.`
+          : "Matching requests still use the current stable strategy.",
+        pattern
+          ? `Observed pattern ${str(pattern.title, "pattern")} succeeded on ${num(asRecord(pattern).sample_count, 0).toLocaleString()} runs.`
+          : "",
+      ]),
+      proposed: cleanEvidenceLines([
+        preview.strategy_version
+          ? `Approve strategy version ${str(preview.strategy_version, "-")}.`
+          : "",
+        ...defaultGuidance.slice(0, 1),
+        ...taskGuidance.slice(0, 2),
+      ]),
+      impact: cleanEvidenceLines([
+        toolSequence.length > 0
+          ? `Would steer matching work toward ${toolSequence.join(" -> ")}.`
+          : "",
+        `Confidence ${confidence} from repeated pattern evidence.`,
+      ]),
+    };
+  }
+  if (
+    type === "memory_add" ||
+    type === "memory_update" ||
+    type === "memory_retract"
+  ) {
+    const operationType = str(preview.operation_type, type);
+    const semanticKey = str(preview.semantic_key, str(row.subject_key, "memory"));
+    const valuePreview = str(preview.value_preview, "");
+    const scope = humanizeStatusLabel(str(preview.scope, "global"));
+    const durability = humanizeStatusLabel(str(preview.durability, ""));
+    const sensitive = toBool(preview.looks_sensitive);
+    const sensitiveReason = str(preview.sensitive_reason, "");
+    return {
+      metrics: [
+        { label: "Confidence", value: confidence },
+        { label: "Kind", value: humanizeStatusLabel(str(preview.memory_kind, "memory")) },
+        { label: "Scope", value: scope },
+        {
+          label: "Duration",
+          value: durability || "-",
+        },
+      ],
+      current: [
+        operationType === "memory_add"
+          ? `Future turns do not yet store ${semanticKey} as reusable memory.`
+          : operationType === "memory_update"
+            ? `Future turns still use the current saved value for ${semanticKey}.`
+            : `Future turns still treat ${semanticKey} as active memory.`,
+      ],
+      proposed: cleanEvidenceLines([
+        operationType === "memory_retract"
+          ? `Retract saved memory ${semanticKey}.`
+          : valuePreview
+            ? `${humanizeStatusLabel(operationType)} ${semanticKey}: ${valuePreview}`
+            : `${humanizeStatusLabel(operationType)} ${semanticKey}.`,
+        `Apply at ${scope}${durability ? ` with ${durability} duration` : ""}.`,
+      ]),
+      impact: cleanEvidenceLines([
+        operationType === "memory_add"
+          ? "Future replies can use this fact automatically."
+          : operationType === "memory_update"
+            ? "Future replies will rely on the updated value instead of the older one."
+            : "Future replies will stop leaning on the retracted memory.",
+        sensitive
+          ? `Value stays masked because it looks sensitive${sensitiveReason ? `: ${sensitiveReason}` : "."}`
+          : `Confidence ${confidence}.`,
+      ]),
+    };
+  }
+  if (type === "memory_deprecate") {
+    const item = context.itemById.get(str(preview.item_id, ""));
+    const nextStatus = humanizeStatusLabel(str(preview.next_status, "deprecated"));
+    return {
+      metrics: [
+        { label: "Confidence", value: confidence },
+        {
+          label: "Support",
+          value: num(asRecord(item).support_count, 0).toLocaleString(),
+        },
+        {
+          label: "Contradictions",
+          value: num(asRecord(item).contradiction_count, 0).toLocaleString(),
+        },
+      ],
+      current: cleanEvidenceLines([
+        item
+          ? `${str(item.title, "This learned item")} is still active.`
+          : "This learned item is still active.",
+        item
+          ? `Support versus contradictions: ${num(asRecord(item).support_count, 0).toLocaleString()} / ${num(asRecord(item).contradiction_count, 0).toLocaleString()}.`
+          : "",
+      ]),
+      proposed: [
+        `Set this learned item to ${nextStatus}.`,
+      ],
+      impact: [
+        "Stops stale guidance from influencing future turns.",
+      ],
+    };
+  }
+  if (type === "memory_merge") {
+    const target = context.itemById.get(str(preview.target_item_id, ""));
+    const source = context.itemById.get(str(preview.source_item_id, ""));
+    return {
+      metrics: [
+        { label: "Confidence", value: confidence },
+        { label: "Target", value: str(asRecord(target).title, "Kept item") },
+        { label: "Duplicate", value: str(asRecord(source).title, "Merged item") },
+      ],
+      current: cleanEvidenceLines([
+        target && source
+          ? `${str(asRecord(target).title, "Target item")} and ${str(asRecord(source).title, "source item")} are both still active.`
+          : "Two overlapping memories are still active separately.",
+      ]),
+      proposed: cleanEvidenceLines([
+        target
+          ? `Keep ${str(asRecord(target).title, "the stronger memory")} as the surviving record.`
+          : "Keep the stronger memory as the surviving record.",
+        source
+          ? `Deprecate duplicate memory ${str(asRecord(source).title, "the duplicate")}.`
+          : "Deprecate the duplicate memory.",
+      ]),
+      impact: cleanEvidenceLines([
+        "Reduces duplicate recall and conflicting memory retrieval.",
+        str(preview.reason, "") === "duplicate_content"
+          ? "The merge is based on overlapping content, not surface wording."
+          : "",
+      ]),
+    };
+  }
+  return {
+    metrics: [{ label: "Confidence", value: confidence }],
+    current: cleanEvidenceLines([str(row.summary, ""), str(row.preview, "")]),
+    proposed: cleanEvidenceLines([str(row.preview, ""), str(row.title, "")]),
+    impact: cleanEvidenceLines([
+      `Confidence ${confidence}.`,
+      "ArkEvolve will measure impact after approval if this change goes live.",
+    ]),
+  };
+}
+
+type EvolutionPageTab = "what" | "helped" | "tests" | "review";
+
+const EVOLUTION_PAGE_TABS: Array<{ value: EvolutionPageTab; label: string }> = [
+  { value: "what", label: "Recent changes" },
+  { value: "helped", label: "What improved" },
+  { value: "tests", label: "Experiments" },
+  { value: "review", label: "Needs approval" },
+];
+
+function clampPercent(value: unknown): number {
+  const parsed = num(value, 0);
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.max(0, Math.min(100, parsed));
+}
+
+function ratioPercent(value: unknown): number {
+  const parsed = num(value, 0);
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.max(0, Math.min(100, parsed * 100));
+}
+
+function evolutionGainLabel(value: unknown): string {
+  const parsed = num(value, Number.NaN);
+  if (!Number.isFinite(parsed)) return "-";
+  return `${parsed >= 0 ? "+" : ""}${(parsed * 100).toFixed(1)} pts`;
+}
+
+function EvolutionStatStrip({
+  items,
+}: {
+  items: Array<{
+    label: string;
+    value: ReactNode;
+    helper: ReactNode;
+    tone?: "default" | "good" | "warn" | "info";
+  }>;
+}) {
+  return (
+    <Box className="list-shell stat-strip">
+      {items.map((item) => (
+        <div
+          key={String(item.label)}
+          className="stat-strip-item"
+          data-tone={item.tone !== "default" ? item.tone : undefined}
+        >
+          <span className="stat-strip-label">{item.label}</span>
+          <span className="stat-strip-value">{item.value}</span>
+          <span className="stat-strip-helper">{item.helper}</span>
+        </div>
+      ))}
+    </Box>
+  );
+}
+
+function EvolutionRolloutBar({
+  label,
+  percent,
+}: {
+  label: string;
+  percent: number;
+}) {
+  const pct = clampPercent(percent);
+  return (
+    <Box>
+      <Stack
+        direction="row"
+        spacing={1}
+        sx={{
+          alignItems: "center",
+          justifyContent: "space-between",
+        }}
+      >
+        <Typography variant="body2">{label}</Typography>
+        <Typography
+          variant="caption"
+          sx={{
+            color: "text.secondary",
+          }}
+        >
+          {pct.toFixed(0)}%
+        </Typography>
+      </Stack>
+      <Box
+        role="meter"
+        aria-label={`${label} rollout ${pct.toFixed(0)} percent`}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={Math.round(pct)}
+        sx={{
+          mt: 0.5,
+          height: 8,
+          borderRadius: 1,
+          bgcolor: "var(--ui-rgba-145-170-205-140)",
+          overflow: "hidden",
+        }}
+      >
+        <Box
+          sx={{
+            width: `${pct}%`,
+            height: "100%",
+            borderRadius: 1,
+            bgcolor: pct > 0 ? "#fbbf24" : "var(--ui-rgba-84-198-255-450)",
+          }}
+        />
+      </Box>
+    </Box>
+  );
+}
+
+/* Analytics (top-level page) */

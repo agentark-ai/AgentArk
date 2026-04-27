@@ -82,7 +82,10 @@ fn audit_custom_channel_capability_review(
             capabilities.join(", "),
             rules
         ),
-        Some(format!("source_kind=custom_channel;channel_id={}", channel.id)),
+        Some(format!(
+            "source_kind=custom_channel;channel_id={}",
+            channel.id
+        )),
     );
 }
 

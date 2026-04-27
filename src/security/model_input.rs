@@ -3,7 +3,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{redact_pii, redact_secret_input, SecretInputType};
+use super::{SecretInputType, redact_pii, redact_secret_input};
 
 const EXECUTION_TARGET_BLOCK_START: &str = "<agentark_current_turn_execution_targets>";
 const EXECUTION_TARGET_BLOCK_END: &str = "</agentark_current_turn_execution_targets>";
@@ -31,12 +31,6 @@ static EXECUTION_ENDPOINT_RE: Lazy<Regex> = Lazy::new(|| {
     .unwrap()
 });
 
-static USER_BOUND_IDENTITY_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(
-        r"(?is)\b(?:my|our|the)\s+(?:user|client|customer|patient|employee)\b.{0,120}\b(?:name|email|phone|address|location|account|ssn|passport|dob|date of birth)\b",
-    )
-    .unwrap()
-});
 static ADDRESS_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r"(?i)\b\d{1,6}\s+[A-Za-z0-9.'-]+\s+(?:street|st|road|rd|avenue|ave|boulevard|blvd|lane|ln|drive|dr|way|court|ct|place|pl)\b",
@@ -163,13 +157,6 @@ fn push_unique(target: &mut Vec<String>, value: impl Into<String>) {
 
 fn has_strong_identity_material(text: &str, reasons: &mut Vec<String>) -> bool {
     let mut found = false;
-    if USER_BOUND_IDENTITY_RE.is_match(text) {
-        push_unique(
-            reasons,
-            "user-bound identity details detected in model input",
-        );
-        found = true;
-    }
     if ADDRESS_RE.is_match(text) {
         push_unique(
             reasons,
@@ -696,9 +683,11 @@ mod tests {
 
         assert_eq!(result.decision, ModelInputPrivacyDecision::Allow);
         assert!(result.sanitized_text.contains("You are AgentArk."));
-        assert!(!result
-            .sanitized_text
-            .contains("[SENSITIVE_CONTEXT_WITHHELD"));
+        assert!(
+            !result
+                .sanitized_text
+                .contains("[SENSITIVE_CONTEXT_WITHHELD")
+        );
     }
 
     #[test]
@@ -711,9 +700,11 @@ mod tests {
         );
 
         assert_eq!(result.decision, ModelInputPrivacyDecision::RedactedAllow);
-        assert!(result
-            .sanitized_text
-            .contains("rtsp://192.168.29.61:554/live.sdp"));
+        assert!(
+            result
+                .sanitized_text
+                .contains("rtsp://192.168.29.61:554/live.sdp")
+        );
         assert!(result.sanitized_text.contains("bare host [IP]"));
     }
 
@@ -752,9 +743,43 @@ mod tests {
         );
         assert_eq!(result.decision, ModelInputPrivacyDecision::Allow);
         assert!(result.sanitized_text.contains("Example User"));
-        assert!(!result
-            .sanitized_text
-            .contains("[SENSITIVE_CONTEXT_WITHHELD"));
+        assert!(
+            !result
+                .sanitized_text
+                .contains("[SENSITIVE_CONTEXT_WITHHELD")
+        );
+    }
+
+    #[test]
+    fn internal_helper_prompt_allows_ordinary_self_introduction() {
+        let result = sanitize_model_input_text(
+            "User message:\nmy name is Debanka and i work for OpenAI",
+            &ModelPrivacyConfig::default(),
+            ModelInputContext::InternalHelperPrompt,
+            false,
+        );
+
+        assert_eq!(result.decision, ModelInputPrivacyDecision::Allow);
+        assert!(!result.strong_identity_detected);
+        assert!(result.sanitized_text.contains("Debanka"));
+        assert!(result.sanitized_text.contains("OpenAI"));
+    }
+
+    #[test]
+    fn internal_helper_prompt_does_not_withhold_router_text_about_user_name() {
+        let result = sanitize_model_input_text(
+            "Candidate capability: save the user's name as a durable memory.\nUser message:\nmy name is Debanka",
+            &ModelPrivacyConfig::default(),
+            ModelInputContext::InternalHelperPrompt,
+            false,
+        );
+
+        assert_eq!(result.decision, ModelInputPrivacyDecision::Allow);
+        assert!(
+            !result
+                .sanitized_text
+                .contains("[SENSITIVE_CONTEXT_WITHHELD")
+        );
     }
 
     #[test]
@@ -771,9 +796,11 @@ mod tests {
         assert_eq!(result.decision, ModelInputPrivacyDecision::RedactedAllow);
         assert!(result.sanitized_text.contains("Example User"));
         assert!(result.sanitized_text.contains("[REDACTED_SECRET]"));
-        assert!(!result
-            .sanitized_text
-            .contains("[SENSITIVE_CONTEXT_WITHHELD"));
+        assert!(
+            !result
+                .sanitized_text
+                .contains("[SENSITIVE_CONTEXT_WITHHELD")
+        );
     }
 
     #[test]

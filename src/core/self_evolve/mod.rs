@@ -11,6 +11,7 @@ pub mod classifier_prompt_evolution;
 pub mod coding_guidelines;
 pub mod policy_evolution;
 pub mod prompt_evolution;
+pub mod replay_gate;
 pub mod security_review;
 pub mod skill_evolution;
 pub mod specialist_prompt_evolution;

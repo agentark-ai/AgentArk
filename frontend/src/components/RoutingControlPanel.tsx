@@ -246,8 +246,8 @@ export function RoutingControlPanel({
                             tabIndex={0}
                             sx={{
                               cursor: "pointer",
-                              borderColor: selectedState ? "rgba(47,212,255,0.48)" : undefined,
-                              background: selectedState ? "rgba(47,212,255,0.06)" : undefined
+                              borderColor: selectedState ? "var(--ui-rgba-47-212-255-480)" : undefined,
+                              background: selectedState ? "var(--ui-rgba-47-212-255-060)" : undefined
                             }}
                           >
                             <Stack spacing={0.75} sx={{ width: "100%" }}>

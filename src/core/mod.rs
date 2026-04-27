@@ -1,6 +1,7 @@
 //! Core agent module - the brain of AgentArk
 #![allow(unused_imports)]
 
+pub(crate) mod action_catalog;
 mod agent;
 pub mod auth_profiles;
 pub mod automation;
@@ -39,8 +40,8 @@ pub mod planner;
 pub mod product_help;
 pub mod prompt_memory;
 pub mod prompt_policy;
+pub mod readiness;
 pub mod release_updates;
-pub mod request_shape;
 pub mod runtime_image;
 pub mod secrets;
 pub mod self_evolve;
@@ -50,7 +51,6 @@ pub mod spawn;
 pub mod swarm;
 mod task;
 pub mod task_router;
-mod tool_handlers;
 pub mod watcher;
 
 pub(crate) use agent::chat_model_is_configured;
@@ -58,9 +58,8 @@ pub(crate) use agent::queue_stream_event;
 pub(crate) use agent::AUTONOMY_SETTINGS_STORAGE_KEY;
 pub(crate) use agent::USER_SELECTED_MODEL_SLOT_KEY;
 pub use agent::{
-    Agent, ClarificationChoice, ConversationMessage, ExecutionStep, ExecutionTrace,
-    RequestExecutionHints, RequestPlanConfirmationMode, SecurityEvents, SecuritySnapshot,
-    StreamEvent, UserProfile,
+    Agent, ChatAttachmentHint, ClarificationChoice, ConversationMessage, ExecutionStep, ExecutionTrace,
+    RequestExecutionHints, SecurityEvents, SecuritySnapshot, StreamEvent, UserProfile,
 };
 pub use automation::{
     list_runs as list_automation_runs, list_supervisor_states as list_automation_supervisor_states,
@@ -132,7 +131,7 @@ pub use nodes::{
 };
 pub use planner::{ExecutionPlan, PlanPromptMode, PlanStep, PlanStepStatus, PlanSubstep};
 pub use prompt_memory::PromptMemory;
-pub use request_shape::RequestShapeAssessment;
+pub use readiness::{DevelopmentalReadiness, ReadinessPolicy};
 pub(crate) use task::{one_shot_reminder_is_expired, one_shot_reminder_needs_delay_notice};
 pub use task::{status_for_task_approval, Task, TaskApproval, TaskQueue, TaskStatus};
 pub(crate) use task::{task_is_one_shot_scheduled_reminder, task_is_scheduled_reminder};

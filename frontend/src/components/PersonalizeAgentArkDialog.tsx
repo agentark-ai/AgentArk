@@ -145,9 +145,9 @@ export function PersonalizeAgentArkDialog({ open, profile, onClose }: Props) {
         paper: {
           sx: {
             borderRadius: 2,
-            border: "1px solid rgba(255, 255, 255, 0.08)",
+            border: "1px solid var(--ui-rgba-255-255-255-080)",
             background:
-              "linear-gradient(160deg, rgba(24, 24, 28, 0.98), rgba(15, 15, 18, 0.95))",
+              "linear-gradient(160deg, var(--ui-rgba-24-24-28-980), var(--ui-rgba-15-15-18-950))",
           },
         },
       }}

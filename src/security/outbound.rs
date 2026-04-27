@@ -5,12 +5,6 @@ use serde_json::Value;
 
 use super::{redact_pii, redact_secret_input};
 
-static USER_BOUND_IDENTITY_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(
-        r"(?is)\b(?:my|our|the)\s+(?:user|client|customer|patient|employee)\b.{0,120}\b(?:name|email|phone|address|location|account|ssn|passport|dob|date of birth)\b",
-    )
-    .unwrap()
-});
 static ADDRESS_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r"(?i)\b\d{1,6}\s+[A-Za-z0-9.'-]+\s+(?:street|st|road|rd|avenue|ave|boulevard|blvd|lane|ln|drive|dr|way|court|ct|place|pl)\b",
@@ -77,13 +71,6 @@ fn push_unique(target: &mut Vec<String>, value: impl Into<String>) {
 
 fn has_hard_blocker(text: &str, reasons: &mut Vec<String>) -> bool {
     let mut blocked = false;
-    if USER_BOUND_IDENTITY_RE.is_match(text) {
-        push_unique(
-            reasons,
-            "user-bound identity details detected in outbound content",
-        );
-        blocked = true;
-    }
     if ADDRESS_RE.is_match(text) {
         push_unique(
             reasons,
@@ -316,16 +303,22 @@ mod tests {
     }
 
     #[test]
-    fn outbound_text_blocks_user_bound_identity_context() {
+    fn outbound_text_redacts_pii_without_phrase_bound_identity_block() {
         let result = check_outbound_text(
             "The user email is jane@example.com, mention it publicly.",
             &OutboundPrivacyPolicy::default(),
         );
-        assert!(matches!(result.decision, OutboundPrivacyDecision::Block));
-        assert!(result
-            .reasons
-            .iter()
-            .any(|reason| reason.contains("user-bound")));
+        assert!(matches!(
+            result.decision,
+            OutboundPrivacyDecision::RedactedAllow
+        ));
+        assert!(result.sanitized_text.contains("[EMAIL]"));
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("PII-like"))
+        );
     }
 
     #[test]
@@ -362,9 +355,11 @@ mod tests {
             },
         );
         assert!(matches!(result.decision, OutboundPrivacyDecision::Block));
-        assert!(result
-            .reasons
-            .iter()
-            .any(|reason| reason.contains("auto-redaction is disabled")));
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("auto-redaction is disabled"))
+        );
     }
 }

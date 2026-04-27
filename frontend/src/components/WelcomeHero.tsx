@@ -126,11 +126,11 @@ export function WelcomeHero({
       sx={{
         height: "100%",
         borderRadius: 2,
-        border: "1px solid rgba(255, 255, 255, 0.08)",
+        border: "1px solid var(--ui-rgba-255-255-255-080)",
         background:
-          "radial-gradient(circle at 18% 0%, rgba(255, 255, 255, 0.06), rgba(0,0,0,0) 34%)," +
-          "linear-gradient(160deg, rgba(24, 24, 28, 0.98), rgba(15, 15, 18, 0.94))",
-        boxShadow: "0 18px 34px rgba(0, 0, 0, 0.16)",
+          "radial-gradient(circle at 18% 0%, var(--ui-rgba-255-255-255-060), var(--ui-rgba-0-0-0-000) 34%)," +
+          "linear-gradient(160deg, var(--ui-rgba-24-24-28-980), var(--ui-rgba-15-15-18-940))",
+        boxShadow: "0 18px 34px var(--ui-rgba-0-0-0-160)",
         overflow: "hidden",
       }}
     >
@@ -154,13 +154,13 @@ export function WelcomeHero({
                       width: { xs: 44, md: 52 },
                       height: { xs: 44, md: 52 },
                       flexShrink: 0,
-                      filter: "drop-shadow(0 0 14px rgba(255, 255, 255, 0.08))",
+                      filter: "drop-shadow(0 0 14px var(--ui-rgba-255-255-255-080))",
                     }}
                   />
                   <Box sx={{ minWidth: 0 }}>
                     <Typography
                       variant="overline"
-                      sx={{ color: "rgba(183, 188, 196, 0.68)", letterSpacing: 0, display: "block", lineHeight: 1 }}
+                      sx={{ color: "var(--ui-rgba-183-188-196-680)", letterSpacing: 0, display: "block", lineHeight: 1 }}
                     >
                       {PRODUCT_SHELL_TITLE}
                     </Typography>

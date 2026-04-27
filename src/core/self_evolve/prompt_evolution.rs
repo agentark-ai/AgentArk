@@ -36,7 +36,7 @@ pub const BASE_SYSTEM_PROMPT_VERSION: &str = "system_prompt_v2";
 
 const PROMPT_BUNDLE_DEFAULT_VERSION: &str = "prompt-bundle-default-v1";
 const LINEAGE_ARCHIVE_REL_PATH: &str = ".agentark/self_evolve/prompt_bundle_lineage.jsonl";
-const BENCHMARK_PROFILE_REL_PATH: &str = "assets/self_evolve/prompt_bundle_benchmark_v1.json";
+const BENCHMARK_PROFILE_JSON: &str = include_str!("benchmarks/prompt_bundle_benchmark_v1.json");
 const DEFAULT_RECENT_LINEAGE_LIMIT: usize = 12;
 const MAX_LINEAGE_ARCHIVE_ENTRIES: usize = 400;
 const MAX_SURFACE_CHARS: usize = 16_000;
@@ -540,21 +540,8 @@ impl PromptEvolutionEngine {
     }
 
     async fn load_benchmark_suite(&self) -> Result<PromptBenchmarkProfile> {
-        let profile_path = self.config.project_root.join(BENCHMARK_PROFILE_REL_PATH);
-        let raw = tokio::fs::read_to_string(&profile_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to read prompt benchmark profile {}",
-                    profile_path.display()
-                )
-            })?;
-        let profile: PromptBenchmarkProfile = serde_json::from_str(&raw).with_context(|| {
-            format!(
-                "failed to parse prompt benchmark JSON {}",
-                profile_path.display()
-            )
-        })?;
+        let profile: PromptBenchmarkProfile = serde_json::from_str(BENCHMARK_PROFILE_JSON)
+            .context("failed to parse embedded prompt benchmark JSON")?;
         if profile.target_key != PROMPT_BUNDLE_PROFILE_KEY {
             tracing::warn!(
                 "prompt evolution benchmark target_key mismatch: got '{}', expected '{}'",
@@ -632,8 +619,12 @@ impl PromptEvolutionEngine {
             &synthesis_preservation.delegation_synthesis.policy_block,
             SYNTHESIS_TOOL_PRESERVATION_MUTATION,
         );
-        synthesis_preservation.delegation_synthesis.instruction_template = append_instruction_note(
-            &synthesis_preservation.delegation_synthesis.instruction_template,
+        synthesis_preservation
+            .delegation_synthesis
+            .instruction_template = append_instruction_note(
+            &synthesis_preservation
+                .delegation_synthesis
+                .instruction_template,
             "If delegated outputs already contain the right action, preserve the clearest required tool call instead of rewording away the action.",
         );
         sanitize_prompt_bundle(&mut synthesis_preservation);

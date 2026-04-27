@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::core::readiness::DevelopmentalReadiness;
+
 pub const AUTONOMY_PAUSED_SINCE_KEY: &str = "autonomy_paused_since_v1";
 pub const AUTONOMY_PAUSE_NUDGE_LAST_SENT_AT_KEY: &str = "autonomy_pause_nudge_last_sent_at_v1";
 pub const AUTONOMY_PAUSE_NUDGE_INTERVAL_SECS: i64 = 7 * 24 * 60 * 60;
@@ -59,6 +61,8 @@ pub struct RiskEnvelope {
     pub requires_approval: bool,
     #[serde(default)]
     pub reasons: Vec<String>,
+    #[serde(default)]
+    pub blocked: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,6 +182,29 @@ pub struct SentinelSettings {
     pub max_proposals_per_scan: u32,
 }
 
+impl SentinelSettings {
+    pub fn enable_all_signals(&mut self) {
+        self.enabled = true;
+        self.watch_in_app = true;
+        self.watch_connected_services = true;
+        self.infer_new_automations = true;
+    }
+
+    pub fn enforce_dependencies(&mut self) {
+        if !self.enabled {
+            self.watch_in_app = false;
+            self.watch_connected_services = false;
+            self.infer_new_automations = false;
+        }
+    }
+}
+
+impl AutonomySettings {
+    pub fn enforce_dependencies(&mut self) {
+        self.sentinel.enforce_dependencies();
+    }
+}
+
 pub fn autonomy_background_paused(settings: &AutonomySettings) -> bool {
     settings.agent_paused || settings.autonomy_mode.eq_ignore_ascii_case("off")
 }
@@ -282,6 +309,8 @@ pub struct RecommendedAction {
     pub payload: serde_json::Value,
     #[serde(default)]
     pub trust: RiskEnvelope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<DevelopmentalReadiness>,
 }
 
 pub fn default_modes() -> Vec<AutopilotMode> {
@@ -340,6 +369,7 @@ pub fn score_action_risk(
 ) -> RiskEnvelope {
     let mut score: u8 = 10;
     let mut reasons = Vec::new();
+    let mut blocked = false;
     let kind_lc = kind.to_ascii_lowercase();
 
     let payload_text = payload.to_string().to_ascii_lowercase();
@@ -374,6 +404,7 @@ pub fn score_action_risk(
             || payload_text.contains(&action.to_ascii_lowercase())
         {
             score = 100;
+            blocked = true;
             reasons.push(format!("action '{}' is blocked by policy", action));
         }
     }
@@ -393,5 +424,6 @@ pub fn score_action_risk(
         score,
         requires_approval,
         reasons,
+        blocked,
     }
 }

@@ -113,6 +113,12 @@ pub struct AppDeployRequest {
     pub install_command: Option<String>,
     #[serde(default)]
     pub entry_command: Option<String>,
+    #[serde(default)]
+    pub start_command: Option<String>,
+    #[serde(default)]
+    pub stop_command: Option<String>,
+    #[serde(default)]
+    pub commands: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -13,7 +13,7 @@ use crate::core::llm::LlmClient;
 
 pub const ROUTING_COMPLEXITY_POLICY_KEY: &str = "routing_complexity_policy_v1";
 const LINEAGE_ARCHIVE_REL_PATH: &str = ".agentark/self_evolve/routing_policy_lineage.jsonl";
-const BENCHMARK_PROFILE_REL_PATH: &str = "assets/self_evolve/routing_benchmark_v1.json";
+const BENCHMARK_PROFILE_JSON: &str = include_str!("benchmarks/routing_benchmark_v1.json");
 const DEFAULT_RECENT_LINEAGE_LIMIT: usize = 12;
 const MAX_LINEAGE_ARCHIVE_ENTRIES: usize = 400;
 const MAX_INDICATORS: usize = 96;
@@ -356,21 +356,8 @@ impl PolicyEvolutionEngine {
     }
 
     async fn load_benchmark_suite(&self) -> Result<Vec<BenchmarkCase>> {
-        let profile_path = self.config.project_root.join(BENCHMARK_PROFILE_REL_PATH);
-        let raw = tokio::fs::read_to_string(&profile_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to read benchmark profile {}",
-                    profile_path.display()
-                )
-            })?;
-        let profile: BenchmarkProfile = serde_json::from_str(&raw).with_context(|| {
-            format!(
-                "failed to parse benchmark profile JSON {}",
-                profile_path.display()
-            )
-        })?;
+        let profile: BenchmarkProfile = serde_json::from_str(BENCHMARK_PROFILE_JSON)
+            .context("failed to parse embedded routing benchmark profile JSON")?;
         if profile.target_key != ROUTING_COMPLEXITY_POLICY_KEY {
             tracing::warn!(
                 "policy evolution benchmark target_key mismatch: got '{}', expected '{}'",

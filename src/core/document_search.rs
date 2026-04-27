@@ -123,32 +123,6 @@ pub(crate) fn is_generic_document_query_token(token: &str) -> bool {
     )
 }
 
-/// Detect whether the user is asking about a document rather than issuing a
-/// general chat request.
-pub(crate) fn looks_like_document_question(text: &str) -> bool {
-    let lower = text.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return false;
-    }
-
-    lower.contains("doc:")
-        || lower.contains(".pdf")
-        || lower.contains(".docx")
-        || lower.contains(".txt")
-        || lower.contains(".md")
-        || lower.contains(".csv")
-}
-
-/// Decide whether clarification should be skipped when document context is
-/// already available.
-pub(crate) fn should_skip_clarification_for_document_context(
-    text: &str,
-    doc_context_available: bool,
-    execution_intent: bool,
-) -> bool {
-    doc_context_available && !execution_intent && looks_like_document_question(text)
-}
-
 /// Build the text fed into the embedding model for a document chunk.
 pub(crate) fn build_embedding_text(
     filename: &str,
@@ -750,36 +724,6 @@ mod tests {
         assert!(tokens.contains("200kb"));
         assert!(!tokens.contains("what"));
         assert!(!tokens.contains("does"));
-    }
-
-    #[test]
-    fn document_question_detection_is_filename_aware() {
-        assert!(looks_like_document_question(
-            "what does NEW_TENANCY_AGREEMENT_2026_under_200kb.pdf talk about?"
-        ));
-        assert!(looks_like_document_question(
-            "summarize doc:123abcde for me"
-        ));
-        assert!(!looks_like_document_question("what time is it?"));
-    }
-
-    #[test]
-    fn clarification_skip_requires_context_and_document_question() {
-        assert!(should_skip_clarification_for_document_context(
-            "what does NEW_TENANCY_AGREEMENT_2026_under_200kb.pdf talk about?",
-            true,
-            false
-        ));
-        assert!(!should_skip_clarification_for_document_context(
-            "what does NEW_TENANCY_AGREEMENT_2026_under_200kb.pdf talk about?",
-            false,
-            false
-        ));
-        assert!(!should_skip_clarification_for_document_context(
-            "what does NEW_TENANCY_AGREEMENT_2026_under_200kb.pdf talk about?",
-            true,
-            true
-        ));
     }
 
     #[test]

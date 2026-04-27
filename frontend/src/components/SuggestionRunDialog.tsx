@@ -334,9 +334,9 @@ export function SuggestionRunDialog({
             width: { xs: "calc(100vw - 32px)", sm: 360 },
             p: 1.5,
             borderRadius: 2,
-            bgcolor: "rgba(8,14,28,0.96)",
-            border: "1px solid rgba(100,160,230,0.24)",
-            boxShadow: "0 18px 50px rgba(0,0,0,0.35)"
+            bgcolor: "var(--ui-rgba-8-14-28-960)",
+            border: "1px solid var(--ui-rgba-100-160-230-240)",
+            boxShadow: "0 18px 50px var(--ui-rgba-0-0-0-350)"
           }}
         >
           <Stack spacing={1}>

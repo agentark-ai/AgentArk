@@ -8,6 +8,11 @@ frontend/*.tsbuildinfo
 frontend/vite.config.js
 frontend/vite.config.d.ts
 frontend/dist/
+frontend/vite-dev*.log
+frontend/vite-dev*.err.log
+
+# Generated test/scratch artifacts
+/landing.html
 
 # Secrets and user data
 *.enc
@@ -20,6 +25,7 @@ config/.keyfile
 config/safety.toml
 config/gmail.json
 data/
+uploads/
 
 # Environment
 .env

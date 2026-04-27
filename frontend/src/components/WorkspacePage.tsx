@@ -13,6 +13,7 @@ type WorkspacePageHeaderProps = {
   title: string;
   description: ReactNode;
   actions?: ReactNode;
+  descriptionNoWrap?: boolean;
   className?: string;
   sx?: SxProps<Theme>;
 };
@@ -39,12 +40,20 @@ export function WorkspacePageHeader({
   title,
   description,
   actions = null,
+  descriptionNoWrap = false,
   className = "",
   sx,
 }: WorkspacePageHeaderProps) {
   return (
     <Box
-      className={["list-shell", "workspace-page-hero-shell", className].filter(Boolean).join(" ")}
+      className={[
+        "list-shell",
+        "workspace-page-hero-shell",
+        descriptionNoWrap ? "workspace-page-hero-shell-nowrap" : "",
+        className,
+      ]
+        .filter(Boolean)
+        .join(" ")}
       sx={sx}
     >
       <Stack
@@ -58,7 +67,15 @@ export function WorkspacePageHeader({
         <Box className="workspace-page-header-copy">
           <Typography className="workspace-page-kicker">{eyebrow}</Typography>
           <Typography className="workspace-page-title">{title}</Typography>
-          <Typography component="div" className="workspace-page-copy">
+          <Typography
+            component="div"
+            className={[
+              "workspace-page-copy",
+              descriptionNoWrap ? "workspace-page-copy-nowrap" : "",
+            ]
+              .filter(Boolean)
+              .join(" ")}
+          >
             {description}
           </Typography>
         </Box>

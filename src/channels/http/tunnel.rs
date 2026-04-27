@@ -17,6 +17,8 @@ pub(super) struct TunnelState {
     pub url: Option<String>,
     /// If set, only this deployed app is reachable through the active remote-access link.
     pub selected_app_id: Option<String>,
+    /// Whether the active tunnel should serve the AgentArk control plane.
+    pub control_plane_enabled: bool,
     /// Whether the tunnel is actively running
     pub active: bool,
     /// Error message if tunnel failed
@@ -30,6 +32,7 @@ impl TunnelState {
             provider: TunnelProviderKind::Cloudflare,
             url: None,
             selected_app_id: None,
+            control_plane_enabled: false,
             active: false,
             error: None,
         }
@@ -276,6 +279,7 @@ pub(super) struct TunnelProvidersResponse {
     link_label: String,
     url: Option<String>,
     selected_app_id: Option<String>,
+    control_plane_enabled: bool,
     error: Option<String>,
     providers: Vec<TunnelProviderResponse>,
 }
@@ -537,6 +541,7 @@ fn tunnel_providers_response(
         link_label: tunnel_provider_link_label(effective_provider).to_string(),
         url: runtime.url.clone(),
         selected_app_id: runtime.selected_app_id.clone(),
+        control_plane_enabled: runtime.control_plane_enabled,
         error: runtime.error.clone(),
         providers: [
             TunnelProviderKind::Cloudflare,
@@ -558,7 +563,15 @@ pub(super) async fn handle_tunnel_control_command(
     match cmd {
         TunnelControlCommand::Start => {
             let config = load_tunnel_config(state).await;
+            tunnel_auth::ensure_control_plane_tunnel_ready(state, config.provider)
+                .await
+                .map_err(|error| error.message().to_string())?;
             spawn_tunnel(state, None).await?;
+            {
+                let mut tunnel = state.tunnel.write().await;
+                tunnel.selected_app_id = None;
+                tunnel.control_plane_enabled = true;
+            }
             persist_public_tunnel_state(state, None, None).await;
 
             let url = wait_for_tunnel_url(state.tunnel.clone(), 12).await;
@@ -595,10 +608,19 @@ pub(super) async fn handle_tunnel_control_command(
                 ))
             }
         }
-        TunnelControlCommand::Stop => {
-            stop_tunnel_internal(state).await;
-            Ok("Tunnel stopped.".to_string())
-        }
+        TunnelControlCommand::Stop => match reset_tunnel_to_infrastructure(state).await {
+            Ok(Some(url)) => Ok(format!(
+                "Public exposure stopped. Tunnel infrastructure remains ready: {}",
+                url
+            )),
+            Ok(None) => {
+                Ok("Public exposure stopped. Tunnel infrastructure is starting.".to_string())
+            }
+            Err(error) => Err(format!(
+                "Public exposure stopped, but tunnel infrastructure could not restart: {}",
+                error
+            )),
+        },
         TunnelControlCommand::Status => {
             let config = load_tunnel_config(state).await;
             let tunnel = state.tunnel.read().await;
@@ -758,9 +780,15 @@ fn spawn_tunnel_output_reader<R>(
             }
             if line_looks_like_tunnel_error(&line) {
                 let mut tunnel = tunnel_arc.write().await;
-                tunnel.error = Some(line);
-                tunnel.active = false;
-                tunnel.url = None;
+                if tunnel.url.is_none() {
+                    tunnel.error = Some(line);
+                } else {
+                    tracing::warn!(
+                        "{} tunnel diagnostic after URL discovery: {}",
+                        tunnel_provider_label(provider),
+                        line
+                    );
+                }
             }
         }
     });
@@ -1112,6 +1140,110 @@ pub(super) async fn persist_public_tunnel_state(
             let _ = agent.storage.delete(PUBLIC_SELECTED_APP_KEY).await;
         }
     }
+}
+
+pub(super) async fn load_public_selected_app_id(state: &AppState) -> Option<String> {
+    let agent = state.agent.read().await;
+    agent
+        .storage
+        .get(PUBLIC_SELECTED_APP_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+async fn selected_public_app_is_ready(state: &AppState, app_id: &str) -> Result<bool, String> {
+    if !is_valid_app_id(app_id) {
+        return Err("Saved public app selection is not a valid app id.".to_string());
+    }
+    if state.app_registry.get_dir(app_id).await.is_none() {
+        return Ok(false);
+    }
+    if !state.app_registry.access_guard_enabled(app_id).await {
+        return Err(
+            "Saved public app selection no longer has App Guard enabled; not exposing it publicly."
+                .to_string(),
+        );
+    }
+    if state
+        .app_registry
+        .access_key(app_id)
+        .await
+        .map(|value| value.trim().is_empty())
+        .unwrap_or(true)
+    {
+        return Err(
+            "Saved public app selection has no access password; not exposing it publicly."
+                .to_string(),
+        );
+    }
+    Ok(true)
+}
+
+pub(super) async fn auto_start_selected_app_tunnel(
+    state: &AppState,
+) -> Result<Option<String>, String> {
+    let Some(app_id) = load_public_selected_app_id(state).await else {
+        return Ok(None);
+    };
+
+    persist_public_tunnel_state(state, None, Some(&app_id)).await;
+    for attempt in 0..30 {
+        match selected_public_app_is_ready(state, &app_id).await {
+            Ok(true) => break,
+            Ok(false) if attempt < 29 => {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            Ok(false) => {
+                return Err(format!(
+                    "Saved public app {} was not restored in time; tunnel auto-start skipped.",
+                    app_id
+                ));
+            }
+            Err(error) => {
+                persist_public_tunnel_state(state, None, None).await;
+                return Err(error);
+            }
+        }
+    }
+
+    spawn_tunnel(state, None).await?;
+    {
+        let mut tunnel = state.tunnel.write().await;
+        tunnel.selected_app_id = Some(app_id.clone());
+        tunnel.control_plane_enabled = false;
+    }
+    let url = wait_for_tunnel_url(state.tunnel.clone(), 12).await;
+    if let Some(found) = url.as_deref() {
+        persist_public_tunnel_state(state, Some(found), Some(&app_id)).await;
+    } else {
+        persist_public_tunnel_state(state, None, Some(&app_id)).await;
+    }
+    Ok(url)
+}
+
+pub(super) async fn auto_start_tunnel_infrastructure(
+    state: &AppState,
+) -> Result<Option<String>, String> {
+    {
+        let tunnel = state.tunnel.read().await;
+        if tunnel.active {
+            return Ok(tunnel.url.clone());
+        }
+    }
+
+    spawn_tunnel(state, None).await?;
+    {
+        let mut tunnel = state.tunnel.write().await;
+        tunnel.selected_app_id = None;
+        tunnel.control_plane_enabled = false;
+    }
+    let url = wait_for_tunnel_url(state.tunnel.clone(), 12).await;
+    Ok(url)
 }
 
 async fn run_tunnel_test_command(
@@ -1845,6 +1977,7 @@ pub(super) async fn get_tunnel_status(State(state): State<AppState>) -> Json<ser
         "active": tunnel.active,
         "url": tunnel.url,
         "selected_app_id": tunnel.selected_app_id,
+        "control_plane_enabled": tunnel.control_plane_enabled,
         "error": tunnel.error,
         "provider": provider.as_str(),
         "provider_label": tunnel_provider_label(provider),
@@ -2288,6 +2421,7 @@ pub(super) async fn start_tunnel(
             {
                 let mut tunnel = state.tunnel.write().await;
                 tunnel.selected_app_id = requested_app_id.clone();
+                tunnel.control_plane_enabled = requested_app_id.is_none();
             }
             persist_public_tunnel_state(&state, None, requested_app_id.as_deref()).await;
             let url = wait_for_tunnel_url(state.tunnel.clone(), 12).await;
@@ -2357,6 +2491,7 @@ pub(super) async fn stop_tunnel_internal(state: &AppState) {
         tunnel.active = false;
         tunnel.url = None;
         tunnel.selected_app_id = None;
+        tunnel.control_plane_enabled = false;
         tunnel.error = None;
         tracing::info!("Tunnel stopped by user");
         provider
@@ -2371,10 +2506,36 @@ pub(super) async fn stop_tunnel_internal(state: &AppState) {
     persist_public_tunnel_state(state, None, None).await;
 }
 
+pub(super) async fn reset_tunnel_to_infrastructure(
+    state: &AppState,
+) -> Result<Option<String>, String> {
+    stop_tunnel_internal(state).await;
+    auto_start_tunnel_infrastructure(state).await
+}
+
 /// POST /tunnel/stop - stop the active public tunnel
-pub(super) async fn stop_tunnel(State(state): State<AppState>) -> Json<serde_json::Value> {
-    stop_tunnel_internal(&state).await;
-    Json(serde_json::json!({ "ok": true, "message": "Tunnel stopped" }))
+pub(super) async fn stop_tunnel(State(state): State<AppState>) -> Response {
+    match reset_tunnel_to_infrastructure(&state).await {
+        Ok(url) => Json(serde_json::json!({
+            "ok": true,
+            "message": "Public exposure stopped; tunnel infrastructure remains ready.",
+            "active": true,
+            "url": url,
+            "selected_app_id": null,
+            "control_plane_enabled": false
+        }))
+        .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("Public exposure stopped, but tunnel infrastructure could not restart: {}", error),
+                "selected_app_id": null,
+                "control_plane_enabled": false
+            })),
+        )
+            .into_response(),
+    }
 }
 
 pub(super) async fn wait_for_tunnel_url(

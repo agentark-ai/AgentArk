@@ -1,5 +1,4 @@
 //! Action system with self-improvement capabilities
-//!
 //! Based on arXiv:2512.17102 "SAGE: Self-Improving Agent with Action Library"
 
 pub mod app;
@@ -17,10 +16,11 @@ use std::collections::BTreeMap;
 
 use crate::runtime::SandboxMode;
 
+pub const ACTION_CATALOG_EMBEDDING_DIM: usize = 384;
 #[allow(unused_imports)]
 pub use gmail::{gmail_reply, gmail_scan};
 #[allow(unused_imports)]
-pub use research::{execute_research, ResearchArgs, ResearchClient, ResearchDepth, ResearchResult};
+pub use research::{ResearchArgs, ResearchClient, ResearchDepth, ResearchResult, execute_research};
 #[allow(unused_imports)]
 pub use search::{SearchBackend, SearchClient, SearchConfig, SearchResponse, SearchResult};
 
@@ -68,6 +68,25 @@ pub enum PlannerSideEffectLevel {
     None,
     Notify,
     Write,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlannerDeliveryMode {
+    /// Returns a usable result in the current turn.
+    Immediate,
+    /// Queues work for later execution.
+    Async,
+    /// Creates a trigger/monitor that fires when a condition is met.
+    Conditional,
+    /// Delivery timing depends on arguments or external configuration.
+    Either,
+}
+
+impl Default for PlannerDeliveryMode {
+    fn default() -> Self {
+        Self::Immediate
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -257,6 +276,8 @@ pub struct ActionPlannerMetadata {
     pub integration_class: PlannerIntegrationClass,
     pub cost: PlannerCostTier,
     pub side_effect_level: PlannerSideEffectLevel,
+    #[serde(default)]
+    pub delivery_mode: PlannerDeliveryMode,
 }
 
 impl Default for ActionPlannerMetadata {
@@ -267,6 +288,7 @@ impl Default for ActionPlannerMetadata {
             integration_class: PlannerIntegrationClass::Unknown,
             cost: PlannerCostTier::Medium,
             side_effect_level: PlannerSideEffectLevel::None,
+            delivery_mode: PlannerDeliveryMode::Immediate,
         }
     }
 }
@@ -275,6 +297,16 @@ impl ActionDef {
     pub fn planner_metadata(&self) -> ActionPlannerMetadata {
         planner_metadata_for_action(self)
     }
+}
+
+fn infer_delivery_mode(capabilities: &std::collections::HashSet<String>) -> PlannerDeliveryMode {
+    if capabilities.contains("scheduler") {
+        return PlannerDeliveryMode::Async;
+    }
+    if capabilities.contains("watcher") {
+        return PlannerDeliveryMode::Conditional;
+    }
+    PlannerDeliveryMode::Immediate
 }
 
 pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata {
@@ -287,6 +319,7 @@ pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata 
 
     let mut meta = ActionPlannerMetadata::default();
     meta.requires_auth = action.authorization.requires_auth;
+    meta.delivery_mode = infer_delivery_mode(&capabilities);
 
     match name.as_str() {
         "current_time" => {
@@ -302,7 +335,7 @@ pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata 
             meta.side_effect_level = PlannerSideEffectLevel::Notify;
             return meta;
         }
-        "watch" | "schedule_task" => {
+        "watch" | "schedule_task" | "delegate" => {
             meta.role = PlannerActionRole::Orchestration;
             meta.integration_class = PlannerIntegrationClass::Internal;
             meta.cost = PlannerCostTier::Low;
@@ -349,6 +382,34 @@ pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata 
             meta.role = PlannerActionRole::Mutation;
             meta.integration_class = PlannerIntegrationClass::Browser;
             meta.cost = PlannerCostTier::High;
+            meta.side_effect_level = PlannerSideEffectLevel::Write;
+            return meta;
+        }
+        "home_assistant" => {
+            meta.role = PlannerActionRole::DataSource;
+            meta.requires_auth = true;
+            meta.integration_class = PlannerIntegrationClass::Network;
+            meta.cost = PlannerCostTier::Low;
+            return meta;
+        }
+        "home_assistant_call_service" => {
+            meta.role = PlannerActionRole::Mutation;
+            meta.requires_auth = true;
+            meta.integration_class = PlannerIntegrationClass::Network;
+            meta.cost = PlannerCostTier::Medium;
+            meta.side_effect_level = PlannerSideEffectLevel::Write;
+            return meta;
+        }
+        "capability_resolve" => {
+            meta.role = PlannerActionRole::Inspection;
+            meta.integration_class = PlannerIntegrationClass::Internal;
+            meta.cost = PlannerCostTier::Low;
+            return meta;
+        }
+        "capability_acquire" | "manage_actions" => {
+            meta.role = PlannerActionRole::Mutation;
+            meta.integration_class = PlannerIntegrationClass::Internal;
+            meta.cost = PlannerCostTier::Medium;
             meta.side_effect_level = PlannerSideEffectLevel::Write;
             return meta;
         }
@@ -408,10 +469,12 @@ pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata 
         return meta;
     }
 
-    if capabilities.contains("watcher_inventory")
+    if capabilities.contains("capability_inventory")
+        || capabilities.contains("watcher_inventory")
         || capabilities.contains("integration_inventory")
         || capabilities.contains("platform_observability")
         || capabilities.contains("database_readonly")
+        || capabilities.contains("session_history")
         || capabilities.contains("memory")
         || capabilities.contains("documents")
     {
@@ -432,6 +495,17 @@ pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata 
         return meta;
     }
 
+    if capabilities.contains("skill_management")
+        || capabilities.contains("integration_builder")
+        || capabilities.contains("integration_admin")
+    {
+        meta.role = PlannerActionRole::Mutation;
+        meta.integration_class = PlannerIntegrationClass::Internal;
+        meta.cost = PlannerCostTier::Medium;
+        meta.side_effect_level = PlannerSideEffectLevel::Write;
+        return meta;
+    }
+
     if capabilities.contains("gmail") || capabilities.contains("google_workspace") {
         meta.role = PlannerActionRole::DataSource;
         meta.integration_class = PlannerIntegrationClass::Workspace;
@@ -441,6 +515,21 @@ pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata 
     if capabilities.contains("search") || capabilities.contains("research") {
         meta.role = PlannerActionRole::DataSource;
         meta.integration_class = PlannerIntegrationClass::Search;
+        return meta;
+    }
+
+    if capabilities.contains("vision_ocr")
+        || capabilities.contains("image_generation")
+        || capabilities.contains("pdf_generation")
+        || capabilities.contains("document_generation")
+    {
+        meta.role = PlannerActionRole::DataSource;
+        meta.integration_class = PlannerIntegrationClass::Media;
+        meta.cost = PlannerCostTier::Medium;
+        if capabilities.contains("pdf_generation") || capabilities.contains("document_generation") {
+            meta.role = PlannerActionRole::Mutation;
+            meta.side_effect_level = PlannerSideEffectLevel::Write;
+        }
         return meta;
     }
 
@@ -538,13 +627,6 @@ pub fn action_requires_nontrivial_direct_execution(action: &ActionDef) -> bool {
                 | PlannerIntegrationClass::Commerce
                 | PlannerIntegrationClass::Media
         )
-}
-
-pub fn action_prefers_code_execution_companion(action: &ActionDef) -> bool {
-    matches!(
-        planner_metadata_for_action(action).role,
-        PlannerActionRole::Orchestration
-    )
 }
 
 /// Action source type
@@ -659,7 +741,53 @@ mod tests {
         };
 
         assert!(action_requires_nontrivial_direct_execution(&action));
-        assert!(action_prefers_code_execution_companion(&action));
+    }
+
+    #[test]
+    fn planner_delivery_mode_comes_from_capabilities() {
+        let scheduled = ActionDef {
+            capabilities: vec!["scheduler".to_string()],
+            ..ActionDef::default()
+        };
+        let watcher = ActionDef {
+            capabilities: vec!["watcher".to_string()],
+            ..ActionDef::default()
+        };
+        let immediate = ActionDef {
+            capabilities: vec!["file_write".to_string()],
+            ..ActionDef::default()
+        };
+
+        assert_eq!(
+            planner_metadata_for_action(&scheduled).delivery_mode,
+            PlannerDeliveryMode::Async
+        );
+        assert_eq!(
+            planner_metadata_for_action(&watcher).delivery_mode,
+            PlannerDeliveryMode::Conditional
+        );
+        assert_eq!(
+            planner_metadata_for_action(&immediate).delivery_mode,
+            PlannerDeliveryMode::Immediate
+        );
+    }
+
+    #[test]
+    fn pdf_generation_keeps_write_effect_without_filesystem_routing_class() {
+        let action = ActionDef {
+            name: "pdf_generate".to_string(),
+            capabilities: vec![
+                "file_write".to_string(),
+                "pdf_generation".to_string(),
+                "document_generation".to_string(),
+            ],
+            ..ActionDef::default()
+        };
+
+        let metadata = planner_metadata_for_action(&action);
+        assert_eq!(metadata.role, PlannerActionRole::Mutation);
+        assert_eq!(metadata.integration_class, PlannerIntegrationClass::Media);
+        assert_eq!(metadata.side_effect_level, PlannerSideEffectLevel::Write);
     }
 
     #[test]
@@ -671,6 +799,5 @@ mod tests {
         };
 
         assert!(!action_requires_nontrivial_direct_execution(&action));
-        assert!(!action_prefers_code_execution_companion(&action));
     }
 }

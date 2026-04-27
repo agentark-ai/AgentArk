@@ -344,7 +344,6 @@ fn tool_argument_phase(tool_name: &str) -> (&'static str, &'static str) {
 
 #[derive(Clone, Copy)]
 enum ModelRequestMode {
-    PrimaryAssistantTurn,
     Helper,
 }
 
@@ -356,16 +355,9 @@ fn sanitize_model_request_bundle(
     policy: &crate::security::ModelPrivacyConfig,
     allow_sensitive_context: bool,
 ) -> (String, String, Vec<ConversationMessage>) {
-    let system_context = match mode {
-        ModelRequestMode::PrimaryAssistantTurn => crate::security::ModelInputContext::SystemPrompt,
-        ModelRequestMode::Helper => crate::security::ModelInputContext::InternalHelperPrompt,
-    };
-    let user_context = match mode {
-        ModelRequestMode::PrimaryAssistantTurn => {
-            crate::security::ModelInputContext::CurrentUserMessage
-        }
-        ModelRequestMode::Helper => crate::security::ModelInputContext::InternalHelperPrompt,
-    };
+    let _ = mode;
+    let system_context = crate::security::ModelInputContext::InternalHelperPrompt;
+    let user_context = crate::security::ModelInputContext::InternalHelperPrompt;
 
     (
         sanitize_model_request_text(
@@ -613,6 +605,66 @@ fn extract_openai_message_text(value: &serde_json::Value) -> Option<String> {
     extract_openai_text_from_value(value, true)
 }
 
+fn extract_json_object_from_text(text: &str) -> Option<serde_json::Value> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        return value.is_object().then_some(value);
+    }
+
+    let bytes = text.as_bytes();
+    let mut start = None::<usize>;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (index, byte) in bytes.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match byte {
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match byte {
+            b'"' => in_string = true,
+            b'{' => {
+                if depth == 0 {
+                    start = Some(index);
+                }
+                depth += 1;
+            }
+            b'}' => {
+                if depth == 0 {
+                    continue;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    let begin = start?;
+                    let candidate = &text[begin..=index];
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) {
+                        if value.is_object() {
+                            return Some(value);
+                        }
+                    }
+                    start = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
 fn extract_openai_delta_text(value: &serde_json::Value) -> Option<String> {
     extract_openai_text_from_value(value, false)
 }
@@ -675,42 +727,6 @@ fn build_openai_responses_tools(actions: &[crate::actions::ActionDef]) -> Vec<se
             })
         })
         .collect()
-}
-
-fn build_openai_chat_tools(actions: &[crate::actions::ActionDef]) -> Vec<serde_json::Value> {
-    actions
-        .iter()
-        .map(|action| {
-            serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": action.name,
-                    "description": action.description,
-                    "parameters": normalize_openai_tool_schema(&action.input_schema),
-                }
-            })
-        })
-        .collect()
-}
-
-fn build_anthropic_tools(actions: &[crate::actions::ActionDef]) -> Vec<serde_json::Value> {
-    actions
-        .iter()
-        .map(|action| {
-            serde_json::json!({
-                "name": action.name,
-                "description": action.description,
-                "input_schema": action.input_schema,
-            })
-        })
-        .collect()
-}
-
-fn serialized_value_char_count(value: &serde_json::Value) -> usize {
-    serde_json::to_string(value)
-        .ok()
-        .map(|text| text_char_count(&text))
-        .unwrap_or(0)
 }
 
 fn build_openai_responses_request(
@@ -1604,19 +1620,40 @@ pub struct LlmResponse {
     pub model: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LlmRequestTelemetry {
-    pub provider: String,
-    pub model: String,
-    pub tool_schema_format: String,
-    pub system_prompt_chars: usize,
-    pub user_message_chars: usize,
-    pub history_chars: usize,
-    pub prompt_chars: usize,
-    pub tool_count: usize,
-    pub tool_schema_chars: usize,
-    pub estimated_total_request_chars: usize,
-    pub estimated_total_request_tokens: u64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LlmStreamFailureKind {
+    NoFirstDelta,
+    InterChunkStall,
+    NoUsefulProgress,
+    TotalTimeout,
+    ChunkErrors,
+    EmptyEnd,
+    NoUsableContent,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct LlmStreamFailure {
+    pub(crate) kind: LlmStreamFailureKind,
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    message: String,
+}
+
+impl LlmStreamFailure {
+    fn new(
+        kind: LlmStreamFailureKind,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            provider: provider.into(),
+            model: model.into(),
+            message: message.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1630,10 +1667,6 @@ pub struct LlmTokenUsage {
 
 fn estimate_tokens_from_chars(chars: usize) -> u64 {
     ((chars.saturating_add(3)) / 4) as u64
-}
-
-fn text_char_count(value: &str) -> usize {
-    value.chars().count()
 }
 
 /// LLM client
@@ -1651,6 +1684,7 @@ struct OpenAiChatParams<'a> {
     user_message: &'a str,
     history: &'a [crate::core::agent::ConversationMessage],
     actions: &'a [crate::actions::ActionDef],
+    max_output_tokens: Option<u32>,
 }
 
 struct OpenAiStreamParams<'a> {
@@ -1788,6 +1822,7 @@ fn is_retryable_error(err: &anyhow::Error) -> bool {
 const RETRY_DELAYS_MS: [u64; 3] = [500, 1500, 3000];
 const MAX_RETRY_ATTEMPTS: u32 = 3;
 const DEFAULT_LLM_HTTP_TIMEOUT_SECS: u64 = 600;
+const DEFAULT_LLM_NON_STREAM_TOTAL_TIMEOUT_SECS: u64 = 180;
 const DEFAULT_LLM_STREAM_FIRST_TOKEN_TIMEOUT_SECS: u64 = 90;
 const DEFAULT_LLM_STREAM_INTER_CHUNK_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_LLM_STREAM_TOTAL_TIMEOUT_SECS: u64 = 240;
@@ -1798,6 +1833,14 @@ fn llm_http_timeout_secs() -> u64 {
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|secs| *secs >= 30 && *secs <= 1800)
         .unwrap_or(DEFAULT_LLM_HTTP_TIMEOUT_SECS)
+}
+
+fn llm_non_stream_total_timeout_secs() -> u64 {
+    std::env::var("AGENTARK_LLM_NON_STREAM_TOTAL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|secs| *secs >= 30 && *secs <= 600)
+        .unwrap_or(DEFAULT_LLM_NON_STREAM_TOTAL_TIMEOUT_SECS)
 }
 
 fn llm_stream_first_token_timeout_secs() -> u64 {
@@ -1848,6 +1891,12 @@ fn openai_stream_data_has_terminal_finish_reason(data: &str) -> bool {
         })
 }
 
+fn model_request_mode_label(mode: ModelRequestMode) -> &'static str {
+    match mode {
+        ModelRequestMode::Helper => "helper",
+    }
+}
+
 impl LlmClient {
     /// Get the model name string for this client
     pub fn model_name(&self) -> &str {
@@ -1856,16 +1905,6 @@ impl LlmClient {
             LlmProvider::OpenAI { model, .. } => model,
             LlmProvider::Ollama { model, .. } => model,
         }
-    }
-
-    pub fn requires_streaming_responses_api(&self) -> bool {
-        matches!(
-            &self.provider,
-            LlmProvider::OpenAI {
-                base_url: Some(base_url),
-                ..
-            } if is_codex_cli_base_url(base_url)
-        )
     }
 
     pub fn provider_name(&self) -> &'static str {
@@ -1878,6 +1917,7 @@ impl LlmClient {
 
     pub fn new(provider: &LlmProvider) -> Result<Self> {
         let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(20))
             .timeout(std::time::Duration::from_secs(llm_http_timeout_secs()))
             .build()?;
 
@@ -1895,7 +1935,7 @@ impl LlmClient {
         _memories: &[crate::core::PromptMemory],
         actions: &[crate::actions::ActionDef],
     ) -> Result<LlmResponse> {
-        self.chat_with_history_for_helper(
+        self.chat_with_history_for_helper_limited(
             system_prompt,
             user_message,
             &[],
@@ -1903,6 +1943,28 @@ impl LlmClient {
             actions,
             &crate::security::ModelPrivacyConfig::default(),
             false,
+            None,
+        )
+        .await
+    }
+
+    pub async fn chat_with_output_limit(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        memories: &[crate::core::PromptMemory],
+        actions: &[crate::actions::ActionDef],
+        max_output_tokens: Option<u32>,
+    ) -> Result<LlmResponse> {
+        self.chat_with_history_for_helper_limited(
+            system_prompt,
+            user_message,
+            &[],
+            memories,
+            actions,
+            &crate::security::ModelPrivacyConfig::default(),
+            false,
+            max_output_tokens,
         )
         .await
     }
@@ -1925,6 +1987,24 @@ impl LlmClient {
         .await
     }
 
+    pub async fn chat_with_system_bounded(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        max_output_tokens: u32,
+    ) -> Result<LlmResponse> {
+        self.chat_for_helper_request_limited(
+            system_prompt,
+            user_message,
+            &[],
+            &[],
+            &crate::security::ModelPrivacyConfig::default(),
+            false,
+            Some(max_output_tokens),
+        )
+        .await
+    }
+
     pub async fn chat_for_helper_request(
         &self,
         system_prompt: &str,
@@ -1934,7 +2014,29 @@ impl LlmClient {
         policy: &crate::security::ModelPrivacyConfig,
         allow_sensitive_context: bool,
     ) -> Result<LlmResponse> {
-        self.chat_with_history_for_helper(
+        self.chat_for_helper_request_limited(
+            system_prompt,
+            user_message,
+            memories,
+            actions,
+            policy,
+            allow_sensitive_context,
+            None,
+        )
+        .await
+    }
+
+    pub async fn chat_for_helper_request_limited(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        memories: &[crate::core::PromptMemory],
+        actions: &[crate::actions::ActionDef],
+        policy: &crate::security::ModelPrivacyConfig,
+        allow_sensitive_context: bool,
+        max_output_tokens: Option<u32>,
+    ) -> Result<LlmResponse> {
+        self.chat_with_history_for_helper_limited(
             system_prompt,
             user_message,
             &[],
@@ -1942,6 +2044,7 @@ impl LlmClient {
             actions,
             policy,
             allow_sensitive_context,
+            max_output_tokens,
         )
         .await
     }
@@ -1977,6 +2080,30 @@ impl LlmClient {
         policy: &crate::security::ModelPrivacyConfig,
         allow_sensitive_context: bool,
     ) -> Result<LlmResponse> {
+        self.chat_with_history_for_helper_limited(
+            system_prompt,
+            user_message,
+            history,
+            _memories,
+            actions,
+            policy,
+            allow_sensitive_context,
+            None,
+        )
+        .await
+    }
+
+    async fn chat_with_history_for_helper_limited(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        history: &[ConversationMessage],
+        _memories: &[crate::core::PromptMemory],
+        actions: &[crate::actions::ActionDef],
+        policy: &crate::security::ModelPrivacyConfig,
+        allow_sensitive_context: bool,
+        max_output_tokens: Option<u32>,
+    ) -> Result<LlmResponse> {
         self.chat_with_history_in_mode(
             ModelRequestMode::Helper,
             system_prompt,
@@ -1986,154 +2113,9 @@ impl LlmClient {
             actions,
             policy,
             allow_sensitive_context,
+            max_output_tokens,
         )
         .await
-    }
-
-    pub async fn chat_for_primary_assistant_turn(
-        &self,
-        system_prompt: &str,
-        user_message: &str,
-        history: &[ConversationMessage],
-        _memories: &[crate::core::PromptMemory],
-        actions: &[crate::actions::ActionDef],
-        policy: &crate::security::ModelPrivacyConfig,
-        allow_sensitive_context: bool,
-    ) -> Result<LlmResponse> {
-        self.chat_with_history_in_mode(
-            ModelRequestMode::PrimaryAssistantTurn,
-            system_prompt,
-            user_message,
-            history,
-            _memories,
-            actions,
-            policy,
-            allow_sensitive_context,
-        )
-        .await
-    }
-
-    pub async fn preview_primary_assistant_turn_request_telemetry(
-        &self,
-        system_prompt: &str,
-        user_message: &str,
-        history: &[ConversationMessage],
-        actions: &[crate::actions::ActionDef],
-        policy: &crate::security::ModelPrivacyConfig,
-        allow_sensitive_context: bool,
-    ) -> Result<LlmRequestTelemetry> {
-        self.preview_request_telemetry(
-            ModelRequestMode::PrimaryAssistantTurn,
-            system_prompt,
-            user_message,
-            history,
-            actions,
-            policy,
-            allow_sensitive_context,
-        )
-        .await
-    }
-
-    async fn preview_request_telemetry(
-        &self,
-        mode: ModelRequestMode,
-        system_prompt: &str,
-        user_message: &str,
-        history: &[ConversationMessage],
-        actions: &[crate::actions::ActionDef],
-        policy: &crate::security::ModelPrivacyConfig,
-        allow_sensitive_context: bool,
-    ) -> Result<LlmRequestTelemetry> {
-        let (system_prompt, user_message, history) = sanitize_model_request_bundle(
-            mode,
-            system_prompt,
-            user_message,
-            history,
-            policy,
-            allow_sensitive_context,
-        );
-        let system_prompt_chars = text_char_count(&system_prompt);
-        let user_message_chars = text_char_count(&user_message);
-        let history_chars = history
-            .iter()
-            .map(|message| text_char_count(&message.content))
-            .sum::<usize>();
-        let prompt_chars = system_prompt_chars
-            .saturating_add(user_message_chars)
-            .saturating_add(history_chars);
-
-        let (provider, model, tool_schema_format, tool_schema_chars) = match &self.provider {
-            LlmProvider::Anthropic { model, .. } => {
-                let tool_schema_chars = if actions.is_empty() {
-                    0
-                } else {
-                    serialized_value_char_count(&serde_json::Value::Array(build_anthropic_tools(
-                        actions,
-                    )))
-                };
-                (
-                    "anthropic".to_string(),
-                    model.to_string(),
-                    "anthropic_tools".to_string(),
-                    tool_schema_chars,
-                )
-            }
-            LlmProvider::OpenAI {
-                api_key,
-                model,
-                base_url,
-            } => {
-                let request_config =
-                    resolve_openai_request_config(&self.client, api_key, base_url.as_deref())
-                        .await?;
-                let (tool_schema_format, tool_schema_chars) = if actions.is_empty() {
-                    ("none".to_string(), 0)
-                } else if request_config.uses_codex_cli_oauth {
-                    (
-                        "openai_responses_tools".to_string(),
-                        serialized_value_char_count(&serde_json::Value::Array(
-                            build_openai_responses_tools(actions),
-                        )),
-                    )
-                } else {
-                    (
-                        "openai_chat_tools".to_string(),
-                        serialized_value_char_count(&serde_json::Value::Array(
-                            build_openai_chat_tools(actions),
-                        )),
-                    )
-                };
-                (
-                    request_config.provider_label.to_string(),
-                    model.to_string(),
-                    tool_schema_format,
-                    tool_schema_chars,
-                )
-            }
-            LlmProvider::Ollama { model, .. } => (
-                "ollama".to_string(),
-                model.to_string(),
-                "none".to_string(),
-                0,
-            ),
-        };
-        let estimated_total_request_chars = prompt_chars.saturating_add(tool_schema_chars);
-
-        Ok(LlmRequestTelemetry {
-            provider,
-            model,
-            tool_schema_format,
-            system_prompt_chars,
-            user_message_chars,
-            history_chars,
-            prompt_chars,
-            tool_count: actions.len(),
-            tool_schema_chars,
-            estimated_total_request_chars,
-            estimated_total_request_tokens: estimate_tokens_from_chars(
-                estimated_total_request_chars,
-            ),
-        })
     }
 
     async fn chat_with_history_in_mode(
@@ -2146,6 +2128,7 @@ impl LlmClient {
         actions: &[crate::actions::ActionDef],
         policy: &crate::security::ModelPrivacyConfig,
         allow_sensitive_context: bool,
+        max_output_tokens: Option<u32>,
     ) -> Result<LlmResponse> {
         let (system_prompt, user_message, sanitized_history) = sanitize_model_request_bundle(
             mode,
@@ -2176,46 +2159,65 @@ impl LlmClient {
             prompt_chars
         );
 
+        let mode_label = model_request_mode_label(mode);
+        let timeout_secs = llm_non_stream_total_timeout_secs();
         let start = std::time::Instant::now();
-        let result = match &self.provider {
-            LlmProvider::Anthropic { api_key, model } => {
-                self.chat_anthropic_with_history(
-                    api_key,
-                    model,
-                    &system_prompt,
-                    &user_message,
-                    &history,
-                    actions,
-                )
-                .await
-            }
-            LlmProvider::OpenAI {
-                api_key,
-                model,
-                base_url,
-            } => {
-                self.chat_openai_with_history(OpenAiChatParams {
-                    api_key,
-                    model,
-                    base_url: base_url.as_deref(),
-                    system_prompt: &system_prompt,
-                    user_message: &user_message,
-                    history: &history,
-                    actions,
-                })
-                .await
-            }
-            LlmProvider::Ollama { base_url, model } => {
-                self.chat_ollama_with_history(
-                    base_url,
-                    model,
-                    &system_prompt,
-                    &user_message,
-                    &history,
-                )
-                .await
-            }
-        };
+        let result =
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
+                match &self.provider {
+                    LlmProvider::Anthropic { api_key, model } => {
+                        self.chat_anthropic_with_history(
+                            api_key,
+                            model,
+                            &system_prompt,
+                            &user_message,
+                            &history,
+                            actions,
+                            max_output_tokens,
+                        )
+                        .await
+                    }
+                    LlmProvider::OpenAI {
+                        api_key,
+                        model,
+                        base_url,
+                    } => {
+                        self.chat_openai_with_history(OpenAiChatParams {
+                            api_key,
+                            model,
+                            base_url: base_url.as_deref(),
+                            system_prompt: &system_prompt,
+                            user_message: &user_message,
+                            history: &history,
+                            actions,
+                            max_output_tokens,
+                        })
+                        .await
+                    }
+                    LlmProvider::Ollama { base_url, model } => {
+                        self.chat_ollama_with_history(
+                            base_url,
+                            model,
+                            &system_prompt,
+                            &user_message,
+                            &history,
+                            max_output_tokens,
+                        )
+                        .await
+                    }
+                }
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(anyhow!(
+                "LLM non-streaming request timed out after {}s (provider={}, model={}, mode={})",
+                timeout_secs,
+                provider_name,
+                model_name,
+                mode_label
+            )),
+            };
 
         let elapsed = start.elapsed();
         match &result {
@@ -2262,6 +2264,7 @@ impl LlmClient {
         user_message: &str,
         history: &[crate::core::agent::ConversationMessage],
         actions: &[crate::actions::ActionDef],
+        max_output_tokens: Option<u32>,
     ) -> Result<LlmResponse> {
         #[derive(Serialize)]
         struct AnthropicRequest {
@@ -2342,7 +2345,7 @@ impl LlmClient {
 
         let request = AnthropicRequest {
             model: model.to_string(),
-            max_tokens: None,
+            max_tokens: max_output_tokens,
             system: system_prompt.to_string(),
             messages,
             tools,
@@ -2451,12 +2454,15 @@ impl LlmClient {
         let user_message = params.user_message;
         let history = params.history;
         let actions = params.actions;
+        let max_output_tokens = params.max_output_tokens;
 
         #[derive(Serialize)]
         struct OpenAIRequest {
             model: String,
             #[serde(skip_serializing_if = "Option::is_none")]
             max_tokens: Option<u32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            reasoning: Option<serde_json::Value>,
             messages: Vec<OpenAIMessage>,
             #[serde(skip_serializing_if = "Vec::is_empty")]
             tools: Vec<OpenAITool>,
@@ -2515,6 +2521,9 @@ impl LlmClient {
             tool_calls: Option<Vec<OpenAIToolCall>>,
             /// OpenRouter reasoning content from reasoning-enabled models
             reasoning_content: Option<String>,
+            /// OpenRouter's current normalized field for reasoning tokens.
+            #[serde(default)]
+            reasoning: Option<serde_json::Value>,
         }
 
         #[derive(Deserialize)]
@@ -2592,7 +2601,14 @@ impl LlmClient {
         let endpoint = format!("{}/chat/completions", request_config.base_url);
         let request = OpenAIRequest {
             model: model.to_string(),
-            max_tokens: None,
+            max_tokens: max_output_tokens,
+            reasoning: if request_config.is_openrouter && max_output_tokens.is_some() {
+                Some(serde_json::json!({
+                    "effort": "none"
+                }))
+            } else {
+                None
+            },
             messages,
             tools,
         };
@@ -2841,14 +2857,20 @@ impl LlmClient {
                 .next()
                 .ok_or_else(|| anyhow!("No response from OpenAI"))?;
 
-            let content = choice
+            let mut content = choice
                 .message
                 .content
                 .as_ref()
                 .and_then(extract_openai_message_text)
                 .unwrap_or_default();
-            let reasoning = choice.message.reasoning_content;
-            let tool_calls = choice
+            let reasoning = choice.message.reasoning_content.or_else(|| {
+                choice
+                    .message
+                    .reasoning
+                    .as_ref()
+                    .and_then(extract_openai_message_text)
+            });
+            let tool_calls: Vec<ToolCall> = choice
                 .message
                 .tool_calls
                 .unwrap_or_default()
@@ -2865,6 +2887,14 @@ impl LlmClient {
                     },
                 })
                 .collect();
+
+            if max_output_tokens.is_some() && content.trim().is_empty() && tool_calls.is_empty() {
+                if let Some(reasoning_text) = reasoning.as_deref() {
+                    if let Some(json) = extract_json_object_from_text(reasoning_text) {
+                        content = serde_json::to_string(&json).unwrap_or_default();
+                    }
+                }
+            }
 
             let prompt_chars = system_prompt.len()
                 + user_message.len()
@@ -2949,31 +2979,6 @@ impl LlmClient {
     ) -> Result<LlmResponse> {
         self.chat_with_history_stream_in_mode(
             ModelRequestMode::Helper,
-            system_prompt,
-            user_message,
-            history,
-            _memories,
-            actions,
-            token_tx,
-            policy,
-            allow_sensitive_context,
-        )
-        .await
-    }
-
-    pub async fn chat_for_primary_assistant_turn_stream(
-        &self,
-        system_prompt: &str,
-        user_message: &str,
-        history: &[ConversationMessage],
-        _memories: &[crate::core::PromptMemory],
-        actions: &[crate::actions::ActionDef],
-        token_tx: Sender<StreamEvent>,
-        policy: &crate::security::ModelPrivacyConfig,
-        allow_sensitive_context: bool,
-    ) -> Result<LlmResponse> {
-        self.chat_with_history_stream_in_mode(
-            ModelRequestMode::PrimaryAssistantTurn,
             system_prompt,
             user_message,
             history,
@@ -3085,12 +3090,20 @@ impl LlmClient {
         system_prompt: &str,
         user_message: &str,
         history: &[crate::core::agent::ConversationMessage],
+        max_output_tokens: Option<u32>,
     ) -> Result<LlmResponse> {
         #[derive(Serialize)]
         struct OllamaRequest {
             model: String,
             messages: Vec<OllamaMessage>,
             stream: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            options: Option<OllamaOptions>,
+        }
+
+        #[derive(Serialize)]
+        struct OllamaOptions {
+            num_predict: i64,
         }
 
         #[derive(Serialize, Deserialize)]
@@ -3135,6 +3148,9 @@ impl LlmClient {
             model: model.to_string(),
             messages,
             stream: false,
+            options: max_output_tokens.map(|tokens| OllamaOptions {
+                num_predict: tokens as i64,
+            }),
         };
 
         let response = self
@@ -3424,21 +3440,15 @@ impl LlmClient {
         let heartbeat_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let hb_done_clone = heartbeat_done.clone();
         let hb_tx = token_tx.clone();
-        let hb_model = model.to_string();
-        let hb_start = std::time::Instant::now();
         let heartbeat_handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 if hb_done_clone.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                let elapsed = hb_start.elapsed().as_secs();
                 queue_stream_event(
                     &hb_tx,
-                    StreamEvent::Thinking(format!(
-                        "Waiting for {} to respond ({}s)...",
-                        hb_model, elapsed
-                    )),
+                    StreamEvent::Thinking("Thinking.".to_string()),
                 );
             }
         });
@@ -3859,6 +3869,14 @@ impl LlmClient {
         let mut reasoning: Option<String> = None;
         let mut tool_builders: HashMap<usize, ToolBuilder> = HashMap::new();
         let mut first_token = true;
+        let provider_display = if request_config
+            .provider_label
+            .eq_ignore_ascii_case("openrouter")
+        {
+            "OpenRouter".to_string()
+        } else {
+            request_config.provider_label.to_string()
+        };
         let inter_chunk_timeout_secs = llm_stream_inter_chunk_timeout_secs();
         let first_token_timeout_secs = llm_stream_first_token_timeout_secs();
         let total_timeout_secs = llm_stream_total_timeout_secs();
@@ -3868,17 +3886,13 @@ impl LlmClient {
         let heartbeat_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let hb_done_clone = heartbeat_done.clone();
         let hb_tx = token_tx.clone();
-        let hb_model = model.to_string();
-        let hb_start = std::time::Instant::now();
         let heartbeat_handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 if hb_done_clone.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                let elapsed = hb_start.elapsed().as_secs();
-                let status = format!("Waiting for {} to respond ({}s)...", hb_model, elapsed);
-                queue_stream_event(&hb_tx, StreamEvent::Thinking(status));
+                queue_stream_event(&hb_tx, StreamEvent::Thinking("Thinking.".to_string()));
             }
         });
 
@@ -3888,13 +3902,21 @@ impl LlmClient {
         let mut consecutive_errors: u32 = 0;
         let mut stream = response.bytes_stream();
         let mut stream_broken = false;
+        let mut stream_failure: Option<LlmStreamFailure> = None;
         let mut usage: Option<LlmTokenUsage> = None;
         loop {
             if send_start.elapsed().as_secs() >= total_timeout_secs {
-                tracing::warn!(
-                    "Stream exceeded total timeout ({}s), breaking with partial response",
-                    total_timeout_secs,
+                let reason = format!(
+                    "{} stream for model {} exceeded the {}s total stream timeout before completion.",
+                    provider_display, model, total_timeout_secs,
                 );
+                tracing::warn!("{}", reason);
+                stream_failure = Some(LlmStreamFailure::new(
+                    LlmStreamFailureKind::TotalTimeout,
+                    provider_display.clone(),
+                    model,
+                    reason,
+                ));
                 stream_broken = true;
                 break;
             }
@@ -3918,7 +3940,17 @@ impl LlmClient {
                     tracing::warn!("Stream chunk error (continuing): {}", e);
                     consecutive_errors += 1;
                     if consecutive_errors > 3 {
-                        tracing::warn!("Too many consecutive stream chunk errors, breaking");
+                        let reason = format!(
+                            "{} stream for model {} had too many consecutive chunk errors: {}",
+                            provider_display, model, e,
+                        );
+                        tracing::warn!("{}", reason);
+                        stream_failure = Some(LlmStreamFailure::new(
+                            LlmStreamFailureKind::ChunkErrors,
+                            provider_display.clone(),
+                            model,
+                            reason,
+                        ));
                         stream_broken = true;
                         break;
                     }
@@ -3931,10 +3963,29 @@ impl LlmClient {
                     break;
                 } // stream ended normally
                 Err(_) => {
-                    tracing::warn!(
-                        "Stream stalled ({}s no data), breaking with partial response",
-                        timeout_secs,
-                    );
+                    let reason = if first_token {
+                        format!(
+                            "{} stream for model {} accepted the request but did not send a token or tool-call delta within {}s.",
+                            provider_display, model, timeout_secs,
+                        )
+                    } else {
+                        format!(
+                            "{} stream for model {} stalled for {}s between chunks.",
+                            provider_display, model, timeout_secs,
+                        )
+                    };
+                    tracing::warn!("{}", reason);
+                    let kind = if first_token {
+                        LlmStreamFailureKind::NoFirstDelta
+                    } else {
+                        LlmStreamFailureKind::InterChunkStall
+                    };
+                    stream_failure = Some(LlmStreamFailure::new(
+                        kind,
+                        provider_display.clone(),
+                        model,
+                        reason,
+                    ));
                     stream_broken = true;
                     break;
                 }
@@ -4157,10 +4208,29 @@ impl LlmClient {
                 inter_chunk_timeout_secs
             };
             if last_meaningful_progress_at.elapsed().as_secs() >= allowed_idle_secs {
-                tracing::warn!(
-                    "Stream received bytes but no meaningful SSE progress for {}s, breaking with partial response",
-                    allowed_idle_secs,
-                );
+                let reason = if first_token {
+                    format!(
+                        "{} stream for model {} sent bytes but no token or tool-call delta for {}s.",
+                        provider_display, model, allowed_idle_secs,
+                    )
+                } else {
+                    format!(
+                        "{} stream for model {} sent bytes but no useful SSE progress for {}s.",
+                        provider_display, model, allowed_idle_secs,
+                    )
+                };
+                tracing::warn!("{}", reason);
+                let kind = if first_token {
+                    LlmStreamFailureKind::NoFirstDelta
+                } else {
+                    LlmStreamFailureKind::NoUsefulProgress
+                };
+                stream_failure = Some(LlmStreamFailure::new(
+                    kind,
+                    provider_display.clone(),
+                    model,
+                    reason,
+                ));
                 stream_broken = true;
                 break;
             }
@@ -4189,10 +4259,18 @@ impl LlmClient {
             !tool_builders.is_empty() && tool_builders.values().any(|tb| !tb.name.is_empty());
 
         if !done && !stream_broken && !has_content && !has_tools {
-            return Err(anyhow!(
-                "Stream ended without content or tool calls after {}ms",
-                send_start.elapsed().as_millis()
-            ));
+            return Err(LlmStreamFailure::new(
+                LlmStreamFailureKind::EmptyEnd,
+                provider_display.clone(),
+                model,
+                format!(
+                    "{} stream for model {} ended without content or tool calls after {}ms.",
+                    provider_display,
+                    model,
+                    send_start.elapsed().as_millis()
+                ),
+            )
+            .into());
         }
 
         if stream_broken && !done {
@@ -4203,10 +4281,21 @@ impl LlmClient {
                     tool_builders.len(),
                 );
             } else {
-                return Err(anyhow!(
-                    "Stream broke with no usable content after {}ms",
-                    send_start.elapsed().as_millis()
-                ));
+                return Err(stream_failure
+                    .unwrap_or_else(|| {
+                        LlmStreamFailure::new(
+                            LlmStreamFailureKind::NoUsableContent,
+                            provider_display.clone(),
+                            model,
+                            format!(
+                                "{} stream for model {} broke with no usable content after {}ms.",
+                                provider_display,
+                                model,
+                                send_start.elapsed().as_millis()
+                            ),
+                        )
+                    })
+                    .into());
             }
         }
 

@@ -19,7 +19,11 @@ pub struct OnePasswordConnector {
 impl OnePasswordConnector {
     pub fn new_with_config_dir(config_dir: PathBuf) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             config_dir,
         }
     }

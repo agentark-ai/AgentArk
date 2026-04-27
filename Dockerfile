@@ -46,6 +46,20 @@
 # WARNING: Running without -v volumes will LOSE YOUR APP DATA on container removal!
 # =============================================================================
 
+# =============================================================================
+# SECRETS POLICY — READ BEFORE ADDING ENV/ARG LINES
+# =============================================================================
+# Do NOT set AGENTARK_POSTGRES_PASSWORD, POSTGRES_PASSWORD, AGENTARK_DATABASE_URL,
+# or any other secret in this Dockerfile (via ENV, ARG, or COPY). The published
+# ghcr.io/agentark-ai/agentark image must be identical for every user and must
+# contain zero credentials.
+#
+# The local Postgres password is generated per-install at `docker compose up`
+# time by the pg-bootstrap init service (see docker-compose.yml) into the
+# agentark-secrets Docker volume. docker-entrypoint.sh reads it at runtime and
+# assembles AGENTARK_DATABASE_URL in memory just before launching the binary.
+# =============================================================================
+
 # -- Stage 1: Rust build (with BuildKit cache for fast rebuilds) --
 # Use Debian trixie here because fastembed -> ort-sys currently links against
 # ONNX Runtime binaries that require glibc 2.38 (__isoc23_* symbols). Bookworm
@@ -94,7 +108,8 @@ RUN --mount=type=cache,id=agentark-cargo-target,target=/app/target \
     else \
         cargo build --release --no-default-features --features "${AGENTARK_DOCKER_FEATURES}" --bins -j "${AGENTARK_BUILD_JOBS}"; \
     fi && \
-    cp target/release/agentark /app/agentark-bin
+    cp target/release/agentark /app/agentark-bin && \
+    cp target/release/agentark_embed_server /app/agentark-embed-server-bin
 
 # Preload the default local embedding model for published/prebuilt images.
 # Runtime still falls back to /app/data/embeddings-cache when this cache is not present.
@@ -166,7 +181,7 @@ ARG INSTALL_DOCKER_CLI=true
 ARG INSTALL_OLLAMA_CLI=false
 
 RUN set -eux; \
-    apt_packages="ca-certificates curl gosu git python3 python3-pip python3-venv"; \
+    apt_packages="ca-certificates curl gosu git postgresql-client python3 python3-pip python3-venv tar"; \
     if [ "${INSTALL_PLAYWRIGHT_RUNTIME}" = "true" ]; then \
         apt_packages="${apt_packages} chromium xvfb x11vnc novnc websockify openbox"; \
     fi; \
@@ -262,6 +277,7 @@ COPY --from=node-builder --chown=agent:agent /bridges/playwright-bridge /app/bri
 
 # Copy AgentArk binary from builder
 COPY --from=builder --chown=agent:agent /app/agentark-bin /app/agentark
+COPY --from=builder --chown=agent:agent /app/agentark-embed-server-bin /app/agentark-embed-server
 COPY --from=builder --chown=agent:agent /app/prebuilt-embeddings-cache /app/prebuilt-embeddings-cache
 
 # Copy assets directly from build context (not part of Rust compilation)
@@ -301,8 +317,8 @@ EXPOSE 8990
 EXPOSE 6080
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8990/health', timeout=5)" || exit 1
+HEALTHCHECK --interval=2s --timeout=2s --start-period=1s --retries=30 \
+    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8990/health', timeout=1)" || exit 1
 
 # Run with entrypoint script that checks for volume mounts
 ENTRYPOINT ["/app/docker-entrypoint.sh"]

@@ -7,7 +7,6 @@
 //! 4. Self-terminate after trigger or timeout
 //!
 //! Watchers are persisted in the database so they survive container restarts.
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

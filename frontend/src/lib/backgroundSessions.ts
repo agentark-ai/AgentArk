@@ -42,7 +42,26 @@ export function isOneShotReminderSession(session: BackgroundSessionSummary): boo
   return String(session.ui_kind || "").trim().toLowerCase() === "one_shot_reminder";
 }
 
+export function isChatContextSession(session: BackgroundSessionSummary): boolean {
+  return String(session.ui_kind || "").trim().toLowerCase() === "chat_context";
+}
+
+export function backgroundSessionLinkedWorkCount(session: BackgroundSessionSummary): number {
+  const counts = session.counts;
+  const countedTasks = Number(counts?.tasks_total || 0);
+  const countedWatchers = Number(counts?.watchers_total || 0);
+  const linkedTasks = Array.isArray(session.linked_task_ids) ? session.linked_task_ids.length : 0;
+  const linkedWatchers = Array.isArray(session.linked_watcher_ids) ? session.linked_watcher_ids.length : 0;
+  return countedTasks + countedWatchers + linkedTasks + linkedWatchers;
+}
+
+export function hasBackgroundSessionLinkedWork(session: BackgroundSessionSummary): boolean {
+  return backgroundSessionLinkedWorkCount(session) > 0;
+}
+
 export function isBackgroundSessionVisibleInUi(session: BackgroundSessionSummary): boolean {
   if (session.default_visible === false) return false;
-  return !isOneShotReminderSession(session);
+  if (isOneShotReminderSession(session)) return false;
+  if (isChatContextSession(session)) return false;
+  return hasBackgroundSessionLinkedWork(session);
 }

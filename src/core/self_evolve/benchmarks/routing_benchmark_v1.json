@@ -1,0 +1,106 @@
+{
+  "target_key": "routing_complexity_policy_v1",
+  "version": 1,
+  "cases": [
+    {
+      "prompt": "hi",
+      "expected": "simple"
+    },
+    {
+      "prompt": "thanks, that helps",
+      "expected": "simple"
+    },
+    {
+      "prompt": "what time is it?",
+      "expected": "simple"
+    },
+    {
+      "prompt": "open the settings page",
+      "expected": "simple"
+    },
+    {
+      "prompt": "yes, go ahead",
+      "expected": "simple"
+    },
+    {
+      "prompt": "show my task list",
+      "expected": "simple"
+    },
+    {
+      "prompt": "rename this title to Q2 Review",
+      "expected": "simple"
+    },
+    {
+      "prompt": "explain why the nightly job failed",
+      "expected": "medium"
+    },
+    {
+      "prompt": "fix the broken login button",
+      "expected": "medium"
+    },
+    {
+      "prompt": "create a CSV summary from these rows",
+      "expected": "medium"
+    },
+    {
+      "prompt": "send a reminder tomorrow morning",
+      "expected": "medium"
+    },
+    {
+      "prompt": "check the latest deployment logs",
+      "expected": "medium"
+    },
+    {
+      "prompt": "implement a small parser guard for empty email",
+      "expected": "medium"
+    },
+    {
+      "prompt": "design a settings modal for account preferences",
+      "expected": "medium"
+    },
+    {
+      "prompt": "help me understand this error message",
+      "expected": "medium"
+    },
+    {
+      "prompt": "deploy the updated frontend after tests pass",
+      "expected": "medium"
+    },
+    {
+      "prompt": "research and compare the top three Rust web frameworks, then recommend one for production",
+      "expected": "complex"
+    },
+    {
+      "prompt": "write a report on the security, performance, and operational risks in this deployment plan",
+      "expected": "complex"
+    },
+    {
+      "prompt": "investigate flaky tests, identify the root cause, patch the code, and add regression coverage",
+      "expected": "complex"
+    },
+    {
+      "prompt": "analyze and compare the storage, concurrency, and rollback behavior across all services",
+      "expected": "complex"
+    },
+    {
+      "prompt": "Create a comprehensive migration plan for the database, API, frontend, and deployment pipeline.",
+      "expected": "complex"
+    },
+    {
+      "prompt": "Audit production readiness for database bloat, concurrency, query safety, security, performance, and operability.",
+      "expected": "complex"
+    },
+    {
+      "prompt": "Map end-to-end release risks for authentication, billing, migrations, monitoring, and rollback.",
+      "expected": "complex"
+    },
+    {
+      "prompt": "Prepare a production launch checklist covering database growth, concurrency limits, alerts, backups, and incident response.",
+      "expected": "complex"
+    },
+    {
+      "prompt": "Review the architecture for scaling risks in search indexing, worker queues, cache invalidation, and API rate limits.",
+      "expected": "complex"
+    }
+  ]
+}

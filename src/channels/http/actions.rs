@@ -13,6 +13,7 @@ struct ActionInfo {
     pub name: String,
     pub description: String,
     pub version: String,
+    pub input_schema: serde_json::Value,
     pub source: String,
     pub editable: bool,
     pub enabled: bool,
@@ -168,6 +169,7 @@ pub(super) async fn list_actions(State(state): State<AppState>) -> Response {
                     name: s.name,
                     description: s.description,
                     version: s.version,
+                    input_schema: s.input_schema,
                     source: source_str.to_string(),
                     editable,
                     enabled,
@@ -416,6 +418,8 @@ pub(super) struct ActionSecretsUpdateRequest {
 pub(super) struct ActionTestRequest {
     #[serde(default)]
     arguments: serde_json::Value,
+    #[serde(default)]
+    run_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -478,10 +482,7 @@ fn unique_push(out: &mut Vec<String>, s: String) {
 }
 
 fn is_known_skill_catalog_host(host: &str) -> bool {
-    host == "clawhub.ai"
-        || host.ends_with(".clawhub.ai")
-        || host == "openclaw.ai"
-        || host.ends_with(".openclaw.ai")
+    host == "clawhub.ai" || host.ends_with(".clawhub.ai")
 }
 
 fn extract_required_envs_from_frontmatter(frontmatter: &str) -> Vec<String> {
@@ -889,6 +890,74 @@ pub(super) async fn set_action_secrets(
     get_action_secrets(State(state), Path(name)).await
 }
 
+fn normalized_action_test_run_id(value: Option<&str>) -> Option<String> {
+    let trimmed = value?.trim();
+    if trimmed.is_empty() || trimmed.len() > 128 {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+async fn bind_action_test_cancellation_sender(
+    state: &AppState,
+    run_id: &str,
+    sender: tokio::sync::watch::Sender<bool>,
+) {
+    state
+        .action_test_cancellations
+        .write()
+        .await
+        .insert(run_id.to_string(), sender);
+}
+
+async fn signal_action_test_cancellation(state: &AppState, run_id: &str) -> bool {
+    let sender = {
+        state
+            .action_test_cancellations
+            .read()
+            .await
+            .get(run_id)
+            .cloned()
+    };
+    if let Some(sender) = sender {
+        let _ = sender.send(true);
+        true
+    } else {
+        false
+    }
+}
+
+async fn unregister_action_test_cancellation(state: &AppState, run_id: &str) {
+    state.action_test_cancellations.write().await.remove(run_id);
+}
+
+pub(super) async fn cancel_action_test(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Response {
+    let Some(run_id) = normalized_action_test_run_id(Some(&run_id)) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "status": "error",
+                "error": "Invalid skill test run id."
+            })),
+        )
+            .into_response();
+    };
+
+    let cancelled = signal_action_test_cancellation(&state, &run_id).await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "run_id": run_id,
+            "cancelled": cancelled
+        })),
+    )
+        .into_response()
+}
+
 pub(super) async fn test_action(
     State(state): State<AppState>,
     maybe_caller: Option<Extension<crate::actions::ActionCallerPrincipal>>,
@@ -900,8 +969,16 @@ pub(super) async fn test_action(
     } else {
         request.arguments
     };
+    let run_id = normalized_action_test_run_id(request.run_id.as_deref());
+    let mut cancellation_rx = if let Some(run_id) = run_id.as_deref() {
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        bind_action_test_cancellation_sender(&state, run_id, sender).await;
+        Some(receiver)
+    } else {
+        None
+    };
 
-    let result = {
+    let test_future = async {
         let agent = state.agent.read().await;
         let caller = maybe_caller.as_ref().map(|Extension(value)| value);
         match agent
@@ -985,6 +1062,18 @@ pub(super) async fn test_action(
             Err(e) => Err(e),
         }
     };
+    let result = if let Some(cancel_rx) = cancellation_rx.as_mut() {
+        tokio::select! {
+            _ = cancel_rx.changed() => Err(anyhow::anyhow!("Skill test cancelled.")),
+            result = test_future => result,
+        }
+    } else {
+        test_future.await
+    };
+
+    if let Some(run_id) = run_id.as_deref() {
+        unregister_action_test_cancellation(&state, run_id).await;
+    }
 
     match result {
         Ok(output) => (StatusCode::OK, Json(output)).into_response(),
@@ -1212,6 +1301,42 @@ fn inject_model_into_frontmatter(content: &str, model: &str) -> String {
 const SKILL_IMPORT_MAX_BYTES: usize = 2 * 1024 * 1024;
 const GITHUB_SKILL_ARCHIVE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const GITHUB_SKILL_ARCHIVE_MAX_ENTRIES: usize = 20_000;
+
+fn skill_import_fetch_user_agent() -> String {
+    format!(
+        "{}/{} ({}; skill import fetcher)",
+        crate::branding::PRODUCT_NAME,
+        env!("CARGO_PKG_VERSION"),
+        crate::branding::REPOSITORY_URL
+    )
+}
+
+fn skill_import_fetch_headers() -> Result<reqwest::header::HeaderMap, String> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    let user_agent = reqwest::header::HeaderValue::from_str(&skill_import_fetch_user_agent())
+        .map_err(|e| format!("Invalid skill import User-Agent: {}", e))?;
+    headers.insert(reqwest::header::USER_AGENT, user_agent);
+    headers.insert(
+        reqwest::header::ACCEPT,
+        reqwest::header::HeaderValue::from_static(
+            "text/markdown,text/plain,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        ),
+    );
+    headers.insert(
+        reqwest::header::ACCEPT_LANGUAGE,
+        reqwest::header::HeaderValue::from_static("en-US,en;q=0.8"),
+    );
+    Ok(headers)
+}
+
+fn skill_import_http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .default_headers(skill_import_fetch_headers()?)
+        .build()
+        .map_err(|e| format!("Failed to initialize HTTP client: {}", e))
+}
 
 async fn validate_import_fetch_url(raw: &str) -> Result<reqwest::Url, String> {
     crate::core::net::validate_public_https_url(raw)
@@ -2050,6 +2175,7 @@ fn test_skill_fetch_overrides() -> &'static std::sync::Mutex<HashMap<String, Fet
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn register_test_skill_fetch_override(
     request_url: &str,
     source_url: &str,
@@ -2068,6 +2194,7 @@ pub(crate) fn register_test_skill_fetch_override(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn clear_test_skill_fetch_override(request_url: &str) {
     let mut overrides = test_skill_fetch_overrides()
         .lock()
@@ -2091,11 +2218,7 @@ pub(crate) async fn fetch_skill_markdown_from_url_shared(
     }
     let _validated = validate_import_fetch_url(url).await?;
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| format!("Failed to initialize HTTP client: {}", e))?;
+    let client = skill_import_http_client()?;
 
     let github_token =
         crate::integrations::github::GitHubConnector::load_token_from(&agent.config_dir);
@@ -2214,12 +2337,7 @@ pub(super) async fn import_action(
             .into_response();
     }
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        // Prevent reqwest from following redirects implicitly; we validate each redirect target.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-    {
+    let client = match skill_import_http_client() {
         Ok(c) => c,
         Err(e) => {
             return (
@@ -2532,11 +2650,17 @@ pub(super) async fn delete_action(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Response {
+    tracing::info!(action = name.as_str(), "HTTP delete action requested");
     let agent_guard = state.agent.read().await;
     let source = match agent_guard.runtime.get_action_content(&name).await {
         Ok(Some((info, _))) => Some(info.source),
         Ok(None) => None,
         Err(e) => {
+            tracing::warn!(
+                action = name.as_str(),
+                error = %e,
+                "HTTP delete action failed while resolving source"
+            );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -2548,6 +2672,7 @@ pub(super) async fn delete_action(
     };
 
     if source.is_none() {
+        tracing::info!(action = name.as_str(), "HTTP delete action not found");
         return (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -2556,6 +2681,17 @@ pub(super) async fn delete_action(
         )
             .into_response();
     }
+    let source_label = match source.as_ref() {
+        Some(crate::actions::ActionSource::Bundled) => "bundled",
+        Some(crate::actions::ActionSource::Custom) => "custom",
+        Some(crate::actions::ActionSource::System) => "system",
+        None => "missing",
+    };
+    tracing::info!(
+        action = name.as_str(),
+        source = source_label,
+        "HTTP delete action source resolved"
+    );
 
     match agent_guard.runtime.delete_action(&name).await {
         Ok(true) => {
@@ -2566,26 +2702,69 @@ pub(super) async fn delete_action(
                 Some(crate::actions::ActionSource::Custom) => "Custom skill deleted",
                 _ => "Skill updated",
             };
-            spawn_autonomy_analysis_tick(state.agent.clone(), "action_deleted");
+            tracing::info!(
+                action = name.as_str(),
+                source = source_label,
+                message = message,
+                "HTTP delete action completed"
+            );
             (
                 StatusCode::OK,
                 Json(serde_json::json!({"status": "ok", "message": message})),
             )
                 .into_response()
         }
-        Ok(false) => (
-            StatusCode::FORBIDDEN,
-            Json(ErrorResponse {
-                error: "Skill cannot be deleted (system skill)".to_string(),
-            }),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+        Ok(false) => {
+            tracing::info!(
+                action = name.as_str(),
+                source = source_label,
+                "HTTP delete action refused"
+            );
+            (
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse {
+                    error: "Skill cannot be deleted (system skill)".to_string(),
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::warn!(
+                action = name.as_str(),
+                source = source_label,
+                error = %e,
+                "HTTP delete action failed"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skill_import_fetch_headers_identify_agentark_and_accept_public_pages() {
+        let headers = skill_import_fetch_headers().expect("skill import headers should build");
+        let user_agent = headers
+            .get(reqwest::header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        let accept = headers
+            .get(reqwest::header::ACCEPT)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+
+        assert!(user_agent.contains(crate::branding::PRODUCT_NAME));
+        assert!(user_agent.contains(crate::branding::REPOSITORY_URL));
+        assert!(accept.contains("text/html"));
+        assert!(accept.contains("text/markdown"));
     }
 }

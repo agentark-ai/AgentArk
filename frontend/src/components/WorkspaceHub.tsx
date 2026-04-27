@@ -22,7 +22,7 @@ const REFRESH_MS = 8000;
 
 type DrawerView = Extract<
   WorkspaceView,
-  "tasks" | "apps" | "documents" | "skills" | "swarm" | "trace" | "status" | "goals" | "moltbook"
+  "tasks" | "apps" | "documents" | "skills" | "swarm" | "trace" | "status" | "goals"
 >;
 
 type Props = {
@@ -79,7 +79,6 @@ const DRAWER_VIEWS: Array<{ view: DrawerView; label: string; detail: string }> =
   { view: "trace", label: "Trace", detail: "Execution history and tool telemetry." },
   { view: "status", label: "Watchers", detail: "Background monitors and triggers." },
   { view: "goals", label: "Goals", detail: "Long-running intent and outcomes." },
-  { view: "moltbook", label: "Moltbook", detail: "Community exposure and publishing." },
 ];
 
 export function WorkspaceHub({

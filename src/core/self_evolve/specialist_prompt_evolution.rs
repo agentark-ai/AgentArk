@@ -35,7 +35,7 @@ pub const BASE_SPECIALIST_PROMPT_VERSION: &str = "specialist_prompt_v1";
 const DEFAULT_VERSION: &str = "specialist-prompt-bundle-default-v1";
 const LINEAGE_ARCHIVE_REL_PATH: &str =
     ".agentark/self_evolve/specialist_prompt_bundle_lineage.jsonl";
-const BENCHMARK_PROFILE_REL_PATH: &str = "assets/self_evolve/specialist_prompt_benchmark_v1.json";
+const BENCHMARK_PROFILE_JSON: &str = include_str!("benchmarks/specialist_prompt_benchmark_v1.json");
 const DEFAULT_RECENT_LINEAGE_LIMIT: usize = 12;
 const MAX_LINEAGE_ARCHIVE_ENTRIES: usize = 400;
 const MAX_SURFACE_CHARS: usize = 12_000;
@@ -384,12 +384,8 @@ impl SpecialistPromptEvolutionEngine {
     }
 
     async fn load_benchmark_suite(&self) -> Result<SpecialistPromptBenchmarkProfile> {
-        let path = self.config.project_root.join(BENCHMARK_PROFILE_REL_PATH);
-        let raw = tokio::fs::read(&path)
-            .await
-            .with_context(|| format!("failed to read specialist benchmark {}", path.display()))?;
-        serde_json::from_slice::<SpecialistPromptBenchmarkProfile>(&raw)
-            .with_context(|| format!("failed to parse specialist benchmark {}", path.display()))
+        serde_json::from_str::<SpecialistPromptBenchmarkProfile>(BENCHMARK_PROFILE_JSON)
+            .context("failed to parse embedded specialist benchmark")
     }
 
     async fn load_recent_lineage(&self, limit: usize) -> Vec<SpecialistPromptLineageEntry> {

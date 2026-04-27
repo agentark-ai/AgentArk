@@ -15,6 +15,49 @@ pub(crate) struct BundledHelpDoc {
 
 pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
     BundledHelpDoc {
+        title: "What AgentArk is",
+        slug: "what-agentark-is",
+        tags: &[
+            "intro",
+            "overview",
+            "positioning",
+            "tagline",
+            "security",
+            "what_is_agentark",
+            "ark",
+        ],
+        summary: "Not an agent. An Ark for agents: build from prompts and tools, deploy as apps, automations, or watchers, monitor every action, secure every boundary, self-evolve from your usage.",
+        sections: &[
+            BundledHelpSection {
+                label: "core inversion",
+                items: &[
+                    "AgentArk is not itself an agent. It is the runtime that agents live inside.",
+                    "An agent here is any one of: a chat handler, a deployed app, a scheduled automation, a conditional watcher, or a specialist sub-agent dispatched by the router.",
+                    "Ark is the security layer. It is the wrapper that contains, observes, and enforces what those agents are allowed to do, and the audit surface where every action becomes reviewable.",
+                ],
+            },
+            BundledHelpSection {
+                label: "what the Ark does",
+                items: &[
+                    "Build: assemble agents from structured prompts, action schemas, connected tools, and integrations registered through the action catalog.",
+                    "Deploy: run them as live apps with public URLs, scheduled automations, conditional watchers, or in-conversation chat sessions.",
+                    "Monitor: ArkSentinel records every action with traces, failure classification, drift detection, and reflection passes.",
+                    "Secure: every capability boundary is gated by intent classification, output guards, approval gates, and per-action authorization. The Ark is the boundary; agents work inside it.",
+                    "Self-evolve: prompts, classifiers, routing policies, and specialist behavior tune themselves from your own usage signals; ArkEvolve reviews changes before they ship.",
+                ],
+            },
+            BundledHelpSection {
+                label: "why the inversion matters",
+                items: &[
+                    "Most agent products are agents. AgentArk is the platform around them.",
+                    "If you only need one agent, you still benefit: the Ark gives it memory, security, observability, and self-evolution it would not have on its own.",
+                    "If you need many agents (chat, automation, watcher, specialist), they share one memory, one security policy, one audit log, and one self-evolving prompt and policy library.",
+                    "The security-layer framing is the load-bearing one. Build, deploy, monitor, and self-evolve are valuable; the reason any of them is safe to point at your real data is that the Ark wraps every action with a security boundary.",
+                ],
+            },
+        ],
+    },
+    BundledHelpDoc {
         title: "Install and first run",
         slug: "install-and-first-run",
         tags: &[
@@ -63,7 +106,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "The web UI opens without the no-model-configured warning.",
                     "Settings save successfully.",
                     "The agent answers a simple chat request.",
-                    "Embeddings show a healthy local setup unless the user intentionally configured an external endpoint.",
+                    "Embeddings use the local isolated sidecar by default; enable an external endpoint only when you want hosted dense retrieval.",
                     "Security and secret handling are available.",
                     "Configured integrations or channels show connected or configured instead of not configured.",
                 ],
@@ -449,6 +492,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                 items: &[
                     "Settings > Models > Embeddings is separate from chat model slots.",
                     "Default mode is Local using built-in Hugging Face embeddings with `BAAI/bge-small-en-v1.5`.",
+                    "Local mode runs in the embeddings sidecar so the control service does not keep the ONNX runtime resident.",
                     "External embeddings are optional and use an OpenAI-compatible embeddings endpoint.",
                     "User-managed Ollama can be used there if the user points __PRODUCT_NAME__ at it explicitly, but Ollama is not bundled for embeddings by default.",
                 ],
@@ -470,7 +514,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "The primary slot is runtime-ready, not just saved.",
                     "A normal chat request succeeds after save.",
                     "If a dedicated research slot exists, source-backed research can use it when the user turns on research mode.",
-                    "The Embeddings tab shows either a ready local model or a reachable external endpoint.",
+                    "The Embeddings tab shows disabled, a ready local model, or a reachable external endpoint.",
                 ],
             },
             BundledHelpSection {
@@ -508,16 +552,16 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Chat model slots and embeddings are separate.",
                     "Chat models power responses, coding, and research.",
                     "Embeddings power retrieval and similarity lookup.",
-                    "The default embedding mode is Local.",
+                    "The default embedding mode is the Local isolated sidecar.",
                 ],
             },
             BundledHelpSection {
-                label: "default local setup",
+                label: "local setup",
                 items: &[
                     "Provider: local built-in Hugging Face embeddings.",
                     "Model: `BAAI/bge-small-en-v1.5`.",
                     "This does not require a bundled Ollama service.",
-                    "The model is managed by __PRODUCT_NAME__ and should become ready after download or cache completes.",
+                    "The model is managed by __PRODUCT_NAME__ and initializes on first dense retrieval use.",
                 ],
             },
             BundledHelpSection {
@@ -1695,12 +1739,12 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         title: "__PRODUCT_NAME__ capabilities overview",
         slug: "capabilities-overview",
         tags: &["capabilities", "features", "overview", "general"],
-        summary: "__PRODUCT_NAME__ is a self-hosted personal AI OS for daily life and work that combines private chat, durable memory, tasks, agents, apps, integrations, companion devices, approvals, smart model routing, evolution, and audit trails.",
+        summary: "__PRODUCT_NAME__ is a self-hosted personal AI Agent OS for daily life and work that combines private chat, durable memory, tasks, agents, apps, integrations, companion devices, approvals, smart model routing, evolution, and audit trails.",
         sections: &[
             BundledHelpSection {
                 label: "core capabilities",
                 items: &[
-                    "Personal AI OS workflow across the web UI, CLI, Telegram, WhatsApp, integrations, and companion devices for summaries, drafts, reminders, follow-up, research, app work, and action requests.",
+                    "Personal AI Agent OS workflow across the web UI, CLI, Telegram, WhatsApp, integrations, and companion devices for summaries, drafts, reminders, follow-up, research, app work, and action requests.",
                     "Mission Control for daily overview, approvals, highlights, suggestions, and attention items.",
                     "Memory and personal continuity through durable facts, preferences, user data, uploaded files, reusable knowledge-base items, and local embeddings by default.",
                     "Security and trust controls including encrypted secret handling, model-privacy controls, security logs, approvals, guarded execution, sender verification, and advanced admin settings.",
@@ -1752,7 +1796,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                 label: "answer rule",
                 items: &[
                     "When the user asks what __PRODUCT_NAME__ can do, answer with a short product-specific Markdown list, not a generic chatbot skill list.",
-                    "Include evolution, security/trust, model-cost routing, memory/documents, integrations/actions, automation/apps/research, and personal AI OS workflow when answering a broad capabilities question.",
+                    "Include evolution, security/trust, model-cost routing, memory/documents, integrations/actions, automation/apps/research, and personal AI Agent OS workflow when answering a broad capabilities question.",
                     "Mention live configured status separately from stable product capability so missing credentials are not confused with missing product features.",
                 ],
             },

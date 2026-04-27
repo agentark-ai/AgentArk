@@ -60,9 +60,11 @@ pub struct ExecutionPlan {
 }
 
 const DEFAULT_MAX_PLAN_STEPS: usize = 8;
+#[cfg(test)]
 pub const DEFAULT_MAX_CONFIRMATION_PLAN_STEPS: usize = 7;
 pub const DEFAULT_MAX_ACTIONS_FOR_PLAN: usize = 8;
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfirmationPlanRelevance {
     pub accepted: bool,
@@ -73,12 +75,14 @@ pub struct ConfirmationPlanRelevance {
     pub matched_anchors: Vec<String>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct RequestOutlineSection {
     heading: Option<String>,
     items: Vec<String>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct RequestOutline {
     objective: String,
@@ -130,6 +134,7 @@ fn allowed_action_names(actions: &[crate::actions::ActionDef]) -> HashSet<String
         .collect()
 }
 
+#[cfg(test)]
 fn normalize_relevance_text(text: &str) -> String {
     text.to_lowercase()
         .chars()
@@ -137,6 +142,7 @@ fn normalize_relevance_text(text: &str) -> String {
         .collect()
 }
 
+#[cfg(test)]
 fn request_anchor_tokens(text: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut tokens = normalize_relevance_text(text)
@@ -163,6 +169,7 @@ fn request_anchor_tokens(text: &str) -> Vec<String> {
     tokens
 }
 
+#[cfg(test)]
 fn trim_request_list_marker(line: &str) -> Option<&str> {
     let trimmed = line.trim();
     for prefix in ["- ", "* ", "+ "] {
@@ -192,13 +199,10 @@ fn trim_request_list_marker(line: &str) -> Option<&str> {
     }
 
     let rest = after_chars.as_str().trim();
-    if rest.is_empty() {
-        None
-    } else {
-        Some(rest)
-    }
+    if rest.is_empty() { None } else { Some(rest) }
 }
 
+#[cfg(test)]
 fn parse_request_outline_heading(line: &str) -> Option<String> {
     let trimmed = line.trim();
     if trim_request_list_marker(trimmed).is_some() {
@@ -211,6 +215,7 @@ fn parse_request_outline_heading(line: &str) -> Option<String> {
     Some(heading.to_string())
 }
 
+#[cfg(test)]
 fn truncate_prompt_text(text: &str, max_chars: usize) -> String {
     let mut truncated = text.chars().take(max_chars).collect::<String>();
     if text.chars().count() > max_chars {
@@ -219,6 +224,7 @@ fn truncate_prompt_text(text: &str, max_chars: usize) -> String {
     truncated
 }
 
+#[cfg(test)]
 fn push_request_outline_section(
     sections: &mut Vec<RequestOutlineSection>,
     heading: Option<String>,
@@ -233,6 +239,7 @@ fn push_request_outline_section(
     });
 }
 
+#[cfg(test)]
 fn extract_request_outline(request: &str) -> RequestOutline {
     let mut outline = RequestOutline::default();
     let mut current_heading: Option<String> = None;
@@ -277,6 +284,7 @@ fn extract_request_outline(request: &str) -> RequestOutline {
     outline
 }
 
+#[cfg(test)]
 pub fn render_confirmation_request_grounding(request: &str) -> String {
     let outline = extract_request_outline(request);
     let anchors = request_anchor_tokens(request);
@@ -302,6 +310,7 @@ pub fn render_confirmation_request_grounding(request: &str) -> String {
     lines.join("\n")
 }
 
+#[cfg(test)]
 fn dense_alnum_text(text: &str) -> String {
     normalize_relevance_text(text)
         .chars()
@@ -309,6 +318,7 @@ fn dense_alnum_text(text: &str) -> String {
         .collect()
 }
 
+#[cfg(test)]
 fn char_ngrams(text: &str, n: usize) -> HashSet<String> {
     let chars = text.chars().collect::<Vec<_>>();
     if chars.len() < n {
@@ -320,6 +330,7 @@ fn char_ngrams(text: &str, n: usize) -> HashSet<String> {
         .collect()
 }
 
+#[cfg(test)]
 fn confirmation_plan_text(plan: &ExecutionPlan) -> String {
     let mut parts = Vec::new();
     if !plan.summary.trim().is_empty() {
@@ -336,6 +347,7 @@ fn confirmation_plan_text(plan: &ExecutionPlan) -> String {
     parts.join(" ")
 }
 
+#[cfg(test)]
 pub fn assess_confirmation_plan_relevance(
     request: &str,
     plan: &ExecutionPlan,
@@ -411,11 +423,7 @@ fn normalize_action_name(
 
 fn normalize_arguments(value: Option<&serde_json::Value>) -> Option<serde_json::Value> {
     let value = value?.clone();
-    if value.is_object() {
-        Some(value)
-    } else {
-        None
-    }
+    if value.is_object() { Some(value) } else { None }
 }
 
 fn normalize_plan_step(
@@ -672,8 +680,7 @@ Rules:\n\
 - Keep descriptions concrete and avoid filler.\n\
 - Do not include `status`, `plan_id`, or `revision` in the response.\n\
 - {}\n",
-        DEFAULT_MAX_PLAN_STEPS,
-        mode_line
+        DEFAULT_MAX_PLAN_STEPS, mode_line
     );
 
     let mut user = format!(
@@ -699,6 +706,7 @@ Rules:\n\
     (system, user)
 }
 
+#[cfg(test)]
 pub fn build_confirmation_plan_prompt(
     request: &str,
     refinement: Option<&str>,
@@ -795,42 +803,7 @@ pub fn parse_plan_from_value(
     Some(create_plan(summary, steps, plan_id, revision))
 }
 
-pub fn prepare_plan_for_execution(plan: &ExecutionPlan) -> ExecutionPlan {
-    let steps = plan
-        .steps
-        .iter()
-        .enumerate()
-        .map(|(index, step)| PlanStep {
-            id: index + 1,
-            title: step.title.clone(),
-            description: step.description.clone(),
-            action: step.action.clone(),
-            arguments: step.arguments.clone(),
-            tool_hint: step.tool_hint.clone(),
-            status: Some(PlanStepStatus::Pending),
-            substeps: step
-                .substeps
-                .iter()
-                .enumerate()
-                .map(|(sub_index, substep)| PlanSubstep {
-                    id: sub_index + 1,
-                    title: substep.title.clone(),
-                    description: substep.description.clone(),
-                    tool_hint: substep.tool_hint.clone(),
-                    status: Some(PlanStepStatus::Pending),
-                })
-                .collect(),
-        })
-        .collect();
-
-    create_plan(
-        plan.summary.clone(),
-        steps,
-        Some(plan.plan_id.clone()),
-        plan.revision,
-    )
-}
-
+#[cfg(test)]
 pub fn truncate_plan_steps(plan: &ExecutionPlan, max_steps: usize) -> ExecutionPlan {
     if plan.steps.len() <= max_steps {
         return plan.clone();
@@ -844,6 +817,7 @@ pub fn truncate_plan_steps(plan: &ExecutionPlan, max_steps: usize) -> ExecutionP
     trimmed
 }
 
+#[cfg(test)]
 pub fn next_revision_plan(
     current_plan: &ExecutionPlan,
     replacement: &ExecutionPlan,
@@ -899,68 +873,6 @@ pub fn next_revision_plan(
         steps,
         Some(current_plan.plan_id.clone()),
         current_plan.revision.saturating_add(1),
-    )
-}
-
-pub fn active_plan_step(plan: &ExecutionPlan) -> Option<&PlanStep> {
-    plan.steps
-        .iter()
-        .find(|step| step.status == Some(PlanStepStatus::Running))
-        .or_else(|| {
-            plan.steps
-                .iter()
-                .find(|step| step.status == Some(PlanStepStatus::Pending))
-        })
-}
-
-pub fn render_plan_for_system_prompt(plan: &ExecutionPlan) -> String {
-    let summary = if plan.summary.trim().is_empty() {
-        "Execution plan"
-    } else {
-        plan.summary.trim()
-    };
-    let steps = plan
-        .steps
-        .iter()
-        .map(|step| {
-            let substeps = if step.substeps.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "\n{}",
-                    step.substeps
-                        .iter()
-                        .map(|substep| format!("   - {}. {}", substep.id, substep.title))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                )
-            };
-            format!(
-                "{}. {} - {}{}",
-                step.id, step.title, step.description, substeps
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "## Execution Plan\nSummary: {}\nPlan ID: {}\nRevision: {}\nFollow this plan step-by-step unless you emit a full replacement plan revision first.\n{}\nDo not narrate new future steps that are not in this plan.",
-        summary,
-        plan.plan_id,
-        plan.revision,
-        steps
-    )
-}
-
-pub fn render_plan_followup_context(plan: &ExecutionPlan) -> String {
-    let active = active_plan_step(plan)
-        .map(|step| format!("{}: {}", step.id, step.title))
-        .unwrap_or_else(|| "none".to_string());
-    format!(
-        "Current execution plan (plan_id={}, revision={}):\n{}\n\nActive step: {}\nRules:\n- Use the current plan as the source of truth.\n- Do not narrate new future steps unless you first return a full replacement plan JSON object for the remaining work.\n- If you revise the plan, return ONLY the replacement plan JSON object and do not call tools in the same response.",
-        plan.plan_id,
-        plan.revision,
-        serde_json::to_string_pretty(plan).unwrap_or_default(),
-        active
     )
 }
 
@@ -1076,14 +988,16 @@ mod tests {
     fn parse_plan_rejects_malformed_or_empty_payloads() {
         let actions = vec![action("file_write")];
         assert!(parse_plan_from_llm_content("not json", &actions, None, 1, false).is_none());
-        assert!(parse_plan_from_llm_content(
-            r#"{"summary":"No steps","steps":[]}"#,
-            &actions,
-            None,
-            1,
-            false
-        )
-        .is_none());
+        assert!(
+            parse_plan_from_llm_content(
+                r#"{"summary":"No steps","steps":[]}"#,
+                &actions,
+                None,
+                1,
+                false
+            )
+            .is_none()
+        );
     }
 
     #[test]

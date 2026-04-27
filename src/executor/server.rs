@@ -748,10 +748,12 @@ async fn load_spec(state: &ExecutorState, app_id: &str) -> Result<LoadedAppSpec>
     if access_guard_enabled && access_key.trim().is_empty() {
         access_key = generate_access_key();
     }
+    let entry_command = crate::actions::app::app_meta_lifecycle_command(&meta, "entry_command");
+    let install_command = crate::actions::app::app_meta_lifecycle_command(&meta, "install_command");
     let is_static = row
         .as_ref()
         .and_then(|v| v.get("is_static").and_then(|v| v.as_bool()))
-        .unwrap_or_else(|| str_val(&meta, "entry_command").is_none());
+        .unwrap_or_else(|| entry_command.is_none());
 
     Ok(LoadedAppSpec {
         title,
@@ -760,8 +762,8 @@ async fn load_spec(state: &ExecutorState, app_id: &str) -> Result<LoadedAppSpec>
         access_key,
         expose_public,
         is_static,
-        entry_command: str_val(&meta, "entry_command"),
-        install_command: str_val(&meta, "install_command"),
+        entry_command,
+        install_command,
         runtime_image: str_val(&meta, "runtime_image"),
         runtime_preference: runtime_preference_from_opt(
             str_val(&meta, "runtime_preference").as_deref(),
@@ -1169,6 +1171,26 @@ async fn app_deploy(
         .filter(|value| !value.trim().is_empty())
     {
         arguments.insert("entry_command".to_string(), json!(value));
+    }
+    if let Some(value) = request
+        .start_command
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        arguments.insert("start_command".to_string(), json!(value));
+    }
+    if let Some(value) = request
+        .stop_command
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        arguments.insert("stop_command".to_string(), json!(value));
+    }
+    if !request.commands.is_empty() {
+        arguments.insert(
+            "commands".to_string(),
+            serde_json::to_value(&request.commands).unwrap_or_else(|_| json!({})),
+        );
     }
 
     let llm_env = std::env::vars().collect::<HashMap<String, String>>();

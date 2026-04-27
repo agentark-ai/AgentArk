@@ -56,37 +56,6 @@ impl HeuristicReflectionPassStats {
 }
 
 impl Agent {
-    fn heuristic_prompt_dedupe_key(raw: &str) -> String {
-        raw.chars()
-            .map(|ch| {
-                if ch.is_ascii_alphanumeric() {
-                    ch.to_ascii_lowercase()
-                } else {
-                    ' '
-                }
-            })
-            .collect::<String>()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
-    fn heuristic_scope_rank(
-        item: &crate::storage::experience_item::Model,
-        project_id: Option<&str>,
-        conversation_id: Option<&str>,
-    ) -> usize {
-        if conversation_id.is_some() && item.conversation_id.as_deref() == conversation_id {
-            3
-        } else if project_id.is_some() && item.project_id.as_deref() == project_id {
-            2
-        } else if item.project_id.is_none() && item.conversation_id.is_none() {
-            1
-        } else {
-            0
-        }
-    }
-
     fn tool_names_from_experience_run(run: &crate::storage::experience_run::Model) -> Vec<String> {
         run.tool_sequence_json
             .as_array()
@@ -370,18 +339,6 @@ Rules:\n\
         }
     }
 
-    async fn load_tool_strategy_profile_by_key(
-        &self,
-        key: &str,
-    ) -> Option<crate::core::self_evolve::strategy_runtime::ToolStrategyProfile> {
-        let raw = self.storage.get(key).await.ok().flatten()?;
-        let value = serde_json::from_slice::<
-            crate::core::self_evolve::strategy_runtime::ToolStrategyProfile,
-        >(&raw)
-        .ok()?;
-        Some(value)
-    }
-
     async fn load_prompt_bundle_by_key(
         &self,
         key: &str,
@@ -406,15 +363,6 @@ Rules:\n\
         crate::core::self_evolve::specialist_prompt_evolution::parse_specialist_prompt_bundle_profile(&raw)
     }
 
-    fn strategy_seed_for_message(message: &str) -> String {
-        let normalized = message.trim().to_ascii_lowercase();
-        if normalized.is_empty() {
-            "_empty".to_string()
-        } else {
-            normalized
-        }
-    }
-
     fn prompt_seed_for_message(message: &str) -> String {
         let normalized = message.trim().to_ascii_lowercase();
         if normalized.is_empty() {
@@ -422,217 +370,6 @@ Rules:\n\
         } else {
             normalized
         }
-    }
-
-    pub(crate) async fn active_strategy_version_for_message(
-        &self,
-        message: &str,
-    ) -> Option<String> {
-        let baseline = self
-            .load_tool_strategy_profile_by_key(
-                crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_PROFILE_KEY,
-            )
-            .await;
-        let mut selected = baseline;
-
-        let canary_state_raw = self
-            .storage
-            .get(crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_CANARY_STATE_KEY)
-            .await
-            .ok()
-            .flatten();
-        if let Some(raw) = canary_state_raw {
-            if let Ok(state) = serde_json::from_slice::<
-                crate::core::self_evolve::strategy_runtime::CanaryRolloutState,
-            >(&raw)
-            {
-                if state.enabled
-                    && crate::core::self_evolve::strategy_runtime::should_use_canary(
-                        &Self::strategy_seed_for_message(message),
-                        state.rollout_percent,
-                    )
-                {
-                    if let Some(canary) = self
-                        .load_tool_strategy_profile_by_key(
-                            crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_PROFILE_CANARY_KEY,
-                        )
-                        .await
-                    {
-                        selected = Some(canary);
-                    }
-                }
-            }
-        }
-
-        selected.map(|p| p.version)
-    }
-
-    pub(crate) async fn build_strategy_prompt_block_for_message(
-        &self,
-        message: &str,
-        request_shape: Option<&crate::core::RequestShapeAssessment>,
-        actions: &[crate::actions::ActionDef],
-    ) -> Option<(String, String, String)> {
-        let task_type =
-            crate::core::self_evolve::strategy_runtime::infer_task_type_from_request_context(
-                request_shape,
-                actions,
-            );
-        let baseline = self
-            .load_tool_strategy_profile_by_key(
-                crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_PROFILE_KEY,
-            )
-            .await;
-        let mut selected = baseline;
-
-        let canary_state_raw = self
-            .storage
-            .get(crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_CANARY_STATE_KEY)
-            .await
-            .ok()
-            .flatten();
-        if let Some(raw) = canary_state_raw {
-            if let Ok(state) = serde_json::from_slice::<
-                crate::core::self_evolve::strategy_runtime::CanaryRolloutState,
-            >(&raw)
-            {
-                if state.enabled
-                    && crate::core::self_evolve::strategy_runtime::should_use_canary(
-                        &Self::strategy_seed_for_message(message),
-                        state.rollout_percent,
-                    )
-                {
-                    if let Some(canary) = self
-                        .load_tool_strategy_profile_by_key(
-                            crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_PROFILE_CANARY_KEY,
-                        )
-                        .await
-                    {
-                        selected = Some(canary);
-                    }
-                }
-            }
-        }
-
-        let profile = selected?;
-        let strategy_version = profile.version.clone();
-        let block = crate::core::self_evolve::strategy_runtime::render_prompt_strategy_block(
-            &profile, &task_type,
-        )?;
-        Some((block, strategy_version, task_type))
-    }
-
-    pub(crate) async fn build_heuristic_prompt_block_for_message(
-        &self,
-        message: &str,
-        project_id: Option<&str>,
-        conversation_id: Option<&str>,
-        request_shape: Option<&crate::core::RequestShapeAssessment>,
-        actions: &[crate::actions::ActionDef],
-    ) -> Option<(String, usize, String)> {
-        let task_type =
-            crate::core::self_evolve::strategy_runtime::infer_task_type_from_request_context(
-                request_shape,
-                actions,
-            );
-        let task_type_label = task_type.as_str();
-        let query_tokens = tokenize_lower(message);
-        let mut lessons = self
-            .storage
-            .list_active_experience_items(&["lesson"], project_id, conversation_id, 32)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter(crate::core::learning::experience_item_is_reflected_heuristic)
-            .collect::<Vec<_>>();
-
-        let mut ranked = Vec::new();
-        for lesson in lessons.drain(..) {
-            let lesson_task_type =
-                crate::core::learning::reflected_heuristic_task_type(&lesson).unwrap_or("general");
-            if lesson_task_type != task_type_label
-                && lesson_task_type != "general"
-                && task_type_label != "general"
-            {
-                continue;
-            }
-
-            let applicability =
-                crate::core::learning::reflected_heuristic_applicability(&lesson).unwrap_or("");
-            let combined = format!(
-                "{} {} {} {}",
-                lesson.title, lesson.content, applicability, lesson_task_type
-            );
-            let scope_rank = Self::heuristic_scope_rank(&lesson, project_id, conversation_id);
-            if scope_rank == 0 {
-                continue;
-            }
-            let task_rank = if lesson_task_type == task_type_label {
-                3
-            } else {
-                2
-            };
-            let overlap = keyword_overlap_score(&combined, &query_tokens);
-            let confidence = crate::core::learning::reflected_heuristic_confidence(&lesson);
-            let score = (scope_rank * 100 + task_rank * 40 + overlap) as f64
-                + confidence * 25.0
-                + lesson.support_count.max(0) as f64 * 6.0;
-            ranked.push((lesson, score));
-        }
-        ranked.sort_by(|left, right| {
-            right
-                .1
-                .total_cmp(&left.1)
-                .then_with(|| right.0.support_count.cmp(&left.0.support_count))
-                .then_with(|| right.0.updated_at.cmp(&left.0.updated_at))
-        });
-
-        let mut seen = std::collections::HashSet::new();
-        let mut lines = Vec::new();
-        let mut used = 0usize;
-        for (lesson, _) in ranked {
-            let dedupe_key = Self::heuristic_prompt_dedupe_key(&lesson.content);
-            if !seen.insert(dedupe_key) {
-                continue;
-            }
-            let applicability =
-                crate::core::learning::reflected_heuristic_applicability(&lesson).unwrap_or("");
-            let prefix = match crate::core::learning::reflected_heuristic_polarity(&lesson) {
-                Some("negative") => "[Avoid]",
-                _ => "[Prefer]",
-            };
-            if applicability.is_empty() {
-                lines.push(format!(
-                    "- {} {}",
-                    prefix,
-                    safe_truncate(&lesson.content, 220)
-                ));
-            } else {
-                lines.push(format!(
-                    "- {} {} ({})",
-                    prefix,
-                    safe_truncate(&lesson.content, 180),
-                    safe_truncate(applicability, 120)
-                ));
-            }
-            used += 1;
-            if used >= 4 {
-                break;
-            }
-        }
-        if lines.is_empty() {
-            return None;
-        }
-
-        Some((
-            format!(
-                "## Learned Heuristics\n- Task type: {}\n{}",
-                task_type_label,
-                lines.join("\n")
-            ),
-            used,
-            task_type,
-        ))
     }
 
     pub(crate) async fn run_heuristic_reflection_pass(
@@ -676,7 +413,7 @@ Rules:\n\
                     &prompt,
                     &[],
                     &[],
-                    2500,
+                    internal_llm_timeout_ms("AGENTARK_HEURISTIC_REFLECTION_TIMEOUT_MS", 20_000),
                     2,
                 )
                 .await
@@ -787,6 +524,7 @@ Rules:\n\
         selected
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn active_classifier_prompt_bundle_for_message(
         &self,
         message: &str,
@@ -908,13 +646,13 @@ mod tests {
     fn operational_payload_preserves_versions_but_redacts_secret_like_text() {
         let fake_key = ["sk", "-1234567890", "abcdefghijklmnop"].concat();
         let payload = serde_json::json!({
-            "classifier_prompt_version": "classifier_prompt_v1+classifier-prompt-bundle-default-v1",
+            "classifier_prompt_version": "agent_turn_loop_v1",
             "specialist_prompt_version": "specialist_prompt_v1+specialist-prompt-bundle-default-v1",
             "diagnostic": format!("api_key={fake_key}")
         });
         let sanitized = Agent::sanitize_operational_payload_json(&payload).expect("payload");
 
-        assert!(sanitized.contains("classifier_prompt_v1+classifier-prompt-bundle-default-v1"));
+        assert!(sanitized.contains("agent_turn_loop_v1"));
         assert!(sanitized.contains("specialist_prompt_v1+specialist-prompt-bundle-default-v1"));
         assert!(sanitized.contains("[REDACTED_API_KEY]"));
         assert!(!sanitized.contains(&fake_key));

@@ -88,7 +88,7 @@ pub(crate) fn render_agent_doc_toc() -> String {
 
     let mut out = String::from(
         "## Agent Documentation Map\n\
-         - Start here as a table of contents for AgentArk's local personal AI OS knowledge.\n\
+         - Start here as a table of contents for AgentArk's local personal AI Agent OS knowledge.\n\
          - This map is not the full documentation. When a task needs implementation details, inspect the referenced source or doc path first instead of relying on this summary.\n\
          - Use runtime inspection for current state such as containers, settings, tasks, traces, apps, and integrations.\n",
     );

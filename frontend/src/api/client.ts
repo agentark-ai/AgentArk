@@ -376,10 +376,17 @@ type ChatStreamPayload = {
   plan_confirmation_mode?: string;
   execution_mode?: string;
   attachments_present?: boolean;
+  attachments?: Array<{
+    upload_id?: string;
+    document_id?: string;
+    kind: "document" | "visual" | string;
+    content_type?: string | null;
+  }>;
 };
 
 type ChatStreamHandlers = {
   signal?: AbortSignal;
+  onOpen?: () => void;
   onEvent?: (event: string, payload: unknown) => void;
   onToken?: (token: string) => void;
   onThinking?: (step: Record<string, unknown>) => void;
@@ -459,6 +466,7 @@ async function streamSseJson(
   }
 
   if (!res.body) throw new Error("Streaming is not available in this browser session.");
+  handlers.onOpen?.();
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
@@ -592,6 +600,7 @@ async function streamRun(runId: string, sinceSeq = 0, handlers: ChatStreamHandle
   }
 
   if (!res.body) throw new Error("Streaming is not available in this browser session.");
+  handlers.onOpen?.();
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
@@ -716,7 +725,7 @@ export const api = {
     }),
   getStatus: () => request<StatusResponse>("/status"),
   getTasks: async () => {
-    const raw = await request<unknown>("/tasks");
+    const raw = await request<unknown>("/tasks?limit=120&sort=ops");
     if (Array.isArray(raw)) return raw as Task[];
     if (raw && typeof raw === "object" && Array.isArray((raw as { tasks?: unknown }).tasks)) {
       return (raw as { tasks: Task[] }).tasks;
@@ -1232,18 +1241,35 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload)
     }),
-  getSkillSecrets: (name: string) =>
-    request<SkillSecretsResponse>(`/skills/${encodeURIComponent(name)}/secrets`),
+  getSkillSecrets: (name: string, init?: RequestOptions) =>
+    request<SkillSecretsResponse>(`/skills/${encodeURIComponent(name)}/secrets`, init),
   setSkillSecrets: (name: string, payload: SkillSecretsUpdateRequest) =>
     request<SkillSecretsResponse>(`/skills/${encodeURIComponent(name)}/secrets`, {
       method: "POST",
       body: JSON.stringify(payload)
     }),
-  testSkill: (name: string, argumentsPayload?: unknown) =>
+  testSkill: (
+    name: string,
+    argumentsPayload?: unknown,
+    init?: RequestOptions,
+    runId?: string
+  ) =>
     request<SkillTestResponse>(`/skills/${encodeURIComponent(name)}/test`, {
+      ...init,
       method: "POST",
-      body: JSON.stringify({ arguments: argumentsPayload ?? {} })
+      body: JSON.stringify({
+        arguments: argumentsPayload ?? {},
+        run_id: runId || null
+      })
     }),
+  cancelSkillTest: (runId: string) =>
+    request<{ status: string; run_id: string; cancelled: boolean }>(
+      `/skills/test-runs/${encodeURIComponent(runId)}/cancel`,
+      {
+        method: "POST",
+        body: JSON.stringify({})
+      }
+    ),
   setSkillEnabled: (name: string, enabled: boolean) =>
     request<{ status: string; name: string; enabled: boolean }>(`/skills/${encodeURIComponent(name)}/enabled`, {
       method: "POST",

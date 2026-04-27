@@ -115,7 +115,7 @@ export function AgentStatusBar({
         <Stack spacing={0.45} sx={{ minWidth: 0, flex: 1 }}>
           <Typography
             variant="overline"
-            sx={{ color: "rgba(183, 188, 196, 0.68)", letterSpacing: 0, display: "block" }}
+            sx={{ color: "var(--ui-rgba-183-188-196-680)", letterSpacing: 0, display: "block" }}
           >
             System Posture
           </Typography>
@@ -129,7 +129,7 @@ export function AgentStatusBar({
                 boxShadow: pulse ? `0 0 6px 1px ${dotColor}` : "none",
               }}
             />
-            <Typography variant="subtitle2" sx={{ color: "rgba(244, 245, 247, 0.96)", fontWeight: 700 }}>
+            <Typography variant="subtitle2" sx={{ color: "var(--ui-rgba-244-245-247-960)", fontWeight: 700 }}>
               {label}
             </Typography>
           </Stack>
@@ -147,8 +147,8 @@ export function AgentStatusBar({
             px: 1,
             py: 0.5,
             borderRadius: 999,
-            border: "1px solid rgba(255, 255, 255, 0.08)",
-            background: "rgba(255, 255, 255, 0.03)",
+            border: "1px solid var(--ui-rgba-255-255-255-080)",
+            background: "var(--ui-rgba-255-255-255-030)",
             color: agentPaused ? "#ffbc7c" : "#82f7c1",
             fontSize: "0.66rem",
             fontWeight: 700,
@@ -219,7 +219,7 @@ export function AgentStatusBar({
           ) : null}
         </Stack>
         {recentFailureTitle ? (
-          <Typography variant="caption" sx={{ color: "rgba(255, 177, 177, 0.82)" }}>
+          <Typography variant="caption" sx={{ color: "var(--ui-rgba-255-177-177-820)" }}>
             Latest degraded run: {recentFailureTitle}
           </Typography>
         ) : null}

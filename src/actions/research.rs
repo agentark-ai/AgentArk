@@ -1,11 +1,10 @@
 //! Research Action - Deep web research and information synthesis
-//!
 //! Provides comprehensive research capabilities by:
 //! 1. Searching multiple sources
 //! 2. Fetching and extracting content from URLs
 //! 3. Synthesizing information into a coherent report
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -173,13 +172,6 @@ pub struct ResearchProgressReporter {
 }
 
 impl ResearchProgressReporter {
-    pub fn new(tx: UnboundedSender<ResearchProgressUpdate>) -> Self {
-        Self {
-            tx,
-            started_at: Instant::now(),
-        }
-    }
-
     pub fn emit(
         &self,
         phase: &str,
@@ -2494,18 +2486,26 @@ mod tests {
         let client = test_client();
         let queries = client.generate_research_queries("rust agent framework", true);
 
-        assert!(queries
-            .iter()
-            .any(|query| query.text.contains("primary sources")));
-        assert!(queries
-            .iter()
-            .any(|query| query.text.contains("recent coverage")));
-        assert!(queries
-            .iter()
-            .any(|query| query.text.contains("comparison alternatives")));
-        assert!(queries
-            .iter()
-            .any(|query| query.text.contains("risks limitations open questions")));
+        assert!(
+            queries
+                .iter()
+                .any(|query| query.text.contains("primary sources"))
+        );
+        assert!(
+            queries
+                .iter()
+                .any(|query| query.text.contains("recent coverage"))
+        );
+        assert!(
+            queries
+                .iter()
+                .any(|query| query.text.contains("comparison alternatives"))
+        );
+        assert!(
+            queries
+                .iter()
+                .any(|query| query.text.contains("risks limitations open questions"))
+        );
     }
 
     #[test]

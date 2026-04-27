@@ -1380,10 +1380,12 @@ mod tests {
         );
 
         assert!(report.blocked);
-        assert!(report
-            .matched_rules
-            .iter()
-            .any(|rule| rule.id == "block-shell-file-network"));
+        assert!(
+            report
+                .matched_rules
+                .iter()
+                .any(|rule| rule.id == "block-shell-file-network")
+        );
     }
 
     #[test]
@@ -1407,10 +1409,12 @@ mod tests {
         let report = evaluate_cross_layer_capabilities(observations)
             .expect("cross-layer report should be produced");
         assert!(report.blocked);
-        assert!(report
-            .matched_rules
-            .iter()
-            .any(|rule| rule.id == "block-shell-file-network"));
+        assert!(
+            report
+                .matched_rules
+                .iter()
+                .any(|rule| rule.id == "block-shell-file-network")
+        );
     }
 
     #[test]

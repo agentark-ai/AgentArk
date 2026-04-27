@@ -902,8 +902,7 @@ impl CompanionControlPlane {
                 session.trusted_unattested.to_string(),
             );
             if bundled_mobile_preset_requires_attestation(&session.preset_id) {
-                let reason =
-                    "High-risk bundled mobile companions require verified platform attestation before approval.";
+                let reason = "High-risk bundled mobile companions require verified platform attestation before approval.";
                 self.audit(
                     "pairing_session_approval_denied",
                     None,
@@ -919,8 +918,7 @@ impl CompanionControlPlane {
                 anyhow::bail!("{}", reason);
             }
             if !session.trusted_unattested {
-                let reason =
-                    "High-risk custom or desktop companions require an explicit trusted_unattested override.";
+                let reason = "High-risk custom or desktop companions require an explicit trusted_unattested override.";
                 self.audit(
                     "pairing_session_approval_denied",
                     None,
@@ -2029,7 +2027,13 @@ pub fn companion_presets() -> Vec<CompanionPreset> {
             "Home server / mini PC",
             "Run scripts, local automations, and private LAN integrations near local resources.",
             "headless",
-            &["notifications", "system_run", "lan_access", "file_read", "file_write"],
+            &[
+                "notifications",
+                "system_run",
+                "lan_access",
+                "file_read",
+                "file_write",
+            ],
         ),
         preset(
             "raspberry_pi",

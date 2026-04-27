@@ -7,6 +7,7 @@ use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration as StdDuration, Instant};
 use tokio::sync::{Mutex, RwLock};
 
 const INTEGRATION_SYNC_STATE_KEY: &str = "integration_sync_state_v1";
@@ -16,6 +17,8 @@ const MAX_FEED_ITEMS: usize = 300;
 const MAX_RUN_ITEMS: usize = 400;
 const MAX_RECENT_SOURCE_IDS: usize = 400;
 const MAX_BASELINE_ITEMS: usize = 8;
+const INTEGRATION_SYNC_STATUS_TIMEOUT_SECS: u64 = 8;
+const INTEGRATION_SYNC_FETCH_TIMEOUT_SECS: u64 = 45;
 const INTEGRATION_SYNC_BUSY_MESSAGE: &str =
     "Another integration sync run is already in progress. Try again in a moment.";
 const DEFAULT_INTEGRATION_SYNC_POLL_SECS: u64 = 30 * 60;
@@ -537,25 +540,86 @@ async fn integration_connected(
     manager: &crate::integrations::IntegrationManager,
     integration_id: &str,
 ) -> bool {
+    let started = Instant::now();
+    tracing::info!(
+        integration_id = integration_id,
+        "Integration sync connection check started"
+    );
     if integration_id == "gmail" {
-        return gmail_connected(ctx).await;
+        let connected = gmail_connected(ctx).await;
+        tracing::info!(
+            integration_id = integration_id,
+            connected = connected,
+            duration_ms = started.elapsed().as_millis() as u64,
+            "Integration sync connection check completed"
+        );
+        return connected;
     }
     if integration_id == "google_calendar" {
-        return calendar_connected(ctx).await;
+        let connected = calendar_connected(ctx).await;
+        tracing::info!(
+            integration_id = integration_id,
+            connected = connected,
+            duration_ms = started.elapsed().as_millis() as u64,
+            "Integration sync connection check completed"
+        );
+        return connected;
     }
     if integration_id == "google_workspace" {
-        return google_workspace_connected(ctx).await;
+        let connected = google_workspace_connected(ctx).await;
+        tracing::info!(
+            integration_id = integration_id,
+            connected = connected,
+            duration_ms = started.elapsed().as_millis() as u64,
+            "Integration sync connection check completed"
+        );
+        return connected;
     }
     if integration_uses_config_only_status(integration_id) {
+        tracing::info!(
+            integration_id = integration_id,
+            connected = false,
+            duration_ms = started.elapsed().as_millis() as u64,
+            "Integration sync connection check skipped for config-only integration"
+        );
         return false;
     }
     let Some(integration) = manager.get(integration_id) else {
+        tracing::info!(
+            integration_id = integration_id,
+            connected = false,
+            duration_ms = started.elapsed().as_millis() as u64,
+            "Integration sync connection check skipped because integration is not registered"
+        );
         return false;
     };
-    matches!(
-        integration.status().await,
-        crate::integrations::IntegrationStatus::Connected
+    match tokio::time::timeout(
+        StdDuration::from_secs(INTEGRATION_SYNC_STATUS_TIMEOUT_SECS),
+        integration.status(),
     )
+    .await
+    {
+        Ok(status) => {
+            let connected = matches!(status, crate::integrations::IntegrationStatus::Connected);
+            tracing::info!(
+                integration_id = integration_id,
+                connected = connected,
+                status = ?status,
+                duration_ms = started.elapsed().as_millis() as u64,
+                "Integration sync connection check completed"
+            );
+            connected
+        }
+        Err(_) => {
+            tracing::warn!(
+                integration_id = integration_id,
+                "Integration sync status check timed out for '{}' after {}s; skipping background sync for this integration",
+                integration_id,
+                INTEGRATION_SYNC_STATUS_TIMEOUT_SECS
+            );
+            false
+        }
+    }
 }
 
 async fn integration_dispatch_enabled(
@@ -952,6 +1016,7 @@ pub async fn update_config(
 }
 
 pub async fn run_due_syncs(ctx: &IntegrationSyncContext) -> Result<()> {
+    let started = Instant::now();
     let Ok(_guard) = INTEGRATION_SYNC_MUTATION_LOCK.try_lock() else {
         tracing::debug!("Integration sync skipped because another sync mutation is active");
         return Ok(());
@@ -969,6 +1034,10 @@ pub async fn run_due_syncs(ctx: &IntegrationSyncContext) -> Result<()> {
     );
     supported_ids.sort();
     supported_ids.dedup();
+    tracing::info!(
+        supported_integrations = supported_ids.len(),
+        "Integration sync run started"
+    );
 
     let mut due_configs = Vec::new();
     for integration_id in supported_ids {
@@ -983,14 +1052,18 @@ pub async fn run_due_syncs(ctx: &IntegrationSyncContext) -> Result<()> {
         if !config.enabled {
             continue;
         }
-        if !integration_connected(ctx, &manager, &integration_id).await {
+        if !integration_dispatch_enabled(ctx, &manager, &integration_id).await {
             continue;
         }
-        if !integration_dispatch_enabled(ctx, &manager, &integration_id).await {
+        if !integration_connected(ctx, &manager, &integration_id).await {
             continue;
         }
         due_configs.push(config);
     }
+    tracing::info!(
+        due_integrations = due_configs.len(),
+        "Integration sync due integration scan completed"
+    );
 
     for config in due_configs {
         let cursor = store
@@ -1014,9 +1087,14 @@ pub async fn run_due_syncs(ctx: &IntegrationSyncContext) -> Result<()> {
         .await;
     }
 
+    tracing::info!("Integration sync persisting state");
     save_state_store(ctx, &store).await?;
     save_feed(ctx, &feed).await?;
     save_runs(ctx, &runs).await?;
+    tracing::info!(
+        duration_ms = started.elapsed().as_millis() as u64,
+        "Integration sync run completed"
+    );
     Ok(())
 }
 
@@ -1173,6 +1251,40 @@ async fn sync_integration(
     let previous_error = cursor.last_error.clone();
 
     if !force && !config.enabled {
+        tracing::info!(
+            integration_id = config.integration_id.as_str(),
+            trigger = trigger,
+            "Integration sync skipped disabled config"
+        );
+        return;
+    }
+
+    let integration_enabled =
+        integration_dispatch_enabled(ctx, manager, &config.integration_id).await;
+    if !integration_enabled {
+        cursor.last_sync_at = Some(now_rfc3339.clone());
+        let error = "Integration is disabled.".to_string();
+        cursor.last_error = Some(error.clone());
+        push_run_record(
+            runs,
+            config,
+            trigger,
+            started_at,
+            Utc::now(),
+            false,
+            false,
+            cursor,
+            &SyncRunOutcome {
+                status: "blocked",
+                error: Some(error),
+                fetched_item_count: 0,
+                new_item_count: 0,
+                recorded_item_count: 0,
+                important_item_count: 0,
+                baseline_mode: false,
+                sample_titles: Vec::new(),
+            },
+        );
         return;
     }
 
@@ -1190,36 +1302,7 @@ async fn sync_integration(
             started_at,
             Utc::now(),
             false,
-            false,
-            cursor,
-            &SyncRunOutcome {
-                status: "blocked",
-                error: Some(error),
-                fetched_item_count: 0,
-                new_item_count: 0,
-                recorded_item_count: 0,
-                important_item_count: 0,
-                baseline_mode: false,
-                sample_titles: Vec::new(),
-            },
-        );
-        return;
-    }
-
-    let integration_enabled =
-        integration_dispatch_enabled(ctx, manager, &config.integration_id).await;
-    if !integration_enabled {
-        cursor.last_sync_at = Some(now_rfc3339.clone());
-        let error = "Integration is disabled.".to_string();
-        cursor.last_error = Some(error.clone());
-        push_run_record(
-            runs,
-            config,
-            trigger,
-            started_at,
-            Utc::now(),
             true,
-            false,
             cursor,
             &SyncRunOutcome {
                 status: "blocked",
@@ -1235,8 +1318,33 @@ async fn sync_integration(
         return;
     }
 
-    match fetch_items(ctx, manager, &config.integration_id, cursor).await {
+    tracing::info!(
+        integration_id = config.integration_id.as_str(),
+        trigger = trigger,
+        timeout_secs = INTEGRATION_SYNC_FETCH_TIMEOUT_SECS,
+        "Integration sync fetch started"
+    );
+    let fetch_result = match tokio::time::timeout(
+        StdDuration::from_secs(INTEGRATION_SYNC_FETCH_TIMEOUT_SECS),
+        fetch_items(ctx, manager, &config.integration_id, cursor),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!(
+            "Integration fetch timed out after {}s",
+            INTEGRATION_SYNC_FETCH_TIMEOUT_SECS
+        )),
+    };
+
+    match fetch_result {
         Ok(items) => {
+            tracing::info!(
+                integration_id = config.integration_id.as_str(),
+                trigger = trigger,
+                fetched_items = items.len(),
+                "Integration sync fetch completed"
+            );
             let baseline_mode = cursor.seeded_at.is_none();
             let result = apply_items(ctx, config, cursor, feed, items, baseline_mode).await;
             cursor.last_sync_at = Some(now_rfc3339.clone());
@@ -1267,6 +1375,12 @@ async fn sync_integration(
             );
         }
         Err(error) => {
+            tracing::warn!(
+                integration_id = config.integration_id.as_str(),
+                trigger = trigger,
+                error = %error,
+                "Integration sync fetch failed"
+            );
             cursor.last_sync_at = Some(now_rfc3339.clone());
             let error_text = short_text(&error.to_string(), 240);
             maybe_emit_sync_attention_notification(

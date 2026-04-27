@@ -1,5 +1,4 @@
 //! Action Runtime - WASM Sandbox + Docker + Transactional Execution
-//!
 //! Based on arXiv:2512.12806 "Fault-Tolerant Sandboxing"
 //!
 //! Features:
@@ -245,6 +244,8 @@ pub struct ActionRuntime {
 const LOCAL_APP_HTTP_PORT: u16 = 8990;
 const HTTP_GET_TIMEOUT_SECS: u64 = 10;
 const HTTP_GET_MAX_BODY_BYTES: usize = 1_000_000;
+const VISION_IMAGE_INLINE_MAX_BODY_BYTES: usize = 20 * 1024 * 1024;
+const VISION_DOCUMENT_INLINE_MAX_BODY_BYTES: usize = 50 * 1024 * 1024;
 const MAX_NATIVE_ENV_OVERRIDES: usize = 32;
 const ACTION_REVIEW_HISTORY_LIMIT: usize = 10;
 const CAPABILITY_CONTEXT_TTL_SECS: i64 = 60 * 60;
@@ -522,6 +523,57 @@ pub const WORKFLOW_ACTION_MARKER: &str = "__WORKFLOW_ACTION__:";
 pub const WORKFLOW_MISSING_INPUTS_MARKER: &str = "__WORKFLOW_MISSING_INPUTS__:";
 pub const TOOL_COMPLETION_MARKER: &str = "__TOOL_COMPLETION__:";
 
+fn runtime_collapse_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn runtime_truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let end = value
+        .char_indices()
+        .nth(max_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(value.len());
+    format!("{}...", &value[..end])
+}
+
+fn structured_tool_completion_output(
+    tool: &str,
+    status: &str,
+    detail: impl Into<String>,
+    data: serde_json::Value,
+) -> String {
+    format!(
+        "{}{}",
+        TOOL_COMPLETION_MARKER,
+        serde_json::json!({
+            "tool": tool,
+            "status": status,
+            "detail": detail.into(),
+            "data": data,
+        })
+    )
+}
+
+fn browse_completion_detail(url: &str, title: &str, extract: &str, content: &str) -> String {
+    let mut lines = Vec::new();
+    if title.trim().is_empty() {
+        lines.push("Fetched page.".to_string());
+    } else {
+        lines.push(format!("Fetched page: {}", title.trim()));
+    }
+    lines.push(format!("URL: {}", url.trim()));
+    lines.push(format!("Extract: {}", extract.trim()));
+    let excerpt = runtime_truncate_chars(&runtime_collapse_whitespace(content), 1_200);
+    if !excerpt.trim().is_empty() {
+        lines.push(String::new());
+        lines.push(format!("Excerpt: {}", excerpt));
+    }
+    lines.join("\n")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowMissingInputsPayload {
     pub action: String,
@@ -587,73 +639,22 @@ pub struct StructuredToolCompletion {
 
 fn parse_structured_tool_completion(output: &str) -> Option<StructuredToolCompletion> {
     if let Some(payload) = output.trim_start().strip_prefix(TOOL_COMPLETION_MARKER) {
+        let payload = payload.lines().next().unwrap_or(payload).trim();
         return serde_json::from_str::<StructuredToolCompletion>(payload).ok();
     }
     serde_json::from_str::<StructuredToolCompletion>(output.trim()).ok()
 }
 
-fn parse_legacy_tool_completion(
-    output: &str,
-    tool: &str,
-    accepted_prefixes: &[&str],
-) -> Option<StructuredToolCompletion> {
-    let trimmed = output.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let lower = trimmed.to_ascii_lowercase();
-    let detail = accepted_prefixes.iter().find_map(|prefix| {
-        if lower.starts_with(prefix) {
-            Some(
-                trimmed[prefix.len()..]
-                    .trim()
-                    .trim_start_matches(':')
-                    .trim(),
-            )
-        } else {
-            None
-        }
-    })?;
-
-    Some(StructuredToolCompletion {
-        tool: tool.to_string(),
-        status: "completed".to_string(),
-        detail: if detail.is_empty() {
-            None
-        } else {
-            Some(detail.to_string())
-        },
-    })
-}
-
 pub fn parse_schedule_task_completion(output: &str) -> Option<StructuredToolCompletion> {
-    parse_structured_tool_completion(output)
-        .filter(|completion| completion.tool == "schedule_task")
-        .or_else(|| {
-            parse_legacy_tool_completion(
-                output,
-                "schedule_task",
-                &[
-                    "task scheduled:",
-                    "scheduled task:",
-                    "schedule created:",
-                    "schedule added:",
-                ],
-            )
-        })
+    parse_structured_tool_completion(output).filter(|completion| completion.tool == "schedule_task")
 }
 
 pub fn parse_watch_completion(output: &str) -> Option<StructuredToolCompletion> {
-    parse_structured_tool_completion(output)
-        .filter(|completion| completion.tool == "watch")
-        .or_else(|| {
-            parse_legacy_tool_completion(
-                output,
-                "watch",
-                &["watch created:", "watch added:", "watcher created:"],
-            )
-        })
+    parse_structured_tool_completion(output).filter(|completion| completion.tool == "watch")
+}
+
+pub fn parse_delegate_completion(output: &str) -> Option<StructuredToolCompletion> {
+    parse_structured_tool_completion(output).filter(|completion| completion.tool == "delegate")
 }
 
 /// Isolation level for ephemeral Docker containers
@@ -3572,18 +3573,6 @@ print(json.dumps({
         self.extension_pack_registry = Some(registry);
     }
 
-    pub fn default_sandbox_mode(&self) -> SandboxMode {
-        self.config.default_sandbox.clone()
-    }
-
-    pub fn wasm_memory_limit_bytes(&self) -> u64 {
-        self.config.wasm_memory_limit
-    }
-
-    pub fn docker_image(&self) -> &str {
-        &self.config.docker_image
-    }
-
     fn action_is_auto_approved(&self, action_name: &str) -> bool {
         self.auto_approved_actions
             .read()
@@ -3710,7 +3699,7 @@ print(json.dumps({
         // File operations
         self.register_builtin_action(ActionDef {
             name: "file_read".to_string(),
-            description: "Read contents of a file".to_string(),
+            description: "Read the full text contents of a single file from the workspace and return them. Use when an action depends on what is already inside a file the user has authored, downloaded, or generated previously — source code, notes, JSON state, generated artifacts. The path must resolve inside the configured workspace and data directories; absolute paths outside those roots are rejected. Returns the file's UTF-8 text body.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -3719,7 +3708,7 @@ print(json.dumps({
                 },
                 "required": ["path"]
             }),
-            capabilities: vec!["file_read".to_string()],
+            capabilities: vec!["capability_inventory".to_string(), "file_read".to_string()],
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
@@ -3729,7 +3718,7 @@ print(json.dumps({
 
         self.register_builtin_action(ActionDef {
             name: "file_write".to_string(),
-            description: "Write contents to a file".to_string(),
+            description: "Author or overwrite a single file in the workspace with the provided text content. Suitable for tangible authored artifacts that the user wants persisted on disk — HTML pages, JSON or YAML configuration, Markdown notes, source code modules, generated reports. The path must resolve inside the configured workspace and data directories; both the path and the full content body are required for any useful write. Parent directories are created if they do not already exist. For multi-file deliverables that should run as a hosted application, use the dedicated app-deployment action instead.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -3772,7 +3761,7 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+            authorization: Default::default(),
         })
         .await;
 
@@ -3797,14 +3786,96 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+            authorization: Default::default(),
+        })
+        .await;
+
+        self.register_builtin_action(ActionDef {
+            name: "product_help_search".to_string(),
+            description: "Search bundled AgentArk product help and runtime documentation on demand. Use when the user asks about product capabilities, setup, navigation, configuration, or how an AgentArk feature works. This is a read-only documentation lookup; live/current AgentArk state should be inspected with state-inspection actions.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Question or topic to search in AgentArk product help" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 8, "description": "Maximum help entries to return (default: 4)" }
+                },
+                "required": ["query"]
+            }),
+            capabilities: vec!["product_help".to_string(), "documentation".to_string(), "database_readonly".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+            authorization: Default::default(),
+        })
+        .await;
+
+        self.register_builtin_action(ActionDef {
+            name: "session_search".to_string(),
+            description: "Search prior conversations, persisted messages, and execution traces in AgentArk's existing history.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search query or topic. Leave empty to return recent sessions." },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["all", "conversations", "messages", "traces"],
+                        "description": "History area to search"
+                    },
+                    "conversation_id": { "type": "string", "description": "Optional conversation id to inspect directly" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 25, "description": "Maximum results to return" }
+                }
+            }),
+            capabilities: vec!["session_history".to_string(), "database_readonly".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+            authorization: Default::default(),
+        })
+        .await;
+
+        self.register_builtin_action(ActionDef {
+            name: "vision_ocr".to_string(),
+            description: "Analyze an uploaded image/PDF or image/PDF URL with a configured provider vision model. Use for OCR, screenshot understanding, visual document extraction, and image questions.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "upload_id": { "type": "string", "description": "Optional uploaded image or PDF id from AgentArk uploads" },
+                    "image_url": { "type": "string", "description": "Optional public image or PDF URL" },
+                    "file_url": { "type": "string", "description": "Optional public image or PDF URL alias" },
+                    "task": {
+                        "type": "string",
+                        "enum": ["extract_text", "describe", "answer_question", "analyze_document"],
+                        "description": "Vision task"
+                    },
+                    "question": { "type": "string", "description": "Question for answer_question or extra analysis instructions" },
+                    "provider": {
+                        "type": "string",
+                        "enum": ["openai", "google_gemini"],
+                        "description": "Optional provider override"
+                    },
+                    "model": { "type": "string", "description": "Optional provider model override" },
+                    "detail": {
+                        "type": "string",
+                        "enum": ["auto", "low", "high"],
+                        "description": "OpenAI image detail level"
+                    }
+                }
+            }),
+            capabilities: vec!["vision_ocr".to_string(), "network".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+            authorization: integration_authorization("media_gen"),
         })
         .await;
 
         // HTTP requests
         self.register_builtin_action(ActionDef {
             name: "http_get".to_string(),
-            description: "Make an HTTP GET request".to_string(),
+            description: "Perform an HTTP GET request against a publicly reachable URL and return the response body. Suitable for fetching small JSON, HTML, or text resources from the open web for inspection, summarization, or follow-up reasoning. Returns the response body alongside the status code. Prefer a dedicated integration action when the user has connected the relevant service rather than treating an authenticated endpoint as plain HTTP.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -3966,7 +4037,7 @@ print(json.dumps({
         // Shell commands (requires approval by default)
         self.register_builtin_action(ActionDef {
             name: "shell".to_string(),
-            description: "Execute a shell command".to_string(),
+            description: "Run a single shell command on the host machine and return its combined stdout/stderr and exit status. Suitable for read-only diagnostics — listing files, inspecting process state, querying versions — and for small scripted manipulations that do not have a dedicated action. The command is forwarded verbatim to the configured shell; quoting and escaping are the caller's responsibility. By default this action requires approval, since arbitrary shell access can mutate host state.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -3987,7 +4058,7 @@ print(json.dumps({
         // Clipboard
         self.register_builtin_action(ActionDef {
             name: "clipboard_read".to_string(),
-            description: "Read from clipboard".to_string(),
+            description: "Read the current text on the host system clipboard and return it as a UTF-8 string. Useful when the user has just copied something — a snippet, a URL, a structured payload — and wants the assistant to operate on that exact content without retyping it. Returns the clipboard's text contents, or an empty string when the clipboard does not currently hold text.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -4003,7 +4074,7 @@ print(json.dumps({
 
         self.register_builtin_action(ActionDef {
             name: "clipboard_write".to_string(),
-            description: "Write to clipboard".to_string(),
+            description: "Replace the host system clipboard's text contents with the provided string so the user can paste it elsewhere immediately. Useful when the assistant has produced a snippet, command, address, or structured value the user wants to use outside the conversation. The full text body is required; existing clipboard content is overwritten.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -4073,7 +4144,7 @@ print(json.dumps({
         // Scheduler
         self.register_builtin_action(ActionDef {
             name: "schedule_task".to_string(),
-            description: "Schedule or update a recurring/one-time AgentArk task. Use this for date/time reminders and notifications that do not require writing to an external calendar. Use `task_id` when the user is changing an existing task from `list_tasks`; otherwise matching tasks are updated/reused unless allow_duplicate=true. Use 'cron' for recurring minute-or-lower-frequency schedules (e.g., daily at 9am = '0 9 * * *') or 'at' for one-time (ISO timestamp). For monitoring intervals below 60 seconds, use `watch` with `interval_secs` instead.".to_string(),
+            description: "Schedule or update a durable recurring/one-time AgentArk task whose execution is intentionally deferred until a specified time or recurrence. The result is an asynchronous task record that runs later and reports through the selected delivery route; it is not a substitute for an immediate action that returns the requested result during the current turn. Create the task directly from the task body, cadence, selected action, validation policy, and reporting route. Use `task_id` when changing an existing task from `list_tasks`; otherwise matching tasks are updated/reused unless allow_duplicate=true. Use cron for recurring schedules with minute granularity or at for one-time ISO timestamps. Use `watch` instead when notification should happen only after a condition, material change, or trigger match.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -4128,7 +4199,7 @@ print(json.dumps({
             }),
         }).await;
 
-        // Background watcher â€” poll an action until a condition is met, then act
+        // Background watcher - poll an action until a condition is met, then act
         // Tunnel control for remote UI access
         self.register_builtin_action(ActionDef {
             name: "tunnel_control".to_string(),
@@ -4151,7 +4222,7 @@ print(json.dumps({
         }).await;
         self.register_builtin_action(ActionDef {
             name: "watch".to_string(),
-            description: "Spawn or update a background watcher that polls an action at regular intervals until a condition is met, then executes follow-up instructions. Use `watcher_id` when the user is changing an existing watcher from `list_watchers`; otherwise matching watchers are updated/reused unless allow_duplicate=true. Use when asked to 'watch for', 'wait for', 'monitor', 'let me know when', or 'poll until'. The watcher runs autonomously and notifies the user when triggered or timed out. It supports sub-minute polling via `interval_secs`. Default duration is 24 hours; users can extend it with timeout_hours, timeout_days, timeout_secs, or until_stopped=true.".to_string(),
+            description: "Spawn or update a durable background watcher that polls an action at regular intervals until a structured condition is met, then executes follow-up instructions. Use this when the requested outcome is conditional monitoring, trigger-on-change detection, sub-minute polling, or a long-running watch that should notify later. Create the watcher directly from the target, poll action, condition, cadence, and notification policy; do not run read/data-source actions first just to establish a baseline unless a required watcher argument cannot be inferred. Use `watcher_id` when changing an existing watcher from `list_watchers`; otherwise matching watchers are updated/reused unless allow_duplicate=true. The watcher runs autonomously and notifies the user when triggered or timed out. Default duration is 24 hours; users can extend it with timeout_hours, timeout_days, timeout_secs, or until_stopped=true.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -4164,7 +4235,7 @@ print(json.dumps({
                         "type": "object",
                         "description": "Structured trigger condition authored by the model. Include a human-readable `description` and an explicit matcher. Prefer `json_predicate` or `json_logic` for structured poll outputs; use `llm` only when the trigger cannot be expressed safely as a deterministic contract.",
                         "properties": {
-                            "description": { "type": "string", "description": "Human-readable summary of what counts as a match" },
+                            "description": { "type": "string", "description": "Human-readable summary of what counts as a match. For change-detection watchers, state the material difference to compare against the previous successful poll." },
                             "type": { "type": "string", "enum": ["not_empty", "text_contains", "regex", "json_predicate", "json_logic", "llm"] },
                             "text": { "type": "string", "description": "Used by `text_contains`" },
                             "case_sensitive": { "type": "boolean", "description": "Optional flag for `text_contains`" },
@@ -4189,7 +4260,7 @@ print(json.dumps({
                         },
                         "required": ["description", "type"]
                     },
-                    "on_trigger": { "type": "string", "description": "What to do when condition is met â€” natural language instructions for the agent" },
+                    "on_trigger": { "type": "string", "description": "What to do when condition is met - natural language instructions for the agent" },
                     "interval_secs": { "type": "integer", "description": "Seconds between polls, including sub-minute monitoring intervals (default: 60)" },
                     "timeout_secs": { "type": "integer", "description": "Max seconds to watch before giving up (default: 86400 = 24 hours)" },
                     "timeout_hours": { "type": "integer", "description": "Convenience timeout override in hours. Supports very large values." },
@@ -4234,6 +4305,34 @@ print(json.dumps({
             authorization: authorization_with_access(crate::actions::ActionAccessMetadata {
                 permission_ids: vec!["watcher".to_string()],
                 channel_targets: vec![channel_target("notify_channel", "preferred")],
+                ..crate::actions::ActionAccessMetadata::default()
+            }),
+        }).await;
+
+        self.register_builtin_action(ActionDef {
+            name: "delegate".to_string(),
+            description: "Coordinate a request across multiple specialized agent workstreams and synthesize one final answer. Use for work whose desired outcome benefits from independent research, implementation analysis, validation, risk review, or other parallel specialist perspectives before consolidation.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "task": { "type": "string", "description": "The complete user request to delegate, including all required sub-questions, constraints, and desired final output." },
+                    "context": { "type": "string", "description": "Optional conversation or business context that delegated agents should use." },
+                    "final_output": { "type": "string", "description": "Optional shape of the consolidated final answer, such as operator-ready plan, recommendation, launch plan, or risk report." }
+                },
+                "required": ["task"]
+            }),
+            capabilities: vec![
+                "swarm".to_string(),
+                "delegate".to_string(),
+                "multi_agent".to_string(),
+                "agent_orchestration".to_string(),
+            ],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+            authorization: authorization_with_access(crate::actions::ActionAccessMetadata {
+                permission_ids: vec!["swarm".to_string()],
                 ..crate::actions::ActionAccessMetadata::default()
             }),
         }).await;
@@ -4308,7 +4407,10 @@ print(json.dumps({
                 },
                 "required": ["goal"]
             }),
-            capabilities: vec!["file_read".to_string()],
+            capabilities: vec![
+                "file_read".to_string(),
+                "capability_inventory".to_string(),
+            ],
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
@@ -4495,7 +4597,7 @@ print(json.dumps({
         // Web search
         self.register_builtin_action(ActionDef {
             name: "web_search".to_string(),
-            description: "Search the web for current information. Use when asked about news, facts, prices, weather, or anything that needs up-to-date data. Keep the query topic-focused and do not invent specific year filters unless the user explicitly asked for them.".to_string(),
+            description: "Search the web for current information needed in the current answer or as a required input to another action. Do not use this as a prerequisite baseline for durable scheduled work or watchers when the durable object can perform its own later poll. Keep the query topic-focused and do not invent specific year filters unless the user explicitly asked for them.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -4516,7 +4618,7 @@ print(json.dumps({
         // Research
         self.register_builtin_action(ActionDef {
             name: "research".to_string(),
-            description: "Conduct deep research on a topic by gathering diverse source sets, fetching and comparing evidence, surfacing contradictions and open questions, and returning a citation-backed synthesis. Use for complex questions that need thorough investigation beyond a simple web search.".to_string(),
+            description: "Conduct deep research on a topic by gathering diverse source sets, fetching and comparing evidence, surfacing contradictions and open questions, and returning a citation-backed synthesis. Use for complex current-answer questions that need thorough investigation beyond a simple web search. Do not use this as a prerequisite baseline for durable scheduled work or watchers when the durable object can perform its own later poll.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -4542,12 +4644,16 @@ print(json.dumps({
         // Code execution sandbox
         self.register_builtin_action(ActionDef {
             name: "code_execute".to_string(),
-            description: "Execute code in an isolated Docker sandbox. Supports Python, JavaScript, TypeScript, Bash, Ruby, PHP, Perl, Lua, R, Java, C, C++, Go, Rust, Swift, Kotlin, and Jupyter notebooks (.ipynb). Use when the user asks to run, execute, test, or debug code, install dependencies, set up custom local automation, bootstrap monitoring scripts, validate a repo/runtime, or perform scripted device/network/media/computer-vision checks. Ordinary sandbox-local pip/npm installs from standard registries are auto-allowed when needed; higher-risk installer paths such as host package managers, remote installer scripts, and non-registry package sources require explicit approval. For ML/data science and EDA, use language='jupyter' to create executable notebooks with visualizations; they get executed and returned as downloadable .ipynb files. When the user has attached files through the upload API, pass their upload IDs in the 'files' array; they'll be validated and available at /data/<filename> inside the sandbox.".to_string(),
+            description: "Execute supplied source code in an isolated Docker sandbox for computational work, runtime validation, dependency bootstrap, scripted checks, and executable notebooks. The sandbox returns stdout, stderr, exit status, generated output files, and execution metadata; it is transient and should not be treated as a durable authoring or deployment surface when a direct filesystem, app-hosting, workspace, or orchestration action can produce the requested persistent result. Uploaded files can be mounted at /data/<filename>; network egress remains disabled unless execution metadata requires live target connectivity.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "language": { "type": "string", "description": "Programming language: python, javascript, typescript, bash, ruby, php, perl, lua, r, java, c, cpp, go, rust, swift, kotlin, jupyter. Use 'jupyter' for EDA/ML notebooks with visualizations." },
+                    "language": {
+                        "type": "string",
+                        "enum": ["python", "javascript", "typescript", "bash", "ruby", "php", "perl", "lua", "r", "java", "c", "cpp", "go", "rust", "swift", "kotlin", "jupyter"],
+                        "description": "Programming language. Use 'jupyter' for EDA/ML notebooks with visualizations."
+                    },
                     "code": { "type": "string", "description": "Code to execute. For jupyter: provide valid .ipynb JSON content (notebook format). For other languages: plain code. Can include dependency installation. When files are provided, access them at /data/<filename>." },
                     "network_access": { "type": "boolean", "description": "Whether this sandbox execution may use outbound network access. Default: false. Leave disabled unless the code genuinely needs egress." },
                     "timeout_secs": { "type": "integer", "description": "Optional execution timeout in seconds. Defaults are chosen by runtime: 60s for scripts, 120s for compiled builds, 600s for notebooks, and longer for dependency bootstrap. Max 600s for scripts/builds and 900s for notebooks." },
@@ -4584,7 +4690,7 @@ print(json.dumps({
                     "filter": { "type": "string", "description": "Filter: 'all', 'pending', 'goals', 'routines', 'completed', 'failed'. Default: 'pending'" }
                 }
             }),
-            capabilities: vec![],
+            capabilities: vec!["skill_management".to_string()],
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
@@ -4618,14 +4724,14 @@ print(json.dumps({
 
         self.register_builtin_action(ActionDef {
             name: "agentark_inspect".to_string(),
-            description: "Inspect live AgentArk internal surfaces such as overview, gateway_ops, arkpulse, sentinel, evolution, moltbook, and trace. Use when the user asks about current AgentArk state, recent internal runs, anomalies, learning status, or what changed.".to_string(),
+            description: "Inspect live AgentArk internal surfaces such as overview, gateway_ops, arkpulse, sentinel, evolution, trace, and moltbook. Use when the user asks about current AgentArk state, recent internal runs, anomalies, learning status, Moltbook activity, or what changed.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "surface": {
                         "type": "string",
-                        "enum": ["overview", "gateway_ops", "arkpulse", "sentinel", "evolution", "moltbook", "trace"],
+                        "enum": ["overview", "gateway_ops", "arkpulse", "sentinel", "evolution", "trace", "moltbook"],
                         "description": "Internal AgentArk surface to inspect. Default: overview."
                     },
                     "limit": {
@@ -4635,6 +4741,10 @@ print(json.dumps({
                     "trace_id": {
                         "type": "string",
                         "description": "Optional execution trace id when surface=trace."
+                    },
+                    "inspect_target": {
+                        "type": "string",
+                        "description": "Optional planner qualifier equivalent to surface. The model may pass this when following an intent plan."
                     }
                 }
             }),
@@ -4732,7 +4842,61 @@ print(json.dumps({
         authorization: integration_authorization("media_gen"),
         }).await;
 
-        // Action management â€” create/update/delete/list custom actions via chat
+        // Action management - create/update/delete/list custom actions via chat
+        // Home Assistant read-only state access.
+        self.register_builtin_action(ActionDef {
+            name: "home_assistant".to_string(),
+            description: "Read Home Assistant state, services, and entities from the configured Home Assistant instance.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "enum": ["list_entities", "search_entities", "get_state", "get_services"],
+                        "description": "Read operation to run"
+                    },
+                    "entity_id": { "type": "string", "description": "Entity id for get_state, such as light.kitchen" },
+                    "domain": { "type": "string", "description": "Optional entity domain filter such as light, sensor, switch, climate" },
+                    "query": { "type": "string", "description": "Optional entity search query" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Maximum entities to return" }
+                },
+                "required": ["operation"]
+            }),
+            capabilities: vec!["home_assistant".to_string(), "local_network".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+            authorization: integration_authorization("home_assistant"),
+        }).await;
+
+        let mut home_assistant_control_auth = integration_authorization("home_assistant");
+        home_assistant_control_auth.risk_level = ActionRiskLevel::High;
+        home_assistant_control_auth.human_approval =
+            crate::actions::ActionHumanApproval { required: true };
+        home_assistant_control_auth.outbound.outbound_write = true;
+        self.register_builtin_action(ActionDef {
+            name: "home_assistant_call_service".to_string(),
+            description: "Call a Home Assistant service on configured devices. Requires explicit user approval because it can change the physical environment.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "domain": { "type": "string", "description": "Home Assistant service domain, such as light, switch, climate, media_player" },
+                    "service": { "type": "string", "description": "Service name in the selected domain, such as turn_on, turn_off, set_temperature" },
+                    "entity_id": { "type": "string", "description": "Optional target entity id" },
+                    "target": { "type": "object", "description": "Optional Home Assistant target object" },
+                    "service_data": { "type": "object", "description": "Optional Home Assistant service data" }
+                },
+                "required": ["domain", "service"]
+            }),
+            capabilities: vec!["home_assistant_control".to_string(), "local_network".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+            authorization: home_assistant_control_auth,
+        }).await;
+
         self.register_builtin_action(ActionDef {
             name: "manage_actions".to_string(),
             description: "Create, update, delete, or list user-added actions/skills/workflows. Use when the user wants to inspect their installed skills, add a new action, or modify the action library.".to_string(),
@@ -4760,7 +4924,7 @@ print(json.dumps({
                 },
                 "required": ["operation"]
             }),
-            capabilities: vec![],
+            capabilities: vec!["skill_management".to_string()],
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
@@ -4791,7 +4955,7 @@ print(json.dumps({
         authorization: Default::default(),
         }).await;
 
-        // PDF generation â€” creates PDF documents from content
+        // PDF generation - creates PDF documents from content
         // Generic extension-pack control plane
         self.register_builtin_action(ActionDef {
             name: "postgres_schema_inspect".to_string(),
@@ -5195,7 +5359,7 @@ print(json.dumps({
 
         self.register_builtin_action(ActionDef {
             name: "pdf_generate".to_string(),
-            description: "Generate a PDF document. Use when asked to create a PDF, report, invoice, or document. Supports styles: report, letter, invoice, plain.".to_string(),
+            description: "Generate a paginated PDF file from supplied text content, with simple report, letter, invoice, or plain layouts. The result is a PDF artifact for reading, printing, or sharing rather than a runnable interface or hosted application.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -5207,14 +5371,18 @@ print(json.dumps({
                 },
                 "required": ["content"]
             }),
-            capabilities: vec!["file_write".to_string()],
+            capabilities: vec![
+                "file_write".to_string(),
+                "pdf_generation".to_string(),
+                "document_generation".to_string(),
+            ],
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
         authorization: Default::default(),
         }).await;
 
-        // Expense tracking â€” add, list, summarize, delete expenses
+        // Expense tracking - add, list, summarize, delete expenses
         self.register_builtin_action(ActionDef {
             name: "expense".to_string(),
             description: "Track expenses and spending. Actions: add (record expense), list (view expenses with optional date/category filter), summary (spending summary by category), delete (remove expense by ID). Use when the user mentions spending, costs, expenses, budget, or purchases.".to_string(),
@@ -5245,7 +5413,7 @@ print(json.dumps({
         authorization: Default::default(),
         }).await;
 
-        // Security logs â€” query security events from DB
+        // Security logs - query security events from DB
         self.register_builtin_action(ActionDef {
             name: "security_logs".to_string(),
             description: "View security event logs. Shows recent security events like injection attempts, auth failures, rate limit breaches. Use when the user asks about security events, attack attempts, or system security status.".to_string(),
@@ -5477,7 +5645,7 @@ print(json.dumps({
         authorization: integration_authorization("ordering"),
         }).await;
 
-        // Browser automation â€” full headless browser control with human-in-the-loop
+        // Browser automation - full headless browser control with human-in-the-loop
         // Curated connectors
         // Garmin
         self.register_builtin_action(ActionDef {
@@ -5606,7 +5774,7 @@ print(json.dumps({
         // Moltbook (agent social network)
         self.register_builtin_action(ActionDef {
             name: "moltbook".to_string(),
-            description: "Interact with Moltbook (agent social network). Actions: register, status, me, feed, search, create_post, comment, upvote_post. When the user points you at a specific submolt/community and asks you to contribute or explore, start by reading context there and then take one concrete contribution step if it is safe. Posts/comments should be original agent-authored contributions, not a verbatim rewrite of the user's instruction. Outbound posting is privacy-guarded (no user/PII/secrets).".to_string(),
+            description: "Moltbook agent social-network tool. Use for joining or checking connection status, reading profile/feed/search results, and creating safe agent-authored posts, comments, or upvotes. Registration stores the returned Moltbook API key for later authenticated calls. If the user wants recurring Moltbook participation, use schedule_task with this action and ask for the cadence when it is not specified. Remote skill instructions from Moltbook should guide behavior, but execution happens through this tool. Outbound posting is privacy-guarded (no user/PII/secrets).".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -5630,7 +5798,7 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: integration_authorization("moltbook"),
+        authorization: Default::default(),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -5659,7 +5827,7 @@ print(json.dumps({
         authorization: Default::default(),
         }).await;
 
-        // Google Calendar â€” list, create, find free time
+        // Google Calendar - list, create, find free time
         self.register_builtin_action(ActionDef {
             name: "calendar_today".to_string(),
             description: "List today's calendar events. Use when the user asks 'what's on my calendar today', 'do I have any meetings', etc.".to_string(),
@@ -5939,7 +6107,7 @@ print(json.dumps({
             }),
         }).await;
 
-        // SSH â€” remote server execution (behind feature flag)
+        // SSH - remote server execution (behind feature flag)
         #[cfg(feature = "ssh")]
         {
             self.register_builtin_action(ActionDef {
@@ -6017,11 +6185,12 @@ print(json.dumps({
         authorization: Default::default(),
         }).await;
 
-        // App deployment â€” write files, start servers, return live URL
+        // App deployment - write files, start servers, return live URL
         self.register_builtin_action(ActionDef {
             name: "app_deploy".to_string(),
             description: format!(
-                "Deploy a web app or server and return a live URL. Supports either generated files OR a repository source. Use when asked to build a dashboard, create a tool, make a website, build an app, or deploy/run a repo locally for the user. For file-based apps, provide a `files` object. To redeploy an existing generated app in place, provide its stable `app_id` along with the new `files` so the same deployed app is updated instead of creating a new id. For repo-based apps, provide `repo_url` (and optionally `repo_ref`, `repo_subdir`, `service_mode`) so {} can clone the repo, inspect the README/manifests, stand up the detected frontend/backend services, and return managed endpoints. For generated file bundles, only request a dynamic runtime when it is genuinely needed by setting `runtime_required=true` and providing an `entry_command` (optionally `runtime_reason`). Otherwise the bundle is treated as a static/local app. Repo-based deploys default to container runtime unless overridden. Dynamic app containers default to the installed {} image unless `runtime_image` or a runner-image env override is provided. Public exposure stays off unless explicitly requested (`expose_public=true`). Declare required inputs via required_inputs and mark each item sensitive=true/false. Access guard follows the current app-hosting default when omitted for local/private apps. Public exposure requires `access_password`, and providing `access_password` enables App Guard.",
+                "Deploy a web app or server and return a live URL. Supports either generated files OR a repository source. Use when asked to build a dashboard, create a tool, make a website, build an app, or deploy/run a repo locally for the user. For file-based apps, provide a `files` object containing every local file needed by the page: if HTML/CSS references a local stylesheet, script, image, font, manifest, or media asset, include that file too. For substantial generated pages, prefer a multi-file static bundle with a complete `index.html` that links app-relative `style.css` and `app.js` files included in `files`; this keeps HTML structure complete and makes validation/repair reliable. Local asset paths must be app-relative, not root-relative. For generated static apps that read public APIs, prefer app-relative {} helpers over third-party CORS proxy services; arXiv search is available at `__agentark/arxiv/search?categories=cs.LG,cs.AI,stat.ML&keywords=reinforcement%20learning,time%20series&max_results=20` and returns normalized JSON from server-side arXiv fetches. Redeploys in an existing conversation update the active app in place unless `allow_duplicate=true`; when an exact app is known, provide its stable `app_id` with the new `files`. For repo-based apps, provide `repo_url` (and optionally `repo_ref`, `repo_subdir`, `service_mode`) so {} can clone the repo, inspect the README/manifests, stand up the detected frontend/backend services, and return managed endpoints. For generated file bundles, provide `entry_command` or `start_command` when the app needs a long-lived server/runtime; a start command makes the app dynamic unless `runtime_required=false` is explicitly supplied. Dynamic app runtimes persist their app directory and lifecycle commands, can install dependencies with network access before startup (`pip`, `npm`, etc.), can run an optional `stop_command` as a graceful stop hook, and restart from saved metadata. Repo-based deploys default to container runtime unless overridden. Dynamic app containers default to the installed {} image unless `runtime_image` or a runner-image env override is provided. Public exposure stays off unless explicitly requested (`expose_public=true`). Declare required inputs via required_inputs and mark each item sensitive=true/false. Access guard follows the current app-hosting default when omitted for local/private apps. Public exposure requires `access_password`, and providing `access_password` enables App Guard.",
+                crate::branding::PRODUCT_NAME,
                 crate::branding::PRODUCT_NAME,
                 crate::branding::PRODUCT_NAME
             ),
@@ -6031,11 +6200,11 @@ print(json.dumps({
                 "properties": {
                     "app_id": {
                         "type": "string",
-                        "description": "Optional stable deployed app id to update in place. Use this only when modifying an existing generated app; omit it to create a new app."
+                        "description": "Optional stable deployed app id to update in place. Use when modifying a known existing generated app; if omitted, AgentArk may update the active app associated with the current conversation unless allow_duplicate=true."
                     },
                     "files": {
                         "type": "object",
-                        "description": "Object mapping filename to file content. e.g. {\"index.html\": \"<html>...\", \"style.css\": \"body{...}\", \"app.py\": \"from fastapi import...\"}"
+                        "description": "Object mapping filename to file content. Include every locally referenced asset; use relative paths such as \"style.css\", \"app.js\", or \"assets/logo.svg\", not \"/style.css\". For generated static pages, prefer {\"index.html\":\"<html>...<link rel=\\\"stylesheet\\\" href=\\\"style.css\\\">...\", \"style.css\":\"body{...}\", \"app.js\":\"...\"} over large inline style/script blocks. Each value must be the complete file body."
                     },
                     "repo_url": {
                         "type": "string",
@@ -6060,11 +6229,24 @@ print(json.dumps({
                     "title": { "type": "string", "description": "App name/title (default: App)" },
                     "entry_command": {
                         "type": "string",
-                        "description": "Command to start the server process (omit for static HTML apps). Use {PORT} placeholder or PORT env var for the port. Python apps auto-activate their venv. Examples: 'python3 app.py', 'node server.js', 'uvicorn app:app --host 0.0.0.0 --port {PORT}'"
+                        "description": "Command to start the server process (omit for static HTML apps). Supplying this makes the app a persistent dynamic runtime unless runtime_required=false is explicitly set. Use {PORT} placeholder or PORT env var for the port. Python apps auto-activate their venv. Examples: 'python3 app.py', 'node server.js', 'uvicorn app:app --host 0.0.0.0 --port {PORT}'"
+                    },
+                    "start_command": {
+                        "type": "string",
+                        "description": "Alias for entry_command. Use when the generated app or repo naturally describes its lifecycle as start/stop commands. It is persisted and used by the Apps UI Start/Restart action."
                     },
                     "install_command": {
                         "type": "string",
-                        "description": "Command to install dependencies before starting (optional). Omit for Python apps with requirements.txt â€” a venv is auto-created. Each app runs in its own isolated environment (Python venv or local node_modules). Examples: 'pip install -r requirements.txt', 'npm install'"
+                        "description": "Command to install dependencies before starting (optional). Omit for Python apps with requirements.txt - a venv is auto-created. Each app runs in its own persistent isolated environment (Python venv or local node_modules), and dynamic runtime dependency installs may use network access. Examples: 'pip install -r requirements.txt', 'npm install'"
+                    },
+                    "stop_command": {
+                        "type": "string",
+                        "description": "Optional direct command to run from the app directory before the managed runtime is stopped. Used as a best-effort graceful stop hook by the Apps UI Stop action. Keep it a single direct command such as 'npm run stop'; shell operators are rejected."
+                    },
+                    "commands": {
+                        "type": "object",
+                        "description": "Optional lifecycle command block. Supported keys: install/setup, start/entry, and stop. Values are persisted in app metadata and used by the Apps UI Start/Restart/Stop actions.",
+                        "additionalProperties": { "type": "string" }
                     },
                     "required_inputs": {
                         "type": "array",
@@ -6140,7 +6322,7 @@ print(json.dumps({
                     },
                     "replace_existing": {
                         "type": "boolean",
-                        "description": "Force recreation even if a matching deployed app already exists. Default: false."
+                        "description": "Update/recreate the targeted deployed app in place when an app_id or matching app is available. Default: false."
                     },
                     "allow_duplicate": {
                         "type": "boolean",
@@ -7035,6 +7217,7 @@ print(json.dumps({
         }
     }
 
+    #[cfg(test)]
     pub async fn install_cli_skill_action(
         &self,
         manifest: InstalledCliSkillManifest,
@@ -8563,22 +8746,53 @@ print(json.dumps({
                         ));
                     };
 
-                // Return scheduling info - actual scheduling is handled by the agent's task queue
+                // Return structured scheduling info - actual scheduling is handled by the agent's task queue
                 Ok(format!(
-                    "Task scheduled: {} | Schedule: {}",
-                    task_desc, schedule_info
+                    "{}{}",
+                    TOOL_COMPLETION_MARKER,
+                    serde_json::json!({
+                        "tool": "schedule_task",
+                        "status": "completed",
+                        "detail": format!("Task: {}; schedule: {}", task_desc, schedule_info),
+                    })
                 ))
             }
             "watch" => {
-                // Return a marker â€” actual watcher creation is handled by Agent::handle_watch
+                // Return structured watcher info - actual watcher creation is handled by Agent::handle_watch
                 let desc = arguments
                     .get("description")
                     .and_then(|v| v.as_str())
                     .unwrap_or("watcher");
-                Ok(format!("Watch created: {}", desc))
+                Ok(format!(
+                    "{}{}",
+                    TOOL_COMPLETION_MARKER,
+                    serde_json::json!({
+                        "tool": "watch",
+                        "status": "completed",
+                        "detail": desc,
+                    })
+                ))
+            }
+            "delegate" => {
+                let task = arguments
+                    .get("task")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("Missing delegated task"))?;
+                Ok(format!(
+                    "{}{}",
+                    TOOL_COMPLETION_MARKER,
+                    serde_json::json!({
+                        "tool": "delegate",
+                        "status": "completed",
+                        "detail": task,
+                    })
+                ))
             }
             "manage_actions" => self.execute_manage_actions(arguments).await,
             "agentark_inspect" => self.execute_agentark_inspect(arguments).await,
+            "product_help_search" => self.execute_product_help_search(arguments).await,
             "list_integrations" => self.execute_list_integrations(arguments).await,
             "postgres_schema_inspect" => self.execute_postgres_schema_inspect(arguments).await,
             "postgres_query_readonly" => self.execute_postgres_query_readonly(arguments).await,
@@ -8658,7 +8872,19 @@ print(json.dumps({
                         .map_err(|e| anyhow::anyhow!("Invalid search arguments: {}", e))?;
 
                 let config = build_search_config(&self.config_dir, self.storage.as_ref()).await;
-                crate::actions::search::execute_search(&args, &config).await
+                let response =
+                    crate::actions::search::execute_search_response(&args, &config).await?;
+                let detail = crate::actions::search::format_search_results(&response);
+                Ok(structured_tool_completion_output(
+                    "web_search",
+                    "completed",
+                    detail,
+                    serde_json::json!({
+                        "query": response.query,
+                        "backend": response.backend,
+                        "results": response.results,
+                    }),
+                ))
             }
             "research" => {
                 let args: crate::actions::research::ResearchArgs =
@@ -8668,6 +8894,24 @@ print(json.dumps({
                 let config = build_search_config(&self.config_dir, self.storage.as_ref()).await;
                 crate::actions::research::execute_research(&args, &config).await
             }
+            "moltbook" => {
+                let sub_action = arguments
+                    .get("action")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("Missing Moltbook action"))?;
+                let connector =
+                    crate::integrations::moltbook::MoltbookConnector::new_with_config_dir(
+                        self.config_dir.clone(),
+                    );
+                let result =
+                    crate::integrations::Integration::execute(&connector, sub_action, arguments)
+                        .await?;
+                Ok(serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string()))
+            }
+            "session_search" => self.execute_session_search(arguments).await,
+            "vision_ocr" => self.execute_vision_ocr(arguments).await,
             "code_execute" => {
                 // Native fallback for code execution (when Docker mode falls through)
                 self.execute_code_native(arguments).await
@@ -8720,12 +8964,14 @@ print(json.dumps({
                     .unwrap_or_default();
                 let tag_re = regex::Regex::new(r"<[^>]+>").unwrap();
 
-                match extract {
-                    "title" => Ok(if title.is_empty() {
-                        "(no title found)".to_string()
-                    } else {
-                        title
-                    }),
+                let content = match extract {
+                    "title" => {
+                        if title.is_empty() {
+                            "(no title found)".to_string()
+                        } else {
+                            title.clone()
+                        }
+                    }
                     "links" => {
                         let link_re = regex::Regex::new(
                             r#"(?is)<a[^>]+href\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>"#,
@@ -8753,16 +8999,16 @@ print(json.dumps({
                             }
                         }
                         if links.is_empty() {
-                            Ok("(no links found)".to_string())
+                            "(no links found)".to_string()
                         } else {
                             // Limit to 50 links to avoid overwhelming output
                             let display_links: Vec<&str> =
                                 links.iter().take(50).map(|s| s.as_str()).collect();
-                            Ok(format!(
+                            format!(
                                 "Found {} links (showing up to 50):\n{}",
                                 links.len(),
                                 display_links.join("\n")
-                            ))
+                            )
                         }
                     }
                     "all" => {
@@ -8804,7 +9050,7 @@ print(json.dumps({
                                 display_links.join("\n")
                             )
                         };
-                        Ok(format!(
+                        format!(
                             "## Title\n{}\n\n## Content\n{}\n\n## Links\n{}",
                             if title.is_empty() {
                                 "(no title)"
@@ -8813,18 +9059,29 @@ print(json.dumps({
                             },
                             text,
                             links_section
-                        ))
+                        )
                     }
                     _ => {
                         // Default: extract text content
                         let text = Self::html_to_text(&html);
-                        Ok(if text.is_empty() {
+                        if text.is_empty() {
                             "(no text content extracted)".to_string()
                         } else {
                             text
-                        })
+                        }
                     }
-                }
+                };
+                Ok(structured_tool_completion_output(
+                    "browse",
+                    "completed",
+                    browse_completion_detail(url, &title, extract, &content),
+                    serde_json::json!({
+                        "url": url,
+                        "title": title,
+                        "extract": extract,
+                        "content": content,
+                    }),
+                ))
             }
             "pdf_generate" => {
                 let content = arguments["content"]
@@ -8848,54 +9105,9 @@ print(json.dumps({
                     tokio::fs::create_dir_all(parent).await?;
                 }
 
-                // Generate Python script that creates the PDF using fpdf2
-                let escaped_content = content
-                    .replace('\\', "\\\\")
-                    .replace('"', "\\\"")
-                    .replace('\n', "\\n");
-                let escaped_title = title.replace('\\', "\\\\").replace('"', "\\\"");
-                let out_str = output_path.to_string_lossy().replace('\\', "/");
-
-                let python_code = format!(
-                    r#"
-import subprocess, sys
-subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "fpdf2"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-from fpdf import FPDF
-
-pdf = FPDF()
-pdf.set_auto_page_break(auto=True, margin=15)
-pdf.add_page()
-style = "{style}"
-
-if style == "invoice":
-    pdf.set_font("Helvetica", "B", 20)
-    pdf.cell(0, 15, "{escaped_title}", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_font("Helvetica", "", 10)
-elif style == "report":
-    pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 12, "{escaped_title}", new_x="LMARGIN", new_y="NEXT")
-    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-    pdf.ln(5)
-    pdf.set_font("Helvetica", "", 11)
-elif style == "letter":
-    pdf.set_font("Helvetica", "", 11)
-    pdf.ln(20)
-else:
-    pdf.set_font("Helvetica", "", 11)
-
-content = "{escaped_content}"
-for line in content.split("\\n"):
-    pdf.multi_cell(0, 6, line)
-
-pdf.output("{out_str}")
-print("PDF generated: {out_str}")
-"#
-                );
-                let code_args = serde_json::json!({
-                    "language": "python",
-                    "code": python_code.trim()
-                });
-                self.execute_code_native(&code_args).await
+                let pdf_bytes = Self::generate_simple_pdf_bytes(title, content, style);
+                tokio::fs::write(&output_path, pdf_bytes).await?;
+                Ok(format!("PDF generated: {}", output_path.display()))
             }
             "expense" => {
                 let action = arguments["action"]
@@ -8979,7 +9191,7 @@ print("PDF generated: {out_str}")
                         let mut total = 0.0f64;
                         for e in &expenses {
                             output.push_str(&format!(
-                                "- [{}] {} {} â€” {} ({}){}\n",
+                                "- [{}] {} {} - {} ({}){}\n",
                                 e.id,
                                 e.currency,
                                 e.amount,
@@ -9061,6 +9273,10 @@ print("PDF generated: {out_str}")
                     ));
                 }
                 Ok(output)
+            }
+            "home_assistant" => self.execute_home_assistant(arguments).await,
+            "home_assistant_call_service" => {
+                self.execute_home_assistant_call_service(arguments).await
             }
             "transcribe_audio" => {
                 let file_path = arguments["file_path"]
@@ -9460,6 +9676,815 @@ print(result["text"])
         }))?)
     }
 
+    async fn execute_home_assistant(&self, arguments: &serde_json::Value) -> Result<String> {
+        let operation = arguments
+            .get("operation")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("home_assistant requires an operation"))?;
+        if !matches!(
+            operation,
+            "list_entities" | "search_entities" | "get_state" | "get_services"
+        ) {
+            anyhow::bail!("home_assistant only supports read-only operations");
+        }
+        let manager = crate::integrations::IntegrationManager::new(&self.config_dir);
+        let result = manager
+            .execute("home_assistant", operation, arguments)
+            .await?;
+        Ok(serde_json::to_string_pretty(&result)?)
+    }
+
+    async fn execute_home_assistant_call_service(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
+        let manager = crate::integrations::IntegrationManager::new(&self.config_dir);
+        let result = manager
+            .execute("home_assistant", "call_service", arguments)
+            .await?;
+        Ok(serde_json::to_string_pretty(&result)?)
+    }
+
+    fn session_search_terms(query: Option<&str>) -> Vec<String> {
+        query
+            .unwrap_or_default()
+            .split(|ch: char| !ch.is_alphanumeric())
+            .map(|part| part.trim().to_ascii_lowercase())
+            .filter(|part| part.chars().count() >= 2)
+            .collect()
+    }
+
+    fn session_search_score(text: &str, terms: &[String]) -> usize {
+        if terms.is_empty() {
+            return 1;
+        }
+        let haystack = text.to_ascii_lowercase();
+        terms
+            .iter()
+            .filter(|term| haystack.contains(term.as_str()))
+            .count()
+    }
+
+    fn session_search_snippet(text: &str, max_chars: usize) -> String {
+        let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if compact.chars().count() <= max_chars {
+            compact
+        } else {
+            format!(
+                "{}...",
+                compact
+                    .chars()
+                    .take(max_chars.saturating_sub(3))
+                    .collect::<String>()
+            )
+        }
+    }
+
+    async fn execute_session_search(&self, arguments: &serde_json::Value) -> Result<String> {
+        let storage = self.runtime_storage()?;
+        let query = arguments
+            .get("query")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let terms = Self::session_search_terms(query);
+        let scope = arguments
+            .get("scope")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("all");
+        if !matches!(scope, "all" | "conversations" | "messages" | "traces") {
+            anyhow::bail!("session_search scope must be all, conversations, messages, or traces");
+        }
+        let limit = arguments
+            .get("limit")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(8)
+            .clamp(1, 25);
+        let conversation_id = arguments
+            .get("conversation_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let scan_limit = (limit * 12).clamp(40, 300);
+        let mut hits: Vec<(usize, String, serde_json::Value)> = Vec::new();
+
+        if matches!(scope, "all" | "conversations") {
+            if let Some(conversation_id) = conversation_id {
+                if let Some(conversation) = storage.get_conversation(conversation_id).await? {
+                    let score = Self::session_search_score(&conversation.title, &terms);
+                    hits.push((
+                        score,
+                        conversation.updated_at.clone(),
+                        serde_json::json!({
+                            "type": "conversation",
+                            "id": conversation.id,
+                            "title": conversation.title,
+                            "channel": conversation.channel,
+                            "project_id": conversation.project_id,
+                            "message_count": conversation.message_count,
+                            "updated_at": conversation.updated_at,
+                            "match_score": score,
+                        }),
+                    ));
+                }
+            } else {
+                for conversation in storage
+                    .list_conversations(scan_limit, 0, None, &[], None)
+                    .await?
+                {
+                    let text = format!("{} {}", conversation.title, conversation.channel);
+                    let score = Self::session_search_score(&text, &terms);
+                    hits.push((
+                        score,
+                        conversation.updated_at.clone(),
+                        serde_json::json!({
+                            "type": "conversation",
+                            "id": conversation.id,
+                            "title": conversation.title,
+                            "channel": conversation.channel,
+                            "project_id": conversation.project_id,
+                            "message_count": conversation.message_count,
+                            "updated_at": conversation.updated_at,
+                            "match_score": score,
+                        }),
+                    ));
+                }
+            }
+        }
+
+        if matches!(scope, "all" | "messages") {
+            let messages = if let Some(conversation_id) = conversation_id {
+                storage
+                    .get_recent_messages(conversation_id, scan_limit)
+                    .await?
+            } else {
+                storage
+                    .get_recent_messages_across_conversations(scan_limit)
+                    .await?
+            };
+            for message in messages {
+                let score = Self::session_search_score(&message.content, &terms);
+                hits.push((
+                    score,
+                    message.timestamp.clone(),
+                    serde_json::json!({
+                        "type": "message",
+                        "id": message.id,
+                        "conversation_id": message.conversation_id,
+                        "role": message.role,
+                        "timestamp": message.timestamp,
+                        "trace_id": message.trace_id,
+                        "snippet": Self::session_search_snippet(&message.content, 420),
+                        "match_score": score,
+                    }),
+                ));
+            }
+        }
+
+        if matches!(scope, "all" | "traces") && conversation_id.is_none() {
+            for trace in storage
+                .list_execution_trace_summaries(None, scan_limit, 0)
+                .await?
+            {
+                let text = format!(
+                    "{} {} {}",
+                    trace.message,
+                    trace.steps_json,
+                    trace.model.clone().unwrap_or_default()
+                );
+                let score = Self::session_search_score(&text, &terms);
+                hits.push((
+                    score,
+                    trace.created_at.clone(),
+                    serde_json::json!({
+                        "type": "trace",
+                        "id": trace.id,
+                        "message": Self::session_search_snippet(&trace.message, 300),
+                        "channel": trace.channel,
+                        "started_at": trace.started_at,
+                        "completed_at": trace.completed_at,
+                        "duration_ms": trace.duration_ms,
+                        "step_count": trace.step_count,
+                        "total_tokens": trace.total_tokens,
+                        "cost_usd": trace.cost_usd,
+                        "complexity": trace.complexity,
+                        "created_at": trace.created_at,
+                        "match_score": score,
+                    }),
+                ));
+            }
+        }
+
+        hits.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+        let results = hits
+            .into_iter()
+            .take(limit as usize)
+            .map(|(_, _, payload)| payload)
+            .collect::<Vec<_>>();
+
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "query": query.unwrap_or(""),
+            "scope": scope,
+            "conversation_id": conversation_id,
+            "result_count": results.len(),
+            "results": results,
+        }))?)
+    }
+
+    fn media_provider_secret(
+        config: &AgentConfig,
+        provider: crate::integrations::media_gen::MediaProvider,
+    ) -> Option<String> {
+        let explicit = config
+            .media_gen
+            .provider_api_keys
+            .iter()
+            .find_map(|(raw_provider, key)| {
+                let configured =
+                    crate::integrations::media_gen::MediaProvider::parse(raw_provider)?;
+                let trimmed = key.trim();
+                if configured == provider && !trimmed.is_empty() && trimmed != "[ENCRYPTED]" {
+                    Some(trimmed.to_string())
+                } else {
+                    None
+                }
+            });
+        if explicit.is_some() {
+            return explicit;
+        }
+        if provider == crate::integrations::media_gen::MediaProvider::OpenAiDalle {
+            if let Some(key) = config.model_pool.slots.iter().find_map(|slot| {
+                let crate::core::LlmProvider::OpenAI {
+                    api_key, base_url, ..
+                } = &slot.provider
+                else {
+                    return None;
+                };
+                if !slot.enabled
+                    || api_key.trim().is_empty()
+                    || api_key.trim() == "[ENCRYPTED]"
+                    || crate::core::llm_provider::openai_provider_label(base_url.as_deref())
+                        != "openai"
+                {
+                    return None;
+                }
+                Some(api_key.trim().to_string())
+            }) {
+                return Some(key);
+            }
+            if let crate::core::LlmProvider::OpenAI {
+                api_key, base_url, ..
+            } = &config.llm
+            {
+                if !api_key.trim().is_empty()
+                    && api_key.trim() != "[ENCRYPTED]"
+                    && crate::core::llm_provider::openai_provider_label(base_url.as_deref())
+                        == "openai"
+                {
+                    return Some(api_key.trim().to_string());
+                }
+            }
+        }
+        None
+    }
+
+    fn media_provider_base_url(
+        config: &AgentConfig,
+        provider: crate::integrations::media_gen::MediaProvider,
+    ) -> String {
+        let explicit = config
+            .media_gen
+            .provider_base_urls
+            .iter()
+            .find_map(|(raw_provider, base_url)| {
+                let configured =
+                    crate::integrations::media_gen::MediaProvider::parse(raw_provider)?;
+                if configured == provider {
+                    let trimmed = base_url.trim().trim_end_matches('/');
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    }
+                }
+                None
+            });
+        if let Some(base_url) = explicit {
+            return base_url;
+        }
+        if provider == crate::integrations::media_gen::MediaProvider::OpenAiDalle {
+            if let Some(base_url) = config.model_pool.slots.iter().find_map(|slot| {
+                let crate::core::LlmProvider::OpenAI { base_url, .. } = &slot.provider else {
+                    return None;
+                };
+                if !slot.enabled
+                    || crate::core::llm_provider::openai_provider_label(base_url.as_deref())
+                        != "openai"
+                {
+                    return None;
+                }
+                base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.trim_end_matches('/').to_string())
+            }) {
+                return base_url;
+            }
+            if let crate::core::LlmProvider::OpenAI { base_url, .. } = &config.llm {
+                if crate::core::llm_provider::openai_provider_label(base_url.as_deref())
+                    == "openai"
+                {
+                    if let Some(base_url) = base_url
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(|value| value.trim_end_matches('/').to_string())
+                    {
+                        return base_url;
+                    }
+                }
+            }
+        }
+        provider.default_base_url().to_string()
+    }
+
+    fn select_vision_provider(
+        config: &AgentConfig,
+        requested: Option<&str>,
+    ) -> Result<crate::integrations::media_gen::MediaProvider> {
+        use crate::integrations::media_gen::MediaProvider;
+
+        let supports_vision = |provider: MediaProvider| {
+            matches!(
+                provider,
+                MediaProvider::OpenAiDalle | MediaProvider::GoogleGemini
+            )
+        };
+
+        if let Some(requested) = requested.map(str::trim).filter(|value| !value.is_empty()) {
+            let provider = MediaProvider::parse(requested)
+                .ok_or_else(|| anyhow::anyhow!("Unknown vision provider '{}'", requested))?;
+            if !supports_vision(provider) {
+                anyhow::bail!(
+                    "Provider '{}' is not available for vision_ocr. Configure OpenAI Images or Google Gemini.",
+                    provider.id()
+                );
+            }
+            return Ok(provider);
+        }
+
+        if let Some(default_provider) = config
+            .media_gen
+            .default_image_provider
+            .as_deref()
+            .and_then(MediaProvider::parse)
+        {
+            if supports_vision(default_provider)
+                && Self::media_provider_secret(config, default_provider).is_some()
+            {
+                return Ok(default_provider);
+            }
+        }
+
+        [MediaProvider::OpenAiDalle, MediaProvider::GoogleGemini]
+            .iter()
+            .copied()
+            .find(|provider| Self::media_provider_secret(config, *provider).is_some())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "vision_ocr needs a configured OpenAI Images or Google Gemini provider key in Settings > Media."
+                )
+            })
+    }
+
+    fn default_vision_model(
+        provider: crate::integrations::media_gen::MediaProvider,
+    ) -> &'static str {
+        use crate::integrations::media_gen::MediaProvider;
+        match provider {
+            MediaProvider::OpenAiDalle => "gpt-4.1-mini",
+            MediaProvider::GoogleGemini => "gemini-2.5-flash",
+            _ => "gpt-4.1-mini",
+        }
+    }
+
+    fn vision_instruction(task: &str, question: Option<&str>) -> Result<String> {
+        let extra = question
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("");
+        let base = match task {
+            "extract_text" => {
+                "Extract all visible text from the image. Preserve reading order, line breaks, tables, labels, and important layout cues where possible."
+            }
+            "describe" => {
+                "Describe the image accurately and concisely. Include objects, visible UI, scene context, and any notable text."
+            }
+            "answer_question" => {
+                if extra.is_empty() {
+                    anyhow::bail!("vision_ocr answer_question requires a question");
+                }
+                "Answer the user's question using only what can be seen in the image. Note uncertainty when the image is ambiguous."
+            }
+            "analyze_document" => {
+                "Analyze the visual document. Extract text, identify structure, summarize key fields, and call out unclear or missing values."
+            }
+            other => anyhow::bail!("Unsupported vision_ocr task '{}'", other),
+        };
+        if extra.is_empty() {
+            Ok(base.to_string())
+        } else {
+            Ok(format!(
+                "{base}\n\nUser question or extra instructions: {extra}"
+            ))
+        }
+    }
+
+    fn normalized_vision_mime(
+        filename: &str,
+        content_type: Option<&str>,
+        bytes: &[u8],
+    ) -> Result<String> {
+        let signature = Self::upload_signature(filename, content_type, bytes);
+        let signature_mime = signature
+            .get("mime")
+            .and_then(|value| value.as_str())
+            .and_then(|value| value.split(';').next())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let content_mime = content_type
+            .and_then(|value| value.split(';').next())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let selected = signature_mime
+            .filter(|mime| mime.starts_with("image/"))
+            .or_else(|| signature_mime.filter(|mime| *mime == "application/pdf"))
+            .or_else(|| {
+                content_mime
+                    .filter(|mime| mime.starts_with("image/") || *mime == "application/pdf")
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "vision_ocr accepts image or PDF uploads/URLs. Detected payload is not a supported vision input."
+                )
+            })?;
+        Ok(selected.to_ascii_lowercase())
+    }
+
+    fn vision_inline_max_bytes(mime_type: &str) -> usize {
+        if mime_type == "application/pdf" {
+            VISION_DOCUMENT_INLINE_MAX_BODY_BYTES
+        } else {
+            VISION_IMAGE_INLINE_MAX_BODY_BYTES
+        }
+    }
+
+    async fn load_vision_input(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<(String, String, String, Vec<u8>)> {
+        let upload_id = arguments
+            .get("upload_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let image_url = arguments
+            .get("image_url")
+            .and_then(|value| value.as_str())
+            .or_else(|| arguments.get("file_url").and_then(|value| value.as_str()))
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        match (upload_id, image_url) {
+            (Some(_), Some(_)) => {
+                anyhow::bail!("vision_ocr accepts either upload_id or a URL, not both")
+            }
+            (Some(upload_id), None) => {
+                let file = self.resolve_upload_for_sandbox(upload_id).await?;
+                let mime = Self::normalized_vision_mime(
+                    &file.filename,
+                    file.content_type.as_deref(),
+                    &file.bytes,
+                )?;
+                let max_bytes = Self::vision_inline_max_bytes(&mime);
+                if file.bytes.len() > max_bytes {
+                    anyhow::bail!(
+                        "vision_ocr input is too large: {} bytes (max {})",
+                        file.bytes.len(),
+                        max_bytes
+                    );
+                }
+                Ok((
+                    format!("upload:{}", file.filename),
+                    file.filename,
+                    mime,
+                    file.bytes,
+                ))
+            }
+            (None, Some(raw_url)) => {
+                let url = self.validate_http_get_url(raw_url).await?;
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(45))
+                    .redirect(reqwest::redirect::Policy::limited(5))
+                    .user_agent(crate::branding::user_agent_with_suffix(
+                        "(Vision OCR Fetch)",
+                    ))
+                    .build()
+                    .map_err(|error| {
+                        anyhow::anyhow!("Failed to build vision fetch client: {}", error)
+                    })?;
+                let response = client.get(url.clone()).send().await?;
+                let status = response.status();
+                let content_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                if !status.is_success() {
+                    let body = response.text().await.unwrap_or_default();
+                    anyhow::bail!("vision_ocr input fetch returned {}: {}", status, body);
+                }
+                let bytes = response.bytes().await?;
+                let filename = url
+                    .path_segments()
+                    .and_then(|segments| segments.last())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("image");
+                let bytes = bytes.to_vec();
+                let mime = Self::normalized_vision_mime(filename, content_type.as_deref(), &bytes)?;
+                let max_bytes = Self::vision_inline_max_bytes(&mime);
+                if bytes.len() > max_bytes {
+                    anyhow::bail!(
+                        "vision_ocr input is too large: {} bytes (max {})",
+                        bytes.len(),
+                        max_bytes
+                    );
+                }
+                Ok((url.as_str().to_string(), filename.to_string(), mime, bytes))
+            }
+            (None, None) => anyhow::bail!("vision_ocr requires upload_id, image_url, or file_url"),
+        }
+    }
+
+    fn openai_response_output_text(value: &serde_json::Value) -> Option<String> {
+        if let Some(text) = value
+            .get("output_text")
+            .and_then(|text| text.as_str())
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            return Some(text.to_string());
+        }
+
+        let mut parts = Vec::new();
+        if let Some(outputs) = value.get("output").and_then(|output| output.as_array()) {
+            for output in outputs {
+                let Some(content) = output.get("content").and_then(|content| content.as_array())
+                else {
+                    continue;
+                };
+                for item in content {
+                    if let Some(text) = item
+                        .get("text")
+                        .and_then(|text| text.as_str())
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                    {
+                        parts.push(text.to_string());
+                    }
+                }
+            }
+        }
+
+        let joined = parts.join("\n").trim().to_string();
+        if joined.is_empty() {
+            None
+        } else {
+            Some(joined)
+        }
+    }
+
+    fn gemini_response_output_text(value: &serde_json::Value) -> Option<String> {
+        let mut parts = Vec::new();
+        let candidates = value.get("candidates").and_then(|value| value.as_array())?;
+        for candidate in candidates {
+            let Some(content_parts) = candidate
+                .pointer("/content/parts")
+                .and_then(|value| value.as_array())
+            else {
+                continue;
+            };
+            for part in content_parts {
+                if let Some(text) = part
+                    .get("text")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    parts.push(text.to_string());
+                }
+            }
+        }
+        let joined = parts.join("\n").trim().to_string();
+        if joined.is_empty() {
+            None
+        } else {
+            Some(joined)
+        }
+    }
+
+    async fn execute_openai_vision(
+        &self,
+        api_key: &str,
+        base_url: &str,
+        model: &str,
+        detail: &str,
+        instruction: &str,
+        filename: &str,
+        mime_type: &str,
+        bytes: &[u8],
+    ) -> Result<String> {
+        let encoded_data =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+        let media_input = if mime_type == "application/pdf" {
+            serde_json::json!({
+                "type": "input_file",
+                "filename": filename,
+                "file_data": encoded_data,
+            })
+        } else {
+            let image_url = format!("data:{mime_type};base64,{encoded_data}");
+            serde_json::json!({
+                "type": "input_image",
+                "image_url": image_url,
+                "detail": detail,
+            })
+        };
+        let body = serde_json::json!({
+            "model": model,
+            "input": [{
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": instruction },
+                    media_input
+                ]
+            }]
+        });
+        let response = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(90))
+            .build()
+            .map_err(|error| anyhow::anyhow!("Failed to build OpenAI vision client: {}", error))?
+            .post(format!("{}/responses", base_url.trim_end_matches('/')))
+            .bearer_auth(api_key)
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = response.status();
+        let value: serde_json::Value = response
+            .json()
+            .await
+            .unwrap_or_else(|_| serde_json::json!({}));
+        if !status.is_success() {
+            anyhow::bail!("OpenAI vision error {}: {}", status, value);
+        }
+        Self::openai_response_output_text(&value)
+            .ok_or_else(|| anyhow::anyhow!("OpenAI vision response did not include text output"))
+    }
+
+    async fn execute_gemini_vision(
+        &self,
+        api_key: &str,
+        base_url: &str,
+        model: &str,
+        instruction: &str,
+        mime_type: &str,
+        bytes: &[u8],
+    ) -> Result<String> {
+        let image_data = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+        let body = serde_json::json!({
+            "contents": [{
+                "parts": [
+                    {
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": image_data
+                        }
+                    },
+                    { "text": instruction }
+                ]
+            }]
+        });
+        let url = reqwest::Url::parse(&format!(
+            "{}/models/{}:generateContent",
+            base_url.trim_end_matches('/'),
+            model.trim().trim_start_matches("models/")
+        ))?;
+        let response = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(90))
+            .build()
+            .map_err(|error| anyhow::anyhow!("Failed to build Gemini vision client: {}", error))?
+            .post(url)
+            .header("x-goog-api-key", api_key)
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = response.status();
+        let value: serde_json::Value = response
+            .json()
+            .await
+            .unwrap_or_else(|_| serde_json::json!({}));
+        if !status.is_success() {
+            anyhow::bail!("Gemini vision error {}: {}", status, value);
+        }
+        Self::gemini_response_output_text(&value)
+            .ok_or_else(|| anyhow::anyhow!("Gemini vision response did not include text output"))
+    }
+
+    async fn execute_vision_ocr(&self, arguments: &serde_json::Value) -> Result<String> {
+        let settings = self.settings_manager()?.load()?;
+        let provider = Self::select_vision_provider(
+            &settings,
+            arguments.get("provider").and_then(|value| value.as_str()),
+        )?;
+        let api_key = Self::media_provider_secret(&settings, provider).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Provider '{}' is selected for vision_ocr but has no configured API key.",
+                provider.id()
+            )
+        })?;
+        let base_url = Self::media_provider_base_url(&settings, provider);
+        let model = arguments
+            .get("model")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| Self::default_vision_model(provider))
+            .to_string();
+        let task = arguments
+            .get("task")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("extract_text");
+        let detail = arguments
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("auto");
+        if !matches!(detail, "auto" | "low" | "high") {
+            anyhow::bail!("vision_ocr detail must be auto, low, or high");
+        }
+        let instruction = Self::vision_instruction(
+            task,
+            arguments.get("question").and_then(|value| value.as_str()),
+        )?;
+        let (source, filename, mime_type, bytes) = self.load_vision_input(arguments).await?;
+
+        let text = match provider {
+            crate::integrations::media_gen::MediaProvider::OpenAiDalle => {
+                self.execute_openai_vision(
+                    &api_key,
+                    &base_url,
+                    &model,
+                    detail,
+                    &instruction,
+                    &filename,
+                    &mime_type,
+                    &bytes,
+                )
+                .await?
+            }
+            crate::integrations::media_gen::MediaProvider::GoogleGemini => {
+                self.execute_gemini_vision(
+                    &api_key,
+                    &base_url,
+                    &model,
+                    &instruction,
+                    &mime_type,
+                    &bytes,
+                )
+                .await?
+            }
+            _ => unreachable!("select_vision_provider only returns supported vision providers"),
+        };
+
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "provider": provider.id(),
+            "model": model,
+            "task": task,
+            "source": source,
+            "mime_type": mime_type,
+            "text": text,
+        }))?)
+    }
+
     fn runtime_storage(&self) -> Result<crate::storage::Storage> {
         self.storage
             .clone()
@@ -9483,20 +10508,6 @@ print(result["text"])
             .ok()
             .flatten()
             .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
-    }
-
-    async fn load_storage_utf8_value(
-        storage: &crate::storage::Storage,
-        key: &str,
-    ) -> Option<String> {
-        storage
-            .get(key)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|raw| String::from_utf8(raw).ok())
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
     }
 
     fn preview_json_array(
@@ -9728,41 +10739,6 @@ print(result["text"])
         }))
     }
 
-    async fn inspect_moltbook_json(
-        &self,
-        storage: &crate::storage::Storage,
-        limit: u64,
-    ) -> Result<serde_json::Value> {
-        let manager = self.settings_manager()?;
-        let has_api_key = std::env::var("MOLTBOOK_API_KEY")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .is_some()
-            || manager
-                .get_custom_secret("moltbook_api_key")
-                .ok()
-                .flatten()
-                .filter(|value| !value.trim().is_empty())
-                .is_some();
-        Ok(serde_json::json!({
-            "surface": "moltbook",
-            "has_api_key": has_api_key,
-            "settings": Self::load_storage_json_value(storage, "moltbook_settings_v1").await,
-            "last_run": Self::load_storage_utf8_value(storage, "moltbook_last_run_v1").await,
-            "last_status": Self::load_storage_utf8_value(storage, "moltbook_last_status_v1").await,
-            "next_run": Self::load_storage_utf8_value(storage, "moltbook_next_run_v1").await,
-            "last_post": Self::load_storage_utf8_value(storage, "moltbook_last_post_v1").await,
-            "last_comment": Self::load_storage_utf8_value(storage, "moltbook_last_comment_v1").await,
-            "last_upvote": Self::load_storage_utf8_value(storage, "moltbook_last_upvote_v1").await,
-            "last_engagement": Self::load_storage_utf8_value(storage, "moltbook_last_engagement_v1").await,
-            "last_run_stats": Self::load_storage_json_value(storage, "moltbook_last_run_stats_v1").await,
-            "recent_activity": Self::preview_json_array(
-                Self::load_storage_json_value(storage, "moltbook_activity_log_v1").await,
-                limit as usize,
-            ),
-        }))
-    }
-
     async fn inspect_trace_json(
         &self,
         storage: &crate::storage::Storage,
@@ -9799,10 +10775,128 @@ print(result["text"])
         }))
     }
 
+    async fn inspect_moltbook_json(
+        &self,
+        storage: &crate::storage::Storage,
+        limit: u64,
+    ) -> Result<serde_json::Value> {
+        let activity = Self::preview_json_array(
+            Self::load_storage_json_value(storage, "moltbook_activity_log_v1").await,
+            limit as usize,
+        )
+        .unwrap_or_else(|| serde_json::json!([]));
+        let recent_errors = activity
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|item| {
+                        item.get("level")
+                            .and_then(|value| value.as_str())
+                            .map(|level| level.eq_ignore_ascii_case("error"))
+                            .unwrap_or(false)
+                    })
+                    .take(limit as usize)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Ok(serde_json::json!({
+            "surface": "moltbook",
+            "configured": crate::integrations::moltbook::MoltbookConnector::new_with_config_dir(
+                self.config_dir.clone()
+            ).has_configured_api_key(),
+            "recent_activity": activity,
+            "recent_errors": recent_errors,
+        }))
+    }
+
+    fn product_help_doc_text(doc: &crate::docs::product_help::BundledHelpDoc) -> String {
+        let mut text = Vec::new();
+        text.push(doc.title.to_string());
+        text.push(doc.summary.to_string());
+        if !doc.tags.is_empty() {
+            text.push(doc.tags.join(" "));
+        }
+        for section in doc.sections {
+            text.push(section.label.to_string());
+            text.extend(section.items.iter().map(|item| item.to_string()));
+        }
+        text.join("\n")
+    }
+
+    fn product_help_query_terms(query: &str) -> Vec<String> {
+        query
+            .split(|ch: char| !ch.is_alphanumeric())
+            .map(|part| part.trim().to_ascii_lowercase())
+            .filter(|part| part.chars().count() >= 2)
+            .collect()
+    }
+
+    fn product_help_match_score(text: &str, terms: &[String]) -> usize {
+        if terms.is_empty() {
+            return 1;
+        }
+        let haystack = text.to_ascii_lowercase();
+        terms
+            .iter()
+            .filter(|term| haystack.contains(term.as_str()))
+            .count()
+    }
+
+    async fn execute_product_help_search(&self, arguments: &serde_json::Value) -> Result<String> {
+        let query = arguments
+            .get("query")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("product_help_search requires a non-empty query"))?;
+        let limit = arguments
+            .get("limit")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(4)
+            .clamp(1, 8) as usize;
+        let terms = Self::product_help_query_terms(query);
+        let mut matches = crate::docs::product_help::BUNDLED_HELP_DOCS
+            .iter()
+            .map(|doc| {
+                let doc_text = Self::product_help_doc_text(doc);
+                let score = Self::product_help_match_score(&doc_text, &terms);
+                serde_json::json!({
+                    "title": crate::branding::brand_text(doc.title),
+                    "slug": doc.slug,
+                    "tags": doc.tags,
+                    "summary": crate::branding::brand_text(doc.summary),
+                    "content": crate::branding::brand_text(
+                        &crate::docs::product_help::render_bundled_help_doc(doc)
+                    ),
+                    "match_score": score,
+                })
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| {
+            let left_score = left
+                .get("match_score")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            let right_score = right
+                .get("match_score")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            right_score.cmp(&left_score)
+        });
+        matches.truncate(limit);
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "query": query,
+            "results": matches,
+        }))?)
+    }
+
     async fn execute_agentark_inspect(&self, arguments: &serde_json::Value) -> Result<String> {
         let storage = self.runtime_storage()?;
         let surface = arguments
             .get("surface")
+            .or_else(|| arguments.get("inspect_target"))
             .and_then(|value| value.as_str())
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -9821,18 +10915,18 @@ print(result["text"])
                 "arkpulse": self.inspect_arkpulse_json(&storage, limit).await?,
                 "sentinel": self.inspect_sentinel_json(&storage, limit).await?,
                 "evolution": self.inspect_evolution_json(&storage, limit).await?,
-                "moltbook": self.inspect_moltbook_json(&storage, limit).await?,
                 "trace": self.inspect_trace_json(&storage, None, limit).await?,
+                "moltbook": self.inspect_moltbook_json(&storage, limit).await?,
             }),
             "gateway_ops" => self.inspect_gateway_ops_json(&storage, limit).await?,
             "arkpulse" => self.inspect_arkpulse_json(&storage, limit).await?,
             "sentinel" => self.inspect_sentinel_json(&storage, limit).await?,
             "evolution" => self.inspect_evolution_json(&storage, limit).await?,
-            "moltbook" => self.inspect_moltbook_json(&storage, limit).await?,
             "trace" => self.inspect_trace_json(&storage, trace_id, limit).await?,
+            "moltbook" => self.inspect_moltbook_json(&storage, limit).await?,
             other => {
                 anyhow::bail!(
-                    "Unknown AgentArk surface '{}'. Use overview, gateway_ops, arkpulse, sentinel, evolution, moltbook, or trace",
+                    "Unknown AgentArk surface '{}'. Use overview, gateway_ops, arkpulse, sentinel, evolution, trace, or moltbook",
                     other
                 )
             }
@@ -11892,6 +12986,130 @@ print(result["text"])
         }
     }
 
+    fn pdf_text_literal(value: &str) -> String {
+        let mut out = String::with_capacity(value.len());
+        for ch in value.chars() {
+            match ch {
+                '\\' => out.push_str("\\\\"),
+                '(' => out.push_str("\\("),
+                ')' => out.push_str("\\)"),
+                '\t' => out.push(' '),
+                ch if ch.is_ascii_graphic() || ch == ' ' => out.push(ch),
+                _ => out.push(' '),
+            }
+        }
+        out
+    }
+
+    fn wrap_pdf_text(text: &str, max_chars: usize) -> Vec<String> {
+        let mut lines = Vec::new();
+        for raw_line in text.lines() {
+            let mut current = String::new();
+            for word in raw_line.split_whitespace() {
+                let separator = usize::from(!current.is_empty());
+                if !current.is_empty() && current.len() + separator + word.len() > max_chars {
+                    lines.push(std::mem::take(&mut current));
+                }
+                if !current.is_empty() {
+                    current.push(' ');
+                }
+                current.push_str(word);
+            }
+            if current.is_empty() {
+                lines.push(String::new());
+            } else {
+                lines.push(current);
+            }
+        }
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines
+    }
+
+    fn generate_simple_pdf_bytes(title: &str, content: &str, style: &str) -> Vec<u8> {
+        const PAGE_WIDTH: usize = 612;
+        const PAGE_HEIGHT: usize = 792;
+        const LINES_PER_PAGE: usize = 42;
+        let body_font = match style {
+            "invoice" => 10,
+            "report" | "letter" | "plain" => 11,
+            _ => 11,
+        };
+        let title_font = match style {
+            "invoice" => 20,
+            "report" => 16,
+            "letter" | "plain" => 14,
+            _ => 14,
+        };
+        let mut lines = Vec::new();
+        lines.push(title.trim().to_string());
+        lines.push(String::new());
+        lines.extend(Self::wrap_pdf_text(content, 92));
+        let pages = lines.chunks(LINES_PER_PAGE).collect::<Vec<_>>();
+        let page_count = pages.len().max(1);
+        let catalog_id = 1usize;
+        let pages_id = 2usize;
+        let font_id = 3usize;
+        let first_page_id = 4usize;
+        let mut objects: Vec<String> = Vec::new();
+        objects.push(format!(
+            "{catalog_id} 0 obj\n<< /Type /Catalog /Pages {pages_id} 0 R >>\nendobj\n"
+        ));
+        let kids = (0..page_count)
+            .map(|index| format!("{} 0 R", first_page_id + index * 2))
+            .collect::<Vec<_>>()
+            .join(" ");
+        objects.push(format!(
+            "{pages_id} 0 obj\n<< /Type /Pages /Kids [{kids}] /Count {page_count} >>\nendobj\n"
+        ));
+        objects.push(format!(
+            "{font_id} 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n"
+        ));
+        for (index, page_lines) in pages.iter().enumerate() {
+            let page_id = first_page_id + index * 2;
+            let content_id = page_id + 1;
+            let mut stream = String::from("BT\n72 740 Td\n");
+            for (line_index, line) in page_lines.iter().enumerate() {
+                if line_index == 0 && index == 0 {
+                    stream.push_str(&format!("/F1 {title_font} Tf\n"));
+                } else if line_index == 1 && index == 0 {
+                    stream.push_str(&format!("/F1 {body_font} Tf\n"));
+                }
+                if line_index > 0 {
+                    stream.push_str("0 -16 Td\n");
+                }
+                stream.push_str(&format!("({}) Tj\n", Self::pdf_text_literal(line)));
+            }
+            stream.push_str("ET\n");
+            objects.push(format!(
+                "{page_id} 0 obj\n<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {PAGE_WIDTH} {PAGE_HEIGHT}] /Resources << /Font << /F1 {font_id} 0 R >> >> /Contents {content_id} 0 R >>\nendobj\n"
+            ));
+            objects.push(format!(
+                "{content_id} 0 obj\n<< /Length {} >>\nstream\n{}endstream\nendobj\n",
+                stream.as_bytes().len(),
+                stream
+            ));
+        }
+
+        let mut pdf = String::from("%PDF-1.4\n%\u{00e2}\u{00e3}\u{00cf}\u{00d3}\n");
+        let mut offsets = vec![0usize];
+        for object in &objects {
+            offsets.push(pdf.len());
+            pdf.push_str(object);
+        }
+        let xref_offset = pdf.len();
+        pdf.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len()));
+        for offset in offsets.iter().skip(1) {
+            pdf.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        pdf.push_str(&format!(
+            "trailer\n<< /Size {} /Root {catalog_id} 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            offsets.len()
+        ));
+        pdf.into_bytes()
+    }
+
     /// Convert HTML to plain text by stripping tags and decoding entities
     fn html_to_text(html: &str) -> String {
         // Remove script and style blocks entirely
@@ -12060,7 +13278,7 @@ print(result["text"])
                         if let Some(ref v) = verdict {
                             if !v.warnings.is_empty() {
                                 msg.push_str(&format!(
-                                    "\nâš ï¸ Security warnings: {}",
+                                    "\nSecurity warnings: {}",
                                     v.warnings.join(", ")
                                 ));
                             }
@@ -12214,7 +13432,7 @@ print(result["text"])
                     }
                 }
                 drop(actions); // Release lock before async call
-                               // Fall back to native
+                // Fall back to native
                 self.execute_native(action_name, arguments).await
             }
         }
@@ -12587,7 +13805,7 @@ print(result["text"])
         }
         #[cfg(feature = "docker")]
         {
-            // Check Docker availability first â€” fall back to native if unavailable
+            // Check Docker availability first - fall back to native if unavailable
             let docker_available = Self::connect_docker().is_ok();
 
             if !docker_available {
@@ -12646,7 +13864,7 @@ print(result["text"])
                 }),
             )
             .await;
-        // Force remove â€” deletes container, volumes, and anonymous volumes
+        // Force remove - deletes container, volumes, and anonymous volumes
         let _ = docker
             .remove_container(
                 id,
@@ -12699,7 +13917,7 @@ print(result["text"])
 
     /// Run a command in a fully isolated, ephemeral Docker container.
     /// Automatically pulls the image if not available locally.
-    /// Container is ALWAYS destroyed after execution â€” no leftovers.
+    /// Container is ALWAYS destroyed after execution - no leftovers.
     #[cfg(feature = "docker")]
     async fn run_isolated_container(
         &self,
@@ -12825,7 +14043,7 @@ print(result["text"])
             action_name
         );
 
-        // Start container â€” if this fails, clean up immediately
+        // Start container - if this fails, clean up immediately
         let start_started = std::time::Instant::now();
         if let Err(e) = docker.start_container(&container_id, None).await {
             crate::metrics::observe_container_lifecycle(
@@ -12999,7 +14217,7 @@ print(result["text"])
             logs_started.elapsed(),
         );
 
-        // Always destroy the container â€” no leftovers
+        // Always destroy the container - no leftovers
         let cleanup_started = std::time::Instant::now();
         Self::force_remove_container(&docker, &container_id).await;
         crate::metrics::observe_container_lifecycle(
@@ -13111,7 +14329,7 @@ print(result["text"])
                 "java -jar {sandbox_dir}/out.jar",
             )),
 
-            // Jupyter notebook â€” execute in-place and output results
+            // Jupyter notebook - execute in-place and output results
             "jupyter" | "notebook" | "ipynb" => Some((
                 "python:3-slim",
                 "ipynb",
@@ -13340,7 +14558,7 @@ print(result["text"])
     /// Detect non-stdlib Python imports and return a pip install command.
     /// Scans `import X` and `from X import` statements, filters out stdlib modules.
     fn detect_python_dep_packages(code: &str) -> Vec<String> {
-        // Python stdlib modules (comprehensive but not exhaustive â€” errs on side of not installing)
+        // Python stdlib modules (comprehensive but not exhaustive - errs on side of not installing)
         const STDLIB: &[&str] = &[
             "abc",
             "aifc",
@@ -13703,8 +14921,8 @@ print(result["text"])
     }
 
     /// Execute code in an isolated Docker container.
-    /// Supports any language with a Docker image â€” auto-pulls if needed.
-    /// Container is ephemeral â€” fully destroyed after execution.
+    /// Supports any language with a Docker image - auto-pulls if needed.
+    /// Container is ephemeral - fully destroyed after execution.
     /// Output files (images, CSVs, etc.) are extracted before container cleanup.
     #[cfg(feature = "docker")]
     async fn execute_code_docker(
@@ -13740,7 +14958,7 @@ print(result["text"])
         }
 
         // Strip Jupyter magic commands (!pip, !apt, !conda, %pip, %conda, etc.)
-        // LLMs often generate these in regular Python scripts â€” our auto-dependency
+        // LLMs often generate these in regular Python scripts - our auto-dependency
         // detection handles installs, so these lines are unnecessary and cause SyntaxError.
         let code = if matches!(language.as_str(), "python" | "python3" | "py") {
             let cleaned: Vec<&str> = code_raw
@@ -13836,7 +15054,7 @@ print(result["text"])
             .replace("{file}", &file_path)
             .replace("{sandbox_dir}", CODE_EXECUTE_SANDBOX_DIR);
         let workspace_bootstrap = format!(
-            "mkdir -p '{sandbox}' '{home}' '{tmp}' '{cache}' '{pip_cache}' '{cache}/npm' /data && export HOME='{home}' TMPDIR='{tmp}' TMP='{tmp}' TEMP='{tmp}' XDG_CACHE_HOME='{cache}' PIP_CACHE_DIR='{pip_cache}' npm_config_cache='{cache}/npm' NPM_CONFIG_CACHE='{cache}/npm' && cd '{sandbox}' && ",
+            "mkdir -p '{sandbox}' '{home}' '{tmp}' '{cache}' '{pip_cache}' '{cache}/npm' && export HOME='{home}' TMPDIR='{tmp}' TMP='{tmp}' TEMP='{tmp}' XDG_CACHE_HOME='{cache}' PIP_CACHE_DIR='{pip_cache}' npm_config_cache='{cache}/npm' NPM_CONFIG_CACHE='{cache}/npm' && cd '{sandbox}' && ",
             sandbox = CODE_EXECUTE_SANDBOX_DIR,
             home = CODE_EXECUTE_HOME_DIR,
             tmp = CODE_EXECUTE_TMP_DIR,
@@ -14010,7 +15228,7 @@ print(result["text"])
 
             (user_output, saved)
         } else {
-            // No file marker found â€” still save the code file
+            // No file marker found - still save the code file
             let mut saved = Vec::new();
             let code_filename = format!("code.{}", ext);
             let code_path = output_dir.join(&code_filename);
@@ -14197,25 +15415,27 @@ print(result["text"])
         drop(disabled);
         let mut enabled = Vec::new();
         for action in actions {
-            if action.source == ActionSource::System
-                && !self.is_action_integration_ready(&action).await
+            if action.source == ActionSource::System {
+                if self.is_action_integration_ready(&action).await {
+                    enabled.push(action);
+                }
+                continue;
+            }
+
+            if self
+                .disabled_actions
+                .read()
+                .await
+                .contains(action.name.as_str())
             {
                 continue;
             }
-            if action.source != ActionSource::System
-                && self
-                    .disabled_actions
-                    .read()
-                    .await
-                    .contains(action.name.as_str())
-            {
-                continue;
-            }
+
             if let Some(review) = self.refresh_action_review_state(&action.name).await? {
                 if !review.visible_in_catalog {
                     continue;
                 }
-            } else if action.source != ActionSource::System {
+            } else {
                 continue;
             }
             enabled.push(action);
@@ -14232,19 +15452,17 @@ print(result["text"])
         let Some(action) = action else {
             return false;
         };
-        if action.source == ActionSource::System && !self.is_action_integration_ready(&action).await
-        {
-            return false;
+        if action.source == ActionSource::System {
+            return self.is_action_integration_ready(&action).await;
         }
-        if action.source != ActionSource::System {
-            let disabled = self.disabled_actions.read().await;
-            if disabled.contains(name) {
-                return false;
-            }
+
+        let disabled = self.disabled_actions.read().await;
+        if disabled.contains(name) {
+            return false;
         }
         match self.refresh_action_review_state(name).await {
             Ok(Some(review)) => review.allow_execute,
-            Ok(None) => action.source == ActionSource::System,
+            Ok(None) => false,
             Err(_) => false,
         }
     }
@@ -14401,87 +15619,6 @@ print(result["text"])
             name
         );
         Ok(true)
-    }
-
-    #[allow(dead_code)]
-    pub async fn apply_skill_evolution_candidate(
-        &self,
-        action: &str,
-        name: &str,
-        content: &str,
-        evidence_markdown: &str,
-    ) -> Result<SkillEvolutionApplyResult> {
-        let action = action.trim().to_ascii_lowercase();
-        let name = name.trim();
-        let content = content.trim();
-        if name.is_empty() {
-            anyhow::bail!("skill evolution candidate is missing a skill name");
-        }
-        if content.is_empty() {
-            anyhow::bail!("skill evolution candidate is missing skill content");
-        }
-
-        match action.as_str() {
-            "create_skill" | "improve_skill" | "optimize_description" => {}
-            other => anyhow::bail!("unsupported skill evolution action '{}'", other),
-        }
-
-        let existing = self.get_action_content(name).await?;
-        if action == "create_skill" && existing.is_none() {
-            let verdict = self.create_action(name, content, false).await?;
-            if verdict.as_ref().is_some_and(|value| !value.allow_load) {
-                anyhow::bail!("skill creation was blocked by the action security guard");
-            }
-            let history_dir = self.actions_dir.join(name).join("history");
-            tokio::fs::create_dir_all(&history_dir).await?;
-            tokio::fs::write(history_dir.join("v0_evidence.md"), evidence_markdown).await?;
-            return Ok(SkillEvolutionApplyResult {
-                skill_name: name.to_string(),
-                approved_ref: format!("skill:{}:v1", name),
-                history_version: 1,
-            });
-        }
-
-        let Some((info, before_content)) = existing else {
-            anyhow::bail!("skill '{}' does not exist in the current runtime", name);
-        };
-        if info.source == ActionSource::System {
-            anyhow::bail!("system actions cannot be modified by skill evolution");
-        }
-
-        let history_dir = if info.source == ActionSource::Bundled {
-            self.actions_dir.join(name).join("history")
-        } else {
-            info.file_path
-                .as_deref()
-                .and_then(|value| Path::new(value).parent().map(|path| path.join("history")))
-                .unwrap_or_else(|| self.actions_dir.join(name).join("history"))
-        };
-        tokio::fs::create_dir_all(&history_dir).await?;
-        let history_version =
-            crate::core::self_evolve::skill_evolution::next_skill_history_version(&history_dir)?;
-        tokio::fs::write(
-            history_dir.join(format!("v{}.md", history_version)),
-            before_content,
-        )
-        .await?;
-        tokio::fs::write(
-            history_dir.join(format!("v{}_evidence.md", history_version)),
-            evidence_markdown,
-        )
-        .await?;
-        if !self.update_action_content(name, content).await? {
-            anyhow::bail!(
-                "failed to update skill '{}' after snapshotting history",
-                name
-            );
-        }
-
-        Ok(SkillEvolutionApplyResult {
-            skill_name: name.to_string(),
-            approved_ref: format!("skill:{}:v{}", name, history_version + 1),
-            history_version: history_version + 1,
-        })
     }
 
     pub async fn apply_semantically_reviewed_skill_evolution_candidate(
@@ -15735,10 +16872,23 @@ required:{required_block}
                 None => return Ok(false),
             }
         };
+        tracing::info!(
+            action = name,
+            source = ?source,
+            has_file_path = file_path.is_some(),
+            "Runtime delete_action resolved action"
+        );
 
         match source {
-            ActionSource::System => Ok(false),
+            ActionSource::System => {
+                tracing::info!(action = name, "Runtime delete_action refused system action");
+                Ok(false)
+            }
             ActionSource::Bundled => {
+                tracing::info!(
+                    action = name,
+                    "Runtime delete_action deleting bundled action"
+                );
                 self.delete_runtime_owned_bundled_skill_dir(name).await?;
                 {
                     let mut removed = self.removed_bundled_actions.write().await;
@@ -15758,11 +16908,20 @@ required:{required_block}
                 Ok(true)
             }
             ActionSource::Custom => {
+                tracing::info!(
+                    action = name,
+                    "Runtime delete_action deleting custom action"
+                );
                 if let Some(fp) = file_path {
                     let action_path = std::path::Path::new(&fp);
                     if let Some(action_dir) = action_path.parent() {
                         let dir_path = action_dir.to_path_buf();
                         if dir_path.exists() {
+                            tracing::info!(
+                                action = name,
+                                path = %dir_path.display(),
+                                "Runtime delete_action removing custom action directory"
+                            );
                             tokio::fs::remove_dir_all(&dir_path).await?;
                         }
                     }
@@ -15790,15 +16949,6 @@ required:{required_block}
             .await
             .get(action_name)
             .and_then(|s| s.workflow_content.clone())
-    }
-
-    pub async fn is_cli_action(&self, action_name: &str) -> bool {
-        self.actions
-            .read()
-            .await
-            .get(action_name)
-            .map(|action| action.cli_binding.is_some())
-            .unwrap_or(false)
     }
 
     /// Execute a workflow action with LLM orchestration
@@ -16393,7 +17543,7 @@ required:{required_block}
                             }
                             Err(e) => {
                                 tracing::warn!(
-                                    "Security check failed for '{}': {} â€” loading anyway",
+                                    "Security check failed for '{}': {} - loading anyway",
                                     info.name,
                                     e
                                 );
@@ -16768,18 +17918,7 @@ mod tests {
     use crate::integrations::integration_enabled_key;
 
     #[test]
-    fn parse_schedule_task_completion_accepts_legacy_and_structured_markers() {
-        let legacy =
-            parse_schedule_task_completion("Task scheduled: backup | Schedule: cron:0 9 * * *")
-                .expect("legacy schedule text should parse");
-        assert_eq!(legacy.tool, "schedule_task");
-        assert_eq!(legacy.status, "completed");
-        assert!(legacy
-            .detail
-            .as_deref()
-            .expect("legacy schedule detail")
-            .contains("backup"));
-
+    fn parse_schedule_task_completion_accepts_structured_marker() {
         let structured = format!(
             "{}{}",
             TOOL_COMPLETION_MARKER,
@@ -16796,17 +17935,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_watch_completion_accepts_legacy_and_structured_markers() {
-        let legacy = parse_watch_completion("Watch created: inbox changes")
-            .expect("legacy watch text should parse");
-        assert_eq!(legacy.tool, "watch");
-        assert_eq!(legacy.status, "completed");
-        assert!(legacy
-            .detail
-            .as_deref()
-            .expect("legacy watch detail")
-            .contains("inbox"));
-
+    fn parse_watch_completion_accepts_structured_marker() {
         let structured = format!(
             "{}{}",
             TOOL_COMPLETION_MARKER,
@@ -16818,6 +17947,41 @@ mod tests {
         );
         let structured =
             parse_watch_completion(&structured).expect("structured watch marker should parse");
+        assert_eq!(structured.tool, "watch");
+        assert_eq!(structured.status, "completed");
+    }
+
+    #[test]
+    fn parse_delegate_completion_accepts_structured_marker() {
+        let structured = format!(
+            "{}{}",
+            TOOL_COMPLETION_MARKER,
+            serde_json::json!({
+                "tool": "delegate",
+                "status": "completed",
+                "detail": "Delegation prepared"
+            })
+        );
+        let structured = parse_delegate_completion(&structured)
+            .expect("structured delegate marker should parse");
+        assert_eq!(structured.tool, "delegate");
+        assert_eq!(structured.status, "completed");
+    }
+
+    #[test]
+    fn parse_tool_completion_accepts_marker_line_before_human_text() {
+        let output = format!(
+            "{}{}\nHuman readable status follows.",
+            TOOL_COMPLETION_MARKER,
+            serde_json::json!({
+                "tool": "watch",
+                "status": "completed",
+                "detail": "Polling configured"
+            })
+        );
+        let structured = parse_watch_completion(&output)
+            .expect("structured marker line should parse before human text");
+
         assert_eq!(structured.tool, "watch");
         assert_eq!(structured.status, "completed");
     }
@@ -17109,14 +18273,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capability_resolve_is_builtin_and_file_read_scoped() {
+    async fn capability_resolve_is_builtin_and_inventory_scoped() {
         let temp = tempfile::tempdir().unwrap();
         let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
         runtime.load_builtin_actions().await.unwrap();
         let action = action_def_by_name(&runtime, "capability_resolve").await;
 
         assert_eq!(action.source, ActionSource::System);
-        assert_eq!(action.capabilities, vec!["file_read".to_string()]);
+        assert!(action.capabilities.iter().any(|cap| cap == "file_read"));
+        assert!(
+            action
+                .capabilities
+                .iter()
+                .any(|cap| cap == "capability_inventory")
+        );
+    }
+
+    #[tokio::test]
+    async fn manage_actions_declares_skill_management_capability() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        runtime.load_builtin_actions().await.unwrap();
+        let action = action_def_by_name(&runtime, "manage_actions").await;
+
+        assert_eq!(action.source, ActionSource::System);
+        assert!(
+            action
+                .capabilities
+                .iter()
+                .any(|cap| cap == "skill_management")
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_is_builtin_multi_agent_capability() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        runtime.load_builtin_actions().await.unwrap();
+        let action = action_def_by_name(&runtime, "delegate").await;
+
+        assert_eq!(action.source, ActionSource::System);
+        assert!(action.capabilities.iter().any(|cap| cap == "multi_agent"));
+        assert!(action.capabilities.iter().any(|cap| cap == "swarm"));
+        assert_eq!(action.input_schema["required"], serde_json::json!(["task"]));
+        let metadata = crate::actions::planner_metadata_for_action(&action);
+        assert_eq!(
+            metadata.role,
+            crate::actions::PlannerActionRole::Orchestration
+        );
+        assert_eq!(
+            metadata.side_effect_level,
+            crate::actions::PlannerSideEffectLevel::Write
+        );
     }
 
     #[tokio::test]
@@ -17127,9 +18335,36 @@ mod tests {
         let action = action_def_by_name(&runtime, "capability_acquire").await;
 
         assert_eq!(action.source, ActionSource::System);
-        assert!(ActionRuntime::action_required_agent_permission_ids(&action)
-            .iter()
-            .any(|permission| permission == "capability_acquire"));
+        assert!(
+            ActionRuntime::action_required_agent_permission_ids(&action)
+                .iter()
+                .any(|permission| permission == "capability_acquire")
+        );
+    }
+
+    #[tokio::test]
+    async fn system_action_review_visibility_does_not_hide_builtin_actions() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        runtime.load_builtin_actions().await.unwrap();
+        runtime
+            .upsert_action_review(ActionReviewSnapshot {
+                action_name: "file_write".to_string(),
+                status: ActionReviewStatus::Blocked,
+                ready: false,
+                allow_load: false,
+                allow_execute: false,
+                visible_in_catalog: false,
+                blocked_reason: Some("stale persisted review".to_string()),
+                ..ActionReviewSnapshot::default()
+            })
+            .await
+            .unwrap();
+
+        let enabled = runtime.list_enabled_actions().await.unwrap();
+
+        assert!(enabled.iter().any(|action| action.name == "file_write"));
+        assert!(runtime.is_action_enabled("file_write").await);
     }
 
     #[tokio::test]
@@ -17173,12 +18408,16 @@ mod tests {
         let enabled = runtime.list_enabled_actions().await.unwrap();
 
         assert!(enabled.iter().any(|action| action.name == "gmail_scan"));
-        assert!(enabled
-            .iter()
-            .any(|action| action.name == "google_workspace_gws_command"));
-        assert!(enabled
-            .iter()
-            .any(|action| action.name == "google_workspace_gws_skills"));
+        assert!(
+            enabled
+                .iter()
+                .any(|action| action.name == "google_workspace_gws_command")
+        );
+        assert!(
+            enabled
+                .iter()
+                .any(|action| action.name == "google_workspace_gws_skills")
+        );
         assert_eq!(
             manager
                 .get_custom_secret(&integration_enabled_key("google_workspace"))
@@ -17196,27 +18435,41 @@ mod tests {
         let enabled = runtime.list_enabled_actions().await.unwrap();
 
         assert!(!enabled.iter().any(|action| action.name == "gmail_scan"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "calendar_create"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_drive_search"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_docs_read"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_sheets_read"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_chat_list_spaces"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_admin_list_users"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_workspace_gws_command"));
+        assert!(
+            !enabled
+                .iter()
+                .any(|action| action.name == "calendar_create")
+        );
+        assert!(
+            !enabled
+                .iter()
+                .any(|action| action.name == "google_drive_search")
+        );
+        assert!(
+            !enabled
+                .iter()
+                .any(|action| action.name == "google_docs_read")
+        );
+        assert!(
+            !enabled
+                .iter()
+                .any(|action| action.name == "google_sheets_read")
+        );
+        assert!(
+            !enabled
+                .iter()
+                .any(|action| action.name == "google_chat_list_spaces")
+        );
+        assert!(
+            !enabled
+                .iter()
+                .any(|action| action.name == "google_admin_list_users")
+        );
+        assert!(
+            !enabled
+                .iter()
+                .any(|action| action.name == "google_workspace_gws_command")
+        );
     }
 
     #[tokio::test]
@@ -17255,24 +18508,36 @@ mod tests {
         assert!(enabled.iter().any(|action| action.name == "gmail_scan"));
         assert!(enabled.iter().any(|action| action.name == "gmail_reply"));
         assert!(!enabled.iter().any(|action| action.name == "calendar_today"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "calendar_create"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_drive_search"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_docs_read"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_sheets_read"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_chat_list_spaces"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_admin_list_users"));
+        assert!(
+            !enabled
+                .iter()
+                .any(|action| action.name == "calendar_create")
+        );
+        assert!(
+            !enabled
+                .iter()
+                .any(|action| action.name == "google_drive_search")
+        );
+        assert!(
+            !enabled
+                .iter()
+                .any(|action| action.name == "google_docs_read")
+        );
+        assert!(
+            !enabled
+                .iter()
+                .any(|action| action.name == "google_sheets_read")
+        );
+        assert!(
+            !enabled
+                .iter()
+                .any(|action| action.name == "google_chat_list_spaces")
+        );
+        assert!(
+            !enabled
+                .iter()
+                .any(|action| action.name == "google_admin_list_users")
+        );
     }
 
     #[tokio::test]
@@ -17310,22 +18575,32 @@ mod tests {
         let enabled = runtime.list_enabled_actions().await.unwrap();
 
         assert!(enabled.iter().any(|action| action.name == "gmail_scan"));
-        assert!(enabled
-            .iter()
-            .any(|action| action.name == "google_drive_search"));
+        assert!(
+            enabled
+                .iter()
+                .any(|action| action.name == "google_drive_search")
+        );
         assert!(!enabled.iter().any(|action| action.name == "calendar_today"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_docs_read"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_sheets_read"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_chat_list_spaces"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_admin_list_users"));
+        assert!(
+            !enabled
+                .iter()
+                .any(|action| action.name == "google_docs_read")
+        );
+        assert!(
+            !enabled
+                .iter()
+                .any(|action| action.name == "google_sheets_read")
+        );
+        assert!(
+            !enabled
+                .iter()
+                .any(|action| action.name == "google_chat_list_spaces")
+        );
+        assert!(
+            !enabled
+                .iter()
+                .any(|action| action.name == "google_admin_list_users")
+        );
     }
 
     #[tokio::test]
@@ -17338,6 +18613,12 @@ mod tests {
         assert!(!enabled.iter().any(|action| action.name == "places"));
         assert!(!enabled.iter().any(|action| action.name == "twilio"));
         assert!(!enabled.iter().any(|action| action.name == "github"));
+        assert!(enabled.iter().any(|action| action.name == "moltbook"));
+        let status = runtime
+            .execute_action("moltbook", &serde_json::json!({ "action": "status" }))
+            .await
+            .unwrap();
+        assert!(status.contains("not_configured"));
     }
 
     #[tokio::test]
@@ -17525,9 +18806,11 @@ version: "1.2.3"
         let reloaded = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
         reloaded.load_all_actions().await.unwrap();
         let reloaded_actions = reloaded.list_actions().await.unwrap();
-        assert!(reloaded_actions
-            .iter()
-            .any(|action| action.name == "officecli"));
+        assert!(
+            reloaded_actions
+                .iter()
+                .any(|action| action.name == "officecli")
+        );
     }
 
     #[tokio::test]
@@ -17655,10 +18938,12 @@ version: "1.2.3"
     async fn lan_discover_requires_explicit_approval_for_trusted_chat() {
         let runtime = runtime_for_authorization_tests().await;
         let action = action_def_by_name(&runtime, "lan_discover").await;
-        assert!(action
-            .capabilities
-            .iter()
-            .any(|cap| cap == "local_network_discovery"));
+        assert!(
+            action
+                .capabilities
+                .iter()
+                .any(|cap| cap == "local_network_discovery")
+        );
 
         let decision = runtime
             .authorize_action_invocation(
@@ -17913,9 +19198,11 @@ version: "1.2.3"
             .unapproved_permissions_for_action(&action, &ActionAuthorizationContext::default())
             .await;
 
-        assert!(unapproved
-            .iter()
-            .any(|perm| matches!(perm, crate::security::action_guard::Permission::CodeExecute)));
+        assert!(
+            unapproved
+                .iter()
+                .any(|perm| matches!(perm, crate::security::action_guard::Permission::CodeExecute))
+        );
     }
 
     #[tokio::test]

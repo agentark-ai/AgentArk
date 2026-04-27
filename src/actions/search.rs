@@ -5,7 +5,7 @@
 //! - Brave Search API
 //! - DuckDuckGo (scraping, no API key needed)
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, Utc};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -57,8 +57,7 @@ const SEARCH_XML_ACCEPT: &str = "application/rss+xml,application/xml,text/xml;q=
 const SEARCH_BACKEND_HEALTH_KEY: &str = "search_backend_health:v1";
 const BUILTIN_BACKEND_COOLDOWN_HOURS: i64 = 24;
 
-pub const SEARCH_PROVIDER_SETUP_REQUIRED_MESSAGE: &str =
-    "No search backend is currently available from this environment. Anonymous HTML/browser search may be blocked; configure a reachable SearXNG instance or an API-backed search provider for reliable research.";
+pub const SEARCH_PROVIDER_SETUP_REQUIRED_MESSAGE: &str = "No search backend is currently available from this environment. Anonymous HTML/browser search may be blocked; configure a reachable SearXNG instance or an API-backed search provider for reliable research.";
 
 fn char_prefix(value: &str, max_chars: usize) -> &str {
     if value.chars().count() <= max_chars {
@@ -1649,6 +1648,16 @@ const DEFAULT_FREE_BACKEND_ORDER: &[&str] = &["duckduckgo", "lightpanda", "bing_
 
 /// Execute a web search
 pub async fn execute_search(args: &SearchArgs, config: &SearchConfig) -> Result<String> {
+    let response = execute_search_response(args, config).await?;
+    Ok(format_search_results(&response))
+}
+
+/// Execute a web search and return the structured response for callers that
+/// need machine-readable fallback behavior.
+pub async fn execute_search_response(
+    args: &SearchArgs,
+    config: &SearchConfig,
+) -> Result<SearchResponse> {
     let response = search_with_config(
         &args.query,
         args.num_results.max(1),
@@ -1656,10 +1665,11 @@ pub async fn execute_search(args: &SearchArgs, config: &SearchConfig) -> Result<
         config,
     )
     .await?;
-    Ok(format_search_results(&response))
+    Ok(response)
 }
+
 /// Format search results into a human-readable string
-fn format_search_results(response: &SearchResponse) -> String {
+pub fn format_search_results(response: &SearchResponse) -> String {
     let mut output = format!("Search results for: {}\n\n", response.query);
     for (i, result) in response.results.iter().enumerate() {
         output.push_str(&format!("{}. {}\n   {}\n", i + 1, result.title, result.url));
@@ -2077,9 +2087,11 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "India AI policy outlook 2026");
         assert_eq!(results[0].url, "https://example.com/policy/india-ai");
-        assert!(results[0]
-            .snippet
-            .contains("Government strategy, compute constraints"));
+        assert!(
+            results[0]
+                .snippet
+                .contains("Government strategy, compute constraints")
+        );
     }
 
     #[test]

@@ -305,7 +305,7 @@ export function GuidedTour({ openTourStep, currentView }: Props) {
             y="0"
             width="100%"
             height="100%"
-            fill="rgba(3, 8, 17, 0.76)"
+            fill="var(--ui-rgba-3-8-17-760)"
             mask="url(#tour-spotlight-mask)"
           />
         </svg>
@@ -349,9 +349,9 @@ export function GuidedTour({ openTourStep, currentView }: Props) {
             width: targetRect.width + pad * 2,
             height: targetRect.height + pad * 2,
             borderRadius: 2,
-            border: "2px solid rgba(47, 212, 255, 0.95)",
+            border: "2px solid var(--ui-rgba-47-212-255-950)",
             boxShadow:
-              "0 0 0 1px rgba(47, 212, 255, 0.2), 0 0 34px rgba(47, 212, 255, 0.2), inset 0 0 24px rgba(47, 212, 255, 0.06)",
+              "0 0 0 1px var(--ui-rgba-47-212-255-200), 0 0 34px var(--ui-rgba-47-212-255-200), inset 0 0 24px var(--ui-rgba-47-212-255-060)",
             animation: "tour-ring-pulse 2s ease-in-out infinite",
           }}
         />
@@ -368,12 +368,12 @@ export function GuidedTour({ openTourStep, currentView }: Props) {
           minHeight: 220,
           zIndex: 10000,
           borderRadius: 2,
-          border: "1px solid rgba(47, 212, 255, 0.22)",
+          border: "1px solid var(--ui-rgba-47-212-255-220)",
           background:
-            "linear-gradient(160deg, rgba(10, 18, 34, 0.97), rgba(7, 14, 28, 0.95))",
+            "linear-gradient(160deg, var(--ui-rgba-10-18-34-970), var(--ui-rgba-7-14-28-950))",
           backdropFilter: "blur(18px)",
           WebkitBackdropFilter: "blur(18px)",
-          boxShadow: "0 18px 48px rgba(0, 0, 0, 0.4)",
+          boxShadow: "0 18px 48px var(--ui-rgba-0-0-0-400)",
           p: 2,
           display: "flex",
           flexDirection: "column",
@@ -391,7 +391,7 @@ export function GuidedTour({ openTourStep, currentView }: Props) {
           <Box>
             <Typography
               variant="overline"
-              sx={{ color: "rgba(47, 212, 255, 0.86)", letterSpacing: 0 }}
+              sx={{ color: "var(--ui-rgba-47-212-255-860)", letterSpacing: 0 }}
             >
               Guided Tour
             </Typography>

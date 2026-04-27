@@ -2,9 +2,10 @@ use super::config::{ModelCapabilityTier, ModelCostTier};
 use super::llm::{LlmClient, LlmResponse};
 use crate::actions::ActionDef;
 use crate::core::PromptMemory;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
@@ -132,22 +133,6 @@ pub enum RequestState {
     HardServiceOutage,
 }
 
-impl RequestState {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::NeedsClarification => "needs_clarification",
-            Self::NeedsPermission => "needs_permission",
-            Self::NeedsIntegration => "needs_integration",
-            Self::NeedsCredentials => "needs_credentials",
-            Self::NeedsStrongerModel => "needs_stronger_model",
-            Self::Executing => "executing",
-            Self::Completed => "completed",
-            Self::CompletedDegraded => "completed_degraded",
-            Self::HardServiceOutage => "hard_service_outage",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureKind {
@@ -241,21 +226,6 @@ pub enum UserFacingOutcomeStatus {
     NeedsCredentials,
     NeedsStrongerModel,
     ServiceUnavailable,
-}
-
-impl UserFacingOutcomeStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Complete => "complete",
-            Self::Degraded => "degraded",
-            Self::NeedsClarification => "needs_clarification",
-            Self::NeedsPermission => "needs_permission",
-            Self::NeedsIntegration => "needs_integration",
-            Self::NeedsCredentials => "needs_credentials",
-            Self::NeedsStrongerModel => "needs_stronger_model",
-            Self::ServiceUnavailable => "service_unavailable",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -573,6 +543,7 @@ impl ExecutionSupervisor {
         }
     }
 
+    #[cfg(test)]
     pub fn build_clarification_outcome(
         &self,
         message: &str,
@@ -729,6 +700,31 @@ impl ExecutionSupervisor {
     }
 }
 
+fn bounded_helper_output_tokens(env_key: &str, default_tokens: u32) -> u32 {
+    std::env::var(env_key)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(default_tokens)
+        .clamp(128, 8_192)
+}
+
+fn supervised_request_output_budget(request_kind: &str) -> Option<u32> {
+    match request_kind {
+        "agent_turn_loop_v1" => Some(bounded_helper_output_tokens(
+            "AGENTARK_AGENT_TURN_LOOP_MAX_OUTPUT_TOKENS",
+            2_400,
+        )),
+        kind if kind.starts_with("user_fact_memory_capture") => Some(bounded_helper_output_tokens(
+            "AGENTARK_MEMORY_CAPTURE_MAX_OUTPUT_TOKENS",
+            900,
+        )),
+        _ => Some(bounded_helper_output_tokens(
+            "AGENTARK_INTERNAL_HELPER_MAX_OUTPUT_TOKENS",
+            1_200,
+        )),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_supervised_transport_chat(
     supervisor: &ExecutionSupervisor,
@@ -740,10 +736,17 @@ pub async fn execute_supervised_transport_chat(
     actions: &[ActionDef],
     timeout_ms: Option<u64>,
 ) -> Result<LlmResponse> {
+    let max_output_tokens = supervised_request_output_budget(&request.kind);
     let response = if let Some(timeout_ms) = timeout_ms.filter(|value| *value > 0) {
         match tokio::time::timeout(
             std::time::Duration::from_millis(timeout_ms),
-            llm.chat(system_prompt, user_message, memories, actions),
+            llm.chat_with_output_limit(
+                system_prompt,
+                user_message,
+                memories,
+                actions,
+                max_output_tokens,
+            ),
         )
         .await
         {
@@ -760,8 +763,81 @@ pub async fn execute_supervised_transport_chat(
             }
         }
     } else {
-        llm.chat(system_prompt, user_message, memories, actions)
-            .await
+        llm.chat_with_output_limit(
+            system_prompt,
+            user_message,
+            memories,
+            actions,
+            max_output_tokens,
+        )
+        .await
+    };
+
+    response.map_err(|error| {
+        let failure_kind = supervisor.classify_failure(&error.to_string());
+        anyhow!(
+            "supervised_chat_failed(kind={}, request_kind={}, model={}): {}",
+            failure_kind.as_str(),
+            request.kind,
+            llm.model_name(),
+            error
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_supervised_transport_chat_stream(
+    supervisor: &ExecutionSupervisor,
+    llm: &LlmClient,
+    request: &ExecutionRequest,
+    system_prompt: &str,
+    user_message: &str,
+    memories: &[PromptMemory],
+    actions: &[ActionDef],
+    timeout_ms: Option<u64>,
+    token_tx: tokio::sync::mpsc::Sender<crate::core::agent::StreamEvent>,
+) -> Result<LlmResponse> {
+    let history: Vec<crate::core::agent::ConversationMessage> = Vec::new();
+    let response = if let Some(timeout_ms) = timeout_ms.filter(|value| *value > 0) {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms),
+            llm.chat_with_history_stream_for_helper(
+                system_prompt,
+                user_message,
+                &history,
+                memories,
+                actions,
+                token_tx,
+                &crate::security::ModelPrivacyConfig::default(),
+                false,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                let failure_kind = FailureKind::Timeout;
+                return Err(anyhow!(
+                    "supervised_chat_failed(kind={}, request_kind={}, model={}): request timed out after {}ms",
+                    failure_kind.as_str(),
+                    request.kind,
+                    llm.model_name(),
+                    timeout_ms
+                ));
+            }
+        }
+    } else {
+        llm.chat_with_history_stream_for_helper(
+            system_prompt,
+            user_message,
+            &history,
+            memories,
+            actions,
+            token_tx,
+            &crate::security::ModelPrivacyConfig::default(),
+            false,
+        )
+        .await
     };
 
     response.map_err(|error| {
@@ -811,49 +887,6 @@ pub struct ExecutionRun {
     pub attempted_models: Vec<ModelAttemptRecord>,
     pub created_at: String,
     pub updated_at: String,
-}
-
-impl ExecutionRun {
-    pub fn new(
-        kind: impl Into<String>,
-        request_id: Option<String>,
-        trace_id: Option<String>,
-        conversation_id: Option<String>,
-        channel: Option<String>,
-        request_message: Option<String>,
-        deadline_at: Option<String>,
-    ) -> Self {
-        let now = now_rfc3339();
-        let stable_request_id = request_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        Self {
-            id: stable_request_id
-                .clone()
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-            kind: kind.into(),
-            request_id: stable_request_id,
-            status: ExecutionRunStatus::Accepted,
-            current_stage: ExecutionRunStatus::Accepted.as_str().to_string(),
-            lease_owner: None,
-            lease_expires_at: None,
-            attempt: 0,
-            deadline_at,
-            cancellation_requested: false,
-            degradation: Vec::new(),
-            last_error: None,
-            result_summary: None,
-            trace_id,
-            conversation_id,
-            channel,
-            request_message,
-            attempted_models: Vec::new(),
-            created_at: now.clone(),
-            updated_at: now,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

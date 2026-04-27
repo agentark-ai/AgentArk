@@ -10,9 +10,6 @@ use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 
-use crate::actions::ActionDef;
-use crate::core::RequestShapeAssessment;
-
 pub const TOOL_STRATEGY_PROFILE_KEY: &str = "tool_strategy_profile_v1";
 pub const TOOL_STRATEGY_PROFILE_CANARY_KEY: &str = "tool_strategy_profile_canary_v1";
 pub const TOOL_STRATEGY_CANARY_STATE_KEY: &str = "tool_strategy_canary_state_v1";
@@ -142,6 +139,7 @@ pub struct PromptProfileCanarySafetyEvent {
     pub created_at: String,
 }
 
+#[cfg(test)]
 fn task_type_for_action_name(action_name: &str) -> Option<&'static str> {
     match action_name.trim().to_ascii_lowercase().as_str() {
         "app_deploy" | "app_restart" | "app_stop" | "app_delete" | "app_inspect" => {
@@ -156,6 +154,7 @@ fn task_type_for_action_name(action_name: &str) -> Option<&'static str> {
     }
 }
 
+#[cfg(test)]
 pub fn infer_task_type_from_action_names<I, S>(action_names: I) -> String
 where
     I: IntoIterator<Item = S>,
@@ -187,72 +186,6 @@ where
     } else {
         "general".to_string()
     }
-}
-
-pub fn infer_task_type_from_request_context(
-    request_shape: Option<&RequestShapeAssessment>,
-    actions: &[ActionDef],
-) -> String {
-    let from_actions =
-        infer_task_type_from_action_names(actions.iter().map(|action| action.name.as_str()));
-    if from_actions != "general" {
-        return from_actions;
-    }
-
-    if let Some(shape) = request_shape {
-        if shape.shape_is("app") {
-            return "app_deploy".to_string();
-        }
-        if shape.is_integration_request() {
-            return "communication".to_string();
-        }
-        if shape.shape_is("watcher") || shape.shape_is("goal") || shape.is_execution_request() {
-            return "general".to_string();
-        }
-    }
-
-    "general".to_string()
-}
-
-pub fn render_prompt_strategy_block(
-    profile: &ToolStrategyProfile,
-    task_type: &str,
-) -> Option<String> {
-    let mut lines: Vec<String> = profile
-        .default_guidance
-        .iter()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .take(4)
-        .map(|s| s.to_string())
-        .collect();
-
-    if let Some(task_lines) = profile.task_guidance.get(task_type) {
-        for line in task_lines
-            .iter()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .take(4)
-        {
-            lines.push(line.to_string());
-        }
-    }
-    if lines.is_empty() {
-        return None;
-    }
-    lines.truncate(6);
-    let mut out = String::new();
-    out.push_str("## Active Tool Strategy\n");
-    out.push_str(&format!(
-        "- Strategy version: {}\n- Task type: {}\n",
-        profile.version, task_type
-    ));
-    for line in lines {
-        out.push_str("- ");
-        out.push_str(&line);
-        out.push('\n');
-    }
-    Some(out)
 }
 
 pub fn should_use_canary(seed: &str, rollout_percent: u8) -> bool {
@@ -308,24 +241,6 @@ mod task_type_tests {
 
         let task_type = infer_task_type_from_action_names(["research", "page_fetch"]);
         assert_eq!(task_type, "research");
-    }
-
-    #[test]
-    fn infers_task_type_from_request_shape_when_actions_are_empty() {
-        let shape = RequestShapeAssessment {
-            shape: "integration".to_string(),
-            execution_mode: "immediate".to_string(),
-            confidence: 0.91,
-            should_confirm: false,
-            confirmation_question: None,
-            reasoning: String::new(),
-            preferred_actions: vec![],
-            integration_id: None,
-            ..Default::default()
-        };
-
-        let task_type = infer_task_type_from_request_context(Some(&shape), &[]);
-        assert_eq!(task_type, "communication");
     }
 }
 

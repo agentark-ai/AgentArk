@@ -401,7 +401,7 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
                   display: "grid",
                   placeItems: "center",
                   color: "primary.main",
-                  bgcolor: "rgba(91, 164, 255, 0.1)",
+                  bgcolor: "var(--ui-rgba-91-164-255-100)",
                   flex: "0 0 auto"
                 }}
               >
@@ -547,7 +547,7 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
                       borderColor: "divider",
                       borderRadius: 1,
                       p: 1,
-                      bgcolor: "rgba(255, 255, 255, 0.02)",
+                      bgcolor: "var(--ui-rgba-255-255-255-020)",
                       minWidth: 0
                     }}
                   >
@@ -612,7 +612,7 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
                   borderColor: "divider",
                   borderRadius: 1,
                   p: 1,
-                  bgcolor: "rgba(255, 255, 255, 0.02)",
+                  bgcolor: "var(--ui-rgba-255-255-255-020)",
                   minWidth: 0
                 }}
               >
@@ -725,7 +725,7 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
                         textAlign: "left",
                         cursor: "pointer",
                         borderColor: selected ? "primary.main" : undefined,
-                        boxShadow: selected ? "0 0 0 1px rgba(91, 164, 255, 0.18)" : undefined,
+                        boxShadow: selected ? "0 0 0 1px var(--ui-rgba-91-164-255-180)" : undefined,
                         "&:focus-visible": { outline: "none", boxShadow: "var(--button-focus-ring)" }
                       }}
                     >

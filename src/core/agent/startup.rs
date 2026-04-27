@@ -1,0 +1,996 @@
+use super::*;
+
+impl Agent {
+    pub async fn snapshot(shared: &Arc<RwLock<Self>>) -> Self {
+        shared.read().await.clone()
+    }
+
+    /// Initialize the agent with all subsystems.
+    /// If `unified_key` is provided (from master password), it is used for ALL encryption.
+    /// Otherwise falls back to legacy auto-generated keyfiles.
+    pub async fn init(
+        config_dir: &Path,
+        data_dir: &Path,
+        database_config: DatabaseConfig,
+        unified_key: Option<Arc<crate::crypto::KeyManager>>,
+    ) -> Result<Self> {
+        // Initialize storage
+        let storage = Storage::connect(database_config).await?;
+        crate::core::config::set_global_settings_storage(storage.clone());
+        let mut startup_issues = Vec::new();
+
+        // Seed default specialist agents on first run
+        if let Err(e) = storage.seed_default_agents().await {
+            tracing::warn!("Failed to seed default agents: {}", e);
+            startup_issues.push(StartupIssue::new(
+                "specialists",
+                "warning",
+                "Default specialist seed failed during startup",
+                e.to_string(),
+            ));
+        }
+
+        // Initialize encryption - unified key (password-derived) or legacy keyfiles
+        let key_manager: Arc<crate::crypto::KeyManager> = if let Some(key) = unified_key.clone() {
+            tracing::info!("Using master-password-derived encryption key");
+            key
+        } else {
+            tracing::info!("Using legacy keyfile encryption");
+            Arc::new(crate::crypto::KeyManager::load_or_create(
+                &data_dir.join("encryption.key"),
+            )?)
+        };
+        crate::storage::install_storage_key_manager(key_manager.clone());
+        let encrypted_storage =
+            crate::storage::encrypted::EncryptedStorage::new(storage.clone(), key_manager.clone());
+        tracing::info!("Encrypted storage initialized");
+        let secure_config = if let Some(key) = unified_key.clone() {
+            crate::core::config::SecureConfigManager::with_key_manager(config_dir, key)
+        } else {
+            crate::core::config::SecureConfigManager::new_with_data_dir(config_dir, Some(data_dir))?
+        };
+        let key_lineage = secure_config.verify_or_initialize_storage_key_lineage()?;
+        if key_lineage.initialized {
+            tracing::info!(
+                "Initialized settings storage key lineage fingerprint {}",
+                key_lineage
+                    .local_fingerprint
+                    .chars()
+                    .take(12)
+                    .collect::<String>()
+            );
+        } else if let Some(stored) = key_lineage.stored_fingerprint.as_deref() {
+            tracing::info!(
+                "Verified settings storage key lineage fingerprint {}",
+                stored.chars().take(12).collect::<String>()
+            );
+        }
+        if key_lineage.mismatch {
+            startup_issues.push(StartupIssue::new(
+                "settings_storage",
+                "high",
+                "Settings storage does not match the active config key",
+                key_lineage.detail.unwrap_or_else(|| {
+                    "Postgres encrypted settings appear to belong to a different config volume or key lineage.".to_string()
+                }),
+            ));
+        } else if storage
+            .ensure_sensitive_payloads_encrypted(
+                key_manager.as_ref(),
+                &[
+                    "user_profile",
+                    crate::core::observability::OBSERVABILITY_LOG_KEY,
+                    crate::sentinel::PULSE_LOG_KEY,
+                    crate::core::config::SETTINGS_CONFIG_KEY,
+                    crate::core::config::SETTINGS_SECRETS_KEY,
+                    crate::core::config::SETTINGS_SEARCH_KEY,
+                    crate::core::config::SETTINGS_RUNTIME_KEY,
+                    crate::core::config::SETTINGS_DISABLED_ACTIONS_KEY,
+                    crate::core::config::SETTINGS_ACTION_REVIEWS_KEY,
+                    crate::core::config::SETTINGS_REMOVED_BUNDLED_ACTIONS_KEY,
+                    crate::core::config::SETTINGS_APPROVED_PERMISSIONS_KEY,
+                ],
+            )
+            .await?
+        {
+            tracing::info!("Applied one-time sensitive payload encryption backfill");
+        }
+
+        // Initialize identity system
+        let identity = IdentityManager::load_or_create(data_dir).await?;
+
+        // Initialize safety engine
+        let safety = Arc::new(SafetyEngine::new(config_dir)?);
+
+        // Initialize proof system
+        let proofs = Arc::new(ProofEngine::new(
+            data_dir,
+            identity.signing_key(),
+            key_manager.clone(),
+        )?);
+
+        // Initialize action runtime
+        let mut runtime = ActionRuntime::new(config_dir, data_dir).await?;
+
+        let config_state = secure_config.load_runtime_state()?;
+        if config_state.config_degraded {
+            startup_issues.push(StartupIssue::new(
+                "settings",
+                "high",
+                "Encrypted agent config could not be decrypted during startup",
+                format!(
+                    "{}. AgentArk started with safe defaults and blocked settings writes until the original key material is restored.",
+                    config_state
+                        .config_issue
+                        .as_deref()
+                        .unwrap_or("agent config payload is unreadable")
+                ),
+            ));
+        }
+        if config_state.secrets_degraded {
+            startup_issues.push(StartupIssue::new(
+                "secrets",
+                "high",
+                "Encrypted secrets could not be decrypted during startup",
+                format!(
+                    "{}. AgentArk started in recovery mode with empty runtime secrets; restore the original key material before updating secrets or integrations.",
+                    config_state
+                        .secrets_issue
+                        .as_deref()
+                        .unwrap_or("encrypted secrets payload is unreadable")
+                ),
+            ));
+        }
+        let mut config = config_state.config;
+
+        if let Ok(stored_swarm_agents) = storage.get_swarm_agents().await {
+            if !stored_swarm_agents.is_empty() {
+                let fallback_swarm_provider = config.llm.clone();
+                config.swarm.specialists = stored_swarm_agents
+                    .iter()
+                    .map(|agent| {
+                        crate::core::swarm::persistence::specialist_config_from_storage_model(
+                            agent,
+                            &fallback_swarm_provider,
+                        )
+                    })
+                    .collect();
+            }
+        }
+
+        // Load HTTP API key from encrypted secrets
+        let api_key = secure_config.get_api_key().unwrap_or(None);
+
+        // Initialize LLM client (primary, for backward compat)
+        let llm = LlmClient::new(&config.llm)?;
+
+        // Build model pool from config
+        let mut model_pool_map = std::collections::HashMap::new();
+        let mut primary_model_id = String::new();
+        for slot in &config.model_pool.slots {
+            if !slot.enabled {
+                continue;
+            }
+            match LlmClient::new(&slot.provider) {
+                Ok(client) => {
+                    if slot.role == ModelRole::Primary && primary_model_id.is_empty() {
+                        primary_model_id = slot.id.clone();
+                    }
+                    model_pool_map.insert(slot.id.clone(), (slot.clone(), client));
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to init model slot '{}': {}", slot.id, e);
+                }
+            }
+        }
+        // If no primary found, use the first runtime-ready slot in config order.
+        if primary_model_id.is_empty() {
+            if let Some(first_id) = config
+                .model_pool
+                .slots
+                .iter()
+                .find(|slot| model_pool_map.contains_key(&slot.id))
+                .map(|slot| slot.id.clone())
+            {
+                primary_model_id = first_id;
+            }
+        }
+        tracing::info!(
+            "Model pool initialized: {} slots, primary='{}'",
+            model_pool_map.len(),
+            primary_model_id
+        );
+
+        let embedding_client = EmbeddingClient::from_config(&config, data_dir)?.map(Arc::new);
+        if let Some(client) = embedding_client.as_ref() {
+            tracing::info!(
+                "Embedding backend configured: {}",
+                client.describe_backend()
+            );
+        } else {
+            tracing::info!(
+                "Embedding backend unavailable; durable memory and document retrieval will use lexical fallback until embeddings are configured"
+            );
+        }
+
+        let persisted_model_override = storage
+            .get(USER_SELECTED_MODEL_SLOT_KEY)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let had_persisted_model_override = persisted_model_override.is_some();
+        let user_selected_model_slot = persisted_model_override.and_then(|slot_id| {
+            let ready = model_pool_map
+                .get(&slot_id)
+                .is_some_and(|(slot, _)| Self::provider_has_runtime_credentials(&slot.provider));
+            if ready { Some(slot_id) } else { None }
+        });
+        if had_persisted_model_override && user_selected_model_slot.is_none() {
+            let _ = storage.delete(USER_SELECTED_MODEL_SLOT_KEY).await;
+        }
+        if let Some(slot_id) = user_selected_model_slot.as_ref() {
+            tracing::info!("Restored user-selected model slot override: {}", slot_id);
+        }
+
+        let mut app_provider_refs: Vec<&crate::core::LlmProvider> = Vec::new();
+        if let Some(selected_slot_id) = user_selected_model_slot.as_ref() {
+            if let Some(slot) = config
+                .model_pool
+                .slots
+                .iter()
+                .find(|slot| slot.id == *selected_slot_id && slot.enabled)
+            {
+                app_provider_refs.push(&slot.provider);
+            }
+        }
+        if let Some(primary_slot) = config
+            .model_pool
+            .slots
+            .iter()
+            .find(|slot| slot.id == primary_model_id && slot.enabled)
+        {
+            app_provider_refs.push(&primary_slot.provider);
+        }
+        app_provider_refs.push(&config.llm);
+        if let Some(fallback) = config.llm_fallback.as_ref() {
+            app_provider_refs.push(fallback);
+        }
+        for slot in &config.model_pool.slots {
+            if slot.enabled && slot.id != primary_model_id {
+                app_provider_refs.push(&slot.provider);
+            }
+        }
+        let app_llm_env = merge_app_llm_env_from_providers(&app_provider_refs);
+
+        // Initialize task queue
+        let tasks = Arc::new(RwLock::new(TaskQueue::new()));
+
+        // Wire task queue into runtime so list_tasks action can access it
+        runtime.set_task_queue(tasks.clone());
+
+        // Wire storage into runtime for expense + entity operations
+        runtime.set_storage(storage.clone());
+
+        // Initialize MCP registry and wire into runtime
+        let mcp_registry = Arc::new(RwLock::new(crate::mcp::registry::McpRegistry::new(
+            storage.clone(),
+        )));
+        runtime.set_mcp_registry(mcp_registry.clone());
+
+        // Initialize plugin registry and wire into runtime
+        let plugin_registry = Arc::new(RwLock::new(crate::plugins::registry::PluginRegistry::new(
+            storage.clone(),
+            config_dir.to_path_buf(),
+            data_dir.to_path_buf(),
+        )));
+        runtime.set_plugin_registry(plugin_registry.clone());
+
+        let extension_pack_registry = Arc::new(RwLock::new(
+            crate::extension_packs::ExtensionPackRegistry::new(
+                storage.clone(),
+                config_dir.to_path_buf(),
+                data_dir.to_path_buf(),
+            ),
+        ));
+        runtime.set_extension_pack_registry(extension_pack_registry.clone());
+
+        // Initialize action security guard (4-pillar defense)
+        let action_guard = match crate::security::ActionGuard::new(
+            identity.signing_key(),
+            identity.did(),
+            config_dir,
+            data_dir,
+        )
+        .await
+        {
+            Ok(guard) => {
+                tracing::info!("Action security guard initialized");
+                let guard = Arc::new(guard.with_semantic_reviewer(llm.clone()));
+                runtime.set_action_guard(guard.clone());
+                Some(guard)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to initialize action security guard: {} - actions will load without security checks",
+                    e
+                );
+                startup_issues.push(StartupIssue::new(
+                    "action_security",
+                    "high",
+                    "Action security guard failed to initialize",
+                    e.to_string(),
+                ));
+                None
+            }
+        };
+
+        // Load all actions (with security guard active)
+        runtime.load_all_actions().await?;
+
+        if let Err(error) = plugin_registry
+            .write()
+            .await
+            .sync_from_storage(&runtime)
+            .await
+        {
+            tracing::warn!("Failed to sync plugin registry from storage: {}", error);
+        }
+        if let Err(error) =
+            crate::custom_apis::sync_to_runtime(&storage, config_dir, data_dir, &runtime).await
+        {
+            tracing::warn!("Failed to sync custom APIs from storage: {}", error);
+        }
+        if let Err(error) = extension_pack_registry
+            .write()
+            .await
+            .sync_from_storage()
+            .await
+        {
+            tracing::warn!(
+                "Failed to sync extension-pack registry from storage: {}",
+                error
+            );
+        }
+        if let Err(error) = extension_pack_registry
+            .read()
+            .await
+            .sync_to_runtime(&runtime)
+            .await
+        {
+            tracing::warn!(
+                "Failed to sync extension-pack runtime actions from storage: {}",
+                error
+            );
+        }
+
+        // Add permission-gating safety rules for actions with unapproved dangerous permissions
+        if let Some(ref guard) = action_guard {
+            if let Ok(action_list) = runtime.list_actions().await {
+                for action_def in &action_list {
+                    let perms = crate::security::ActionGuard::permissions_from_capabilities(
+                        &action_def.capabilities,
+                    );
+                    let unapproved = guard.check_permissions(&action_def.name, &perms).await;
+                    if !unapproved.is_empty() {
+                        let perm_names: Vec<String> =
+                            unapproved.iter().map(|p| p.to_string()).collect();
+                        safety.add_rule(crate::safety::SafetyRule {
+                            name: format!("permission_gate_{}", action_def.name),
+                            description: format!(
+                                "Requires approval for action '{}' - unapproved permissions: {:?}",
+                                action_def.name, perm_names
+                            ),
+                            trigger: crate::safety::RuleTrigger::Action {
+                                name: action_def.name.clone(),
+                            },
+                            condition: None,
+                            action: crate::safety::RuleAction::RequireApproval,
+                            verified: true,
+                        });
+                        tracing::info!(
+                            "Permission gate added for action '{}': {:?}",
+                            action_def.name,
+                            perm_names
+                        );
+                    }
+                }
+            }
+        }
+
+        // MCP servers are warmed in the background after the app starts so slow
+        // stdio providers do not block overall startup.
+
+        // Initialize orchestra for sub-agent delegation
+        let orchestra = Orchestra::new(OrchestraConfig::default());
+
+        // Initialize security guard for prompt injection/leakage protection
+        let security = SecurityGuard::new(true); // Strict mode enabled
+
+        // Load persisted user profile (encrypted at rest)
+        let mut user_profile = match encrypted_storage.get_decrypted("user_profile").await {
+            Ok(Some(bytes)) => serde_json::from_slice::<UserProfile>(&bytes).unwrap_or_default(),
+            _ => UserProfile::default(),
+        };
+        let mut user_profile_dirty = false;
+        // Legacy cleanup: these fields were previously auto-extracted from chat and could be noisy.
+        // Keep explicit settings fields (timezone/language/tone/email_format), and let the
+        // cognitive-memory pipeline capture durable long-term memory instead.
+        if user_profile.name.is_some()
+            || user_profile.location.is_some()
+            || user_profile.preferences.is_some()
+        {
+            user_profile.name = None;
+            user_profile.location = None;
+            user_profile.preferences = None;
+            user_profile_dirty = true;
+        }
+        let saved_user_name = storage
+            .get_user_preference("user_name", None)
+            .await
+            .ok()
+            .flatten()
+            .map(|item| item.value);
+        let saved_priority_focus = storage
+            .get_user_preference("assistant_priority_focus", None)
+            .await
+            .ok()
+            .flatten()
+            .map(|item| item.value);
+        if !user_profile.onboarding_complete
+            && Self::onboarding_profile_ready(
+                &user_profile,
+                saved_user_name.as_deref(),
+                saved_priority_focus.as_deref(),
+            )
+        {
+            user_profile.onboarding_complete = true;
+            user_profile_dirty = true;
+        }
+        if user_profile_dirty {
+            if let Ok(bytes) = serde_json::to_vec(&user_profile) {
+                if let Err(e) = encrypted_storage
+                    .set_encrypted("user_profile", &bytes)
+                    .await
+                {
+                    tracing::warn!("Failed to persist updated user profile fields: {}", e);
+                }
+            }
+        }
+
+        // Load persisted tasks (if any)
+        if let Ok(stored_tasks) = storage.get_tasks().await {
+            let mut queue = tasks.write().await;
+            for t in stored_tasks {
+                let id = uuid::Uuid::parse_str(&t.id).unwrap_or_else(|_| uuid::Uuid::new_v4());
+                let arguments =
+                    serde_json::from_str(&t.arguments).unwrap_or_else(|_| serde_json::json!({}));
+                let approval = super::task::normalized_task_approval(
+                    &serde_json::from_str(&t.approval).unwrap_or(super::task::TaskApproval::Auto),
+                );
+                let mut status =
+                    serde_json::from_str(&t.status).unwrap_or(super::task::TaskStatus::Pending);
+                if super::task::task_requires_explicit_approval(&approval)
+                    && matches!(
+                        status,
+                        super::task::TaskStatus::Pending
+                            | super::task::TaskStatus::AwaitingApproval
+                    )
+                {
+                    status = super::task::TaskStatus::AwaitingApproval;
+                }
+                let created_at = chrono::DateTime::parse_from_rfc3339(&t.created_at)
+                    .map(|d| d.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| chrono::Utc::now());
+                let scheduled_for = t
+                    .scheduled_for
+                    .as_deref()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|d| d.with_timezone(&chrono::Utc));
+                let proof_id = t
+                    .proof_id
+                    .as_deref()
+                    .and_then(|s| uuid::Uuid::parse_str(s).ok());
+
+                queue.add(super::task::Task {
+                    id,
+                    description: t.description,
+                    action: t.action,
+                    arguments,
+                    approval,
+                    capabilities: vec![],
+                    status,
+                    created_at,
+                    scheduled_for,
+                    cron: t.cron,
+                    result: t.result,
+                    proof_id,
+                    priority: t.priority.map(|v| v as f32),
+                    urgency: t.urgency.map(|v| v as f32),
+                    importance: t.importance.map(|v| v as f32),
+                    eisenhower_quadrant: t.eisenhower_quadrant.map(|v| v as u8),
+                });
+            }
+        }
+
+        // Initialize integration manager
+        let integrations = Arc::new(crate::integrations::IntegrationManager::new(config_dir));
+
+        // Configure media generation providers from saved config
+        if !config.media_gen.provider_api_keys.is_empty() {
+            if let Some(media_gen) = integrations.get("media_gen") {
+                for (provider, api_key) in &config.media_gen.provider_api_keys {
+                    if !api_key.is_empty() && api_key != "[ENCRYPTED]" {
+                        let canonical_provider =
+                            crate::integrations::media_gen::MediaProvider::parse(provider)
+                                .map(|provider| provider.id().to_string())
+                                .unwrap_or_else(|| provider.clone());
+                        let base_url = config
+                            .media_gen
+                            .provider_base_urls
+                            .get(&canonical_provider)
+                            .or_else(|| config.media_gen.provider_base_urls.get(provider))
+                            .cloned();
+                        let mut payload = serde_json::json!({
+                            "provider": canonical_provider,
+                            "api_key": api_key
+                        });
+                        if let Some(base_url) = base_url
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                        {
+                            payload["base_url"] = serde_json::Value::String(base_url.to_string());
+                        }
+                        let _ = media_gen.execute("configure_provider", &payload).await;
+                        tracing::info!("Configured media gen provider: {}", provider);
+                    }
+                }
+            }
+        }
+
+        // Initialize swarm manager (always active - specialists are optional boosters)
+        let swarm = match SwarmManager::new(config.swarm.clone()).await {
+            Ok(manager) => {
+                tracing::info!(
+                    "Swarm manager initialized with {} specialists",
+                    manager.config.specialists.len()
+                );
+                Some(manager)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to initialize swarm manager: {}", e);
+                None
+            }
+        };
+
+        // Restore persisted hooks/automations from storage.
+        let persisted_hooks = match storage.get(HOOKS_STORAGE_KEY).await {
+            Ok(Some(raw)) => match serde_json::from_slice::<Vec<crate::hooks::Hook>>(&raw) {
+                Ok(hooks) => hooks,
+                Err(e) => {
+                    tracing::warn!("Failed to parse persisted hooks; starting empty: {}", e);
+                    Vec::new()
+                }
+            },
+            Ok(None) => Vec::new(),
+            Err(e) => {
+                tracing::warn!("Failed to load persisted hooks; starting empty: {}", e);
+                Vec::new()
+            }
+        };
+
+        let (notification_events, _) = broadcast::channel(256);
+
+        // Sync auto-approve list from config into safety and runtime enforcement at startup.
+        safety.set_auto_approved(&config.auto_approve);
+        runtime.set_auto_approved_actions(&config.auto_approve);
+        runtime.set_tool_args_guard_config(config.security.tool_args.clone());
+
+        let app_registry = {
+            let reg = crate::actions::app::AppRegistry::with_paths(
+                config_dir.to_path_buf(),
+                data_dir.to_path_buf(),
+            );
+            {
+                let reg_for_boot = reg.clone();
+                let storage_for_boot = storage.clone();
+                let config_dir_for_boot = config_dir.to_path_buf();
+                let data_dir_for_boot = data_dir.to_path_buf();
+                let app_llm_env_for_boot = app_llm_env.clone();
+                crate::spawn_logged!("src/core/agent/startup.rs:app_boot_reconcile", async move {
+                    let boot_report = reg_for_boot.reconcile_on_boot().await;
+                    match crate::sentinel::find_stale_app_references_in_pulse_events(
+                        &storage_for_boot,
+                        &boot_report.valid_app_ids,
+                    )
+                    .await
+                    {
+                        Ok(stale_report) => {
+                            if !stale_report.event_ids.is_empty() {
+                                if let Err(error) = storage_for_boot
+                                    .delete_arkpulse_events_by_ids(&stale_report.event_ids)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "Failed to delete stale ArkPulse app events during startup: {}",
+                                        error
+                                    );
+                                }
+                            }
+                            let mut deleted_app_ids = boot_report.quarantined_app_ids.clone();
+                            deleted_app_ids.extend(stale_report.missing_app_ids);
+                            for app_id in deleted_app_ids {
+                                reg_for_boot.purge_deleted_app_state(&app_id).await;
+                                if let Err(error) = storage_for_boot
+                                    .delete_app_notifications(&app_id, None)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "Failed to delete stale app notifications during startup (app={}): {}",
+                                        app_id,
+                                        error
+                                    );
+                                }
+                            }
+                        }
+                        Err(error) => tracing::warn!(
+                            "Failed to reconcile stale ArkPulse app references during startup: {}",
+                            error
+                        ),
+                    }
+                    reg_for_boot
+                        .restore_from_disk(
+                            &config_dir_for_boot,
+                            &data_dir_for_boot,
+                            &app_llm_env_for_boot,
+                        )
+                        .await;
+                });
+            }
+            reg
+        };
+
+        let agent = Self {
+            _agent_id: AgentId::new(),
+            storage: storage.clone(),
+            encrypted_storage,
+            identity,
+            safety,
+            proofs,
+            runtime: Arc::new(runtime),
+            mcp: mcp_registry,
+            plugins: plugin_registry,
+            extension_packs: extension_pack_registry,
+            llm,
+            embedding_client,
+            model_pool: model_pool_map,
+            execution_supervisor: super::ExecutionSupervisor::default(),
+            primary_model_id,
+            tasks,
+            background_sessions: super::background_session::BackgroundSessionManager::new(Some(
+                storage.clone(),
+            ))
+            .await,
+            config,
+            config_dir: config_dir.to_path_buf(),
+            data_dir: data_dir.to_path_buf(),
+            _orchestra: orchestra,
+            swarm,
+            task_router: super::task_router::TaskRouter::new(
+                super::task_router::TaskRouterConfig::default(),
+            ),
+            swarm_activity: Arc::new(crate::core::swarm::SwarmActivityTracker::new(200)),
+            security,
+            conversation_history: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            integration_connect_flows: Arc::new(RwLock::new(HashMap::new())),
+            pending_skill_imports: Arc::new(RwLock::new(HashMap::new())),
+            pending_secret_followups: Arc::new(RwLock::new(HashMap::new())),
+            pending_chat_credential_prompts: Arc::new(RwLock::new(HashMap::new())),
+            user_profile: Arc::new(RwLock::new(user_profile)),
+            last_trace: Arc::new(RwLock::new(ExecutionTrace::default())),
+            trace_history: Arc::new(RwLock::new(Vec::new())),
+            integrations,
+            hooks: crate::hooks::HookManager::from_hooks(persisted_hooks),
+            last_conversation_id: Arc::new(RwLock::new(None)),
+            last_conversation_title: Arc::new(RwLock::new(None)),
+            api_key,
+            watcher_manager: super::watcher::WatcherManager::new(
+                Some(data_dir),
+                Some(storage.clone()),
+            )
+            .await,
+            browser_sessions: super::browser_session::BrowserSessionManager::new(Some(
+                storage.clone(),
+            ))
+            .await,
+            last_activity: Arc::new(RwLock::new(None)),
+            active_message_requests: Arc::new(AtomicUsize::new(0)),
+            security_events: Arc::new(SecurityEvents::new()),
+            user_selected_model_slot_id: Arc::new(std::sync::RwLock::new(user_selected_model_slot)),
+            notification_events,
+            live_runs: Arc::new(crate::core::LiveRunRegistry::new(Some(storage.clone()))),
+            startup_issues: Arc::new(RwLock::new(startup_issues)),
+            app_registry,
+        };
+
+        {
+            let agent_for_approval_repair = agent.clone();
+            crate::spawn_logged!("src/core/agent/startup.rs:approval_repair", async move {
+                if let Err(error) = agent_for_approval_repair
+                    .repair_unrecoverable_approval_tasks()
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to repair unrecoverable approval tasks during startup: {}",
+                        error
+                    );
+                }
+            });
+        }
+
+        {
+            let agent_for_catalog = agent.clone();
+            crate::spawn_logged!("src/core/agent/startup.rs:action_catalog_warmup", async move {
+                match agent_for_catalog.load_action_catalog_actions().await {
+                    Ok(actions) => agent_for_catalog.spawn_action_catalog_index_sync(actions, "startup"),
+                    Err(error) => {
+                        tracing::warn!("Failed to load actions for catalog index sync: {}", error);
+                        agent_for_catalog
+                            .push_startup_issue(StartupIssue::new(
+                                "action_catalog_index",
+                                "warning",
+                                "Action catalog semantic index sync could not start",
+                                error.to_string(),
+                            ))
+                            .await;
+                    }
+                }
+            });
+        }
+
+        {
+            let agent_for_product_help = agent.clone();
+            crate::spawn_logged!("src/core/agent/startup.rs:product_help_sync", async move {
+                match agent_for_product_help.sync_bundled_product_help().await {
+                    Ok(count) => {
+                        tracing::info!("Synced {} bundled product-help knowledge item(s)", count)
+                    }
+                    Err(error) => {
+                        tracing::warn!("Failed to sync bundled product-help knowledge: {}", error);
+                        agent_for_product_help
+                            .push_startup_issue(StartupIssue::new(
+                                "product_help",
+                                "warning",
+                                "Bundled product-help sync failed during startup",
+                                error.to_string(),
+                            ))
+                            .await;
+                    }
+                }
+            });
+        }
+
+        Ok(agent)
+    }
+
+    pub(super) async fn push_startup_issue(&self, issue: StartupIssue) {
+        let mut issues = self.startup_issues.write().await;
+        if issues.len() >= 64 {
+            issues.remove(0);
+        }
+        issues.push(issue);
+    }
+
+    pub fn startup_issues_handle(&self) -> Arc<RwLock<Vec<StartupIssue>>> {
+        Arc::clone(&self.startup_issues)
+    }
+
+    pub(super) async fn load_action_catalog_actions(
+        &self,
+    ) -> Result<Vec<crate::actions::ActionDef>> {
+        let mut actions = self.runtime.list_enabled_actions().await?;
+        self.append_dynamic_integration_actions(&mut actions).await;
+        let calendar_available = self.calendar_integration_is_configured();
+        Self::retain_actions_for_connected_integrations(&mut actions, calendar_available);
+        Ok(actions)
+    }
+
+    pub(super) fn spawn_action_catalog_index_sync(
+        &self,
+        actions: Vec<crate::actions::ActionDef>,
+        reason: &'static str,
+    ) {
+        if actions.is_empty() {
+            return;
+        }
+        if ACTION_CATALOG_SYNC_ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            tracing::debug!(
+                "Action catalog index sync already active; skipped {} refresh",
+                reason
+            );
+            return;
+        }
+
+        let agent = self.clone();
+        crate::spawn_logged!("src/core/agent.rs:action_catalog_index_sync", async move {
+            let result = agent.sync_action_catalog_index(&actions).await;
+            ACTION_CATALOG_SYNC_ACTIVE.store(false, Ordering::Release);
+            match result {
+                Ok(stats) => tracing::info!(
+                    "Action catalog index sync complete reason={} actions={} embedded={} reused={} missing_embeddings={} disabled={} embedding_failures={}",
+                    reason,
+                    stats.actions_seen,
+                    stats.embedded,
+                    stats.reused_embeddings,
+                    stats.missing_embeddings,
+                    stats.stale_disabled,
+                    stats.embedding_failures
+                ),
+                Err(error) => {
+                    tracing::warn!(
+                        "Action catalog index sync failed reason={}: {}",
+                        reason,
+                        error
+                    );
+                    agent
+                        .push_startup_issue(StartupIssue::new(
+                            "action_catalog_index",
+                            "warning",
+                            "Action catalog semantic index sync failed",
+                            error.to_string(),
+                        ))
+                        .await;
+                }
+            }
+        });
+    }
+
+    pub(super) async fn sync_action_catalog_index(
+        &self,
+        actions: &[crate::actions::ActionDef],
+    ) -> Result<ActionCatalogSyncStats> {
+        let descriptors = actions
+            .iter()
+            .map(build_action_catalog_descriptor)
+            .collect::<Vec<_>>();
+        let action_names = descriptors
+            .iter()
+            .map(|descriptor| descriptor.action_name.clone())
+            .collect::<Vec<_>>();
+        let existing = self
+            .storage
+            .action_catalog_index_entries(&action_names)
+            .await?;
+        let mut stats = ActionCatalogSyncStats {
+            actions_seen: descriptors.len(),
+            ..Default::default()
+        };
+        let mut embeddings_by_action: HashMap<String, Option<PgVector>> = HashMap::new();
+        let mut embed_inputs = Vec::new();
+
+        for descriptor in &descriptors {
+            let existing_row = existing.get(&descriptor.action_name);
+            if action_catalog_entry_needs_embedding(descriptor, existing_row) {
+                embed_inputs.push((
+                    descriptor.action_name.clone(),
+                    descriptor.descriptor_text.clone(),
+                ));
+            } else if let Some(embedding) = existing_row
+                .and_then(|row| row.embedding.clone())
+                .filter(action_catalog_embedding_has_default_dim)
+            {
+                stats.reused_embeddings += 1;
+                embeddings_by_action.insert(descriptor.action_name.clone(), Some(embedding));
+            }
+        }
+
+        if !embed_inputs.is_empty() {
+            if let Some(embedder) = self.embedding_client.as_deref() {
+                let texts = embed_inputs
+                    .iter()
+                    .map(|(_, text)| text.clone())
+                    .collect::<Vec<_>>();
+                match embedder.embed_texts(&texts).await {
+                    Ok(embeddings) if embeddings.len() == embed_inputs.len() => {
+                        for ((action_name, _), embedding) in
+                            embed_inputs.into_iter().zip(embeddings.into_iter())
+                        {
+                            if action_catalog_embedding_has_default_dim(&embedding) {
+                                stats.embedded += 1;
+                                embeddings_by_action.insert(action_name, Some(embedding));
+                            } else {
+                                stats.embedding_failures += 1;
+                                stats.missing_embeddings += 1;
+                                embeddings_by_action.insert(action_name, None);
+                            }
+                        }
+                    }
+                    Ok(embeddings) => {
+                        tracing::warn!(
+                            "Action catalog embedding batch returned {} vectors for {} descriptors",
+                            embeddings.len(),
+                            embed_inputs.len()
+                        );
+                        stats.embedding_failures += embed_inputs.len();
+                        stats.missing_embeddings += embed_inputs.len();
+                        for (action_name, _) in embed_inputs {
+                            embeddings_by_action.insert(action_name, None);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!("Action catalog embedding batch failed: {}", error);
+                        stats.embedding_failures += embed_inputs.len();
+                        stats.missing_embeddings += embed_inputs.len();
+                        for (action_name, _) in embed_inputs {
+                            embeddings_by_action.insert(action_name, None);
+                        }
+                    }
+                }
+            } else {
+                stats.missing_embeddings += embed_inputs.len();
+                for (action_name, _) in embed_inputs {
+                    embeddings_by_action.insert(action_name, None);
+                }
+            }
+        }
+
+        for descriptor in descriptors {
+            let embedding = embeddings_by_action
+                .remove(&descriptor.action_name)
+                .flatten();
+            self.storage
+                .upsert_action_catalog_index_entry(&crate::storage::ActionCatalogIndexEntry {
+                    action_name: descriptor.action_name,
+                    source: descriptor.source,
+                    version: descriptor.version,
+                    descriptor_hash: descriptor.descriptor_hash,
+                    descriptor_text: descriptor.descriptor_text,
+                    enabled: true,
+                    metadata_json: descriptor.metadata_json,
+                    embedding,
+                })
+                .await?;
+        }
+
+        stats.stale_disabled = self
+            .storage
+            .mark_unavailable_action_catalog_entries_disabled(&action_names)
+            .await?;
+        Ok(stats)
+    }
+
+    pub async fn sync_bundled_product_help(&self) -> Result<usize> {
+        let actions = self.load_action_catalog_actions().await?;
+        let items = crate::core::product_help::build_seed_knowledge_items(&actions);
+
+        self.storage
+            .delete_knowledge_items_by_source(crate::core::product_help::CURATED_SOURCE)
+            .await?;
+        self.storage
+            .delete_knowledge_items_by_source(crate::core::product_help::RUNTIME_SOURCE)
+            .await?;
+
+        let mut inserted = 0usize;
+        for item in items {
+            self.storage
+                .create_knowledge_item(
+                    &item.title,
+                    &item.content,
+                    Some(item.source),
+                    item.url.as_deref(),
+                    item.tags.as_deref(),
+                    None,
+                )
+                .await?;
+            inserted += 1;
+        }
+
+        Ok(inserted)
+    }
+}

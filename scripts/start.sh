@@ -58,39 +58,16 @@ upsert_managed_env_value() {
 
 ensure_postgres_password() {
     mkdir -p "$(dirname "$AGENTARK_LOCAL_ENV")"
-    local existing
-    existing="$(read_env_value AGENTARK_POSTGRES_PASSWORD "$AGENTARK_LOCAL_ENV")"
-    if [ -n "$existing" ]; then
-        AGENTARK_POSTGRES_PASSWORD="$existing"
-        export AGENTARK_POSTGRES_PASSWORD
-        return 0
+    touch "$AGENTARK_LOCAL_ENV"
+    if grep -q '^AGENTARK_POSTGRES_PASSWORD=' "$AGENTARK_LOCAL_ENV"; then
+        local tmp_file
+        tmp_file="$(mktemp)"
+        grep -v '^AGENTARK_POSTGRES_PASSWORD=' "$AGENTARK_LOCAL_ENV" > "$tmp_file"
+        cat "$tmp_file" > "$AGENTARK_LOCAL_ENV"
+        rm -f "$tmp_file"
     fi
-    existing="$(read_env_value AGENTARK_POSTGRES_PASSWORD ".env")"
-    if [ -n "$existing" ]; then
-        upsert_managed_env_value AGENTARK_POSTGRES_PASSWORD "$existing"
-        AGENTARK_POSTGRES_PASSWORD="$existing"
-        export AGENTARK_POSTGRES_PASSWORD
-        echo -e "${GREEN}Migrated local Postgres password to ${AGENTARK_LOCAL_ENV}${NC}"
-        return 0
-    fi
-
-    local generated=""
-    if command -v openssl >/dev/null 2>&1; then
-        generated="$(openssl rand -hex 24 2>/dev/null || true)"
-    fi
-    if [ -z "$generated" ] && [ -r /dev/urandom ]; then
-        generated="$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')"
-    fi
-    if [ -z "$generated" ]; then
-        echo -e "${RED}Failed to generate a local Postgres password.${NC}"
-        return 1
-    fi
-
-    upsert_managed_env_value AGENTARK_POSTGRES_PASSWORD "$generated"
-    AGENTARK_POSTGRES_PASSWORD="$generated"
-    export AGENTARK_POSTGRES_PASSWORD
-
-    echo -e "${GREEN}Generated a local Postgres password in ${AGENTARK_LOCAL_ENV}${NC}"
+    unset AGENTARK_POSTGRES_PASSWORD
+    echo -e "${GREEN}Local Postgres password is managed inside the Docker volume agentark-secrets.${NC}"
 }
 
 verify_lightpanda_runtime() {
@@ -110,12 +87,17 @@ verify_lightpanda_runtime() {
     return 1
 }
 
+verify_lightpanda_runtime_async() {
+    mkdir -p "$(dirname "$AGENTARK_LOCAL_ENV")"
+    (verify_lightpanda_runtime > "$(dirname "$AGENTARK_LOCAL_ENV")/lightpanda-check.log" 2>&1 || true) &
+}
+
 case "${1:-start}" in
     start)
         ensure_postgres_password || exit 1
         echo -e "${GREEN}Starting AgentArk...${NC}"
         compose up -d
-        verify_lightpanda_runtime
+        verify_lightpanda_runtime_async
         echo ""
         echo -e "${GREEN}AgentArk is running!${NC}"
         echo -e "  Web UI:  ${CYAN}http://localhost:8990${NC}"
@@ -159,7 +141,7 @@ case "${1:-start}" in
         ensure_postgres_password || exit 1
         echo -e "${GREEN}Starting AgentArk with remote access...${NC}"
         AGENTARK_TUNNEL=true compose up -d
-        verify_lightpanda_runtime
+        verify_lightpanda_runtime_async
         echo ""
         echo -e "${GREEN}AgentArk is starting with secure tunnel!${NC}"
         echo ""
@@ -192,8 +174,8 @@ case "${1:-start}" in
         ;;
     restart)
         echo -e "${YELLOW}Restarting AgentArk...${NC}"
-        compose restart agentark-control agentark-workspace agentark-executor
-        verify_lightpanda_runtime
+        compose restart agentark-control agentark-workspace agentark-executor agentark-embeddings
+        verify_lightpanda_runtime_async
         ;;
     logs)
         compose logs -f
@@ -203,14 +185,14 @@ case "${1:-start}" in
         echo -e "${YELLOW}Updating AgentArk (your data will be preserved)...${NC}"
         compose pull
         compose up -d
-        verify_lightpanda_runtime
+        verify_lightpanda_runtime_async
         echo -e "${GREEN}Update complete! Your data is intact.${NC}"
         ;;
     build)
         ensure_postgres_password || exit 1
         echo -e "${YELLOW}Building AgentArk from this checkout and force-recreating containers (your data will be preserved)...${NC}"
         AGENTARK_IMAGE=${AGENTARK_IMAGE:-agentark:dev} compose_dev up -d --build --force-recreate
-        verify_lightpanda_runtime
+        verify_lightpanda_runtime_async
         echo -e "${GREEN}Local build complete! Your data is intact.${NC}"
         ;;
     backup)

@@ -449,7 +449,7 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
               </Typography>
               <Box
                 sx={{
-                  border: "1px solid rgba(110, 160, 255, 0.18)",
+                  border: "1px solid var(--ui-rgba-110-160-255-180)",
                   borderRadius: 2,
                   p: 1.25,
                   minHeight: 160
@@ -544,7 +544,7 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
                   <Box
                     key={pluginId}
                     sx={{
-                      border: "1px solid rgba(110, 160, 255, 0.18)",
+                      border: "1px solid var(--ui-rgba-110-160-255-180)",
                       borderRadius: 2,
                       p: 1.5
                     }}

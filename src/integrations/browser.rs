@@ -1,5 +1,4 @@
 //! Browser automation integration via Playwright bridge
-//!
 //! HTTP client that communicates with the local Playwright bridge
 //! to control a headless browser for web automation tasks.
 
@@ -101,6 +100,56 @@ fn browser_target_host_allowed(host: &url::Host<&str>) -> bool {
     }
 }
 
+fn browser_app_path_allowed(path: &str) -> bool {
+    path == "/apps" || path == "/apps/" || path.starts_with("/apps/")
+}
+
+fn browser_host_is_local_or_wildcard(host: &url::Host<&str>) -> bool {
+    match host {
+        url::Host::Domain(domain) => {
+            let lower = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+            lower == "localhost"
+                || lower.ends_with(".localhost")
+                || lower == "0.0.0.0"
+                || lower == "::"
+        }
+        url::Host::Ipv4(ip) => ip.is_loopback() || ip.is_unspecified(),
+        url::Host::Ipv6(ip) => ip.is_loopback() || ip.is_unspecified(),
+    }
+}
+
+fn browser_hosts_match_for_internal_app(
+    target: &url::Host<&str>,
+    internal: &url::Host<&str>,
+) -> bool {
+    if target.to_string().eq_ignore_ascii_case(&internal.to_string()) {
+        return true;
+    }
+    browser_host_is_local_or_wildcard(target) && browser_host_is_local_or_wildcard(internal)
+}
+
+fn browser_target_is_internal_app_url(parsed: &url::Url) -> bool {
+    if !browser_app_path_allowed(parsed.path()) {
+        return false;
+    }
+    let Ok(internal_base) = url::Url::parse(&crate::core::net::internal_api_base_url()) else {
+        return false;
+    };
+    if parsed.scheme() != internal_base.scheme() {
+        return false;
+    }
+    if parsed.port_or_known_default() != internal_base.port_or_known_default() {
+        return false;
+    }
+    let Some(target_host) = parsed.host() else {
+        return false;
+    };
+    let Some(internal_host) = internal_base.host() else {
+        return false;
+    };
+    browser_hosts_match_for_internal_app(&target_host, &internal_host)
+}
+
 fn validate_browser_url(url: &str) -> Result<url::Url> {
     let parsed = url::Url::parse(url).map_err(|e| anyhow!("Invalid browser URL: {}", e))?;
     match parsed.scheme() {
@@ -115,7 +164,7 @@ fn validate_browser_url(url: &str) -> Result<url::Url> {
     let host = parsed
         .host()
         .ok_or_else(|| anyhow!("Browser URL must include a host"))?;
-    if !browser_target_host_allowed(&host) {
+    if !browser_target_host_allowed(&host) && !browser_target_is_internal_app_url(&parsed) {
         return Err(anyhow!("Browser URL target is not allowed"));
     }
     Ok(parsed)
@@ -383,6 +432,16 @@ mod tests {
         assert!(validate_browser_url("http://127.0.0.1:8080").is_err());
         assert!(validate_browser_url("http://localhost:8080").is_err());
         assert!(validate_browser_url("http://169.254.169.254/latest/meta-data").is_err());
+    }
+
+    #[test]
+    fn browser_accepts_internal_app_targets_only() {
+        let base = crate::core::net::internal_api_base_url();
+        let app_url = format!("{}/apps/demo/", base.trim_end_matches('/'));
+        let control_url = format!("{}/api/health", base.trim_end_matches('/'));
+
+        assert!(validate_browser_url(&app_url).is_ok());
+        assert!(validate_browser_url(&control_url).is_err());
     }
 
     #[test]

@@ -56,12 +56,20 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import useMediaQuery from "@mui/material/useMediaQuery";
 import { api } from "./api/client";
 import { PersonalizeAgentArkDialog } from "./components/PersonalizeAgentArkDialog";
+import { AmberCascadesBackground } from "./components/AmberCascadesBackground";
 import {
   NativeWorkspace,
   preloadCommonSettingsPanels,
   preloadWorkspaceSurface,
   type WorkspaceView,
 } from "./components/NativeWorkspace";
+import SettingsPage from "./components/pages/SettingsPage";
+import {
+  CORE_SETTINGS_STALE_TIME_MS,
+  fetchSettings,
+  prefetchSettingsPageData,
+  SETTINGS_QUERY_KEYS,
+} from "./components/pages/settingsData";
 import { OverviewPane } from "./components/OverviewPane";
 import { LibraryPane } from "./components/LibraryPane";
 import { useUiStore } from "./store/uiStore";
@@ -113,7 +121,6 @@ const loadBrowserHandoffPageLazy = memoizeModuleLoader(() =>
     default: module.BrowserHandoffPage,
   })),
 );
-
 const ApprovalPromptOverlay = lazy(loadApprovalPromptOverlayLazy);
 const GuidedTour = lazy(loadGuidedTourLazy);
 const BrowserHandoffPage = lazy(loadBrowserHandoffPageLazy);
@@ -154,7 +161,6 @@ type ViewKey =
   | "tasks"
   | "sessions"
   | "apps"
-  | "moltbook"
   | "arkpulse"
   | "arkmemory"
   | "goals"
@@ -307,7 +313,6 @@ const VIEW_KEYS: ReadonlySet<ViewKey> = new Set<ViewKey>([
   "tasks",
   "sessions",
   "apps",
-  "moltbook",
   "arkpulse",
   "arkmemory",
   "goals",
@@ -452,7 +457,6 @@ const VIEW_PATH_SEGMENTS: Record<ViewKey, string> = {
   tasks: "tasks",
   sessions: "sessions",
   apps: "apps",
-  moltbook: "moltbook",
   arkpulse: "arkpulse",
   arkmemory: "arkmemory",
   goals: "goals",
@@ -868,8 +872,9 @@ export default function App() {
     refetchInterval: false,
   });
   const appSettingsQ = useQuery({
-    queryKey: ["settings"],
-    queryFn: () => api.rawGet("/settings"),
+    queryKey: SETTINGS_QUERY_KEYS.settings,
+    queryFn: fetchSettings,
+    staleTime: CORE_SETTINGS_STALE_TIME_MS,
     refetchInterval: false,
   });
   const profileRecord = asRecord(profileQ.data);
@@ -943,11 +948,12 @@ export default function App() {
         options?.settingsTab,
       );
       preloadWorkspaceSurface(nextView as WorkspaceView, settingsTab);
-      if (nextView === "settings" && settingsTab == null) {
+      if (nextView === "settings" || settingsTab != null) {
         preloadCommonSettingsPanels();
+        prefetchSettingsPageData(queryClient);
       }
     },
-    [],
+    [queryClient],
   );
   const navigateToView = useCallback(
     (
@@ -990,13 +996,14 @@ export default function App() {
     }, 900);
     const cancelSettingsWarmup = scheduleWarmup(() => {
       preloadAppView("settings");
+      prefetchSettingsPageData(queryClient);
       void loadGuidedTourModule();
     }, 1800);
     return () => {
       cancelCoreWarmup();
       cancelSettingsWarmup();
     };
-  }, [preloadAppView]);
+  }, [preloadAppView, queryClient]);
 
   useEffect(() => {
     const syncFromLocation = (replaceInvalid: boolean) => {
@@ -1154,6 +1161,9 @@ export default function App() {
 
   useEffect(() => {
     if (typeof window === "undefined") return undefined;
+    let invalidationTimer: number | null = null;
+    let pendingApprovalInvalidation = false;
+    let pendingChatInvalidation = false;
 
     const invalidateNotificationViews = (includeApprovalTasks: boolean) => {
       void queryClient.invalidateQueries({ queryKey: ["notifications"] });
@@ -1180,6 +1190,26 @@ export default function App() {
         queryKey: ["autonomy-browser-sessions"],
       });
     };
+    const flushPendingInvalidations = () => {
+      invalidationTimer = null;
+      const includeApprovalTasks = pendingApprovalInvalidation;
+      const includeChatViews = pendingChatInvalidation;
+      pendingApprovalInvalidation = false;
+      pendingChatInvalidation = false;
+      invalidateNotificationViews(includeApprovalTasks);
+      if (includeChatViews) {
+        invalidateChatViews();
+      }
+    };
+    const queueStreamInvalidation = (
+      includeApprovalTasks: boolean,
+      includeChatViews: boolean,
+    ) => {
+      pendingApprovalInvalidation ||= includeApprovalTasks;
+      pendingChatInvalidation ||= includeChatViews;
+      if (invalidationTimer !== null) return;
+      invalidationTimer = window.setTimeout(flushPendingInvalidations, 450);
+    };
 
     const stream = new EventSource("/notifications/stream", {
       withCredentials: true,
@@ -1187,8 +1217,7 @@ export default function App() {
 
     const handleConnected = () => {
       setNotificationsStreamConnected(true);
-      invalidateNotificationViews(true);
-      invalidateChatViews();
+      queueStreamInvalidation(true, true);
     };
 
     const handleNotification = (event: Event) => {
@@ -1202,16 +1231,15 @@ export default function App() {
           payload = {};
         }
       }
-      invalidateNotificationViews(notificationEventAffectsApprovals(payload));
-      if (notificationEventAffectsChat(payload)) {
-        invalidateChatViews();
-      }
+      queueStreamInvalidation(
+        notificationEventAffectsApprovals(payload),
+        notificationEventAffectsChat(payload),
+      );
     };
 
     const handleResync = () => {
       setNotificationsStreamConnected(true);
-      invalidateNotificationViews(true);
-      invalidateChatViews();
+      queueStreamInvalidation(true, true);
     };
 
     const handleClosed = () => {
@@ -1228,6 +1256,9 @@ export default function App() {
     stream.addEventListener("closed", handleClosed);
 
     return () => {
+      if (invalidationTimer !== null) {
+        window.clearTimeout(invalidationTimer);
+      }
       stream.close();
       stream.removeEventListener("connected", handleConnected);
       stream.removeEventListener("notification", handleNotification);
@@ -1548,6 +1579,7 @@ export default function App() {
 
   return (
     <Box className="agi-shell">
+      <AmberCascadesBackground />
       <Box className="bg-orb orb-a" />
       <Box className="bg-orb orb-b" />
       <Box className="app-frame">
@@ -1588,26 +1620,27 @@ export default function App() {
               <Box className="shell-brand-mark">
                 <img src="/logo.svg" alt="AgentArk" width={36} height={36} />
               </Box>
-              <Box sx={{ minWidth: 0 }}>
+              <Box className="shell-brand-copy">
                 <Typography variant="caption" className="shell-kicker">
                   {PRODUCT_NAME}
                 </Typography>
-                <Typography variant="subtitle1" className="shell-title" noWrap>
-                  {PRODUCT_CATEGORY}
-                </Typography>
+                <Box className="shell-title-row">
+                  <Typography variant="subtitle1" className="shell-title" noWrap>
+                    {PRODUCT_CATEGORY}
+                  </Typography>
+                  <Tooltip title={serverTooltip} arrow>
+                    <Box
+                      onClick={() => serverQ.refetch()}
+                      className={serverPulse ? "status-dot status-dot--pulse" : "status-dot"}
+                      style={{
+                        cursor: "pointer",
+                        backgroundColor: serverDotColor,
+                        boxShadow: serverPulse ? `0 0 6px 1px ${serverDotColor}` : "none",
+                      }}
+                    />
+                  </Tooltip>
+                </Box>
               </Box>
-              <Tooltip title={serverTooltip} arrow>
-                <Box
-                  onClick={() => serverQ.refetch()}
-                  className={serverPulse ? "status-dot status-dot--pulse" : "status-dot"}
-                  style={{
-                    marginLeft: 6,
-                    cursor: "pointer",
-                    backgroundColor: serverDotColor,
-                    boxShadow: serverPulse ? `0 0 6px 1px ${serverDotColor}` : "none",
-                  }}
-                />
-              </Tooltip>
             </Stack>
             <Stack
               direction="row"
@@ -1752,9 +1785,9 @@ export default function App() {
               height: { xs: "92vh", md: "84vh" },
               maxHeight: "92vh",
               borderRadius: 2.25,
-              border: "1px solid rgba(255, 255, 255, 0.08)",
+              border: "1px solid var(--ui-rgba-255-255-255-080)",
               background:
-                "linear-gradient(160deg, rgba(24, 24, 28, 0.98), rgba(15, 15, 18, 0.95))",
+                "linear-gradient(160deg, var(--ui-rgba-24-24-28-980), var(--ui-rgba-15-15-18-950))",
               backdropFilter: "blur(18px)",
               WebkitBackdropFilter: "blur(18px)",
               overflow: "hidden",
@@ -1770,7 +1803,7 @@ export default function App() {
             py: 1.25,
             px: 2,
             minHeight: 48,
-            borderBottom: "1px solid rgba(255, 255, 255, 0.08)",
+            borderBottom: "1px solid var(--ui-rgba-255-255-255-080)",
           }}
         >
           <Typography variant="h6" sx={{ lineHeight: 1 }}>
@@ -1785,17 +1818,7 @@ export default function App() {
           </IconButton>
         </DialogTitle>
         <DialogContent sx={{ p: 0, height: "100%", overflow: "hidden" }}>
-          <Suspense fallback={<WorkspacePaneFallback />}>
-            <NativeWorkspace
-              view="settings"
-              autoRefresh={false}
-              showAdvanced={showAdvanced}
-              settingsInitialTab={settingsInitialTab}
-              onNavigateToView={
-                navigateToView as (view: string, replace?: boolean) => void
-              }
-            />
-          </Suspense>
+          <SettingsPage autoRefresh={false} initialTab={settingsInitialTab} />
         </DialogContent>
       </Dialog>
       <Popover
@@ -1811,9 +1834,9 @@ export default function App() {
               maxWidth: "calc(100vw - 24px)",
               borderRadius: 2.5,
               overflow: "hidden",
-              border: "1px solid rgba(255, 255, 255, 0.08)",
-              background: "rgba(22, 22, 26, 0.94)",
-              boxShadow: "0 16px 48px rgba(0, 0, 0, 0.5)",
+              border: "1px solid var(--ui-rgba-255-255-255-080)",
+              background: "var(--ui-rgba-22-22-26-940)",
+              boxShadow: "0 16px 48px var(--ui-rgba-0-0-0-500)",
               backdropFilter: "blur(24px)",
               WebkitBackdropFilter: "blur(24px)",
             },
@@ -1825,7 +1848,7 @@ export default function App() {
             px: 1.5,
             pt: 1.25,
             pb: 1,
-            borderBottom: "1px solid rgba(255, 255, 255, 0.08)",
+            borderBottom: "1px solid var(--ui-rgba-255-255-255-080)",
           }}
         >
           <Stack
@@ -1839,7 +1862,7 @@ export default function App() {
               variant="subtitle1"
               sx={{
                 fontWeight: 600,
-                color: "rgba(244, 245, 247, 0.94)",
+                color: "var(--ui-rgba-244-245-247-940)",
               }}
             >
               Notifications
@@ -1853,10 +1876,10 @@ export default function App() {
               sx={{
                 textTransform: "none",
                 fontSize: "0.75rem",
-                color: "rgba(171, 176, 184, 0.7)",
+                color: "var(--ui-rgba-171-176-184-700)",
                 "&:hover": {
-                  color: "rgba(239, 241, 244, 0.88)",
-                  background: "rgba(255, 255, 255, 0.05)",
+                  color: "var(--ui-rgba-239-241-244-880)",
+                  background: "var(--ui-rgba-255-255-255-050)",
                 },
               }}
             >
@@ -1951,16 +1974,16 @@ export default function App() {
                       py: 0.85,
                       border: "none",
                       background: inputNeeded
-                        ? "rgba(255, 193, 7, 0.06)"
+                        ? "var(--ui-rgba-255-193-7-060)"
                         : "transparent",
                       transition: "background 140ms ease",
                       "&:hover": {
                         background: inputNeeded
-                          ? "rgba(255, 193, 7, 0.1)"
-                          : "rgba(255, 255, 255, 0.05)",
+                          ? "var(--ui-rgba-255-193-7-100)"
+                          : "var(--ui-rgba-255-255-255-050)",
                       },
                       "&:not(:last-child)": {
-                        borderBottom: "1px solid rgba(255, 255, 255, 0.06)",
+                        borderBottom: "1px solid var(--ui-rgba-255-255-255-060)",
                       },
                     }}
                     onClick={async () => {
@@ -1978,11 +2001,11 @@ export default function App() {
                           height: 6,
                           borderRadius: "50%",
                           background: inputNeeded
-                            ? "rgba(255, 193, 7, 0.95)"
-                            : "rgba(244, 245, 247, 0.88)",
+                            ? "var(--ui-rgba-255-193-7-950)"
+                            : "var(--ui-rgba-244-245-247-880)",
                           boxShadow: inputNeeded
-                            ? "0 0 6px rgba(255, 193, 7, 0.45)"
-                            : "0 0 6px rgba(255, 255, 255, 0.18)",
+                            ? "0 0 6px var(--ui-rgba-255-193-7-450)"
+                            : "0 0 6px var(--ui-rgba-255-255-255-180)",
                           flexShrink: 0,
                           mt: 0.8,
                           mr: 1,
@@ -2011,8 +2034,8 @@ export default function App() {
                               minWidth: 0,
                               flex: 1,
                               color: n.read
-                                ? "rgba(177, 181, 189, 0.68)"
-                                : "rgba(244, 245, 247, 0.94)",
+                                ? "var(--ui-rgba-177-181-189-680)"
+                                : "var(--ui-rgba-244-245-247-940)",
                             }}
                           >
                             {displayTitle}
@@ -2022,7 +2045,7 @@ export default function App() {
                             noWrap
                             sx={{
                               flexShrink: 0,
-                              color: "rgba(155, 159, 169, 0.52)",
+                              color: "var(--ui-rgba-155-159-169-520)",
                             }}
                             title={notifTimeAgo(n.created_at).tip}
                           >
@@ -2037,8 +2060,8 @@ export default function App() {
                             sx={{
                               display: "block",
                               color: n.read
-                                ? "rgba(155, 159, 169, 0.6)"
-                                : "rgba(187, 191, 199, 0.78)",
+                                ? "var(--ui-rgba-155-159-169-600)"
+                                : "var(--ui-rgba-187-191-199-780)",
                               lineHeight: 1.45,
                             }}
                             noWrap
@@ -2079,8 +2102,8 @@ export default function App() {
                                 variant="outlined"
                                 sx={{
                                   height: 22,
-                                  color: "rgba(187, 191, 199, 0.76)",
-                                  borderColor: "rgba(255, 255, 255, 0.08)",
+                                  color: "var(--ui-rgba-187-191-199-760)",
+                                  borderColor: "var(--ui-rgba-255-255-255-080)",
                                 }}
                               />
                             ) : null}
@@ -2104,9 +2127,9 @@ export default function App() {
             sx: {
               width: 520,
               maxWidth: "calc(100vw - 24px)",
-              borderLeft: "1px solid rgba(255, 255, 255, 0.08)",
+              borderLeft: "1px solid var(--ui-rgba-255-255-255-080)",
               background:
-                "linear-gradient(160deg, rgba(24, 24, 28, 0.98), rgba(15, 15, 18, 0.95))",
+                "linear-gradient(160deg, var(--ui-rgba-24-24-28-980), var(--ui-rgba-15-15-18-950))",
             },
           },
         }}

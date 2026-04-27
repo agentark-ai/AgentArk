@@ -44,6 +44,21 @@ pub enum MediaProvider {
 }
 
 impl MediaProvider {
+    pub fn id(&self) -> &'static str {
+        match self {
+            Self::Replicate => "replicate",
+            Self::StabilityAi => "stability_ai",
+            Self::Fal => "fal",
+            Self::Together => "together",
+            Self::OpenAiDalle => "openai_dalle",
+            Self::OpenAiSora => "openai_sora",
+            Self::GoogleGemini => "google_gemini",
+            Self::GoogleVeo => "google_veo",
+            Self::Runway => "runway",
+            Self::Luma => "luma",
+        }
+    }
+
     pub fn name(&self) -> &str {
         match self {
             Self::Replicate => "Replicate",
@@ -56,6 +71,44 @@ impl MediaProvider {
             Self::GoogleVeo => "Google Veo",
             Self::Runway => "Runway ML",
             Self::Luma => "Luma AI",
+        }
+    }
+
+    pub fn default_base_url(&self) -> &'static str {
+        match self {
+            MediaProvider::Replicate => "https://api.replicate.com/v1",
+            MediaProvider::StabilityAi => "https://api.stability.ai/v1",
+            MediaProvider::Fal => "https://fal.run",
+            MediaProvider::Together => "https://api.together.xyz/v1",
+            MediaProvider::OpenAiDalle => "https://api.openai.com/v1",
+            MediaProvider::OpenAiSora => "https://api.openai.com/v1",
+            MediaProvider::GoogleGemini => "https://generativelanguage.googleapis.com/v1beta",
+            MediaProvider::GoogleVeo => "https://generativelanguage.googleapis.com/v1beta",
+            MediaProvider::Runway => "https://api.runwayml.com/v1",
+            MediaProvider::Luma => "https://api.lumalabs.ai/dream-machine/v1",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        let normalized = value
+            .trim()
+            .to_ascii_lowercase()
+            .replace('-', "_")
+            .replace(' ', "_");
+        match normalized.as_str() {
+            "replicate" => Some(Self::Replicate),
+            "stability_ai" | "stability" => Some(Self::StabilityAi),
+            "fal" | "fal_ai" => Some(Self::Fal),
+            "together" | "together_ai" => Some(Self::Together),
+            "openai" | "openai_dalle" | "open_ai_dalle" | "dalle" | "dall_e" => {
+                Some(Self::OpenAiDalle)
+            }
+            "openai_sora" | "open_ai_sora" | "sora" => Some(Self::OpenAiSora),
+            "google" | "gemini" | "google_gemini" => Some(Self::GoogleGemini),
+            "google_veo" | "veo" => Some(Self::GoogleVeo),
+            "runway" | "runway_ml" => Some(Self::Runway),
+            "luma" | "luma_ai" => Some(Self::Luma),
+            _ => None,
         }
     }
 
@@ -169,27 +222,26 @@ impl MediaGenConnector {
         }
     }
 
-    /// Configure a provider with API key
-    pub async fn configure_provider(&self, provider: MediaProvider, api_key: String) {
-        let base_url = match provider {
-            MediaProvider::Replicate => "https://api.replicate.com/v1",
-            MediaProvider::StabilityAi => "https://api.stability.ai/v1",
-            MediaProvider::Fal => "https://fal.run",
-            MediaProvider::Together => "https://api.together.xyz/v1",
-            MediaProvider::OpenAiDalle => "https://api.openai.com/v1",
-            MediaProvider::OpenAiSora => "https://api.openai.com/v1",
-            MediaProvider::GoogleGemini => "https://generativelanguage.googleapis.com/v1beta",
-            MediaProvider::GoogleVeo => "https://generativelanguage.googleapis.com/v1beta",
-            MediaProvider::Runway => "https://api.runwayml.com/v1",
-            MediaProvider::Luma => "https://api.lumalabs.ai/dream-machine/v1",
-        };
+    /// Configure a provider with an optional compatible endpoint override.
+    pub async fn configure_provider_with_base_url(
+        &self,
+        provider: MediaProvider,
+        api_key: String,
+        base_url: Option<String>,
+    ) {
+        let base_url = base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.trim_end_matches('/').to_string())
+            .unwrap_or_else(|| provider.default_base_url().to_string());
 
         let mut providers = self.providers.write().await;
         providers.insert(
             provider,
             ProviderConfig {
                 api_key: Zeroizing::new(api_key),
-                base_url: base_url.to_string(),
+                base_url,
             },
         );
 
@@ -874,6 +926,7 @@ impl MediaGenConnector {
         #[derive(Deserialize)]
         struct DalleImage {
             url: Option<String>,
+            b64_json: Option<String>,
             #[serde(rename = "revised_prompt")]
             _revised_prompt: Option<String>,
         }
@@ -884,8 +937,19 @@ impl MediaGenConnector {
             .first()
             .ok_or_else(|| anyhow!("No image generated"))?;
 
+        let url = image
+            .url
+            .clone()
+            .or_else(|| {
+                image
+                    .b64_json
+                    .as_ref()
+                    .map(|data| format!("data:image/png;base64,{}", data))
+            })
+            .unwrap_or_default();
+
         Ok(MediaGenResult {
-            url: image.url.clone().unwrap_or_default(),
+            url,
             media_type: "image".to_string(),
             provider: "OpenAI".to_string(),
             model: model.to_string(),
@@ -1491,7 +1555,7 @@ impl Integration for MediaGenConnector {
                 let provider = params
                     .get("provider")
                     .and_then(|v| v.as_str())
-                    .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok());
+                    .and_then(MediaProvider::parse);
 
                 let result = self.generate_image(request, provider).await?;
                 Ok(serde_json::to_value(result)?)
@@ -1501,20 +1565,30 @@ impl Integration for MediaGenConnector {
                 let provider = params
                     .get("provider")
                     .and_then(|v| v.as_str())
-                    .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok());
+                    .and_then(MediaProvider::parse);
 
                 let result = self.generate_video(request, provider).await?;
                 Ok(serde_json::to_value(result)?)
             }
             "configure_provider" => {
-                let provider: MediaProvider =
-                    serde_json::from_value(params.get("provider").cloned().unwrap_or_default())?;
+                let provider = params
+                    .get("provider")
+                    .and_then(|v| v.as_str())
+                    .and_then(MediaProvider::parse)
+                    .ok_or_else(|| anyhow!("Unknown media provider"))?;
                 let api_key = params
                     .get("api_key")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("Missing api_key"))?;
+                let base_url = params
+                    .get("base_url")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.to_string());
 
-                self.configure_provider(provider, api_key.to_string()).await;
+                self.configure_provider_with_base_url(provider, api_key.to_string(), base_url)
+                    .await;
                 Ok(serde_json::json!({"status": "configured"}))
             }
             "list_providers" => {
@@ -1523,7 +1597,7 @@ impl Integration for MediaGenConnector {
                     .iter()
                     .map(|(p, configured, supports_image)| {
                         serde_json::json!({
-                            "provider": p,
+                            "provider": p.id(),
                             "name": p.name(),
                             "configured": configured,
                             "supports_image": supports_image,
@@ -1534,14 +1608,20 @@ impl Integration for MediaGenConnector {
                 Ok(serde_json::json!({"providers": list}))
             }
             "set_default_image_provider" => {
-                let provider: MediaProvider =
-                    serde_json::from_value(params.get("provider").cloned().unwrap_or_default())?;
+                let provider = params
+                    .get("provider")
+                    .and_then(|v| v.as_str())
+                    .and_then(MediaProvider::parse)
+                    .ok_or_else(|| anyhow!("Unknown media provider"))?;
                 self.set_default_image_provider(provider).await;
                 Ok(serde_json::json!({"status": "ok"}))
             }
             "set_default_video_provider" => {
-                let provider: MediaProvider =
-                    serde_json::from_value(params.get("provider").cloned().unwrap_or_default())?;
+                let provider = params
+                    .get("provider")
+                    .and_then(|v| v.as_str())
+                    .and_then(MediaProvider::parse)
+                    .ok_or_else(|| anyhow!("Unknown media provider"))?;
                 self.set_default_video_provider(provider).await;
                 Ok(serde_json::json!({"status": "ok"}))
             }

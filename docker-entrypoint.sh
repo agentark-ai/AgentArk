@@ -152,6 +152,10 @@ print_startup_banner() {
             echo "  AgentArk Workspace Service Starting..."
             echo "  Internal Workspace API: 0.0.0.0:8992"
             ;;
+        embeddings)
+            echo "  AgentArk Embeddings Sidecar Starting..."
+            echo "  Internal Embeddings API: ${AGENTARK_EMBEDDINGS_BIND:-0.0.0.0:8993}"
+            ;;
         *)
             echo "  AgentArk Starting..."
             echo "  Web UI: http://localhost:8990"
@@ -287,10 +291,86 @@ check_volume_mount() {
     fi
 }
 
+# Assemble AGENTARK_DATABASE_URL from the password file written by the
+# Postgres service startup wrapper (see docker-compose.yml). The password is never
+# baked into this image — it lives in the agentark-secrets Docker volume,
+# is read only at runtime, and is never logged.
+#
+# Precedence:
+#   1. AGENTARK_DATABASE_URL already set (external Postgres override) — use as-is
+#   2. AGENTARK_POSTGRES_PASSWORD_FILE readable — assemble URL from file + host/port/user/db env
+#   3. AGENTARK_POSTGRES_PASSWORD set in env (CI / custom setups) — assemble from env
+#   4. No DB role (workspace) — skip; DB is not required
+#   5. DB role but no source — hard-fail loudly rather than silently defaulting
+build_database_url_from_secret() {
+    if [ -n "${AGENTARK_DATABASE_URL:-}" ]; then
+        return 0
+    fi
+
+    local pg_user="${AGENTARK_POSTGRES_USER:-agentark}"
+    local pg_db="${AGENTARK_POSTGRES_DB:-agentark}"
+    local pg_host="${AGENTARK_POSTGRES_HOST:-postgres}"
+    local pg_port="${AGENTARK_POSTGRES_PORT:-5432}"
+    local pg_pw=""
+
+    if [ -n "${AGENTARK_POSTGRES_PASSWORD_FILE:-}" ] && [ -r "${AGENTARK_POSTGRES_PASSWORD_FILE}" ] && [ -s "${AGENTARK_POSTGRES_PASSWORD_FILE}" ]; then
+        pg_pw="$(cat "${AGENTARK_POSTGRES_PASSWORD_FILE}")"
+    elif [ -n "${AGENTARK_POSTGRES_PASSWORD:-}" ]; then
+        pg_pw="${AGENTARK_POSTGRES_PASSWORD}"
+    fi
+
+    if [ -n "$pg_pw" ]; then
+        AGENTARK_DATABASE_URL="$(AGENTARK_PG_PASSWORD_VALUE="$pg_pw" python3 - <<'PY'
+import os
+import urllib.parse
+
+user = os.environ.get("AGENTARK_POSTGRES_USER", "agentark")
+password = os.environ["AGENTARK_PG_PASSWORD_VALUE"]
+host = os.environ.get("AGENTARK_POSTGRES_HOST", "postgres")
+port = os.environ.get("AGENTARK_POSTGRES_PORT", "5432")
+database = os.environ.get("AGENTARK_POSTGRES_DB", "agentark")
+
+print(
+    "postgres://{user}:{password}@{host}:{port}/{database}".format(
+        user=urllib.parse.quote(user, safe=""),
+        password=urllib.parse.quote(password, safe=""),
+        host=host,
+        port=port,
+        database=urllib.parse.quote(database, safe=""),
+    )
+)
+PY
+)"
+        export AGENTARK_DATABASE_URL
+        unset pg_pw
+        echo -e "${GREEN}Configured Postgres connection from runtime secret.${NC}"
+        return 0
+    fi
+
+    # Workspace role does not connect to Postgres, so missing DB credentials are fine.
+    local role
+    role=$(normalized_stack_role)
+    if [ "$role" = "workspace" ] || [ "$role" = "embeddings" ]; then
+        return 0
+    fi
+
+    echo -e "${RED}No Postgres credentials available.${NC}" >&2
+    echo -e "${RED}Expected one of: AGENTARK_DATABASE_URL, AGENTARK_POSTGRES_PASSWORD_FILE (mounted from agentark-secrets volume), or AGENTARK_POSTGRES_PASSWORD.${NC}" >&2
+    echo -e "${RED}If you ran docker-compose, confirm the Postgres service generated /run/secrets/pg_pw in the 'agentark-secrets' volume.${NC}" >&2
+    exit 1
+}
+
 # Run setup as root
 setup_docker_socket
 check_volume_mount
+
+if [ "$(normalized_stack_role)" = "embeddings" ]; then
+    print_startup_banner
+    exec gosu agent /app/agentark-embed-server "$@"
+fi
+
 load_internal_service_tokens
+build_database_url_from_secret
 
 # WhatsApp bridge is bundled in the full image and managed by the AgentArk backend on demand
 # when WhatsApp Baileys runs in bundled bridge mode. Cloud API mode does not start it.
@@ -511,23 +591,44 @@ default_health_watchdog_url() {
         workspace)
             echo "http://127.0.0.1:8992/health"
             ;;
+        embeddings)
+            echo "http://127.0.0.1:8993/health"
+            ;;
         *)
             echo "http://127.0.0.1:8990/health"
             ;;
     esac
 }
 
+health_probe() {
+    local url="$1"
+    local timeout="$2"
+    HEALTH_PROBE_ERROR="$(
+        AGENTARK_HEALTH_PROBE_URL="$url" \
+        AGENTARK_HEALTH_PROBE_TIMEOUT="$timeout" \
+        python3 - <<'PY' 2>&1
+import os
+import sys
+import urllib.request
+
+url = os.environ["AGENTARK_HEALTH_PROBE_URL"]
+timeout = float(os.environ.get("AGENTARK_HEALTH_PROBE_TIMEOUT", "10"))
+
+try:
+    with urllib.request.urlopen(url, timeout=timeout) as response:
+        response.read(1)
+        if response.status >= 400:
+            raise RuntimeError(f"http_status={response.status}")
+except Exception as exc:
+    print(f"{type(exc).__name__}: {exc}")
+    sys.exit(1)
+PY
+    )"
+}
+
 start_health_watchdog() {
     local role
     role=$(normalized_stack_role)
-
-    # Docker already has an outer healthcheck and restart policy for this image.
-    # Keep the in-process watchdog opt-in so a transient startup stall does not
-    # self-terminate the service.
-    if [ -z "${AGENTARK_SELF_WATCHDOG:-}" ]; then
-        return
-    fi
-    truthy_env "$AGENTARK_SELF_WATCHDOG" || return
 
     local url=${AGENTARK_SELF_WATCHDOG_URL:-$(default_health_watchdog_url)}
     local interval=${AGENTARK_SELF_WATCHDOG_INTERVAL_SECS:-15}
@@ -546,7 +647,7 @@ start_health_watchdog() {
                 exit 0
             fi
 
-            if python3 -c "import urllib.request; urllib.request.urlopen('${url}', timeout=${timeout})" >/dev/null 2>&1; then
+            if health_probe "$url" "$timeout"; then
                 failures=0
                 if [ "$armed" -eq 0 ]; then
                     armed=1
@@ -557,7 +658,7 @@ start_health_watchdog() {
                     now=$(date +%s)
                     if [ "$now" -lt "$startup_deadline" ]; then
                         remaining=$(( startup_deadline - now ))
-                        echo -e "${YELLOW}Health watchdog: startup probe failed for ${url}; waiting up to ${remaining}s for first healthy response before counting failures.${NC}"
+                        echo -e "${YELLOW}Health watchdog: startup probe failed for ${url}; error=${HEALTH_PROBE_ERROR:-unknown}; waiting up to ${remaining}s for first healthy response before counting failures.${NC}"
                         sleep "$interval"
                         continue
                     fi
@@ -565,7 +666,7 @@ start_health_watchdog() {
                     echo -e "${YELLOW}Health watchdog: startup grace expired without a successful probe for ${url}; counting failures now.${NC}"
                 fi
                 failures=$((failures + 1))
-                echo -e "${YELLOW}Health watchdog: local probe failed (${failures}/${max_failures}) for ${url}.${NC}"
+                echo -e "${YELLOW}Health watchdog: local probe failed (${failures}/${max_failures}) for ${url}; error=${HEALTH_PROBE_ERROR:-unknown}.${NC}"
             fi
 
             if [ "$failures" -ge "$max_failures" ]; then

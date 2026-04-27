@@ -9,6 +9,7 @@ $SourceDir = Join-Path $InstallDir "source"
 $ReleaseRepo = if ([string]::IsNullOrWhiteSpace($env:AGENTARK_RELEASE_REPO)) { "agentark-ai/AgentArk" } else { $env:AGENTARK_RELEASE_REPO.Trim() }
 $RepoUrl = "https://github.com/$ReleaseRepo.git"
 $ImageRepository = if ([string]::IsNullOrWhiteSpace($env:AGENTARK_IMAGE_REPOSITORY)) { "ghcr.io/agentark-ai/agentark" } else { $env:AGENTARK_IMAGE_REPOSITORY.Trim() }
+$LocalSourceImage = "agentark:dev"
 
 function Get-AgentArkLatestReleaseTag {
     $refs = & docker run --rm alpine/git ls-remote --tags --refs $RepoUrl "v*" 2>$null
@@ -40,10 +41,12 @@ function Get-AgentArkReleaseVersionFromTag {
     return $Tag.TrimStart("v", "V")
 }
 
-function Ensure-AgentArkEnvFile {
-    $envPath = Join-Path $SourceDir ".env"
-    if (-not (Test-Path $envPath) -and (Test-Path (Join-Path $SourceDir ".env.example"))) {
-        Copy-Item (Join-Path $SourceDir ".env.example") $envPath
+function Ensure-AgentArkScriptEnvFile {
+    # Script-managed Compose variables live here. Do not create a root .env.
+    $envPath = Join-Path $SourceDir ".agentark\local.env"
+    $envDir = Split-Path $envPath
+    if (-not (Test-Path $envDir)) {
+        New-Item -ItemType Directory -Path $envDir -Force | Out-Null
     }
     if (-not (Test-Path $envPath)) {
         New-Item -ItemType File -Path $envPath -Force | Out-Null
@@ -57,7 +60,7 @@ function Set-AgentArkEnvValue {
         [Parameter(Mandatory = $true)][string]$Value
     )
 
-    $envPath = Ensure-AgentArkEnvFile
+    $envPath = Ensure-AgentArkScriptEnvFile
     $lines = if (Test-Path $envPath) { [System.Collections.Generic.List[string]](Get-Content $envPath) } else { [System.Collections.Generic.List[string]]::new() }
     $updated = $false
     for ($i = 0; $i -lt $lines.Count; $i++) {
@@ -79,6 +82,16 @@ function Set-AgentArkPinnedRelease {
     Set-AgentArkEnvValue -Key "AGENTARK_IMAGE" -Value "${ImageRepository}:$version"
     Set-AgentArkEnvValue -Key "AGENTARK_RELEASE_REPO" -Value $ReleaseRepo
     Set-AgentArkEnvValue -Key "AGENTARK_RELEASE_TAG" -Value $Tag
+    Set-AgentArkEnvValue -Key "AGENTARK_INSTALL_SOURCE" -Value "image"
+}
+
+function Set-AgentArkSourceBuildRelease {
+    param([Parameter(Mandatory = $true)][string]$Tag)
+
+    Set-AgentArkEnvValue -Key "AGENTARK_IMAGE" -Value $LocalSourceImage
+    Set-AgentArkEnvValue -Key "AGENTARK_RELEASE_REPO" -Value $ReleaseRepo
+    Set-AgentArkEnvValue -Key "AGENTARK_RELEASE_TAG" -Value $Tag
+    Set-AgentArkEnvValue -Key "AGENTARK_INSTALL_SOURCE" -Value "source"
 }
 
 function Assert-AgentArkCleanCheckout {
@@ -108,6 +121,223 @@ function Write-AgentArkPortWarning {
     }
 }
 
+function Test-AgentArkTruthyEnv {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $false
+    }
+    return @("1", "true", "yes", "y", "on") -contains $Value.Trim().ToLowerInvariant()
+}
+
+function Confirm-AgentArkAction {
+    param([Parameter(Mandatory = $true)][string]$Prompt)
+
+    if (Test-AgentArkTruthyEnv $env:AGENTARK_ASSUME_YES) {
+        return $true
+    }
+
+    $answer = Read-Host $Prompt
+    return @("y", "yes") -contains $answer.Trim().ToLowerInvariant()
+}
+
+function Get-AgentArkWslReadiness {
+    $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
+    if (-not $wsl) {
+        return [pscustomobject]@{
+            Ready = $false
+            Detail = "wsl.exe was not found."
+        }
+    }
+
+    $output = & wsl.exe --status 2>&1
+    $detail = ($output | Out-String).Trim()
+    return [pscustomobject]@{
+        Ready = ($LASTEXITCODE -eq 0)
+        Detail = $detail
+    }
+}
+
+function Write-AgentArkWslHelp {
+    Write-Host "Docker Desktop uses the WSL 2 backend for AgentArk's Linux containers." -ForegroundColor Yellow
+    Write-Host "If Docker Desktop reports that WSL is missing or outdated, run this from an elevated PowerShell:" -ForegroundColor Yellow
+    Write-Host "  wsl --install --no-distribution" -ForegroundColor Cyan
+    Write-Host "Then reboot, open Docker Desktop once, and rerun this installer." -ForegroundColor Yellow
+}
+
+function Add-AgentArkDockerCliPath {
+    $paths = @()
+    if (-not [string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
+        $paths += (Join-Path $env:ProgramFiles "Docker\Docker\resources\bin")
+    }
+    $programFilesX86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
+    if (-not [string]::IsNullOrWhiteSpace($programFilesX86)) {
+        $paths += (Join-Path $programFilesX86 "Docker\Docker\resources\bin")
+    }
+
+    foreach ($path in $paths) {
+        if ((Test-Path $path) -and ($env:PATH -notlike "*$path*")) {
+            $env:PATH = "$env:PATH;$path"
+        }
+    }
+}
+
+function Resolve-AgentArkDockerDesktopExe {
+    $candidates = @()
+    if (-not [string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
+        $candidates += (Join-Path $env:ProgramFiles "Docker\Docker\Docker Desktop.exe")
+    }
+    $programFilesX86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
+    if (-not [string]::IsNullOrWhiteSpace($programFilesX86)) {
+        $candidates += (Join-Path $programFilesX86 "Docker\Docker\Docker Desktop.exe")
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+        $candidates += (Join-Path $env:LOCALAPPDATA "Docker\Docker Desktop.exe")
+    }
+
+    foreach ($candidate in $candidates) {
+        if (Test-Path $candidate) {
+            return $candidate
+        }
+    }
+    return $null
+}
+
+function Install-AgentArkDockerDesktop {
+    $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+    if (-not $winget) {
+        Write-Host "Docker not found and winget is unavailable." -ForegroundColor Red
+        Write-Host "Install Docker Desktop manually: https://docs.docker.com/desktop/install/windows-install/" -ForegroundColor Cyan
+        exit 1
+    }
+
+    if (-not (Confirm-AgentArkAction "Docker Desktop is required. Install it now with winget? [y/N]")) {
+        Write-Host "Install Docker Desktop manually, open it once, then rerun this installer:" -ForegroundColor Yellow
+        Write-Host "  https://docs.docker.com/desktop/install/windows-install/" -ForegroundColor Cyan
+        exit 1
+    }
+
+    Write-Host "Installing Docker Desktop with winget..." -ForegroundColor Cyan
+    & winget install --id Docker.DockerDesktop -e --source winget --accept-package-agreements --accept-source-agreements
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Docker Desktop installation failed." -ForegroundColor Red
+        Write-Host "Install it manually, open it once, then rerun this installer:" -ForegroundColor Yellow
+        Write-Host "  https://docs.docker.com/desktop/install/windows-install/" -ForegroundColor Cyan
+        exit 1
+    }
+
+    Add-AgentArkDockerCliPath
+}
+
+function Test-AgentArkDockerEngine {
+    $docker = Get-Command docker -ErrorAction SilentlyContinue
+    if (-not $docker) {
+        return $false
+    }
+    & docker info *> $null
+    return $LASTEXITCODE -eq 0
+}
+
+function Start-AgentArkDockerDesktop {
+    $exe = Resolve-AgentArkDockerDesktopExe
+    if ([string]::IsNullOrWhiteSpace($exe)) {
+        return $false
+    }
+
+    Write-Host "Starting Docker Desktop..." -ForegroundColor Cyan
+    Start-Process -FilePath $exe | Out-Null
+    return $true
+}
+
+function Wait-AgentArkDockerEngine {
+    param([int]$Attempts = 90)
+
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        if (Test-AgentArkDockerEngine) {
+            return $true
+        }
+        Start-Sleep -Seconds 2
+    }
+    return $false
+}
+
+function Ensure-AgentArkDockerReady {
+    $wslStatus = Get-AgentArkWslReadiness
+    if ($wslStatus.Ready) {
+        Write-Host "[1/5] WSL available." -ForegroundColor Green
+    } else {
+        Write-Host "[1/5] WSL is not ready." -ForegroundColor Yellow
+        if (-not [string]::IsNullOrWhiteSpace($wslStatus.Detail)) {
+            Write-Host $wslStatus.Detail -ForegroundColor DarkYellow
+        }
+        Write-AgentArkWslHelp
+    }
+
+    Add-AgentArkDockerCliPath
+    $docker = Get-Command docker -ErrorAction SilentlyContinue
+    if (-not $docker) {
+        Write-Host "Docker not found." -ForegroundColor Yellow
+        Install-AgentArkDockerDesktop
+        $docker = Get-Command docker -ErrorAction SilentlyContinue
+    }
+
+    if (-not $docker) {
+        Write-Host "Docker Desktop was installed, but docker.exe is not visible in this shell yet." -ForegroundColor Yellow
+        Write-Host "Open a new PowerShell after Docker Desktop finishes setup, then rerun this installer." -ForegroundColor Cyan
+        exit 1
+    }
+    Write-Host "[2/5] Docker CLI found." -ForegroundColor Green
+
+    $composeCheck = docker compose version 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Docker Compose not found. Docker Desktop may not have finished setup." -ForegroundColor Red
+        Write-Host "Open Docker Desktop once, wait until it says it is running, then rerun this installer." -ForegroundColor Cyan
+        exit 1
+    }
+    Write-Host "[3/5] Docker Compose found." -ForegroundColor Green
+
+    if (-not (Test-AgentArkDockerEngine)) {
+        if (Start-AgentArkDockerDesktop) {
+            if (-not (Wait-AgentArkDockerEngine)) {
+                Write-Host "Docker Desktop did not become ready in time." -ForegroundColor Red
+                Write-AgentArkWslHelp
+                exit 1
+            }
+        } else {
+            Write-Host "Docker is installed, but the Docker engine is not running." -ForegroundColor Red
+            Write-Host "Start Docker Desktop, wait until it is running, then rerun this installer." -ForegroundColor Cyan
+            Write-AgentArkWslHelp
+            exit 1
+        }
+    }
+    Write-Host "Docker engine is running." -ForegroundColor Green
+}
+
+function Select-AgentArkInstallKind {
+    Write-Host ""
+    Write-Host "Choose install method:" -ForegroundColor White
+    Write-Host "  1. Fast install - download the published AgentArk image (recommended)" -ForegroundColor Green
+    Write-Host "  2. Source build - clone AgentArk and build the local image on this machine" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "Source build avoids pulling the AgentArk image from GHCR, but it is slower and still downloads Docker build base images and package dependencies." -ForegroundColor Yellow
+
+    if (Test-AgentArkTruthyEnv $env:AGENTARK_ASSUME_YES) {
+        Write-Host "Using fast install because AGENTARK_ASSUME_YES is set." -ForegroundColor Green
+        return "image"
+    }
+
+    while ($true) {
+        $choice = Read-Host "Install method [1]"
+        $normalized = $choice.Trim().ToLowerInvariant()
+        if ([string]::IsNullOrWhiteSpace($normalized) -or $normalized -eq "1" -or $normalized -eq "fast" -or $normalized -eq "image") {
+            return "image"
+        }
+        if ($normalized -eq "2" -or $normalized -eq "source" -or $normalized -eq "build") {
+            return "source"
+        }
+        Write-Host "Choose 1 for fast install or 2 for source build." -ForegroundColor Yellow
+    }
+}
+
 Write-Host ""
 Write-Host "=========================================" -ForegroundColor White
 Write-Host "  AgentArk Installer" -ForegroundColor White
@@ -115,20 +345,8 @@ Write-Host "  Think. Act. Remember. Securely." -ForegroundColor White
 Write-Host "=========================================" -ForegroundColor White
 Write-Host ""
 
-$docker = Get-Command docker -ErrorAction SilentlyContinue
-if (-not $docker) {
-    Write-Host "Docker not found." -ForegroundColor Red
-    Write-Host "Please install Docker Desktop: https://docs.docker.com/desktop/install/windows-install/" -ForegroundColor Cyan
-    exit 1
-}
-Write-Host "[1/4] Docker found." -ForegroundColor Green
-
-$composeCheck = docker compose version 2>&1
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "Docker Compose not found. Please install Docker Desktop." -ForegroundColor Red
-    exit 1
-}
-Write-Host "[2/4] Docker Compose found." -ForegroundColor Green
+Ensure-AgentArkDockerReady
+$InstallKind = Select-AgentArkInstallKind
 
 if (-not (Test-Path $InstallDir)) {
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
@@ -162,8 +380,13 @@ if (-not (Test-Path (Join-Path $SourceDir "docker-compose.yml"))) {
     throw "Missing $SourceDir\docker-compose.yml after checkout."
 }
 
-Set-AgentArkPinnedRelease -Tag $TargetReleaseTag
-Write-Host "[3/4] Source checkout ready at $SourceDir" -ForegroundColor Green
+if ($InstallKind -eq "source") {
+    Set-AgentArkSourceBuildRelease -Tag $TargetReleaseTag
+} else {
+    Set-AgentArkPinnedRelease -Tag $TargetReleaseTag
+}
+$AgentArkEnvFile = Ensure-AgentArkScriptEnvFile
+Write-Host "[4/5] Source checkout ready at $SourceDir" -ForegroundColor Green
 
 $cmdWrapper = @'
 @echo off
@@ -178,7 +401,11 @@ if ($userPath -notlike "*$InstallDir*") {
     Write-Host "Added $InstallDir to your PATH." -ForegroundColor Green
 }
 
-Write-Host "Downloading AgentArk container image for $TargetReleaseTag..." -ForegroundColor Cyan
+if ($InstallKind -eq "source") {
+    Write-Host "Building AgentArk from source checkout $TargetReleaseTag..." -ForegroundColor Cyan
+} else {
+    Write-Host "Downloading AgentArk container image for $TargetReleaseTag..." -ForegroundColor Cyan
+}
 $postgresPort = 5432
 if ($env:AGENTARK_POSTGRES_PORT -match '^\d+$') {
     $postgresPort = [int]$env:AGENTARK_POSTGRES_PORT
@@ -188,19 +415,26 @@ Write-AgentArkPortWarning -Port 8990 -ServiceName "AgentArk Web UI"
 
 Push-Location $SourceDir
 try {
-    Write-Host "[4/4] Starting AgentArk..." -ForegroundColor Green
-    & docker compose pull
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to pull AgentArk images."
-    }
-    & docker compose up -d
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to start AgentArk."
+    Write-Host "[5/5] Starting AgentArk..." -ForegroundColor Green
+    if ($InstallKind -eq "source") {
+        & docker compose --env-file $AgentArkEnvFile -f docker-compose.yml -f docker-compose.dev.yml up -d --build --force-recreate
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to build and start AgentArk from source."
+        }
+    } else {
+        & docker compose --env-file $AgentArkEnvFile pull
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to pull AgentArk images."
+        }
+        & docker compose --env-file $AgentArkEnvFile up -d
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to start AgentArk."
+        }
     }
 
     $lightpandaReady = $false
     for ($attempt = 0; $attempt -lt 20; $attempt++) {
-        & docker compose exec -T agentark-control sh -lc "command -v lightpanda >/dev/null 2>&1" *> $null
+        & docker compose --env-file $AgentArkEnvFile exec -T agentark-control sh -lc "command -v lightpanda >/dev/null 2>&1" *> $null
         if ($LASTEXITCODE -eq 0) {
             $lightpandaReady = $true
             break
@@ -220,6 +454,11 @@ Write-Host "  AgentArk is running!" -ForegroundColor Green
 Write-Host "=========================================" -ForegroundColor White
 Write-Host ""
 Write-Host "  Web UI:  http://localhost:8990" -ForegroundColor Cyan
+if ($InstallKind -eq "source") {
+    Write-Host "  Install: source build using local image $LocalSourceImage" -ForegroundColor Cyan
+} else {
+    Write-Host "  Install: published image pinned to $TargetReleaseTag" -ForegroundColor Cyan
+}
 Write-Host ""
 Write-Host "  Commands (run from anywhere):" -ForegroundColor White
 Write-Host "    agentark chat       Interactive CLI chat"

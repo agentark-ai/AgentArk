@@ -1,0 +1,28 @@
+{
+  "target_key": "classifier_prompt_bundle_profile_v1",
+  "version": 1,
+  "cases": [
+    {
+      "surface": "link_intent",
+      "prompt": "User message:\nkeep this repo around for later, not doing anything with it right now\n\nReferenced URLs:\n- https://example.com/skill-repo\n\nReturn JSON only.",
+      "expected_json": {
+        "label": "SHARE_ONLY"
+      }
+    },
+    {
+      "surface": "explicit_approval",
+      "prompt": "User message:\nyes, go ahead and deploy it now\n\nPending action summary:\n- deploy the updated app\n\nReturn JSON only.",
+      "expected_json": {
+        "explicit_approval": true
+      }
+    },
+    {
+      "surface": "pending_action",
+      "prompt": "Pending actions:\n- key: pending:secret | summary: provide the missing API key\n\nUser follow-up:\nuse the saved key and continue\n\nReturn JSON only.",
+      "expected_json": {
+        "decision": "approve",
+        "action_key": "pending:secret"
+      }
+    }
+  ]
+}

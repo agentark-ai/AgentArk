@@ -1,5 +1,4 @@
 //! Telegram bot channel
-
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use teloxide::prelude::*;
@@ -317,11 +316,11 @@ fn markdown_to_telegram_html(text: &str) -> String {
                     }
                     header_text.push(chars.next().unwrap());
                 }
-                // Add emoji prefix for different levels
+                // Add ASCII prefix for different levels
                 let prefix = match level {
-                    1 => "📌 ",
-                    2 => "▸ ",
-                    3 => "• ",
+                    1 => "* ",
+                    2 => "> ",
+                    3 => "- ",
                     _ => "",
                 };
                 result.push_str(&format!("<b>{}{}</b>", prefix, header_text));
@@ -417,7 +416,7 @@ fn markdown_to_telegram_html(text: &str) -> String {
                     dash_count += 1;
                 }
                 if dash_count >= 3 {
-                    result.push_str("─────────────────");
+                    result.push_str("-----------------");
                 } else {
                     for _ in 0..dash_count {
                         result.push('-');
@@ -451,7 +450,7 @@ async fn register_commands(bot: &Bot) {
         BotCommand::new("actions", "List available actions"),
         BotCommand::new("memory", "Memory stats"),
         BotCommand::new("model", "Switch LLM model - /model <name>"),
-        BotCommand::new("settings", "View current settings"),
+        BotCommand::new("settings", "View settings"),
         BotCommand::new("tunnel", "Tunnel control - /tunnel [start|stop|status]"),
         BotCommand::new("clear", "Clear conversation history"),
     ];
@@ -771,19 +770,6 @@ pub async fn send_message(agent: &Agent, text: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn send_message_to_chat(
-    config: &crate::core::config::TelegramConfig,
-    chat_id: i64,
-    text: &str,
-) -> Result<()> {
-    if chat_id == 0 || text.trim().is_empty() {
-        return Ok(());
-    }
-    let bot = Bot::new(&config.bot_token);
-    bot.send_message(ChatId(chat_id), text).await?;
-    Ok(())
-}
-
 /// Resolve the configured DM target for proactive Telegram notifications.
 pub(crate) fn configured_notification_chat_id(
     config: &crate::core::config::TelegramConfig,
@@ -795,7 +781,7 @@ pub(crate) fn configured_notification_chat_id(
     if chat_id != 0 {
         return Some(chat_id);
     }
-    tracing::warn!("Telegram: no chat_id available — user must send a message to the bot first");
+    tracing::warn!("Telegram: no chat_id available - user must send a message to the bot first");
     None
 }
 
@@ -845,11 +831,11 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
         "/start" | "/help" => {
             let agent = agent.read().await;
             format!(
-                "Welcome to {}! 🤖\n\n\
-                📸 Media:\n\
+                "Welcome to {}!\n\n\
+                Media:\n\
                 /image <prompt> - Generate image\n\
                 /video <prompt> - Generate video\n\n\
-                ⏰ Productivity:\n\
+                Productivity:\n\
                 /remind <time> <msg> - Set reminder\n\
                 /todo - View todo list\n\
                 /todo add <item> - Add todo\n\
@@ -857,12 +843,12 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
                 /tasks - View pending tasks\n\
                 /approve-task <task_id> - Approve a waiting task\n\
                 /reject-task <task_id> - Reject a waiting task\n\n\
-                🔍 Utilities:\n\
+                Utilities:\n\
                 /weather [location] - Get weather\n\
                 /translate <text> - Translate\n\
                 /search <query> - Web search\n\
                 /summarize - Summarize chat\n\n\
-                ⚙️ Settings:\n\
+                Settings:\n\
                 /status - Agent status\n\
                 /skills - List skills\n\
                 /memory - Memory stats\n\
@@ -881,11 +867,11 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
             let agent = agent.read().await;
             let status = agent.status().await;
             format!(
-                "📊 Agent Status\n\n\
-                🆔 DID: {}\n\
-                🧠 Memory: {} entries\n\
-                🛠 Skills: {} loaded\n\
-                📋 Tasks: {} pending",
+                "Agent status\n\n\
+                DID: {}\n\
+                Memory: {} entries\n\
+                Skills: {} loaded\n\
+                Tasks: {} pending",
                 status.did, status.memory_entries, status.actions_loaded, status.tasks_pending
             )
         }
@@ -913,11 +899,11 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
                 .unwrap_or_else(|| "None".to_string());
 
             format!(
-                "⚙️ Current Settings\n\n\
-                🤖 Bot: {}\n\
-                💬 Personality: {}\n\
-                🧠 Model: {}\n\
-                🔄 Fallback: {}",
+                "Current settings\n\n\
+                Bot: {}\n\
+                Personality: {}\n\
+                Model: {}\n\
+                Fallback: {}",
                 agent.config.name, agent.config.personality, model, fallback
             )
         }
@@ -946,7 +932,7 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
                 let list = actions
                     .iter()
                     .take(15) // Limit to prevent too long message
-                    .map(|s| format!("• {} - {}", s.name, s.description))
+                    .map(|s| format!("- {} - {}", s.name, s.description))
                     .collect::<Vec<_>>()
                     .join("\n");
                 let more = if actions.len() > 15 {
@@ -954,7 +940,7 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
                 } else {
                     String::new()
                 };
-                format!("🛠 Available Skills:\n\n{}{}", list, more)
+                format!("Available skills:\n\n{}{}", list, more)
             }
         }
 
@@ -962,10 +948,10 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
             let agent = agent.read().await;
             let status = agent.status().await;
             format!(
-                "🧠 Memory Stats\n\n\
-                📝 Entries: {}\n\
-                🛠 Skills: {}\n\
-                📋 Tasks: {}",
+                "Memory stats\n\n\
+                Entries: {}\n\
+                Skills: {} loaded\n\
+                Tasks: {} pending",
                 status.memory_entries, status.actions_loaded, status.tasks_pending
             )
         }
@@ -1066,7 +1052,7 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
                         .await
                     {
                         Ok(r) => r,
-                        Err(e) => format!("❌ Error: {}", e),
+                        Err(e) => format!("Error: {}", e),
                     }
                 };
                 response
@@ -1080,7 +1066,7 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
                         .await
                     {
                         Ok(r) => r,
-                        Err(e) => format!("❌ Error: {}", e),
+                        Err(e) => format!("Error: {}", e),
                     }
                 };
                 response
@@ -1101,7 +1087,7 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
                         .await
                     {
                         Ok(r) => r,
-                        Err(e) => format!("❌ Error: {}", e),
+                        Err(e) => format!("Error: {}", e),
                     }
                 };
                 response
@@ -1119,15 +1105,15 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
                 .collect();
 
             if pending.is_empty() {
-                "📋 No pending tasks".to_string()
+                "No pending tasks".to_string()
             } else {
                 let list = pending
                     .iter()
                     .map(|t| {
                         let status = match t.status {
-                            TaskStatus::AwaitingApproval => "⏳",
-                            TaskStatus::Pending => "📌",
-                            _ => "•",
+                            TaskStatus::AwaitingApproval => "[approval]",
+                            TaskStatus::Pending => "[pending]",
+                            _ => "-",
                         };
                         if matches!(t.status, TaskStatus::AwaitingApproval) {
                             format!("{} {} [{}]", status, t.description, t.id)
@@ -1137,7 +1123,7 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                format!("📋 Pending Tasks:\n\n{}", list)
+                format!("Pending tasks:\n\n{}", list)
             }
         }
 
@@ -1150,9 +1136,9 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
                 };
                 let agent = agent.read().await;
                 match agent.approve_task_request(task_id, "telegram").await {
-                    Ok(Some(task)) => format!("âœ… Approved: {}", task.description),
+                    Ok(Some(task)) => format!("Approved: {}", task.description),
                     Ok(None) => "Task not found or is not awaiting approval.".to_string(),
-                    Err(e) => format!("âŒ Failed to approve task: {}", e),
+                    Err(e) => format!("Failed to approve task: {}", e),
                 }
             }
         }
@@ -1173,9 +1159,9 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
                     )
                     .await
                 {
-                    Ok(Some(task)) => format!("âœ… Rejected: {}", task.description),
+                    Ok(Some(task)) => format!("Rejected: {}", task.description),
                     Ok(None) => "Task not found or is not awaiting approval.".to_string(),
-                    Err(e) => format!("âŒ Failed to reject task: {}", e),
+                    Err(e) => format!("Failed to reject task: {}", e),
                 }
             }
         }
@@ -1185,7 +1171,7 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
             agent
                 .clear_conversation_by_id("telegram", &conversation_id, None)
                 .await;
-            "🧹 Conversation cleared! Starting fresh.".to_string()
+            "Conversation cleared. Starting fresh.".to_string()
         }
 
         "/model" => {
@@ -1198,7 +1184,7 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
                 };
                 format!("Current model: {}\n\nUsage: /model <model_name>\n\nNote: Changing models requires restart", current)
             } else {
-                format!("Model change to '{}' noted.\n\n⚠️ To apply, please update via web UI settings and restart.", args)
+                format!("Model change to '{}' noted.\n\nTo apply, please update via web UI settings and restart.", args)
             }
         }
 
@@ -1221,7 +1207,7 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
                     .await
                 {
                     Ok(r) => r,
-                    Err(e) => format!("❌ Error: {}", e),
+                    Err(e) => format!("Error: {}", e),
                 }
             }
         }
@@ -1256,8 +1242,8 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
                 };
 
                 match add_result {
-                    Ok(_) => format!("✅ Task created: {}", description),
-                    Err(e) => format!("❌ Failed to create task: {}", e),
+                    Ok(_) => format!("Task created: {}", description),
+                    Err(e) => format!("Failed to create task: {}", e),
                 }
             }
         }

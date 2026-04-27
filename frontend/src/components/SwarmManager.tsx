@@ -346,19 +346,19 @@ function statusDotColor(status: unknown): string {
     case "running":
     case "assigned":
     case "synthesizing":
-      return "rgba(74,210,157,0.85)";
+      return "var(--ui-rgba-74-210-157-850)";
     case "failed":
     case "timed_out":
     case "panicked":
     case "offline":
-      return "rgba(255,100,100,0.85)";
+      return "var(--ui-rgba-255-100-100-850)";
     case "completed":
     case "interrupted":
     case "partial":
     case "disabled":
-      return "rgba(255,191,130,0.85)";
+      return "var(--ui-rgba-255-191-130-850)";
     default:
-      return "rgba(180,200,220,0.5)";
+      return "var(--ui-rgba-180-200-220-500)";
   }
 }
 
@@ -668,7 +668,7 @@ function toBuilderOptions(data: unknown): BuilderOptions {
           str(row.name, str(row.id, "")),
           [str(row.description, ""), `${num(row.tool_count, 0)} tools`, `${num(row.resource_count, 0)} resources`]
             .filter(Boolean)
-            .join(" • ")
+            .join(" | ")
         )
       )
       .filter((item): item is BuilderOption => Boolean(item)),
@@ -688,7 +688,7 @@ function toBuilderOptions(data: unknown): BuilderOptions {
           row,
           str(row.id, ""),
           str(row.name, str(row.id, "")),
-          [str(row.base_url, ""), `${num(row.action_count, 0)} actions`].filter(Boolean).join(" • ")
+          [str(row.base_url, ""), `${num(row.action_count, 0)} actions`].filter(Boolean).join(" | ")
         )
       )
       .filter((item): item is BuilderOption => Boolean(item)),
@@ -698,7 +698,7 @@ function toBuilderOptions(data: unknown): BuilderOptions {
           row,
           str(row.id, ""),
           str(row.name, str(row.id, "")),
-          [str(row.description, ""), str(row.status, "")].filter(Boolean).join(" • ")
+          [str(row.description, ""), str(row.status, "")].filter(Boolean).join(" | ")
         )
       )
       .filter((item): item is BuilderOption => Boolean(item)),
@@ -714,7 +714,7 @@ function toBuilderOptions(data: unknown): BuilderOptions {
             str(row.status, "")
           ]
             .filter(Boolean)
-            .join(" â€¢ ")
+            .join(" | ")
         )
       )
       .filter((item): item is BuilderOption => Boolean(item)),
@@ -730,7 +730,7 @@ function toBuilderOptions(data: unknown): BuilderOptions {
             str(row.status, "")
           ]
             .filter(Boolean)
-            .join(" • ")
+            .join(" | ")
         )
       )
       .filter((item): item is BuilderOption => Boolean(item))
@@ -939,10 +939,10 @@ function SectionShell({
       sx={{
         p: { xs: 2, md: 2.35 },
         borderRadius: "8px",
-        border: "1px solid rgba(255,255,255,0.07)",
+        border: "1px solid var(--ui-rgba-255-255-255-070)",
         background:
-          "linear-gradient(180deg, rgba(255,255,255,0.05) 0%, rgba(255,255,255,0.025) 100%)",
-        boxShadow: "0 18px 40px rgba(7, 16, 32, 0.22)"
+          "linear-gradient(180deg, var(--ui-rgba-255-255-255-050) 0%, var(--ui-rgba-255-255-255-025) 100%)",
+        boxShadow: "0 18px 40px var(--ui-rgba-7-16-32-220)"
       }}
     >
       <Stack spacing={1.4}>
@@ -977,11 +977,11 @@ function RunCard({ run, live = false }: { run: SwarmRun; live?: boolean }) {
         p: 1.5,
         borderRadius: "8px",
         border: live
-          ? "1px solid rgba(88, 174, 255, 0.18)"
-          : "1px solid rgba(255,255,255,0.07)",
+          ? "1px solid var(--ui-rgba-88-174-255-180)"
+          : "1px solid var(--ui-rgba-255-255-255-070)",
         background: live
-          ? "linear-gradient(180deg, rgba(88, 174, 255, 0.10) 0%, rgba(255,255,255,0.03) 100%)"
-          : "linear-gradient(180deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.02) 100%)"
+          ? "linear-gradient(180deg, var(--ui-rgba-88-174-255-100) 0%, var(--ui-rgba-255-255-255-030) 100%)"
+          : "linear-gradient(180deg, var(--ui-rgba-255-255-255-040) 0%, var(--ui-rgba-255-255-255-020) 100%)"
       }}
     >
       <Stack spacing={1.2}>
@@ -1037,7 +1037,7 @@ function RunCard({ run, live = false }: { run: SwarmRun; live?: boolean }) {
           {run.agents.map((agent) => (
             <Box
               key={`${run.id}-${agent.id}`}
-              sx={{ width: "100%", px: 0, py: 1.15, borderBottom: "1px solid", borderColor: "divider", transition: "background 0.15s ease", "&:hover": { background: "rgba(57, 208, 255, 0.04)" } }}
+              sx={{ width: "100%", px: 0, py: 1.15, borderBottom: "1px solid", borderColor: "divider", transition: "background 0.15s ease", "&:hover": { background: "var(--ui-rgba-57-208-255-040)" } }}
             >
               <Stack spacing={0.4}>
                 {/* Line 1: dot + agent name ... status right */}
@@ -1046,7 +1046,7 @@ function RunCard({ run, live = false }: { run: SwarmRun; live?: boolean }) {
                     <Box sx={{ width: 7, height: 7, borderRadius: "50%", flexShrink: 0, background: statusDotColor(agent.status) }} />
                     <Typography variant="body2" sx={{ fontWeight: 600 }}>
                       {agent.agentRole
-                        ? `${agent.agentName} · ${agent.agentRole}`
+                        ? `${agent.agentName} - ${agent.agentRole}`
                         : agent.agentName}
                     </Typography>
                   </Stack>
@@ -1122,8 +1122,8 @@ function RunHistoryList({ runs }: { runs: SwarmRun[] }) {
                 borderBottom: "1px solid",
                 borderColor: "divider",
                 transition: "background 0.15s ease",
-                "&:hover": { background: "rgba(57, 208, 255, 0.04)" },
-                ...(isSelected ? { background: "rgba(57, 208, 255, 0.07)" } : {})
+                "&:hover": { background: "var(--ui-rgba-57-208-255-040)" },
+                ...(isSelected ? { background: "var(--ui-rgba-57-208-255-070)" } : {})
               }}
             >
               <Stack spacing={0.4}>
@@ -1155,7 +1155,7 @@ function RunHistoryList({ runs }: { runs: SwarmRun[] }) {
                 </Typography>
                 {/* Line 3: metadata */}
                 <Typography variant="caption" sx={{ color: "text.secondary", pl: "15px" }}>
-                  {trackedAgents} agent{trackedAgents === 1 ? "" : "s"} · {run.channel || "Workspace"} · Started {formatTimestamp(run.startedAt)} · {run.completedAt ? `Finished ${formatTimestamp(run.completedAt)}` : `Updated ${formatTimestamp(run.updatedAt)}`}
+                  {trackedAgents} agent{trackedAgents === 1 ? "" : "s"} - {run.channel || "Workspace"} - Started {formatTimestamp(run.startedAt)} - {run.completedAt ? `Finished ${formatTimestamp(run.completedAt)}` : `Updated ${formatTimestamp(run.updatedAt)}`}
                 </Typography>
               </Stack>
             </ButtonBase>
@@ -1259,9 +1259,9 @@ function AccessScopeSelect({
           sx: {
             mt: 0.75,
             borderRadius: "8px",
-            border: "1px solid rgba(255,255,255,0.09)",
-            background: "linear-gradient(180deg, rgba(8, 14, 28, 0.98) 0%, rgba(6, 10, 20, 0.98) 100%)",
-            boxShadow: "0 24px 80px rgba(0,0,0,0.45)",
+            border: "1px solid var(--ui-rgba-255-255-255-090)",
+            background: "linear-gradient(180deg, var(--ui-rgba-8-14-28-980) 0%, var(--ui-rgba-6-10-20-980) 100%)",
+            boxShadow: "0 24px 80px var(--ui-rgba-0-0-0-450)",
             "& .MuiAutocomplete-listbox": {
               p: 0.75,
               display: "grid",
@@ -1299,16 +1299,16 @@ function AccessScopeSelect({
               px: 1.15,
               py: 1,
               borderRadius: "8px",
-              border: "1px solid rgba(255,255,255,0.06)",
-              background: "rgba(255,255,255,0.02)",
+              border: "1px solid var(--ui-rgba-255-255-255-060)",
+              background: "var(--ui-rgba-255-255-255-020)",
               transition: "background 0.18s ease, border-color 0.18s ease",
               "&.Mui-focused": {
-                background: "rgba(57, 208, 255, 0.08)",
-                borderColor: "rgba(57, 208, 255, 0.22)"
+                background: "var(--ui-rgba-57-208-255-080)",
+                borderColor: "var(--ui-rgba-57-208-255-220)"
               },
               '&[aria-selected="true"]': {
-                background: "rgba(57, 208, 255, 0.12)",
-                borderColor: "rgba(57, 208, 255, 0.28)"
+                background: "var(--ui-rgba-57-208-255-120)",
+                borderColor: "var(--ui-rgba-57-208-255-280)"
               }
             }}
           >
@@ -1730,8 +1730,8 @@ export function SwarmManager({ autoRefresh }: Props) {
               p: 0.45,
               borderRadius: "8px",
               border: "1px solid var(--surface-border)",
-              background: "rgba(255,255,255,0.02)",
-              boxShadow: "inset 0 1px 0 rgba(255,255,255,0.03)"
+              background: "var(--ui-rgba-255-255-255-020)",
+              boxShadow: "inset 0 1px 0 var(--ui-rgba-255-255-255-030)"
             }}>
             <Button
               size="small"
@@ -1839,7 +1839,7 @@ export function SwarmManager({ autoRefresh }: Props) {
             {customAgents.map((agent) => (
               <Box
                 key={agent.id}
-                sx={{ width: "100%", px: 0, py: 1.15, borderBottom: "1px solid", borderColor: "divider", transition: "background 0.15s ease", "&:hover": { background: "rgba(57, 208, 255, 0.04)" } }}
+                sx={{ width: "100%", px: 0, py: 1.15, borderBottom: "1px solid", borderColor: "divider", transition: "background 0.15s ease", "&:hover": { background: "var(--ui-rgba-57-208-255-040)" } }}
               >
                 <Stack spacing={0.5}>
                   {/* Line 1: dot + agent name ... enabled/disabled right */}
@@ -1848,7 +1848,7 @@ export function SwarmManager({ autoRefresh }: Props) {
                       <Box sx={{ width: 7, height: 7, borderRadius: "50%", flexShrink: 0, background: statusDotColor(agent.enabled ? agent.status : "disabled") }} />
                       <Typography variant="body2" sx={{ fontWeight: 600 }}>
                         {agent.agentType
-                          ? `${agent.displayName} · ${agent.agentType}`
+                          ? `${agent.displayName} - ${agent.agentType}`
                           : agent.displayName}
                       </Typography>
                     </Stack>
@@ -1860,8 +1860,8 @@ export function SwarmManager({ autoRefresh }: Props) {
                   <Typography variant="caption" sx={{ color: "text.secondary", pl: "15px" }}>
                     {agent.provider} / {agent.model}
                     {accessScopeSummary(agent.accessScope).length > 0
-                      ? ` · ${accessScopeSummary(agent.accessScope).join(", ")}`
-                      : " · No elevated access"}
+                      ? ` - ${accessScopeSummary(agent.accessScope).join(", ")}`
+                      : " - No elevated access"}
                   </Typography>
                   {/* Line 3: capabilities */}
                   {agent.capabilities.length > 0 || agent.systemPrompt ? (
@@ -1901,12 +1901,12 @@ export function SwarmManager({ autoRefresh }: Props) {
                   {/* Line 5: latest task */}
                   <Typography variant="caption" sx={{ color: "text.secondary", pl: "15px" }}>
                     {agent.lastTask || "No delegated task recorded yet."}
-                    {(agent.lastUpdate || agent.lastSummary) ? ` — ${agent.lastUpdate || agent.lastSummary}` : ""}
+                    {(agent.lastUpdate || agent.lastSummary) ? ` - ${agent.lastUpdate || agent.lastSummary}` : ""}
                   </Typography>
                   {/* Line 6: timestamps + action buttons */}
                   <Stack direction="row" sx={{ alignItems: "center", justifyContent: "space-between", pl: "15px", gap: 1 }}>
                     <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                      {agent.lastActivityAt ? `Last active ${formatTimestamp(agent.lastActivityAt)} · ` : ""}Created {formatTimestamp(agent.createdAt)}
+                      {agent.lastActivityAt ? `Last active ${formatTimestamp(agent.lastActivityAt)} - ` : ""}Created {formatTimestamp(agent.createdAt)}
                     </Typography>
                     <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexShrink: 0 }}>
                       <Button size="small" variant="outlined" onClick={() => openEditAgentDialog(agent)}>
@@ -1944,7 +1944,7 @@ export function SwarmManager({ autoRefresh }: Props) {
           <RunHistoryList runs={recentRuns} />
         </SectionShell>
       ) : null}
-      <Dialog open={createOpen} onClose={closeAgentDialog} maxWidth="md" fullWidth slotProps={{ paper: { sx: { borderRadius: "8px", border: "1px solid var(--surface-border)", background: "var(--surface-bg-elevated)", boxShadow: "0 28px 96px rgba(0,0,0,0.5)" } } }}>
+      <Dialog open={createOpen} onClose={closeAgentDialog} maxWidth="md" fullWidth slotProps={{ paper: { sx: { borderRadius: "8px", border: "1px solid var(--surface-border)", background: "var(--surface-bg-elevated)", boxShadow: "0 28px 96px var(--ui-rgba-0-0-0-500)" } } }}>
         <DialogTitle>{editingAgent ? "Edit custom agent" : "Add custom agent"}</DialogTitle>
         <DialogContent dividers>
           <Stack spacing={1.35}>
@@ -2055,8 +2055,8 @@ export function SwarmManager({ autoRefresh }: Props) {
                   px: 1.15,
                   py: 1,
                   borderRadius: "8px",
-                  border: "1px solid rgba(255,255,255,0.08)",
-                  background: "linear-gradient(180deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.02) 100%)"
+                  border: "1px solid var(--ui-rgba-255-255-255-080)",
+                  background: "linear-gradient(180deg, var(--ui-rgba-255-255-255-040) 0%, var(--ui-rgba-255-255-255-020) 100%)"
                 }}
               >
                 <Stack
@@ -2114,8 +2114,8 @@ export function SwarmManager({ autoRefresh }: Props) {
             <Box
               sx={{
                 borderRadius: "8px",
-                border: "1px solid rgba(255,255,255,0.08)",
-                background: "rgba(255,255,255,0.02)",
+                border: "1px solid var(--ui-rgba-255-255-255-080)",
+                background: "var(--ui-rgba-255-255-255-020)",
                 px: 1.15,
                 py: 1.05
               }}
@@ -2185,8 +2185,8 @@ export function SwarmManager({ autoRefresh }: Props) {
                               px: 1,
                               py: 0.85,
                               borderRadius: "8px",
-                              border: "1px solid rgba(255,255,255,0.08)",
-                              background: "rgba(255,255,255,0.02)",
+                              border: "1px solid var(--ui-rgba-255-255-255-080)",
+                              background: "var(--ui-rgba-255-255-255-020)",
                               display: "flex",
                               alignItems: { xs: "stretch", sm: "center" },
                               justifyContent: "space-between",

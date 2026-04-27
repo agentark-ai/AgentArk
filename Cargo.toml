@@ -162,6 +162,10 @@ name = "swarm_api_test"
 path = "tests/swarm_api_test.rs"
 required-features = ["live-smoke-tests"]
 
+[[test]]
+name = "semantic_benchmark_corpus"
+path = "tests/semantic_benchmark_corpus.rs"
+
 [profile.release]
 lto = true
 codegen-units = 1

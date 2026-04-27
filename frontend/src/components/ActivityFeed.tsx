@@ -103,7 +103,7 @@ export function ActivityFeed({ traces, onViewAll }: Props) {
                   sx={{
                     cursor: "pointer",
                     borderRadius: 2,
-                    background: "linear-gradient(180deg, rgba(24, 24, 28, 0.92), rgba(15, 15, 18, 0.88))",
+                    background: "linear-gradient(180deg, var(--ui-rgba-24-24-28-920), var(--ui-rgba-15-15-18-880))",
                   }}
                 >
                   <Stack
@@ -141,7 +141,7 @@ export function ActivityFeed({ traces, onViewAll }: Props) {
                   </Stack>
 
                   <Collapse in={expandedId === trace.id}>
-                    <Box sx={{ mt: 0.75, pl: 1, borderLeft: "2px solid rgba(255, 255, 255, 0.12)" }}>
+                    <Box sx={{ mt: 0.75, pl: 1, borderLeft: "2px solid var(--ui-rgba-255-255-255-120)" }}>
                       {trace.duration_ms != null ? (
                         <Typography
                           variant="caption"

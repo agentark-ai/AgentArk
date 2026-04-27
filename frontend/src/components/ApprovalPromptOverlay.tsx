@@ -142,9 +142,9 @@ export function ApprovalPromptOverlay({
         maxWidth: "calc(100vw - 24px)",
         zIndex: 1450,
         borderRadius: "8px",
-        border: "1px solid rgba(255, 179, 71, 0.24)",
-        background: "linear-gradient(165deg, rgba(24, 15, 6, 0.96), rgba(12, 18, 33, 0.95))",
-        boxShadow: "0 24px 56px rgba(0, 0, 0, 0.46), 0 0 0 1px rgba(255, 179, 71, 0.08)",
+        border: "1px solid var(--ui-rgba-255-179-71-240)",
+        background: "linear-gradient(165deg, var(--ui-rgba-24-15-6-960), var(--ui-rgba-12-18-33-950))",
+        boxShadow: "0 24px 56px var(--ui-rgba-0-0-0-460), 0 0 0 1px var(--ui-rgba-255-179-71-080)",
         backdropFilter: "blur(20px)",
         WebkitBackdropFilter: "blur(20px)",
         overflow: "hidden"
@@ -173,18 +173,18 @@ export function ApprovalPromptOverlay({
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "center",
-                background: "rgba(255, 179, 71, 0.14)",
-                color: "rgba(255, 210, 140, 0.95)",
+                background: "var(--ui-rgba-255-179-71-140)",
+                color: "var(--ui-rgba-255-210-140-950)",
                 flexShrink: 0
               }}
             >
               <NotificationsActiveRoundedIcon fontSize="small" />
             </Box>
             <Box sx={{ minWidth: 0 }}>
-              <Typography variant="subtitle2" sx={{ fontWeight: 700, color: "rgba(255, 241, 224, 0.96)" }}>
+              <Typography variant="subtitle2" sx={{ fontWeight: 700, color: "var(--ui-rgba-255-241-224-960)" }}>
                 Approval Needed
               </Typography>
-              <Typography variant="caption" sx={{ color: "rgba(255, 219, 174, 0.72)" }}>
+              <Typography variant="caption" sx={{ color: "var(--ui-rgba-255-219-174-720)" }}>
                 {remainingCount === 1
                   ? "A task is waiting for your decision."
                   : `${remainingCount} tasks are waiting for your decision.`}
@@ -194,7 +194,7 @@ export function ApprovalPromptOverlay({
           <IconButton
             size="small"
             onClick={() => setDismissedIds((current) => [...current, activeApproval.id])}
-            sx={{ color: "rgba(255, 219, 174, 0.6)" }}
+            sx={{ color: "var(--ui-rgba-255-219-174-600)" }}
             aria-label="Dismiss approval popup"
           >
             <CloseRoundedIcon fontSize="small" />
@@ -209,9 +209,9 @@ export function ApprovalPromptOverlay({
               size="small"
               label={`Risk: ${activeApproval.riskLevel}`}
               sx={{
-                background: "rgba(255, 179, 71, 0.12)",
-                color: "rgba(255, 224, 184, 0.92)",
-                border: "1px solid rgba(255, 179, 71, 0.18)"
+                background: "var(--ui-rgba-255-179-71-120)",
+                color: "var(--ui-rgba-255-224-184-920)",
+                border: "1px solid var(--ui-rgba-255-179-71-180)"
               }}
             />
           ) : null}
@@ -220,9 +220,9 @@ export function ApprovalPromptOverlay({
               size="small"
               label={`Score ${activeApproval.riskScore}`}
               sx={{
-                background: "rgba(120, 174, 255, 0.08)",
-                color: "rgba(207, 226, 255, 0.9)",
-                border: "1px solid rgba(120, 174, 255, 0.12)"
+                background: "var(--ui-rgba-120-174-255-080)",
+                color: "var(--ui-rgba-207-226-255-900)",
+                border: "1px solid var(--ui-rgba-120-174-255-120)"
               }}
             />
           ) : null}
@@ -232,8 +232,8 @@ export function ApprovalPromptOverlay({
               variant="outlined"
               label={activeApproval.source}
               sx={{
-                color: "rgba(197, 214, 238, 0.82)",
-                borderColor: "rgba(116, 153, 202, 0.18)"
+                color: "var(--ui-rgba-197-214-238-820)",
+                borderColor: "var(--ui-rgba-116-153-202-180)"
               }}
             />
           ) : null}
@@ -243,20 +243,20 @@ export function ApprovalPromptOverlay({
           sx={{
             borderRadius: "8px",
             p: 1.25,
-            background: "rgba(255,255,255,0.025)",
-            border: "1px solid rgba(255,255,255,0.05)"
+            background: "var(--ui-rgba-255-255-255-025)",
+            border: "1px solid var(--ui-rgba-255-255-255-050)"
           }}
         >
-          <Typography variant="body2" sx={{ fontWeight: 700, color: "rgba(241, 248, 255, 0.95)" }}>
+          <Typography variant="body2" sx={{ fontWeight: 700, color: "var(--ui-rgba-241-248-255-950)" }}>
             {activeApproval.title}
           </Typography>
           {activeApproval.summary ? (
-            <Typography variant="body2" sx={{ mt: 0.75, color: "rgba(210, 223, 242, 0.82)" }}>
+            <Typography variant="body2" sx={{ mt: 0.75, color: "var(--ui-rgba-210-223-242-820)" }}>
               {activeApproval.summary}
             </Typography>
           ) : null}
           {activeApproval.reason ? (
-            <Typography variant="caption" sx={{ mt: 1, display: "block", color: "rgba(255, 215, 167, 0.72)" }}>
+            <Typography variant="caption" sx={{ mt: 1, display: "block", color: "var(--ui-rgba-255-215-167-720)" }}>
               Why it asked: {activeApproval.reason}
             </Typography>
           ) : null}
@@ -279,11 +279,11 @@ export function ApprovalPromptOverlay({
           disabled={busy}
           sx={{
             "& .MuiInputBase-root": {
-              color: "rgba(241, 248, 255, 0.95)",
-              background: "rgba(255,255,255,0.03)"
+              color: "var(--ui-rgba-241-248-255-950)",
+              background: "var(--ui-rgba-255-255-255-030)"
             },
-            "& .MuiInputLabel-root": { color: "rgba(255, 219, 174, 0.72)" },
-            "& .MuiOutlinedInput-notchedOutline": { borderColor: "rgba(255,255,255,0.12)" }
+            "& .MuiInputLabel-root": { color: "var(--ui-rgba-255-219-174-720)" },
+            "& .MuiOutlinedInput-notchedOutline": { borderColor: "var(--ui-rgba-255-255-255-120)" }
           }}
         />
 
@@ -318,14 +318,14 @@ export function ApprovalPromptOverlay({
           <Button
             size="small"
             onClick={onOpenTasks}
-            sx={{ textTransform: "none", color: "rgba(197, 214, 238, 0.85)" }}
+            sx={{ textTransform: "none", color: "var(--ui-rgba-197-214-238-850)" }}
           >
             Open Tasks
           </Button>
           <Button
             size="small"
             onClick={() => setDismissedIds((current) => [...current, activeApproval.id])}
-            sx={{ textTransform: "none", color: "rgba(255, 219, 174, 0.7)" }}
+            sx={{ textTransform: "none", color: "var(--ui-rgba-255-219-174-700)" }}
           >
             Later
           </Button>

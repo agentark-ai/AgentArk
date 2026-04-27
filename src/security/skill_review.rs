@@ -4,7 +4,7 @@
 //! deterministic policy engine then turns those capabilities into an auditable
 //! verdict. The model never decides allow/block.
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
@@ -12,8 +12,8 @@ use std::path::Path;
 use crate::core::LlmClient;
 use crate::security::action_guard::{AnalysisFinding, FindingCategory, ThreatLevel};
 use crate::security::capabilities::{
-    canonical_capability_set, capability_category, capability_severity, normalize_capability_kind,
-    normalize_capability_selector, normalize_capability_target, CAPABILITY_VOCABULARY,
+    CAPABILITY_VOCABULARY, canonical_capability_set, capability_category, capability_severity,
+    normalize_capability_kind, normalize_capability_selector, normalize_capability_target,
 };
 
 const MAX_SKILL_REVIEW_CHARS: usize = 32_000;
@@ -585,10 +585,12 @@ mod tests {
 
         let decision = evaluate_policy(&default_policy(), &classification);
         assert!(decision.blocked);
-        assert!(decision
-            .matched_rules
-            .iter()
-            .any(|rule| rule.id == "block-keystrokes-with-network"));
+        assert!(
+            decision
+                .matched_rules
+                .iter()
+                .any(|rule| rule.id == "block-keystrokes-with-network")
+        );
     }
 
     #[test]
@@ -634,14 +636,18 @@ mod tests {
             },
         );
 
-        assert!(merged
-            .rules
-            .iter()
-            .any(|rule| rule.id == "block-unknown-high-risk"));
-        assert!(merged
-            .rules
-            .iter()
-            .any(|rule| rule.id == "block-custom-domain"));
+        assert!(
+            merged
+                .rules
+                .iter()
+                .any(|rule| rule.id == "block-unknown-high-risk")
+        );
+        assert!(
+            merged
+                .rules
+                .iter()
+                .any(|rule| rule.id == "block-custom-domain")
+        );
         let shell_rule = merged
             .rules
             .iter()
@@ -700,10 +706,12 @@ mod tests {
 
         let decision = evaluate_policy(&default_policy(), &classification);
         assert!(decision.blocked);
-        assert!(decision
-            .matched_rules
-            .iter()
-            .any(|rule| rule.id == "block-sensor-capture-with-network"));
+        assert!(
+            decision
+                .matched_rules
+                .iter()
+                .any(|rule| rule.id == "block-sensor-capture-with-network")
+        );
     }
 
     #[test]

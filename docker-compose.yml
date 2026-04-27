@@ -43,6 +43,21 @@ services:
     container_name: agentark-postgres
     restart: unless-stopped
     stop_grace_period: 30s
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -eu
+        umask 077
+        mkdir -p /run/secrets
+        if [ ! -s /run/secrets/pg_pw ]; then
+          head -c 24 /dev/urandom | od -An -tx1 | tr -d '[:space:]' > /run/secrets/pg_pw
+          chmod 0400 /run/secrets/pg_pw
+          echo "Generated Postgres password in agentark-secrets volume."
+        else
+          echo "Reusing existing Postgres password from agentark-secrets volume."
+        fi
+        exec docker-entrypoint.sh "$0" "$@"
     command:
       - postgres
       - -c
@@ -52,11 +67,14 @@ services:
     environment:
       - POSTGRES_DB=${AGENTARK_POSTGRES_DB:-agentark}
       - POSTGRES_USER=${AGENTARK_POSTGRES_USER:-agentark}
-      - POSTGRES_PASSWORD=${AGENTARK_POSTGRES_PASSWORD:?run scripts/start.sh or scripts/start.bat to generate a local Postgres password}
+      - POSTGRES_PASSWORD_FILE=/run/secrets/pg_pw
     ports:
       - "127.0.0.1:${AGENTARK_POSTGRES_PORT:-5432}:5432"
     volumes:
       - agentark-postgres-data:/var/lib/postgresql/data
+      # Postgres owns first-run generation of /run/secrets/pg_pw. Other
+      # AgentArk services mount this volume read-only.
+      - agentark-secrets:/run/secrets
     networks:
       - agent-network
     healthcheck:
@@ -65,10 +83,10 @@ services:
           "CMD-SHELL",
           "pg_isready -U ${AGENTARK_POSTGRES_USER:-agentark} -d ${AGENTARK_POSTGRES_DB:-agentark}",
         ]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 10s
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 1s
     deploy:
       resources:
         limits:
@@ -87,6 +105,7 @@ services:
     image: ${AGENTARK_IMAGE:-ghcr.io/agentark-ai/agentark:latest}
     container_name: agentark-control
     restart: unless-stopped
+    cpus: "${AGENTARK_CONTROL_CPUS:-1}"
     security_opt:
       - no-new-privileges:true
     ports:
@@ -96,20 +115,29 @@ services:
     volumes:
       - agentark-data:/app/data
       - agentark-config:/app/config
+      - agentark-secrets:/run/secrets:ro
       - ${AGENTARK_WORKSPACE_HOST_DIR:-.}:${AGENTARK_WORKSPACE_ROOT:-/workspace/agentark}
     depends_on:
       postgres:
         condition: service_healthy
       agentark-executor:
-        condition: service_healthy
+        condition: service_started
       agentark-workspace:
-        condition: service_healthy
+        condition: service_started
+      agentark-embeddings:
+        condition: service_started
     environment:
       - RUST_LOG=info,sqlx::query=warn,sea_orm=warn,hyper=warn,reqwest=warn
       - AGENTARK_CONFIG=/app/config
       - AGENTARK_DATA=/app/data
       - AGENTARK_WORKSPACE_ROOT=${AGENTARK_WORKSPACE_ROOT:-/workspace/agentark}
-      - AGENTARK_DATABASE_URL=postgres://${AGENTARK_POSTGRES_USER:-agentark}:${AGENTARK_POSTGRES_PASSWORD:?run scripts/start.sh or scripts/start.bat to generate a local Postgres password}@postgres:5432/${AGENTARK_POSTGRES_DB:-agentark}
+      # DB URL is assembled at runtime by docker-entrypoint.sh from the password file
+      # written by the Postgres service into the agentark-secrets volume.
+      - AGENTARK_POSTGRES_PASSWORD_FILE=/run/secrets/pg_pw
+      - AGENTARK_POSTGRES_HOST=postgres
+      - AGENTARK_POSTGRES_PORT=5432
+      - AGENTARK_POSTGRES_USER=${AGENTARK_POSTGRES_USER:-agentark}
+      - AGENTARK_POSTGRES_DB=${AGENTARK_POSTGRES_DB:-agentark}
       - AGENTARK_DB_MAX_CONNECTIONS=${AGENTARK_DB_MAX_CONNECTIONS:-20}
       - AGENTARK_DB_CONNECT_TIMEOUT_SECS=${AGENTARK_DB_CONNECT_TIMEOUT_SECS:-5}
       - AGENTARK_DB_STATEMENT_TIMEOUT_MS=${AGENTARK_DB_STATEMENT_TIMEOUT_MS:-30000}
@@ -122,13 +150,13 @@ services:
       - AGENTARK_STACK_ROLE=control
       - AGENTARK_EXECUTOR_URL=http://agentark-executor:8991
       - AGENTARK_WORKSPACE_URL=http://agentark-workspace:8992
+      - AGENTARK_LOCAL_EMBEDDINGS_URL=http://agentark-embeddings:8993
       - AGENTARK_BROWSER_HANDOFF_PUBLIC_PORT=${AGENTARK_BROWSER_HANDOFF_PORT:-6080}
       - AGENTARK_DEBUG=${AGENTARK_DEBUG:-false}
       - AGENTARK_TUNNEL=${AGENTARK_TUNNEL:-false}
       - AGENTARK_LAN_HELPER_URL=${AGENTARK_LAN_HELPER_URL:-}
       - AGENTARK_LAN_HELPER_TOKEN=${AGENTARK_LAN_HELPER_TOKEN:-}
       - AGENTARK_MASTER_PASSWORD=${AGENTARK_MASTER_PASSWORD:-}
-      - AGENTARK_SELF_WATCHDOG=${AGENTARK_SELF_WATCHDOG:-true}
     networks:
       - agent-network
     healthcheck:
@@ -137,12 +165,66 @@ services:
           "CMD",
           "python3",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8990/health', timeout=5)",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8990/health', timeout=1)",
         ]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 5s
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 1s
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+        reservations:
+          cpus: "0.25"
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  agentark-embeddings:
+    image: ${AGENTARK_IMAGE:-ghcr.io/agentark-ai/agentark:latest}
+    container_name: agentark-embeddings
+    restart: unless-stopped
+    cpus: "${AGENTARK_EMBEDDINGS_CPUS:-1}"
+    mem_limit: "${AGENTARK_EMBEDDINGS_MEMORY:-768M}"
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - agentark-data:/app/data
+    environment:
+      - RUST_LOG=info,hyper=warn,reqwest=warn
+      - AGENTARK_STACK_ROLE=embeddings
+      - AGENTARK_EMBEDDINGS_BIND=0.0.0.0:8993
+      - AGENTARK_LOCAL_EMBEDDINGS_MODEL=${AGENTARK_LOCAL_EMBEDDINGS_MODEL:-BAAI/bge-small-en-v1.5}
+      - AGENTARK_LOCAL_EMBEDDINGS_CACHE_DIR=${AGENTARK_LOCAL_EMBEDDINGS_CACHE_DIR:-/app/prebuilt-embeddings-cache}
+      - OMP_NUM_THREADS=${AGENTARK_EMBEDDINGS_THREADS:-1}
+      - OPENBLAS_NUM_THREADS=${AGENTARK_EMBEDDINGS_THREADS:-1}
+      - MKL_NUM_THREADS=${AGENTARK_EMBEDDINGS_THREADS:-1}
+      - RAYON_NUM_THREADS=${AGENTARK_EMBEDDINGS_THREADS:-1}
+    networks:
+      - agent-network
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8993/health', timeout=1)",
+        ]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 1s
+    deploy:
+      resources:
+        limits:
+          cpus: "${AGENTARK_EMBEDDINGS_CPUS:-1}"
+          memory: "${AGENTARK_EMBEDDINGS_MEMORY:-768M}"
+        reservations:
+          cpus: "0.25"
+          memory: 128M
     logging:
       driver: json-file
       options:
@@ -158,19 +240,26 @@ services:
     volumes:
       - agentark-data:/app/data
       - agentark-config:/app/config
+      - agentark-secrets:/run/secrets:ro
       - ${AGENTARK_WORKSPACE_HOST_DIR:-.}:${AGENTARK_WORKSPACE_ROOT:-/workspace/agentark}
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       postgres:
         condition: service_healthy
       agentark-workspace:
-        condition: service_healthy
+        condition: service_started
     environment:
       - RUST_LOG=info,sqlx::query=warn,sea_orm=warn,hyper=warn,reqwest=warn
       - AGENTARK_CONFIG=/app/config
       - AGENTARK_DATA=/app/data
       - AGENTARK_WORKSPACE_ROOT=${AGENTARK_WORKSPACE_ROOT:-/workspace/agentark}
-      - AGENTARK_DATABASE_URL=postgres://${AGENTARK_POSTGRES_USER:-agentark}:${AGENTARK_POSTGRES_PASSWORD:?run scripts/start.sh or scripts/start.bat to generate a local Postgres password}@postgres:5432/${AGENTARK_POSTGRES_DB:-agentark}
+      # DB URL is assembled at runtime by docker-entrypoint.sh from the password file
+      # written by the Postgres service into the agentark-secrets volume.
+      - AGENTARK_POSTGRES_PASSWORD_FILE=/run/secrets/pg_pw
+      - AGENTARK_POSTGRES_HOST=postgres
+      - AGENTARK_POSTGRES_PORT=5432
+      - AGENTARK_POSTGRES_USER=${AGENTARK_POSTGRES_USER:-agentark}
+      - AGENTARK_POSTGRES_DB=${AGENTARK_POSTGRES_DB:-agentark}
       - AGENTARK_DB_MAX_CONNECTIONS=${AGENTARK_DB_MAX_CONNECTIONS:-20}
       - AGENTARK_DB_CONNECT_TIMEOUT_SECS=${AGENTARK_DB_CONNECT_TIMEOUT_SECS:-5}
       - AGENTARK_DB_STATEMENT_TIMEOUT_MS=${AGENTARK_DB_STATEMENT_TIMEOUT_MS:-30000}
@@ -186,7 +275,6 @@ services:
       - DOCKER_HOST=unix:///var/run/docker.sock
       - AGENTARK_DEBUG=${AGENTARK_DEBUG:-false}
       - AGENTARK_MASTER_PASSWORD=${AGENTARK_MASTER_PASSWORD:-}
-      - AGENTARK_SELF_WATCHDOG=${AGENTARK_SELF_WATCHDOG:-true}
     networks:
       - agent-network
     healthcheck:
@@ -195,12 +283,12 @@ services:
           "CMD",
           "python3",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8991/health', timeout=5)",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8991/health', timeout=1)",
         ]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 5s
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 1s
     logging:
       driver: json-file
       options:
@@ -224,7 +312,6 @@ services:
       - AGENTARK_STACK_ROLE=workspace
       - AGENTARK_WORKSPACE_ROOT=${AGENTARK_WORKSPACE_ROOT:-/workspace/agentark}
       - AGENTARK_WORKSPACE_BIND=0.0.0.0:8992
-      - AGENTARK_SELF_WATCHDOG=${AGENTARK_SELF_WATCHDOG:-true}
     networks:
       - agent-network
     healthcheck:
@@ -233,12 +320,12 @@ services:
           "CMD",
           "python3",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8992/health', timeout=5)",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8992/health', timeout=1)",
         ]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 5s
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 1s
     logging:
       driver: json-file
       options:
@@ -252,6 +339,12 @@ volumes:
     name: agentark-config
   agentark-postgres-data:
     name: agentark-postgres-data
+  # Holds the generated Postgres password file (/run/secrets/pg_pw). Docker-managed;
+  # never touches the host filesystem. `docker compose down -v` removes it and
+  # triggers a fresh password on next start (which also requires wiping
+  # agentark-postgres-data to match).
+  agentark-secrets:
+    name: agentark-secrets
 networks:
   agent-network:
     driver: bridge

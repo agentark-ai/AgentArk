@@ -1,7 +1,5 @@
 use super::*;
 
-const ROUTING_COMPLEXITY_POLICY_KEY: &str = "routing_complexity_policy_v1";
-const ROUTING_COMPLEXITY_POLICY_DEFAULT_VERSION: &str = "routing-policy-default-v2";
 const ROUTER_CALL_TIMEOUT_MS: u64 = 12_000;
 
 fn router_call_timeout_ms() -> u64 {
@@ -78,242 +76,64 @@ fn parse_routing_decision_from_text(
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SwarmDirective {
-    Auto,
-    Force,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct RoutingComplexityPolicy {
-    long_question_word_threshold: usize,
-    long_message_word_threshold: usize,
-    multi_sentence_threshold: usize,
-    structured_line_threshold: usize,
-    medium_score_threshold: f32,
-    complex_score_threshold: f32,
-}
-
-impl Default for RoutingComplexityPolicy {
-    fn default() -> Self {
-        Self {
-            long_question_word_threshold: 50,
-            long_message_word_threshold: 30,
-            multi_sentence_threshold: 3,
-            structured_line_threshold: 4,
-            medium_score_threshold: 0.38,
-            complex_score_threshold: 0.72,
-        }
+fn structural_complexity_score(message: &str) -> f32 {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return 0.0;
     }
+
+    let word_count = trimmed.split_whitespace().count() as f32;
+    let line_count = trimmed.lines().count() as f32;
+    let question_count = trimmed.matches('?').count() as f32;
+    let has_code_block = trimmed.contains("```");
+    let has_list_shape = trimmed
+        .lines()
+        .map(str::trim_start)
+        .any(|line| line.starts_with("- ") || line.starts_with("* ") || line.starts_with("1."));
+
+    let mut score = 0.0_f32;
+    if word_count >= 30.0 {
+        score += ((word_count - 30.0) / 60.0).clamp(0.1, 0.4);
+    }
+    if line_count >= 4.0 {
+        score += (line_count / 10.0).clamp(0.08, 0.2);
+    }
+    if question_count >= 2.0 {
+        score += 0.08;
+    }
+    if has_code_block {
+        score += 0.12;
+    }
+    if has_list_shape {
+        score += 0.12;
+    }
+    score.clamp(0.0, 1.0)
 }
 
 impl Agent {
-    fn apply_routing_complexity_policy_override(
-        policy: &mut RoutingComplexityPolicy,
-        raw: &serde_json::Value,
-    ) {
-        let Some(obj) = raw.as_object() else {
-            return;
-        };
-
-        if let Some(v) = obj
-            .get("long_question_word_threshold")
-            .and_then(|v| v.as_u64())
-        {
-            policy.long_question_word_threshold = v.clamp(5, 1000) as usize;
-        }
-        if let Some(v) = obj
-            .get("long_message_word_threshold")
-            .and_then(|v| v.as_u64())
-        {
-            policy.long_message_word_threshold = v.clamp(5, 1000) as usize;
-        }
-        if let Some(v) = obj.get("multi_sentence_threshold").and_then(|v| v.as_u64()) {
-            policy.multi_sentence_threshold = v.clamp(1, 50) as usize;
-        }
-        if let Some(v) = obj
-            .get("structured_line_threshold")
-            .and_then(|v| v.as_u64())
-        {
-            policy.structured_line_threshold = v.clamp(2, 50) as usize;
-        }
-        if let Some(v) = obj
-            .get("medium_score_threshold")
-            .and_then(|v| v.as_f64())
-            .map(|v| v as f32)
-        {
-            policy.medium_score_threshold = v.clamp(0.05, 0.95);
-        }
-        if let Some(v) = obj
-            .get("complex_score_threshold")
-            .and_then(|v| v.as_f64())
-            .map(|v| v as f32)
-        {
-            policy.complex_score_threshold = v.clamp(0.10, 0.99);
-        }
-        if policy.complex_score_threshold <= policy.medium_score_threshold {
-            policy.complex_score_threshold = (policy.medium_score_threshold + 0.05).min(0.99);
-        }
-    }
-
-    fn routing_seed_for_message(message: &str) -> String {
-        let normalized = message.trim().to_ascii_lowercase();
-        if normalized.is_empty() {
-            "_empty".to_string()
-        } else {
-            normalized
-        }
-    }
-
-    async fn load_routing_complexity_policy_for_message(
+    async fn classify_complexity_fallback(
         &self,
         message: &str,
-    ) -> (RoutingComplexityPolicy, String) {
-        let mut policy = RoutingComplexityPolicy::default();
-        let mut selected_version = ROUTING_COMPLEXITY_POLICY_DEFAULT_VERSION.to_string();
-
-        if let Ok(raw_env) = std::env::var("AGENTARK_ROUTING_COMPLEXITY_POLICY_JSON") {
-            match serde_json::from_str::<serde_json::Value>(&raw_env) {
-                Ok(value) => Self::apply_routing_complexity_policy_override(&mut policy, &value),
-                Err(e) => tracing::warn!(
-                    "Invalid AGENTARK_ROUTING_COMPLEXITY_POLICY_JSON ignored: {}",
-                    e
-                ),
-            }
-        }
-
-        if let Ok(Some(raw)) = self.storage.get(ROUTING_COMPLEXITY_POLICY_KEY).await {
-            match serde_json::from_slice::<serde_json::Value>(&raw) {
-                Ok(value) => Self::apply_routing_complexity_policy_override(&mut policy, &value),
-                Err(e) => tracing::warn!(
-                    "Invalid routing complexity policy in storage ignored: {}",
-                    e
-                ),
-            }
-        }
-
-        let baseline_policy = policy.clone();
-
-        if let Ok(Some(raw_state)) = self
-            .storage
-            .get(crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_CANARY_STATE_KEY)
-            .await
-        {
-            match serde_json::from_slice::<
-                crate::core::self_evolve::strategy_runtime::CanaryRolloutState,
-            >(&raw_state)
-            {
-                Ok(state) if state.enabled => {
-                    selected_version = state.baseline_version;
-                    if crate::core::self_evolve::strategy_runtime::should_use_canary(
-                        &Self::routing_seed_for_message(message),
-                        state.rollout_percent,
-                    ) {
-                        if let Ok(Some(raw_canary)) = self
-                            .storage
-                            .get(
-                                crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_POLICY_CANARY_KEY,
-                            )
-                            .await
-                        {
-                            match serde_json::from_slice::<serde_json::Value>(&raw_canary) {
-                                Ok(value) => {
-                                    let mut canary_policy = baseline_policy.clone();
-                                    Self::apply_routing_complexity_policy_override(
-                                        &mut canary_policy,
-                                        &value,
-                                    );
-                                    policy = canary_policy;
-                                    selected_version = state.candidate_version;
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "Invalid routing complexity canary policy ignored: {}",
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => tracing::warn!(
-                    "Invalid routing complexity canary state in storage ignored: {}",
-                    e
-                ),
-            }
-        }
-
-        (policy, selected_version)
-    }
-
-    pub(crate) async fn active_routing_policy_version_for_message(&self, message: &str) -> String {
-        let (_, version) = self
-            .load_routing_complexity_policy_for_message(message)
-            .await;
-        version
-    }
-
-    /// Select the best model role based on message content and complexity
-    pub(crate) fn select_model_role(
-        &self,
-        message: &str,
-        complexity: &QueryComplexity,
-    ) -> ModelRole {
-        if !self.config.model_pool.smart_routing {
-            return ModelRole::Primary;
-        }
-        let trimmed = message.trim();
-        let word_count = trimmed.split_whitespace().count();
-        let question_count = trimmed.matches('?').count();
-        let has_role = |role: ModelRole| {
-            self.model_pool
-                .values()
-                .any(|(s, _)| s.role == role && s.enabled)
-        };
-
-        let code_syntax_signal = message.contains("```")
-            || message.contains("fn ")
-            || message.contains("def ")
-            || message.contains("SELECT ")
-            || message.contains("class ")
-            || message.contains("import ")
-            || message.contains("=>");
-        let symbol_chars = trimmed
-            .chars()
-            .filter(|c| "{}[]();:=<>/\\#`".contains(*c))
-            .count();
-        let symbol_ratio = if trimmed.is_empty() {
-            0.0
+    ) -> crate::core::task_router::RoutingDecision {
+        let score = structural_complexity_score(message);
+        let complexity = if score >= 0.72 {
+            QueryComplexity::Complex
+        } else if score >= 0.38 {
+            QueryComplexity::Medium
         } else {
-            symbol_chars as f32 / trimmed.chars().count().max(1) as f32
+            QueryComplexity::Simple
         };
-
-        if has_role(ModelRole::Code)
-            && (code_syntax_signal || (symbol_ratio >= 0.08 && word_count >= 12))
-        {
-            return ModelRole::Code;
-        }
-        if has_role(ModelRole::Research)
-            && matches!(complexity, QueryComplexity::Complex)
-            && (question_count > 0 || word_count >= 90)
-        {
-            return ModelRole::Research;
-        }
-
-        match complexity {
-            QueryComplexity::Simple => {
-                if has_role(ModelRole::Fast) {
-                    ModelRole::Fast
-                } else {
-                    ModelRole::Primary
-                }
-            }
-            _ => ModelRole::Primary,
+        crate::core::task_router::RoutingDecision {
+            needs_delegation: false,
+            complexity,
+            sub_agents: vec![],
+            reasoning: "Structural fallback classification".to_string(),
+            confidence: score,
+            should_clarify: false,
+            clarification_question: None,
         }
     }
 
-    /// LLM-based routing: decide if we need sub-agents and what kind
     pub(crate) async fn route_query(
         &self,
         message: &str,
@@ -346,9 +166,6 @@ impl Agent {
                 .join("\n")
         };
 
-        let (routing_policy_hint, routing_policy_version) = self
-            .load_routing_complexity_policy_for_message(message)
-            .await;
         let action_hint_block = if actions.is_empty() {
             "No registered actions available.".to_string()
         } else {
@@ -365,27 +182,17 @@ impl Agent {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
+
         let preferred_direct_action =
             crate::core::intent::preferred_direct_action_name(message, actions)
                 .unwrap_or_else(|| "none".to_string());
-        let policy_hint_block = format!(
-            "Active routing policy version: {}\n\
-Routing fallback signals are structure-first (not keyword lists).\n\
-Thresholds: long_question_word_threshold={}, long_message_word_threshold={}, multi_sentence_threshold={}, structured_line_threshold={}, medium_score_threshold={:.2}, complex_score_threshold={:.2}",
-            routing_policy_version,
-            routing_policy_hint.long_question_word_threshold,
-            routing_policy_hint.long_message_word_threshold,
-            routing_policy_hint.multi_sentence_threshold,
-            routing_policy_hint.structured_line_threshold,
-            routing_policy_hint.medium_score_threshold,
-            routing_policy_hint.complex_score_threshold,
-        );
+        let policy_hint_block = "Fallback routing is structure-first. Do not infer a delegated plan from keyword matches alone.";
 
         let routing_prompt = crate::core::self_evolve::prompt_evolution::render_router_user_prompt(
             prompt_bundle,
             &crate::core::self_evolve::prompt_evolution::RouterPromptRenderInputs {
                 specialists: &specialist_desc,
-                policy_hint: &policy_hint_block,
+                policy_hint: policy_hint_block,
                 action_hints: &action_hint_block,
                 preferred_action: &preferred_direct_action,
                 message,
@@ -396,16 +203,9 @@ Thresholds: long_question_word_threshold={}, long_message_word_threshold={}, mul
 
         let empty_actions: Vec<crate::actions::ActionDef> = Vec::new();
         let mut router_response: Option<crate::core::llm::LlmResponse> = None;
-        let mut router_errors: Vec<String> = Vec::new();
         let timeout_ms = router_call_timeout_ms();
-        for (idx, candidate) in router_candidates.iter().enumerate() {
-            if idx > 0 {
-                tracing::warn!(
-                    "Routing self-heal: switching router model to {} ({}) after previous failure",
-                    candidate.slot_label,
-                    candidate.client.model_name()
-                );
-            }
+
+        for candidate in router_candidates {
             let route_call =
                 candidate
                     .client
@@ -417,99 +217,44 @@ Thresholds: long_question_word_threshold={}, long_message_word_threshold={}, mul
                     router_response = Some(resp);
                     break;
                 }
-                Ok(Err(e)) => {
-                    let err_msg = format!(
-                        "{} ({}) failed: {}",
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        "Routing model attempt failed for {} ({}): {}",
                         candidate.slot_label,
                         candidate.client.model_name(),
-                        e
+                        error
                     );
-                    tracing::warn!("Routing model attempt failed: {}", err_msg);
-                    router_errors.push(err_msg);
                 }
                 Err(_) => {
-                    let err_msg = format!(
-                        "{} ({}) timed out after {}ms",
+                    tracing::warn!(
+                        "Routing model attempt timed out for {} ({}) after {}ms",
                         candidate.slot_label,
                         candidate.client.model_name(),
                         timeout_ms
                     );
-                    tracing::warn!("Routing model attempt timed out: {}", err_msg);
-                    router_errors.push(err_msg);
                 }
-            };
+            }
         }
 
         match router_response {
-            Some(response) => {
-                let content = response.content.trim();
-                match parse_routing_decision_from_text(content) {
-                    Some(mut decision) => {
-                        if !(0.0..=1.0).contains(&decision.confidence) || decision.confidence <= 0.0
-                        {
-                            decision.confidence = if decision.needs_delegation {
-                                0.75
-                            } else {
-                                0.65
-                            };
-                        }
-                        decision
+            Some(response) => match parse_routing_decision_from_text(response.content.trim()) {
+                Some(mut decision) => {
+                    if !(0.0..=1.0).contains(&decision.confidence) || decision.confidence <= 0.0 {
+                        decision.confidence = if decision.needs_delegation {
+                            0.75
+                        } else {
+                            0.65
+                        };
                     }
-                    None => {
-                        tracing::warn!(
-                            "Failed to parse routing JSON, falling back to structural classifier"
-                        );
-                        self.classify_complexity_fallback(message, actions).await
-                    }
+                    decision
                 }
-            }
-            None => {
-                tracing::warn!(
-                    "Routing LLM call failed across all candidates, falling back to structural classifier: {}",
-                    router_errors.join(" | ")
-                );
-                self.classify_complexity_fallback(message, actions).await
-            }
+                None => {
+                    tracing::warn!("Failed to parse routing JSON, using structural fallback");
+                    self.classify_complexity_fallback(message).await
+                }
+            },
+            None => self.classify_complexity_fallback(message).await,
         }
-    }
-
-    /// Structural fallback used when semantic routing is unavailable.
-    pub(crate) async fn classify_complexity_fallback(
-        &self,
-        message: &str,
-        actions: &[crate::actions::ActionDef],
-    ) -> crate::core::task_router::RoutingDecision {
-        let _ = actions;
-        let (policy, _) = self
-            .load_routing_complexity_policy_for_message(message)
-            .await;
-        let score = Self::structural_complexity_score(message, &policy);
-        let complexity = if score >= policy.complex_score_threshold {
-            QueryComplexity::Complex
-        } else if score >= policy.medium_score_threshold {
-            QueryComplexity::Medium
-        } else {
-            QueryComplexity::Simple
-        };
-        crate::core::task_router::RoutingDecision {
-            needs_delegation: false,
-            complexity,
-            sub_agents: vec![],
-            reasoning: "Structural fallback classification".to_string(),
-            confidence: score,
-            should_clarify: false,
-            clarification_question: None,
-        }
-    }
-    pub(crate) fn detect_swarm_directive(&self, message: &str) -> SwarmDirective {
-        let trimmed = message.trim();
-        if trimmed.eq_ignore_ascii_case("/delegate")
-            || trimmed.to_ascii_lowercase().starts_with("/delegate ")
-        {
-            return SwarmDirective::Force;
-        }
-
-        SwarmDirective::Auto
     }
 
     pub(crate) fn forced_swarm_specs(
@@ -617,109 +362,6 @@ Thresholds: long_question_word_threshold={}, long_message_word_threshold={}, mul
                 plan_step_id: None,
             },
         ]
-    }
-
-    pub(crate) fn apply_swarm_directive(
-        &self,
-        message: &str,
-        actions: &[crate::actions::ActionDef],
-        decision: &mut crate::core::task_router::RoutingDecision,
-        directive: SwarmDirective,
-    ) {
-        match directive {
-            SwarmDirective::Force => {
-                decision.needs_delegation = true;
-                decision.complexity = QueryComplexity::Complex;
-                if decision.sub_agents.len() < 2 {
-                    decision.sub_agents = self.forced_swarm_specs(message, actions);
-                }
-                decision.confidence = decision.confidence.max(0.96);
-                decision.reasoning = format!(
-                    "{} | Explicit structured delegation command forced multi-agent execution.",
-                    decision.reasoning
-                );
-            }
-            SwarmDirective::Auto => {
-                if decision.needs_delegation && decision.sub_agents.len() < 2 {
-                    decision.needs_delegation = false;
-                    decision.sub_agents.clear();
-                    decision.reasoning = format!(
-                        "{} | Delegation suppressed because the task did not decompose into 2+ usable agents.",
-                        decision.reasoning
-                    );
-                }
-            }
-        }
-    }
-
-    fn structural_complexity_score(message: &str, policy: &RoutingComplexityPolicy) -> f32 {
-        let trimmed = message.trim();
-        if trimmed.is_empty() {
-            return 0.0;
-        }
-
-        let word_count = trimmed.split_whitespace().count();
-        let line_count = trimmed.lines().count();
-        let sentence_count = trimmed.matches('.').count()
-            + trimmed.matches('?').count()
-            + trimmed.matches('!').count();
-        let question_count = trimmed.matches('?').count();
-        let has_code_block = trimmed.contains("```");
-        let has_list_shape = trimmed
-            .lines()
-            .map(str::trim_start)
-            .any(|line| line.starts_with("- ") || line.starts_with("* ") || line.starts_with("1."));
-        let has_structured_layout =
-            line_count >= policy.structured_line_threshold || has_code_block || has_list_shape;
-
-        let mut score = 0.0_f32;
-
-        if word_count >= policy.long_message_word_threshold {
-            let span = (policy.long_message_word_threshold.max(1)) as f32;
-            let normalized = ((word_count as f32 - span) / span).clamp(0.0, 1.0);
-            score += 0.35 * normalized.max(0.25);
-        }
-
-        if sentence_count >= policy.multi_sentence_threshold {
-            let normalized = (sentence_count as f32 / policy.multi_sentence_threshold as f32)
-                .clamp(1.0, 3.0)
-                / 3.0;
-            score += 0.22 * normalized;
-        }
-
-        if question_count > 0 && word_count >= policy.long_question_word_threshold {
-            score += 0.14;
-        } else if question_count >= 2 {
-            score += 0.08;
-        }
-
-        if has_structured_layout {
-            score += 0.16;
-        }
-        if line_count >= policy.structured_line_threshold + 2 {
-            score += 0.10;
-        }
-        if has_code_block {
-            score += 0.10;
-        }
-
-        score.clamp(0.0, 1.0)
-    }
-
-    /// Classify query complexity for routing (structure-first fallback)
-    pub(crate) async fn classify_complexity(&self, message: &str) -> QueryComplexity {
-        let (policy, _) = self
-            .load_routing_complexity_policy_for_message(message)
-            .await;
-        let score = Self::structural_complexity_score(message, &policy);
-
-        if score >= policy.complex_score_threshold {
-            return QueryComplexity::Complex;
-        }
-        if score >= policy.medium_score_threshold {
-            return QueryComplexity::Medium;
-        }
-        QueryComplexity::Simple
     }
 }
 

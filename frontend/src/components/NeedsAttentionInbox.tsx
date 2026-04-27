@@ -15,7 +15,7 @@ import type { Notification, Task } from "../types";
 
 export type AttentionItem = {
   id: string;
-  kind: "approval" | "failed" | "security" | "setup";
+  kind: "approval" | "input" | "failed" | "security" | "setup";
   title: string;
   detail?: string;
   targetView?: string;
@@ -30,25 +30,31 @@ function attentionMeta(kind: AttentionItem["kind"]): {
     case "approval":
       return {
         label: "Approval",
-        accent: "rgba(255, 194, 87, 0.96)",
+        accent: "var(--ui-rgba-255-194-87-960)",
         defaultDetail: "An operator decision is blocking execution.",
+      };
+    case "input":
+      return {
+        label: "Input",
+        accent: "var(--ui-rgba-97-208-255-960)",
+        defaultDetail: "Execution is paused until missing input is provided.",
       };
     case "failed":
       return {
         label: "Failure",
-        accent: "rgba(255, 123, 123, 0.95)",
+        accent: "var(--ui-rgba-255-123-123-950)",
         defaultDetail: "A run degraded and may need intervention.",
       };
     case "setup":
       return {
         label: "Setup",
-        accent: "rgba(97, 208, 255, 0.96)",
+        accent: "var(--ui-rgba-97-208-255-960)",
         defaultDetail: "Core capability setup is incomplete.",
       };
     default:
       return {
         label: "Alert",
-        accent: "rgba(255, 151, 115, 0.94)",
+        accent: "var(--ui-rgba-255-151-115-940)",
         defaultDetail: "A system alert needs operator review.",
       };
   }
@@ -63,10 +69,18 @@ function notificationTargetView(notification: Notification): string {
   return "settings";
 }
 
+type SecurityLog = {
+  event_type: string;
+  severity: string;
+  message: string;
+  source?: string;
+  created_at?: string;
+};
+
 type Props = {
   tasks: Task[];
   notifications: Notification[];
-  securityLogs: Array<{ event_type: string; severity: string; message: string }>;
+  securityLogs: SecurityLog[];
   settingsLoaded: boolean;
   hasLlmConfigured: boolean;
   onApprove: (id: string) => void;
@@ -87,10 +101,62 @@ function isTestArtifactTask(task: Task): boolean {
   return desc.includes("e2e test task") || desc.includes("integration test task");
 }
 
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function isInternalWebChatTask(task: Task): boolean {
+  const args = asRecord(task.arguments);
+  return (
+    String(task.action || "").trim().toLowerCase() === "chat_request" &&
+    String(args._origin || "").trim().toLowerCase() === "chat" &&
+    String(args.channel || "").trim().toLowerCase() === "web"
+  );
+}
+
+function taskNeedsInput(task: Task): boolean {
+  const raw = task.result;
+  const text = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (text.startsWith("__input_needed__:")) return true;
+  const payload = asRecord(raw);
+  const kind = String(payload.kind || "").trim().toLowerCase();
+  return kind === "input_needed" || kind === "input-needed" || kind === "workflow_inputs";
+}
+
+function securityLogIsOperatorActionable(log: SecurityLog): boolean {
+  const severity = String(log.severity || "").toLowerCase();
+  if (severity !== "high" && severity !== "critical") return false;
+  const eventType = String(log.event_type || "").toLowerCase();
+  const message = String(log.message || "").toLowerCase();
+  if (eventType === "capability_correlation") return false;
+  if (message.includes("runtime capability correlation")) return false;
+  return true;
+}
+
+function notificationIsOperatorActionable(notification: Notification): boolean {
+  if (notification.read) return false;
+  const level = String(notification.level || "").toLowerCase();
+  if (level !== "error" && level !== "critical") return false;
+  const hay = [
+    notification.title,
+    notification.body,
+    notification.source,
+    notification.metadata?.source,
+  ]
+    .map((value) => String(value || "").toLowerCase())
+    .join(" ");
+  if (hay.includes("runtime capability correlation")) return false;
+  if (hay.includes("semantic router")) return false;
+  if (hay.includes("run stream not found")) return false;
+  return true;
+}
+
 export function buildAttentionItems(
   tasks: Task[],
   notifications: Notification[],
-  securityLogs: Array<{ event_type: string; severity: string; message: string }>,
+  securityLogs: SecurityLog[],
   settingsLoaded: boolean,
   hasLlmConfigured: boolean
 ): AttentionItem[] {
@@ -107,6 +173,7 @@ export function buildAttentionItems(
 
   for (const task of tasks) {
     if (isTestArtifactTask(task)) continue;
+    if (isInternalWebChatTask(task)) continue;
     const status = String(task?.status || "").toLowerCase();
     if (status.includes("awaitingapproval")) {
       items.push({
@@ -119,6 +186,20 @@ export function buildAttentionItems(
 
   for (const task of tasks) {
     if (isTestArtifactTask(task)) continue;
+    if (isInternalWebChatTask(task)) continue;
+    const status = String(task?.status || "").toLowerCase();
+    if (taskNeedsInput(task) || status.includes("paused")) {
+      items.push({
+        id: task.id,
+        kind: "input",
+        title: task.description || "Task needs input",
+      });
+    }
+  }
+
+  for (const task of tasks) {
+    if (isTestArtifactTask(task)) continue;
+    if (isInternalWebChatTask(task)) continue;
     const status = String(task?.status || "").toLowerCase();
     if (status.includes("failed")) {
       items.push({
@@ -130,8 +211,7 @@ export function buildAttentionItems(
   }
 
   for (const log of securityLogs) {
-    const severity = (log.severity || "").toLowerCase();
-    if (severity === "high" || severity === "critical") {
+    if (securityLogIsOperatorActionable(log)) {
       items.push({
         id: `sec_${log.event_type}_${log.message?.slice(0, 20)}`,
         kind: "security",
@@ -142,7 +222,7 @@ export function buildAttentionItems(
   }
 
   for (const notification of notifications) {
-    if (!notification.read && (notification.level === "error" || notification.level === "critical")) {
+    if (notificationIsOperatorActionable(notification)) {
       items.push({
         id: `notif_${notification.id}`,
         kind: "security",
@@ -173,11 +253,14 @@ export function NeedsAttentionInbox({
   const items = buildAttentionItems(tasks, notifications, securityLogs, settingsLoaded, hasLlmConfigured);
   const count = items.length;
   const waitingCount = tasks.filter((task) => {
+    if (isInternalWebChatTask(task)) return false;
     const status = String(task?.status || "").toLowerCase();
-    return status.includes("awaitingapproval") || status.includes("paused");
+    return status.includes("awaitingapproval") || status.includes("paused") || taskNeedsInput(task);
   }).length;
-  const failedCount = tasks.filter((task) => String(task?.status || "").toLowerCase().includes("failed")).length;
-  const unreadAlerts = notifications.filter((notification) => !notification.read).length;
+  const failedCount = tasks.filter(
+    (task) => !isInternalWebChatTask(task) && String(task?.status || "").toLowerCase().includes("failed")
+  ).length;
+  const unreadAlerts = notifications.filter(notificationIsOperatorActionable).length;
 
   return (
     <Card className="attention-card mission-panel mission-panel--adaptive" data-tour-target="overview-attention">
@@ -192,7 +275,7 @@ export function NeedsAttentionInbox({
                 mb: 0.45
               }}>
               <WarningAmberRoundedIcon
-                sx={{ color: count > 0 ? "rgba(255, 167, 38, 0.9)" : "rgba(155, 180, 214, 0.4)", fontSize: 20 }}
+                sx={{ color: count > 0 ? "var(--ui-rgba-255-167-38-900)" : "var(--ui-rgba-155-180-214-400)", fontSize: 20 }}
               />
               <Typography variant="body1" sx={{ flex: 1, fontWeight: 700 }}>
                 Needs Attention
@@ -216,7 +299,7 @@ export function NeedsAttentionInbox({
 
           {count === 0 ? (
             <Box className="empty-state mission-empty-copy" sx={{ py: 3 }}>
-              <CheckCircleOutlineRoundedIcon sx={{ fontSize: 36, color: "rgba(20, 241, 149, 0.6)" }} />
+              <CheckCircleOutlineRoundedIcon sx={{ fontSize: 36, color: "var(--ui-rgba-20-241-149-600)" }} />
               <Typography
                 variant="body2"
                 sx={{
@@ -237,7 +320,7 @@ export function NeedsAttentionInbox({
                     sx={{
                       p: "10px 12px",
                       borderLeft: `3px solid ${meta.accent}`,
-                      background: "rgba(255,255,255,0.02)",
+                      background: "var(--ui-rgba-255-255-255-020)",
                     }}
                   >
                     <Stack

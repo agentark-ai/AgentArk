@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
@@ -2066,7 +2066,7 @@ pub async fn test_selected_bundles(config_dir: &Path) -> Result<HashMap<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{http::StatusCode, routing::get, Router};
+    use axum::{Router, http::StatusCode, routing::get};
     use tempfile::tempdir;
     use tokio::net::TcpListener;
 

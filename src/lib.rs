@@ -1,4 +1,4 @@
-//! AgentArk - A personal AI OS for memory, agents, apps, automations, and reviewable actions
+//! AgentArk - A personal AI Agent OS for memory, agents, apps, automations, and reviewable actions
 //!
 //! Features:
 //! - Daily briefs, reminders, and channel delivery
@@ -202,7 +202,8 @@ async fn initialize_executor_service_globals(config_dir: &Path, data_dir: &Path)
     Ok(())
 }
 
-const CLI_SETUP_COMMAND: &str = "agentark setup";
+const CLI_CHAT_COMMAND: &str = "agentark --chat";
+const CLI_SETUP_COMMAND: &str = "agentark --setup";
 const CLI_SETTINGS_URL: &str = "http://localhost:8990";
 const CLI_SETUP_PROMPT: &str = "Launch setup wizard now? [Y/n]";
 
@@ -257,7 +258,7 @@ pub(crate) fn render_cli_chat_onboarding_message(
             "  2. Or open {} and go to Settings > Models.",
             CLI_SETTINGS_URL
         ),
-        "  3. Re-run `agentark chat` after setup.".to_string(),
+        format!("  3. Re-run `{}` after setup.", CLI_CHAT_COMMAND),
     ];
 
     if include_prompt {
@@ -268,9 +269,32 @@ pub(crate) fn render_cli_chat_onboarding_message(
     lines.join("\n")
 }
 
+fn cli_chat_request_hints() -> core::RequestExecutionHints {
+    core::RequestExecutionHints {
+        caller_principal: Some(actions::ActionCallerPrincipal::local_admin("cli")),
+        execution_surface: actions::ActionExecutionSurface::Chat,
+        direct_user_intent: true,
+        routing: None,
+        intent_plan: None,
+        secret_offered: None,
+        attachments: Vec::new(),
+        saved_user_facts_context: None,
+    }
+}
+
 fn should_launch_cli_setup(choice: &str) -> bool {
     !matches!(choice.trim().to_ascii_lowercase().as_str(), "n" | "no")
 }
+
+const AGENTARK_UNIX_BANNER: &[&str] = &[
+    r"    _                    _      _        _    ",
+    r"   / \   __ _  ___ _ __ | |_   / \   _ _| | __",
+    r"  / _ \ / _` |/ _ \ '_ \| __| / _ \ | '__| |/ /",
+    r" / ___ \ (_| |  __/ | | | |_ / ___ \| |  |   < ",
+    r"/_/   \_\__, |\___|_| |_|\__/_/   \_\_|  |_|\_\",
+    r"        |___/                                    ",
+];
+const AGENTARK_UNIX_BANNER_MIN_WIDTH: usize = 60;
 
 fn print_unix_cli_banner(mode: &str) {
     print_unix_cli_banner_with_color(mode, None);
@@ -283,13 +307,23 @@ fn print_unix_cli_banner_with_color(mode: &str, color: Option<&str>) {
         env!("CARGO_PKG_VERSION"),
         mode
     );
-    let rule = "=".repeat(title.len());
+    let width = AGENTARK_UNIX_BANNER
+        .iter()
+        .map(|line| line.len())
+        .max()
+        .unwrap_or(title.len())
+        .max(title.len())
+        .max(AGENTARK_UNIX_BANNER_MIN_WIDTH);
+    let rule = "-".repeat(width);
     let prefix = color.unwrap_or("");
     let suffix = if color.is_some() { "\x1b[0m" } else { "" };
 
     println!();
+    for line in AGENTARK_UNIX_BANNER {
+        println!("{}{}{}", prefix, line, suffix);
+    }
     println!("{}{}{}", prefix, rule, suffix);
-    println!("{}{}{}", prefix, title, suffix);
+    println!("{}{:^width$}{}", prefix, title, suffix, width = width);
     println!("{}{}{}", prefix, rule, suffix);
 }
 
@@ -304,10 +338,13 @@ impl FormatTime for HumanReadableUtcLogTime {
 
 pub async fn run() -> Result<()> {
     let args = Args::parse();
+    let requested_chat = args.chat || matches!(args.command.as_ref(), Some(cli::Command::Chat));
+    let requested_setup = args.setup || matches!(args.command.as_ref(), Some(cli::Command::Setup));
+    let requested_pulse = args.pulse || matches!(args.command.as_ref(), Some(cli::Command::Pulse));
 
     // Initialize tracing
     // --debug enables verbose logging for agentark while keeping noisy deps quiet
-    let default_filter = if args.chat {
+    let default_filter = if requested_chat {
         "error".to_string()
     } else if args.debug {
         "warn,agentark=debug,sqlx::query=warn,sea_orm=info,hyper=warn,reqwest=warn,bollard=info,tower=warn,h2=warn,rustls=warn".to_string()
@@ -317,8 +354,8 @@ pub async fn run() -> Result<()> {
             args.log_level
         )
     };
-    let env_filter = if args.chat {
-        // In chat mode, force error-only — ignore RUST_LOG env var
+    let env_filter = if requested_chat {
+        // In chat mode, force error-only; ignore RUST_LOG env var.
         "error".parse().expect("Invalid log filter")
     } else {
         tracing_subscriber::EnvFilter::try_from_default_env()
@@ -364,28 +401,28 @@ pub async fn run() -> Result<()> {
     let is_first_run = !core::config::bootstrap_metadata_exists(&config_dir);
     let deployment_mode = startup_deployment_mode(&config_dir);
 
-    if is_first_run && !args.setup {
+    if is_first_run && !requested_setup {
         // Print welcome message
         print_unix_cli_banner("Welcome");
         println!();
-        println!("╔═══════════════════════════════════════════════════════════╗");
-        println!("║                                                           ║");
+        println!("+---------------------------------------------------------+");
+        println!("|                                                         |");
         println!(
-            "║                Welcome to {} v{}                 ║",
+            "|                Welcome to {} v{}                 |",
             branding::PRODUCT_NAME,
             env!("CARGO_PKG_VERSION")
         );
-        println!("║                                                           ║");
+        println!("|                                                         |");
         println!(
-            "║   A {} with:                                  ║",
+            "|   A {} with:                                  |",
             branding::PRODUCT_CATEGORY
         );
-        println!("║   • Chat, memory, agents, apps, and automations          ║");
-        println!("║   • Daily briefs, reminders, and follow-up               ║");
-        println!("║   • Safe actions with approvals and sandboxing           ║");
-        println!("║   • Connected tools and companion devices                ║");
-        println!("║                                                           ║");
-        println!("╚═══════════════════════════════════════════════════════════╝");
+        println!("|   - Chat, memory, agents, apps, and automations         |");
+        println!("|   - Daily briefs, reminders, and follow-up              |");
+        println!("|   - Safe actions with approvals and sandboxing          |");
+        println!("|   - Connected tools and companion devices               |");
+        println!("|                                                         |");
+        println!("+---------------------------------------------------------+");
         println!();
     }
 
@@ -418,7 +455,7 @@ pub async fn run() -> Result<()> {
         database_config.url = database_url;
     }
 
-    // Resolve master password → unified encryption key
+    // Resolve master password to unified encryption key.
     let master_mgr = crypto::master::MasterPasswordManager::new(&config_dir, &data_dir);
     let startup_master_password = startup_master_password_secret();
 
@@ -504,7 +541,7 @@ pub async fn run() -> Result<()> {
             }
         }
     } else {
-        // No master password exists — always initialize a bootstrap password so data is
+        // No master password exists; always initialize a bootstrap password so data is
         // encrypted by default, even when this is not the very first run (e.g. master.json
         // was removed or never created due to a crash).
         match master_mgr.initialize_bootstrap_password_if_needed()? {
@@ -535,13 +572,12 @@ pub async fn run() -> Result<()> {
         unified_key.clone(),
     )
     .await?;
-    tracing::info!("Agent DID: {}", agent.identity.did());
 
     // Handle first run or explicit setup
-    if args.setup || (is_first_run && !args.chat) {
+    if requested_setup || (is_first_run && !requested_chat) {
         // In headless mode (Docker), skip interactive setup - just use defaults
         // Users can configure via the Web UI Settings page
-        if args.headless && !args.setup {
+        if args.headless && !requested_setup {
             tracing::info!("First run in headless mode - using default config");
             tracing::info!("Configure via Web UI at http://127.0.0.1:8990 -> Settings");
             // Config already has defaults, just save it
@@ -570,10 +606,15 @@ pub async fn run() -> Result<()> {
     }
 
     if let Some(command) = args.command {
-        return cli::run(agent, command).await;
+        match command {
+            cli::Command::Chat => {}
+            cli::Command::Setup => return Ok(()),
+            cli::Command::Pulse => return run_cli_pulse(agent).await,
+            command => return cli::run(agent, command).await,
+        }
     }
 
-    if args.chat {
+    if requested_chat {
         let readiness = cli_chat_readiness(&agent.config);
         if !readiness.chat_ready {
             if std::io::stdin().is_terminal() {
@@ -619,7 +660,7 @@ pub async fn run() -> Result<()> {
         return run_chat_repl(agent).await;
     }
 
-    if args.pulse {
+    if requested_pulse {
         return run_cli_pulse(agent).await;
     }
 
@@ -681,7 +722,7 @@ fn effective_service_mode(parsed: cli::ServiceMode) -> cli::ServiceMode {
         .unwrap_or(parsed)
 }
 
-/// Interactive CLI chat mode — talk to the agent from your terminal.
+/// Interactive CLI chat mode: talk to the agent from your terminal.
 #[derive(Default)]
 struct CliStreamRenderState {
     assistant_inline_open: bool,
@@ -751,29 +792,6 @@ fn render_cli_stream_event(
                 println!("\x1b[32m[done]\x1b[0m {}: {}", name, content.trim());
             }
         }
-        core::StreamEvent::PlanGenerated { plan } => {
-            finish_cli_inline_response(state)?;
-            println!("\x1b[35m[plan]\x1b[0m {} steps planned", plan.steps.len());
-        }
-        core::StreamEvent::PlanRevised { plan, reason } => {
-            finish_cli_inline_response(state)?;
-            println!(
-                "\x1b[35m[plan]\x1b[0m {}",
-                reason.unwrap_or_else(|| format!("Plan revised to {} steps", plan.steps.len()))
-            );
-        }
-        core::StreamEvent::PlanReadyForConfirmation { task_id, plan, .. } => {
-            finish_cli_inline_response(state)?;
-            println!(
-                "\x1b[35m[plan]\x1b[0m Ready for confirmation on task {} ({} steps)",
-                &task_id[..task_id.len().min(8)],
-                plan.steps.len()
-            );
-        }
-        core::StreamEvent::PlanUnavailable { reason } => {
-            finish_cli_inline_response(state)?;
-            println!("\x1b[33m[plan]\x1b[0m {}", reason);
-        }
         core::StreamEvent::PlanStepUpdate {
             step_id,
             step_title,
@@ -812,13 +830,14 @@ async fn run_cli_streamed_turn(
     });
 
     let processed = agent
-        .process_message_stream_with_meta(
+        .process_message_stream_with_meta_and_hints(
             input,
             "cli",
             Some(conv_id),
             None,
             trace_ref.clone(),
             stream_tx,
+            cli_chat_request_hints(),
         )
         .await?;
 
@@ -852,18 +871,8 @@ async fn run_chat_repl(agent: core::Agent) -> Result<()> {
 
     print_unix_cli_banner("CLI Chat");
     println!();
-    println!("╔═══════════════════════════════════════════════════════════╗");
-    println!(
-        "║           {} v{} — CLI Chat                    ║",
-        branding::PRODUCT_NAME,
-        env!("CARGO_PKG_VERSION")
-    );
-    println!("╠═══════════════════════════════════════════════════════════╣");
-    println!("║  Type your message and press Enter.                      ║");
-    println!("║  Commands: /exit  /new  /help                            ║");
-    println!("╚═══════════════════════════════════════════════════════════╝");
-    println!();
-
+    println!("Type your message and press Enter.");
+    println!("Commands: /exit  /new  /help");
     println!("Shortcuts: Ctrl+T toggles trace mode, Ctrl+D exits the chat.");
     println!("When trace mode is enabled, the full trace prints before each agent reply.");
     println!();
@@ -912,7 +921,7 @@ async fn run_chat_repl(agent: core::Agent) -> Result<()> {
             }
             "/new" => {
                 conv_id = uuid::Uuid::new_v4().to_string();
-                println!("\x1b[33m— New conversation started —\x1b[0m");
+                println!("\x1b[33mNew conversation started\x1b[0m");
                 println!();
                 continue;
             }
@@ -1015,21 +1024,6 @@ fn print_cli_pulse_event(event: &crate::sentinel::PulseEvent) {
     let status = event.status.trim().to_ascii_lowercase();
     let status_color = pulse_status_color(&status);
     print_unix_cli_banner_with_color("ArkPulse", Some(status_color));
-
-    println!(
-        "{}╔═══════════════════════════════════════════════════════════╗\x1b[0m",
-        status_color
-    );
-    println!(
-        "{}║           {} v{} — ArkPulse                 ║\x1b[0m",
-        status_color,
-        branding::PRODUCT_NAME,
-        env!("CARGO_PKG_VERSION")
-    );
-    println!(
-        "{}╚═══════════════════════════════════════════════════════════╝\x1b[0m",
-        status_color
-    );
     println!();
     println!(
         "\x1b[36mStatus:\x1b[0m {}{}\x1b[0m",
@@ -1415,10 +1409,6 @@ fn print_cli_trace(trace: &core::ExecutionTrace) {
 async fn run_cli_setup(config_dir: &Path, agent: &core::Agent) -> Result<()> {
     print_unix_cli_banner("Setup Wizard");
     println!();
-    println!("═══════════════════════════════════════════════════════════");
-    println!("                    SETUP WIZARD");
-    println!("═══════════════════════════════════════════════════════════");
-    println!();
     println!("Your Agent Identity (DID):");
     println!("  {}", agent.identity.did());
     println!();
@@ -1427,7 +1417,7 @@ async fn run_cli_setup(config_dir: &Path, agent: &core::Agent) -> Result<()> {
     let mut stdout = std::io::stdout();
 
     // Step 1: LLM Provider
-    println!("═══ Step 1: LLM Configuration ═══");
+    println!("=== Step 1: LLM Configuration ===");
     println!();
     println!("Choose your LLM provider:");
     println!("  1) Ollama (local, free, private)");
@@ -1505,7 +1495,7 @@ async fn run_cli_setup(config_dir: &Path, agent: &core::Agent) -> Result<()> {
     println!();
 
     // Step 2: Telegram (optional)
-    println!("═══ Step 2: Telegram Configuration (Optional) ═══");
+    println!("=== Step 2: Telegram Configuration (Optional) ===");
     println!();
     print!("Configure Telegram bot? [y/N]: ");
     stdout.flush()?;
@@ -1547,10 +1537,6 @@ async fn run_cli_setup(config_dir: &Path, agent: &core::Agent) -> Result<()> {
     config.telegram = telegram;
     config.save(config_dir, None)?;
     print_unix_cli_banner("Setup Complete");
-
-    println!("═══════════════════════════════════════════════════════════");
-    println!("                  SETUP COMPLETE!");
-    println!("═══════════════════════════════════════════════════════════");
     println!();
     println!("Configuration saved to: {}", config_dir.display());
     println!();
@@ -1599,35 +1585,33 @@ async fn run_headless(agent: core::Agent) -> Result<()> {
 
     print_unix_cli_banner("Headless Mode");
     println!();
-    println!("╔═══════════════════════════════════════════════════════════╗");
+    println!("+---------------------------------------------------------+");
     println!(
-        "║             {} v{} - Headless Mode               ║",
+        "|             {} v{} - Headless Mode               |",
         branding::PRODUCT_NAME,
         env!("CARGO_PKG_VERSION")
     );
-    println!("╚═══════════════════════════════════════════════════════════╝");
-    println!();
-    println!("DID: {}", agent.identity.did());
+    println!("+---------------------------------------------------------+");
     println!();
     if let Some(ref api_key) = agent.api_key {
-        println!("┌─────────────────────────────────────────────────────────┐");
-        println!("│  Authentication enabled                                 │");
-        println!("│  API Key: {}...  │", mask_api_key_for_console(api_key));
-        println!("│  Use: Authorization: Bearer <key>                       │");
-        println!("└─────────────────────────────────────────────────────────┘");
+        println!("+---------------------------------------------------------+");
+        println!("|  Authentication enabled                                 |");
+        println!("|  API Key: {}...  |", mask_api_key_for_console(api_key));
+        println!("|  Use: Authorization: Bearer <key>                       |");
+        println!("+---------------------------------------------------------+");
         println!();
     }
     let bind_addr = std::env::var("AGENTARK_BIND").unwrap_or_else(|_| "127.0.0.1:8990".to_string());
-    println!("┌─────────────────────────────────────────────────────────┐");
-    println!("│  Web UI:   http://{}                       │", bind_addr);
-    println!("├─────────────────────────────────────────────────────────┤");
-    println!("│  API Endpoints:                                         │");
-    println!("│    GET  /health  - Health check (no auth)               │");
-    println!("│    GET  /status  - Agent status                         │");
-    println!("│    POST /chat    - Chat with agent                      │");
-    println!("│    GET  /skills  - List skills                          │");
-    println!("│    GET  /tasks   - List tasks                           │");
-    println!("└─────────────────────────────────────────────────────────┘");
+    println!("+---------------------------------------------------------+");
+    println!("|  Web UI:   http://{}                       |", bind_addr);
+    println!("+---------------------------------------------------------+");
+    println!("|  API Endpoints:                                         |");
+    println!("|    GET  /health  - Health check (no auth)               |");
+    println!("|    GET  /status  - Agent status                         |");
+    println!("|    POST /chat    - Chat with agent                      |");
+    println!("|    GET  /skills  - List skills                          |");
+    println!("|    GET  /tasks   - List tasks                           |");
+    println!("+---------------------------------------------------------+");
     println!();
     let tunnel_auto = std::env::var("AGENTARK_TUNNEL")
         .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
@@ -1637,7 +1621,7 @@ async fn run_headless(agent: core::Agent) -> Result<()> {
         println!("  Tunnel URL will appear in logs shortly...");
     } else {
         println!("Remote access (VPS): AGENTARK_TUNNEL=true docker compose up -d");
-        println!("  Or enable in Settings → Advanced → Remote Access");
+        println!("  Or enable in Settings > Advanced > Remote Access");
     }
     println!();
     println!("Press Ctrl+C to stop");
@@ -1645,7 +1629,7 @@ async fn run_headless(agent: core::Agent) -> Result<()> {
 
     let agent = std::sync::Arc::new(tokio::sync::RwLock::new(agent));
 
-    // Daily brief task is opt-in via Settings — not auto-created on fresh install
+    // Daily brief task is opt-in via Settings; it is not auto-created on fresh install.
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -1692,7 +1676,7 @@ async fn run_headless(agent: core::Agent) -> Result<()> {
         })
     };
 
-    // Start ArkSentinel — unified background engine (scheduler, watchers, experience learning, ArkPulse)
+    // Start ArkSentinel - unified background engine (scheduler, watchers, experience learning, ArkPulse)
     let sentinel_handles = sentinel::start(
         agent.clone(),
         sentinel::SentinelConfig::default(),
@@ -1756,8 +1740,9 @@ async fn run_headless(agent: core::Agent) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cli_chat_readiness, render_cli_chat_onboarding_message, should_launch_cli_setup,
-        CliChatReadiness, CLI_SETTINGS_URL, CLI_SETUP_COMMAND, CLI_SETUP_PROMPT,
+        cli_chat_readiness, cli_chat_request_hints, render_cli_chat_onboarding_message,
+        should_launch_cli_setup, CliChatReadiness, CLI_SETTINGS_URL, CLI_SETUP_COMMAND,
+        CLI_SETUP_PROMPT,
     };
     use crate::core::config::{
         AgentConfig, ModelCapabilityTier, ModelCostTier, ModelHealthScope, ModelRole, ModelSlot,
@@ -1850,6 +1835,22 @@ mod tests {
         assert!(message.contains(CLI_SETUP_COMMAND));
         assert!(message.contains(CLI_SETTINGS_URL));
         assert!(!message.contains(CLI_SETUP_PROMPT));
+    }
+
+    #[test]
+    fn cli_chat_request_hints_match_direct_trusted_chat_surface() {
+        let hints = cli_chat_request_hints();
+
+        assert_eq!(
+            hints.execution_surface,
+            crate::actions::ActionExecutionSurface::Chat
+        );
+        assert!(hints.direct_user_intent);
+        let principal = hints
+            .caller_principal
+            .expect("CLI chat should run as a trusted local operator request");
+        assert_eq!(principal.auth_source, "cli");
+        assert!(principal.trusted);
     }
 
     #[test]

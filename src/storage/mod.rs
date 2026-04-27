@@ -1,5 +1,4 @@
 //! Database storage using SeaORM backed by PostgreSQL.
-
 pub mod encrypted;
 pub mod entities;
 mod migrations;
@@ -19,6 +18,7 @@ use sea_orm::{
     TryGetable, Unchanged,
 };
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -71,6 +71,18 @@ pub struct UploadManifest {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ActionCatalogIndexEntry {
+    pub action_name: String,
+    pub source: String,
+    pub version: String,
+    pub descriptor_hash: String,
+    pub descriptor_text: String,
+    pub enabled: bool,
+    pub metadata_json: serde_json::Value,
+    pub embedding: Option<PgVector>,
+}
+
 #[derive(Debug, Clone, FromQueryResult, serde::Serialize)]
 pub struct ExecutionTraceSummaryRow {
     pub id: String,
@@ -94,6 +106,25 @@ pub struct OperationalLogVersionMetricRow {
     pub latency_ms: Option<i64>,
     pub policy_version: Option<String>,
     pub strategy_version: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExecutionTraceMessageMetrics {
+    pub duration_ms: Option<i64>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+    pub time_to_first_token_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, FromQueryResult)]
+struct ExecutionTraceMessageMetricRow {
+    id: String,
+    duration_ms: Option<i32>,
+    input_tokens: i32,
+    output_tokens: i32,
+    total_tokens: i32,
+    steps_json: String,
 }
 
 #[derive(Debug, Clone)]
@@ -293,6 +324,29 @@ fn encrypt_optional_storage_string(value: Option<&str>) -> Result<Option<String>
 
 fn decrypt_optional_storage_string(value: Option<String>) -> Option<String> {
     value.map(|inner| decrypt_storage_string(&inner))
+}
+
+fn trace_time_to_first_token_ms(steps_json: &str) -> Option<i64> {
+    let steps: Vec<crate::core::ExecutionStep> = serde_json::from_str(steps_json).ok()?;
+    steps.into_iter().find_map(|step| {
+        let data = step.data.as_deref()?;
+        let payload = serde_json::from_str::<serde_json::Value>(data).ok()?;
+        let metric = payload.get("metric").and_then(|value| value.as_str())?;
+        if metric != "time_to_first_token" {
+            return None;
+        }
+        payload
+            .get("duration_ms")
+            .and_then(|value| {
+                value
+                    .as_i64()
+                    .or_else(|| value.as_u64().map(|v| v.min(i64::MAX as u64) as i64))
+            })
+            .or_else(|| {
+                step.duration_ms
+                    .map(|value| value.min(i64::MAX as u64) as i64)
+            })
+    })
 }
 
 fn pgvector_sql_literal(embedding: &PgVector) -> String {
@@ -649,6 +703,7 @@ pub struct ExperienceItemSearchHit {
     pub score: f64,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ProceduralPatternSearchHit {
     pub pattern: procedural_pattern::Model,
@@ -731,6 +786,7 @@ impl Storage {
     const MAX_EXPERIENCE_RUN_ROWS_PER_QUERY: u64 = 1_000;
     const MAX_EXPERIENCE_ITEM_ROWS_PER_QUERY: u64 = 2_000;
     const MAX_PROCEDURAL_PATTERN_ROWS_PER_QUERY: u64 = 2_000;
+    #[allow(dead_code)]
     const MAX_RELATED_EXPERIENCE_EDGE_ROWS_PER_QUERY: u64 = 5_000;
     const SENSITIVE_PAYLOAD_BACKFILL_MARKER_KEY: &'static str =
         "storage_sensitive_payload_backfill_v4";
@@ -1615,6 +1671,145 @@ impl Storage {
         Ok(true)
     }
 
+    // ==================== Action Catalog Semantic Index ====================
+
+    pub async fn action_catalog_index_entries(
+        &self,
+        action_names: &[String],
+    ) -> Result<HashMap<String, action_catalog_index::Model>> {
+        if action_names.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = action_catalog_index::Entity::find()
+            .filter(action_catalog_index::Column::ActionName.is_in(action_names.to_vec()))
+            .all(&self.db)
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.action_name.clone(), row))
+            .collect())
+    }
+
+    pub async fn nearest_action_catalog_index_entries(
+        &self,
+        embedding: &PgVector,
+        limit: u64,
+    ) -> Result<Vec<(action_catalog_index::Model, f64)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        if self.db.get_database_backend() != DbBackend::Postgres {
+            return Ok(Vec::new());
+        }
+
+        let embedding_sql = pgvector_sql_literal(embedding);
+        let sql = format!(
+            "SELECT action_name, embedding <=> {embedding_sql} AS cosine_distance \
+             FROM action_catalog_index \
+             WHERE enabled = true \
+               AND embedding IS NOT NULL \
+             ORDER BY embedding <=> {embedding_sql} ASC \
+             LIMIT {}",
+            Self::db_limit(limit),
+        );
+        let rows = self
+            .db
+            .query_all(Statement::from_string(DbBackend::Postgres, sql))
+            .await?;
+        let mut scored = Vec::with_capacity(rows.len());
+        for row in rows {
+            let action_name: String = row.try_get("", "action_name")?;
+            let distance: f64 = row.try_get("", "cosine_distance")?;
+            scored.push((action_name, distance));
+        }
+        if scored.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let action_names = scored
+            .iter()
+            .map(|(action_name, _)| action_name.clone())
+            .collect::<Vec<_>>();
+        let models = action_catalog_index::Entity::find()
+            .filter(action_catalog_index::Column::ActionName.is_in(action_names))
+            .all(&self.db)
+            .await?;
+        let mut by_name: HashMap<String, action_catalog_index::Model> = models
+            .into_iter()
+            .map(|model| (model.action_name.clone(), model))
+            .collect();
+        Ok(scored
+            .into_iter()
+            .filter_map(|(action_name, distance)| {
+                by_name.remove(&action_name).map(|model| (model, distance))
+            })
+            .collect())
+    }
+
+    pub async fn upsert_action_catalog_index_entry(
+        &self,
+        entry: &ActionCatalogIndexEntry,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        action_catalog_index::Entity::insert(action_catalog_index::ActiveModel {
+            action_name: Set(entry.action_name.clone()),
+            source: Set(entry.source.clone()),
+            version: Set(entry.version.clone()),
+            descriptor_hash: Set(entry.descriptor_hash.clone()),
+            descriptor_text: Set(entry.descriptor_text.clone()),
+            enabled: Set(entry.enabled),
+            metadata_json: Set(entry.metadata_json.clone()),
+            embedding: Set(entry.embedding.clone()),
+            updated_at: Set(now),
+        })
+        .on_conflict(
+            OnConflict::column(action_catalog_index::Column::ActionName)
+                .update_columns([
+                    action_catalog_index::Column::Source,
+                    action_catalog_index::Column::Version,
+                    action_catalog_index::Column::DescriptorHash,
+                    action_catalog_index::Column::DescriptorText,
+                    action_catalog_index::Column::Enabled,
+                    action_catalog_index::Column::MetadataJson,
+                    action_catalog_index::Column::Embedding,
+                    action_catalog_index::Column::UpdatedAt,
+                ])
+                .to_owned(),
+        )
+        .exec(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn mark_unavailable_action_catalog_entries_disabled(
+        &self,
+        available_action_names: &[String],
+    ) -> Result<u64> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let filter = if available_action_names.is_empty() {
+            "enabled = true".to_string()
+        } else {
+            format!(
+                "enabled = true AND action_name NOT IN ({})",
+                sql_string_list(available_action_names)
+            )
+        };
+        let sql = format!(
+            "UPDATE action_catalog_index \
+             SET enabled = false, updated_at = {} \
+             WHERE {}",
+            sql_string_literal(&now),
+            filter
+        );
+        let result = self
+            .db
+            .execute(Statement::from_string(DbBackend::Postgres, sql))
+            .await?;
+        Ok(result.rows_affected())
+    }
+
     // ==================== LLM Usage ====================
 
     /// Insert an LLM usage record for analytics (tokens/cost estimation).
@@ -1784,6 +1979,7 @@ impl Storage {
         confidence: f32,
         source: Option<&str>,
         project_id: Option<&str>,
+        sensitivity: Option<&str>,
     ) -> Result<user_preference::Model> {
         let key = key.trim();
         if key.is_empty() {
@@ -1797,6 +1993,10 @@ impl Storage {
             .map(|p| p.trim())
             .filter(|p| !p.is_empty())
             .map(|p| p.to_string());
+        let normalized_sensitivity = user_preference::normalize_memory_sensitivity(sensitivity)
+            .unwrap_or_else(|| user_preference::classify_user_preference_sensitivity(key, value))
+            .as_str()
+            .to_string();
 
         if let Some(existing) = user_preference::Entity::find_by_id(id.clone())
             .one(&self.db)
@@ -1805,6 +2005,7 @@ impl Storage {
             let mut model: user_preference::ActiveModel = existing.into();
             model.key = Set(key.to_ascii_lowercase());
             model.value = Set(encrypted_value.clone());
+            model.sensitivity = Set(normalized_sensitivity);
             model.confidence = Set(bounded_confidence);
             model.source = Set(source.map(|s| s.to_string()));
             model.project_id = Set(normalized_project);
@@ -1817,6 +2018,7 @@ impl Storage {
                 id: Set(id),
                 key: Set(key.to_ascii_lowercase()),
                 value: Set(encrypted_value),
+                sensitivity: Set(normalized_sensitivity),
                 confidence: Set(bounded_confidence),
                 source: Set(source.map(|s| s.to_string())),
                 project_id: Set(normalized_project),
@@ -1865,25 +2067,6 @@ impl Storage {
             query = query.filter(user_preference::Column::ProjectId.eq(pid));
         }
         let mut rows = query
-            .limit(Self::db_limit(limit))
-            .offset(Self::db_offset(offset))
-            .all(&self.db)
-            .await?;
-        for row in &mut rows {
-            row.value = decrypt_storage_string(&row.value);
-        }
-        Ok(rows)
-    }
-
-    /// List only global-scope user preferences.
-    pub async fn list_global_user_preferences(
-        &self,
-        limit: u64,
-        offset: u64,
-    ) -> Result<Vec<user_preference::Model>> {
-        let mut rows = user_preference::Entity::find()
-            .filter(user_preference::Column::ProjectId.is_null())
-            .order_by_desc(user_preference::Column::UpdatedAt)
             .limit(Self::db_limit(limit))
             .offset(Self::db_offset(offset))
             .all(&self.db)
@@ -2030,31 +2213,6 @@ impl Storage {
         Ok(rows)
     }
 
-    /// List only global-scope user data items.
-    pub async fn list_global_user_data_items(
-        &self,
-        limit: u64,
-        offset: u64,
-        kind: Option<&str>,
-    ) -> Result<Vec<user_data_item::Model>> {
-        let mut query = user_data_item::Entity::find()
-            .filter(user_data_item::Column::ProjectId.is_null())
-            .order_by_desc(user_data_item::Column::UpdatedAt);
-        if let Some(kind_value) = kind.map(|v| v.trim()).filter(|v| !v.is_empty()) {
-            query = query.filter(user_data_item::Column::Kind.eq(kind_value));
-        }
-        let mut rows = query
-            .limit(Self::db_limit(limit))
-            .offset(Self::db_offset(offset))
-            .all(&self.db)
-            .await?;
-        for row in &mut rows {
-            row.title = decrypt_storage_string(&row.title);
-            row.content = decrypt_storage_string(&row.content);
-        }
-        Ok(rows)
-    }
-
     /// Count user data items by scope and optional kind.
     pub async fn count_user_data_items(
         &self,
@@ -2113,30 +2271,6 @@ impl Storage {
         Ok(model)
     }
 
-    /// List knowledge base items by scope.
-    pub async fn list_knowledge_items(
-        &self,
-        limit: u64,
-        offset: u64,
-        project_id: Option<&str>,
-    ) -> Result<Vec<knowledge_item::Model>> {
-        let mut query =
-            knowledge_item::Entity::find().order_by_desc(knowledge_item::Column::UpdatedAt);
-        if let Some(pid) = project_id {
-            query = query.filter(knowledge_item::Column::ProjectId.eq(pid));
-        }
-        let mut rows = query
-            .limit(Self::db_limit(limit))
-            .offset(Self::db_offset(offset))
-            .all(&self.db)
-            .await?;
-        for row in &mut rows {
-            row.title = decrypt_storage_string(&row.title);
-            row.content = decrypt_storage_string(&row.content);
-        }
-        Ok(rows)
-    }
-
     fn visible_knowledge_source_filter() -> Condition {
         Condition::any()
             .add(knowledge_item::Column::Source.is_null())
@@ -2160,26 +2294,6 @@ impl Storage {
             query = query.filter(knowledge_item::Column::ProjectId.eq(pid));
         }
         let mut rows = query
-            .limit(Self::db_limit(limit))
-            .offset(Self::db_offset(offset))
-            .all(&self.db)
-            .await?;
-        for row in &mut rows {
-            row.title = decrypt_storage_string(&row.title);
-            row.content = decrypt_storage_string(&row.content);
-        }
-        Ok(rows)
-    }
-
-    /// List only global-scope knowledge items.
-    pub async fn list_global_knowledge_items(
-        &self,
-        limit: u64,
-        offset: u64,
-    ) -> Result<Vec<knowledge_item::Model>> {
-        let mut rows = knowledge_item::Entity::find()
-            .filter(knowledge_item::Column::ProjectId.is_null())
-            .order_by_desc(knowledge_item::Column::UpdatedAt)
             .limit(Self::db_limit(limit))
             .offset(Self::db_offset(offset))
             .all(&self.db)
@@ -2945,6 +3059,7 @@ impl Storage {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn insert_execution_run(&self, run: &crate::core::ExecutionRun) -> Result<()> {
         execution_run::Entity::insert(execution_run::ActiveModel {
             id: Set(run.id.clone()),
@@ -3011,6 +3126,7 @@ impl Storage {
             .map(model_to_execution_run))
     }
 
+    #[allow(dead_code)]
     pub async fn load_execution_run_by_request_id(
         &self,
         request_id: &str,
@@ -3052,6 +3168,22 @@ impl Storage {
             .collect())
     }
 
+    pub async fn list_recent_execution_runs(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<crate::core::ExecutionRun>> {
+        let capped_limit = limit.clamp(1, 100);
+        Ok(execution_run::Entity::find()
+            .order_by_desc(execution_run::Column::UpdatedAt)
+            .limit(capped_limit)
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .map(model_to_execution_run)
+            .collect())
+    }
+
+    #[allow(dead_code)]
     pub async fn append_execution_checkpoint(
         &self,
         checkpoint: &crate::core::ExecutionCheckpoint,
@@ -3101,6 +3233,7 @@ impl Storage {
             .collect())
     }
 
+    #[allow(dead_code)]
     pub async fn append_tool_attempt(&self, attempt: &crate::core::ToolAttempt) -> Result<()> {
         tool_attempt::Entity::insert(tool_attempt::ActiveModel {
             id: Set(attempt.id.clone()),
@@ -3238,6 +3371,30 @@ impl Storage {
             .collect())
     }
 
+    pub async fn append_readiness_evaluation(
+        &self,
+        evaluation: &readiness_evaluation::Model,
+    ) -> Result<()> {
+        readiness_evaluation::Entity::insert(readiness_evaluation::ActiveModel {
+            id: Set(evaluation.id.clone()),
+            target_type: Set(evaluation.target_type.clone()),
+            target_id: Set(evaluation.target_id.clone()),
+            score: Set(evaluation.score),
+            stage: Set(evaluation.stage.clone()),
+            allows_review: Set(evaluation.allows_review),
+            allows_auto: Set(evaluation.allows_auto),
+            reasons_json: Set(evaluation.reasons_json.clone()),
+            blockers_json: Set(evaluation.blockers_json.clone()),
+            signals_json: Set(evaluation.signals_json.clone()),
+            policy_version: Set(evaluation.policy_version.clone()),
+            created_at: Set(evaluation.created_at.clone()),
+        })
+        .exec(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     pub async fn mark_latest_provisional_experience_run_corrected(
         &self,
         conversation_id: &str,
@@ -3297,6 +3454,7 @@ impl Storage {
         Ok(Some(updated))
     }
 
+    #[allow(dead_code)]
     pub async fn mark_provisional_experience_run_corrected_by_trace_id(
         &self,
         trace_id: &str,
@@ -3420,6 +3578,12 @@ impl Storage {
             .all(&self.db)
             .await
             .map_err(Into::into)
+    }
+
+    pub async fn get_experience_run(&self, id: &str) -> Result<Option<experience_run::Model>> {
+        Ok(experience_run::Entity::find_by_id(id.to_string())
+            .one(&self.db)
+            .await?)
     }
 
     pub async fn list_experience_runs_for_heuristic_reflection(
@@ -4368,6 +4532,40 @@ impl Storage {
         Ok(items)
     }
 
+    pub async fn list_active_experience_items_any_scope(
+        &self,
+        kinds: &[&str],
+        limit: u64,
+    ) -> Result<Vec<experience_item::Model>> {
+        let mut query =
+            experience_item::Entity::find().filter(experience_item::Column::Status.eq("active"));
+        if !kinds.is_empty() {
+            query = query.filter(
+                experience_item::Column::Kind.is_in(
+                    kinds
+                        .iter()
+                        .map(|kind| (*kind).to_string())
+                        .collect::<Vec<_>>(),
+                ),
+            );
+        }
+        let capped_limit = limit.min(Self::MAX_EXPERIENCE_ITEM_ROWS_PER_QUERY);
+        let mut items = query
+            .order_by_desc(experience_item::Column::UpdatedAt)
+            .limit(Self::db_limit(capped_limit))
+            .all(&self.db)
+            .await?;
+        items.sort_by(|left, right| {
+            experience_item_kind_rank(&left.kind)
+                .cmp(&experience_item_kind_rank(&right.kind))
+                .then_with(|| right.confidence.total_cmp(&left.confidence))
+                .then_with(|| right.support_count.cmp(&left.support_count))
+                .then_with(|| right.updated_at.cmp(&left.updated_at))
+        });
+        items.truncate(capped_limit as usize);
+        Ok(items)
+    }
+
     pub async fn search_experience_items(
         &self,
         query: &str,
@@ -4450,6 +4648,7 @@ impl Storage {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn list_related_experience_items(
         &self,
         seed_refs: &[String],
@@ -4573,6 +4772,7 @@ impl Storage {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn search_procedural_patterns(
         &self,
         query: &str,
@@ -4652,6 +4852,15 @@ impl Storage {
             .await?)
     }
 
+    pub async fn get_procedural_pattern(
+        &self,
+        id: &str,
+    ) -> Result<Option<procedural_pattern::Model>> {
+        Ok(procedural_pattern::Entity::find_by_id(id.to_string())
+            .one(&self.db)
+            .await?)
+    }
+
     pub async fn list_procedural_patterns(
         &self,
         project_id: Option<&str>,
@@ -4715,6 +4924,59 @@ impl Storage {
         });
         patterns.truncate(capped_limit as usize);
         Ok(patterns)
+    }
+
+    pub async fn list_procedural_patterns_any_scope(
+        &self,
+        statuses: &[&str],
+        limit: u64,
+    ) -> Result<Vec<procedural_pattern::Model>> {
+        let mut query = procedural_pattern::Entity::find();
+        if !statuses.is_empty() {
+            query = query.filter(
+                procedural_pattern::Column::Status.is_in(
+                    statuses
+                        .iter()
+                        .map(|status| (*status).to_string())
+                        .collect::<Vec<_>>(),
+                ),
+            );
+        }
+        let capped_limit = limit.min(Self::MAX_PROCEDURAL_PATTERN_ROWS_PER_QUERY);
+        let mut patterns = query
+            .limit(Self::db_limit(capped_limit))
+            .all(&self.db)
+            .await?;
+        patterns.sort_by(|left, right| {
+            procedural_pattern_status_rank(&right.status)
+                .cmp(&procedural_pattern_status_rank(&left.status))
+                .then_with(|| right.sample_count.cmp(&left.sample_count))
+                .then_with(|| right.success_rate.total_cmp(&left.success_rate))
+                .then_with(|| right.updated_at.cmp(&left.updated_at))
+        });
+        patterns.truncate(capped_limit as usize);
+        Ok(patterns)
+    }
+
+    pub async fn list_experience_edges_for_refs(
+        &self,
+        refs: &[String],
+        limit: u64,
+    ) -> Result<Vec<experience_edge::Model>> {
+        if refs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let capped_limit = limit.min(500);
+        Ok(experience_edge::Entity::find()
+            .filter(
+                Condition::any()
+                    .add(experience_edge::Column::SourceRef.is_in(refs.to_vec()))
+                    .add(experience_edge::Column::TargetRef.is_in(refs.to_vec())),
+            )
+            .order_by_desc(experience_edge::Column::UpdatedAt)
+            .limit(Self::db_limit(capped_limit))
+            .all(&self.db)
+            .await?)
     }
 
     pub async fn upsert_learning_candidate_guarded(
@@ -5088,6 +5350,7 @@ impl Storage {
             .await?)
     }
 
+    #[allow(dead_code)]
     pub async fn list_learning_candidates(
         &self,
         approval_status: Option<&str>,
@@ -6347,6 +6610,7 @@ impl Storage {
         Ok(msgs)
     }
 
+    #[allow(dead_code)]
     pub async fn latest_assistant_trace_id_for_conversation(
         &self,
         conversation_id: &str,
@@ -6367,6 +6631,22 @@ impl Storage {
     pub async fn get_recent_user_messages(&self, limit: u64) -> Result<Vec<message::Model>> {
         let mut msgs = message::Entity::find()
             .filter(message::Column::Role.eq("user"))
+            .order_by_desc(message::Column::Timestamp)
+            .limit(Self::db_limit(limit))
+            .all(&self.db)
+            .await?;
+        for msg in &mut msgs {
+            msg.content = decrypt_storage_string(&msg.content);
+        }
+        Ok(msgs)
+    }
+
+    /// Get most recent persisted messages across conversations.
+    pub async fn get_recent_messages_across_conversations(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<message::Model>> {
+        let mut msgs = message::Entity::find()
             .order_by_desc(message::Column::Timestamp)
             .limit(Self::db_limit(limit))
             .all(&self.db)
@@ -7208,6 +7488,7 @@ impl Storage {
 
     // ==================== Execution Traces ====================
 
+    #[allow(dead_code)]
     pub async fn insert_execution_proof(
         &self,
         proof: &crate::proofs::ExecutionProof,
@@ -7429,26 +7710,42 @@ impl Storage {
         Ok(query.count(&self.db).await?)
     }
 
-    pub async fn get_execution_trace_total_tokens_by_ids(
+    pub async fn get_execution_trace_message_metrics_by_ids(
         &self,
         ids: &[String],
-    ) -> Result<std::collections::HashMap<String, i64>> {
+    ) -> Result<std::collections::HashMap<String, ExecutionTraceMessageMetrics>> {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
-        let rows = crate::storage::entities::execution_trace::Entity::find()
+        let mut rows = crate::storage::entities::execution_trace::Entity::find()
             .select_only()
             .columns([
                 crate::storage::entities::execution_trace::Column::Id,
+                crate::storage::entities::execution_trace::Column::DurationMs,
+                crate::storage::entities::execution_trace::Column::InputTokens,
+                crate::storage::entities::execution_trace::Column::OutputTokens,
                 crate::storage::entities::execution_trace::Column::TotalTokens,
+                crate::storage::entities::execution_trace::Column::StepsJson,
             ])
             .filter(crate::storage::entities::execution_trace::Column::Id.is_in(ids.to_vec()))
-            .into_tuple::<(String, i32)>()
+            .into_model::<ExecutionTraceMessageMetricRow>()
             .all(&self.db)
             .await?;
+        for row in &mut rows {
+            row.steps_json = decrypt_storage_string(&row.steps_json);
+        }
         Ok(rows
             .into_iter()
-            .map(|(id, total_tokens)| (id, total_tokens as i64))
+            .map(|row| {
+                let metrics = ExecutionTraceMessageMetrics {
+                    duration_ms: row.duration_ms.map(i64::from),
+                    input_tokens: i64::from(row.input_tokens),
+                    output_tokens: i64::from(row.output_tokens),
+                    total_tokens: i64::from(row.total_tokens),
+                    time_to_first_token_ms: trace_time_to_first_token_ms(&row.steps_json),
+                };
+                (row.id, metrics)
+            })
             .collect())
     }
 
@@ -8627,7 +8924,7 @@ impl Storage {
                 "id",
                 "updated_at",
                 &experience_item_cutoff,
-                "AND (status <> 'active' OR kind NOT IN ('personal_fact', 'constraint'))",
+                "AND status <> 'active'",
             )
             .await?;
         }
@@ -8640,7 +8937,7 @@ impl Storage {
                 "id",
                 "updated_at",
                 &procedural_pattern_cutoff,
-                "",
+                "AND status NOT IN ('active', 'draft')",
             )
             .await?;
         }

@@ -99,7 +99,7 @@ export function BrowserHandoffPage({ sessionId, onBack }: BrowserHandoffPageProp
         px: { xs: 2, md: 3 },
         py: 2.5,
         background:
-          "radial-gradient(circle at 12% 18%, rgba(255, 255, 255, 0.05), transparent 34%), radial-gradient(circle at 84% 76%, rgba(158, 184, 255, 0.06), transparent 28%), linear-gradient(180deg, #111216 0%, #0d0e11 52%, #0a0b0e 100%)",
+          "radial-gradient(circle at 12% 18%, var(--ui-rgba-255-255-255-050), transparent 34%), radial-gradient(circle at 84% 76%, var(--ui-rgba-158-184-255-060), transparent 28%), linear-gradient(180deg, #111216 0%, #0d0e11 52%, #0a0b0e 100%)",
       }}
     >
       <Stack spacing={2} sx={{ maxWidth: 1480, mx: "auto" }}>
@@ -242,7 +242,7 @@ export function BrowserHandoffPage({ sessionId, onBack }: BrowserHandoffPageProp
                       alignItems: "center",
                       justifyContent: "center",
                       p: 3,
-                      bgcolor: "rgba(13, 14, 17, 0.58)",
+                      bgcolor: "var(--ui-rgba-13-14-17-580)",
                     }}
                   >
                     <Box

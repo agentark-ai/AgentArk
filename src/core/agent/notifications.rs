@@ -1,0 +1,1492 @@
+use super::*;
+
+const PUSH_NOTIFICATIONS_MUTE_UNTIL_KEY: &str = "push_notifications_mute_until_v1";
+const PUSH_NOTIFICATIONS_LAST_SIGNATURE_KEY: &str = "push_notifications_last_signature_v1";
+const PUSH_NOTIFICATIONS_LAST_SENT_AT_KEY: &str = "push_notifications_last_sent_at_v1";
+const PUSH_NOTIFICATION_DUPLICATE_COOLDOWN_SECS: i64 = 30 * 60;
+
+pub(super) fn notification_push_signature(message: &str) -> String {
+    let mut out = String::with_capacity(message.len().min(240));
+    let mut prev_space = false;
+    for ch in message.chars() {
+        if ch.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+            continue;
+        }
+        prev_space = false;
+        out.push(ch.to_ascii_lowercase());
+        if out.len() >= 220 {
+            break;
+        }
+    }
+    out.trim().to_string()
+}
+
+const PUSH_NOTIFICATION_CHANNELS: &[&str] = &[
+    "telegram",
+    "whatsapp",
+    "slack",
+    "discord",
+    "matrix",
+    "teams",
+    "google_chat",
+    "signal",
+    "imessage",
+    "line",
+    "wechat",
+    "qq",
+];
+
+pub(super) fn is_push_notification_channel(channel: &str) -> bool {
+    PUSH_NOTIFICATION_CHANNELS
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(channel.trim()))
+}
+
+pub(super) fn is_external_notification_channel(channel: &str) -> bool {
+    let trimmed = channel.trim().to_ascii_lowercase();
+    // Namespaced pack channel ids (see
+    // `crate::channels::messaging_registry::EXTENSION_CHANNEL_ID_PREFIX`) are
+    // structurally valid external channels even though they aren't in the
+    // bundled compile-time list. The registry is the authoritative source of
+    // truth for whether the id is actually installed and configured; this
+    // function answers the narrower question "is this a well-shaped external
+    // channel id?" without reaching into async registry state.
+    if trimmed.starts_with(crate::channels::messaging_registry::EXTENSION_CHANNEL_ID_PREFIX)
+        || trimmed.starts_with(crate::custom_messaging_channels::CUSTOM_CHANNEL_ID_PREFIX)
+    {
+        return true;
+    }
+    crate::channels::messaging_registry::BUNDLED_CHANNEL_IDS
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(&trimmed))
+}
+
+pub(super) fn notification_channel_display_name(channel: &str) -> &str {
+    match channel.trim().to_ascii_lowercase().as_str() {
+        "web" => "local Web UI",
+        "email" => "Email",
+        "google_chat" => "Google Chat",
+        "signal" => "Signal",
+        "imessage" => "iMessage",
+        "line" => "LINE",
+        "wechat" => "WeChat",
+        "qq" => "QQ",
+        "telegram" => "Telegram",
+        "whatsapp" => "WhatsApp",
+        "slack" => "Slack",
+        "discord" => "Discord",
+        "matrix" => "Matrix",
+        "teams" => "Teams",
+        _ => channel,
+    }
+}
+
+pub(super) fn inbound_security_source_label(channel: &str) -> String {
+    notification_channel_display_name(channel).to_string()
+}
+
+pub(super) fn telegram_notification_target_is_configured(
+    config: &crate::core::config::TelegramConfig,
+) -> bool {
+    !config.bot_token.trim().is_empty()
+        && config.allowed_users.len() == 1
+        && config.allowed_users.first().copied().unwrap_or_default() != 0
+}
+
+pub(super) fn whatsapp_notification_target_is_configured(
+    config: &crate::channels::whatsapp::WhatsAppChannelConfig,
+) -> bool {
+    let has_target = crate::channels::whatsapp::configured_notification_recipient(config).is_some();
+    match config.mode {
+        crate::channels::whatsapp::WhatsAppMode::CloudApi => {
+            !config.access_token.trim().is_empty()
+                && !config.phone_number_id.trim().is_empty()
+                && has_target
+        }
+        crate::channels::whatsapp::WhatsAppMode::Baileys => {
+            !config.bridge_url.trim().is_empty() && has_target
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct NotificationStore {
+    storage: Storage,
+    notification_events: broadcast::Sender<NotificationEvent>,
+    notifications_enabled: bool,
+}
+
+impl NotificationStore {
+    pub fn broadcast_event(&self, event: NotificationEvent) {
+        let _ = self.notification_events.send(event);
+    }
+
+    async fn notifications_unlocked(&self) -> bool {
+        if !self.notifications_enabled {
+            return false;
+        }
+
+        match self.storage.has_user_chat_messages().await {
+            Ok(true) => true,
+            Ok(false) => self
+                .storage
+                .get("arkpulse_last_run_at")
+                .await
+                .ok()
+                .flatten()
+                .is_some(),
+            Err(error) => {
+                tracing::debug!(
+                    "notifications_unlocked: failed to check chat history; suppressing notifications: {}",
+                    error
+                );
+                false
+            }
+        }
+    }
+
+    pub async fn emit_notification_with_status(
+        &self,
+        title: &str,
+        body: &str,
+        level: &str,
+        source: &str,
+    ) -> NotificationDispatchOutcome {
+        if !self.notifications_unlocked().await {
+            tracing::debug!(
+                "Notification suppressed (bootstrap gate): title='{}', source='{}'",
+                title,
+                source
+            );
+            return NotificationDispatchOutcome {
+                channel: "web".to_string(),
+                success: false,
+                error: Some("Notification suppressed by bootstrap gate".to_string()),
+            };
+        }
+        let notif = crate::storage::entities::notification::Model {
+            id: uuid::Uuid::new_v4().to_string(),
+            title: title.to_string(),
+            body: body.to_string(),
+            level: level.to_string(),
+            source: source.to_string(),
+            read: false,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        match self.storage.insert_notification(&notif).await {
+            Ok(_) => {
+                let _ = self
+                    .notification_events
+                    .send(NotificationEvent::from_model(&notif));
+                NotificationDispatchOutcome {
+                    channel: "web".to_string(),
+                    success: true,
+                    error: None,
+                }
+            }
+            Err(error) => {
+                tracing::warn!("Failed to emit notification: {}", error);
+                NotificationDispatchOutcome {
+                    channel: "web".to_string(),
+                    success: false,
+                    error: Some(format!("Failed to store notification: {}", error)),
+                }
+            }
+        }
+    }
+
+    pub async fn emit_notification(&self, title: &str, body: &str, level: &str, source: &str) {
+        let _ = self
+            .emit_notification_with_status(title, body, level, source)
+            .await;
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NotificationDispatchOutcome {
+    pub channel: String,
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NotificationEvent {
+    pub kind: String,
+    pub id: String,
+    pub title: String,
+    pub body: String,
+    pub level: String,
+    pub source: String,
+    pub read: bool,
+    pub created_at: String,
+}
+
+impl NotificationEvent {
+    fn from_model(notif: &crate::storage::entities::notification::Model) -> Self {
+        Self {
+            kind: "notification.created".to_string(),
+            id: notif.id.clone(),
+            title: notif.title.clone(),
+            body: notif.body.clone(),
+            level: notif.level.clone(),
+            source: notif.source.clone(),
+            read: notif.read,
+            created_at: notif.created_at.clone(),
+        }
+    }
+}
+
+impl Agent {
+    pub(super) async fn configured_push_channels(&self) -> Vec<String> {
+        PUSH_NOTIFICATION_CHANNELS
+            .iter()
+            .filter(|channel| self.push_channel_is_configured(channel))
+            .map(|channel| (*channel).to_string())
+            .collect()
+    }
+
+    pub(super) fn calendar_integration_is_configured(&self) -> bool {
+        if !self.integrations.is_enabled("google_calendar")
+            && !self.integrations.is_enabled("google_workspace")
+        {
+            return false;
+        }
+
+        crate::core::config::SecureConfigManager::new(&self.config_dir)
+            .ok()
+            .and_then(|manager| manager.get_custom_secret("calendar_tokens").ok().flatten())
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+            || crate::actions::google_workspace::granted_bundles(&self.config_dir)
+                .map(|bundles| bundles.iter().any(|bundle| bundle == "calendar"))
+                .unwrap_or(false)
+    }
+
+    pub(super) fn email_notification_is_configured(&self) -> bool {
+        let available_backends = self.configured_email_backends();
+        crate::core::email_delivery::email_channel_is_ready(
+            &self.config.email.provider,
+            &available_backends,
+        )
+    }
+
+    pub(super) fn legacy_gmail_notification_is_configured(&self) -> bool {
+        if !self.integrations.is_enabled("gmail") {
+            return false;
+        }
+        crate::core::config::SecureConfigManager::new(&self.config_dir)
+            .ok()
+            .and_then(|manager| manager.get_custom_secret("gmail_tokens").ok().flatten())
+            .is_some_and(|value| !value.trim().is_empty())
+    }
+
+    pub(super) fn workspace_gmail_notification_is_configured(&self) -> bool {
+        if !self.integrations.is_enabled("google_workspace") {
+            return false;
+        }
+        crate::actions::google_workspace::granted_bundles(&self.config_dir)
+            .map(|bundles| bundles.iter().any(|bundle| bundle == "gmail"))
+            .unwrap_or(false)
+    }
+
+    pub(super) fn configured_email_backends(&self) -> Vec<String> {
+        let mut backends = Vec::new();
+        if self.legacy_gmail_notification_is_configured() {
+            backends.push(crate::core::email_delivery::EMAIL_PROVIDER_GMAIL.to_string());
+        }
+        if self.workspace_gmail_notification_is_configured() {
+            backends.push(crate::core::email_delivery::EMAIL_PROVIDER_GOOGLE_WORKSPACE.to_string());
+        }
+        if crate::core::email_delivery::external_email_delivery_is_ready(&self.config.email) {
+            if let Some(provider_id) =
+                crate::core::email_delivery::external_email_provider_id(&self.config.email)
+            {
+                if !backends.iter().any(|existing| existing == &provider_id) {
+                    backends.push(provider_id);
+                }
+            }
+        }
+        backends
+    }
+
+    pub(super) async fn configured_email_mailboxes(&self) -> Vec<(String, String)> {
+        let mut mailboxes = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for backend in self.configured_email_backends() {
+            if !matches!(
+                backend.as_str(),
+                crate::core::email_delivery::EMAIL_PROVIDER_GMAIL
+                    | crate::core::email_delivery::EMAIL_PROVIDER_GOOGLE_WORKSPACE
+            ) {
+                continue;
+            }
+            match self.email_sender_address_for_backend(&backend).await {
+                Ok(address) => {
+                    let dedupe_key = address.to_ascii_lowercase();
+                    if seen.insert(dedupe_key) {
+                        mailboxes.push((backend, address));
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        "configured_email_mailboxes: failed to load mailbox for {}: {}",
+                        backend,
+                        error
+                    );
+                }
+            }
+        }
+        mailboxes
+    }
+
+    pub(super) async fn email_sender_address_for_backend(
+        &self,
+        backend: &str,
+    ) -> std::result::Result<String, String> {
+        match backend {
+            crate::core::email_delivery::EMAIL_PROVIDER_GMAIL => {
+                crate::actions::gmail::gmail_profile_email_for_source(
+                    &self.config_dir,
+                    crate::actions::gmail::GmailDeliverySource::Gmail,
+                )
+                .await
+                .map_err(|error| format!("Failed to read Gmail sender address: {}", error))
+            }
+            crate::core::email_delivery::EMAIL_PROVIDER_GOOGLE_WORKSPACE => {
+                crate::actions::gmail::gmail_profile_email_for_source(
+                    &self.config_dir,
+                    crate::actions::gmail::GmailDeliverySource::GoogleWorkspace,
+                )
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Failed to read Google Workspace Gmail sender address: {}",
+                        error
+                    )
+                })
+            }
+            _ => crate::core::email_delivery::validate_optional_email_address(
+                self.config.email.from_address.as_deref(),
+            )
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                "email.from_address is required for external email delivery".to_string()
+            }),
+        }
+    }
+
+    pub(super) async fn resolve_email_notification_recipient(
+        &self,
+        backend: &str,
+    ) -> std::result::Result<String, String> {
+        if let Some(address) = self.config.email.to_address.as_deref() {
+            return crate::core::email_delivery::validate_email_address(address)
+                .map_err(|error| error.to_string());
+        }
+        if matches!(
+            backend,
+            crate::core::email_delivery::EMAIL_PROVIDER_GMAIL
+                | crate::core::email_delivery::EMAIL_PROVIDER_GOOGLE_WORKSPACE
+        ) {
+            return self.email_sender_address_for_backend(backend).await;
+        }
+        let mailboxes = self.configured_email_mailboxes().await;
+        match mailboxes.as_slice() {
+            [(_, address)] => Ok(address.clone()),
+            [] => Err(
+                "email.to_address is required for external email delivery when no Gmail or Google Workspace mailbox is connected"
+                    .to_string(),
+            ),
+            _ => Err(
+                "email.to_address is required for external email delivery when multiple Gmail or Google Workspace mailboxes are connected"
+                    .to_string(),
+            ),
+        }
+    }
+
+    pub(super) async fn send_email_notification_reported(
+        &self,
+        safe_message: &str,
+    ) -> std::result::Result<(), String> {
+        let available_backends = self.configured_email_backends();
+        let backend = crate::core::email_delivery::normalize_email_backend_selection(
+            &self.config.email.provider,
+            &available_backends,
+        )
+        .map_err(|error| error.to_string())?;
+        let recipient = self.resolve_email_notification_recipient(&backend).await?;
+        let (timezone, email_format) = {
+            let profile = self.user_profile.read().await;
+            (
+                profile
+                    .timezone
+                    .as_deref()
+                    .and_then(|value| value.parse::<chrono_tz::Tz>().ok()),
+                profile.email_format.clone(),
+            )
+        };
+        let now = chrono::Utc::now();
+        let (subject_date, generated_at) = match timezone {
+            Some(tz) => (
+                now.with_timezone(&tz).format("%Y-%m-%d").to_string(),
+                now.with_timezone(&tz)
+                    .format("%Y-%m-%d %H:%M %Z")
+                    .to_string(),
+            ),
+            None => (
+                now.format("%Y-%m-%d").to_string(),
+                now.format("%Y-%m-%d %H:%M UTC").to_string(),
+            ),
+        };
+        let subject = format!("{} - {}", self.config.name, subject_date);
+        let rendered = crate::core::email_delivery::render_notification_email(
+            &self.config.name,
+            &subject,
+            safe_message,
+            Some(&generated_at),
+            email_format.as_deref(),
+        );
+        match backend.as_str() {
+            crate::core::email_delivery::EMAIL_PROVIDER_GMAIL => {
+                let args = serde_json::json!({
+                    "to": recipient,
+                    "subject": rendered.subject,
+                    "body": rendered.text_body,
+                    "html_body": rendered.html_body,
+                    "delivery_source": "gmail",
+                });
+                self.runtime
+                    .execute_action("gmail_reply", &args)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            }
+            crate::core::email_delivery::EMAIL_PROVIDER_GOOGLE_WORKSPACE => {
+                let args = serde_json::json!({
+                    "to": recipient,
+                    "subject": rendered.subject,
+                    "body": rendered.text_body,
+                    "html_body": rendered.html_body,
+                    "delivery_source": "google_workspace",
+                });
+                self.runtime
+                    .execute_action("gmail_reply", &args)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            }
+            _ => crate::core::email_delivery::send_external_email(
+                &self.config.email,
+                &rendered,
+                &recipient,
+            )
+            .await
+            .map_err(|error| error.to_string()),
+        }
+    }
+
+    pub(crate) fn notification_channel_is_configured(&self, channel: &str) -> bool {
+        match channel.trim().to_ascii_lowercase().as_str() {
+            "email" => self.email_notification_is_configured(),
+            other => self.push_channel_is_configured(other),
+        }
+    }
+
+    pub(super) async fn configured_notification_channels(&self) -> Vec<String> {
+        let manager = crate::core::config::SecureConfigManager::new_with_data_dir(
+            &self.config_dir,
+            Some(&self.data_dir),
+        )
+        .ok();
+        let packs_guard = self.extension_packs.read().await;
+        struct AgentBundledCheck<'a>(&'a Agent);
+        impl<'a> crate::channels::messaging_registry::BundledConfiguredCheck for AgentBundledCheck<'a> {
+            fn is_configured(&self, channel_id: &str) -> bool {
+                self.0.notification_channel_is_configured(channel_id)
+            }
+        }
+        let bundled_check = AgentBundledCheck(self);
+        let ctx = crate::channels::messaging_registry::ChannelQueryContext {
+            bundled_configured: &bundled_check,
+            extension_packs: &*packs_guard,
+            storage: &self.storage,
+            config_dir: &self.config_dir,
+            data_dir: &self.data_dir,
+            config_manager: manager.as_ref(),
+        };
+        match crate::channels::messaging_registry::MessagingChannelRegistry::new()
+            .list_configured(&ctx)
+            .await
+        {
+            Ok(channels) => channels.into_iter().map(|channel| channel.id).collect(),
+            Err(error) => {
+                tracing::debug!(
+                    "configured_notification_channels: registry failed: {}",
+                    error
+                );
+                crate::channels::messaging_registry::BUNDLED_CHANNEL_IDS
+                    .iter()
+                    .filter(|channel| self.notification_channel_is_configured(channel))
+                    .map(|channel| (*channel).to_string())
+                    .collect()
+            }
+        }
+    }
+
+    pub(super) async fn stored_preferred_notification_channel(&self) -> Option<String> {
+        let value = self
+            .storage
+            .get("daily_brief_channel")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| is_external_notification_channel(value))?;
+        if self.notification_channel_is_configured_any(&value).await {
+            Some(value)
+        } else {
+            None
+        }
+    }
+
+    pub(super) async fn resolve_single_notification_channel(
+        &self,
+        requested: Option<&str>,
+    ) -> Option<String> {
+        if let Some(channel) = requested
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_ascii_lowercase())
+            .filter(|value| is_external_notification_channel(value))
+        {
+            if self.notification_channel_is_configured_any(&channel).await {
+                return Some(channel);
+            }
+        }
+
+        if let Some(preferred) = self.stored_preferred_notification_channel().await {
+            return Some(preferred);
+        }
+
+        self.configured_notification_channels()
+            .await
+            .into_iter()
+            .next()
+    }
+
+    pub(super) async fn notification_channel_is_configured_any(&self, channel: &str) -> bool {
+        let channel = channel.trim().to_ascii_lowercase();
+        if channel.is_empty() || !is_external_notification_channel(&channel) {
+            return false;
+        }
+        if crate::channels::messaging_registry::BUNDLED_CHANNEL_IDS
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(&channel))
+        {
+            return self.notification_channel_is_configured(&channel);
+        }
+        let manager = crate::core::config::SecureConfigManager::new_with_data_dir(
+            &self.config_dir,
+            Some(&self.data_dir),
+        )
+        .ok();
+        let packs_guard = self.extension_packs.read().await;
+        let bundled_check: fn(&str) -> bool = |_| false;
+        let ctx = crate::channels::messaging_registry::ChannelQueryContext {
+            bundled_configured: &bundled_check,
+            extension_packs: &*packs_guard,
+            storage: &self.storage,
+            config_dir: &self.config_dir,
+            data_dir: &self.data_dir,
+            config_manager: manager.as_ref(),
+        };
+        crate::channels::messaging_registry::MessagingChannelRegistry::new()
+            .lookup(&ctx, &channel)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|descriptor| descriptor.configured)
+    }
+
+    pub fn notification_store(&self) -> NotificationStore {
+        NotificationStore {
+            storage: self.storage.clone(),
+            notification_events: self.notification_events.clone(),
+            notifications_enabled: !self.model_pool.is_empty(),
+        }
+    }
+
+    pub(super) async fn notifications_unlocked(&self) -> bool {
+        if self.model_pool.is_empty() {
+            return false;
+        }
+
+        match self.storage.has_user_chat_messages().await {
+            Ok(true) => true,
+            Ok(false) => self
+                .storage
+                .get("arkpulse_last_run_at")
+                .await
+                .ok()
+                .flatten()
+                .is_some(),
+            Err(e) => {
+                tracing::debug!(
+                    "notifications_unlocked: failed to check chat history; suppressing notifications: {}",
+                    e
+                );
+                false
+            }
+        }
+    }
+
+    pub async fn pause_push_notifications_for_hours(&self, hours: i64) -> Result<i64> {
+        let clamped_hours = hours.clamp(1, 24 * 30);
+        let until_ts = chrono::Utc::now().timestamp() + (clamped_hours * 3600);
+        self.storage
+            .set(
+                PUSH_NOTIFICATIONS_MUTE_UNTIL_KEY,
+                until_ts.to_string().as_bytes(),
+            )
+            .await?;
+        Ok(until_ts)
+    }
+
+    pub async fn resume_push_notifications(&self) -> Result<()> {
+        self.storage
+            .delete(PUSH_NOTIFICATIONS_MUTE_UNTIL_KEY)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn push_notifications_muted_until_ts(&self) -> Option<i64> {
+        let now_ts = chrono::Utc::now().timestamp();
+        let muted_until = self
+            .storage
+            .get(PUSH_NOTIFICATIONS_MUTE_UNTIL_KEY)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|b| String::from_utf8(b).ok())
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0);
+
+        if muted_until > now_ts {
+            return Some(muted_until);
+        }
+
+        if muted_until > 0 {
+            let _ = self.storage.delete(PUSH_NOTIFICATIONS_MUTE_UNTIL_KEY).await;
+        }
+        None
+    }
+
+    pub(super) async fn push_notifications_muted(&self) -> bool {
+        self.push_notifications_muted_until_ts().await.is_some()
+    }
+
+    pub(super) async fn push_notification_in_cooldown(&self, message: &str) -> bool {
+        let now_ts = chrono::Utc::now().timestamp();
+        let current_sig = notification_push_signature(message);
+        if current_sig.is_empty() {
+            return false;
+        }
+
+        let last_sig = self
+            .storage
+            .get(PUSH_NOTIFICATIONS_LAST_SIGNATURE_KEY)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap_or_default();
+
+        let last_sent_at = self
+            .storage
+            .get(PUSH_NOTIFICATIONS_LAST_SENT_AT_KEY)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|b| String::from_utf8(b).ok())
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0);
+
+        !last_sig.is_empty()
+            && last_sig == current_sig
+            && last_sent_at > 0
+            && (now_ts - last_sent_at) < PUSH_NOTIFICATION_DUPLICATE_COOLDOWN_SECS
+    }
+
+    pub(super) async fn remember_push_notification_sent(&self, message: &str) {
+        let signature = notification_push_signature(message);
+        if signature.is_empty() {
+            return;
+        }
+        let now = chrono::Utc::now().timestamp().to_string();
+        if let Err(e) = self
+            .storage
+            .set(PUSH_NOTIFICATIONS_LAST_SIGNATURE_KEY, signature.as_bytes())
+            .await
+        {
+            tracing::debug!(
+                "Failed to persist push notification signature (dedupe): {}",
+                e
+            );
+        }
+        if let Err(e) = self
+            .storage
+            .set(PUSH_NOTIFICATIONS_LAST_SENT_AT_KEY, now.as_bytes())
+            .await
+        {
+            tracing::debug!(
+                "Failed to persist push notification timestamp (dedupe): {}",
+                e
+            );
+        }
+    }
+
+    pub(super) async fn store_notification_with_status(
+        &self,
+        title: &str,
+        body: &str,
+        level: &str,
+        source: &str,
+    ) -> NotificationDispatchOutcome {
+        if !self.notifications_unlocked().await {
+            tracing::debug!(
+                "Notification suppressed (bootstrap gate): title='{}', source='{}'",
+                title,
+                source
+            );
+            return NotificationDispatchOutcome {
+                channel: "web".to_string(),
+                success: false,
+                error: Some("Notification suppressed by bootstrap gate".to_string()),
+            };
+        }
+        let notif = crate::storage::entities::notification::Model {
+            id: uuid::Uuid::new_v4().to_string(),
+            title: title.to_string(),
+            body: body.to_string(),
+            level: level.to_string(),
+            source: source.to_string(),
+            read: false,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        match self.storage.insert_notification(&notif).await {
+            Ok(_) => {
+                let _ = self
+                    .notification_events
+                    .send(NotificationEvent::from_model(&notif));
+                NotificationDispatchOutcome {
+                    channel: "web".to_string(),
+                    success: true,
+                    error: None,
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to emit notification: {}", e);
+                NotificationDispatchOutcome {
+                    channel: "web".to_string(),
+                    success: false,
+                    error: Some(format!("Failed to store notification: {}", e)),
+                }
+            }
+        }
+    }
+
+    /// Emit a notification (stored in DB, visible in UI).
+    pub async fn emit_notification_with_status(
+        &self,
+        title: &str,
+        body: &str,
+        level: &str,
+        source: &str,
+    ) -> NotificationDispatchOutcome {
+        if !self.notifications_unlocked().await {
+            tracing::debug!(
+                "Notification suppressed (bootstrap gate): title='{}', source='{}'",
+                title,
+                source
+            );
+            return NotificationDispatchOutcome {
+                channel: "web".to_string(),
+                success: false,
+                error: Some("Notification suppressed by bootstrap gate".to_string()),
+            };
+        }
+        self.store_notification_with_status(title, body, level, source)
+            .await
+    }
+
+    /// Emit a notification (stored in DB, visible in UI)
+    pub async fn emit_notification(&self, title: &str, body: &str, level: &str, source: &str) {
+        let _ = self
+            .emit_notification_with_status(title, body, level, source)
+            .await;
+    }
+
+    /// Emit a notification even when chat/bootstrap gating would normally suppress it.
+    pub async fn emit_notification_forced_with_status(
+        &self,
+        title: &str,
+        body: &str,
+        level: &str,
+        source: &str,
+    ) -> NotificationDispatchOutcome {
+        self.store_notification_with_status(title, body, level, source)
+            .await
+    }
+
+    /// Emit a notification even when chat/bootstrap gating would normally suppress it.
+    pub async fn emit_notification_forced(
+        &self,
+        title: &str,
+        body: &str,
+        level: &str,
+        source: &str,
+    ) {
+        let _ = self
+            .emit_notification_forced_with_status(title, body, level, source)
+            .await;
+    }
+
+    pub fn subscribe_notification_events(&self) -> broadcast::Receiver<NotificationEvent> {
+        self.notification_events.subscribe()
+    }
+
+    pub(super) fn push_channel_is_configured(&self, channel: &str) -> bool {
+        match channel {
+            "telegram" => self
+                .config
+                .telegram
+                .as_ref()
+                .map(telegram_notification_target_is_configured)
+                .unwrap_or(false),
+            "whatsapp" => self
+                .config
+                .whatsapp
+                .as_ref()
+                .map(whatsapp_notification_target_is_configured)
+                .unwrap_or(false),
+            "slack" => self
+                .config
+                .slack
+                .as_ref()
+                .map(|cfg| {
+                    !cfg.bot_token.trim().is_empty() && !cfg.default_channel_id.trim().is_empty()
+                })
+                .unwrap_or(false),
+            "discord" => self
+                .config
+                .discord
+                .as_ref()
+                .map(|cfg| {
+                    (!cfg.bot_token.trim().is_empty() || !cfg.webhook_url.trim().is_empty())
+                        && !cfg.default_channel_id.trim().is_empty()
+                })
+                .unwrap_or(false),
+            "matrix" => self
+                .config
+                .matrix
+                .as_ref()
+                .map(|cfg| {
+                    !cfg.access_token.trim().is_empty()
+                        && cfg
+                            .default_room_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .is_some()
+                })
+                .unwrap_or(false),
+            "teams" => self
+                .config
+                .teams
+                .as_ref()
+                .map(|cfg| {
+                    !cfg.access_token.trim().is_empty()
+                        && (cfg
+                            .channel_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .is_some()
+                            || cfg
+                                .chat_id
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|value| !value.is_empty())
+                                .is_some())
+                })
+                .unwrap_or(false),
+            "google_chat" => self
+                .config
+                .google_chat
+                .as_ref()
+                .map(|cfg| {
+                    !cfg.access_token.trim().is_empty()
+                        && cfg
+                            .space
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .is_some()
+                })
+                .unwrap_or(false),
+            "signal" => self
+                .config
+                .signal
+                .as_ref()
+                .map(|cfg| {
+                    !cfg.bridge_token.trim().is_empty()
+                        && (!cfg.default_recipient.trim().is_empty()
+                            || !cfg.default_group_id.trim().is_empty())
+                })
+                .unwrap_or(false),
+            "imessage" => self
+                .config
+                .imessage
+                .as_ref()
+                .map(|cfg| {
+                    !cfg.bridge_token.trim().is_empty()
+                        && (!cfg.default_chat_id.trim().is_empty()
+                            || !cfg.default_handle.trim().is_empty())
+                })
+                .unwrap_or(false),
+            "line" => self
+                .config
+                .line
+                .as_ref()
+                .map(|cfg| {
+                    !cfg.channel_access_token.trim().is_empty()
+                        && !cfg.channel_secret.trim().is_empty()
+                        && cfg
+                            .default_target
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .is_some()
+                })
+                .unwrap_or(false),
+            "wechat" => self
+                .config
+                .wechat
+                .as_ref()
+                .map(|cfg| {
+                    !cfg.bridge_token.trim().is_empty()
+                        && !cfg.bridge_url.trim().is_empty()
+                        && !cfg.default_target_id.trim().is_empty()
+                })
+                .unwrap_or(false),
+            "qq" => self
+                .config
+                .qq
+                .as_ref()
+                .map(|cfg| {
+                    !cfg.bridge_token.trim().is_empty()
+                        && !cfg.bridge_url.trim().is_empty()
+                        && !cfg.default_target_id.trim().is_empty()
+                })
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    pub(super) fn preferred_notification_override_value(
+        preferred_override: Option<&str>,
+    ) -> Option<String> {
+        preferred_override
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_ascii_lowercase())
+    }
+
+    pub(super) async fn stored_preferred_notification_override(&self) -> Option<String> {
+        self.storage
+            .get("daily_brief_channel")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+    }
+
+    pub(super) async fn preferred_notification_candidates(
+        &self,
+        preferred_override: Option<&str>,
+        push_only: bool,
+    ) -> Vec<String> {
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+
+        let preferred = Self::preferred_notification_override_value(preferred_override)
+            .or(self.stored_preferred_notification_override().await);
+        if let Some(preferred) = preferred {
+            let eligible = if push_only {
+                is_push_notification_channel(&preferred)
+                    && self.push_channel_is_configured(&preferred)
+            } else {
+                !is_external_notification_channel(&preferred)
+                    || self
+                        .notification_channel_is_configured_any(&preferred)
+                        .await
+            };
+            if eligible && seen.insert(preferred.clone()) {
+                candidates.push(preferred);
+            }
+        }
+
+        let configured = if push_only {
+            self.configured_push_channels().await
+        } else {
+            self.configured_notification_channels().await
+        };
+        for channel in configured {
+            if seen.insert(channel.clone()) {
+                candidates.push(channel);
+            }
+        }
+
+        if !push_only {
+            for integration_id in self.integrations.notifiable_integrations().await {
+                if seen.insert(integration_id.clone()) {
+                    candidates.push(integration_id);
+                }
+            }
+        }
+
+        candidates
+    }
+
+    pub(super) async fn notify_preferred_channel_with_hint(
+        &self,
+        message: &str,
+        preferred_override: Option<&str>,
+        enforce_duplicate_cooldown: bool,
+    ) -> bool {
+        if !self.notifications_unlocked().await {
+            tracing::debug!("notify_preferred_channel suppressed (bootstrap gate)");
+            return false;
+        }
+        if self.push_notifications_muted().await {
+            tracing::debug!("notify_preferred_channel suppressed (mute active)");
+            return false;
+        }
+        if enforce_duplicate_cooldown && self.push_notification_in_cooldown(message).await {
+            tracing::debug!(
+                "notify_preferred_channel suppressed (duplicate within {}s cooldown)",
+                PUSH_NOTIFICATION_DUPLICATE_COOLDOWN_SECS
+            );
+            return false;
+        }
+
+        for channel in self
+            .preferred_notification_candidates(preferred_override, false)
+            .await
+        {
+            tracing::info!("notify_preferred_channel: trying '{}'", channel);
+            if self.try_send_notification(&channel, message).await {
+                if enforce_duplicate_cooldown {
+                    self.remember_push_notification_sent(message).await;
+                }
+                return true;
+            }
+        }
+
+        tracing::info!(
+            "notify_preferred_channel: no external channel delivered, notification stored in DB"
+        );
+        false
+    }
+
+    pub(super) async fn notify_preferred_channel_reported_with_hint(
+        &self,
+        message: &str,
+        preferred_override: Option<&str>,
+        enforce_duplicate_cooldown: bool,
+    ) -> Vec<NotificationDispatchOutcome> {
+        let mut attempts = Vec::new();
+
+        if !self.notifications_unlocked().await {
+            tracing::debug!("notify_preferred_channel suppressed (bootstrap gate)");
+            attempts.push(NotificationDispatchOutcome {
+                channel: "push".to_string(),
+                success: false,
+                error: Some("Notification suppressed by bootstrap gate".to_string()),
+            });
+            return attempts;
+        }
+        if self.push_notifications_muted().await {
+            tracing::debug!("notify_preferred_channel suppressed (mute active)");
+            attempts.push(NotificationDispatchOutcome {
+                channel: "push".to_string(),
+                success: false,
+                error: Some("Push notifications are currently muted".to_string()),
+            });
+            return attempts;
+        }
+        if enforce_duplicate_cooldown && self.push_notification_in_cooldown(message).await {
+            tracing::debug!(
+                "notify_preferred_channel suppressed (duplicate within {}s cooldown)",
+                PUSH_NOTIFICATION_DUPLICATE_COOLDOWN_SECS
+            );
+            attempts.push(NotificationDispatchOutcome {
+                channel: "push".to_string(),
+                success: false,
+                error: Some(format!(
+                    "Duplicate notification suppressed within {} second cooldown",
+                    PUSH_NOTIFICATION_DUPLICATE_COOLDOWN_SECS
+                )),
+            });
+            return attempts;
+        }
+
+        for channel in self
+            .preferred_notification_candidates(preferred_override, false)
+            .await
+        {
+            tracing::info!("notify_preferred_channel: trying '{}'", channel);
+            let outcome = self.try_send_notification_reported(&channel, message).await;
+            let success = outcome.success;
+            attempts.push(outcome);
+            if success {
+                if enforce_duplicate_cooldown {
+                    self.remember_push_notification_sent(message).await;
+                }
+                return attempts;
+            }
+        }
+
+        tracing::info!(
+            "notify_preferred_channel: no external channel delivered, notification stored in DB"
+        );
+        if attempts.is_empty() {
+            attempts.push(NotificationDispatchOutcome {
+                channel: "push".to_string(),
+                success: false,
+                error: Some("No connected notification integrations available".to_string()),
+            });
+        }
+        attempts
+    }
+
+    /// Send a message to the user's preferred notification channel (non-blocking).
+    /// Reads daily_brief_channel from settings to determine where to send.
+    /// Falls back to any connected integration with Notify capability.
+    pub async fn notify_preferred_channel(&self, message: &str) {
+        let _ = self
+            .notify_preferred_channel_with_hint(message, None, true)
+            .await;
+    }
+
+    pub(super) fn sanitize_outbound_notification_message(
+        channel: &str,
+        message: &str,
+    ) -> std::result::Result<String, String> {
+        if channel == "web" {
+            return Ok(message.to_string());
+        }
+
+        let privacy = crate::security::check_outbound_text(
+            message,
+            &crate::security::OutboundPrivacyPolicy::default(),
+        );
+        match privacy.decision {
+            crate::security::OutboundPrivacyDecision::Allow => Ok(message.to_string()),
+            crate::security::OutboundPrivacyDecision::RedactedAllow => {
+                tracing::warn!(
+                    channel = channel,
+                    redactions = ?privacy.redactions,
+                    reasons = ?privacy.reasons,
+                    "Outbound privacy gate redacted notification message"
+                );
+                Ok(privacy.sanitized_text)
+            }
+            crate::security::OutboundPrivacyDecision::Block => {
+                Err(crate::security::format_outbound_privacy_block(
+                    &format!("notification via '{}'", channel),
+                    &privacy.reasons,
+                ))
+            }
+        }
+    }
+
+    pub(super) async fn try_send_registry_messaging_channel(
+        &self,
+        channel: &str,
+        safe_message: &str,
+    ) -> Option<std::result::Result<(), String>> {
+        let normalized = channel.trim().to_ascii_lowercase();
+        if !(normalized
+            .starts_with(crate::channels::messaging_registry::EXTENSION_CHANNEL_ID_PREFIX)
+            || normalized.starts_with(crate::custom_messaging_channels::CUSTOM_CHANNEL_ID_PREFIX))
+        {
+            return None;
+        }
+        let manager = match crate::core::config::SecureConfigManager::new_with_data_dir(
+            &self.config_dir,
+            Some(&self.data_dir),
+        ) {
+            Ok(manager) => manager,
+            Err(error) => return Some(Err(format!("Credential store unavailable: {}", error))),
+        };
+        let packs_guard = self.extension_packs.read().await;
+        let bundled_check: fn(&str) -> bool = |_| false;
+        let ctx = crate::channels::messaging_registry::ChannelQueryContext {
+            bundled_configured: &bundled_check,
+            extension_packs: &*packs_guard,
+            storage: &self.storage,
+            config_dir: &self.config_dir,
+            data_dir: &self.data_dir,
+            config_manager: Some(&manager),
+        };
+        let descriptor = match crate::channels::messaging_registry::MessagingChannelRegistry::new()
+            .lookup(&ctx, &normalized)
+            .await
+        {
+            Ok(Some(descriptor)) => descriptor,
+            Ok(None) => return Some(Err("Messaging channel is not installed.".to_string())),
+            Err(error) => return Some(Err(format!("Messaging channel lookup failed: {}", error))),
+        };
+        if matches!(
+            descriptor.source,
+            crate::channels::messaging_registry::ChannelSource::Bundled
+        ) {
+            return None;
+        }
+        if !descriptor.configured {
+            return Some(Err(format!(
+                "{} is not connected yet.",
+                descriptor.display_name
+            )));
+        }
+        let Some(send_spec) = descriptor.send_spec.as_ref() else {
+            return Some(Err(format!(
+                "{} does not declare a send endpoint.",
+                descriptor.display_name
+            )));
+        };
+        let overlay = if let Some(profile_id) = descriptor.auth_profile_id.as_deref() {
+            match crate::core::auth_profiles::AuthProfileControlPlane::resolve_http(
+                &self.storage,
+                profile_id,
+            )
+            .await
+            {
+                Ok(resolved) => Some(resolved.overlay),
+                Err(error) => return Some(Err(format!("Auth profile is not ready: {}", error))),
+            }
+        } else {
+            None
+        };
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => return Some(Err(format!("Failed to build HTTP client: {}", error))),
+        };
+        let inputs = crate::channels::messaging_dispatch::DispatchInputs {
+            text: safe_message,
+            to: None,
+            conversation_id: None,
+            subject: safe_message.lines().next(),
+        };
+        let result = crate::channels::messaging_dispatch::dispatch_pack_channel_with_overlay(
+            &client,
+            &manager,
+            send_spec,
+            &inputs,
+            overlay.as_ref(),
+        )
+        .await;
+        Some(
+            result
+                .map(|_| ())
+                .map_err(|error| crate::security::redact_secret_input(&error.to_string()).text),
+        )
+    }
+
+    /// Attempt to send a notification via a specific channel/integration.
+    /// Returns true on success, false on failure.
+    pub async fn try_send_notification(&self, channel: &str, message: &str) -> bool {
+        let safe_message = match Self::sanitize_outbound_notification_message(channel, message) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!("{}", error);
+                return false;
+            }
+        };
+
+        match channel {
+            #[cfg(feature = "telegram")]
+            "telegram" => crate::channels::telegram::send_message(self, &safe_message)
+                .await
+                .is_ok(),
+            "slack" => crate::channels::slack::send_message(self, &safe_message)
+                .await
+                .is_ok(),
+            "discord" => crate::channels::discord::send_message(self, &safe_message)
+                .await
+                .is_ok(),
+            "matrix" => crate::channels::matrix::send_message(self, &safe_message)
+                .await
+                .is_ok(),
+            "teams" => crate::channels::teams::send_message(self, &safe_message)
+                .await
+                .is_ok(),
+            "whatsapp" => crate::channels::whatsapp::send_message(self, &safe_message)
+                .await
+                .is_ok(),
+            "google_chat" => crate::channels::google_chat::send_message(self, &safe_message)
+                .await
+                .is_ok(),
+            "signal" => crate::channels::signal::send_message(self, &safe_message)
+                .await
+                .is_ok(),
+            "imessage" => crate::channels::imessage::send_message(self, &safe_message)
+                .await
+                .is_ok(),
+            "line" => crate::channels::line::send_message(self, &safe_message)
+                .await
+                .is_ok(),
+            "wechat" => crate::channels::wechat::send_message(self, &safe_message)
+                .await
+                .is_ok(),
+            "qq" => crate::channels::qq::send_message(self, &safe_message)
+                .await
+                .is_ok(),
+            "email" => self
+                .send_email_notification_reported(&safe_message)
+                .await
+                .is_ok(),
+            "web" => {
+                // Web notifications are already stored in DB
+                true
+            }
+            other => {
+                if let Some(result) = self
+                    .try_send_registry_messaging_channel(other, &safe_message)
+                    .await
+                {
+                    return result.is_ok();
+                }
+                // Try as a generic integration that supports Notify
+                self.integrations
+                    .execute(
+                        other,
+                        "notify",
+                        &serde_json::json!({"message": safe_message}),
+                    )
+                    .await
+                    .is_ok()
+            }
+        }
+    }
+
+    pub async fn notify_preferred_channel_reported(
+        &self,
+        message: &str,
+    ) -> Vec<NotificationDispatchOutcome> {
+        self.notify_preferred_channel_reported_with_hint(message, None, true)
+            .await
+    }
+
+    pub async fn try_send_notification_reported(
+        &self,
+        channel: &str,
+        message: &str,
+    ) -> NotificationDispatchOutcome {
+        let channel_name = channel.to_string();
+        let safe_message = match Self::sanitize_outbound_notification_message(channel, message) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!("{}", error);
+                return NotificationDispatchOutcome {
+                    channel: channel_name,
+                    success: false,
+                    error: Some(error),
+                };
+            }
+        };
+        let result: std::result::Result<(), String> = match channel {
+            #[cfg(feature = "telegram")]
+            "telegram" => crate::channels::telegram::send_message(self, &safe_message)
+                .await
+                .map_err(|e| e.to_string()),
+            "slack" => crate::channels::slack::send_message(self, &safe_message)
+                .await
+                .map_err(|e| e.to_string()),
+            "discord" => crate::channels::discord::send_message(self, &safe_message)
+                .await
+                .map_err(|e| e.to_string()),
+            "matrix" => crate::channels::matrix::send_message(self, &safe_message)
+                .await
+                .map_err(|e| e.to_string()),
+            "teams" => crate::channels::teams::send_message(self, &safe_message)
+                .await
+                .map_err(|e| e.to_string()),
+            "whatsapp" => crate::channels::whatsapp::send_message(self, &safe_message)
+                .await
+                .map_err(|e| e.to_string()),
+            "google_chat" => crate::channels::google_chat::send_message(self, &safe_message)
+                .await
+                .map_err(|e| e.to_string()),
+            "signal" => crate::channels::signal::send_message(self, &safe_message)
+                .await
+                .map_err(|e| e.to_string()),
+            "imessage" => crate::channels::imessage::send_message(self, &safe_message)
+                .await
+                .map_err(|e| e.to_string()),
+            "line" => crate::channels::line::send_message(self, &safe_message)
+                .await
+                .map_err(|e| e.to_string()),
+            "wechat" => crate::channels::wechat::send_message(self, &safe_message)
+                .await
+                .map_err(|e| e.to_string()),
+            "qq" => crate::channels::qq::send_message(self, &safe_message)
+                .await
+                .map_err(|e| e.to_string()),
+            "email" => self.send_email_notification_reported(&safe_message).await,
+            "web" => Ok(()),
+            other => {
+                if let Some(result) = self
+                    .try_send_registry_messaging_channel(other, &safe_message)
+                    .await
+                {
+                    result
+                } else {
+                    self.integrations
+                        .execute(
+                            other,
+                            "notify",
+                            &serde_json::json!({"message": safe_message}),
+                        )
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                }
+            }
+        };
+
+        match result {
+            Ok(()) => NotificationDispatchOutcome {
+                channel: channel_name,
+                success: true,
+                error: None,
+            },
+            Err(error) => NotificationDispatchOutcome {
+                channel: channel_name,
+                success: false,
+                error: Some(error),
+            },
+        }
+    }
+}
