@@ -5,7 +5,7 @@
 //! firmware files under `src/core/arkorbit/l0` during source-tree runs, which
 //! win over the embedded L0 fallback compiled into the binary.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
@@ -632,11 +632,21 @@ mod tests {
         let store = LayeredStore::new(tmp.path());
         let orbit_id = Uuid::new_v4().to_string();
         store
-            .write_orbit_file(&orbit_id, "mod/weather/index.js", b"export function render() {}")
+            .write_orbit_file(
+                &orbit_id,
+                "mod/weather/index.js",
+                b"export function render() {}",
+            )
             .unwrap();
 
         assert!(store.remove_orbit_module_dir(&orbit_id, "weather").unwrap());
-        assert!(!store.orbit_dir(&orbit_id).join("mod").join("weather").exists());
+        assert!(
+            !store
+                .orbit_dir(&orbit_id)
+                .join("mod")
+                .join("weather")
+                .exists()
+        );
         assert!(!store.remove_orbit_module_dir(&orbit_id, "weather").unwrap());
     }
 

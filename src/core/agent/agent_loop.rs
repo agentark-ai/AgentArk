@@ -840,6 +840,7 @@ fn routing_signal_for_prompt(
         "required_capabilities": signal.required_capabilities,
         "rationale": signal.rationale,
         "goals": signal.goals,
+        "semantic_turn_plan": signal.semantic_turn_plan(),
     })
 }
 
@@ -1516,22 +1517,80 @@ fn action_is_read_only_fast_path_candidate(action: &crate::actions::ActionDef) -
     )
 }
 
+fn normalize_action_capability_id(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn action_has_capability_id(action: &crate::actions::ActionDef, capability: &str) -> bool {
+    let expected = normalize_action_capability_id(capability);
+    action
+        .capabilities
+        .iter()
+        .any(|candidate| normalize_action_capability_id(candidate) == expected)
+}
+
+fn action_is_product_help_lookup(action: &crate::actions::ActionDef) -> bool {
+    action_has_capability_id(action, "product_help")
+}
+
+fn routing_has_specific_read_only_grounding(
+    routing: &crate::security::intent_classifier::InboundRoutingSignal,
+) -> bool {
+    routing.product_help_expected || routing.live_state_expected || routing.external_info_expected
+}
+
+fn action_matches_routed_read_only_grounding(
+    action: &crate::actions::ActionDef,
+    routing: &crate::security::intent_classifier::InboundRoutingSignal,
+) -> bool {
+    if !routing_has_specific_read_only_grounding(routing) {
+        return true;
+    }
+    let metadata = action.planner_metadata();
+    if routing.product_help_expected && action_is_product_help_lookup(action) {
+        return true;
+    }
+    if routing.live_state_expected
+        && !action_is_product_help_lookup(action)
+        && matches!(
+            metadata.integration_class,
+            crate::actions::PlannerIntegrationClass::Internal
+                | crate::actions::PlannerIntegrationClass::Analytics
+        )
+    {
+        return true;
+    }
+    routing.external_info_expected
+        && matches!(
+            metadata.integration_class,
+            crate::actions::PlannerIntegrationClass::Search
+                | crate::actions::PlannerIntegrationClass::Network
+                | crate::actions::PlannerIntegrationClass::Workspace
+        )
+}
+
 fn read_only_fast_path_action_preference(
     action: &crate::actions::ActionDef,
     routing: Option<&crate::security::intent_classifier::InboundRoutingSignal>,
 ) -> u8 {
     let metadata = action.planner_metadata();
-    if action_schema_accepts_direct_query_argument(action) {
-        return 0;
-    }
     if let Some(signal) = routing {
+        if signal.product_help_expected && action_is_product_help_lookup(action) {
+            return 0;
+        }
         if signal.live_state_expected
+            && !action_is_product_help_lookup(action)
             && matches!(
                 metadata.integration_class,
                 crate::actions::PlannerIntegrationClass::Internal
+                    | crate::actions::PlannerIntegrationClass::Analytics
             )
         {
-            return 1;
+            return 0;
         }
         if signal.external_info_expected
             && matches!(
@@ -1541,8 +1600,11 @@ fn read_only_fast_path_action_preference(
                     | crate::actions::PlannerIntegrationClass::Workspace
             )
         {
-            return 1;
+            return 0;
         }
+    }
+    if action_schema_accepts_direct_query_argument(action) {
+        return 1;
     }
     match metadata.integration_class {
         crate::actions::PlannerIntegrationClass::Internal => 2,
@@ -1574,6 +1636,11 @@ fn select_read_only_fast_path_action(
         .iter()
         .enumerate()
         .filter(|(_, action)| action_is_read_only_fast_path_candidate(action))
+        .filter(|(_, action)| {
+            routing
+                .map(|signal| action_matches_routed_read_only_grounding(action, signal))
+                .unwrap_or(true)
+        })
         .filter_map(|(source_rank, action)| {
             let score = semantic_scores
                 .get(&action.name)
@@ -1738,10 +1805,21 @@ fn synthetic_read_only_fast_path_call(
         return None;
     }
     let query = direct_query_for_read_only_fast_path(message, routing)?;
+    let mut arguments = serde_json::json!({ "query": query });
+    if action_is_product_help_lookup(action) {
+        if let Some(doc_ids) = routing
+            .map(|signal| signal.grounding_doc_ids.clone())
+            .filter(|doc_ids| !doc_ids.is_empty())
+        {
+            if let Some(arguments) = arguments.as_object_mut() {
+                arguments.insert("doc_ids".to_string(), serde_json::json!(doc_ids));
+            }
+        }
+    }
     Some(crate::core::llm::ToolCall {
         id: uuid::Uuid::new_v4().to_string(),
         name: action.name.clone(),
-        arguments: serde_json::json!({ "query": query }),
+        arguments,
     })
 }
 
@@ -3019,6 +3097,7 @@ fn parsed_calls_include_ready_app_delivery_action(
             .map(|action| {
                 action_is_app_delivery_candidate(action)
                     && tool_call_validation_issue(call, action).is_none()
+                    && app_delivery_call_has_deployable_source(&call.arguments)
             })
             .unwrap_or(false)
     })
@@ -3036,6 +3115,27 @@ fn parsed_calls_include_generic_filesystem_write(
     })
 }
 
+fn app_delivery_payload_validation_issues(
+    calls: &[crate::core::llm::ToolCall],
+    action_map: &HashMap<String, crate::actions::ActionDef>,
+) -> Vec<AgentLoopToolCallValidationIssue> {
+    calls
+        .iter()
+        .filter_map(|call| {
+            action_map.get(&call.name).and_then(|action| {
+                (action_is_app_delivery_candidate(action)
+                    && !app_delivery_call_has_deployable_source(&call.arguments))
+                .then(|| AgentLoopToolCallValidationIssue {
+                    action_name: call.name.clone(),
+                    reason: "app delivery payload must include generated files, staged source, patch data, or a repository source"
+                        .to_string(),
+                    missing_fields: vec!["files_or_repo_source".to_string()],
+                })
+            })
+        })
+        .collect()
+}
+
 fn reject_calls_before_pending_app_delivery(
     calls: &[crate::core::llm::ToolCall],
     action_map: &HashMap<String, crate::actions::ActionDef>,
@@ -3047,10 +3147,16 @@ fn reject_calls_before_pending_app_delivery(
         return None;
     }
     let call_validation_issues = tool_call_validation_issues(calls, action_map);
+    let app_payload_issues = app_delivery_payload_validation_issues(calls, action_map);
     let calls_include_generic_filesystem_write =
         parsed_calls_include_generic_filesystem_write(calls, action_map);
     let calls_include_ready_app_delivery =
         parsed_calls_include_ready_app_delivery_action(calls, action_map);
+    if !app_payload_issues.is_empty() {
+        let mut issues = call_validation_issues;
+        issues.extend(app_payload_issues);
+        return Some(issues);
+    }
     if calls_include_generic_filesystem_write
         || (!call_validation_issues.is_empty() && !calls_include_ready_app_delivery)
     {
@@ -3959,6 +4065,12 @@ fn goal_has_app_delivery_intent(
     goal: &AgentLoopGoalState,
     actions: &[crate::actions::ActionDef],
 ) -> bool {
+    if matches!(
+        normalized_goal_durability(goal).as_str(),
+        "scheduled_time" | "recurring_monitor" | "watcher" | "integration"
+    ) {
+        return false;
+    }
     if goal_requires_durable_commit(goal) {
         return true;
     }
@@ -5346,6 +5458,8 @@ fn agent_loop_processed_message(
         run_id: None,
         run_status: Some(run_status.to_string()),
         trace_id: None,
+        input_tokens: 0,
+        output_tokens: 0,
         total_tokens: 0,
         choices: Vec::new(),
         degradation: degradation.clone(),
@@ -5764,6 +5878,13 @@ impl Agent {
         if current_answer_only || suppress_app_delivery_for_turn {
             actions.retain(|action| !action_is_app_delivery_candidate(action));
         }
+        if let Some(signal) = routing {
+            if routing_allows_read_only_fast_path(Some(signal))
+                && routing_has_specific_read_only_grounding(signal)
+            {
+                actions.retain(|action| action_matches_routed_read_only_grounding(action, signal));
+            }
+        }
         let anchored_to_direct_actions = !current_answer_only
             && !suppress_app_delivery_for_turn
             && anchor_scope_to_required_direct_actions(
@@ -5798,6 +5919,14 @@ impl Agent {
             let Some(action) = authorized_action_map.get(name) else {
                 continue;
             };
+            if let Some(signal) = routing {
+                if routing_allows_read_only_fast_path(Some(signal))
+                    && routing_has_specific_read_only_grounding(signal)
+                    && !action_matches_routed_read_only_grounding(action, signal)
+                {
+                    continue;
+                }
+            }
             if routing_should_suppress_app_delivery_candidates(
                 routing,
                 routing_trusted,
@@ -9173,6 +9302,92 @@ mod tests {
     }
 
     #[test]
+    fn product_help_routing_uses_product_help_grounding_only() {
+        let web_search = action(
+            "web_search",
+            "Retrieve current public information and return structured results.",
+            &["search"],
+        );
+        let product_help = action(
+            "product_help_search",
+            "Search bundled product help and runtime documentation.",
+            &["product_help", "documentation", "database_readonly"],
+        );
+        let actions = vec![web_search, product_help];
+        let scores = HashMap::from([
+            ("web_search".to_string(), 0.99),
+            ("product_help_search".to_string(), 0.86),
+        ]);
+        let routing = crate::security::intent_classifier::InboundRoutingSignal {
+            should_execute: true,
+            tool_use_expected: true,
+            current_answer_expected: true,
+            product_help_expected: true,
+            goals: vec![crate::security::intent_classifier::InboundTurnGoal {
+                id: "g1".to_string(),
+                intent_summary: "Explain a product concept".to_string(),
+                capability_query: "Read relevant bundled product documentation".to_string(),
+                expected_outcome: "A grounded product explanation".to_string(),
+                durability: "none".to_string(),
+                groundings: vec!["product_help".to_string()],
+                dependencies: Vec::new(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let selected = select_read_only_fast_path_action(Some(&routing), None, &actions, &scores)
+            .expect("product-help routing should select product help lookup");
+
+        assert_eq!(selected.actions.len(), 1);
+        assert_eq!(
+            selected.primary_action().map(|action| action.name.as_str()),
+            Some("product_help_search")
+        );
+        assert!(selected.actions.iter().all(action_is_product_help_lookup));
+    }
+
+    #[test]
+    fn product_help_scope_expansion_rejects_external_read_only_actions() {
+        let product_help = action(
+            "product_help_search",
+            "Search bundled product help and runtime documentation.",
+            &["product_help", "documentation", "database_readonly"],
+        );
+        let web_search = action(
+            "web_search",
+            "Retrieve current public information and return structured results.",
+            &["search"],
+        );
+        let routing = crate::security::intent_classifier::InboundRoutingSignal {
+            should_execute: true,
+            tool_use_expected: true,
+            current_answer_expected: true,
+            product_help_expected: true,
+            goals: vec![crate::security::intent_classifier::InboundTurnGoal {
+                id: "g1".to_string(),
+                intent_summary: "Explain a product concept".to_string(),
+                capability_query: "Read relevant bundled product documentation".to_string(),
+                expected_outcome: "A grounded product explanation".to_string(),
+                durability: "none".to_string(),
+                groundings: vec!["product_help".to_string()],
+                dependencies: Vec::new(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(action_matches_routed_read_only_grounding(
+            &product_help,
+            &routing
+        ));
+        assert!(!action_matches_routed_read_only_grounding(
+            &web_search,
+            &routing
+        ));
+    }
+
+    #[test]
     fn read_only_fast_path_uses_semantic_dominance_when_routing_unavailable() {
         let actions = vec![
             action(
@@ -9500,6 +9715,66 @@ mod tests {
     }
 
     #[test]
+    fn product_help_fast_path_synthesizes_scoped_doc_ids() {
+        let mut lookup = action(
+            "product_help_search",
+            "Search bundled product help and runtime documentation.",
+            &["product_help", "documentation", "database_readonly"],
+        );
+        lookup.input_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string" },
+                "doc_ids": { "type": "array", "items": { "type": "string" } }
+            },
+            "required": ["query"]
+        });
+        let routing = crate::security::intent_classifier::InboundRoutingSignal {
+            should_execute: true,
+            tool_use_expected: true,
+            current_answer_expected: true,
+            product_help_expected: true,
+            grounding_doc_ids: vec![
+                "product_help:1111222233334444".to_string(),
+                "product_help:aaaabbbbccccdddd".to_string(),
+            ],
+            goals: vec![crate::security::intent_classifier::InboundTurnGoal {
+                id: "g1".to_string(),
+                intent_summary: "Explain a product concept".to_string(),
+                capability_query: "Read relevant bundled product documentation".to_string(),
+                expected_outcome: "A grounded product explanation".to_string(),
+                durability: "none".to_string(),
+                groundings: vec!["product_help".to_string()],
+                dependencies: Vec::new(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let fast_path = AgentLoopReadOnlyFastPath {
+            actions: vec![lookup],
+            score: 0.91,
+            runner_up_score: 0.10,
+        };
+
+        let call =
+            synthetic_read_only_fast_path_call(&fast_path, "what is this feature?", Some(&routing))
+                .expect("product-help lookup should be directly invokable");
+
+        assert_eq!(call.name, "product_help_search");
+        assert_eq!(
+            call.arguments.get("query").and_then(|value| value.as_str()),
+            Some("what is this feature?")
+        );
+        assert_eq!(
+            call.arguments
+                .get("doc_ids")
+                .and_then(|value| value.as_array())
+                .map(|items| items.len()),
+            Some(2)
+        );
+    }
+
+    #[test]
     fn read_only_fast_path_can_synthesize_optional_query_call_from_schema() {
         let mut lookup = action(
             "session_search",
@@ -9821,6 +10096,24 @@ mod tests {
             total_loaded: 2,
             ..Default::default()
         };
+        let request_hints = RequestExecutionHints {
+            routing_trusted: true,
+            routing: Some(crate::security::intent_classifier::InboundRoutingSignal {
+                current_answer_expected: true,
+                goals: vec![crate::security::intent_classifier::InboundTurnGoal {
+                    id: "g1".to_string(),
+                    intent_summary: "Refine the previous answer".to_string(),
+                    capability_query: "answer refinement".to_string(),
+                    expected_outcome: "A more detailed version of the prior answer".to_string(),
+                    durability: "none".to_string(),
+                    groundings: Vec::new(),
+                    side_effect: "none".to_string(),
+                    dependencies: vec!["previous_answer".to_string()],
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
         let user_prompt = build_agent_loop_user_prompt(
             "Make the explanation more detailed.",
             "conversation-test",
@@ -9832,7 +10125,7 @@ mod tests {
             &[],
             &[],
             0,
-            &RequestExecutionHints::default(),
+            &request_hints,
             None,
             true,
             false,
@@ -10774,7 +11067,7 @@ mod tests {
         );
         let app_deploy = app_delivery_action();
         let mut scoped = vec![file_write, code_execute, app_deploy.clone()];
-        let mut plan = turn_plan(goal("none"));
+        let mut plan = turn_plan(goal("deployment"));
         let semantic_scores = HashMap::from([
             ("app_deploy".to_string(), 0.77),
             ("file_write".to_string(), 0.31),

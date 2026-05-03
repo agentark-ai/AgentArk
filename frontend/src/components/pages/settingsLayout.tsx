@@ -8,6 +8,7 @@ export type SettingsSectionIntroArgs = {
   description: string;
   info?: string | null;
   action?: ReactNode;
+  icon?: ReactNode;
 };
 
 export type SettingsInlineCardProps = {
@@ -57,6 +58,7 @@ export function SettingsSectionIntro({
   description,
   info = null,
   action = null,
+  icon = null,
   selectedHeaderTitle,
 }: SettingsSectionIntroArgs & { selectedHeaderTitle: string }) {
   const showEyebrow =
@@ -65,6 +67,7 @@ export function SettingsSectionIntro({
   const duplicatesPageHeader =
     !info &&
     !action &&
+    !icon &&
     normalizeSettingsHeading(title) ===
       normalizeSettingsHeading(selectedHeaderTitle);
 
@@ -82,37 +85,62 @@ export function SettingsSectionIntro({
         alignItems: { xs: "flex-start", md: "center" },
       }}
     >
-      <Box className="settings-section-intro-copy">
-        {showEyebrow ? (
-          <Typography className="settings-section-kicker">
-            {eyebrow}
-          </Typography>
+      <Stack
+        direction="row"
+        spacing={1.25}
+        sx={{ alignItems: "flex-start", flex: 1, minWidth: 0 }}
+      >
+        {icon ? (
+          <Box
+            className="settings-section-icon"
+            sx={{
+              width: 36,
+              height: 36,
+              borderRadius: "10px",
+              background: "var(--ui-rgba-244-245-247-080, rgba(244,245,247,0.08))",
+              border: "1px solid var(--ui-rgba-244-245-247-160, rgba(244,245,247,0.16))",
+              display: "grid",
+              placeItems: "center",
+              flex: "0 0 auto",
+              color: "var(--ui-rgba-244-245-247-820, rgba(244,245,247,0.82))",
+              mt: 0.25,
+            }}
+          >
+            {icon}
+          </Box>
         ) : null}
-        <Stack
-          direction="row"
-          spacing={0.75}
-          className="settings-section-title-row"
-          sx={{
-            alignItems: "center",
-          }}
-        >
-          <Typography className="settings-section-title">{title}</Typography>
-          {info ? (
-            <Tooltip title={info} arrow placement="top-start">
-              <IconButton
-                size="small"
-                className="settings-section-info"
-                aria-label={`${title} information`}
-              >
-                <InfoOutlinedIcon fontSize="inherit" />
-              </IconButton>
-            </Tooltip>
+        <Box className="settings-section-intro-copy" sx={{ minWidth: 0, flex: 1 }}>
+          {showEyebrow ? (
+            <Typography className="settings-section-kicker">
+              {eyebrow}
+            </Typography>
           ) : null}
-        </Stack>
-        <Typography className="settings-section-description">
-          {description}
-        </Typography>
-      </Box>
+          <Stack
+            direction="row"
+            spacing={0.75}
+            className="settings-section-title-row"
+            sx={{
+              alignItems: "center",
+            }}
+          >
+            <Typography className="settings-section-title">{title}</Typography>
+            {info ? (
+              <Tooltip title={info} arrow placement="top-start">
+                <IconButton
+                  size="small"
+                  className="settings-section-info"
+                  aria-label={`${title} information`}
+                >
+                  <InfoOutlinedIcon fontSize="inherit" />
+                </IconButton>
+              </Tooltip>
+            ) : null}
+          </Stack>
+          <Typography className="settings-section-description">
+            {description}
+          </Typography>
+        </Box>
+      </Stack>
       {action ? <Box className="settings-section-actions">{action}</Box> : null}
     </Stack>
   );

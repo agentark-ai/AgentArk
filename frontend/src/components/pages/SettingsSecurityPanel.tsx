@@ -1,4 +1,10 @@
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
+import LockRoundedIcon from "@mui/icons-material/LockRounded";
+import ShieldRoundedIcon from "@mui/icons-material/ShieldRounded";
+import VpnKeyRoundedIcon from "@mui/icons-material/VpnKeyRounded";
+import PublicRoundedIcon from "@mui/icons-material/PublicRounded";
+import InventoryRoundedIcon from "@mui/icons-material/Inventory2Rounded";
+import VisibilityOffRoundedIcon from "@mui/icons-material/VisibilityOffRounded";
 import {
   Accordion,
   AccordionDetails,
@@ -104,27 +110,23 @@ export function SettingsSecurityPanel({
   setSuccess,
 }: SettingsSecurityPanelProps) {
   return (
-              <Grid2 container spacing={1.5}>
-                <Grid2 size={{ xs: 12, lg: 12 }}>
-                  <Box
-                    sx={{
-                      display: "grid",
-                      gap: 2,
-                      alignItems: "start",
-                      gridTemplateColumns: {
-                        xs: "minmax(0, 1fr)",
-                        lg: "minmax(0, 1.45fr) minmax(320px, 1fr)",
-                      },
-                      gridTemplateAreas: {
-                        xs: showInternalServiceSection
-                          ? '"security" "abuse" "internal" "remote" "vault" "privacy"'
-                          : '"security" "abuse" "remote" "vault" "privacy"',
-                        lg: showInternalServiceSection
-                          ? '"security internal" "abuse abuse" "remote vault" "privacy privacy"'
-                          : '"security vault" "abuse abuse" "remote vault" "privacy privacy"',
-                      },
-                    }}
-                  >
+              <Stack spacing={2}>
+                {renderSettingsInlineCard({
+                  eyebrow: "Security",
+                  title: "Review before changing",
+                  description:
+                    "These controls govern who can sign in, what credentials live on this instance, and how the public surface is exposed. Changes take effect immediately for new sessions.",
+                  fullWidthCopy: true,
+                  tone: "warning",
+                })}
+                <Box
+                  sx={{
+                    display: "grid",
+                    gap: 2,
+                    alignItems: "start",
+                    gridTemplateColumns: "minmax(0, 1fr)",
+                  }}
+                >
                     <Box
                       className="list-shell"
                       sx={{ minHeight: 0, gridArea: "security" }}
@@ -135,6 +137,7 @@ export function SettingsSecurityPanel({
                           title: "Security & Master Password",
                           description:
                             "Protect operator access, control remote sign-in, and manage the primary instance password.",
+                          icon: <LockRoundedIcon fontSize="small" />,
                         })}
                         {securityStatusQ.isLoading ? (
                           <Typography
@@ -188,6 +191,7 @@ export function SettingsSecurityPanel({
                           title: "Abuse Review",
                           description:
                             "Resume or pause sources that repeatedly tripped the inbound semantic guard.",
+                          icon: <ShieldRoundedIcon fontSize="small" />,
                           action: (
                             <Chip
                               size="small"
@@ -303,6 +307,7 @@ export function SettingsSecurityPanel({
                           eyebrow: "Security",
                           title: "Internal Service Credentials",
                           description: internalServiceDescription,
+                          icon: <VpnKeyRoundedIcon fontSize="small" />,
                           action: internalServiceRotationSupported ? (
                             <Stack
                               direction="row"
@@ -468,6 +473,7 @@ export function SettingsSecurityPanel({
                           title: "Remote Access",
                           description:
                             "Only expose remote sign-in when you need it, and keep the access method and posture visible.",
+                          icon: <PublicRoundedIcon fontSize="small" />,
                           action: (
                             <Stack
                               direction="row"
@@ -922,6 +928,7 @@ export function SettingsSecurityPanel({
                           title: "Secrets vault",
                           description: vaultSummaryText,
                           info: "Save private keys and tokens here so AgentArk can use them without showing the raw value in normal screens.",
+                          icon: <InventoryRoundedIcon fontSize="small" />,
                           action: (
                             <Chip
                               size="small"
@@ -1149,6 +1156,7 @@ export function SettingsSecurityPanel({
                           title: "Model Privacy Boundary",
                           description:
                             "Control what sensitive content can enter model prompts, and whether chat can pause for one-time approval when read-only tools uncover person-linked data.",
+                          icon: <VisibilityOffRoundedIcon fontSize="small" />,
                           action: (
                             <Chip
                               size="small"
@@ -1255,8 +1263,6 @@ export function SettingsSecurityPanel({
                       </Stack>
                     </Box>
                   </Box>
-                </Grid2>
-
-              </Grid2>
+              </Stack>
   );
 }

@@ -3,7 +3,7 @@
 use super::*;
 
 use crate::core::arkorbit::{
-    OrbitAgentEvent, OrbitUpdate, content_type_for_name, stream_orbit_chat_turn,
+    OrbitAgentEvent, OrbitChatUsage, OrbitUpdate, content_type_for_name, stream_orbit_chat_turn,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -98,6 +98,7 @@ struct OrbitTraceAccumulator {
     file_write_count: usize,
     read_count: usize,
     error: Option<String>,
+    usage: Option<OrbitChatUsage>,
 }
 
 fn truncate_trace_value(value: &str, max_chars: usize) -> String {
@@ -196,6 +197,9 @@ impl OrbitTraceAccumulator {
                     started_at,
                 ));
             }
+            OrbitAgentEvent::Usage(usage) => {
+                self.usage = Some(usage.clone());
+            }
             OrbitAgentEvent::Error(message) => {
                 self.error = Some(message.clone());
                 self.steps.push(orbit_trace_step(
@@ -255,6 +259,7 @@ async fn persist_orbit_trace(
     } else {
         response
     };
+    let usage = accumulator.usage;
     let file_write_count = accumulator.file_write_count;
     let read_count = accumulator.read_count;
     let steps = accumulator.steps;
@@ -263,6 +268,13 @@ async fn persist_orbit_trace(
         let mut trace = trace_ref.write().await;
         trace.completed_at = Some(completed_at);
         trace.response = Some(response.clone());
+        if let Some(usage) = usage {
+            trace.model = usage.model;
+            trace.input_tokens = usage.input_tokens.min(i64::MAX as u64) as i64;
+            trace.output_tokens = usage.output_tokens.min(i64::MAX as u64) as i64;
+            trace.total_tokens = usage.total_tokens.min(i64::MAX as u64) as i64;
+            trace.cost_usd = usage.cost_usd.unwrap_or(0.0);
+        }
         trace.steps.extend(steps);
         trace.steps.push(crate::core::ExecutionStep {
             icon: if failed { "[error]" } else { "[reply]" }.to_string(),
@@ -519,6 +531,133 @@ pub(super) async fn orbit_file_endpoint(
         }
         Err(err) => json_error(StatusCode::BAD_REQUEST, err.to_string()),
     }
+}
+
+fn orbit_widget_layout_number(
+    body: &serde_json::Value,
+    key: &str,
+) -> std::result::Result<Option<f64>, String> {
+    if !body.as_object().is_some_and(|object| object.contains_key(key)) {
+        return Ok(None);
+    }
+    let Some(value) = body.get(key).and_then(|value| value.as_f64()) else {
+        return Err(format!("'{}' must be a finite number", key));
+    };
+    if !value.is_finite() || value < 0.0 || value > 1_000_000.0 {
+        return Err(format!("'{}' must be between 0 and 1000000", key));
+    }
+    Ok(Some(value))
+}
+
+pub(super) async fn update_orbit_widget_endpoint(
+    State(state): State<AppState>,
+    Path((id, widget_id)): Path<(String, String)>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let Some(widget_id) = widget_registry_key(&widget_id) else {
+        return json_error(StatusCode::BAD_REQUEST, "invalid widget id");
+    };
+    let left = match orbit_widget_layout_number(&body, "left") {
+        Ok(value) => value,
+        Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
+    };
+    let top = match orbit_widget_layout_number(&body, "top") {
+        Ok(value) => value,
+        Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
+    };
+    if left.is_none() && top.is_none() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "at least one layout field is required",
+        );
+    }
+
+    let agent = state.agent.read().await;
+    match agent.arkorbit.get_orbit(&id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return json_error(StatusCode::NOT_FOUND, "orbit not found"),
+        Err(err) => return json_error(StatusCode::BAD_REQUEST, err.to_string()),
+    }
+
+    let raw = match agent
+        .arkorbit
+        .read_orbit_file_text(&id, "data/widgets.json")
+    {
+        Ok(raw) => raw,
+        Err(err) => return json_error(StatusCode::NOT_FOUND, err.to_string()),
+    };
+
+    let parsed = match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(value) => value,
+        Err(err) => return json_error(StatusCode::BAD_REQUEST, err.to_string()),
+    };
+    let (mut root, mut widgets) = if let Some(list) = parsed.as_array() {
+        (None, list.clone())
+    } else if let Some(list) = parsed.get("widgets").and_then(|value| value.as_array()) {
+        (Some(parsed.clone()), list.clone())
+    } else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "data/widgets.json must be an array or object with widgets",
+        );
+    };
+
+    let mut updated_widget = None;
+    for widget in widgets.iter_mut() {
+        let id_matches = widget_entry_key(widget, "id").as_deref() == Some(widget_id.as_str());
+        let module_matches =
+            widget_entry_key(widget, "module").as_deref() == Some(widget_id.as_str());
+        if !id_matches && !module_matches {
+            continue;
+        }
+        let Some(object) = widget.as_object_mut() else {
+            continue;
+        };
+        if let Some(left) = left {
+            object.insert("left".to_string(), serde_json::json!(left));
+        }
+        if let Some(top) = top {
+            object.insert("top".to_string(), serde_json::json!(top));
+        }
+        updated_widget = Some(serde_json::Value::Object(object.clone()));
+        break;
+    }
+
+    let Some(updated_widget) = updated_widget else {
+        return json_error(StatusCode::NOT_FOUND, "widget not found");
+    };
+
+    let next = if let Some(root) = root.as_mut() {
+        if let Some(object) = root.as_object_mut() {
+            object.insert(
+                "widgets".to_string(),
+                serde_json::Value::Array(widgets.clone()),
+            );
+        }
+        serde_json::to_string_pretty(root)
+    } else {
+        serde_json::to_string_pretty(&widgets)
+    };
+    match next {
+        Ok(next) => {
+            if let Err(err) = agent
+                .arkorbit
+                .write_orbit_file(&id, "data/widgets.json", &next)
+            {
+                return internal_error(err);
+            }
+        }
+        Err(err) => return internal_error(err),
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "widget": updated_widget,
+        })),
+    )
+        .into_response()
 }
 
 pub(super) async fn delete_orbit_widget_endpoint(
@@ -992,7 +1131,7 @@ pub(super) async fn orbit_chat_endpoint(
                     _ = idle_status.tick() => {
                         if client_open {
                             let payload = serde_json::json!({
-                                "message": "Still working on the Orbit file changes."
+                                "message": "Still working on the Orbit request."
                             });
                             if let Ok(data) = serde_json::to_string(&payload) {
                                 if sse_tx
@@ -1029,6 +1168,10 @@ pub(super) async fn orbit_chat_endpoint(
                     OrbitAgentEvent::ReadRequested { path } => {
                         ("read", serde_json::json!({ "path": path }))
                     }
+                    OrbitAgentEvent::Usage(usage) => (
+                        "usage",
+                        serde_json::to_value(&usage).unwrap_or_else(|_| serde_json::json!({})),
+                    ),
                     OrbitAgentEvent::Done => ("done", serde_json::json!({})),
                     OrbitAgentEvent::Error(message) => {
                         ("error", serde_json::json!({ "message": message }))

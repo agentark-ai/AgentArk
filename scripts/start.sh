@@ -52,7 +52,7 @@ verify_lightpanda_runtime() {
 }
 
 verify_lightpanda_runtime_async() {
-    (verify_lightpanda_runtime > /tmp/agentark-lightpanda-check.log 2>&1 || true) &
+    (verify_lightpanda_runtime >/dev/null 2>&1 || true) &
 }
 
 verify_gepa_optimizer_runtime() {
@@ -73,7 +73,7 @@ verify_gepa_optimizer_runtime() {
 }
 
 verify_gepa_optimizer_runtime_async() {
-    (verify_gepa_optimizer_runtime > /tmp/agentark-gepa-check.log 2>&1 || true) &
+    (verify_gepa_optimizer_runtime >/dev/null 2>&1 || true) &
 }
 
 case "${1:-start}" in

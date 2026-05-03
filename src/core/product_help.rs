@@ -1,9 +1,13 @@
 use crate::actions::ActionDef;
-use crate::docs::product_help::{render_bundled_help_doc, BUNDLED_HELP_DOCS};
+use crate::docs::product_help::{BUNDLED_HELP_DOCS, render_bundled_help_doc};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 pub const CURATED_SOURCE: &str = "agentark_help";
 pub const RUNTIME_SOURCE: &str = "agentark_runtime_help";
+pub const DOCUMENT_ID_PREFIX: &str = "product_help:";
+pub const DOCUMENT_CONTENT_TYPE: &str = "application/x-agentark-product-help";
+const PRODUCT_HELP_CHUNK_MAX_CHARS: usize = 1_400;
 
 #[derive(Debug, Clone)]
 pub struct SeedKnowledgeItem {
@@ -12,6 +16,18 @@ pub struct SeedKnowledgeItem {
     pub source: &'static str,
     pub url: Option<String>,
     pub tags: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SeedProductHelpDocument {
+    pub id: String,
+    pub filename: String,
+    pub content_type: &'static str,
+    pub title: String,
+    pub content: String,
+    pub url: Option<String>,
+    pub tags: Option<String>,
+    pub chunks: Vec<String>,
 }
 
 fn branded_product_text(text: &str) -> String {
@@ -24,6 +40,173 @@ pub fn build_seed_knowledge_items(actions: &[ActionDef]) -> Vec<SeedKnowledgeIte
     items.extend(build_connect_flow_docs());
     items.extend(build_runtime_action_catalog_docs(actions));
     items
+}
+
+pub fn build_seed_product_help_documents(actions: &[ActionDef]) -> Vec<SeedProductHelpDocument> {
+    build_seed_knowledge_items(actions)
+        .into_iter()
+        .map(seed_product_help_document)
+        .collect()
+}
+
+fn seed_product_help_document(item: SeedKnowledgeItem) -> SeedProductHelpDocument {
+    let id = product_help_document_id(&item);
+    let filename = product_help_filename(&item);
+    let chunks = product_help_chunks(&item);
+    SeedProductHelpDocument {
+        id,
+        filename,
+        content_type: DOCUMENT_CONTENT_TYPE,
+        title: item.title,
+        content: item.content,
+        url: item.url,
+        tags: item.tags,
+        chunks,
+    }
+}
+
+fn product_help_document_id(item: &SeedKnowledgeItem) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(item.source.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(item.title.as_bytes());
+    hasher.update(b"\n");
+    if let Some(url) = item.url.as_deref() {
+        hasher.update(url.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let hash = digest
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{DOCUMENT_ID_PREFIX}{hash}")
+}
+
+fn product_help_filename(item: &SeedKnowledgeItem) -> String {
+    let source = item.source.replace('_', "-");
+    let mut slug = item
+        .title
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while slug.contains("--") {
+        slug = slug.replace("--", "-");
+    }
+    let slug = slug.trim_matches('-');
+    format!("{}-{}.md", source, slug)
+}
+
+fn product_help_chunks(item: &SeedKnowledgeItem) -> Vec<String> {
+    let header = product_help_chunk_header(item);
+    let max_body_chars = PRODUCT_HELP_CHUNK_MAX_CHARS.saturating_sub(header.chars().count() + 2);
+    let max_body_chars = max_body_chars.max(400);
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+
+    for block in product_help_content_blocks(&item.content, max_body_chars) {
+        let separator = if current.is_empty() { "" } else { "\n\n" };
+        let candidate_len =
+            current.chars().count() + separator.chars().count() + block.chars().count();
+        if !current.is_empty() && candidate_len > max_body_chars {
+            chunks.push(format!("{header}\n\n{}", current.trim()));
+            current.clear();
+        }
+        if !current.is_empty() {
+            current.push_str("\n\n");
+        }
+        current.push_str(block.trim());
+    }
+
+    if !current.trim().is_empty() {
+        chunks.push(format!("{header}\n\n{}", current.trim()));
+    }
+    if chunks.is_empty() {
+        chunks.push(header);
+    }
+    chunks
+}
+
+fn product_help_chunk_header(item: &SeedKnowledgeItem) -> String {
+    let mut lines = vec![
+        format!("title: {}", item.title.trim()),
+        format!("source: {}", item.source),
+    ];
+    if let Some(tags) = item
+        .tags
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("tags: {tags}"));
+    }
+    if let Some(url) = item
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("url: {url}"));
+    }
+    lines.join("\n")
+}
+
+fn product_help_content_blocks(content: &str, max_chars: usize) -> Vec<String> {
+    let mut blocks = Vec::new();
+    for block in content
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if block.chars().count() <= max_chars {
+            blocks.push(block.to_string());
+            continue;
+        }
+        let mut current = String::new();
+        for line in block
+            .lines()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let separator = if current.is_empty() { "" } else { "\n" };
+            let candidate_len =
+                current.chars().count() + separator.chars().count() + line.chars().count();
+            if !current.is_empty() && candidate_len > max_chars {
+                blocks.push(current.trim().to_string());
+                current.clear();
+            }
+            if line.chars().count() > max_chars {
+                if !current.trim().is_empty() {
+                    blocks.push(current.trim().to_string());
+                    current.clear();
+                }
+                blocks.extend(split_long_product_help_text(line, max_chars));
+                continue;
+            }
+            if !current.is_empty() {
+                current.push('\n');
+            }
+            current.push_str(line);
+        }
+        if !current.trim().is_empty() {
+            blocks.push(current.trim().to_string());
+        }
+    }
+    blocks
+}
+
+fn split_long_product_help_text(text: &str, max_chars: usize) -> Vec<String> {
+    let chars = text.chars().collect::<Vec<_>>();
+    chars
+        .chunks(max_chars.max(1))
+        .map(|chunk| chunk.iter().collect::<String>())
+        .collect()
 }
 
 fn bundled_docs() -> Vec<SeedKnowledgeItem> {
@@ -451,32 +634,50 @@ mod tests {
         ]);
         assert!(items.iter().any(|item| item.source == CURATED_SOURCE));
         assert!(items.iter().any(|item| item.source == RUNTIME_SOURCE));
-        assert!(items
-            .iter()
-            .any(|item| item.title.contains("Main navigation")));
-        assert!(items
-            .iter()
-            .any(|item| item.title == "Models and provider setup"));
-        assert!(items
-            .iter()
-            .any(|item| item.title == "Embeddings and retrieval"));
-        assert!(items
-            .iter()
-            .any(|item| item.title == "Input needed and unattended runs"));
-        assert!(items
-            .iter()
-            .any(|item| item.title == "Environment, deployment, and investigation"));
-        assert!(items
-            .iter()
-            .any(|item| item.title == "Chat shortcuts and safe actions"));
-        assert!(items
-            .iter()
-            .any(|item| item.title == "Custom integrations and extension packs"));
-        assert!(items
-            .iter()
-            .any(|item| item.title == "Plugins, webhooks, and custom APIs"));
-        assert!(items
-            .iter()
-            .any(|item| item.title == "Runtime environment and investigation"));
+        assert!(
+            items
+                .iter()
+                .any(|item| item.title.contains("Main navigation"))
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.title == "Models and provider setup")
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.title == "Embeddings and retrieval")
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.title == "Input needed and unattended runs")
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.title == "Environment, deployment, and investigation")
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.title == "Chat shortcuts and safe actions")
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.title == "Custom integrations and extension packs")
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.title == "Plugins, webhooks, and custom APIs")
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.title == "Runtime environment and investigation")
+        );
     }
 }

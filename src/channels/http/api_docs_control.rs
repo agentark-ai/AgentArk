@@ -430,7 +430,7 @@ pub(super) fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value
     add(
         "/reflect",
         "GET",
-        "Get cached ArkReflect clusters across chat, ArkOrbit, apps, goals, watchers, Sentinel, ArkPulse, ArkEvolve, usage, memory, and workflows",
+        "Get cached ArkReflect clusters and daily digest status across chat, ArkOrbit, apps, goals, watchers, Sentinel, ArkPulse, ArkEvolve, usage, memory, and workflows",
         "Analytics",
     );
     add(

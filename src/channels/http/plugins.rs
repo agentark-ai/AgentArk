@@ -143,8 +143,8 @@ pub(super) async fn list_plugin_logs(
 mod tests {
     use super::*;
     use crate::core::Agent;
-    use axum::body::{Body, to_bytes};
-    use axum::http::{HeaderMap, Request, header};
+    use axum::body::{to_bytes, Body};
+    use axum::http::{header, HeaderMap, Request};
     use axum::routing::{get, post};
     use serde_json::Value;
     use std::collections::HashMap;
@@ -209,6 +209,9 @@ mod tests {
                 whatsapp_bridge: Arc::new(RwLock::new(WhatsAppBridgeState::new())),
                 security_events,
                 app_registry,
+                app_publish_locks: Arc::new(parking_lot::Mutex::new(
+                    std::collections::HashSet::new(),
+                )),
                 executor_client: None,
                 workspace_client: None,
                 application_registry: applications::ApplicationLauncherRegistry::default(),
@@ -481,22 +484,18 @@ mod tests {
             .and_then(|value| value.as_array())
             .cloned()
             .unwrap_or_default();
-        assert!(
-            logs.iter()
-                .any(|entry| entry.get("kind").and_then(|v| v.as_str()) == Some("manifest"))
-        );
-        assert!(
-            logs.iter()
-                .any(|entry| entry.get("kind").and_then(|v| v.as_str()) == Some("action"))
-        );
-        assert!(
-            logs.iter()
-                .any(|entry| entry.get("kind").and_then(|v| v.as_str()) == Some("event"))
-        );
-        assert!(
-            logs.iter()
-                .any(|entry| entry.get("kind").and_then(|v| v.as_str()) == Some("ping"))
-        );
+        assert!(logs
+            .iter()
+            .any(|entry| entry.get("kind").and_then(|v| v.as_str()) == Some("manifest")));
+        assert!(logs
+            .iter()
+            .any(|entry| entry.get("kind").and_then(|v| v.as_str()) == Some("action")));
+        assert!(logs
+            .iter()
+            .any(|entry| entry.get("kind").and_then(|v| v.as_str()) == Some("event")));
+        assert!(logs
+            .iter()
+            .any(|entry| entry.get("kind").and_then(|v| v.as_str()) == Some("ping")));
 
         let action_payloads = mock_plugin.action_payloads.lock().await.clone();
         assert_eq!(action_payloads.len(), 1);

@@ -1,9 +1,9 @@
 use crate::core::Agent;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;

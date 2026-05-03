@@ -228,6 +228,8 @@ pub struct ActionRuntime {
         std::sync::RwLock<crate::security::tool_args_guard::ToolArgsGuardConfig>,
     /// Shared storage for expense + entity operations
     storage: Option<crate::storage::Storage>,
+    /// Embedding client for runtime actions that do bounded semantic retrieval.
+    embedding_client: Option<std::sync::Arc<crate::core::EmbeddingClient>>,
     /// Stable identifier for the active user (DID), set by `Agent::init`. Used
     /// by per-user features such as ArkOrbit when no explicit user scope is
     /// supplied in tool arguments.
@@ -3551,6 +3553,7 @@ print(json.dumps({
             auto_approved_actions: std::sync::RwLock::new(HashSet::new()),
             tool_args_guard_config: std::sync::RwLock::new(Default::default()),
             storage: None,
+            embedding_client: None,
             current_user_id: None,
             mcp_registry: None,
             plugin_registry: None,
@@ -3606,6 +3609,13 @@ print(json.dumps({
     /// Set shared storage reference for expense/entity operations (called from Agent::init)
     pub fn set_storage(&mut self, storage: crate::storage::Storage) {
         self.storage = Some(storage);
+    }
+
+    pub fn set_embedding_client(
+        &mut self,
+        embedding_client: Option<std::sync::Arc<crate::core::EmbeddingClient>>,
+    ) {
+        self.embedding_client = embedding_client;
     }
 
     pub fn storage(&self) -> Option<crate::storage::Storage> {
@@ -3892,7 +3902,12 @@ print(json.dumps({
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Question or topic to search in AgentArk product help" },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 8, "description": "Maximum help entries to return (default: 4)" }
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 8, "description": "Maximum help entries to return (default: 4)" },
+                    "doc_ids": {
+                        "type": "array",
+                        "description": "Optional product-help document IDs that scope retrieval when routing already selected grounding documents.",
+                        "items": { "type": "string" }
+                    }
                 },
                 "required": ["query"]
             }),
@@ -9304,6 +9319,7 @@ print(json.dumps({
             }
             "manage_actions" => self.execute_manage_actions(arguments).await,
             "ark_inspect" => self.execute_ark_inspect(arguments).await,
+            "memory_lookup" => self.execute_memory_lookup(arguments).await,
             "product_help_search" => self.execute_product_help_search(arguments).await,
             "list_integrations" => self.execute_list_integrations(arguments).await,
             "postgres_schema_inspect" => self.execute_postgres_schema_inspect(arguments).await,
@@ -11341,20 +11357,6 @@ print(result["text"])
         }))
     }
 
-    fn product_help_doc_text(doc: &crate::docs::product_help::BundledHelpDoc) -> String {
-        let mut text = Vec::new();
-        text.push(doc.title.to_string());
-        text.push(doc.summary.to_string());
-        if !doc.tags.is_empty() {
-            text.push(doc.tags.join(" "));
-        }
-        for section in doc.sections {
-            text.push(section.label.to_string());
-            text.extend(section.items.iter().map(|item| item.to_string()));
-        }
-        text.join("\n")
-    }
-
     fn product_help_query_terms(query: &str) -> Vec<String> {
         query
             .split(|ch: char| !ch.is_alphanumeric())
@@ -11374,6 +11376,131 @@ print(result["text"])
             .count()
     }
 
+    fn product_help_chunk_field(content: &str, field: &str) -> Option<String> {
+        let prefix = format!("{field}:");
+        content.lines().find_map(|line| {
+            line.strip_prefix(&prefix)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+    }
+
+    fn product_help_hit_json(
+        hit: crate::core::document_search::DocumentSearchHit,
+    ) -> serde_json::Value {
+        let title = Self::product_help_chunk_field(&hit.content, "title")
+            .unwrap_or_else(|| hit.filename.clone());
+        let url = Self::product_help_chunk_field(&hit.content, "url");
+        let tags = Self::product_help_chunk_field(&hit.content, "tags");
+        serde_json::json!({
+            "title": title,
+            "document_id": hit.document_id,
+            "chunk_index": hit.chunk_index,
+            "content": Self::compact_text(&hit.content, 1800),
+            "score": hit.score,
+            "lexical_score": hit.lexical_score,
+            "dense_score": hit.dense_score,
+            "match_reason": hit.match_reason,
+            "url": url,
+            "tags": tags,
+        })
+    }
+
+    fn product_help_fallback_results(
+        actions: &[ActionDef],
+        query: &str,
+        limit: usize,
+        doc_ids: &std::collections::HashSet<String>,
+    ) -> Vec<serde_json::Value> {
+        let terms = Self::product_help_query_terms(query);
+        let mut scored = crate::core::product_help::build_seed_product_help_documents(actions)
+            .into_iter()
+            .filter(|doc| doc_ids.is_empty() || doc_ids.contains(&doc.id))
+            .flat_map(|doc| {
+                let title = doc.title.clone();
+                let doc_id = doc.id.clone();
+                let url = doc.url.clone();
+                let tags = doc.tags.clone();
+                let terms_for_doc = terms.clone();
+                doc.chunks
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(chunk_index, content)| {
+                        let raw_score = Self::product_help_match_score(&content, &terms_for_doc);
+                        let score = if terms_for_doc.is_empty() {
+                            1.0
+                        } else {
+                            raw_score as f64 / terms_for_doc.len().max(1) as f64
+                        };
+                        (
+                            score,
+                            serde_json::json!({
+                                "title": title.clone(),
+                                "document_id": doc_id.clone(),
+                                "chunk_index": chunk_index,
+                                "content": Self::compact_text(&content, 1800),
+                                "score": score,
+                                "lexical_score": score,
+                                "dense_score": serde_json::Value::Null,
+                                "match_reason": "lexical_fallback",
+                                "url": url.clone(),
+                                "tags": tags.clone(),
+                            }),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|(score, _)| *score > 0.0 || terms.is_empty())
+            .collect::<Vec<_>>();
+        scored.sort_by(|left, right| {
+            right
+                .0
+                .partial_cmp(&left.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        scored
+            .into_iter()
+            .take(limit)
+            .map(|(_, value)| value)
+            .collect()
+    }
+
+    fn product_help_doc_ids_from_arguments(
+        arguments: &serde_json::Value,
+    ) -> Result<std::collections::HashSet<String>> {
+        let mut doc_ids = std::collections::HashSet::new();
+        let Some(items) = arguments.get("doc_ids") else {
+            return Ok(doc_ids);
+        };
+        let Some(items) = items.as_array() else {
+            anyhow::bail!("product_help_search doc_ids must be an array when supplied");
+        };
+        for item in items {
+            let Some(raw) = item
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            if !raw.starts_with(crate::core::product_help::DOCUMENT_ID_PREFIX)
+                || !raw
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ':' | '-' | '_'))
+            {
+                anyhow::bail!(
+                    "product_help_search doc_ids may only contain product-help document IDs"
+                );
+            }
+            doc_ids.insert(raw.to_string());
+            if doc_ids.len() >= 16 {
+                break;
+            }
+        }
+        Ok(doc_ids)
+    }
+
     async fn execute_product_help_search(&self, arguments: &serde_json::Value) -> Result<String> {
         let query = arguments
             .get("query")
@@ -11386,39 +11513,438 @@ print(result["text"])
             .and_then(|value| value.as_u64())
             .unwrap_or(4)
             .clamp(1, 8) as usize;
-        let terms = Self::product_help_query_terms(query);
-        let mut matches = crate::docs::product_help::BUNDLED_HELP_DOCS
-            .iter()
-            .map(|doc| {
-                let doc_text = Self::product_help_doc_text(doc);
-                let score = Self::product_help_match_score(&doc_text, &terms);
-                serde_json::json!({
-                    "title": crate::branding::brand_text(doc.title),
-                    "slug": doc.slug,
-                    "tags": doc.tags,
-                    "summary": crate::branding::brand_text(doc.summary),
-                    "content": crate::branding::brand_text(
-                        &crate::docs::product_help::render_bundled_help_doc(doc)
-                    ),
-                    "match_score": score,
-                })
-            })
-            .collect::<Vec<_>>();
-        matches.sort_by(|left, right| {
-            let left_score = left
-                .get("match_score")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0);
-            let right_score = right
-                .get("match_score")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0);
-            right_score.cmp(&left_score)
-        });
-        matches.truncate(limit);
+        let requested_doc_ids = Self::product_help_doc_ids_from_arguments(arguments)?;
+        let storage = self.runtime_storage()?;
+        let mut product_docs = storage
+            .list_documents_by_id_prefix(crate::core::product_help::DOCUMENT_ID_PREFIX, 512)
+            .await?;
+        if !requested_doc_ids.is_empty() {
+            product_docs.retain(|doc| requested_doc_ids.contains(&doc.id));
+        }
+        let embedding_available = self.embedding_client.is_some();
+        let semantic_results = if product_docs.is_empty() {
+            Vec::new()
+        } else {
+            crate::core::document_search::search_document_models(
+                &storage,
+                self.embedding_client.as_deref(),
+                query,
+                limit,
+                product_docs,
+            )
+            .await?
+            .into_iter()
+            .map(Self::product_help_hit_json)
+            .collect::<Vec<_>>()
+        };
+        let (mode, matches) = if semantic_results.is_empty() {
+            let actions = self.list_enabled_actions().await.unwrap_or_default();
+            (
+                "bounded_lexical_chunk_fallback",
+                Self::product_help_fallback_results(&actions, query, limit, &requested_doc_ids),
+            )
+        } else {
+            (
+                if requested_doc_ids.is_empty() {
+                    "pgvector_document_chunks"
+                } else {
+                    "pgvector_scoped_document_chunks"
+                },
+                semantic_results,
+            )
+        };
         Ok(serde_json::to_string_pretty(&serde_json::json!({
             "query": query,
+            "retrieval": {
+                "mode": mode,
+                "embedding_available": embedding_available,
+                "result_scope": "product_help_document_chunks",
+                "max_results": limit,
+                "scoped_doc_ids": requested_doc_ids.iter().cloned().collect::<Vec<_>>(),
+            },
             "results": matches,
+        }))?)
+    }
+
+    fn memory_lookup_terms(query: &str) -> Vec<String> {
+        let mut seen = std::collections::BTreeSet::new();
+        query
+            .split(|ch: char| !ch.is_alphanumeric())
+            .filter_map(|term| {
+                let term = term.trim().to_ascii_lowercase();
+                if term.chars().count() < 2 || !seen.insert(term.clone()) {
+                    None
+                } else {
+                    Some(term)
+                }
+            })
+            .collect()
+    }
+
+    fn memory_lookup_score<'a>(
+        terms: &[String],
+        weighted_fields: impl IntoIterator<Item = (&'a str, f32)>,
+    ) -> f32 {
+        if terms.is_empty() {
+            return 0.0;
+        }
+        let fields = weighted_fields
+            .into_iter()
+            .map(|(value, weight)| (value.to_ascii_lowercase(), weight))
+            .collect::<Vec<_>>();
+        let mut score = 0.0f32;
+        for term in terms {
+            for (field, weight) in &fields {
+                if field.contains(term) {
+                    score += *weight;
+                }
+            }
+        }
+        score
+    }
+
+    fn memory_lookup_include_sensitive_experience_item(
+        item: &crate::storage::experience_item::Model,
+    ) -> bool {
+        let sensitivity = item
+            .metadata
+            .get("sensitivity")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', ' '], "_");
+        !matches!(sensitivity.as_str(), "sensitive" | "crisis_sensitive")
+    }
+
+    fn memory_lookup_experience_json(
+        item: crate::storage::experience_item::Model,
+    ) -> serde_json::Value {
+        let key = item
+            .metadata
+            .get("key")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        let memory_kind = item
+            .metadata
+            .get("memory_kind")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        serde_json::json!({
+            "id": item.id,
+            "kind": item.kind,
+            "scope": item.scope,
+            "project_id": item.project_id,
+            "conversation_id": item.conversation_id,
+            "title": Self::compact_text(&item.title, 180),
+            "content": Self::compact_text(&item.content, 420),
+            "key": key,
+            "memory_kind": memory_kind,
+            "confidence": item.confidence,
+            "support_count": item.support_count,
+            "updated_at": item.updated_at,
+        })
+    }
+
+    async fn execute_memory_lookup(&self, arguments: &serde_json::Value) -> Result<String> {
+        let query = arguments
+            .get("query")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("memory_lookup requires a non-empty query"))?;
+        let limit = arguments
+            .get("limit")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(5)
+            .clamp(1, 12) as usize;
+        let include_semantic = arguments
+            .get("include_semantic")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true);
+        let include_structured = arguments
+            .get("include_structured")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true);
+        let include_procedures = arguments
+            .get("include_procedures")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true);
+        let include_lessons = arguments
+            .get("include_lessons")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true);
+        let project_id = arguments
+            .get("project_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let conversation_id = arguments
+            .get("conversation_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let storage = self.runtime_storage()?;
+        let terms = Self::memory_lookup_terms(query);
+        let semantic_kinds = if include_lessons {
+            vec![
+                "identity",
+                "preference",
+                "location",
+                "workflow",
+                "constraint",
+                "personal_fact",
+                "other",
+                "lesson",
+                "procedure",
+            ]
+        } else {
+            vec![
+                "identity",
+                "preference",
+                "location",
+                "workflow",
+                "constraint",
+                "personal_fact",
+                "other",
+            ]
+        };
+
+        let semantic_facts = if include_semantic {
+            let mut scored = storage
+                .list_active_experience_items(
+                    &semantic_kinds,
+                    project_id,
+                    conversation_id,
+                    96,
+                )
+                .await?
+                .into_iter()
+                .filter(Self::memory_lookup_include_sensitive_experience_item)
+                .map(|item| {
+                    let key = item
+                        .metadata
+                        .get("key")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let memory_kind = item
+                        .metadata
+                        .get("memory_kind")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let score = Self::memory_lookup_score(
+                        &terms,
+                        [
+                            (item.kind.as_str(), 2.0),
+                            (key.as_str(), 2.0),
+                            (memory_kind.as_str(), 2.0),
+                            (item.title.as_str(), 1.5),
+                            (item.content.as_str(), 1.0),
+                            (item.normalized_key.as_str(), 1.0),
+                        ],
+                    );
+                    (score, item)
+                })
+                .collect::<Vec<_>>();
+            scored.sort_by(|left, right| {
+                right
+                    .0
+                    .partial_cmp(&left.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| right.1.updated_at.cmp(&left.1.updated_at))
+            });
+            scored
+                .into_iter()
+                .filter(|(score, _)| *score > 0.0 || terms.is_empty())
+                .take(limit)
+                .map(|(_, item)| Self::memory_lookup_experience_json(item))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        let preferences = if include_structured {
+            let mut scored = storage
+                .list_user_preferences(48, 0, project_id)
+                .await?
+                .into_iter()
+                .map(|item| {
+                    let score = Self::memory_lookup_score(
+                        &terms,
+                        [(item.key.as_str(), 2.0), (item.value.as_str(), 1.0)],
+                    );
+                    (score, item)
+                })
+                .collect::<Vec<_>>();
+            scored.sort_by(|left, right| {
+                right
+                    .0
+                    .partial_cmp(&left.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| right.1.updated_at.cmp(&left.1.updated_at))
+            });
+            scored
+                .into_iter()
+                .filter(|(score, _)| *score > 0.0 || terms.is_empty())
+                .take(limit)
+                .map(|(_, item)| {
+                    serde_json::json!({
+                        "id": item.id,
+                        "key": item.key,
+                        "value": Self::compact_text(&item.value, 320),
+                        "sensitivity": item.sensitivity,
+                        "confidence": item.confidence,
+                        "project_id": item.project_id,
+                        "updated_at": item.updated_at,
+                    })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        let user_data = if include_structured {
+            let mut scored = storage
+                .list_user_data_items(48, 0, project_id, None)
+                .await?
+                .into_iter()
+                .map(|item| {
+                    let url = item.url.clone().unwrap_or_default();
+                    let score = Self::memory_lookup_score(
+                        &terms,
+                        [
+                            (item.kind.as_str(), 2.0),
+                            (item.title.as_str(), 1.5),
+                            (item.content.as_str(), 1.0),
+                            (url.as_str(), 0.5),
+                        ],
+                    );
+                    (score, item)
+                })
+                .collect::<Vec<_>>();
+            scored.sort_by(|left, right| {
+                right
+                    .0
+                    .partial_cmp(&left.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| right.1.updated_at.cmp(&left.1.updated_at))
+            });
+            scored
+                .into_iter()
+                .filter(|(score, _)| *score > 0.0 || terms.is_empty())
+                .take(limit)
+                .map(|(_, item)| {
+                    serde_json::json!({
+                        "id": item.id,
+                        "kind": item.kind,
+                        "title": Self::compact_text(&item.title, 180),
+                        "content": Self::compact_text(&item.content, 320),
+                        "url": item.url,
+                        "pinned": item.pinned,
+                        "project_id": item.project_id,
+                        "conversation_id": item.conversation_id,
+                        "updated_at": item.updated_at,
+                    })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        let knowledge = if include_structured {
+            let mut scored = storage
+                .list_visible_knowledge_items(48, 0, project_id)
+                .await?
+                .into_iter()
+                .map(|item| {
+                    let tags = item.tags.clone().unwrap_or_default();
+                    let source = item.source.clone().unwrap_or_default();
+                    let score = Self::memory_lookup_score(
+                        &terms,
+                        [
+                            (item.title.as_str(), 1.5),
+                            (item.content.as_str(), 1.0),
+                            (tags.as_str(), 1.0),
+                            (source.as_str(), 0.5),
+                        ],
+                    );
+                    (score, item)
+                })
+                .collect::<Vec<_>>();
+            scored.sort_by(|left, right| {
+                right
+                    .0
+                    .partial_cmp(&left.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| right.1.updated_at.cmp(&left.1.updated_at))
+            });
+            scored
+                .into_iter()
+                .filter(|(score, _)| *score > 0.0 || terms.is_empty())
+                .take(limit)
+                .map(|(_, item)| {
+                    serde_json::json!({
+                        "id": item.id,
+                        "title": Self::compact_text(&item.title, 180),
+                        "content": Self::compact_text(&item.content, 420),
+                        "source": item.source,
+                        "url": item.url,
+                        "tags": item.tags,
+                        "project_id": item.project_id,
+                        "updated_at": item.updated_at,
+                    })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        let procedures = if include_procedures {
+            storage
+                .search_procedural_patterns(query, project_id, conversation_id, limit as u64)
+                .await?
+                .into_iter()
+                .map(|hit| {
+                    serde_json::json!({
+                        "id": hit.pattern.id,
+                        "status": hit.pattern.status,
+                        "title": Self::compact_text(&hit.pattern.title, 180),
+                        "trigger_summary": Self::compact_text(&hit.pattern.trigger_summary, 260),
+                        "summary": Self::compact_text(&hit.pattern.summary, 420),
+                        "score": hit.score,
+                        "sample_count": hit.pattern.sample_count,
+                        "success_rate": hit.pattern.success_rate,
+                        "updated_at": hit.pattern.updated_at,
+                    })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "query": query,
+            "retrieval": {
+                "mode": "bounded_local_memory",
+                "max_results_per_bucket": limit,
+                "include_semantic": include_semantic,
+                "include_structured": include_structured,
+                "include_procedures": include_procedures,
+                "include_lessons": include_lessons,
+                "scope": {
+                    "project_id": project_id,
+                    "conversation_id": conversation_id,
+                },
+            },
+            "results": {
+                "semantic_facts": semantic_facts,
+                "preferences": preferences,
+                "user_data": user_data,
+                "knowledge": knowledge,
+                "procedures": procedures,
+            },
         }))?)
     }
 
@@ -19162,6 +19688,7 @@ mod tests {
             task_queue: None,
             action_guard: None,
             storage: None,
+            embedding_client: None,
             current_user_id: None,
             mcp_registry: None,
             plugin_registry: None,

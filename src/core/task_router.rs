@@ -4,7 +4,7 @@
 //! and they are auto-spawned from the model pool. User-configured specialists
 //! act as priority boosters — preferred when they match, but never required.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -22,8 +22,8 @@ use super::swarm::specialist::SpecialistAgent;
 use super::swarm::{AgentAccessScope, SwarmActivityAgent, SwarmActivityTracker};
 use super::{DegradationNote, DelegationStatus, FailureKind, StreamEvent};
 use crate::actions::ActionDef;
-use crate::core::queue_stream_event;
 use crate::core::PromptMemory;
+use crate::core::queue_stream_event;
 
 fn compact_text(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
@@ -3099,11 +3099,13 @@ mod tests {
 
         assert_eq!(degradation.len(), 1);
         assert_eq!(degradation[0].kind, "delegation");
-        assert!(degradation[0]
-            .detail
-            .as_deref()
-            .unwrap_or_default()
-            .contains("panicked"));
+        assert!(
+            degradation[0]
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("panicked")
+        );
     }
 
     #[test]
@@ -3142,9 +3144,11 @@ mod tests {
             &[degraded_result(DelegationStatus::TimedOut)],
         );
 
-        assert!(response
-            .content
-            .contains("couldn't complete the delegated execution cleanly"));
+        assert!(
+            response
+                .content
+                .contains("couldn't complete the delegated execution cleanly")
+        );
         assert!(response.content.contains("Still needs follow-up"));
     }
 

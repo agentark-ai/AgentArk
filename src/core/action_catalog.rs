@@ -343,9 +343,11 @@ mod tests {
     fn descriptor_includes_schema_field_descriptions() {
         let descriptor = build_action_catalog_descriptor(&action("research", "Gather evidence"));
 
-        assert!(descriptor
-            .descriptor_text
-            .contains("query: string required"));
+        assert!(
+            descriptor
+                .descriptor_text
+                .contains("query: string required")
+        );
         assert!(descriptor.descriptor_text.contains("Topic or objective"));
         assert!(descriptor.descriptor_text.contains("options.depth"));
     }

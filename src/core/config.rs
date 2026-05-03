@@ -17,8 +17,8 @@ use crate::channels::{
 };
 use crate::crypto::KeyManager;
 use crate::security::ModelPrivacyConfig;
-use anyhow::{anyhow, Result};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use anyhow::{Result, anyhow};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

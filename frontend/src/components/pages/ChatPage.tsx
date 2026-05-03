@@ -6518,34 +6518,25 @@ function buildChatRunMetricItems(metrics: ChatRunMetrics): Array<{
   label: string;
   value: string;
 }> {
-  const items: Array<{ label: string; value: string }> = [];
-  const inputTokens = positiveRunMetric(metrics.inputTokens);
-  const outputTokens = positiveRunMetric(metrics.outputTokens);
+  const nonNegativeMetric = (value: unknown): number => {
+    const amount = num(value, 0);
+    if (!Number.isFinite(amount) || amount < 0) return 0;
+    return amount;
+  };
+  const inputTokens = nonNegativeMetric(metrics.inputTokens);
+  const outputTokens = nonNegativeMetric(metrics.outputTokens);
   const explicitTotalTokens = positiveRunMetric(metrics.totalTokens);
   const totalTokens =
     explicitTotalTokens ??
-    (inputTokens != null || outputTokens != null
-      ? (inputTokens ?? 0) + (outputTokens ?? 0)
-      : null);
-  const timeToFirstTokenMs = positiveRunMetric(metrics.timeToFirstTokenMs);
+    inputTokens + outputTokens;
+  const timeToFirstTokenMs = nonNegativeMetric(metrics.timeToFirstTokenMs);
 
-  if (timeToFirstTokenMs != null) {
-    items.push({ label: "First token", value: formatTraceDuration(timeToFirstTokenMs) });
-  }
-  if (inputTokens != null && inputTokens > 0) {
-    items.push({ label: "Input tokens", value: Math.round(inputTokens).toLocaleString() });
-  }
-  if (outputTokens != null && outputTokens > 0) {
-    items.push({ label: "Output tokens", value: Math.round(outputTokens).toLocaleString() });
-  }
-  if (totalTokens != null && totalTokens > 0) {
-    items.push({ label: "Total tokens", value: Math.round(totalTokens).toLocaleString() });
-  }
-  const durationMs = positiveRunMetric(metrics.durationMs);
-  if (durationMs != null && durationMs > 0) {
-    items.push({ label: "Duration", value: formatTraceDuration(durationMs) });
-  }
-  return items;
+  return [
+    { label: "Total tokens", value: Math.round(totalTokens).toLocaleString() },
+    { label: "Input tokens", value: Math.round(inputTokens).toLocaleString() },
+    { label: "Output tokens", value: Math.round(outputTokens).toLocaleString() },
+    { label: "TTFT", value: formatTraceDuration(timeToFirstTokenMs) },
+  ];
 }
 
 function promptProposalStatusColor(
@@ -13073,7 +13064,7 @@ function ChatPageInner({
     const requestedConversationOverride = (
       opts?.conversationIdOverride || ""
     ).trim();
-    const targetConversationId =
+    let targetConversationId =
       requestedConversationOverride || conversationId || "";
     const preservedResumeSnapshot =
       isResumeMode && targetConversationId
@@ -13133,6 +13124,41 @@ function ChatPageInner({
     const deepResearch = Boolean(opts?.deepResearch);
     const planOverride = opts?.planOverride ?? null;
     const executionMode: ChatExecutionMode = "auto";
+    if (!isResumeMode && workingChatCount >= CHAT_WORKING_CHATS_MAX) {
+      setChatError(
+        `You already have ${CHAT_WORKING_CHATS_MAX} working chats. Wait for one to finish or stop one before starting another.`,
+      );
+      return false;
+    }
+    streamLockRef.current = true;
+    if (!isResumeMode && !targetConversationId) {
+      try {
+        const created = asRecord(
+          await api.rawPost("/conversations", {
+            title: activeMessagePreview || "New Chat",
+            channel: "web",
+          }),
+        );
+        const createdId = str(
+          created.id,
+          str(created.conversation_id, str(created.conversationId, "")),
+        ).trim();
+        if (!createdId) {
+          streamLockRef.current = false;
+          setChatError("Could not attach this chat before starting.");
+          return false;
+        }
+        targetConversationId = createdId;
+        setConversationPage(0);
+        setConversationId(createdId);
+      } catch (err) {
+        streamLockRef.current = false;
+        setChatError(
+          `Could not attach this chat before starting: ${normalizeChatError(errMessage(err))}`,
+        );
+        return false;
+      }
+    }
     const attachmentFingerprint = files
       .map((file) => `${file.name}:${file.size}:${file.lastModified}`)
       .join("|");
@@ -13148,17 +13174,11 @@ function ChatPageInner({
       lastSend.fingerprint === fingerprint &&
       now - lastSend.at < 1500
     ) {
+      streamLockRef.current = false;
       setChatNotice("Duplicate send ignored.");
       return false;
     }
-    if (!isResumeMode && workingChatCount >= CHAT_WORKING_CHATS_MAX) {
-      setChatError(
-        `You already have ${CHAT_WORKING_CHATS_MAX} working chats. Wait for one to finish or stop one before starting another.`,
-      );
-      return false;
-    }
     recentSendRef.current = { fingerprint, at: now };
-    streamLockRef.current = true;
     stopRequestedRef.current = false;
     const streamGeneration = streamGenerationRef.current + 1;
     streamGenerationRef.current = streamGeneration;
@@ -13272,6 +13292,8 @@ function ChatPageInner({
     const absorbRunMetrics = (payload: unknown) => {
       const obj = asRecord(payload);
       const next: ChatRunMetrics = {};
+      const observedElapsedMs = Math.max(1, Date.now() - streamStartedAt);
+      const hasVisibleContent = str(obj.content, "").length > 0;
       const inputTokens = positiveRunMetric(obj.input_tokens);
       const outputTokens = positiveRunMetric(obj.output_tokens);
       const totalTokens = positiveRunMetric(obj.total_tokens);
@@ -13280,11 +13302,22 @@ function ChatPageInner({
       if (inputTokens != null) next.inputTokens = inputTokens;
       if (outputTokens != null) next.outputTokens = outputTokens;
       if (totalTokens != null) next.totalTokens = totalTokens;
-      if (durationMs != null) next.durationMs = durationMs;
+      if (durationMs != null) {
+        next.durationMs = Math.max(durationMs, observedElapsedMs);
+      }
       if (timeToFirstTokenMs != null) {
-        next.timeToFirstTokenMs = timeToFirstTokenMs;
-        firstTokenMs = timeToFirstTokenMs;
+        const serverFirstTokenMs = hasVisibleContent
+          ? Math.max(timeToFirstTokenMs, observedElapsedMs)
+          : timeToFirstTokenMs;
+        firstTokenMs =
+          firstTokenMs != null
+            ? Math.max(firstTokenMs, serverFirstTokenMs)
+            : serverFirstTokenMs;
+        next.timeToFirstTokenMs = firstTokenMs;
       } else if (firstTokenMs != null) {
+        next.timeToFirstTokenMs = firstTokenMs;
+      } else if (hasVisibleContent) {
+        firstTokenMs = observedElapsedMs;
         next.timeToFirstTokenMs = firstTokenMs;
       }
       if (Object.keys(next).length === 0) return;

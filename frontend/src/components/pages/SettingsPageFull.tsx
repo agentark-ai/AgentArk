@@ -644,6 +644,7 @@ export default function SettingsPage({
     daily_brief_enabled: false,
     daily_brief_time: "09:00",
     daily_brief_channel: "telegram",
+    arkreflect_daily_digest_enabled: false,
     smart_routing: true,
     embeddings_provider: "local-hf",
     embeddings_model: LOCAL_EMBEDDINGS_MODEL,
@@ -1056,6 +1057,9 @@ export default function SettingsPage({
       daily_brief_enabled: toBool(settings.daily_brief_enabled),
       daily_brief_time: str(settings.daily_brief_time, "09:00"),
       daily_brief_channel: str(settings.daily_brief_channel, "telegram"),
+      arkreflect_daily_digest_enabled: toBool(
+        settings.arkreflect_daily_digest_enabled,
+      ),
       smart_routing: toBool(settings.smart_routing),
       embeddings_provider: str(settings.embeddings_provider, "local-hf"),
       embeddings_model: str(settings.embeddings_model, LOCAL_EMBEDDINGS_MODEL),
@@ -1627,6 +1631,7 @@ export default function SettingsPage({
         daily_brief_enabled: form.daily_brief_enabled,
         daily_brief_time: form.daily_brief_time || "09:00",
         daily_brief_channel: form.daily_brief_channel || "telegram",
+        arkreflect_daily_digest_enabled: form.arkreflect_daily_digest_enabled,
         smart_routing: form.smart_routing,
         embeddings_provider: form.embeddings_provider || "local-hf",
         embeddings_model:
@@ -5005,6 +5010,32 @@ export default function SettingsPage({
                           }
                           label={
                             form.daily_brief_enabled ? "Enabled" : "Disabled"
+                          }
+                        />
+                      ),
+                    })}
+                    {renderSettingsInlineCard({
+                      eyebrow: "ArkReflect",
+                      title: "Daily digest",
+                      description:
+                        "Send one end-of-day reflection to the same notification channel, only when AgentArk found meaningful activity.",
+                      action: (
+                        <FormControlLabel
+                          control={
+                            <Switch
+                              checked={form.arkreflect_daily_digest_enabled}
+                              onChange={(e) =>
+                                setField(
+                                  "arkreflect_daily_digest_enabled",
+                                  e.target.checked,
+                                )
+                              }
+                            />
+                          }
+                          label={
+                            form.arkreflect_daily_digest_enabled
+                              ? "Enabled"
+                              : "Disabled"
                           }
                         />
                       ),

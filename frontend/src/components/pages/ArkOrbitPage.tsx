@@ -8,6 +8,7 @@ import {
   type PointerEvent,
 } from "react";
 import { Alert, Box, IconButton, Stack, Tooltip, Typography } from "@mui/material";
+import OpenWithRoundedIcon from "@mui/icons-material/OpenWithRounded";
 import AgentLogo from "../../assets/logo.svg";
 import { arkorbitApi } from "../arkorbit/api";
 import { OrbitChat } from "../arkorbit/OrbitChat";
@@ -29,6 +30,8 @@ type DragState = {
   startY: number;
   originX: number;
   originY: number;
+  width: number;
+  height: number;
 };
 
 function OrbitHomeDashboard({
@@ -159,13 +162,13 @@ export function ArkOrbitPage() {
     [activeOrbitId],
   );
 
-  const clampChatAnchor = useCallback((x: number, y: number): ChatAnchor => {
+  const clampChatAnchor = useCallback((x: number, y: number, width = 54, height = 54): ChatAnchor => {
     const rect = canvasRef.current?.getBoundingClientRect();
-    const width = rect?.width ?? 1200;
-    const height = rect?.height ?? 800;
+    const canvasWidth = rect?.width ?? 1200;
+    const canvasHeight = rect?.height ?? 800;
     return {
-      x: Math.min(Math.max(10, x), Math.max(10, width - 54)),
-      y: Math.min(Math.max(10, y), Math.max(10, height - 54)),
+      x: Math.min(Math.max(10, x), Math.max(10, canvasWidth - width - 10)),
+      y: Math.min(Math.max(10, y), Math.max(10, canvasHeight - height - 10)),
     };
   }, []);
 
@@ -211,6 +214,8 @@ export function ArkOrbitPage() {
         startY: event.clientY,
         originX: origin.x,
         originY: origin.y,
+        width: buttonRect.width,
+        height: buttonRect.height,
       };
       chatMovedRef.current = false;
       event.currentTarget.setPointerCapture(event.pointerId);
@@ -219,7 +224,7 @@ export function ArkOrbitPage() {
   );
 
   const handleChatPointerMove = useCallback(
-    (event: PointerEvent<HTMLButtonElement>) => {
+    (event: PointerEvent<HTMLElement>) => {
       const drag = chatDragRef.current;
       if (!drag || drag.pointerId !== event.pointerId) return;
       const dx = event.clientX - drag.startX;
@@ -227,12 +232,14 @@ export function ArkOrbitPage() {
       if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
         chatMovedRef.current = true;
       }
-      setChatAnchor(clampChatAnchor(drag.originX + dx, drag.originY + dy));
+      setChatAnchor(
+        clampChatAnchor(drag.originX + dx, drag.originY + dy, drag.width, drag.height),
+      );
     },
     [clampChatAnchor],
   );
 
-  const handleChatPointerUp = useCallback((event: PointerEvent<HTMLButtonElement>) => {
+  const handleChatPointerUp = useCallback((event: PointerEvent<HTMLElement>) => {
     const drag = chatDragRef.current;
     if (!drag || drag.pointerId !== event.pointerId) return;
     chatDragRef.current = null;
@@ -249,6 +256,28 @@ export function ArkOrbitPage() {
       return;
     }
     setChatOpen((open) => !open);
+  }, []);
+
+  const handleChatFlyoutPointerDown = useCallback((event: PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    const target = event.target;
+    const dragHandle =
+      target instanceof Element ? target.closest("[data-orbit-chat-drag-handle]") : null;
+    if (!dragHandle) return;
+    const rect = canvasRef.current?.getBoundingClientRect();
+    const flyoutRect = event.currentTarget.getBoundingClientRect();
+    chatDragRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: rect ? flyoutRect.left - rect.left : flyoutRect.left,
+      originY: rect ? flyoutRect.top - rect.top : flyoutRect.top,
+      width: flyoutRect.width,
+      height: flyoutRect.height,
+    };
+    chatMovedRef.current = false;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.preventDefault();
   }, []);
 
   return (
@@ -322,7 +351,24 @@ export function ArkOrbitPage() {
           </Tooltip>
         ) : null}
         {activeOrbitId && chatOpen ? (
-          <Box className="arkorbit-chat-flyout" style={chatFlyoutStyle}>
+          <Box
+            className={`arkorbit-chat-flyout${chatAnchor ? " is-positioned" : ""}`}
+            style={chatFlyoutStyle}
+            onPointerDown={handleChatFlyoutPointerDown}
+            onPointerMove={handleChatPointerMove}
+            onPointerUp={handleChatPointerUp}
+            onPointerCancel={handleChatPointerUp}
+          >
+            <Tooltip title="Move chat">
+              <IconButton
+                size="small"
+                className="arkorbit-chat-drag-handle"
+                data-orbit-chat-drag-handle="true"
+                aria-label="Move Orbit chat"
+              >
+                <OpenWithRoundedIcon fontSize="small" />
+              </IconButton>
+            </Tooltip>
             <OrbitChat
               orbitId={activeOrbitId}
               onFileWritten={() => setOrbitReloadSignal((version) => version + 1)}

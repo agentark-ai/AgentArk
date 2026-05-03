@@ -1461,6 +1461,8 @@ pub struct ProcessedMessage {
     pub run_id: Option<String>,
     pub run_status: Option<String>,
     pub trace_id: Option<String>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
     pub total_tokens: i64,
     pub choices: Vec<ClarificationChoice>,
     pub degradation: Vec<crate::core::DegradationNote>,

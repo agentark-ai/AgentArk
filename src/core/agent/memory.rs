@@ -8,7 +8,15 @@ const USER_MEMORY_CAPTURE_PENDING_STATUS: &str = "pending_consolidation";
 const USER_MEMORY_CAPTURE_PROCESSING_DEFERRED_STATUS: &str = "processing_deferred";
 const USER_MEMORY_CAPTURE_COMPLETED_DEFERRED_STATUS: &str = "completed_deferred";
 const USER_MEMORY_CAPTURE_FAILED_DEFERRED_STATUS: &str = "failed_deferred";
-const USER_MEMORY_CAPTURE_DEFERRED_BATCH_LIMIT: u64 = 1;
+const USER_MEMORY_CAPTURE_DEFERRED_BATCH_LIMIT: u64 = 16;
+const USER_MEMORY_CAPTURE_DRAIN_MAX_BATCHES: usize = 8;
+const USER_MEMORY_CAPTURE_STARTUP_BACKFILL_LIMIT: u64 = 12;
+
+static USER_MEMORY_CAPTURE_DRAIN_SEMAPHORE: once_cell::sync::Lazy<
+    std::sync::Arc<tokio::sync::Semaphore>,
+> = once_cell::sync::Lazy::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)));
+static USER_MEMORY_CAPTURE_DRAIN_WAKE_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 pub(super) fn saved_memory_sensitivity_from_parts(
     key: Option<&str>,
@@ -4909,10 +4917,10 @@ impl Agent {
         conversation_id: Option<&str>,
         project_id: Option<&str>,
         source_message_id: Option<&str>,
-    ) {
+    ) -> bool {
         let trimmed = message.trim();
         if trimmed.is_empty() || source_message_id.unwrap_or_default().trim().is_empty() {
-            return;
+            return false;
         }
         let semantic_capture_key = ambient_stable_hash(&[
             channel.trim(),
@@ -4928,7 +4936,7 @@ impl Agent {
             .unwrap_or(0)
             > 0
         {
-            return;
+            return false;
         }
         if self
             .storage
@@ -4937,7 +4945,7 @@ impl Agent {
             .unwrap_or(0)
             > 0
         {
-            return;
+            return false;
         }
         let now = chrono::Utc::now().to_rfc3339();
         let event = crate::storage::memory_capture_event::Model {
@@ -4969,7 +4977,101 @@ impl Agent {
                 conversation_id,
                 error
             );
+            return false;
         }
+        true
+    }
+
+    pub(super) fn kick_deferred_user_memory_capture_processing(&self) {
+        USER_MEMORY_CAPTURE_DRAIN_WAKE_REQUESTED
+            .store(true, std::sync::atomic::Ordering::Release);
+        let semaphore = USER_MEMORY_CAPTURE_DRAIN_SEMAPHORE.clone();
+        let Ok(permit) = semaphore.try_acquire_owned() else {
+            return;
+        };
+        let agent = self.clone();
+        crate::spawn_logged!(
+            "src/core/agent/memory.rs:deferred_user_memory_capture_drain",
+            async move {
+                let handled = agent
+                    .drain_deferred_user_memory_capture_candidates_unlocked()
+                    .await;
+                drop(permit);
+                if USER_MEMORY_CAPTURE_DRAIN_WAKE_REQUESTED
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    agent.kick_deferred_user_memory_capture_processing();
+                }
+                if handled > 0 {
+                    tracing::debug!(
+                        handled,
+                        "Deferred user memory capture drain handled queued candidate(s)"
+                    );
+                }
+            }
+        );
+    }
+
+    pub(super) async fn backfill_recent_user_memory_capture_candidates(&self) -> usize {
+        let mut messages = match self
+            .encrypted_storage
+            .get_recent_user_messages_decrypted(USER_MEMORY_CAPTURE_STARTUP_BACKFILL_LIMIT)
+            .await
+        {
+            Ok(messages) => messages,
+            Err(error) => {
+                tracing::debug!(
+                    "Failed to load recent user messages for memory capture backfill: {}",
+                    error
+                );
+                return 0;
+            }
+        };
+        messages.reverse();
+        let mut queued = 0usize;
+        let mut conversation_channels: HashMap<String, String> = HashMap::new();
+        for message in messages {
+            let conversation_id = message.conversation_id.trim();
+            if conversation_id.is_empty() || message.content.trim().is_empty() {
+                continue;
+            }
+            let channel = match conversation_channels.get(conversation_id) {
+                Some(channel) => channel.clone(),
+                None => {
+                    let channel = self
+                        .storage
+                        .get_conversation(conversation_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|conversation| conversation.channel)
+                        .map(|channel| channel.trim().to_string())
+                        .filter(|channel| !channel.is_empty())
+                        .unwrap_or_else(|| "chat".to_string());
+                    conversation_channels.insert(conversation_id.to_string(), channel.clone());
+                    channel
+                }
+            };
+            if self
+                .mark_user_memory_capture_candidate(
+                    &message.content,
+                    &channel,
+                    Some(conversation_id),
+                    None,
+                    Some(&message.id),
+                )
+                .await
+            {
+                queued += 1;
+            }
+        }
+        if queued > 0 {
+            tracing::debug!(
+                queued,
+                "Backfilled recent user message(s) for deferred memory capture"
+            );
+        }
+        queued
     }
 
     async fn pending_memory_capture_source_message(
@@ -4990,6 +5092,55 @@ impl Agent {
     }
 
     pub(crate) async fn process_deferred_user_memory_capture_candidates(&self) -> usize {
+        let semaphore = USER_MEMORY_CAPTURE_DRAIN_SEMAPHORE.clone();
+        let permit = match semaphore.acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::debug!("Deferred memory capture drain limiter is closed");
+                return 0;
+            }
+        };
+        let handled = self
+            .drain_deferred_user_memory_capture_candidates_unlocked()
+            .await;
+        drop(permit);
+        if USER_MEMORY_CAPTURE_DRAIN_WAKE_REQUESTED
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.kick_deferred_user_memory_capture_processing();
+        }
+        handled
+    }
+
+    async fn drain_deferred_user_memory_capture_candidates_unlocked(&self) -> usize {
+        let mut total_handled = 0usize;
+        for batch_index in 0..USER_MEMORY_CAPTURE_DRAIN_MAX_BATCHES {
+            USER_MEMORY_CAPTURE_DRAIN_WAKE_REQUESTED
+                .store(false, std::sync::atomic::Ordering::Release);
+            let handled = self
+                .process_deferred_user_memory_capture_candidate_batch()
+                .await;
+            total_handled += handled;
+            let wake_requested = USER_MEMORY_CAPTURE_DRAIN_WAKE_REQUESTED
+                .swap(false, std::sync::atomic::Ordering::AcqRel);
+            if handled < USER_MEMORY_CAPTURE_DEFERRED_BATCH_LIMIT as usize && !wake_requested {
+                break;
+            }
+            if batch_index + 1 >= USER_MEMORY_CAPTURE_DRAIN_MAX_BATCHES {
+                USER_MEMORY_CAPTURE_DRAIN_WAKE_REQUESTED
+                    .store(true, std::sync::atomic::Ordering::Release);
+                tracing::debug!(
+                    max_batches = USER_MEMORY_CAPTURE_DRAIN_MAX_BATCHES,
+                    total_handled,
+                    "Deferred user memory capture drain yielded with more work likely pending"
+                );
+                break;
+            }
+        }
+        total_handled
+    }
+
+    async fn process_deferred_user_memory_capture_candidate_batch(&self) -> usize {
         let events = match self
             .storage
             .list_memory_capture_events_by_statuses_all_scopes(
@@ -5008,8 +5159,9 @@ impl Agent {
             }
         };
         let worker = UserMemoryCaptureWorker::from_agent(self);
-        let mut processed = 0usize;
+        let mut handled = 0usize;
         for mut event in events {
+            handled += 1;
             event.status = USER_MEMORY_CAPTURE_PROCESSING_DEFERRED_STATUS.to_string();
             event.updated_at = chrono::Utc::now().to_rfc3339();
             let _ = self.storage.upsert_memory_capture_event(&event).await;
@@ -5041,9 +5193,8 @@ impl Agent {
             event.completed_at = Some(chrono::Utc::now().to_rfc3339());
             event.updated_at = chrono::Utc::now().to_rfc3339();
             let _ = self.storage.upsert_memory_capture_event(&event).await;
-            processed += 1;
         }
-        processed
+        handled
     }
 
     pub(crate) async fn apply_memory_operation_by_id_with_source(

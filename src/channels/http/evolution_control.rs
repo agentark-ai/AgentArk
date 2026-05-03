@@ -248,7 +248,11 @@ pub(super) async fn load_learning_queue_cap(storage: &crate::storage::Storage) -
 }
 
 pub(super) fn bool_setting_bytes(enabled: bool) -> &'static [u8] {
-    if enabled { b"true" } else { b"false" }
+    if enabled {
+        b"true"
+    } else {
+        b"false"
+    }
 }
 
 pub(super) async fn store_bool_setting(
@@ -345,6 +349,27 @@ pub(super) fn build_learning_candidate_summary(
                     .and_then(|value| value.as_str())
                     .map(|value| value.lines().take(4).collect::<Vec<_>>().join(" "))
             }),
+        crate::core::self_evolve::ROUTING_CANONICAL_CANDIDATE_TYPE => candidate
+            .proposed_content
+            .get("add")
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .take(3)
+                    .filter_map(|item| {
+                        let category = item.get("category")?.as_str()?.trim();
+                        let concept = item.get("concept")?.as_str()?.trim();
+                        if category.is_empty() || concept.is_empty() {
+                            None
+                        } else {
+                            Some(format!("{category}:{concept}"))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            })
+            .filter(|value| !value.is_empty()),
         _ => serde_json::to_string(&candidate.proposed_content).ok(),
     };
     let skill_name = candidate
@@ -713,9 +738,7 @@ pub(super) fn build_skill_evolution_entry(
         } else {
             let assessment = SkillImpactAssessment {
                 status: "pending".to_string(),
-                summary: vec![
-                    "Approved, but waiting for the first post-approval runs.".to_string(),
-                ],
+                summary: vec!["Approved, but waiting for the first post-approval runs.".to_string()],
                 ..SkillImpactAssessment::default()
             };
             (
@@ -4568,6 +4591,35 @@ pub(super) async fn run_evolution_dev_action(
                                 Json(ErrorResponse {
                                     error: format!(
                                         "Failed to approve strategy learning candidate: {}",
+                                        error
+                                    ),
+                                }),
+                            )
+                                .into_response();
+                        }
+                    }
+                }
+                crate::core::self_evolve::ROUTING_CANONICAL_CANDIDATE_TYPE => {
+                    let data_dir = {
+                        let agent = state.agent.read().await;
+                        agent.data_dir.clone()
+                    };
+                    match crate::core::self_evolve::routing_canonical_evolution::promote_routing_canonical_candidate(
+                        &data_dir,
+                        &candidate,
+                    )
+                    .await
+                    {
+                        Ok(promoted) => format!(
+                            "{}:{promoted}",
+                            crate::core::self_evolve::ROUTING_CANONICAL_SUBJECT_KEY
+                        ),
+                        Err(error) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(ErrorResponse {
+                                    error: format!(
+                                        "Failed to promote routing canonical candidate: {}",
                                         error
                                     ),
                                 }),

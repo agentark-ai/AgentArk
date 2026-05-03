@@ -9,7 +9,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use crate::core::embeddings::EmbeddingClient;
-use crate::storage::{document, document_chunk, Storage};
+use crate::storage::{Storage, document, document_chunk};
 
 const MAX_EMBED_BATCH: usize = 64;
 const MAX_FILENAME_MATCH_DOCS: usize = 4;
@@ -486,10 +486,23 @@ pub(crate) async fn search_documents(
     limit: usize,
     project_id: Option<&str>,
 ) -> Result<Vec<DocumentSearchHit>> {
+    let docs = storage.list_documents_for_search(project_id).await?;
+    search_document_models(storage, embedding_client, query, limit, docs).await
+}
+
+/// Search a caller-supplied document set. This keeps product/runtime help
+/// retrieval scoped to its own indexed corpus instead of searching every
+/// uploaded document.
+pub(crate) async fn search_document_models(
+    storage: &Storage,
+    embedding_client: Option<&EmbeddingClient>,
+    query: &str,
+    limit: usize,
+    docs: Vec<document::Model>,
+) -> Result<Vec<DocumentSearchHit>> {
     if limit == 0 || query.trim().is_empty() {
         return Ok(Vec::new());
     }
-
     let doc_ref_re = regex::Regex::new(r"(?i)\bdoc:([a-z0-9-]{6,})\b").ok();
     let explicit_doc_ids: HashSet<String> = doc_ref_re
         .as_ref()
@@ -513,7 +526,6 @@ pub(crate) async fn search_documents(
         .cloned()
         .collect();
 
-    let docs = storage.list_documents_for_search(project_id).await?;
     if docs.is_empty() {
         return Ok(Vec::new());
     }

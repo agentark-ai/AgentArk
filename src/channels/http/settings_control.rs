@@ -31,6 +31,13 @@ pub(super) async fn get_settings(State(state): State<AppState>) -> Json<Settings
     };
     let stored_daily_brief_enabled =
         parse_bool_pref(storage.get(DAILY_BRIEF_ENABLED_KEY).await.ok().flatten());
+    let arkreflect_daily_digest_enabled = parse_bool_pref(
+        storage
+            .get(ARKREFLECT_DAILY_DIGEST_ENABLED_KEY)
+            .await
+            .ok()
+            .flatten(),
+    );
     let stored_daily_brief_time = storage
         .get(DAILY_BRIEF_TIME_KEY)
         .await
@@ -703,6 +710,7 @@ pub(super) async fn get_settings(State(state): State<AppState>) -> Json<Settings
         daily_brief_enabled,
         daily_brief_time,
         daily_brief_channel,
+        arkreflect_daily_digest_enabled,
         llm_provider: settings_llm_provider,
         llm_model: settings_llm_model,
         llm_base_url: settings_llm_base_url,
@@ -1255,6 +1263,16 @@ pub(super) async fn update_settings(
     let requested_daily_brief_enabled = settings
         .daily_brief_enabled
         .unwrap_or(!existing_daily_brief_tasks.is_empty() || stored_daily_brief_enabled);
+    let stored_arkreflect_daily_digest_enabled = parse_bool_pref(
+        deferred_storage
+            .get(ARKREFLECT_DAILY_DIGEST_ENABLED_KEY)
+            .await
+            .ok()
+            .flatten(),
+    );
+    let requested_arkreflect_daily_digest_enabled = settings
+        .arkreflect_daily_digest_enabled
+        .unwrap_or(stored_arkreflect_daily_digest_enabled);
 
     if let Some(timezone) = settings.timezone.as_ref() {
         if !timezone.trim().is_empty() && timezone.parse::<chrono_tz::Tz>().is_err() {
@@ -1418,6 +1436,7 @@ pub(super) async fn update_settings(
     let deferred_daily_brief_channel = Some(requested_daily_brief_channel.clone());
     let deferred_daily_brief_enabled = Some(requested_daily_brief_enabled);
     let deferred_daily_brief_time = Some(requested_daily_brief_time.clone());
+    let deferred_arkreflect_daily_digest_enabled = Some(requested_arkreflect_daily_digest_enabled);
 
     if let Some(update) = settings.data_lifecycle.as_ref() {
         let mut current = load_data_lifecycle_settings(&deferred_storage).await;
@@ -3947,6 +3966,15 @@ pub(super) async fn update_settings(
             .await
         {
             tracing::warn!("Failed to persist daily brief time: {}", e);
+        }
+    }
+    if let Some(enabled) = deferred_arkreflect_daily_digest_enabled {
+        let stored_value = if enabled { "true" } else { "false" };
+        if let Err(e) = deferred_storage
+            .set(ARKREFLECT_DAILY_DIGEST_ENABLED_KEY, stored_value.as_bytes())
+            .await
+        {
+            tracing::warn!("Failed to persist ArkReflect daily digest setting: {}", e);
         }
     }
 

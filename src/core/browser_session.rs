@@ -4,7 +4,7 @@
 //! pause for explicit operator handoff when the browser needs a human, and keep
 //! enough durable state to survive restarts.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::Utc;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};

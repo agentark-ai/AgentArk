@@ -3,7 +3,7 @@ use crate::core::AgentConfig;
 use crate::storage::Storage;
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::path::Path;
 

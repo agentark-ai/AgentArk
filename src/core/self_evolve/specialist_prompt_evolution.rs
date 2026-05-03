@@ -249,8 +249,14 @@ impl SpecialistPromptEvolutionEngine {
             .await,
         );
 
-        self.evaluate_candidate_set(user_request, baseline_bundle, baseline_eval, &benchmark, candidates)
-            .await
+        self.evaluate_candidate_set(
+            user_request,
+            baseline_bundle,
+            baseline_eval,
+            &benchmark,
+            candidates,
+        )
+        .await
     }
 
     pub async fn evaluate_external_specialist_prompt_candidates(
@@ -269,8 +275,14 @@ impl SpecialistPromptEvolutionEngine {
                 bundle: candidate.bundle,
             })
             .collect::<Vec<_>>();
-        self.evaluate_candidate_set(user_request, baseline_bundle, baseline_eval, &benchmark, candidates)
-            .await
+        self.evaluate_candidate_set(
+            user_request,
+            baseline_bundle,
+            baseline_eval,
+            &benchmark,
+            candidates,
+        )
+        .await
     }
 
     async fn evaluate_candidate_set(

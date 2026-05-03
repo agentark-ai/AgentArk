@@ -24,6 +24,11 @@ const FAST_MEMORY_CAPTURE_REJECT_MIN_SCORE: f32 = 0.74;
 const FAST_ROUTING_MIN_SCORE: f32 = 0.70;
 const FAST_ROUTING_MARGIN: f32 = 0.06;
 const FAST_UNCHECKED_ROUTE_MIN_SCORE: f32 = 0.58;
+const PRODUCT_HELP_ANSWER_CONCEPT: &str = "product_help_answer";
+const SCHEDULED_TASK_CONCEPT: &str = "scheduled_task";
+const WATCHER_MONITOR_CONCEPT: &str = "watcher_monitor";
+const INTEGRATION_SETUP_CONCEPT: &str = "integration_setup";
+const PERSISTENT_ARTIFACT_CONCEPT: &str = "persistent_artifact";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SecurityCategory {
@@ -127,7 +132,7 @@ fn default_canonicals() -> Vec<SecurityCanonical> {
         ),
         canonical(
             SecurityCategory::DirectReply,
-            "product_help_answer",
+            PRODUCT_HELP_ANSWER_CONCEPT,
             "The user asks a question about how the running product behaves or what a visible product setting means, and the answer can be given as explanatory text rather than by inspecting logs or changing state.",
         ),
         canonical(
@@ -154,6 +159,26 @@ fn default_canonicals() -> Vec<SecurityCanonical> {
             SecurityCategory::DurableWork,
             "persistent_artifact_or_deployment",
             "The user wants persistent work such as creating, editing, deploying, scheduling, saving, watching, installing, integrating, or otherwise changing durable system or workspace state.",
+        ),
+        canonical(
+            SecurityCategory::DurableWork,
+            SCHEDULED_TASK_CONCEPT,
+            "The user wants a time-based future or recurring background task, reminder, report, follow-up, or notification that should run later and persist beyond the current answer.",
+        ),
+        canonical(
+            SecurityCategory::DurableWork,
+            WATCHER_MONITOR_CONCEPT,
+            "The user wants durable monitoring, watching, polling, tracking, or alerting based on changing external, local, message, feed, page, camera, news, pricing, app, or system conditions.",
+        ),
+        canonical(
+            SecurityCategory::DurableWork,
+            INTEGRATION_SETUP_CONCEPT,
+            "The user wants to connect, install, configure, authorize, or set up a durable integration, service connector, messaging channel, extension, plugin, or external application capability.",
+        ),
+        canonical(
+            SecurityCategory::DurableWork,
+            PERSISTENT_ARTIFACT_CONCEPT,
+            "The user wants a persistent authored object such as a file, document, report, data artifact, importable skill, reusable workflow, or saved asset without necessarily needing a hosted app runtime.",
         ),
         canonical(
             SecurityCategory::ManagedAppDelivery,
@@ -253,8 +278,65 @@ fn category_margin(
     score - competing
 }
 
+fn product_help_routing_for_concept(_concept: &str) -> InboundRoutingSignal {
+    InboundRoutingSignal {
+        should_execute: true,
+        tool_use_expected: true,
+        durable_work_expected: false,
+        current_answer_expected: true,
+        semantic_queries: Vec::new(),
+        required_capabilities: vec!["product documentation lookup".to_string()],
+        rationale: Some("high confidence product-help embedding route".to_string()),
+        product_help_expected: true,
+        goals: vec![InboundTurnGoal {
+            id: "g1".to_string(),
+            intent_summary: "Answer from product help".to_string(),
+            capability_query: "product documentation lookup".to_string(),
+            expected_outcome: "A grounded product-help answer".to_string(),
+            durability: "none".to_string(),
+            groundings: vec!["product_help".to_string()],
+            side_effect: "none".to_string(),
+            dependencies: Vec::new(),
+        }],
+        ..InboundRoutingSignal::default()
+    }
+}
+
+fn durable_routing_shape(concept: &str) -> (&'static str, &'static str, &'static str) {
+    match concept {
+        SCHEDULED_TASK_CONCEPT => (
+            "scheduled_time",
+            "Create or update the requested time-based background task",
+            "Scheduled task is persisted and will run at the requested time or cadence",
+        ),
+        WATCHER_MONITOR_CONCEPT => (
+            "recurring_monitor",
+            "Create or update the requested durable monitor",
+            "Watcher or monitor is persisted with its trigger and reporting route",
+        ),
+        INTEGRATION_SETUP_CONCEPT => (
+            "integration",
+            "Configure the requested durable integration",
+            "Integration setup is completed or the missing authorization step is identified",
+        ),
+        PERSISTENT_ARTIFACT_CONCEPT => (
+            "artifact",
+            "Create or update the requested persistent artifact",
+            "Persistent artifact is saved or updated",
+        ),
+        _ => (
+            "persistent_work",
+            "Complete the requested durable outcome",
+            "Persistent result created, changed, or delivered",
+        ),
+    }
+}
+
 fn routing_for_category(category: SecurityCategory, concept: &str) -> InboundRoutingSignal {
     match category {
+        SecurityCategory::DirectReply if concept == PRODUCT_HELP_ANSWER_CONCEPT => {
+            product_help_routing_for_concept(concept)
+        }
         SecurityCategory::DirectReply => InboundRoutingSignal {
             should_execute: false,
             tool_use_expected: false,
@@ -285,6 +367,16 @@ fn routing_for_category(category: SecurityCategory, concept: &str) -> InboundRou
             ..InboundRoutingSignal::default()
         },
         SecurityCategory::DurableWork | SecurityCategory::ManagedAppDelivery => {
+            let (durability, intent_summary, expected_outcome) =
+                if category == SecurityCategory::ManagedAppDelivery {
+                    (
+                        "deployment",
+                        "Complete the requested app delivery outcome",
+                        "Persistent app or browser-usable result is deployed or updated",
+                    )
+                } else {
+                    durable_routing_shape(concept)
+                };
             InboundRoutingSignal {
                 should_execute: true,
                 tool_use_expected: true,
@@ -295,15 +387,10 @@ fn routing_for_category(category: SecurityCategory, concept: &str) -> InboundRou
                 rationale: Some("high confidence embedding fast path".to_string()),
                 goals: vec![InboundTurnGoal {
                     id: "g1".to_string(),
-                    intent_summary: "Complete the requested durable outcome".to_string(),
+                    intent_summary: intent_summary.to_string(),
                     capability_query: concept.to_string(),
-                    expected_outcome: "Persistent result created, changed, or delivered"
-                        .to_string(),
-                    durability: if category == SecurityCategory::ManagedAppDelivery {
-                        "deployment".to_string()
-                    } else {
-                        "persistent_work".to_string()
-                    },
+                    expected_outcome: expected_outcome.to_string(),
+                    durability: durability.to_string(),
                     groundings: Vec::new(),
                     side_effect: "write".to_string(),
                     dependencies: Vec::new(),
@@ -325,6 +412,7 @@ fn block_decision(concept: &str) -> InboundClassificationDecision {
         memory_capture: InboundMemoryCaptureSignal::default(),
         routing: InboundRoutingSignal::default(),
         direct_response: None,
+        model_response: None,
     }
 }
 
@@ -334,6 +422,7 @@ fn allow_decision(category: SecurityCategory, concept: &str) -> InboundClassific
         memory_capture: InboundMemoryCaptureSignal::default(),
         routing: routing_for_category(category, concept),
         direct_response: None,
+        model_response: None,
     }
 }
 
@@ -350,6 +439,7 @@ fn unchecked_route_decision(
         memory_capture: InboundMemoryCaptureSignal::default(),
         routing: routing_for_category(category, concept),
         direct_response: None,
+        model_response: None,
     }
 }
 
@@ -570,6 +660,22 @@ mod tests {
     }
 
     #[test]
+    fn routing_for_product_help_answer_uses_product_help_lookup() {
+        let routing =
+            routing_for_category(SecurityCategory::DirectReply, PRODUCT_HELP_ANSWER_CONCEPT);
+        assert!(routing.current_answer_expected);
+        assert!(routing.should_execute);
+        assert!(routing.tool_use_expected);
+        assert!(!routing.durable_work_expected);
+        assert!(routing.product_help_expected);
+        assert!(routing.has_transient_read_only_lookup());
+        assert_eq!(
+            routing.goals[0].groundings,
+            vec!["product_help".to_string()]
+        );
+    }
+
+    #[test]
     fn routing_for_managed_app_delivery_is_deployment() {
         let routing =
             routing_for_category(SecurityCategory::ManagedAppDelivery, "managed_app_delivery");
@@ -580,8 +686,28 @@ mod tests {
     }
 
     #[test]
+    fn durable_canonicals_preserve_semantic_delivery_shape() {
+        let scheduled = routing_for_category(SecurityCategory::DurableWork, SCHEDULED_TASK_CONCEPT);
+        assert_eq!(scheduled.goals[0].durability, "scheduled_time");
+        assert_eq!(
+            scheduled.semantic_turn_plan().goals[0].delivery_kind,
+            "scheduled_task"
+        );
+
+        let watcher = routing_for_category(SecurityCategory::DurableWork, WATCHER_MONITOR_CONCEPT);
+        assert_eq!(watcher.goals[0].durability, "recurring_monitor");
+        assert_eq!(
+            watcher.semantic_turn_plan().goals[0].delivery_kind,
+            "watcher_monitor"
+        );
+    }
+
+    #[test]
     fn durable_shapes_never_use_trusted_embedding_fast_path() {
-        for category in [SecurityCategory::DurableWork, SecurityCategory::ManagedAppDelivery] {
+        for category in [
+            SecurityCategory::DurableWork,
+            SecurityCategory::ManagedAppDelivery,
+        ] {
             assert!(!embedding_fast_path_accepts(category, 0.99, 0.99));
         }
         assert!(embedding_fast_path_accepts(

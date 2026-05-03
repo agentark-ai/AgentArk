@@ -4,13 +4,13 @@
 //! It never invokes the main agent turn loop, intent planner, semantic router,
 //! or tool-call envelope path.
 
-use anyhow::{anyhow, Result};
-use serde::Deserialize;
+use anyhow::{Result, anyhow};
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::actions::{ActionDef, ActionSource};
-use crate::core::{ConversationMessage, LlmClient, StreamEvent, ToolCall};
+use crate::core::{ConversationMessage, LlmClient, LlmResponse, StreamEvent, ToolCall};
 
 use super::models::OrbitChatMessage;
 use super::service::ArkOrbitService;
@@ -23,13 +23,18 @@ const ORBIT_OPERATIONS_ACTION: &str = "arkorbit_apply_operations";
 
 #[derive(Debug, Clone)]
 pub enum OrbitAgentEvent {
-    Status { message: String },
+    Status {
+        message: String,
+    },
     Token(String),
     FileWritten {
         path: String,
         operation: OrbitFileOperation,
     },
-    ReadRequested { path: String },
+    ReadRequested {
+        path: String,
+    },
+    Usage(OrbitChatUsage),
     Done,
     Error(String),
 }
@@ -56,47 +61,96 @@ impl OrbitFileOperation {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OrbitChatUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub total_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    #[serde(default)]
+    pub estimated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_to_first_token_ms: Option<u64>,
+}
+
+impl OrbitChatUsage {
+    fn is_empty(&self) -> bool {
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.total_tokens == 0
+            && self.cost_usd.is_none()
+            && self.duration_ms.unwrap_or(0) == 0
+            && self.time_to_first_token_ms.unwrap_or(0) == 0
+            && self.model.is_none()
+    }
+
+    fn merge(&mut self, next: OrbitChatUsage) {
+        if let Some(model) = next.model {
+            if !model.trim().is_empty() {
+                self.model = Some(model);
+            }
+        }
+        self.input_tokens = self.input_tokens.saturating_add(next.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(next.output_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(next.total_tokens);
+        self.estimated |= next.estimated;
+        self.duration_ms = Some(
+            self.duration_ms
+                .unwrap_or(0)
+                .saturating_add(next.duration_ms.unwrap_or(0)),
+        )
+        .filter(|value| *value > 0);
+        if self.time_to_first_token_ms.is_none() {
+            self.time_to_first_token_ms = next.time_to_first_token_ms;
+        }
+        self.cost_usd = match (self.cost_usd, next.cost_usd) {
+            (Some(left), Some(right)) => Some(left + right),
+            (Some(value), None) | (None, Some(value)) => Some(value),
+            (None, None) => None,
+        };
+    }
+
+    fn from_response(
+        response: &LlmResponse,
+        duration_ms: u64,
+        time_to_first_token_ms: Option<u64>,
+    ) -> Self {
+        let usage = response.usage.as_ref();
+        let input_tokens = usage.map(|usage| usage.prompt_tokens).unwrap_or(0);
+        let output_tokens = usage.map(|usage| usage.completion_tokens).unwrap_or(0);
+        let total_tokens = usage
+            .map(|usage| usage.total_tokens)
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
+        Self {
+            model: (!response.model.trim().is_empty()).then(|| response.model.clone()),
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            cost_usd: usage.and_then(|usage| usage.cost_usd),
+            estimated: usage.map(|usage| usage.estimated).unwrap_or(false),
+            duration_ms: (duration_ms > 0).then_some(duration_ms),
+            time_to_first_token_ms,
+        }
+    }
+}
+
 #[cfg(test)]
 mod orbit_agent_extra_tests {
     use super::*;
 
     #[test]
-    fn edit_intent_requests_file_write_repair() {
-        assert!(request_likely_requires_file_write(
-            "create a weather widget for madhyamgram"
-        ));
-        assert!(request_likely_requires_file_write("add a chart to the canvas"));
-        assert!(!request_likely_requires_file_write(
-            "how do I create a widget?"
-        ));
-        assert!(request_likely_creates_new_widget("create a weather widget"));
-        assert!(!request_likely_creates_new_widget("edit the weather widget"));
-        assert!(!request_likely_creates_new_widget(
-            "make the weather widget blue"
-        ));
-    }
-
-    #[test]
     fn module_title_is_human_readable() {
         assert_eq!(title_from_module("weather-card"), "Weather Card");
         assert_eq!(title_from_module("daily_news"), "Daily News");
-    }
-
-    #[test]
-    fn extracts_plain_javascript_widget_from_code_fence() {
-        let response = "Here is the widget:\n```js\nexport function render(el) { el.textContent = 'ok'; }\n```";
-        let extracted = extract_plain_js_widget_module("create a weather widget", response)
-            .expect("widget module");
-        assert_eq!(extracted.0, "weather");
-        assert!(extracted.1.contains("export function render"));
-    }
-
-    #[test]
-    fn prefers_mentioned_module_path_for_plain_javascript() {
-        let response = "Write mod/weather-card/index.js:\n```javascript\nexport function render(el) { el.textContent = 'ok'; }\n```";
-        let extracted = extract_plain_js_widget_module("create a widget", response)
-            .expect("widget module");
-        assert_eq!(extracted.0, "weather-card");
     }
 
     #[test]
@@ -121,20 +175,6 @@ mod orbit_agent_extra_tests {
     fn surgical_edit_replaces_first_exact_match() {
         let updated = apply_surgical_edit("alpha old old", "old", "new").expect("edit");
         assert_eq!(updated, "alpha new old");
-    }
-
-    #[test]
-    fn initial_status_is_tied_to_user_request() {
-        assert_eq!(
-            initial_file_operation_status(
-                "create a dashboard for restaurants near me i stay in pincode 700130 pricing per 2 pax"
-            ),
-            "I'm planning the restaurant dashboard for pincode 700130 and preparing the file changes."
-        );
-        assert_eq!(
-            initial_file_operation_status("create a todo app"),
-            "I'm planning the todo app and preparing the file changes."
-        );
     }
 }
 
@@ -176,28 +216,17 @@ pub async fn stream_orbit_chat_turn(
     let mut assistant_draft = AssistantMessageDraft::create(&service, &orbit_id, "")?;
     let mut assistant_visible = String::new();
     let mut read_context = Vec::new();
-    let mut file_write_count = 0usize;
-
-    let file_ops_requested = request_likely_requires_file_write(&user_message);
-    if file_ops_requested {
-        emit_status(
-            &event_tx,
-            &mut assistant_draft,
-            initial_file_operation_status(&user_message),
-        )
-        .await?;
-    }
+    let mut usage = OrbitChatUsage::default();
 
     for round in 0..=READ_ROUND_LIMIT {
-        let use_file_operations = file_ops_requested || round > 0;
-        let system_prompt = build_system_prompt(&service, &orbit_id, use_file_operations).await?;
+        let system_prompt = build_system_prompt(&service, &orbit_id).await?;
         let current_user = if round == 0 {
             user_message.clone()
         } else {
             render_read_resume_message(&read_context)
         };
         let persist_prefix = assistant_visible.clone();
-        let (visible, reads, writes) = run_single_stream(
+        let (visible, reads, _writes, turn_usage) = run_single_stream(
             &service,
             &llm,
             &orbit_id,
@@ -207,10 +236,10 @@ pub async fn stream_orbit_chat_turn(
             &event_tx,
             &mut assistant_draft,
             &persist_prefix,
-            use_file_operations,
+            true,
         )
         .await?;
-        file_write_count += writes;
+        usage.merge(turn_usage);
         assistant_visible.push_str(&visible);
         if reads.is_empty() || round == READ_ROUND_LIMIT {
             break;
@@ -228,51 +257,10 @@ pub async fn stream_orbit_chat_turn(
         });
     }
 
-    if file_write_count == 0 && request_likely_creates_new_widget(&user_message) {
-        if let Some((module, content)) =
-            extract_plain_js_widget_module(&user_message, &assistant_visible)
-        {
-            let path = format!("mod/{}/index.js", module);
-            validate_writable_orbit_path(&path)?;
-            emit_status(
-                &event_tx,
-                &mut assistant_draft,
-                format_file_activity("writing", &path),
-            )
-            .await?;
-            service.write_orbit_file(&orbit_id, &path, &content)?;
-            upsert_widget_registry_for_module(&service, &orbit_id, &path)?;
-            file_write_count += 1;
-            let line = format_file_update_line(OrbitFileOperation::Wrote, &path);
-            append_visible_line(&mut assistant_visible, &line);
-            assistant_draft.persist_content(assistant_visible.trim())?;
-            let _ = event_tx
-                .send(OrbitAgentEvent::FileWritten {
-                    path: path.clone(),
-                    operation: OrbitFileOperation::Wrote,
-                })
-                .await;
-            let _ = event_tx
-                .send(OrbitAgentEvent::Token(format!("{}\n", line)))
-                .await;
-        }
-    }
-
-    if file_write_count == 0 && request_likely_requires_file_write(&user_message) {
-        let system_prompt = build_system_prompt(&service, &orbit_id, true).await?;
-        let repair_user =
-            render_no_write_repair_message(&user_message, &assistant_visible, &read_context);
-        let persist_prefix = if assistant_visible.is_empty() || assistant_visible.ends_with('\n') {
-            assistant_visible.clone()
-        } else {
-            format!("{}\n", assistant_visible)
-        };
-        history.push(ConversationMessage {
-            role: "assistant".to_string(),
-            content: assistant_visible.clone(),
-            _timestamp: chrono::Utc::now(),
-        });
-        let (visible, _reads, writes) = run_single_stream(
+    if assistant_visible.trim().is_empty() {
+        let system_prompt = build_system_prompt(&service, &orbit_id).await?;
+        let repair_user = render_empty_turn_repair_message(&user_message, &read_context);
+        let (visible, _reads, _writes, turn_usage) = run_single_stream(
             &service,
             &llm,
             &orbit_id,
@@ -281,31 +269,27 @@ pub async fn stream_orbit_chat_turn(
             &history,
             &event_tx,
             &mut assistant_draft,
-            &persist_prefix,
+            "",
             true,
         )
         .await?;
-        file_write_count += writes;
-        if !assistant_visible.ends_with('\n') && !visible.starts_with('\n') {
-            assistant_visible.push('\n');
-        }
+        usage.merge(turn_usage);
         assistant_visible.push_str(&visible);
     }
 
-    if file_write_count == 0 && request_likely_requires_file_write(&user_message) {
-        let message =
-            "Orbit did not update because no valid structured file operation or JavaScript widget module was produced.";
+    if assistant_visible.trim().is_empty() {
+        let message = "Orbit did not produce a visible answer or file operation for this turn.";
         let _ = event_tx
             .send(OrbitAgentEvent::Error(message.to_string()))
             .await;
-        if !assistant_visible.ends_with('\n') {
-            assistant_visible.push('\n');
-        }
         assistant_visible.push_str(message);
-        assistant_draft.persist_content(assistant_visible.trim())?;
     }
 
     assistant_draft.persist_content(assistant_visible.trim())?;
+    assistant_draft.persist_usage(&usage)?;
+    if !usage.is_empty() {
+        let _ = event_tx.send(OrbitAgentEvent::Usage(usage)).await;
+    }
     let _ = event_tx.send(OrbitAgentEvent::Done).await;
     Ok(())
 }
@@ -321,7 +305,7 @@ async fn run_single_stream(
     assistant_draft: &mut AssistantMessageDraft,
     persist_prefix: &str,
     use_file_operations: bool,
-) -> Result<(String, Vec<String>, usize)> {
+) -> Result<(String, Vec<String>, usize, OrbitChatUsage)> {
     let (token_tx, mut token_rx) = mpsc::channel::<StreamEvent>(128);
     let llm = llm.clone();
     let system_prompt = system_prompt.to_string();
@@ -349,10 +333,19 @@ async fn run_single_stream(
     let mut writes = 0usize;
     let mut saw_stream_token = false;
     let mut buffered_content = String::new();
+    let started_at = std::time::Instant::now();
+    let mut first_token_ms: Option<u64> = None;
 
     while let Some(event) = token_rx.recv().await {
         if let StreamEvent::Token(text) = event {
             saw_stream_token = true;
+            first_token_ms.get_or_insert_with(|| {
+                (started_at
+                    .elapsed()
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64)
+                    .max(1)
+            });
             if use_file_operations {
                 buffered_content.push_str(&text);
             } else {
@@ -369,13 +362,22 @@ async fn run_single_stream(
     }
 
     let response = handle.await??;
+    let duration_ms = started_at
+        .elapsed()
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    let first_content_ms = first_token_ms.or_else(|| {
+        (!response.content.is_empty() || !buffered_content.is_empty()).then_some(duration_ms.max(1))
+    });
+    let usage = OrbitChatUsage::from_response(&response, duration_ms, first_content_ms);
     if use_file_operations {
         let model_content = if response.content.is_empty() {
             buffered_content
         } else {
             response.content.clone()
         };
-        let operation_payloads = collect_orbit_operation_payloads(&response.tool_calls, &model_content);
+        let operation_payloads =
+            collect_orbit_operation_payloads(&response.tool_calls, &model_content);
         if operation_payloads.is_empty() {
             if !model_content.trim().is_empty() {
                 emit_visible_text(
@@ -409,9 +411,9 @@ async fn run_single_stream(
             &mut assistant_visible,
             &response.content,
         )
-        .await?;
+            .await?;
     }
-    Ok((assistant_visible, reads, writes))
+    Ok((assistant_visible, reads, writes, usage))
 }
 
 async fn emit_visible_text(
@@ -425,11 +427,10 @@ async fn emit_visible_text(
         return Ok(());
     }
     assistant_visible.push_str(text);
-    assistant_draft.persist_content(&combine_visible_content(
-        persist_prefix,
-        assistant_visible,
-    ))?;
-    let _ = event_tx.send(OrbitAgentEvent::Token(text.to_string())).await;
+    assistant_draft.persist_content(&combine_visible_content(persist_prefix, assistant_visible))?;
+    let _ = event_tx
+        .send(OrbitAgentEvent::Token(text.to_string()))
+        .await;
     Ok(())
 }
 
@@ -446,7 +447,12 @@ async fn apply_orbit_operation_payloads(
 ) -> Result<()> {
     for payload in payloads {
         let args = parse_orbit_tool_arguments(&payload)?;
-        if let Some(message) = args.message.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        if let Some(message) = args
+            .message
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
             emit_visible_text(
                 event_tx,
                 assistant_draft,
@@ -502,24 +508,26 @@ async fn apply_orbit_operation_payloads(
                         event_tx,
                         assistant_draft,
                         format_file_activity("saving", &path),
-                )
-                .await?;
-                service.write_orbit_file(orbit_id, &path, &content)?;
-                upsert_widget_registry_for_module(service, orbit_id, &path)?;
-                let line = format_file_update_line(OrbitFileOperation::Wrote, &path);
-                append_visible_line(assistant_visible, &line);
-                assistant_draft
-                    .persist_content(&combine_visible_content(persist_prefix, assistant_visible))?;
-                *writes += 1;
-                let _ = event_tx
-                    .send(OrbitAgentEvent::FileWritten {
-                        path: path.clone(),
-                        operation: OrbitFileOperation::Wrote,
-                    })
-                    .await;
-                let _ = event_tx
-                    .send(OrbitAgentEvent::Token(format!("{}\n", line)))
-                    .await;
+                    )
+                    .await?;
+                    service.write_orbit_file(orbit_id, &path, &content)?;
+                    upsert_widget_registry_for_module(service, orbit_id, &path)?;
+                    let line = format_file_update_line(OrbitFileOperation::Wrote, &path);
+                    append_visible_line(assistant_visible, &line);
+                    assistant_draft.persist_content(&combine_visible_content(
+                        persist_prefix,
+                        assistant_visible,
+                    ))?;
+                    *writes += 1;
+                    let _ = event_tx
+                        .send(OrbitAgentEvent::FileWritten {
+                            path: path.clone(),
+                            operation: OrbitFileOperation::Wrote,
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(OrbitAgentEvent::Token(format!("{}\n", line)))
+                        .await;
                 }
                 OrbitStructuredOperationKind::Edit => {
                     let Some(find) = operation.find else {
@@ -539,28 +547,30 @@ async fn apply_orbit_operation_payloads(
                     emit_status(
                         event_tx,
                         assistant_draft,
-                    format_file_activity("saving edits to", &path),
-                )
-                .await?;
-                let current = service.read_orbit_file_text(orbit_id, &path)?;
-                let updated = apply_surgical_edit(&current, &find, &replace)
-                    .ok_or_else(|| anyhow!("Edit target was not found in {}", path))?;
-                service.write_orbit_file(orbit_id, &path, &updated)?;
-                upsert_widget_registry_for_module(service, orbit_id, &path)?;
-                let line = format_file_update_line(OrbitFileOperation::Edited, &path);
-                append_visible_line(assistant_visible, &line);
-                assistant_draft
-                    .persist_content(&combine_visible_content(persist_prefix, assistant_visible))?;
-                *writes += 1;
-                let _ = event_tx
-                    .send(OrbitAgentEvent::FileWritten {
-                        path: path.clone(),
-                        operation: OrbitFileOperation::Edited,
-                    })
-                    .await;
-                let _ = event_tx
-                    .send(OrbitAgentEvent::Token(format!("{}\n", line)))
-                    .await;
+                        format_file_activity("saving edits to", &path),
+                    )
+                    .await?;
+                    let current = service.read_orbit_file_text(orbit_id, &path)?;
+                    let updated = apply_surgical_edit(&current, &find, &replace)
+                        .ok_or_else(|| anyhow!("Edit target was not found in {}", path))?;
+                    service.write_orbit_file(orbit_id, &path, &updated)?;
+                    upsert_widget_registry_for_module(service, orbit_id, &path)?;
+                    let line = format_file_update_line(OrbitFileOperation::Edited, &path);
+                    append_visible_line(assistant_visible, &line);
+                    assistant_draft.persist_content(&combine_visible_content(
+                        persist_prefix,
+                        assistant_visible,
+                    ))?;
+                    *writes += 1;
+                    let _ = event_tx
+                        .send(OrbitAgentEvent::FileWritten {
+                            path: path.clone(),
+                            operation: OrbitFileOperation::Edited,
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(OrbitAgentEvent::Token(format!("{}\n", line)))
+                        .await;
                 }
             }
         }
@@ -754,11 +764,7 @@ fn parse_fenced_json_payload(text: &str) -> Option<serde_json::Value> {
 
 fn parse_orbit_tool_arguments(value: &serde_json::Value) -> Result<OrbitToolArguments> {
     let normalized = normalize_orbit_tool_arguments_value(value)?;
-    let args: OrbitToolArguments = serde_json::from_value(normalized)?;
-    if args.operations.is_empty() {
-        return Err(anyhow!("ArkOrbit structured operation payload contained no operations"));
-    }
-    Ok(args)
+    Ok(serde_json::from_value(normalized)?)
 }
 
 fn normalize_orbit_tool_arguments_value(value: &serde_json::Value) -> Result<serde_json::Value> {
@@ -788,7 +794,10 @@ fn normalize_orbit_operation_kind(
         "edit" | "patch" | "update" => Ok(OrbitStructuredOperationKind::Edit),
         "" if operation.content.is_some() => Ok(OrbitStructuredOperationKind::Write),
         "" if operation.find.is_some() => Ok(OrbitStructuredOperationKind::Edit),
-        _ => Err(anyhow!("Unknown ArkOrbit operation '{}'", operation.operation)),
+        _ => Err(anyhow!(
+            "Unknown ArkOrbit operation '{}'",
+            operation.operation
+        )),
     }
 }
 
@@ -893,171 +902,19 @@ fn render_read_resume_message(reads: &[(String, String)]) -> String {
     let payload = serde_json::to_string_pretty(&serde_json::json!({ "files": files }))
         .unwrap_or_else(|_| "{\"files\":[]}".to_string());
     format!(
-        "The requested orbit file contents are available below as JSON. Continue the same task using these files and call {} with the next read/write/edit operations.\n\n{}",
+        "The requested orbit file contents are available below as JSON. Continue the same task using these files. If the user's intent is inspection, explanation, or diagnosis, answer directly in plain prose. If additional orbit file reads, writes, or edits are needed, call {} with the next operations.\n\n{}",
         ORBIT_OPERATIONS_ACTION, payload
     )
 }
 
-fn request_likely_requires_file_write(message: &str) -> bool {
-    let lower = message.to_lowercase();
-    let trimmed = lower.trim_start();
-    if trimmed.starts_with("how ") || trimmed.starts_with("why ") {
-        return false;
-    }
-    [
-        "add",
-        "build",
-        "canvas",
-        "change",
-        "chart",
-        "create",
-        "dashboard",
-        "delete",
-        "design",
-        "display",
-        "edit",
-        "make",
-        "modify",
-        "module",
-        "place",
-        "remove",
-        "render",
-        "show",
-        "table",
-        "update",
-        "widget",
-        "write",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-}
-
-fn initial_file_operation_status(message: &str) -> String {
-    format!(
-        "I'm planning {} and preparing the file changes.",
-        requested_canvas_target(message)
-    )
-}
-
-fn requested_canvas_target(message: &str) -> String {
-    let lower = message.to_ascii_lowercase();
-    let artifact = if lower.contains("dashboard") {
-        "dashboard"
-    } else if lower.contains("app") || lower.contains("application") || lower.contains("todo") {
-        "app"
-    } else if lower.contains("chart") {
-        "chart"
-    } else if lower.contains("table") {
-        "table"
-    } else if lower.contains("card") {
-        "card"
-    } else if lower.contains("widget") {
-        "widget"
-    } else if lower.contains("delete") || lower.contains("remove") {
-        "widget removal"
-    } else if lower.contains("edit") || lower.contains("update") || lower.contains("change") {
-        "widget update"
-    } else {
-        "canvas change"
-    };
-    let topic = if lower.contains("restaurant") {
-        Some("restaurant")
-    } else if lower.contains("weather") {
-        Some("weather")
-    } else if lower.contains("todo") || lower.contains("task") {
-        Some("todo")
-    } else if lower.contains("news") {
-        Some("news")
-    } else if lower.contains("llm") && lower.contains("cost") {
-        Some("LLM cost comparison")
-    } else if lower.contains("cost") || lower.contains("pricing") {
-        Some("pricing")
-    } else if lower.contains("covid") || lower.contains("corona") {
-        Some("COVID")
-    } else {
-        None
-    };
-    let mut target = match topic {
-        Some(topic) => format!("the {} {}", topic, artifact),
-        None if artifact == "canvas change" => "the canvas change".to_string(),
-        None => format!("the {}", artifact),
-    };
-    if let Some(pincode) = extract_pincode(&lower) {
-        target.push_str(" for pincode ");
-        target.push_str(&pincode);
-    }
-    target
-}
-
-fn extract_pincode(lower_message: &str) -> Option<String> {
-    if !lower_message.contains("pincode")
-        && !lower_message.contains("pin code")
-        && !lower_message.contains("postcode")
-        && !lower_message.contains("postal")
-        && !lower_message.contains("zip")
-    {
-        return None;
-    }
-    let mut current = String::new();
-    for ch in lower_message.chars() {
-        if ch.is_ascii_digit() {
-            current.push(ch);
-            continue;
-        }
-        if matches!(current.len(), 5 | 6) {
-            return Some(current);
-        }
-        current.clear();
-    }
-    matches!(current.len(), 5 | 6).then_some(current)
-}
-
-fn request_likely_creates_new_widget(message: &str) -> bool {
-    let lower = message.to_lowercase();
-    let is_edit = ["change", "delete", "edit", "modify", "remove", "update"]
-        .iter()
-        .any(|needle| lower.contains(needle));
-    if is_edit {
-        return false;
-    }
-    let explicit_create = ["add", "build", "create"]
-        .iter()
-        .any(|needle| lower.contains(needle));
-    let create_verb = ["add", "build", "create", "display", "make", "render", "show"]
-        .iter()
-        .any(|needle| lower.contains(needle));
-    let canvas_noun = ["widget", "chart", "table", "dashboard", "card"]
-        .iter()
-        .any(|needle| lower.contains(needle));
-    let existing_target = !explicit_create
-        && (lower.contains(" it")
-        || lower.contains(" this ")
-        || lower.contains(" that ")
-        || (lower.contains(" the ") && canvas_noun));
-    if existing_target {
-        return false;
-    }
-    create_verb && canvas_noun
-}
-
-fn render_no_write_repair_message(
-    user_message: &str,
-    assistant_visible: &str,
-    read_context: &[(String, String)],
-) -> String {
+fn render_empty_turn_repair_message(user_message: &str, reads: &[(String, String)]) -> String {
     let mut message = format!(
-        "The user asked for an Orbit canvas change, but no valid structured file operation was produced, so no JavaScript changed.\n\nOriginal request:\n{}\n\nMake the change now:\n- Do not ask for confirmation.\n- Use the {} tool with operations.\n- For an existing widget/file, use a read operation first if needed, then an edit operation with the smallest exact find/replace snippet.\n- For a new widget, use a write operation with one complete JavaScript module at mod/<short-widget-id>/index.js.\n- The module must export render(el, ctx = {{}}).\n- Do not edit index.html; the Orbit canvas mounts widget modules automatically.\n- If native tool calling is unavailable, return JSON only with this shape: {{\"agent_tool_calls\":[{{\"name\":\"{}\",\"arguments\":{{\"operations\":[{{\"operation\":\"write\",\"path\":\"mod/<short-widget-id>/index.js\",\"content\":\"complete module\"}}]}}}}]}}.",
-        user_message,
-        ORBIT_OPERATIONS_ACTION,
-        ORBIT_OPERATIONS_ACTION
+        "Complete the user's Orbit request now. The previous response produced neither visible text nor a concrete file operation.\n\nOriginal request:\n{}\n\nIf orbit file reads, writes, or edits are needed to satisfy the request, call {} with concrete operations. If no file operation is needed, answer directly in plain prose. Do not call the tool with an empty operations array, and do not return an empty response.",
+        user_message, ORBIT_OPERATIONS_ACTION
     );
-    if !assistant_visible.trim().is_empty() {
-        message.push_str("\n\nPrevious non-writing response:\n");
-        message.push_str(assistant_visible.trim());
-    }
-    if !read_context.is_empty() {
-        message.push_str("\n\nAlready-read file contents:\n");
-        message.push_str(&render_read_context_json(read_context));
+    if !reads.is_empty() {
+        message.push_str("\n\nAlready-read orbit file contents:\n");
+        message.push_str(&render_read_context_json(reads));
     }
     message
 }
@@ -1074,156 +931,6 @@ fn render_read_context_json(reads: &[(String, String)]) -> String {
         .collect::<Vec<_>>();
     serde_json::to_string_pretty(&serde_json::json!({ "files": files }))
         .unwrap_or_else(|_| "{\"files\":[]}".to_string())
-}
-
-fn extract_plain_js_widget_module(
-    user_message: &str,
-    assistant_visible: &str,
-) -> Option<(String, String)> {
-    let content = extract_javascript_body(assistant_visible)?;
-    if !looks_like_render_module(&content) {
-        return None;
-    }
-    let module = mentioned_module_name(assistant_visible)
-        .unwrap_or_else(|| widget_module_slug_from_request(user_message));
-    Some((module, content.trim().to_string()))
-}
-
-fn extract_javascript_body(text: &str) -> Option<String> {
-    if let Some(body) = extract_fenced_javascript(text) {
-        return Some(body);
-    }
-    if let Some(body) = extract_script_body(text) {
-        return Some(body);
-    }
-    if looks_like_render_module(text) {
-        return Some(text.trim().to_string());
-    }
-    None
-}
-
-fn extract_fenced_javascript(text: &str) -> Option<String> {
-    let mut rest = text;
-    loop {
-        let start = rest.find("```")?;
-        let after_ticks = &rest[start + 3..];
-        let newline = after_ticks.find('\n')?;
-        let header = after_ticks[..newline].trim().to_ascii_lowercase();
-        let body_start = start + 3 + newline + 1;
-        let after_body_start = &rest[body_start..];
-        let end = after_body_start.find("```")?;
-        let body = after_body_start[..end].trim();
-        let is_javascript = header.is_empty()
-            || header == "js"
-            || header == "javascript"
-            || header == "mjs"
-            || header == "jsx";
-        if is_javascript && looks_like_render_module(body) {
-            return Some(body.to_string());
-        }
-        rest = &after_body_start[end + 3..];
-    }
-}
-
-fn extract_script_body(text: &str) -> Option<String> {
-    let lower = text.to_ascii_lowercase();
-    let start = lower.find("<script")?;
-    let open_end = lower[start..].find('>')? + start + 1;
-    let close = lower[open_end..].find("</script>")? + open_end;
-    let body = text[open_end..close].trim();
-    looks_like_render_module(body).then(|| body.to_string())
-}
-
-fn looks_like_render_module(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    lower.contains("export function render")
-        || lower.contains("export async function render")
-        || lower.contains("export const render")
-        || lower.contains("export let render")
-        || (lower.contains("function render") && lower.contains("export { render"))
-}
-
-fn mentioned_module_name(text: &str) -> Option<String> {
-    let mut rest = text;
-    while let Some(idx) = rest.find("mod/") {
-        let after = &rest[idx + "mod/".len()..];
-        if let Some(end) = after.find("/index.js") {
-            let candidate = &after[..end];
-            if valid_module_name(candidate) {
-                return Some(candidate.to_string());
-            }
-        }
-        rest = after.get(1..).unwrap_or("");
-    }
-    None
-}
-
-fn widget_module_slug_from_request(message: &str) -> String {
-    let mut words = Vec::new();
-    let mut current = String::new();
-    for ch in message.chars() {
-        if ch.is_ascii_alphanumeric() {
-            current.push(ch.to_ascii_lowercase());
-        } else if !current.is_empty() {
-            if !is_slug_stop_word(&current) {
-                words.push(current.clone());
-            }
-            current.clear();
-        }
-    }
-    if !current.is_empty() && !is_slug_stop_word(&current) {
-        words.push(current);
-    }
-    let mut slug = words.into_iter().take(3).collect::<Vec<_>>().join("-");
-    if slug.is_empty() {
-        slug = "widget".to_string();
-    }
-    if slug.len() > 48 {
-        slug.truncate(48);
-        slug = slug.trim_end_matches('-').to_string();
-    }
-    if valid_module_name(&slug) {
-        slug
-    } else {
-        "widget".to_string()
-    }
-}
-
-fn valid_module_name(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-}
-
-fn is_slug_stop_word(word: &str) -> bool {
-    matches!(
-        word,
-        "a" | "an"
-            | "and"
-            | "add"
-            | "build"
-            | "canvas"
-            | "card"
-            | "create"
-            | "display"
-            | "for"
-            | "in"
-            | "make"
-            | "me"
-            | "module"
-            | "on"
-            | "orbit"
-            | "place"
-            | "render"
-            | "show"
-            | "the"
-            | "to"
-            | "widget"
-            | "with"
-            | "write"
-    )
 }
 
 fn upsert_widget_registry_for_module(
@@ -1249,7 +956,10 @@ fn upsert_widget_registry_for_module(
             if let Some(list) = value.as_array() {
                 Some(list.clone())
             } else {
-                value.get("widgets").and_then(|widgets| widgets.as_array()).cloned()
+                value
+                    .get("widgets")
+                    .and_then(|widgets| widgets.as_array())
+                    .cloned()
             }
         })
         .unwrap_or_default();
@@ -1297,7 +1007,6 @@ fn title_from_module(module: &str) -> String {
 async fn build_system_prompt(
     service: &ArkOrbitService,
     orbit_id: &str,
-    use_file_operations: bool,
 ) -> Result<String> {
     let orbit = service
         .get_orbit(orbit_id)
@@ -1314,19 +1023,15 @@ async fn build_system_prompt(
     let now_utc = chrono::Utc::now();
     let current_datetime = now_utc.to_rfc3339();
     let current_date = now_utc.format("%A, %B %d, %Y").to_string();
-    let operation_protocol = if use_file_operations {
-        format!(
-            "File operation protocol:\n\
+    let operation_protocol = format!(
+        "File operation protocol:\n\
 - Use the structured {action} tool for every orbit file read, write, or edit.\n\
 - If native tool calling is unavailable, return JSON only with this exact fallback shape: {{\"agent_tool_calls\":[{{\"name\":\"{action}\",\"arguments\":{{\"message\":\"short acknowledgement\",\"operations\":[{{\"operation\":\"write\",\"path\":\"mod/<short-widget-id>/index.js\",\"content\":\"complete module\"}}]}}}}]}}.\n\
 - For an existing widget/file, use a read operation first if the exact current contents are needed, then use an edit operation with the smallest exact find/replace snippet.\n\
 - For a new widget, use a write operation with complete file contents.\n\
 - Do not emit XML-style file commands such as <file>, <edit>, or <read>; prose is not a file operation protocol.",
-            action = ORBIT_OPERATIONS_ACTION
-        )
-    } else {
-        "File operation protocol:\n- No file operation tool is available for this non-mutating turn. Answer normally unless the user clearly asks for a canvas change.".to_string()
-    };
+        action = ORBIT_OPERATIONS_ACTION
+    );
     Ok(format!(
         "You are the agent inside an ArkOrbit canvas. The user owns this canvas.\n\
 Files outside this orbit are off-limits.\n\
@@ -1339,8 +1044,10 @@ Canvas behavior:\n\
 - For a new widget, write one small JavaScript module at mod/<short-widget-id>/index.js.\n\
 - The module must export render(el, ctx = {{}}). The host automatically registers, mounts, reloads, and makes it draggable.\n\
 - Every write operation must include the complete JavaScript file content in the content field. Never call a write operation with only a path.\n\
+- Widget left/top/width/height values in data/widgets.json are user layout state. Preserve them for existing widgets unless the user asks to move, resize, rearrange, or replace the whole canvas.\n\
 - For an edit to an existing widget, first read the target file if needed, then replace only the smallest exact snippet that satisfies the request.\n\
-- If the user asks to restore, add back, show again, or re-add a widget, first check whether mod/<name>/index.js still exists. If it exists, read or edit data/widgets.json and add a registry entry for that module. If it was deleted, recreate the module from the user's request and conversation context.\n\
+- When the user's intent is to replace the whole canvas state, treat the current widget registry as disposable: write the desired final widget registry and the needed modules directly, and do not read existing files unless the final result depends on their current contents.\n\
+- When the user wants a previously available widget brought back into the canvas, first check whether its module still exists. If it exists, read or edit data/widgets.json and add a registry entry for that module. If it was deleted, recreate the module from the user's request and conversation context.\n\
 - Do not re-emit a whole existing widget file for a small edit. Replace only the smallest exact snippet that satisfies the request.\n\
 - Keep generated widget modules browser-only and self-contained. Put styling inside the rendered subtree or a small injected style element.\n\n\
 Live data rules:\n\
@@ -1353,7 +1060,7 @@ Live data rules:\n\
 Orbit metadata:\n- id: {}\n- name: {}\n- instructions: {}\n\n\
 Current orbit files:\n{}\n\n\
 Execution rules:\n\
-- If the user asks you to create, build, add, edit, update, render, display, or place anything on the canvas, do it in the same turn.\n\
+- If the user wants the canvas state to be different, make the necessary file changes in the same turn.\n\
 - Start the visible response with one short natural acknowledgement tailored to the user's request, for example: Got it, I'll build the weather widget for you.\n\
 - Do not ask for confirmation before writing orbit files unless a safety-critical detail is missing.\n\
 - Resolve the user's intended timeframe before using time-sensitive data: explicit dates, months, years, events, or phrases like \"March 2020\" override today's date. If no timeframe is given, default to the current date/time above.\n\
@@ -1401,6 +1108,14 @@ fn append_message(
         role: role.to_string(),
         content: content.to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
+        model: None,
+        input_tokens: None,
+        output_tokens: None,
+        total_tokens: None,
+        cost_usd: None,
+        estimated: None,
+        duration_ms: None,
+        time_to_first_token_ms: None,
     };
     let mut line = serde_json::to_string(&message)?;
     line.push('\n');
@@ -1439,6 +1154,23 @@ impl AssistantMessageDraft {
 
     fn persist_content(&mut self, content: &str) -> Result<()> {
         self.persist_content_internal(content, !content.trim().is_empty())
+    }
+
+    fn persist_usage(&mut self, usage: &OrbitChatUsage) -> Result<()> {
+        if usage.is_empty() {
+            return Ok(());
+        }
+        self.message.model = usage.model.clone();
+        self.message.input_tokens = (usage.input_tokens > 0).then_some(usage.input_tokens);
+        self.message.output_tokens = (usage.output_tokens > 0).then_some(usage.output_tokens);
+        self.message.total_tokens = (usage.total_tokens > 0).then_some(usage.total_tokens);
+        self.message.cost_usd = usage.cost_usd;
+        self.message.estimated =
+            (usage.input_tokens > 0 || usage.output_tokens > 0 || usage.total_tokens > 0)
+                .then_some(usage.estimated);
+        self.message.duration_ms = usage.duration_ms;
+        self.message.time_to_first_token_ms = usage.time_to_first_token_ms;
+        rewrite_message_by_id(&self.path, &self.message)
     }
 
     fn persist_content_internal(&mut self, content: &str, visible: bool) -> Result<()> {

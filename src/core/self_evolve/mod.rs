@@ -12,6 +12,7 @@ pub mod gepa_bridge;
 pub mod policy_evolution;
 pub mod prompt_evolution;
 pub mod replay_gate;
+pub mod routing_canonical_evolution;
 pub mod security_review;
 pub mod skill_evolution;
 pub mod specialist_prompt_evolution;
@@ -26,6 +27,10 @@ pub use prompt_evolution::{
     PromptBundleDiffSummary, PromptBundleProfile, PromptEvolutionConfig, PromptEvolutionEngine,
     PromptEvolutionResult, PROMPT_BUNDLE_BASELINE_SNAPSHOT_KEY, PROMPT_BUNDLE_CANARY_STATE_KEY,
     PROMPT_BUNDLE_LAST_RESULT_KEY, PROMPT_BUNDLE_PROFILE_CANARY_KEY, PROMPT_BUNDLE_PROFILE_KEY,
+};
+pub use routing_canonical_evolution::{
+    RoutingCanonicalCandidatePayload, RoutingCanonicalOverlayEntry,
+    ROUTING_CANONICAL_CANDIDATE_TYPE, ROUTING_CANONICAL_SUBJECT_KEY,
 };
 pub use specialist_prompt_evolution::{
     SpecialistPromptBundleDiffSummary, SpecialistPromptBundleProfile,

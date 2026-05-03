@@ -537,6 +537,10 @@ pub(super) const ARKMEMORY_MEMORY_CANDIDATE_TYPES: &[&str] = &[
     "memory_update",
     "memory_retract",
 ];
+pub(super) const ARKMEMORY_PENDING_CAPTURE_STATUSES: &[&str] =
+    &["pending_consolidation", "processing_deferred", "processing"];
+pub(super) const ARKMEMORY_FAILED_CAPTURE_STATUSES: &[&str] =
+    &["failed", "failed_deferred", "rejected_sensitive_input"];
 pub(super) const ARKMEMORY_APPLYING_LEASE_TIMEOUT_SECS: i64 = 10 * 60;
 
 pub(super) fn arkmemory_project_param(params: &HashMap<String, String>) -> Option<&str> {
@@ -1249,6 +1253,16 @@ pub(super) async fn arkmemory_summary(
         .await
         .map(|items| items.len())
         .unwrap_or(0);
+    let pending_capture = storage
+        .list_memory_capture_events_by_statuses(ARKMEMORY_PENDING_CAPTURE_STATUSES, project_id, 200)
+        .await
+        .map(|items| items.len())
+        .unwrap_or(0);
+    let failed_capture = storage
+        .list_memory_capture_events_by_statuses(ARKMEMORY_FAILED_CAPTURE_STATUSES, project_id, 200)
+        .await
+        .map(|items| items.len())
+        .unwrap_or(0);
     let ledger = storage.count_recall_events(project_id).await.unwrap_or(0);
     let tests = storage.count_recall_tests(project_id).await.unwrap_or(0);
     let health = arkmemory_build_health_findings(storage, project_id, 200)
@@ -1265,6 +1279,10 @@ pub(super) async fn arkmemory_summary(
                 "knowledge": knowledge,
             },
             "queue": queue,
+            "capture_pipeline": {
+                "pending": pending_capture,
+                "failed": failed_capture,
+            },
             "ledger": ledger,
             "health": health,
             "tests": tests,

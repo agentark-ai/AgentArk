@@ -577,7 +577,12 @@ impl WatcherManager {
             return;
         };
         match watcher {
-            Some(watcher) if matches!(watcher.status, WatcherStatus::Active | WatcherStatus::Paused) => {
+            Some(watcher)
+                if matches!(
+                    watcher.status,
+                    WatcherStatus::Active | WatcherStatus::Paused
+                ) =>
+            {
                 if let Err(error) = storage.upsert_watcher(&watcher).await {
                     tracing::warn!("Failed to persist watcher '{}' to DB: {}", id, error);
                 }
@@ -1108,8 +1113,10 @@ impl WatcherManager {
             let removed_ids = watchers
                 .iter()
                 .filter_map(|(id, watcher)| {
-                    (!matches!(watcher.status, WatcherStatus::Active | WatcherStatus::Paused)
-                        && watcher.created_at <= cutoff)
+                    (!matches!(
+                        watcher.status,
+                        WatcherStatus::Active | WatcherStatus::Paused
+                    ) && watcher.created_at <= cutoff)
                         .then_some(*id)
                 })
                 .collect::<Vec<_>>();

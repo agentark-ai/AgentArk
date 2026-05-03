@@ -301,11 +301,11 @@ COPY --from=builder --chown=agent:agent /app/agentark-bin /app/agentark
 COPY --from=builder --chown=agent:agent /app/agentark-embed-server-bin /app/agentark-embed-server
 COPY --from=builder --chown=agent:agent /app/prebuilt-embeddings-cache /app/prebuilt-embeddings-cache
 
-# Copy Python optimizers and preinstall DSPy for ArkEvolve GEPA runs.
-COPY --chown=agent:agent tools /app/tools
+# Copy Python bridge and preinstall DSPy for ArkEvolve GEPA runs.
+COPY --chown=agent:agent bridges/gepa_optimizer /app/bridges/gepa_optimizer
 RUN python3 -m venv /opt/agentark-gepa && \
     /opt/agentark-gepa/bin/python -m pip install --upgrade pip && \
-    /opt/agentark-gepa/bin/python -m pip install -r /app/tools/gepa_optimizer/requirements.txt && \
+    /opt/agentark-gepa/bin/python -m pip install -r /app/bridges/gepa_optimizer/requirements.txt && \
     /opt/agentark-gepa/bin/python -c "import dspy" && \
     chown -R agent:agent /opt/agentark-gepa
 

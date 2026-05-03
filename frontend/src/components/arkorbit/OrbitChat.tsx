@@ -16,7 +16,13 @@ import SendRoundedIcon from "@mui/icons-material/SendRounded";
 import StopCircleRoundedIcon from "@mui/icons-material/StopCircleRounded";
 import AgentLogo from "../../assets/logo.svg";
 import { arkorbitApi } from "./api";
-import type { OrbitChatFileChip, OrbitChatTranscript, OrbitId } from "./types";
+import type {
+  OrbitChatFileChip,
+  OrbitChatHistoryMessage,
+  OrbitChatTranscript,
+  OrbitChatUsage,
+  OrbitId,
+} from "./types";
 
 type Role = "user" | "assistant";
 type OrbitFileOperation = "wrote" | "edited";
@@ -26,6 +32,7 @@ type ChatMessage = {
   role: Role;
   text: string;
   files?: OrbitChatFileChip[];
+  usage?: OrbitChatUsage;
   activity?: string;
   active?: boolean;
 };
@@ -41,6 +48,7 @@ type StreamHandlers = {
   onFileWritten: (path: string, operation: OrbitFileOperation) => void;
   onRead: (path: string) => void;
   onStatus: (message: string) => void;
+  onUsage: (usage: OrbitChatUsage) => void;
   onError: (message: string) => void;
   onDone: () => void;
 };
@@ -67,6 +75,74 @@ function fileActivityLabel(operation: OrbitFileOperation, path: string): string 
 
 function normalizeOperation(value: string): OrbitFileOperation {
   return value.toLowerCase() === "edited" ? "edited" : "wrote";
+}
+
+function positiveMetric(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? value
+    : undefined;
+}
+
+function normalizeUsage(value: Partial<OrbitChatUsage>): OrbitChatUsage | undefined {
+  const usage: OrbitChatUsage = {};
+  const model = typeof value.model === "string" ? value.model.trim() : "";
+  const inputTokens = positiveMetric(value.input_tokens);
+  const outputTokens = positiveMetric(value.output_tokens);
+  const totalTokens =
+    positiveMetric(value.total_tokens) ??
+    (inputTokens || outputTokens
+      ? (inputTokens ?? 0) + (outputTokens ?? 0)
+      : undefined);
+  const costUsd = positiveMetric(value.cost_usd);
+  const durationMs = positiveMetric(value.duration_ms);
+  const timeToFirstTokenMs = positiveMetric(value.time_to_first_token_ms);
+  if (model) usage.model = model;
+  if (inputTokens) usage.input_tokens = inputTokens;
+  if (outputTokens) usage.output_tokens = outputTokens;
+  if (totalTokens) usage.total_tokens = totalTokens;
+  if (costUsd) usage.cost_usd = costUsd;
+  if (typeof value.estimated === "boolean") usage.estimated = value.estimated;
+  if (durationMs) usage.duration_ms = durationMs;
+  if (timeToFirstTokenMs) usage.time_to_first_token_ms = timeToFirstTokenMs;
+  return Object.keys(usage).length > 0 ? usage : undefined;
+}
+
+function formatDurationMs(value: number | undefined): string {
+  if (!value || !Number.isFinite(value) || value <= 0) return "0ms";
+  if (value < 1000) return `${Math.round(value)}ms`;
+  if (value < 60_000) return `${(value / 1000).toFixed(value < 10_000 ? 1 : 0)}s`;
+  const minutes = Math.floor(value / 60_000);
+  const seconds = Math.round((value % 60_000) / 1000);
+  return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
+}
+
+function orbitUsageMetricItems(usage?: OrbitChatUsage): Array<{
+  label: string;
+  value: string;
+}> {
+  const normalized = usage ? normalizeUsage(usage) : undefined;
+  if (!normalized) return [];
+  const inputTokens = normalized.input_tokens ?? 0;
+  const outputTokens = normalized.output_tokens ?? 0;
+  const totalTokens = normalized.total_tokens ?? inputTokens + outputTokens;
+  if (totalTokens <= 0 && !normalized.time_to_first_token_ms) return [];
+  return [
+    { label: "Total tokens", value: Math.round(totalTokens).toLocaleString() },
+    { label: "Input tokens", value: Math.round(inputTokens).toLocaleString() },
+    { label: "Output tokens", value: Math.round(outputTokens).toLocaleString() },
+    { label: "TTFT", value: formatDurationMs(normalized.time_to_first_token_ms) },
+  ];
+}
+
+function orbitUsageTitle(usage?: OrbitChatUsage): string | undefined {
+  const normalized = usage ? normalizeUsage(usage) : undefined;
+  if (!normalized) return undefined;
+  const details: string[] = [];
+  if (normalized.model) details.push(`Model: ${normalized.model}`);
+  if (normalized.cost_usd) details.push(`Cost: $${normalized.cost_usd.toFixed(6)}`);
+  if (normalized.estimated) details.push("Token counts are estimated");
+  if (normalized.duration_ms) details.push(`Duration: ${formatDurationMs(normalized.duration_ms)}`);
+  return details.length > 0 ? details.join(" | ") : undefined;
 }
 
 function fileChip(path: string, operation: OrbitFileOperation): OrbitChatFileChip {
@@ -124,11 +200,7 @@ function normalizeAssistantContent(content: string): {
   return { text, files };
 }
 
-function historyToChatMessage(message: {
-  id: string;
-  role: string;
-  content: string;
-}): ChatMessage | null {
+function historyToChatMessage(message: OrbitChatHistoryMessage): ChatMessage | null {
   if (message.role !== "user" && message.role !== "assistant") return null;
   const normalized =
     message.role === "assistant"
@@ -146,6 +218,7 @@ function historyToChatMessage(message: {
     role: message.role,
     text: normalized.text,
     files: normalized.files,
+    usage: message.role === "assistant" ? normalizeUsage(message) : undefined,
   };
 }
 
@@ -158,7 +231,9 @@ function sameChatMessages(left: ChatMessage[], right: ChatMessage[]): boolean {
       message.id === other.id &&
       message.role === other.role &&
       message.text === other.text &&
-      (message.files?.length ?? 0) === (other.files?.length ?? 0)
+      (message.files?.length ?? 0) === (other.files?.length ?? 0) &&
+      JSON.stringify(normalizeUsage(message.usage ?? {})) ===
+        JSON.stringify(normalizeUsage(other.usage ?? {}))
     );
   });
 }
@@ -261,6 +336,11 @@ function dispatchStreamEvent(
       (typeof payload.status === "string" && payload.status) ||
       "";
     if (message) handlers.onStatus(message);
+    return;
+  }
+  if (event.event === "usage") {
+    const usage = normalizeUsage(payload as Partial<OrbitChatUsage>);
+    if (usage) handlers.onUsage(usage);
     return;
   }
   if (event.event === "error") {
@@ -560,6 +640,11 @@ export function OrbitChat({ orbitId, onFileWritten, onClose }: Props) {
               activity: messageText,
               active: true,
             })),
+          onUsage: (usage) =>
+            updateAssistant(assistantId, (message) => ({
+              ...message,
+              usage,
+            })),
           onError: (messageText) =>
             updateAssistant(assistantId, (message) => ({
               ...message,
@@ -703,55 +788,80 @@ export function OrbitChat({ orbitId, onFileWritten, onClose }: Props) {
                 msg.role !== "assistant" ||
                 Boolean(msg.text.trim() || msg.activity || msg.active || msg.files?.length),
             )
-            .map((msg) => (
-              <Box
-                key={msg.id}
-                className={`orbit-chat-msg orbit-chat-msg-${msg.role}${
-                  msg.active && msg.activity ? " orbit-chat-msg-active" : ""
-                }`}
-              >
-                <span className="orbit-chat-msg-role">
-                  <span className="orbit-chat-role-avatar" aria-hidden="true">
-                    {msg.role === "user" ? (
-                      <PersonRoundedIcon className="orbit-chat-role-user-icon" />
-                    ) : (
-                      <img
-                        src={AgentLogo}
-                        alt=""
-                        className="orbit-chat-role-agent-logo"
-                      />
-                    )}
-                  </span>
-                  <span>{msg.role === "user" ? "You" : "AgentArk"}</span>
-                </span>
-                {msg.text ? (
-                  <span className="orbit-chat-msg-text">{msg.text}</span>
-                ) : null}
-                {msg.role === "assistant" && msg.active && msg.activity ? (
-                  <span className="orbit-chat-activity" aria-live="polite">
-                    <span className="orbit-chat-activity-pulse" aria-hidden="true" />
-                    <span className="orbit-chat-activity-label">{msg.activity}</span>
-                    <span className="orbit-chat-activity-dots" aria-hidden="true">
-                      <i />
-                      <i />
-                      <i />
+            .map((msg) => {
+              const usageMetricItems =
+                msg.role === "assistant" ? orbitUsageMetricItems(msg.usage) : [];
+              return (
+                <Box
+                  key={msg.id}
+                  className={`orbit-chat-msg orbit-chat-msg-${msg.role}${
+                    msg.active && msg.activity ? " orbit-chat-msg-active" : ""
+                  }`}
+                >
+                  <span className="orbit-chat-msg-role">
+                    <span className="orbit-chat-role-avatar" aria-hidden="true">
+                      {msg.role === "user" ? (
+                        <PersonRoundedIcon className="orbit-chat-role-user-icon" />
+                      ) : (
+                        <img
+                          src={AgentLogo}
+                          alt=""
+                          className="orbit-chat-role-agent-logo"
+                        />
+                      )}
                     </span>
+                    <span>{msg.role === "user" ? "You" : "AgentArk"}</span>
                   </span>
-                ) : !msg.text && msg.activity ? (
-                  <span className="orbit-chat-msg-text">{msg.activity}</span>
-                ) : null}
-                {msg.files?.length ? (
-                  <Stack direction="row" spacing={0.75} className="orbit-file-chip-row">
-                    {msg.files.map((file) => (
-                      <span key={file.id} className="orbit-file-chip">
-                        {file.operation === "edited" ? "Edited " : "Wrote "}
-                        {file.path}
+                  {msg.text ? (
+                    <span className="orbit-chat-msg-text">{msg.text}</span>
+                  ) : null}
+                  {msg.role === "assistant" && msg.active && msg.activity ? (
+                    <span className="orbit-chat-activity" aria-live="polite">
+                      <span className="orbit-chat-activity-pulse" aria-hidden="true" />
+                      <span className="orbit-chat-activity-label">{msg.activity}</span>
+                      <span className="orbit-chat-activity-dots" aria-hidden="true">
+                        <i />
+                        <i />
+                        <i />
                       </span>
-                    ))}
-                  </Stack>
-                ) : null}
-              </Box>
-            ))
+                    </span>
+                  ) : !msg.text && msg.activity ? (
+                    <span className="orbit-chat-msg-text">{msg.activity}</span>
+                  ) : null}
+                  {msg.files?.length ? (
+                    <Stack direction="row" spacing={0.75} className="orbit-file-chip-row">
+                      {msg.files.map((file) => (
+                        <span key={file.id} className="orbit-file-chip">
+                          {file.operation === "edited" ? "Edited " : "Wrote "}
+                          {file.path}
+                        </span>
+                      ))}
+                    </Stack>
+                  ) : null}
+                  {usageMetricItems.length > 0 ? (
+                    <Box
+                      className="orbit-chat-run-metrics"
+                      aria-label="Orbit run metrics"
+                      title={orbitUsageTitle(msg.usage)}
+                    >
+                      {usageMetricItems.map((item) => (
+                        <span
+                          key={`${msg.id}:${item.label}`}
+                          className="orbit-chat-run-metric"
+                        >
+                          <span className="orbit-chat-run-metric-label">
+                            {item.label}
+                          </span>
+                          <span className="orbit-chat-run-metric-value">
+                            {item.value}
+                          </span>
+                        </span>
+                      ))}
+                    </Box>
+                  ) : null}
+                </Box>
+              );
+            })
         )}
       </Box>
       <OrbitChatComposer

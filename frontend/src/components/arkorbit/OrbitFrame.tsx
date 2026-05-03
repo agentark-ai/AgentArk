@@ -7,7 +7,19 @@ import {
   type CSSProperties,
   type PointerEvent,
 } from "react";
-import { Box, IconButton, Tooltip, Typography } from "@mui/material";
+import {
+  Alert,
+  Box,
+  Button,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
+  IconButton,
+  Stack,
+  Tooltip,
+  Typography,
+} from "@mui/material";
 import CloseRoundedIcon from "@mui/icons-material/CloseRounded";
 import CodeRoundedIcon from "@mui/icons-material/CodeRounded";
 import FolderOpenRoundedIcon from "@mui/icons-material/FolderOpenRounded";
@@ -62,6 +74,7 @@ type OrbitFetchInput = string | URL | Request;
 type WidgetLayout = { x: number; y: number; width: number; height: number };
 type ViewportRect = { left: number; top: number; width: number; height: number };
 type WidgetIdentity = { id: string; moduleName: string };
+type WidgetRemovalTarget = WidgetIdentity & { title: string };
 
 const WIDGET_POSITION_STORAGE_VERSION = "v2";
 const INTERACTIVE_SELECTOR =
@@ -192,21 +205,6 @@ function readStoredPositions(orbitId: OrbitId): Record<string, { x: number; y: n
   }
 }
 
-function writeStoredPosition(
-  orbitId: OrbitId,
-  id: string,
-  x: number,
-  y: number,
-) {
-  try {
-    const positions = readStoredPositions(orbitId);
-    positions[id] = { x, y };
-    localStorage.setItem(storageKey(orbitId), JSON.stringify(positions));
-  } catch {
-    // Browser storage can be disabled. Dragging should still work for this view.
-  }
-}
-
 function removeStoredPosition(orbitId: OrbitId, id: string) {
   try {
     const positions = readStoredPositions(orbitId);
@@ -243,6 +241,23 @@ function widgetSize(widget: OrbitWidgetRegistryEntry): Pick<WidgetLayout, "width
     width: numberValue(widget.width, DEFAULT_WIDGET_WIDTH),
     height: numberValue(widget.height, DEFAULT_WIDGET_HEIGHT),
   };
+}
+
+function widgetRemovalTarget(
+  widgets: OrbitWidgetRegistryEntry[],
+  id: string | null,
+): WidgetRemovalTarget | null {
+  if (!id) return null;
+  for (let index = 0; index < widgets.length; index += 1) {
+    const widget = widgets[index];
+    const identity = widgetIdentity(widget, index);
+    if (!identity || identity.id !== id) continue;
+    return {
+      ...identity,
+      title: String(widget.title || identity.moduleName),
+    };
+  }
+  return null;
 }
 
 function currentViewport(node: HTMLElement | null): ViewportRect {
@@ -354,7 +369,13 @@ function resolveWidgetLayouts(
     const identity = widgetIdentity(widget, index);
     if (!identity) return;
     const size = widgetSize(widget);
-    const storedPosition = stored[identity.id];
+    const savedLeft = numberValue(widget.left, Number.NaN);
+    const savedTop = numberValue(widget.top, Number.NaN);
+    const savedPosition =
+      Number.isFinite(savedLeft) && Number.isFinite(savedTop)
+        ? { x: savedLeft, y: savedTop }
+        : null;
+    const storedPosition = savedPosition ?? stored[identity.id];
     const mounted = mountedRects[identity.id];
     let layout: WidgetLayout;
 
@@ -367,7 +388,6 @@ function resolveWidgetLayouts(
       };
     } else {
       layout = findClosestEmptyLayout(occupied, viewport, size);
-      writeStoredPosition(orbitId, identity.id, layout.x, layout.y);
     }
 
     layouts[identity.id] = layout;
@@ -660,6 +680,7 @@ type OrbitWidgetSlotProps = {
   layout: WidgetLayout;
   reloadToken: number;
   onRemove: (id: string) => void;
+  onMove: (id: string, x: number, y: number) => void;
   onRuntimeNotice?: (message: string) => void;
 };
 
@@ -670,6 +691,7 @@ function OrbitWidgetSlot({
   layout,
   reloadToken,
   onRemove,
+  onMove,
   onRuntimeNotice,
 }: OrbitWidgetSlotProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -791,14 +813,14 @@ function OrbitWidgetSlot({
       dragRef.current = null;
       const x = Number.parseFloat(event.currentTarget.style.left) || 0;
       const y = Number.parseFloat(event.currentTarget.style.top) || 0;
-      writeStoredPosition(orbitId, id, x, y);
+      onMove(id, x, y);
       try {
         event.currentTarget.releasePointerCapture(event.pointerId);
       } catch {
         // Pointer capture may already be released by the browser.
       }
     },
-    [id, orbitId],
+    [id, onMove],
   );
 
   if (!moduleName) {
@@ -853,6 +875,8 @@ export function OrbitFrame({
   const [loading, setLoading] = useState(true);
   const [reloadToken, setReloadToken] = useState(0);
   const [filesReloadToken, setFilesReloadToken] = useState(0);
+  const [pendingRemoveWidgetId, setPendingRemoveWidgetId] = useState<string | null>(null);
+  const [removingWidget, setRemovingWidget] = useState(false);
 
   const reload = useCallback(() => {
     if (reloadTimerRef.current !== null) {
@@ -875,14 +899,48 @@ export function OrbitFrame({
       try {
         await arkorbitApi.deleteWidget(orbitId, id);
         reload();
+        return true;
       } catch (err) {
         setWidgets(previous);
         const message = err instanceof Error ? err.message : String(err);
         onRuntimeNotice?.(`Could not remove widget: ${message}`);
+        return false;
       }
     },
     [orbitId, onRuntimeNotice, reload, widgets],
   );
+
+  const moveWidget = useCallback(
+    (id: string, x: number, y: number) => {
+      setWidgets((current) =>
+        current.map((widget, index) => {
+          const identity = widgetIdentity(widget, index);
+          return identity?.id === id ? { ...widget, left: x, top: y } : widget;
+        }),
+      );
+      void arkorbitApi.updateWidgetLayout(orbitId, id, { left: x, top: y }).catch((err) => {
+        const message = err instanceof Error ? err.message : String(err);
+        onRuntimeNotice?.(`Could not save widget position: ${message}`);
+      });
+    },
+    [orbitId, onRuntimeNotice],
+  );
+
+  const pendingRemoveWidget = useMemo(
+    () => widgetRemovalTarget(widgets, pendingRemoveWidgetId),
+    [pendingRemoveWidgetId, widgets],
+  );
+
+  const confirmRemoveWidget = useCallback(async () => {
+    if (!pendingRemoveWidgetId) return;
+    setRemovingWidget(true);
+    try {
+      const removed = await removeWidget(pendingRemoveWidgetId);
+      if (removed) setPendingRemoveWidgetId(null);
+    } finally {
+      setRemovingWidget(false);
+    }
+  }, [pendingRemoveWidgetId, removeWidget]);
 
   useEffect(
     () => () => {
@@ -988,13 +1046,53 @@ export function OrbitFrame({
                 index={index}
                 layout={layout}
                 reloadToken={reloadToken}
-                onRemove={removeWidget}
+                onRemove={setPendingRemoveWidgetId}
+                onMove={moveWidget}
                 onRuntimeNotice={onRuntimeNotice}
               />
             );
           })()
         ))}
       </Box>
+      <Dialog
+        open={pendingRemoveWidgetId !== null}
+        onClose={() => {
+          if (!removingWidget) setPendingRemoveWidgetId(null);
+        }}
+        maxWidth="xs"
+        fullWidth
+      >
+        <DialogTitle>Remove widget?</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ pt: 0.5 }}>
+            <Typography variant="body2">
+              Remove <strong>{pendingRemoveWidget?.title ?? "this widget"}</strong> from this
+              Orbit canvas?
+            </Typography>
+            <Alert severity="warning">
+              This also deletes the widget code module if no other widget still uses it.
+            </Alert>
+          </Stack>
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2 }}>
+          <Button
+            size="small"
+            onClick={() => setPendingRemoveWidgetId(null)}
+            disabled={removingWidget}
+          >
+            Cancel
+          </Button>
+          <Button
+            size="small"
+            color="error"
+            variant="contained"
+            onClick={confirmRemoveWidget}
+            disabled={removingWidget || pendingRemoveWidgetId === null}
+          >
+            Remove widget
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   );
 }

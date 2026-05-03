@@ -86,7 +86,7 @@ def _configure_dspy():
         import dspy  # type: ignore
     except Exception as exc:  # pragma: no cover - depends on dev env
         raise RuntimeError(
-            "DSPy is not installed. Install tools/gepa_optimizer/requirements.txt "
+            "DSPy is not installed. Install bridges/gepa_optimizer/requirements.txt "
             "before running offline GEPA optimization."
         ) from exc
 
@@ -274,7 +274,7 @@ def run(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="python -m tools.gepa_optimizer")
+    parser = argparse.ArgumentParser(prog="python -m bridges.gepa_optimizer")
     subparsers = parser.add_subparsers(dest="command", required=True)
     run_parser = subparsers.add_parser("run")
     run_parser.add_argument("--export", required=True)

@@ -2,7 +2,7 @@ use super::config::{ModelCapabilityTier, ModelCostTier};
 use super::llm::{LlmClient, LlmResponse, LlmStreamFailure, LlmStreamFailureKind};
 use crate::actions::ActionDef;
 use crate::core::PromptMemory;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]

@@ -209,6 +209,7 @@ export default function ArkMemoryPage({
 
   const summary = asRecord(summaryQ.data);
   const currentMemory = asRecord(summary.current_memory);
+  const capturePipeline = asRecord(summary.capture_pipeline);
   const queueItems = pickRecords(queueQ.data, "items");
   const ledgerEvents = pickRecords(ledgerQ.data, "events");
   const historyEvents = useMemo(
@@ -243,6 +244,8 @@ export default function ArkMemoryPage({
     num(currentMemory.preferences) +
     num(currentMemory.user_data) +
     num(currentMemory.knowledge);
+  const pendingConsolidation = num(capturePipeline.pending);
+  const failedCaptureCount = num(capturePipeline.failed);
   useEffect(() => {
     if (!showQueueTab && memoryTab === "queue") {
       setMemoryTab("current");
@@ -270,6 +273,15 @@ export default function ArkMemoryPage({
             label: "Pending Review",
             value: queueItems.length,
             helper: "Memory changes",
+          },
+        ]
+      : []),
+    ...(pendingConsolidation > 0
+      ? [
+          {
+            label: "Queued",
+            value: pendingConsolidation,
+            helper: "Consolidating",
           },
         ]
       : []),
@@ -324,6 +336,20 @@ export default function ArkMemoryPage({
           New memories may take a moment to appear.
         </Typography>
       </Stack>
+      {pendingConsolidation > 0 ? (
+        <Alert severity="info">
+          {pendingConsolidation === 1
+            ? "1 memory signal is queued for ArkMemory consolidation."
+            : `${pendingConsolidation} memory signals are queued for ArkMemory consolidation.`}
+        </Alert>
+      ) : null}
+      {failedCaptureCount > 0 ? (
+        <Alert severity="warning">
+          {failedCaptureCount === 1
+            ? "1 memory capture needs attention."
+            : `${failedCaptureCount} memory captures need attention.`}
+        </Alert>
+      ) : null}
 
       <Box className="list-shell stat-strip">
         {statItems.map((item) => (

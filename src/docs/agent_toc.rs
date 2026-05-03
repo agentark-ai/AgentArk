@@ -9,7 +9,7 @@ pub(crate) const AGENT_DOC_TOC: &[AgentDocTocEntry] = &[
     AgentDocTocEntry {
         label: "Bundled product help",
         location: "src/docs/product_help.rs",
-        use_for: "user-facing setup, navigation, feature, Docker, memory, built-in connector, and custom integration guidance",
+        use_for: "user-facing setup, navigation, feature, Docker, memory, ArkReflect, built-in connector, and custom integration guidance",
     },
     AgentDocTocEntry {
         label: "Product help retrieval",
@@ -42,6 +42,11 @@ pub(crate) const AGENT_DOC_TOC: &[AgentDocTocEntry] = &[
         use_for: "API routes, settings endpoints, local web UI behavior, and browser-visible workflows",
     },
     AgentDocTocEntry {
+        label: "ArkReflect",
+        location: "src/channels/http/reflect_control.rs; src/storage/entities/semantic_work_unit.rs; frontend/src/components/pages/ArkReflectPage.tsx; src/docs/product_help.rs",
+        use_for: "cached day/week/month retrospectives, /reflect API queries, derived semantic work units, source coverage, related-history lookup, Daily Digest delivery, and Panorama UI behavior",
+    },
+    AgentDocTocEntry {
         label: "Custom messaging channels",
         location: "src/custom_messaging_channels/mod.rs; src/channels/messaging_registry.rs; src/channels/messaging_dispatch.rs; frontend/src/components/IntegrationsPanel.tsx",
         use_for: "user-added outbound notification channels, secure credential forms, registry gating, and HTTP dispatch templates",
@@ -55,6 +60,11 @@ pub(crate) const AGENT_DOC_TOC: &[AgentDocTocEntry] = &[
         label: "Learning and evolution",
         location: "src/core/learning.rs; src/core/self_evolve/",
         use_for: "experience items, prompt evolution, background learning, and self-improvement workflows",
+    },
+    AgentDocTocEntry {
+        label: "GEPA background optimizer",
+        location: "src/core/self_evolve/gepa_bridge.rs; bridges/gepa_optimizer/; src/channels/http/evolution_control.rs; src/docs/product_help.rs",
+        use_for: "automatic prompt optimizer scheduling, model/runtime readiness, cost budgets, GEPA file artifacts, and experience_runs or kv_store inspection",
     },
     AgentDocTocEntry {
         label: "Prompt telemetry and canary safety",
@@ -116,6 +126,6 @@ mod tests {
         assert!(rendered.contains("src/docs/product_help.rs"));
         assert!(rendered.contains("src/core/agent/prompt_builder.rs"));
         assert!(rendered.contains("src/storage/"));
-        assert!(rendered.lines().count() <= 20);
+        assert!(rendered.lines().count() <= 22);
     }
 }

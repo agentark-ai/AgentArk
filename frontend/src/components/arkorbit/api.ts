@@ -13,6 +13,10 @@ function asString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+function asNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
 function asOrbit(value: unknown): Orbit | null {
   if (!value || typeof value !== "object") return null;
   const raw = value as Record<string, unknown>;
@@ -65,6 +69,14 @@ function asChatHistoryMessage(value: unknown): OrbitChatHistoryMessage | null {
     role: raw.role,
     content: raw.content,
     created_at: asString(raw.created_at),
+    model: asString(raw.model),
+    input_tokens: asNumber(raw.input_tokens),
+    output_tokens: asNumber(raw.output_tokens),
+    total_tokens: asNumber(raw.total_tokens),
+    cost_usd: asNumber(raw.cost_usd),
+    estimated: typeof raw.estimated === "boolean" ? raw.estimated : undefined,
+    duration_ms: asNumber(raw.duration_ms),
+    time_to_first_token_ms: asNumber(raw.time_to_first_token_ms),
   };
 }
 
@@ -207,6 +219,16 @@ export const arkorbitApi = {
   async deleteWidget(orbitId: OrbitId, widgetId: string): Promise<void> {
     await api.rawDelete(
       `/api/arkorbit/orbits/${encodeURIComponent(orbitId)}/widgets/${encodeURIComponent(widgetId)}`,
+    );
+  },
+  async updateWidgetLayout(
+    orbitId: OrbitId,
+    widgetId: string,
+    layout: { left?: number; top?: number },
+  ): Promise<void> {
+    await api.rawPut(
+      `/api/arkorbit/orbits/${encodeURIComponent(orbitId)}/widgets/${encodeURIComponent(widgetId)}`,
+      layout,
     );
   },
   orbitIndexUrl(orbitId: OrbitId): string {

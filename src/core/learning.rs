@@ -2,13 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::Result;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::core::self_evolve::skill_evolution::{self, SkillMetricsSnapshot, SkillWindowDirection};
 use crate::storage::{
-    experience_edge, experience_item, experience_run, learning_candidate, procedural_pattern,
-    KvLeaseGuard, Storage,
+    KvLeaseGuard, Storage, experience_edge, experience_item, experience_run, learning_candidate,
+    procedural_pattern,
 };
 
 pub const LEARNING_ENABLED_KEY: &str = "learning_enabled_v1";
@@ -2456,9 +2456,11 @@ mod tests {
         };
         let action_name = candidate_action_name(&pattern);
         assert!(action_name.starts_with("learned-fix-tool-bug-flow"));
-        assert!(action_name
-            .chars()
-            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-'));
+        assert!(
+            action_name
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+        );
     }
 
     #[test]

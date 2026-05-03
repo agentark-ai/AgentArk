@@ -199,11 +199,7 @@ fn trim_request_list_marker(line: &str) -> Option<&str> {
     }
 
     let rest = after_chars.as_str().trim();
-    if rest.is_empty() {
-        None
-    } else {
-        Some(rest)
-    }
+    if rest.is_empty() { None } else { Some(rest) }
 }
 
 #[cfg(test)]
@@ -427,11 +423,7 @@ fn normalize_action_name(
 
 fn normalize_arguments(value: Option<&serde_json::Value>) -> Option<serde_json::Value> {
     let value = value?.clone();
-    if value.is_object() {
-        Some(value)
-    } else {
-        None
-    }
+    if value.is_object() { Some(value) } else { None }
 }
 
 fn normalize_plan_step(
@@ -996,14 +988,16 @@ mod tests {
     fn parse_plan_rejects_malformed_or_empty_payloads() {
         let actions = vec![action("file_write")];
         assert!(parse_plan_from_llm_content("not json", &actions, None, 1, false).is_none());
-        assert!(parse_plan_from_llm_content(
-            r#"{"summary":"No steps","steps":[]}"#,
-            &actions,
-            None,
-            1,
-            false
-        )
-        .is_none());
+        assert!(
+            parse_plan_from_llm_content(
+                r#"{"summary":"No steps","steps":[]}"#,
+                &actions,
+                None,
+                1,
+                false
+            )
+            .is_none()
+        );
     }
 
     #[test]

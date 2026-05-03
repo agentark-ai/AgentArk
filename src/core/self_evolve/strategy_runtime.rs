@@ -142,9 +142,7 @@ pub struct PromptProfileCanarySafetyEvent {
 #[cfg(test)]
 fn task_type_for_action_name(action_name: &str) -> Option<&'static str> {
     match action_name.trim().to_ascii_lowercase().as_str() {
-        "app_deploy" | "app_restart" | "app_stop" | "app_delete" => {
-            Some("app_deploy")
-        }
+        "app_deploy" | "app_restart" | "app_stop" | "app_delete" => Some("app_deploy"),
         "file_read" | "file_write" | "shell" | "code_execute" | "local_cli"
         | "connector_request" => Some("coding"),
         "research" | "web_search" | "page_fetch" | "rank_signals" => Some("research"),

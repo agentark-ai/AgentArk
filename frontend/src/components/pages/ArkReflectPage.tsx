@@ -26,6 +26,7 @@ import HubRoundedIcon from "@mui/icons-material/HubRounded";
 import InsightsRoundedIcon from "@mui/icons-material/InsightsRounded";
 import MemoryRoundedIcon from "@mui/icons-material/MemoryRounded";
 import MonitorHeartRoundedIcon from "@mui/icons-material/MonitorHeartRounded";
+import NotificationsActiveRoundedIcon from "@mui/icons-material/NotificationsActiveRounded";
 import RefreshRoundedIcon from "@mui/icons-material/RefreshRounded";
 import WorkHistoryRoundedIcon from "@mui/icons-material/WorkHistoryRounded";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -127,6 +128,22 @@ type ReflectResponse = {
     cached_units: number;
     stale: boolean;
     detail: string;
+  };
+  daily_digest_status: {
+    enabled: boolean;
+    status: string;
+    target_date: string;
+    today_date: string;
+    meaningful: boolean;
+    unit_count: number;
+    cluster_count: number;
+    source_counts: ReflectSourceCounts;
+    summary: string;
+    detail: string;
+    last_checked_at: string;
+    last_sent_at: string;
+    last_skipped_at: string;
+    last_error: string;
   };
   clusters: ReflectCluster[];
   unclustered_units: ReflectUnit[];
@@ -280,42 +297,34 @@ function asReflectCluster(value: unknown): ReflectCluster | null {
   };
 }
 
+function parseSourceCounts(value: unknown): ReflectSourceCounts {
+  const sourceCounts = asRecord(value);
+  return {
+    main_chat: num(sourceCounts.main_chat, 0),
+    orbit_chat: num(sourceCounts.orbit_chat, 0),
+    memory: num(sourceCounts.memory, 0),
+    procedures: num(sourceCounts.procedures, 0),
+    apps: num(sourceCounts.apps, 0),
+    goals: num(sourceCounts.goals, 0),
+    watchers: num(sourceCounts.watchers, 0),
+    sentinel: num(sourceCounts.sentinel, 0),
+    arkpulse: num(sourceCounts.arkpulse, 0),
+    arkevolve: num(sourceCounts.arkevolve, 0),
+    usage: num(sourceCounts.usage, 0),
+  };
+}
+
 function parseReflectResponse(value: unknown, period: ReflectPeriod): ReflectResponse {
   const raw = asRecord(value);
-  const sourceCounts = asRecord(raw.source_counts);
-  const baselineSourceCounts = asRecord(raw.baseline_source_counts);
   const embedding = asRecord(raw.embedding_status);
+  const digest = asRecord(raw.daily_digest_status);
   return {
     period,
     from: str(raw.from, ""),
     to: str(raw.to, ""),
     generated_at: str(raw.generated_at, ""),
-    source_counts: {
-      main_chat: num(sourceCounts.main_chat, 0),
-      orbit_chat: num(sourceCounts.orbit_chat, 0),
-      memory: num(sourceCounts.memory, 0),
-      procedures: num(sourceCounts.procedures, 0),
-      apps: num(sourceCounts.apps, 0),
-      goals: num(sourceCounts.goals, 0),
-      watchers: num(sourceCounts.watchers, 0),
-      sentinel: num(sourceCounts.sentinel, 0),
-      arkpulse: num(sourceCounts.arkpulse, 0),
-      arkevolve: num(sourceCounts.arkevolve, 0),
-      usage: num(sourceCounts.usage, 0),
-    },
-    baseline_source_counts: {
-      main_chat: num(baselineSourceCounts.main_chat, 0),
-      orbit_chat: num(baselineSourceCounts.orbit_chat, 0),
-      memory: num(baselineSourceCounts.memory, 0),
-      procedures: num(baselineSourceCounts.procedures, 0),
-      apps: num(baselineSourceCounts.apps, 0),
-      goals: num(baselineSourceCounts.goals, 0),
-      watchers: num(baselineSourceCounts.watchers, 0),
-      sentinel: num(baselineSourceCounts.sentinel, 0),
-      arkpulse: num(baselineSourceCounts.arkpulse, 0),
-      arkevolve: num(baselineSourceCounts.arkevolve, 0),
-      usage: num(baselineSourceCounts.usage, 0),
-    },
+    source_counts: parseSourceCounts(raw.source_counts),
+    baseline_source_counts: parseSourceCounts(raw.baseline_source_counts),
     embedding_status: {
       mode: str(embedding.mode, "activity"),
       embedded_units: num(embedding.embedded_units, 0),
@@ -334,6 +343,22 @@ function parseReflectResponse(value: unknown, period: ReflectPeriod): ReflectRes
       cached_units: num(asRecord(raw.cache_status).cached_units, 0),
       stale: Boolean(asRecord(raw.cache_status).stale),
       detail: str(asRecord(raw.cache_status).detail, ""),
+    },
+    daily_digest_status: {
+      enabled: Boolean(digest.enabled),
+      status: str(digest.status, "disabled"),
+      target_date: str(digest.target_date, ""),
+      today_date: str(digest.today_date, ""),
+      meaningful: Boolean(digest.meaningful),
+      unit_count: num(digest.unit_count, 0),
+      cluster_count: num(digest.cluster_count, 0),
+      source_counts: parseSourceCounts(digest.source_counts),
+      summary: str(digest.summary, ""),
+      detail: str(digest.detail, ""),
+      last_checked_at: str(digest.last_checked_at, ""),
+      last_sent_at: str(digest.last_sent_at, ""),
+      last_skipped_at: str(digest.last_skipped_at, ""),
+      last_error: str(digest.last_error, ""),
     },
     clusters: pickRecords(raw, "clusters")
       .map(asReflectCluster)
@@ -491,6 +516,15 @@ function countForSourceCounts(counts: ReflectSourceCounts | undefined, source: s
   }
 }
 
+function totalForSourceCounts(counts: ReflectSourceCounts | undefined): number {
+  if (!counts) return 0;
+  return SOURCE_ORDER.reduce((sum, source) => sum + countForSourceCounts(counts, source), 0);
+}
+
+function meaningfulForSourceCounts(counts: ReflectSourceCounts | undefined): number {
+  return Math.max(0, totalForSourceCounts(counts) - countForSourceCounts(counts, "llm_usage"));
+}
+
 function sourceMeta(source: string) {
   return SOURCE_DISPLAY[source] ?? { label: "Work", group: "Mixed work", color: "#8FA3BF" };
 }
@@ -503,7 +537,83 @@ function dominantSource(cluster: ReflectCluster): string {
   return [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "work";
 }
 
+function hexToHsl(hex: string): { h: number; s: number; l: number } | null {
+  const m = hex.match(/^#([0-9a-f]{6})$/i);
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  const r = ((n >> 16) & 0xff) / 255;
+  const g = ((n >> 8) & 0xff) / 255;
+  const b = (n & 0xff) / 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const l = (max + min) / 2;
+  if (max === min) return { h: 0, s: 0, l };
+  const d = max - min;
+  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+  let h = 0;
+  if (max === r) h = ((g - b) / d + (g < b ? 6 : 0)) / 6;
+  else if (max === g) h = ((b - r) / d + 2) / 6;
+  else h = ((r - g) / d + 4) / 6;
+  return { h, s, l };
+}
+
+function hslToHex(h: number, s: number, l: number): string {
+  const hue2rgb = (p: number, q: number, t: number) => {
+    let tt = t;
+    if (tt < 0) tt += 1;
+    if (tt > 1) tt -= 1;
+    if (tt < 1 / 6) return p + (q - p) * 6 * tt;
+    if (tt < 1 / 2) return q;
+    if (tt < 2 / 3) return p + (q - p) * (2 / 3 - tt) * 6;
+    return p;
+  };
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+  const p = 2 * l - q;
+  const r = Math.round(hue2rgb(p, q, h + 1 / 3) * 255);
+  const g = Math.round(hue2rgb(p, q, h) * 255);
+  const b = Math.round(hue2rgb(p, q, h - 1 / 3) * 255);
+  const toHex = (x: number) => x.toString(16).padStart(2, "0");
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+}
+
+function tacticalAccent(hex: string): string {
+  const hsl = hexToHsl(hex);
+  if (!hsl) return hex;
+  return hslToHex(hsl.h, Math.min(0.7, hsl.s * 0.78), Math.min(0.78, hsl.l * 0.95 + 0.18));
+}
+
+function tacticalSymbol(source: string): string {
+  const HEXAGON = "path://M50,3 L93,26 L93,74 L50,97 L7,74 L7,26 Z";
+  const DIAMOND = "path://M50,3 L97,50 L50,97 L3,50 Z";
+  const TRIANGLE = "path://M50,6 L94,88 L6,88 Z";
+  const SQUARE = "path://M10,10 L90,10 L90,90 L10,90 Z";
+  if (source === "conversation" || source === "orbit_chat") return HEXAGON;
+  if (source === "watcher" || source === "sentinel" || source === "arkpulse") return DIAMOND;
+  if (source === "experience_item" || source === "procedural_pattern") return TRIANGLE;
+  if (source === "app" || source === "goal" || source === "arkevolve") return SQUARE;
+  return HEXAGON;
+}
+
+function tacticalCode(source: string): string {
+  const map: Record<string, string> = {
+    conversation: "CHT",
+    orbit_chat: "ORB",
+    experience_item: "MEM",
+    procedural_pattern: "PRC",
+    app: "APP",
+    goal: "GOL",
+    watcher: "WCH",
+    sentinel: "SNT",
+    arkpulse: "PLS",
+    arkevolve: "EVO",
+    llm_usage: "USG",
+  };
+  return map[source] ?? "WRK";
+}
+
 function clusterDisplayLabel(cluster: ReflectCluster): string {
+  const explicit = cluster.label?.trim();
+  if (explicit) return explicit;
   const sourceKinds = new Set(cluster.units.map((unit) => unit.source_kind));
   if (sourceKinds.size === 1) return sourceMeta(dominantSource(cluster)).group;
   if (sourceKinds.has("conversation") || sourceKinds.has("orbit_chat")) return "Conversation-led work";
@@ -511,6 +621,90 @@ function clusterDisplayLabel(cluster: ReflectCluster): string {
     return "Background operations";
   }
   return "Mixed AgentArk activity";
+}
+
+function clusterDistinguishingHint(cluster: ReflectCluster): string {
+  const firstUnit = cluster.units[0];
+  const title = firstUnit?.title?.trim() ?? "";
+  if (title) {
+    const words = title.split(/\s+/).slice(0, 4).join(" ");
+    return words.length > 32 ? `${words.slice(0, 29)}...` : words;
+  }
+  return cluster.id.slice(0, 6);
+}
+
+function buildClusterLabelMap(clusters: ReflectCluster[]): Record<string, string> {
+  const counts = new Map<string, number>();
+  for (const cluster of clusters) {
+    const primary = clusterDisplayLabel(cluster);
+    counts.set(primary, (counts.get(primary) ?? 0) + 1);
+  }
+  const result: Record<string, string> = {};
+  for (const cluster of clusters) {
+    const primary = clusterDisplayLabel(cluster);
+    const collision = (counts.get(primary) ?? 1) > 1;
+    if (!collision) {
+      result[cluster.id] = primary;
+      continue;
+    }
+    const hint = clusterDistinguishingHint(cluster);
+    result[cluster.id] = hint ? `${primary}: ${hint}` : primary;
+  }
+  return result;
+}
+
+function digestStatusTitle(response: ReflectResponse | undefined): string {
+  const digest = response?.daily_digest_status;
+  if (!digest || !digest.enabled) return "Daily digest is off";
+  const appliesToToday = !digest.target_date || digest.target_date === digest.today_date;
+  if (!appliesToToday) {
+    const meaningful = meaningfulForSourceCounts(response?.source_counts);
+    return meaningful > 0 ? "Today has activity to reflect" : "Waiting for today's activity";
+  }
+  if (digest.status === "sent") return "Daily digest sent";
+  if (digest.status === "preparing") return "Preparing today's digest";
+  if (digest.status === "skipped_quiet") return "No digest sent for a quiet day";
+  if (digest.status === "delivery_failed") return "Digest delivery needs attention";
+  const meaningful = meaningfulForSourceCounts(response?.source_counts);
+  if (meaningful > 0) return "Today has activity to reflect";
+  return "Waiting for meaningful activity";
+}
+
+function digestStatusDetail(response: ReflectResponse | undefined, fetching: boolean): string {
+  if (!response) {
+    return fetching
+      ? "Loading today's ArkReflect status."
+      : "Today status appears here after ArkReflect has cached activity.";
+  }
+  const digest = response.daily_digest_status;
+  const total = totalForSourceCounts(response.source_counts);
+  const meaningful = meaningfulForSourceCounts(response.source_counts);
+  const appliesToToday = !digest.target_date || digest.target_date === digest.today_date;
+  if (!digest.enabled) {
+    return total > 0
+      ? `${meaningful} meaningful signal${meaningful === 1 ? "" : "s"} cached today. Enable the daily digest in Settings to send recaps.`
+      : "Enable the digest in Settings if you want meaningful days sent to your notification channel.";
+  }
+  if (!appliesToToday) {
+    return total > 0
+      ? `${meaningful} meaningful signal${meaningful === 1 ? "" : "s"} cached today; today's digest will wait for a quiet end-of-day window.`
+      : "No meaningful activity has been cached for today yet.";
+  }
+  if (digest.status === "sent" && digest.last_sent_at) {
+    return `Sent for ${digest.target_date || "the selected day"} at ${formatUiDateTime(digest.last_sent_at)}.`;
+  }
+  if (digest.status === "skipped_quiet") {
+    return "ArkReflect checked the day and found nothing worth notifying you about.";
+  }
+  if (digest.status === "preparing") {
+    return "AgentArk is refreshing the daily work units in the background.";
+  }
+  if (digest.status === "delivery_failed") {
+    return digest.last_error || "The digest was prepared, but no notification channel accepted it.";
+  }
+  return total > 0
+    ? `${meaningful} meaningful signal${meaningful === 1 ? "" : "s"} cached today; the digest waits for a quiet end-of-day window.`
+    : "No meaningful activity has been cached for today yet.";
 }
 
 function clusterPlainSummary(cluster: ReflectCluster): string {
@@ -569,9 +763,19 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
   const bounds = useMemo(() => periodBounds(period, anchor), [period, anchor]);
   const fromIso = bounds.from.toISOString();
   const toIso = bounds.to.toISOString();
+  const todayBounds = useMemo(
+    () => periodBounds("daily", toDateInputValue(new Date())),
+    [],
+  );
+  const todayFromIso = todayBounds.from.toISOString();
+  const todayToIso = todayBounds.to.toISOString();
   const reflectQueryKey = useMemo(
     () => ["arkreflect", period, fromIso, toIso] as const,
     [period, fromIso, toIso],
+  );
+  const todayQueryKey = useMemo(
+    () => ["arkreflect", "today", todayFromIso, todayToIso] as const,
+    [todayFromIso, todayToIso],
   );
 
   const reflectQ = useQuery({
@@ -593,10 +797,22 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
     },
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: reflectQueryKey });
+      void queryClient.invalidateQueries({ queryKey: todayQueryKey });
     },
   });
 
   const response = reflectQ.data;
+  const todayQ = useQuery({
+    queryKey: todayQueryKey,
+    queryFn: async () => {
+      const raw = await api.rawGet(
+        `/reflect?period=daily&from=${encodeURIComponent(todayFromIso)}&to=${encodeURIComponent(todayToIso)}`,
+      );
+      return parseReflectResponse(raw, "daily");
+    },
+    refetchInterval: autoRefresh ? 120000 : false,
+  });
+  const todayResponse = todayQ.data;
 
   useEffect(() => {
     if (!response?.refresh_status.running && !refreshMutation.isPending) return undefined;
@@ -607,6 +823,7 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
   }, [queryClient, reflectQueryKey, refreshMutation.isPending, response?.refresh_status.running]);
 
   const clusters = response?.clusters ?? [];
+  const clusterLabelById = useMemo(() => buildClusterLabelMap(clusters), [clusters]);
   const allUnits = useMemo(() => {
     const byId = new Map<string, ReflectUnit>();
     for (const cluster of clusters) {
@@ -625,7 +842,13 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
 
   const rangeLabel = formatUiDateRange(response?.from || fromIso, response?.to || toIso);
   const status = quietStatus(response, reflectQ.isFetching, refreshMutation.isPending);
-  const focusLabel = strongestCluster ? clusterDisplayLabel(strongestCluster) : "No activity yet";
+  const todayDigestTitle = digestStatusTitle(todayResponse);
+  const todayDigestDetail = digestStatusDetail(todayResponse, todayQ.isFetching);
+  const todayMeaningful = meaningfulForSourceCounts(todayResponse?.source_counts);
+  const todayTotal = totalForSourceCounts(todayResponse?.source_counts);
+  const focusLabel = strongestCluster
+    ? (clusterLabelById[strongestCluster.id] ?? clusterDisplayLabel(strongestCluster))
+    : "No activity yet";
   const recurringCount = clusters.filter((cluster) => cluster.related_history.mode === "recurring").length;
   const sourceRows = useMemo(
     () =>
@@ -651,43 +874,113 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
     [backgroundCount, focusLabel, learnedCount, recurringCount, response, totalUnits],
   );
 
+  const SPARKLINE_BUCKETS = 7;
+  const backgroundSparklines = useMemo(() => {
+    const sources = ["app", "goal", "watcher", "sentinel", "arkpulse", "arkevolve"] as const;
+    const fromTs = response?.from ? Date.parse(response.from) : NaN;
+    const toTs = response?.to ? Date.parse(response.to) : NaN;
+    const haveBounds =
+      Number.isFinite(fromTs) && Number.isFinite(toTs) && toTs > fromTs;
+    const span = haveBounds ? toTs - fromTs : 1;
+    const result: Record<string, number[]> = {};
+    for (const source of sources) {
+      result[source] = new Array(SPARKLINE_BUCKETS).fill(0);
+    }
+    if (!haveBounds) return result;
+    for (const unit of allUnits) {
+      const bucket = result[unit.source_kind as keyof typeof result];
+      if (!bucket) continue;
+      const ts = Date.parse(unit.occurred_at);
+      if (!Number.isFinite(ts)) continue;
+      const ratio = (ts - fromTs) / span;
+      const idx = Math.min(
+        SPARKLINE_BUCKETS - 1,
+        Math.max(0, Math.floor(ratio * SPARKLINE_BUCKETS)),
+      );
+      bucket[idx] += 1;
+    }
+    return result;
+  }, [allUnits, response?.from, response?.to]);
+
   const constellationOption = useMemo(() => {
     const nodes: Array<Record<string, unknown>> = [];
     const links: Array<Record<string, unknown>> = [];
     const seen = new Set<string>();
+    const clusterNodeIds: string[] = [];
     clusters.forEach((cluster, index) => {
       const source = dominantSource(cluster);
       const meta = sourceMeta(source);
-      const clusterName = clusterDisplayLabel(cluster);
+      const clusterName = clusterLabelById[cluster.id] ?? clusterDisplayLabel(cluster);
       const nodeId = `cluster-${cluster.id}`;
       seen.add(nodeId);
+      clusterNodeIds.push(nodeId);
+      const nodeSize = Math.max(14, Math.min(28, 12 + cluster.unit_count * 3));
+      const stroke = tacticalAccent(meta.color);
+      const code = tacticalCode(source);
+      const idx = String(index + 1).padStart(2, "0");
+      const truncated = clusterName.length > 38 ? `${clusterName.slice(0, 36)}…` : clusterName;
       nodes.push({
         id: nodeId,
         name: clusterName,
         value: cluster.unit_count,
-        symbolSize: Math.max(46, Math.min(112, 44 + cluster.unit_count * 16)),
+        symbol: tacticalSymbol(source),
+        symbolSize: nodeSize,
         category: 0,
         itemStyle: {
-          color: meta.color,
-          shadowBlur: 24,
-          shadowColor: meta.color,
-          opacity: 0.95,
+          color: "rgba(0,0,0,0)",
+          borderColor: stroke,
+          borderWidth: 1,
+          shadowBlur: 6,
+          shadowColor: stroke,
         },
         label: {
           show: true,
-          formatter: clusterName,
-          color: "#fff",
-          fontWeight: 800,
-          fontSize: 12,
-          width: 118,
-          overflow: "break",
+          position: "right",
+          distance: 8,
+          formatter: `{code|${idx}·${code}}  {name|${truncated.toUpperCase()}}`,
+          rich: {
+            code: {
+              color: stroke,
+              fontSize: 8.5,
+              fontFamily: "'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
+              fontWeight: 500,
+              letterSpacing: 1,
+              backgroundColor: "rgba(0,0,0,0.35)",
+              padding: [2, 4, 2, 4],
+              borderRadius: 1,
+            },
+            name: {
+              color: "rgba(210, 226, 238, 0.78)",
+              fontSize: 9.5,
+              fontFamily: "'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
+              fontWeight: 400,
+              letterSpacing: 0.6,
+            },
+          },
         },
-        emphasis: { scale: true },
-        x: Math.cos((index / Math.max(clusters.length, 1)) * Math.PI * 2) * 180,
-        y: Math.sin((index / Math.max(clusters.length, 1)) * Math.PI * 2) * 100,
+        emphasis: {
+          scale: 1.4,
+          itemStyle: {
+            borderColor: stroke,
+            borderWidth: 1.4,
+            shadowBlur: 14,
+            shadowColor: stroke,
+          },
+          label: {
+            rich: {
+              name: { color: "#f4fbff" },
+              code: { color: stroke },
+            },
+          },
+        },
+        x: Math.cos((index / Math.max(clusters.length, 1)) * Math.PI * 2 - Math.PI / 2) * 240,
+        y: Math.sin((index / Math.max(clusters.length, 1)) * Math.PI * 2 - Math.PI / 2) * 150,
       });
+      const angle = (index / Math.max(clusters.length, 1)) * Math.PI * 2 - Math.PI / 2;
       cluster.related_history.items.slice(0, 2).forEach((item, itemIndex) => {
         const historyId = `history-${item.id}`;
+        const satOffset = 36 + itemIndex * 18;
+        const satAngle = angle + (itemIndex === 0 ? -0.22 : 0.22);
         if (!seen.has(historyId)) {
           seen.add(historyId);
           nodes.push({
@@ -705,14 +998,17 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
               has_embedding: true,
             }),
             value: 1,
-            symbolSize: 22,
+            symbol: "path://M50,8 L92,50 L50,92 L8,50 Z",
+            symbolSize: 6,
             category: 1,
             itemStyle: {
-              color: "rgba(255,255,255,0.38)",
-              shadowBlur: 12,
-              shadowColor: "rgba(255,255,255,0.35)",
+              color: "rgba(0,0,0,0)",
+              borderColor: "rgba(170, 200, 220, 0.4)",
+              borderWidth: 0.8,
             },
             label: { show: false },
+            x: Math.cos(satAngle) * (240 + satOffset),
+            y: Math.sin(satAngle) * (150 + satOffset * 0.6),
           });
         }
         links.push({
@@ -720,94 +1016,212 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
           target: historyId,
           value: item.similarity,
           lineStyle: {
-            width: 1 + item.similarity * 2,
-            color: "rgba(255,255,255,0.28)",
-            curveness: 0.18 + itemIndex * 0.08,
+            width: 0.8 + item.similarity * 1.4,
+            color: stroke,
+            opacity: 0.42,
+            curveness: 0.14 + itemIndex * 0.06,
+            type: "solid",
           },
         });
       });
     });
+    if (links.length === 0 && clusterNodeIds.length >= 2) {
+      for (let i = 0; i < clusterNodeIds.length; i += 1) {
+        for (let j = i + 1; j < clusterNodeIds.length; j += 1) {
+          links.push({
+            source: clusterNodeIds[i],
+            target: clusterNodeIds[j],
+            lineStyle: {
+              width: 0.6,
+              color: "rgba(140, 200, 220, 0.16)",
+              curveness: 0.18,
+              type: [3, 5],
+              dashOffset: 0,
+            },
+          });
+        }
+      }
+    }
     return {
+      backgroundColor: "transparent",
       tooltip: {
-        formatter: (info: { data?: { name?: string; value?: number } }) =>
-          `${info.data?.name || "Theme"}${info.data?.value ? `<br/>${info.data.value} item${info.data.value === 1 ? "" : "s"}` : ""}`,
+        backgroundColor: "rgba(6, 11, 16, 0.96)",
+        borderColor: "rgba(120, 200, 220, 0.4)",
+        borderWidth: 1,
+        padding: [8, 12],
+        textStyle: {
+          color: "#dceaf2",
+          fontSize: 11.5,
+          fontFamily: "'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
+        },
+        formatter: (info: { data?: { name?: string; value?: number } }) => {
+          const name = (info.data?.name || "node").toUpperCase();
+          const v = info.data?.value;
+          return v
+            ? `<span style="opacity:0.6">› TRACE</span> ${name}<br/><span style="opacity:0.6">› UNITS</span> ${v}`
+            : `<span style="opacity:0.6">› NODE</span> ${name}`;
+        },
+      },
+      graphic: {
+        elements: [
+          {
+            type: "group",
+            left: "center",
+            top: "middle",
+            children: [
+              { type: "circle", shape: { cx: 0, cy: 0, r: 3 }, style: { fill: "transparent", stroke: "rgba(120,200,220,0.55)", lineWidth: 1 } },
+              { type: "circle", shape: { cx: 0, cy: 0, r: 1 }, style: { fill: "rgba(120,200,220,0.7)" } },
+              { type: "line", shape: { x1: -10, y1: 0, x2: -5, y2: 0 }, style: { stroke: "rgba(120,200,220,0.45)", lineWidth: 1 } },
+              { type: "line", shape: { x1: 5, y1: 0, x2: 10, y2: 0 }, style: { stroke: "rgba(120,200,220,0.45)", lineWidth: 1 } },
+              { type: "line", shape: { x1: 0, y1: -10, x2: 0, y2: -5 }, style: { stroke: "rgba(120,200,220,0.45)", lineWidth: 1 } },
+              { type: "line", shape: { x1: 0, y1: 5, x2: 0, y2: 10 }, style: { stroke: "rgba(120,200,220,0.45)", lineWidth: 1 } },
+            ],
+          },
+          {
+            type: "text",
+            left: 14,
+            top: 12,
+            style: {
+              text: `◢ PANORAMA · ${clusters.length.toString().padStart(2, "0")} TRACES`,
+              fill: "rgba(120, 200, 220, 0.55)",
+              font: "500 9.5px 'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
+            },
+          },
+          {
+            type: "text",
+            right: 14,
+            bottom: 12,
+            style: {
+              text: "◣ FOCUS·MAP",
+              fill: "rgba(120, 200, 220, 0.45)",
+              font: "500 9.5px 'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
+              textAlign: "right",
+            },
+          },
+        ],
       },
       animationDurationUpdate: 900,
+      animationEasingUpdate: "cubicInOut",
       series: [
         {
           type: "graph",
-          layout: "force",
+          layout: "none",
           roam: false,
           draggable: false,
-          force: {
-            repulsion: 360,
-            edgeLength: [80, 180],
-            gravity: 0.08,
-          },
-          categories: [{ name: "This range" }, { name: "History" }],
+          categories: [{ name: "Active" }, { name: "Bridge" }],
           data: nodes,
           links,
           edgeSymbol: ["none", "none"],
-          lineStyle: { opacity: 0.42 },
+          lineStyle: { opacity: 0.4, curveness: 0.08 },
+          zlevel: 2,
         },
       ],
     };
-  }, [clusters]);
+  }, [clusters, clusterLabelById]);
 
   const activityOption = useMemo(() => {
-    const counts = new Map<string, number>();
+    const TIMELINE_BUCKETS = period === "daily" ? 24 : period === "weekly" ? 28 : 36;
+    const fromTs = response?.from ? Date.parse(response.from) : NaN;
+    const toTs = response?.to ? Date.parse(response.to) : NaN;
+    const haveBounds = Number.isFinite(fromTs) && Number.isFinite(toTs) && toTs > fromTs;
+    const span = haveBounds ? toTs - fromTs : 1;
+    const buckets = new Array(TIMELINE_BUCKETS).fill(0);
     for (const unit of allUnits) {
-      const date = new Date(unit.occurred_at);
-      if (Number.isNaN(date.getTime())) continue;
-      const key =
-        period === "daily"
-          ? `${pad(date.getHours())}:00`
-          : formatUiDateOnly(date.toISOString(), { fallback: date.toISOString().slice(0, 10) });
-      counts.set(key, (counts.get(key) ?? 0) + 1);
+      const ts = Date.parse(unit.occurred_at);
+      if (!Number.isFinite(ts)) continue;
+      if (!haveBounds) continue;
+      const ratio = (ts - fromTs) / span;
+      const idx = Math.min(TIMELINE_BUCKETS - 1, Math.max(0, Math.floor(ratio * TIMELINE_BUCKETS)));
+      buckets[idx] += 1;
     }
-    const labels = [...counts.keys()];
+    const peak = Math.max(1, ...buckets);
+    const startLabel = haveBounds
+      ? formatUiDateOnly(new Date(fromTs).toISOString(), { fallback: "start" })
+      : "start";
+    const endLabel = haveBounds
+      ? formatUiDateOnly(new Date(toTs).toISOString(), { fallback: "now" })
+      : "now";
+    const data = buckets.map((count) => ({
+      value: count,
+      itemStyle: {
+        color: count === 0 ? "rgba(120, 200, 220, 0.10)" : "rgba(120, 200, 220, 0.78)",
+        borderColor: count === peak ? "rgba(180, 230, 250, 0.95)" : "transparent",
+        borderWidth: count === peak ? 0.6 : 0,
+      },
+    }));
     return {
-      tooltip: { trigger: "axis" },
-      grid: { left: 32, right: 16, top: 18, bottom: 28 },
+      backgroundColor: "transparent",
+      tooltip: {
+        trigger: "axis",
+        backgroundColor: "rgba(6, 11, 16, 0.96)",
+        borderColor: "rgba(120, 200, 220, 0.4)",
+        borderWidth: 1,
+        padding: [6, 10],
+        textStyle: {
+          color: "#dceaf2",
+          fontSize: 11,
+          fontFamily: "'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
+        },
+        axisPointer: { type: "shadow", shadowStyle: { color: "rgba(120, 200, 220, 0.06)" } },
+        formatter: (params: Array<{ dataIndex: number; value: number }>) => {
+          const p = params?.[0];
+          if (!p) return "";
+          const i = p.dataIndex;
+          const tBucket = haveBounds ? new Date(fromTs + ((i + 0.5) / TIMELINE_BUCKETS) * span) : null;
+          const stamp = tBucket ? tBucket.toISOString().slice(0, 16).replace("T", " ") : `BIN ${i + 1}`;
+          return `<span style="opacity:0.55">› T</span> ${stamp}<br/><span style="opacity:0.55">› N</span> ${p.value}`;
+        },
+      },
+      grid: { left: 28, right: 12, top: 14, bottom: 22, containLabel: false },
       xAxis: {
         type: "category",
-        data: labels,
-        axisLabel: { color: "rgba(255,255,255,0.68)" },
-        axisLine: { lineStyle: { color: "rgba(255,255,255,0.16)" } },
+        data: buckets.map((_, i) => i),
+        boundaryGap: true,
+        axisTick: { show: false },
+        axisLine: { lineStyle: { color: "rgba(120, 200, 220, 0.18)" } },
+        axisLabel: {
+          color: "rgba(180, 210, 225, 0.5)",
+          fontSize: 9,
+          fontFamily: "'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
+          letterSpacing: 0.6,
+          interval: TIMELINE_BUCKETS - 2,
+          formatter: (val: string) => {
+            const i = Number(val);
+            if (i === 0) return startLabel.toUpperCase();
+            if (i === TIMELINE_BUCKETS - 1) return endLabel.toUpperCase();
+            return "";
+          },
+          align: (val: string) => (Number(val) === 0 ? "left" : "right"),
+        },
       },
       yAxis: {
         type: "value",
         minInterval: 1,
-        axisLabel: { color: "rgba(255,255,255,0.68)" },
-        splitLine: { lineStyle: { color: "rgba(255,255,255,0.1)" } },
+        max: peak,
+        axisTick: { show: false },
+        axisLine: { show: false },
+        axisLabel: {
+          color: "rgba(180, 210, 225, 0.45)",
+          fontSize: 9,
+          fontFamily: "'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
+          showMinLabel: false,
+          formatter: (val: number) => (val === peak || val === 0 ? String(val) : ""),
+        },
+        splitLine: { show: false },
       },
       series: [
         {
-          type: "line",
-          smooth: true,
-          data: labels.map((label) => counts.get(label) ?? 0),
-          showSymbol: false,
-          lineStyle: { color: "#00A8A8", width: 3 },
-          areaStyle: {
-            color: {
-              type: "linear",
-              x: 0,
-              y: 0,
-              x2: 0,
-              y2: 1,
-              colorStops: [
-                { offset: 0, color: "rgba(0,168,168,0.42)" },
-                { offset: 1, color: "rgba(0,168,168,0.02)" },
-              ],
-            },
-          },
-          itemStyle: {
-            color: "#00A8A8",
-          },
+          type: "bar",
+          data,
+          barWidth: 2,
+          barCategoryGap: "60%",
+          silent: false,
+          animationDuration: 600,
+          animationEasing: "cubicOut",
         },
       ],
     };
-  }, [allUnits, period]);
+  }, [allUnits, period, response?.from, response?.to]);
 
   const sourceDonutOption = useMemo(
     () => ({
@@ -880,41 +1294,6 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
     }),
     [styleSignals],
   );
-
-  const backgroundOption = useMemo(() => {
-    const rows = SOURCE_ORDER.filter((source) =>
-      ["app", "goal", "watcher", "sentinel", "arkpulse", "arkevolve"].includes(source),
-    )
-      .map((source) => ({ ...sourceMeta(source), count: countForSource(response, source) }))
-      .filter((row) => row.count > 0);
-    return {
-      tooltip: { trigger: "axis", axisPointer: { type: "shadow" } },
-      grid: { left: 92, right: 18, top: 10, bottom: 24 },
-      xAxis: {
-        type: "value",
-        minInterval: 1,
-        axisLabel: { color: "rgba(255,255,255,0.64)" },
-        splitLine: { lineStyle: { color: "rgba(255,255,255,0.1)" } },
-      },
-      yAxis: {
-        type: "category",
-        data: rows.map((row) => row.label),
-        axisLabel: { color: "rgba(255,255,255,0.72)" },
-        axisLine: { show: false },
-        axisTick: { show: false },
-      },
-      series: [
-        {
-          type: "bar",
-          data: rows.map((row) => ({
-            value: row.count,
-            itemStyle: { color: row.color, borderRadius: [0, 6, 6, 0] },
-          })),
-          barMaxWidth: 24,
-        },
-      ],
-    };
-  }, [response]);
 
   return (
     <WorkspacePageShell spacing={1.4}>
@@ -990,20 +1369,20 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
       {reflectQ.error ? <Alert severity="error">{errMessage(reflectQ.error)}</Alert> : null}
       {refreshMutation.error ? <Alert severity="error">{errMessage(refreshMutation.error)}</Alert> : null}
       <Box
-        className="list-shell"
+        className="list-shell arkreflect-status"
         sx={{
           p: 1.25,
           borderColor: status.active ? "rgba(0,168,168,0.34)" : "rgba(255,255,255,0.1)",
-          bgcolor: status.active ? "rgba(0,168,168,0.08)" : "rgba(255,255,255,0.035)",
         }}
       >
         <Stack direction="row" spacing={1.1} sx={{ alignItems: "center" }}>
           <InsightsRoundedIcon color={status.active ? "primary" : "disabled"} fontSize="small" />
           <Box sx={{ minWidth: 0, flex: 1 }}>
+            <span className="arkreflect-section-eyebrow">Reflect Runtime</span>
             <Typography variant="body2" sx={{ fontWeight: 800 }}>
               {status.title}
             </Typography>
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" className="arkreflect-section-subtitle">
               {status.detail}
             </Typography>
           </Box>
@@ -1020,22 +1399,79 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
         {status.active || reflectQ.isFetching ? <LinearProgress sx={{ mt: 1.1, borderRadius: 999 }} /> : null}
       </Box>
 
-      <Box className="list-shell" sx={{ p: { xs: 1.4, md: 2 }, borderColor: "rgba(78,141,255,0.2)" }}>
+      <Box
+        className="list-shell arkreflect-status"
+        sx={{
+          p: 1.25,
+          borderColor:
+            todayResponse?.daily_digest_status.enabled && todayMeaningful > 0
+              ? "rgba(78,141,255,0.34)"
+              : "rgba(255,255,255,0.1)",
+        }}
+      >
+        <Stack direction={{ xs: "column", md: "row" }} spacing={1.2} sx={{ alignItems: { xs: "flex-start", md: "center" } }}>
+          <Stack direction="row" spacing={1.1} sx={{ alignItems: "center", minWidth: 0, flex: 1 }}>
+            <NotificationsActiveRoundedIcon
+              color={todayResponse?.daily_digest_status.enabled ? "primary" : "disabled"}
+              fontSize="small"
+            />
+            <Box sx={{ minWidth: 0 }}>
+              <span className="arkreflect-section-eyebrow">Today Status</span>
+              <Typography variant="body2" sx={{ fontWeight: 850 }}>
+                {todayDigestTitle}
+              </Typography>
+              <Typography variant="caption" className="arkreflect-section-subtitle">
+                {todayDigestDetail}
+              </Typography>
+            </Box>
+          </Stack>
+          <Stack direction="row" spacing={0.75} sx={{ flexWrap: "wrap", rowGap: 0.75 }}>
+            <Chip size="small" label={`${todayTotal} cached`} variant="outlined" />
+            <Chip size="small" label={`${todayMeaningful} meaningful`} color={todayMeaningful > 0 ? "primary" : "default"} variant="outlined" />
+            {todayResponse?.daily_digest_status.summary &&
+            (!todayResponse.daily_digest_status.target_date ||
+              todayResponse.daily_digest_status.target_date ===
+                todayResponse.daily_digest_status.today_date) ? (
+              <Chip size="small" label="Summary prepared" color="success" variant="outlined" />
+            ) : null}
+          </Stack>
+        </Stack>
+        {todayResponse?.daily_digest_status.summary &&
+        (!todayResponse.daily_digest_status.target_date ||
+          todayResponse.daily_digest_status.target_date ===
+            todayResponse.daily_digest_status.today_date) ? (
+          <Typography
+            variant="body2"
+            sx={{
+              mt: 1,
+              whiteSpace: "pre-line",
+              color: "text.primary",
+              lineHeight: 1.55,
+            }}
+          >
+            {todayResponse.daily_digest_status.summary}
+          </Typography>
+        ) : null}
+        {todayQ.isFetching ? <LinearProgress sx={{ mt: 1.1, borderRadius: 999 }} /> : null}
+      </Box>
+
+      <Box className="list-shell arkreflect-narrative" sx={{ p: { xs: 1.4, md: 2 } }}>
         <Stack spacing={1.3}>
           <Stack direction="row" spacing={1} sx={{ alignItems: "center" }}>
             <InsightsRoundedIcon color="primary" />
             <Box>
-              <Typography variant="h6" sx={{ fontWeight: 850 }}>
-                What I noticed
+              <span className="arkreflect-section-eyebrow">What I noticed</span>
+              <Typography variant="h6" sx={{ fontWeight: 850, lineHeight: 1.2 }}>
+                A plain-language read of this period
               </Typography>
-              <Typography variant="body2" color="text.secondary">
-                A plain-language read of this period before the charts.
+              <Typography variant="body2" className="arkreflect-section-subtitle">
+                Before the charts. Numbers below.
               </Typography>
             </Box>
           </Stack>
           <Stack spacing={0.8}>
             {narrative.map((line) => (
-              <Typography key={line} variant="body1" sx={{ lineHeight: 1.65 }}>
+              <Typography key={line} className="arkreflect-narrative-line" variant="body1">
                 {line}
               </Typography>
             ))}
@@ -1044,33 +1480,47 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
       </Box>
 
       <Box
-        className="list-shell"
+        className="list-shell arkreflect-panorama"
         sx={{
           p: { xs: 1.2, md: 1.6 },
-          minHeight: 460,
-          overflow: "hidden",
-          background:
-            "radial-gradient(circle at 30% 25%, rgba(78,141,255,0.16), transparent 34%), radial-gradient(circle at 72% 34%, rgba(0,168,168,0.12), transparent 30%), rgba(255,255,255,0.025)",
         }}
       >
-        <Stack direction="row" sx={{ justifyContent: "space-between", alignItems: "flex-start", mb: 1 }}>
+        <Box className="arkreflect-panorama-backdrop" />
+        <Box className="arkreflect-panorama-grid" />
+        <Stack
+          direction="row"
+          sx={{ justifyContent: "space-between", alignItems: "flex-start", mb: 1, position: "relative", zIndex: 3 }}
+        >
           <Box>
-            <Typography variant="h6" sx={{ fontWeight: 850 }}>
-              Panorama
+            <span className="arkreflect-section-eyebrow">Panorama</span>
+            <Typography variant="h6" sx={{ fontWeight: 850, lineHeight: 1.2 }}>
+              Focus areas across this period
             </Typography>
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" className="arkreflect-section-subtitle">
               Islands are focus areas. Bridges connect this period to similar history.
             </Typography>
           </Box>
           <Stack direction="row" spacing={0.7} sx={{ flexWrap: "wrap", justifyContent: "flex-end", gap: 0.7 }}>
-            <Chip size="small" icon={<BubbleChartRoundedIcon />} label={`${clusters.length} focus areas`} />
-            <Chip size="small" icon={<WorkHistoryRoundedIcon />} label={`${recurringCount} recurring`} />
+            <Chip
+              className="arkreflect-pill"
+              size="small"
+              icon={<BubbleChartRoundedIcon />}
+              label={`${clusters.length} focus areas`}
+            />
+            <Chip
+              className="arkreflect-pill"
+              size="small"
+              icon={<WorkHistoryRoundedIcon />}
+              label={`${recurringCount} recurring`}
+            />
           </Stack>
         </Stack>
         {clusters.length > 0 ? (
-          <ReactECharts option={constellationOption} style={{ height: 385, width: "100%" }} />
+          <Box className="arkreflect-panorama-canvas">
+            <ReactECharts option={constellationOption} style={{ height: 460, width: "100%" }} />
+          </Box>
         ) : (
-          <Box sx={{ height: 385, display: "grid", placeItems: "center", textAlign: "center" }}>
+          <Box className="arkreflect-panorama-empty" sx={{ height: 420, display: "grid", placeItems: "center", textAlign: "center" }}>
             <Stack spacing={0.8} sx={{ alignItems: "center" }}>
               <BubbleChartRoundedIcon color="disabled" />
               <Typography color="text.secondary">
@@ -1083,7 +1533,7 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
 
       <Grid2 container spacing={1.2}>
         <Grid2 size={{ xs: 12, lg: 5 }}>
-          <Box className="list-shell" sx={{ p: 1.2, minHeight: 360 }}>
+          <Box className="list-shell arkreflect-grid-pane" sx={{ p: 1.2, minHeight: 360 }}>
             <Stack direction="row" spacing={1} sx={{ alignItems: "center", px: 0.4 }}>
               <AutoGraphRoundedIcon color="success" />
               <Box>
@@ -1099,7 +1549,7 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
           </Box>
         </Grid2>
         <Grid2 size={{ xs: 12, lg: 7 }}>
-          <Box className="list-shell" sx={{ p: 1.2, minHeight: 360 }}>
+          <Box className="list-shell arkreflect-grid-pane" sx={{ p: 1.2, minHeight: 360 }}>
             <Stack direction="row" spacing={1} sx={{ alignItems: "center", px: 0.4 }}>
               <MonitorHeartRoundedIcon color="info" />
               <Box>
@@ -1111,20 +1561,138 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
                 </Typography>
               </Box>
             </Stack>
-            {backgroundCount > 0 ? (
-              <ReactECharts option={backgroundOption} style={{ height: 292, width: "100%" }} />
-            ) : (
-              <Box sx={{ height: 292, display: "grid", placeItems: "center", textAlign: "center" }}>
-                <Typography color="text.secondary">No background activity in this range.</Typography>
-              </Box>
-            )}
+            <Box
+              sx={{
+                display: "grid",
+                gridTemplateColumns: {
+                  xs: "repeat(2, minmax(0, 1fr))",
+                  md: "repeat(3, minmax(0, 1fr))",
+                },
+                gap: 1,
+                mt: 1.2,
+              }}
+            >
+              {(["app", "goal", "watcher", "sentinel", "arkpulse", "arkevolve"] as const).map(
+                (source) => {
+                  const meta = sourceMeta(source);
+                  const count = countForSource(response, source);
+                  const active = count > 0;
+                  const buckets = backgroundSparklines[source] ?? [];
+                  const bucketMax = buckets.reduce((m, v) => (v > m ? v : m), 0);
+                  const showSparkline = active && bucketMax > 0;
+                  return (
+                    <Box
+                      key={source}
+                      sx={{
+                        p: 1.2,
+                        borderRadius: "8px",
+                        border: `1px solid ${active ? `${meta.color}55` : "rgba(255,255,255,0.08)"}`,
+                        background: active
+                          ? `linear-gradient(180deg, ${meta.color}1f, rgba(7,13,18,0.4))`
+                          : "rgba(255,255,255,0.02)",
+                        minWidth: 0,
+                        position: "relative",
+                        overflow: "hidden",
+                      }}
+                    >
+                      <Stack
+                        direction="row"
+                        spacing={0.8}
+                        sx={{ alignItems: "center", mb: 0.6 }}
+                      >
+                        <Box
+                          sx={{
+                            width: 10,
+                            height: 10,
+                            borderRadius: "50%",
+                            flex: "0 0 auto",
+                            background: active ? meta.color : "rgba(255,255,255,0.2)",
+                            boxShadow: active ? `0 0 10px ${meta.color}` : "none",
+                          }}
+                        />
+                        <Typography
+                          variant="caption"
+                          sx={{
+                            color: active ? "#edf7f4" : "rgba(255,255,255,0.42)",
+                            textTransform: "uppercase",
+                            letterSpacing: "0.08em",
+                            fontWeight: 700,
+                            fontSize: "0.68rem",
+                            whiteSpace: "nowrap",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                          }}
+                        >
+                          {meta.label}
+                        </Typography>
+                      </Stack>
+                      <Stack
+                        direction="row"
+                        spacing={1}
+                        sx={{ alignItems: "flex-end", justifyContent: "space-between" }}
+                      >
+                        <Typography
+                          variant="h5"
+                          sx={{
+                            fontWeight: 700,
+                            color: active ? meta.color : "rgba(255,255,255,0.3)",
+                            fontVariantNumeric: "tabular-nums",
+                            lineHeight: 1,
+                            fontFamily: "var(--font-display)",
+                          }}
+                        >
+                          {count}
+                        </Typography>
+                        {showSparkline ? (
+                          <Box
+                            sx={{
+                              display: "flex",
+                              alignItems: "flex-end",
+                              gap: "3px",
+                              height: 20,
+                              flex: "0 1 auto",
+                              minWidth: 56,
+                            }}
+                          >
+                            {buckets.map((value, idx) => {
+                              const heightPct =
+                                value > 0
+                                  ? Math.max(18, Math.round((value / bucketMax) * 100))
+                                  : 10;
+                              return (
+                                <Box
+                                  key={idx}
+                                  sx={{
+                                    width: 4,
+                                    height: `${heightPct}%`,
+                                    borderRadius: "1px",
+                                    background:
+                                      value > 0 ? meta.color : `${meta.color}33`,
+                                    opacity: value > 0 ? 0.92 : 0.35,
+                                    boxShadow:
+                                      value > 0 ? `0 0 4px ${meta.color}` : "none",
+                                    transition:
+                                      "height 240ms ease, opacity 240ms ease",
+                                  }}
+                                  title={`Bucket ${idx + 1}: ${value} event${value === 1 ? "" : "s"}`}
+                                />
+                              );
+                            })}
+                          </Box>
+                        ) : null}
+                      </Stack>
+                    </Box>
+                  );
+                },
+              )}
+            </Box>
           </Box>
         </Grid2>
       </Grid2>
 
       <Grid2 container spacing={1.2}>
         <Grid2 size={{ xs: 12, lg: 7 }}>
-          <Box className="list-shell" sx={{ p: 1.2, minHeight: 330 }}>
+          <Box className="list-shell arkreflect-grid-pane" sx={{ p: 1.2, minHeight: 168 }}>
             <Typography variant="subtitle1" sx={{ fontWeight: 800, px: 0.4 }}>
               Timeline ribbon
             </Typography>
@@ -1132,16 +1700,16 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
               The rhythm of this period.
             </Typography>
             {allUnits.length > 0 ? (
-              <ReactECharts option={activityOption} style={{ height: 265, width: "100%" }} />
+              <ReactECharts option={activityOption} style={{ height: 110, width: "100%" }} />
             ) : (
-              <Box sx={{ height: 265, display: "grid", placeItems: "center", textAlign: "center" }}>
+              <Box sx={{ height: 110, display: "grid", placeItems: "center", textAlign: "center" }}>
                 <Typography color="text.secondary">No rhythm to show yet.</Typography>
               </Box>
             )}
           </Box>
         </Grid2>
         <Grid2 size={{ xs: 12, lg: 5 }}>
-          <Box className="list-shell" sx={{ p: 1.2, minHeight: 330 }}>
+          <Box className="list-shell arkreflect-grid-pane" sx={{ p: 1.2, minHeight: 330 }}>
             <Stack direction="row" spacing={1} sx={{ alignItems: "center", px: 0.4 }}>
               <DonutLargeRoundedIcon color="warning" />
               <Box>
@@ -1182,70 +1750,189 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
             <Chip size="small" label={`${totalUnits} item${totalUnits === 1 ? "" : "s"}`} />
           </Stack>
         </AccordionSummary>
-        <AccordionDetails>
-          <Grid2 container spacing={1.2}>
-            {clusters.map((cluster) => {
-              const sourceEntries = Object.entries(cluster.source_mix).sort((a, b) => b[1] - a[1]);
-              return (
-                <Grid2 size={{ xs: 12, md: 6, xl: 4 }} key={cluster.id}>
-                  <Box className="list-shell" sx={{ p: 1.35, minHeight: 240 }}>
-                    <Stack spacing={1}>
-                      <Stack direction="row" sx={{ alignItems: "flex-start", justifyContent: "space-between", gap: 1 }}>
-                        <Box sx={{ minWidth: 0 }}>
-                          <Typography variant="subtitle1" sx={{ fontWeight: 850, lineHeight: 1.2 }}>
-                            {clusterDisplayLabel(cluster)}
+        <AccordionDetails sx={{ pt: 0.5, pb: 1 }}>
+          {(() => {
+            const MAX_CLUSTERS = 6;
+            const ranked = [...clusters].sort((a, b) => b.unit_count - a.unit_count).slice(0, MAX_CLUSTERS);
+            const hiddenClusters = clusters.length - ranked.length;
+            const monoFont = "'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace";
+            const headerCellSx = {
+              fontSize: 8.5,
+              fontFamily: monoFont,
+              color: "rgba(180,210,225,0.42)",
+              letterSpacing: 1.2,
+              fontWeight: 600,
+              textTransform: "uppercase" as const,
+              py: 0.5,
+            };
+            return (
+              <Box>
+                <Box
+                  sx={{
+                    display: "grid",
+                    gridTemplateColumns: "28px 44px 1fr 56px 88px 96px",
+                    columnGap: 1.2,
+                    px: 0.8,
+                    borderBottom: "1px solid rgba(120,200,220,0.14)",
+                    alignItems: "center",
+                  }}
+                >
+                  <Box sx={headerCellSx}>idx</Box>
+                  <Box sx={headerCellSx}>code</Box>
+                  <Box sx={headerCellSx}>cluster</Box>
+                  <Box sx={{ ...headerCellSx, textAlign: "right" }}>units</Box>
+                  <Box sx={headerCellSx}>recent</Box>
+                  <Box sx={headerCellSx}>signal</Box>
+                </Box>
+                {ranked.map((cluster, i) => {
+                  const source = dominantSource(cluster);
+                  const meta = sourceMeta(source);
+                  const stroke = tacticalAccent(meta.color);
+                  const code = tacticalCode(source);
+                  const idx = String(i + 1).padStart(2, "0");
+                  const dedup = new Set<string>();
+                  let uniqueCount = 0;
+                  let mostRecent = 0;
+                  for (const u of cluster.units) {
+                    const k = unitDisplayTitle(u).trim().toLowerCase();
+                    if (!dedup.has(k)) {
+                      dedup.add(k);
+                      uniqueCount += 1;
+                    }
+                    const ts = Date.parse(u.occurred_at);
+                    if (Number.isFinite(ts) && ts > mostRecent) mostRecent = ts;
+                  }
+                  const recentLabel = mostRecent > 0
+                    ? formatUiDateTime(new Date(mostRecent).toISOString(), { fallback: "—" })
+                    : "—";
+                  const recurring = cluster.related_history.mode === "recurring";
+                  const title = (clusterLabelById[cluster.id] ?? clusterDisplayLabel(cluster)).trim();
+                  return (
+                    <Box
+                      key={cluster.id}
+                      sx={{
+                        display: "grid",
+                        gridTemplateColumns: "28px 44px 1fr 56px 88px 96px",
+                        columnGap: 1.2,
+                        px: 0.8,
+                        py: 0.7,
+                        alignItems: "center",
+                        borderBottom: "1px solid rgba(120,200,220,0.06)",
+                        transition: "background 160ms ease",
+                        "&:hover": { background: "rgba(120,200,220,0.04)" },
+                      }}
+                    >
+                      <Box sx={{ fontSize: 9.5, fontFamily: monoFont, color: "rgba(180,210,225,0.5)", letterSpacing: 0.6 }}>
+                        {idx}
+                      </Box>
+                      <Box
+                        sx={{
+                          fontSize: 9.5,
+                          fontFamily: monoFont,
+                          color: stroke,
+                          letterSpacing: 0.8,
+                          fontWeight: 600,
+                          border: `1px solid ${stroke}`,
+                          borderRadius: 0.5,
+                          px: 0.5,
+                          py: 0.1,
+                          textAlign: "center",
+                          width: "fit-content",
+                          opacity: 0.92,
+                        }}
+                      >
+                        {code}
+                      </Box>
+                      <Box sx={{ minWidth: 0 }}>
+                        <Typography
+                          sx={{
+                            fontSize: 12,
+                            fontFamily: monoFont,
+                            fontWeight: 600,
+                            color: "rgba(232,242,250,0.92)",
+                            letterSpacing: 0.3,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          {title.toUpperCase()}
+                        </Typography>
+                        {uniqueCount < cluster.unit_count ? (
+                          <Typography
+                            sx={{
+                              fontSize: 9,
+                              fontFamily: monoFont,
+                              color: "rgba(180,210,225,0.4)",
+                              letterSpacing: 0.4,
+                              mt: 0.1,
+                            }}
+                          >
+                            {uniqueCount} unique · {cluster.unit_count - uniqueCount} repeat{cluster.unit_count - uniqueCount === 1 ? "" : "s"}
                           </Typography>
-                          <Typography variant="body2" color="text.secondary" sx={{ mt: 0.35 }}>
-                            {clusterPlainSummary(cluster)}
-                          </Typography>
-                        </Box>
-                        <Chip size="small" label={cluster.unit_count} sx={{ fontWeight: 800 }} />
-                      </Stack>
-                      <Stack direction="row" sx={{ flexWrap: "wrap", gap: 0.65 }}>
-                        {sourceEntries.map(([label, count]) => (
-                          <Chip
-                            key={label}
-                            size="small"
-                            icon={sourceIcon(label)}
-                            label={`${label} ${count}`}
-                            variant="outlined"
-                          />
-                        ))}
-                        <Chip
-                          size="small"
-                          color={relatedHistoryColor(cluster.related_history)}
-                          label={relatedHistoryLabel(cluster.related_history)}
-                          variant={cluster.related_history.mode === "unavailable" ? "outlined" : "filled"}
-                        />
-                      </Stack>
-                      <Typography variant="body2" color="text.secondary">
-                        {relatedHistoryText(cluster.related_history)}
-                      </Typography>
-                      <Divider />
-                      <Stack spacing={0.9}>
-                        {cluster.units.slice(0, 4).map((unit) => (
-                          <Box key={unit.id} sx={{ minWidth: 0 }}>
-                            <Stack direction="row" spacing={0.75} sx={{ alignItems: "center" }}>
-                              <Chip size="small" label={unit.source_label} sx={{ height: 22 }} />
-                              <Typography variant="caption" color="text.secondary">
-                                {formatUiDateTime(unit.occurred_at, { fallback: unit.occurred_at })}
-                              </Typography>
-                            </Stack>
-                            <Typography variant="body2" sx={{ mt: 0.35, fontWeight: 700 }}>
-                              {unitDisplayTitle(unit)}
-                            </Typography>
-                            <Typography variant="body2" color="text.secondary">
-                              {unit.content_preview || unit.summary}
-                            </Typography>
-                          </Box>
-                        ))}
-                      </Stack>
-                    </Stack>
-                  </Box>
-                </Grid2>
-              );
-            })}
-          </Grid2>
+                        ) : null}
+                      </Box>
+                      <Box
+                        sx={{
+                          fontSize: 11,
+                          fontFamily: monoFont,
+                          color: stroke,
+                          fontWeight: 700,
+                          textAlign: "right",
+                          letterSpacing: 0.4,
+                        }}
+                      >
+                        {String(cluster.unit_count).padStart(3, "0")}
+                      </Box>
+                      <Box
+                        sx={{
+                          fontSize: 9.5,
+                          fontFamily: monoFont,
+                          color: "rgba(180,210,225,0.55)",
+                          letterSpacing: 0.4,
+                          whiteSpace: "nowrap",
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                        }}
+                      >
+                        {recentLabel}
+                      </Box>
+                      <Box
+                        sx={{
+                          fontSize: 9,
+                          fontFamily: monoFont,
+                          color: recurring ? stroke : "rgba(180,210,225,0.45)",
+                          letterSpacing: 0.6,
+                          fontWeight: 500,
+                        }}
+                      >
+                        {recurring ? "◆ RECURRING" : "◇ NEW"}
+                      </Box>
+                    </Box>
+                  );
+                })}
+                <Box
+                  sx={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    px: 0.8,
+                    pt: 1,
+                    fontSize: 8.5,
+                    fontFamily: monoFont,
+                    color: "rgba(180,210,225,0.42)",
+                    letterSpacing: 0.8,
+                  }}
+                >
+                  <span>◢ TOP {ranked.length} BY ACTIVITY</span>
+                  <span>
+                    {hiddenClusters > 0
+                      ? `${hiddenClusters} CLUSTER${hiddenClusters === 1 ? "" : "S"} OMITTED · ${totalUnits} TOTAL UNITS`
+                      : `${totalUnits} TOTAL UNITS`}
+                  </span>
+                </Box>
+              </Box>
+            );
+          })()}
         </AccordionDetails>
       </Accordion>
 

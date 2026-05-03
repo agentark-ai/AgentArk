@@ -816,9 +816,9 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
         title="ArkEvolve"
         description={
           <>
-            ArkEvolve is a continuous self-improvement loop running on your private usage.
+            ArkEvolve quietly improves AgentArk based on how you actually use it.
             <br />
-            It generates candidate changes to prompts, routing, and specialists, tests each against your own runs and statistical evidence thresholds, and asks before anything becomes permanent.
+            Each candidate change is tested against your own runs, then asked before anything sticks.
           </>
         }
         actions={
@@ -877,6 +877,58 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
       />
       {success ? <Alert severity="success">{success}</Alert> : null}
       {activeError ? <Alert severity="error">{activeError}</Alert> : null}
+      {!showArkEvolveInternals ? (
+        <>
+          <Box className="list-shell" sx={{ p: 1.5 }}>
+            <Stack spacing={0.5}>
+              <Typography variant="body1" sx={{ fontWeight: 700, color: "#e8f4ff" }}>
+                ArkEvolve is {toBool(evolution.self_evolve_enabled) ? "on" : "off"}.
+              </Typography>
+              <Typography variant="body2" sx={{ color: "text.secondary", lineHeight: 1.6 }}>
+                {activeTests > 0
+                  ? `${activeTests} active experiment${activeTests === 1 ? "" : "s"}.`
+                  : "No experiment running right now."}{" "}
+                {needsApprovalCount > 0
+                  ? `${needsApprovalCount} change${needsApprovalCount === 1 ? "" : "s"} waiting on you.`
+                  : "Nothing waiting on you."}{" "}
+                {promotedChangeCount > 0
+                  ? `${promotedChangeCount} confirmed improvement${promotedChangeCount === 1 ? "" : "s"} so far.`
+                  : "No confirmed improvements yet."}
+              </Typography>
+            </Stack>
+          </Box>
+          <Accordion
+            disableGutters
+            sx={{
+              background: "transparent",
+              border: "1px solid var(--ui-rgba-145-170-205-120)",
+              borderRadius: 1,
+              "&::before": { display: "none" },
+            }}
+          >
+            <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ px: 1.5 }}>
+              <Typography variant="body2" sx={{ fontWeight: 700, color: "#e8f4ff" }}>
+                How does ArkEvolve work?
+              </Typography>
+            </AccordionSummary>
+            <AccordionDetails sx={{ px: 1.5, pb: 1.5 }}>
+              <Stack spacing={1.1}>
+                <Typography variant="body2" sx={{ color: "text.secondary", lineHeight: 1.65 }}>
+                  ArkEvolve watches how AgentArk performs on your real work. When it spots corrected runs, slow turns, or recurring patterns, it drafts a candidate improvement to a prompt, a routing rule, or a specialist behavior.
+                </Typography>
+                <Typography variant="body2" sx={{ color: "text.secondary", lineHeight: 1.65 }}>
+                  Each candidate is tested against your own runs and statistical evidence thresholds. Only changes that beat the current behavior with confidence get promoted, and meaningful changes always ask before becoming permanent.
+                </Typography>
+                <Typography variant="body2" sx={{ color: "text.secondary", lineHeight: 1.65 }}>
+                  Toggle <strong>Show ArkEvolve internals</strong> at the top right to see live experiments, evidence, the review queue, and per-step diagnostics.
+                </Typography>
+              </Stack>
+            </AccordionDetails>
+          </Accordion>
+        </>
+      ) : null}
+      {showArkEvolveInternals ? (
+        <>
       <EvolutionStatStrip
         items={[
           {
@@ -929,131 +981,21 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
       />
       <Box className="list-shell" sx={{ p: 1.25 }}>
         <Stack spacing={1.15}>
-          <Stack
-            direction={{ xs: "column", lg: "row" }}
-            spacing={1}
-            sx={{
-              alignItems: { xs: "flex-start", lg: "center" },
-              justifyContent: "space-between",
-            }}
-          >
-            <Box sx={{ minWidth: 0 }}>
-              <Typography
-                variant="subtitle1"
-                sx={{ color: "#e8f4ff", fontWeight: 700 }}
-              >
-                Improve AgentArk
-              </Typography>
-              <Typography
-                variant="body2"
-                sx={{ color: "text.secondary", mt: 0.25 }}
-              >
-                Learn from corrected or slow turns, test safer behavior on a
-                small rollout, then approve or roll back from here.
-              </Typography>
-            </Box>
-            <Stack
-              direction="row"
-              spacing={0.75}
-              useFlexGap
-              sx={{ alignItems: "center", flexWrap: "wrap" }}
+          <Box sx={{ minWidth: 0 }}>
+            <Typography
+              variant="subtitle1"
+              sx={{ color: "#e8f4ff", fontWeight: 700 }}
             >
-              {!toBool(evolution.self_evolve_enabled) ? (
-                <Button
-                  size="small"
-                  variant="contained"
-                  disabled={
-                    statusLoading ||
-                    updateEvolutionMutation.isPending ||
-                    runEvolutionActionMutation.isPending
-                  }
-                  onClick={() =>
-                    void updateEvolution(
-                      { self_evolve_enabled: true },
-                      "ArkEvolve learning is on.",
-                    )
-                  }
-                >
-                  Turn on learning
-                </Button>
-              ) : (
-                <Chip size="small" color="success" label="Learning on" />
-              )}
-              <Button
-                size="small"
-                variant="contained"
-                disabled={guidedOptimizationDisabled}
-                onClick={() =>
-                  void runEvolutionAction(
-                    { action: "run_guided_optimization" },
-                    "Optimization check finished.",
-                  )
-                }
-              >
-                Find improvement
-              </Button>
-              <Button
-                size="small"
-                color="inherit"
-                disabled={runEvolutionActionMutation.isPending}
-                onClick={() => setTab("review")}
-              >
-                Review queue
-              </Button>
-              {hasActiveRoutingCanary ? (
-                <>
-                  <Button
-                    size="small"
-                    color="success"
-                    variant="outlined"
-                    disabled={runEvolutionActionMutation.isPending}
-                    onClick={() =>
-                      void runEvolutionAction(
-                        { action: "promote_candidate" },
-                        "Routing test approved as stable.",
-                        "Approve the active routing test as the stable behavior?",
-                      )
-                    }
-                  >
-                    Approve test
-                  </Button>
-                  <Button
-                    size="small"
-                    color="warning"
-                    variant="outlined"
-                    disabled={runEvolutionActionMutation.isPending}
-                    onClick={() =>
-                      void runEvolutionAction(
-                        { action: "disable_canary" },
-                        "Routing test stopped.",
-                        "Stop the active routing test and keep the current stable behavior?",
-                      )
-                    }
-                  >
-                    Stop test
-                  </Button>
-                </>
-              ) : null}
-              <Button
-                size="small"
-                color="warning"
-                variant="outlined"
-                disabled={
-                  runEvolutionActionMutation.isPending ||
-                  !routingRollbackAvailable
-                }
-                onClick={() =>
-                  void runEvolutionAction(
-                    { action: "rollback_baseline" },
-                    "Rolled back the last routing policy change.",
-                    "Roll back the last stable routing-policy change if a snapshot is available?",
-                  )
-                }
-              >
-                Roll back
-              </Button>
-            </Stack>
-          </Stack>
+              Improve AgentArk
+            </Typography>
+            <Typography
+              variant="body2"
+              sx={{ color: "text.secondary", mt: 0.25 }}
+            >
+              Learn from corrected or slow turns, test safer behavior on a
+              small rollout, then approve or roll back from here.
+            </Typography>
+          </Box>
           <Box
             sx={{
               display: "grid",
@@ -1201,115 +1143,52 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
 
           <Box
             sx={{
-              display: "grid",
-              gridTemplateColumns: {
-                xs: "1fr",
-                md: "repeat(4, minmax(0, 1fr))",
-              },
+              pt: 1,
               borderTop: "1px solid var(--ui-rgba-145-170-205-120)",
+              display: "flex",
+              flexDirection: "column",
+              gap: 0.5,
+              fontVariantNumeric: "tabular-nums",
             }}
           >
-            {[
-              {
-                label: "Status",
-                value: backgroundImprovementLabel,
-                helper: backgroundImprovementSummary,
-                tone:
-                  backgroundImprovementColor === "success" ? "success" : "default",
-              },
-              {
-                label: "Quiet queue",
-                value:
-                  gepaRunningJobs > 0
-                    ? "Running"
-                    : gepaPendingJobs > 0
-                      ? `${gepaPendingJobs} waiting`
-                      : "Clear",
-                helper:
-                  gepaRunningJobs > 0
-                    ? "A background check is active."
-                    : gepaPendingJobs > 0
-                      ? "It will start after active work settles."
-                      : "No background improvement is queued.",
-                tone:
-                  gepaRunningJobs > 0 || gepaPendingJobs > 0
-                    ? "warning"
-                    : "success",
-              },
-              {
-                label: "Evidence",
-                value:
-                  gepaEvidenceSamples > 0
-                    ? `${gepaEvidenceSamples} fresh sample${gepaEvidenceSamples === 1 ? "" : "s"}`
-                    : "Collecting",
-                helper: "Runs after enough completed work is available.",
-                tone: gepaEvidenceSamples >= 6 ? "success" : "default",
-              },
-              {
-                label: "Daily guardrail",
-                value: `$${gepaRemainingBudgetUsd.toFixed(2)} left`,
-                helper: `${num(gepaBudget.runs_today, 0)} of ${num(
-                  gepaBudget.max_runs_per_day,
-                  1,
-                )} background check${num(gepaBudget.max_runs_per_day, 1) === 1 ? "" : "s"} used today`,
-                tone: gepaBudgetAllowed ? "success" : "warning",
-              },
-            ].map((item, idx) => (
-              <Box
-                key={item.label}
-                sx={{
-                  py: 1,
-                  px: { xs: 0, md: 1.1 },
-                  pr: idx === 3 ? 0 : { xs: 0, md: 1.1 },
-                  borderRight:
-                    idx === 3
-                      ? "none"
-                      : {
-                          xs: "none",
-                          md: "1px solid var(--ui-rgba-145-170-205-120)",
-                        },
-                }}
-              >
-                <Typography
-                  variant="caption"
-                  sx={{
-                    color: "text.secondary",
-                    display: "block",
-                    textTransform: "uppercase",
-                    letterSpacing: 0,
-                  }}
-                >
-                  {item.label}
-                </Typography>
-                <Typography
-                  variant="body2"
-                  sx={{
-                    color:
-                      item.tone === "success"
-                        ? "#8ee3b1"
-                        : item.tone === "warning"
-                          ? "#ffd180"
-                          : "#e8f4ff",
-                    fontWeight: 650,
-                    mt: 0.2,
-                    wordBreak: "break-word",
-                  }}
-                >
-                  {item.value}
-                </Typography>
-                <Typography
-                  variant="caption"
-                  sx={{
-                    color: "text.secondary",
-                    display: "block",
-                    mt: 0.25,
-                    overflowWrap: "anywhere",
-                  }}
-                >
-                  {item.helper}
-                </Typography>
-              </Box>
-            ))}
+            <Typography variant="body2" sx={{ color: "text.secondary", lineHeight: 1.6 }}>
+              {gepaRunningJobs > 0 ? (
+                <>
+                  A background check is <strong style={{ color: "#ffd180" }}>running now</strong>.{" "}
+                  {backgroundImprovementSummary}
+                </>
+              ) : gepaPendingJobs > 0 ? (
+                <>
+                  <strong style={{ color: "#ffd180" }}>{gepaPendingJobs}</strong> check
+                  {gepaPendingJobs === 1 ? "" : "s"} queued, waiting for active work to settle.
+                </>
+              ) : (
+                <>
+                  Queue is <strong style={{ color: "#8ee3b1" }}>clear</strong>. {backgroundImprovementSummary}
+                </>
+              )}
+            </Typography>
+            <Typography variant="body2" sx={{ color: "text.secondary", lineHeight: 1.6 }}>
+              {gepaEvidenceSamples > 0 ? (
+                <>
+                  <strong style={{ color: gepaEvidenceSamples >= 6 ? "#8ee3b1" : "#e8f4ff" }}>
+                    {gepaEvidenceSamples}
+                  </strong>{" "}
+                  fresh sample{gepaEvidenceSamples === 1 ? "" : "s"} collected.
+                </>
+              ) : (
+                <>Collecting more completed work before the next check.</>
+              )}{" "}
+              Runs after enough completed work is available.
+            </Typography>
+            <Typography variant="body2" sx={{ color: "text.secondary", lineHeight: 1.6 }}>
+              <strong style={{ color: gepaBudgetAllowed ? "#8ee3b1" : "#ffd180" }}>
+                ${gepaRemainingBudgetUsd.toFixed(2)}
+              </strong>{" "}
+              of today&apos;s budget remaining ({num(gepaBudget.runs_today, 0)} of{" "}
+              {num(gepaBudget.max_runs_per_day, 1)} background check
+              {num(gepaBudget.max_runs_per_day, 1) === 1 ? "" : "s"} used).
+            </Typography>
           </Box>
 
           {!gepaReady && !showArkEvolveInternals ? (
@@ -4194,6 +4073,8 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
           <Button onClick={() => setReadinessDialog(null)}>Close</Button>
         </DialogActions>
       </Dialog>
+        </>
+      ) : null}
     </WorkspacePageShell>
   );
 }

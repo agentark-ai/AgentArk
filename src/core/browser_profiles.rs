@@ -3,8 +3,8 @@
 //! This module keeps profile state in the existing encrypted KV store so we can
 //! add browser profile management without introducing schema churn.
 
-use anyhow::{bail, Context, Result};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::storage::Storage;
 

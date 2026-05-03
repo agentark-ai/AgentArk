@@ -181,8 +181,7 @@ ping -n 2 127.0.0.1 >nul
 goto verify_lightpanda_loop
 
 :verify_lightpanda_async
-if not exist ".agentark" mkdir ".agentark" >nul 2>&1
-start "" /b /d "%CD%" "%ComSpec%" /c call "%~f0" verify-lightpanda ^> ".agentark\lightpanda-check.log" 2^>^&1
+start "" /b /d "%CD%" "%ComSpec%" /c call "%~f0" verify-lightpanda ^>nul 2^>^&1
 exit /b 0
 
 :verify_gepa
@@ -203,8 +202,7 @@ ping -n 2 127.0.0.1 >nul
 goto verify_gepa_loop
 
 :verify_gepa_async
-if not exist ".agentark" mkdir ".agentark" >nul 2>&1
-start "" /b /d "%CD%" "%ComSpec%" /c call "%~f0" verify-gepa ^> ".agentark\gepa-check.log" 2^>^&1
+start "" /b /d "%CD%" "%ComSpec%" /c call "%~f0" verify-gepa ^>nul 2^>^&1
 exit /b 0
 
 :usage

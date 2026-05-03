@@ -2,7 +2,7 @@
 
 pub(crate) mod stream_blocks;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use futures::StreamExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -11,9 +11,9 @@ use tokio::sync::mpsc::Sender;
 
 use crate::core::agent::{ConversationMessage, StreamEvent};
 use crate::core::llm_provider::{
-    display_openai_base_url, force_refresh_codex_cli_api_key, is_codex_cli_base_url,
-    openai_provider_label, resolve_openai_request_config, PromptCacheCapability,
-    ResolvedOpenAiRequestConfig,
+    PromptCacheCapability, ResolvedOpenAiRequestConfig, display_openai_base_url,
+    force_refresh_codex_cli_api_key, is_codex_cli_base_url, openai_provider_label,
+    resolve_openai_request_config,
 };
 
 // OpenRouter enforces request affordability against the declared output budget.
@@ -1620,11 +1620,11 @@ mod tests {
         parse_partial_tool_arguments, prompt_cache_uses_openai_explicit_key,
         should_request_openai_stream_usage, total_tokens_or_sum,
     };
-    use crate::core::llm_provider::{
-        PromptCacheCapability, ResolvedOpenAiRequestConfig, OPENAI_PROVIDER_ID,
-        OPENROUTER_PROVIDER_ID,
-    };
     use crate::core::StreamEvent;
+    use crate::core::llm_provider::{
+        OPENAI_PROVIDER_ID, OPENROUTER_PROVIDER_ID, PromptCacheCapability,
+        ResolvedOpenAiRequestConfig,
+    };
     use std::collections::HashMap;
 
     #[test]
@@ -1666,10 +1666,12 @@ mod tests {
             normalized.get("type").and_then(|v| v.as_str()),
             Some("object")
         );
-        assert!(normalized
-            .get("properties")
-            .and_then(|v| v.as_object())
-            .is_some());
+        assert!(
+            normalized
+                .get("properties")
+                .and_then(|v| v.as_object())
+                .is_some()
+        );
         assert!(normalized.get("anyOf").is_none());
         let description = normalized
             .get("description")
@@ -2601,8 +2603,9 @@ impl LlmClient {
         let mode_label = model_request_mode_label(mode);
         let timeout_secs = llm_non_stream_total_timeout_secs();
         let start = std::time::Instant::now();
-        let result =
-            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
+        let result = match tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            async {
                 match &self.provider {
                     LlmProvider::Anthropic { api_key, model } => {
                         self.chat_anthropic_with_history(
@@ -2645,18 +2648,19 @@ impl LlmClient {
                         .await
                     }
                 }
-            })
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(anyhow!(
+            },
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!(
                 "LLM non-streaming request timed out after {}s (provider={}, model={}, mode={})",
                 timeout_secs,
                 provider_name,
                 model_name,
                 mode_label
             )),
-            };
+        };
 
         let elapsed = start.elapsed();
         match &result {

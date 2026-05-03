@@ -1,7 +1,7 @@
 use super::*;
 use crate::core::autonomy::{RecommendedAction, RiskEnvelope};
-use axum::body::{Body, to_bytes};
-use axum::http::{HeaderValue, Request, header};
+use axum::body::{to_bytes, Body};
+use axum::http::{header, HeaderValue, Request};
 use axum::routing::{get, post};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tempfile::TempDir;
@@ -55,6 +55,7 @@ async fn build_test_state() -> (AppState, TempDir, TempDir) {
         whatsapp_bridge: Arc::new(RwLock::new(WhatsAppBridgeState::new())),
         security_events,
         app_registry,
+        app_publish_locks: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
         executor_client: None,
         workspace_client: None,
         application_registry: applications::ApplicationLauncherRegistry::default(),
@@ -527,13 +528,11 @@ async fn chat_rejects_oversized_messages() {
     let response = router.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     let payload = response_json(response).await;
-    assert!(
-        payload
-            .get("error")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default()
-            .contains("100000")
-    );
+    assert!(payload
+        .get("error")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .contains("100000"));
 }
 
 #[tokio::test]
@@ -564,12 +563,10 @@ async fn chat_fast_path_stores_secret_without_live_server() {
     let response = router.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let payload = response_json(response).await;
-    assert!(
-        payload["response"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("Saved secret 'TEST_FAST_PATH_SECRET'")
-    );
+    assert!(payload["response"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("Saved secret 'TEST_FAST_PATH_SECRET'"));
 
     let manager = crate::core::config::SecureConfigManager::new_with_data_dir(
         config_dir.path(),
@@ -612,17 +609,13 @@ async fn chat_fast_path_controls_notifications_without_live_server() {
     let response = router.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let payload = response_json(response).await;
-    assert!(
-        payload["response"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("Push notifications paused until")
-    );
-    assert!(
-        payload["conversation_id"]
-            .as_str()
-            .is_some_and(|value| !value.trim().is_empty())
-    );
+    assert!(payload["response"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("Push notifications paused until"));
+    assert!(payload["conversation_id"]
+        .as_str()
+        .is_some_and(|value| !value.trim().is_empty()));
 
     let agent = state.agent.read().await;
     assert!(agent.push_notifications_muted_until_ts().await.is_some());
@@ -1280,13 +1273,11 @@ async fn resume_chat_stream_rejects_non_chat_and_paused_tasks() {
         .unwrap();
     assert_eq!(non_chat_response.status(), StatusCode::CONFLICT);
     let non_chat_body = response_json(non_chat_response).await;
-    assert!(
-        non_chat_body
-            .get("error")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default()
-            .contains("Only chat-request tasks")
-    );
+    assert!(non_chat_body
+        .get("error")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .contains("Only chat-request tasks"));
 
     let mut paused_chat_task = crate::core::Task::new(
         "Paused chat task".to_string(),
@@ -1315,13 +1306,11 @@ async fn resume_chat_stream_rejects_non_chat_and_paused_tasks() {
         .unwrap();
     assert_eq!(paused_response.status(), StatusCode::CONFLICT);
     let paused_body = response_json(paused_response).await;
-    assert!(
-        paused_body
-            .get("error")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default()
-            .contains("cancelled or failed")
-    );
+    assert!(paused_body
+        .get("error")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .contains("cancelled or failed"));
 }
 
 #[tokio::test]
@@ -1469,13 +1458,11 @@ async fn generic_resume_and_retry_reject_chat_request_tasks() {
         .unwrap();
     assert_eq!(resume_response.status(), StatusCode::CONFLICT);
     let resume_body = response_json(resume_response).await;
-    assert!(
-        resume_body
-            .get("error")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default()
-            .contains("resume-chat/stream")
-    );
+    assert!(resume_body
+        .get("error")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .contains("resume-chat/stream"));
 
     let mut cancelled_chat_task = crate::core::Task::new(
         "Cancelled chat task".to_string(),
@@ -1504,13 +1491,11 @@ async fn generic_resume_and_retry_reject_chat_request_tasks() {
         .unwrap();
     assert_eq!(retry_response.status(), StatusCode::CONFLICT);
     let retry_body = response_json(retry_response).await;
-    assert!(
-        retry_body
-            .get("error")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default()
-            .contains("resume-chat/stream")
-    );
+    assert!(retry_body
+        .get("error")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .contains("resume-chat/stream"));
 }
 
 #[tokio::test]
@@ -1624,12 +1609,11 @@ async fn settings_endpoint_rejects_discord_without_bot_token() {
     let response = router.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = response_json(response).await;
-    assert!(
-        body.get("error")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default()
-            .contains("Discord bot token is required")
-    );
+    assert!(body
+        .get("error")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .contains("Discord bot token is required"));
 }
 
 #[tokio::test]
@@ -1656,12 +1640,11 @@ async fn settings_endpoint_rejects_discord_without_scope() {
     let response = router.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = response_json(response).await;
-    assert!(
-        body.get("error")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default()
-            .contains("guild, channel, or thread scope")
-    );
+    assert!(body
+        .get("error")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .contains("guild, channel, or thread scope"));
 }
 
 #[tokio::test]
@@ -1689,12 +1672,11 @@ async fn settings_endpoint_requires_google_chat_verify_token() {
     let response = router.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = response_json(response).await;
-    assert!(
-        body.get("error")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default()
-            .contains("verification token")
-    );
+    assert!(body
+        .get("error")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .contains("verification token"));
 }
 
 #[tokio::test]
@@ -1721,12 +1703,11 @@ async fn settings_endpoint_rejects_incomplete_matrix_config() {
     let response = router.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = response_json(response).await;
-    assert!(
-        body.get("error")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default()
-            .contains("Matrix homeserver URL and user ID are required")
-    );
+    assert!(body
+        .get("error")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .contains("Matrix homeserver URL and user ID are required"));
 }
 
 #[tokio::test]
@@ -1868,12 +1849,11 @@ async fn profile_onboarding_endpoint_rejects_invalid_timezone() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = response_json(response).await;
-    assert!(
-        body.get("error")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default()
-            .contains("Invalid timezone")
-    );
+    assert!(body
+        .get("error")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .contains("Invalid timezone"));
 }
 
 #[tokio::test]
@@ -1909,16 +1889,12 @@ async fn gateway_channels_endpoint_returns_transport_inventory() {
         .get("channels")
         .and_then(|value| value.as_array())
         .expect("channels array");
-    assert!(
-        channels
-            .iter()
-            .any(|channel| { channel.get("id").and_then(|value| value.as_str()) == Some("slack") })
-    );
-    assert!(
-        channels
-            .iter()
-            .any(|channel| { channel.get("id").and_then(|value| value.as_str()) == Some("teams") })
-    );
+    assert!(channels
+        .iter()
+        .any(|channel| { channel.get("id").and_then(|value| value.as_str()) == Some("slack") }));
+    assert!(channels
+        .iter()
+        .any(|channel| { channel.get("id").and_then(|value| value.as_str()) == Some("teams") }));
 }
 
 #[tokio::test]
@@ -2265,12 +2241,11 @@ async fn whatsapp_bridge_status_reports_external_warning_for_legacy_bridge() {
         body.get("managed_by").and_then(|value| value.as_str()),
         Some("external")
     );
-    assert!(
-        body.get("warning")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default()
-            .contains("legacy configuration")
-    );
+    assert!(body
+        .get("warning")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .contains("legacy configuration"));
     assert!(body.get("installed").is_none());
 }
 
@@ -2365,12 +2340,11 @@ async fn update_settings_rejects_new_external_whatsapp_bridge_without_token() {
         "unexpected response: {}",
         body
     );
-    assert!(
-        body.get("error")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default()
-            .contains("external bridge token is required")
-    );
+    assert!(body
+        .get("error")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .contains("external bridge token is required"));
 }
 
 #[tokio::test]
@@ -2431,12 +2405,11 @@ async fn arkpulse_fix_rejects_command_text_without_structured_remediation() {
     let response = router.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = response_json(response).await;
-    assert!(
-        body.get("error")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default()
-            .contains("no executable ArkPulse auto-fix")
-    );
+    assert!(body
+        .get("error")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .contains("no executable ArkPulse auto-fix"));
 }
 
 #[tokio::test]
@@ -2860,24 +2833,18 @@ fn build_prompt_insights_surfaces_end_to_end_regressions() {
 
     let insights = build_prompt_insights(&metrics, Some(&canary_state));
 
-    assert!(
-        insights
-            .regressions
-            .iter()
-            .any(|line| line.contains("End-to-end experience success is down"))
-    );
-    assert!(
-        insights
-            .regressions
-            .iter()
-            .any(|line| line.contains("Tool success is down"))
-    );
-    assert!(
-        insights
-            .regressions
-            .iter()
-            .any(|line| line.contains("p95 latency regressed"))
-    );
+    assert!(insights
+        .regressions
+        .iter()
+        .any(|line| line.contains("End-to-end experience success is down")));
+    assert!(insights
+        .regressions
+        .iter()
+        .any(|line| line.contains("Tool success is down")));
+    assert!(insights
+        .regressions
+        .iter()
+        .any(|line| line.contains("p95 latency regressed")));
 }
 
 #[test]
@@ -2904,27 +2871,21 @@ fn build_prompt_optimization_opportunities_include_change_preview() {
         .find(|item| item.id == "prompt-opt-runtime-summary-compact")
         .expect("runtime summary proposal should exist");
 
-    assert!(
-        proposal
-            .change_preview
-            .before
-            .iter()
-            .any(|line| line.contains("1,962 chars"))
-    );
-    assert!(
-        proposal
-            .change_preview
-            .after
-            .iter()
-            .any(|line| line.contains("compact runtime-access profile"))
-    );
-    assert!(
-        proposal
-            .change_preview
-            .impact_estimate
-            .iter()
-            .any(|line| line.contains("6.2%"))
-    );
+    assert!(proposal
+        .change_preview
+        .before
+        .iter()
+        .any(|line| line.contains("1,962 chars")));
+    assert!(proposal
+        .change_preview
+        .after
+        .iter()
+        .any(|line| line.contains("compact runtime-access profile")));
+    assert!(proposal
+        .change_preview
+        .impact_estimate
+        .iter()
+        .any(|line| line.contains("6.2%")));
 }
 
 #[test]
@@ -2972,24 +2933,20 @@ fn build_learning_candidate_summary_includes_strategy_preview() {
             .and_then(|value| value.as_str()),
         Some("learned-strategy-abc123")
     );
-    assert!(
-        preview
-            .get("default_guidance")
-            .and_then(|value| value.as_array())
-            .expect("default guidance")
-            .iter()
-            .filter_map(|value| value.as_str())
-            .any(|line| line.contains("Prefer proven local procedures"))
-    );
-    assert!(
-        preview
-            .get("task_guidance")
-            .and_then(|value| value.as_array())
-            .expect("task guidance")
-            .iter()
-            .filter_map(|value| value.as_str())
-            .any(|line| line.starts_with("research:"))
-    );
+    assert!(preview
+        .get("default_guidance")
+        .and_then(|value| value.as_array())
+        .expect("default guidance")
+        .iter()
+        .filter_map(|value| value.as_str())
+        .any(|line| line.contains("Prefer proven local procedures")));
+    assert!(preview
+        .get("task_guidance")
+        .and_then(|value| value.as_array())
+        .expect("task guidance")
+        .iter()
+        .filter_map(|value| value.as_str())
+        .any(|line| line.starts_with("research:")));
 }
 
 #[test]

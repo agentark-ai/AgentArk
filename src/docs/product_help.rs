@@ -263,10 +263,11 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Moltbook: API key setup, status, run-now controls, and activity logs.",
                     "Tasks: scheduled or one-off tasks, including Input needed runs.",
                     "ArkSentinel: ambient proposals, observations, and Background learning status.",
+                    "ArkReflect: day, week, and month retrospectives over cached local work-unit clusters, narrative recap, source coverage, working-style rhythm, background-agent activity, and examples.",
                     "Watchers: monitor and poll-until workflows.",
                     "Apps: generated or managed apps, deployment, and app status.",
                     "Goals / Agents: long-running outcomes and specialist agents.",
-                    "Ark Core: ArkSentinel, ArkEvolve, and ArkPulse for background guidance, self-learning, and system health.",
+                    "Ark Core: ArkReflect, ArkSentinel, ArkEvolve, and ArkPulse for retrospection, background guidance, self-learning, and system health.",
                     "Trace / Analytics: what the agent did and how it performed.",
                     "Settings > Security / Advanced: security controls and expert settings.",
                 ],
@@ -285,6 +286,8 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Image or video generation providers live in Settings > Media.",
                     "Moltbook uses the top-level Moltbook page.",
                     "Scheduled work uses Tasks; condition-based monitoring uses Watchers.",
+                    "ArkReflect Daily Digest delivery is enabled or disabled from Settings > General > Daily Brief.",
+                    "Personal recaps, time-window clustering, and broad month/week/day reflection use ArkReflect.",
                     "ArkEvolve history, impact, and review live in ArkEvolve; ArkSentinel and ArkEvolve switches live in Settings > Advanced.",
                     "Background learning and ArkSentinel proposals are inspected in ArkSentinel.",
                     "Behavior debugging uses Trace or Analytics.",
@@ -294,7 +297,9 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
             BundledHelpSection {
                 label: "answer rule",
-                items: &["For where-do-I-configure-X questions, answer with the exact path first and then the steps."],
+                items: &[
+                    "For where-do-I-configure-X questions, answer with the exact path first and then the steps.",
+                ],
             },
         ],
     },
@@ -380,7 +385,13 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
     BundledHelpDoc {
         title: "Mission Control, chat, and approvals",
         slug: "mission-control-chat-and-approvals",
-        tags: &["mission_control", "chat", "inbox", "approvals", "navigation"],
+        tags: &[
+            "mission_control",
+            "chat",
+            "inbox",
+            "approvals",
+            "navigation",
+        ],
         summary: "Chat is the main command surface. Mission Control is the daily overview for approvals, live work, highlights, suggestions, and attention items.",
         sections: &[
             BundledHelpSection {
@@ -439,7 +450,11 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
             BundledHelpSection {
                 label: "notifications",
-                items: &["`/notifications pause`.", "`/notifications resume`.", "`/notifications status`."],
+                items: &[
+                    "`/notifications pause`.",
+                    "`/notifications resume`.",
+                    "`/notifications status`.",
+                ],
             },
             BundledHelpSection {
                 label: "delegation",
@@ -601,7 +616,14 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
     BundledHelpDoc {
         title: "Media generation providers",
         slug: "media-generation-providers",
-        tags: &["media", "images", "video", "providers", "settings", "api_keys"],
+        tags: &[
+            "media",
+            "images",
+            "video",
+            "providers",
+            "settings",
+            "api_keys",
+        ],
         summary: "Settings > Media configures image and video generation providers, their API keys, defaults, and fallbacks.",
         sections: &[
             BundledHelpSection {
@@ -911,7 +933,9 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
             BundledHelpSection {
                 label: "preference",
-                items: &["If the user asks specifically for Gmail access, prefer this Google Workspace path unless they explicitly want the separate legacy Gmail-only connector."],
+                items: &[
+                    "If the user asks specifically for Gmail access, prefer this Google Workspace path unless they explicitly want the separate legacy Gmail-only connector.",
+                ],
             },
         ],
     },
@@ -965,7 +989,9 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
             BundledHelpSection {
                 label: "answer rule",
-                items: &["If the user asks how to run Moltbook, answer with the top-level Moltbook path, key setup, save, run-now, and verification steps."],
+                items: &[
+                    "If the user asks how to run Moltbook, answer with the top-level Moltbook path, key setup, save, run-now, and verification steps.",
+                ],
             },
         ],
     },
@@ -1110,7 +1136,10 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         sections: &[
             BundledHelpSection {
                 label: "surfaces",
-                items: &["Main surface: Tasks.", "Related surfaces: Notifications and Trace."],
+                items: &[
+                    "Main surface: Tasks.",
+                    "Related surfaces: Notifications and Trace.",
+                ],
             },
             BundledHelpSection {
                 label: "core rule",
@@ -1249,7 +1278,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                 items: &[
                     "Current workspace, config/data locations, and managed app roots when the runtime exposes them.",
                     "Visible CPU count, sandbox defaults, runtime image clues, container-runtime availability, and app-deploy posture.",
-                    "Tasks, watchers, goals, apps, traces, analytics, ArkPulse findings, and security logs.",
+                    "Tasks, watchers, goals, apps, ArkReflect recaps, traces, analytics, ArkPulse findings, and security logs.",
                     "Connected integrations, messaging channels, MCP servers, plugins, custom APIs, and reusable actions currently loaded.",
                     "Memory, knowledge, document, and approval/permission state that the instance already tracks.",
                 ],
@@ -1260,7 +1289,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Start in Chat with the current runtime access summary and action catalog because they are request-scoped live clues.",
                     "Use Settings > Integrations > Messaging Channels and Settings > Integrations > Prebuilt Connectors for connected systems.",
                     "Use ArkMemory and Library > Documents for memory and indexed files.",
-                    "Use Tasks, Watchers, Goals, Apps, Trace, Analytics, and ArkPulse for durable work and operational investigation.",
+                    "Use Tasks, Watchers, Goals, Apps, ArkReflect, Trace, Analytics, and ArkPulse for durable work and operational investigation.",
                     "Use Settings > Security, Settings > Advanced, and Settings > Observability for approvals, runtime policy, export, and deploy defaults.",
                 ],
             },
@@ -1292,28 +1321,111 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
     },
     BundledHelpDoc {
+        title: "ArkReflect retrospectives",
+        slug: "arkreflect-retrospectives",
+        tags: &[
+            "arkreflect",
+            "reflect",
+            "retrospective",
+            "recap",
+            "clusters",
+            "semantic_clusters",
+            "working_style",
+            "weekly_review",
+            "monthly_review",
+            "daily_review",
+            "arkorbit",
+            "memory",
+            "analytics",
+        ],
+        summary: "ArkReflect is the Ark Core panorama for understanding a selected day, week, or month: where work clustered, what sources contributed, how background agents helped, and what patterns stood out.",
+        sections: &[
+            BundledHelpSection {
+                label: "where it lives",
+                items: &[
+                    "Open Ark Core > ArkReflect in the web UI.",
+                    "Use the Day, Week, or Month selector plus the date picker to choose the period.",
+                    "The page is intentionally a broad personal recap, not a raw analytics table.",
+                ],
+            },
+            BundledHelpSection {
+                label: "what it shows",
+                items: &[
+                    "A plain-language narrative summary of the selected period.",
+                    "A constellation-style visual of clustered work areas, with larger islands representing more related activity.",
+                    "Source coverage across main chat, ArkOrbit chat, memory, procedural patterns, apps, goals, watchers, ArkSentinel, ArkPulse, ArkEvolve, and LLM usage.",
+                    "Working-style and activity rhythm charts so novice users can see how the period felt without reading raw logs.",
+                    "A background-agent lane for work that happened outside direct chat, such as watchers, Sentinel, Pulse, and Evolve activity.",
+                    "A Today Status card that shows current-day cached activity and the latest ArkReflect Daily Digest state.",
+                    "An examples drawer that keeps technical evidence available without forcing it into the novice-first view.",
+                ],
+            },
+            BundledHelpSection {
+                label: "data model",
+                items: &[
+                    "ArkReflect does not store raw per-message chat embeddings.",
+                    "It builds retention-managed derived semantic work units from source summaries and metadata, embeds those units, then clusters them for the selected period.",
+                    "The `semantic_work_units` table is also used for cross-period related-history lookup so recurring themes can be recognized without scanning every old source row.",
+                    "Raw source records remain in their owning systems; ArkReflect caches only the derived work-unit view needed for fast recaps.",
+                ],
+            },
+            BundledHelpSection {
+                label: "API queries",
+                items: &[
+                    "Read cached data with `GET /reflect?period=weekly&from=2026-05-01T00:00:00Z&to=2026-05-08T00:00:00Z`.",
+                    "Queue a refresh with `POST /reflect/refresh?period=weekly&from=2026-05-01T00:00:00Z&to=2026-05-08T00:00:00Z`.",
+                    "Use `GET /reflect?refresh=1&period=monthly&from=2026-05-01T00:00:00Z&to=2026-06-01T00:00:00Z` when the caller wants a cached response and a background refresh request in one call.",
+                    "Supported periods are `daily`, `weekly`, and `monthly`; `from` and `to` are RFC3339 timestamps and default to the selected period window when omitted.",
+                    "The response includes `clusters`, `source_counts`, `baseline_source_counts`, `embedding_status`, `refresh_status`, `cache_status`, `related_history`, and `unclustered_units`.",
+                ],
+            },
+            BundledHelpSection {
+                label: "runtime behavior",
+                items: &[
+                    "`GET /reflect` should be treated as a cached read. Do not expect it to scan all sources, embed, and cluster inline.",
+                    "Refresh work is single-flight guarded, lease-protected, timeout-bounded, and designed to run in the background when AgentArk is quiet.",
+                    "ArkReflect Daily Digest delivery is off by default. Users can enable it in Settings; it then prepares a user-readable recap with the configured model and sends it only when the structured day has meaningful activity.",
+                    "If the daily digest gate finds nothing meaningful, no in-app or external notification is sent.",
+                    "If cache is empty or stale, show the preparing or stale state calmly and let the refresh job fill the cache; do not present this as a severe warning.",
+                    "If semantic embeddings are unavailable, ArkReflect can still show source-aware activity summaries while semantic grouping catches up.",
+                ],
+            },
+            BundledHelpSection {
+                label: "answer rules",
+                items: &[
+                    "When the user asks what they worked on in a day, week, or month, point to ArkReflect before Trace or Analytics unless they specifically need a single run or cost breakdown.",
+                    "Use Trace for exact execution steps, Analytics for token or model spend, ArkPulse for health findings, and ArkReflect for the broad personal recap.",
+                    "Explain ArkReflect as local and cached by default. Refresh is explicit or background; normal reads should not hang the server.",
+                    "Do not describe ArkReflect as exact phrase matching. Its grouping is based on derived source summaries and embeddings over work units.",
+                ],
+            },
+        ],
+    },
+    BundledHelpDoc {
         title: "Trace, analytics, and ArkPulse",
         slug: "trace-analytics-and-arkpulse",
         tags: &[
             "trace",
             "analytics",
+            "arkreflect",
             "arkpulse",
             "observability",
             "operations",
             "telemetry",
             "prompt_telemetry",
         ],
-        summary: "Trace, Analytics, and ArkPulse are separate top-level surfaces for execution history, aggregate metrics, and operational health.",
+        summary: "Trace, Analytics, ArkReflect, and ArkPulse are separate surfaces for execution history, aggregate metrics, personal retrospectives, and operational health.",
         sections: &[
             BundledHelpSection {
                 label: "pages",
-                items: &["Trace.", "Analytics.", "ArkPulse."],
+                items: &["Trace.", "Analytics.", "ArkReflect.", "ArkPulse."],
             },
             BundledHelpSection {
                 label: "what each one is for",
                 items: &[
                     "Trace shows step-by-step execution history for what the agent actually did.",
                     "Analytics shows aggregated usage metrics such as model, channel, token, and cost trends.",
+                    "ArkReflect shows a day/week/month personal recap over clustered work, source coverage, activity rhythm, and background-agent activity.",
                     "ArkPulse shows operational health and fix guidance across the instance.",
                 ],
             },
@@ -1331,6 +1443,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Open Trace when the user asks what the agent did or when a run needs debugging.",
                     "Use trace, conversation, run, and task ids as operational references for correlation; they are not credentials or secrets by themselves.",
                     "Open Analytics when the user asks about usage, volume, model mix, or cost trends.",
+                    "Open ArkReflect when the user wants a broad recap of what happened across chat, ArkOrbit, apps, goals, watchers, memory, and background systems.",
                     "Open ArkPulse when the user asks whether the system is healthy or wants guided remediation for operational findings.",
                 ],
             },
@@ -1355,6 +1468,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                 items: &[
                     "Analytics is not the right place for a single failed run; use Trace.",
                     "Trace is not the right place for long-term spend trends; use Analytics.",
+                    "ArkReflect is not the raw source of every event; it is a cached derived view for human-readable retrospection.",
                     "Do not treat a redacted placeholder in an operational id field as a valid reference id; it means diagnostic redaction touched data that should be kept as an internal reference.",
                     "ArkPulse is a higher-level operational guide, not the raw event stream.",
                 ],
@@ -1442,6 +1556,91 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
     },
     BundledHelpDoc {
+        title: "ArkEvolve GEPA background optimizer",
+        slug: "arkevolve-gepa-background-optimizer",
+        tags: &[
+            "gepa",
+            "dspy",
+            "optimizer",
+            "prompt_optimization",
+            "background_learning",
+            "self_evolve",
+            "experience_runs",
+            "kv_store",
+            "cost_budget",
+            "docker",
+        ],
+        summary: "GEPA is the bundled ArkEvolve prompt optimizer. It runs in the background after AgentArk is quiet, uses the same active model configured in Settings > Models, and hands candidates back to ArkEvolve replay and canary gates.",
+        sections: &[
+            BundledHelpSection {
+                label: "what it is",
+                items: &[
+                    "GEPA is a DSPy-backed optimizer bridge for prompt and specialist-prompt candidates; it is not base-model weight retraining.",
+                    "The Docker image bakes in the Python optimizer runtime at `/opt/agentark-gepa/bin/python` and the bridge package at `/app/bridges/gepa_optimizer`.",
+                    "GEPA uses AgentArk's selected primary model/provider credentials from Settings > Models. There is no separate GEPA model picker, API key, local env file, or normal user-run button.",
+                    "The normal path is automatic. The UI should surface Background improvement status, queue, evidence, guardrail, and latest result rather than asking a novice user to understand or trigger GEPA.",
+                ],
+            },
+            BundledHelpSection {
+                label: "when it runs",
+                items: &[
+                    "The scheduler starts about 90 seconds after the HTTP runtime starts, then checks about every 30 minutes.",
+                    "It queues work only when learning and self-evolve are enabled, GEPA readiness is clean, the daily budget allows a run, no GEPA job is already pending or running, and AgentArk has been quiet for the quiet window.",
+                    "The default quiet window is 5 minutes for automatic scheduling, with an 18 hour cooldown after recent GEPA activity.",
+                    "The scheduler requires at least 6 fresh non-provisional experience runs since the latest GEPA activity so it does not optimize on thin or stale evidence.",
+                    "Default guardrails reserve at most 1 GEPA run per day, about 1 USD per day, about 0.50 USD per run, and 24 metric calls per run unless changed by operator controls.",
+                ],
+            },
+            BundledHelpSection {
+                label: "data flow",
+                items: &[
+                    "Rust reads recent `experience_runs`, the current prompt bundle profile, the current specialist prompt bundle profile, benchmark profiles, and recent lineage.",
+                    "The bridge writes a redacted run export to `/app/.agentark/self_evolve/gepa/runs/<run_id>/export.json`.",
+                    "Python runs `python -m bridges.gepa_optimizer run --export ... --out ...` and writes bounded candidate records to `candidates.jsonl`.",
+                    "Rust imports those candidates, sanitizes them, evaluates them through the existing prompt and specialist-prompt evolution engines, and leaves rollout, replay, promotion, and rollback decisions inside ArkEvolve.",
+                    "Job status files move through `/app/.agentark/self_evolve/gepa/pending`, `running`, `completed`, and `failed`; detailed run artifacts live under `/app/.agentark/self_evolve/gepa/runs`.",
+                ],
+            },
+            BundledHelpSection {
+                label: "tables and keys",
+                items: &[
+                    "`experience_runs` is the source evidence table. Inspect `id`, `updated_at`, `success_state`, `correction_state`, `request_text`, `outcome_summary`, `failure_reason`, `prompt_version`, `model_slot`, `metadata`, `consolidated`, and `heuristic_reflected`.",
+                    "`kv_store` stores GEPA JSON state under `gepa_optimizer_config_v1`, `gepa_optimizer_auto_state_v1`, `gepa_optimizer_budget_ledger_v1`, and `gepa_optimizer_last_result_v1`.",
+                    "`kv_store` also stores the global switches `self_evolve_enabled_v1` and `learning_enabled_v1` that must be on for automatic scheduling.",
+                    "Prompt rollout state is stored in `kv_store` under `prompt_bundle_profile_v1`, `prompt_bundle_profile_canary_v1`, `prompt_bundle_canary_state_v1`, and `prompt_bundle_last_result_v1`.",
+                    "Specialist prompt rollout state is stored in `kv_store` under `specialist_prompt_bundle_profile_v1`, `specialist_prompt_bundle_profile_canary_v1`, `specialist_prompt_bundle_canary_state_v1`, and `specialist_prompt_bundle_last_result_v1`.",
+                ],
+            },
+            BundledHelpSection {
+                label: "operator queries",
+                items: &[
+                    "Recent evidence: `SELECT id, updated_at, success_state, correction_state, prompt_version, model_slot FROM experience_runs ORDER BY updated_at DESC LIMIT 20;`",
+                    "GEPA state: `SELECT key, updated_at, convert_from(value, 'UTF8')::jsonb AS value FROM kv_store WHERE key IN ('gepa_optimizer_config_v1', 'gepa_optimizer_auto_state_v1', 'gepa_optimizer_budget_ledger_v1', 'gepa_optimizer_last_result_v1');`",
+                    "Prompt rollout state: `SELECT key, updated_at, convert_from(value, 'UTF8')::jsonb AS value FROM kv_store WHERE key IN ('prompt_bundle_profile_v1', 'prompt_bundle_profile_canary_v1', 'prompt_bundle_canary_state_v1', 'prompt_bundle_last_result_v1', 'specialist_prompt_bundle_profile_v1', 'specialist_prompt_bundle_profile_canary_v1', 'specialist_prompt_bundle_canary_state_v1', 'specialist_prompt_bundle_last_result_v1');`",
+                    "Use the ArkEvolve Background improvement card and ArkSentinel > Background learning > Prompt tuning before asking a user to inspect SQL directly.",
+                ],
+            },
+            BundledHelpSection {
+                label: "bloat and retention",
+                items: &[
+                    "GEPA run artifacts are pruned after 30 days and capped to about 80 run directories.",
+                    "Completed and failed GEPA status files are pruned with the same retention policy, and stale running jobs are recovered before pruning.",
+                    "The GEPA budget ledger keeps about 7 days of entries and caps itself at 512 records.",
+                    "The larger long-term database growth source is `experience_runs` and related trace/history tables; use Settings > Data Cleanup for runtime retention instead of adding GEPA-specific table resets.",
+                ],
+            },
+            BundledHelpSection {
+                label: "answer rules",
+                items: &[
+                    "When asked whether GEPA is ready, prefer live API/UI/DB state over this static documentation.",
+                    "Do not tell normal users to create `.env` files, maintain a separate GEPA model configuration, install DSPy manually, or press a GEPA run button.",
+                    "If GEPA is not running, explain the gate that blocked it: model readiness, learning switch, daily budget, active work, cooldown, quiet time, or not enough fresh experience.",
+                    "Keep GEPA phrasing operator-facing. For novice users call it background improvement or prompt tuning unless they explicitly ask for implementation details.",
+                ],
+            },
+        ],
+    },
+    BundledHelpDoc {
         title: "Prompt telemetry and prompt cost review",
         slug: "prompt-telemetry-and-prompt-cost-review",
         tags: &[
@@ -1512,7 +1711,14 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
     BundledHelpDoc {
         title: "Plugins, webhooks, and custom APIs",
         slug: "plugins-webhooks-and-custom-apis",
-        tags: &["plugins", "webhooks", "custom_api", "integrations", "mcp", "events"],
+        tags: &[
+            "plugins",
+            "webhooks",
+            "custom_api",
+            "integrations",
+            "mcp",
+            "events",
+        ],
         summary: "Webhooks & APIs and Plugins are related integration surfaces, but they cover different flows.",
         sections: &[
             BundledHelpSection {
@@ -1594,7 +1800,11 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
             BundledHelpSection {
                 label: "use Security for",
-                items: &["Master password and secret protection.", "Security status.", "Security logs."],
+                items: &[
+                    "Master password and secret protection.",
+                    "Security status.",
+                    "Security logs.",
+                ],
             },
             BundledHelpSection {
                 label: "use Advanced for",
@@ -1645,7 +1855,13 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
     BundledHelpDoc {
         title: "Swarm, agents, and delegation",
         slug: "swarm-agents-and-delegation",
-        tags: &["swarm", "agents", "delegation", "specialists", "multi_agent"],
+        tags: &[
+            "swarm",
+            "agents",
+            "delegation",
+            "specialists",
+            "multi_agent",
+        ],
         summary: "The top-level Agents page shows specialist agents and swarm state, but normal users can still trigger delegation directly from chat.",
         sections: &[
             BundledHelpSection {
@@ -1690,7 +1906,14 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
     BundledHelpDoc {
         title: "Browser automation, search, and research",
         slug: "browser-search-and-research",
-        tags: &["browser", "search", "research", "web_search", "browser_auto", "chat"],
+        tags: &[
+            "browser",
+            "search",
+            "research",
+            "web_search",
+            "browser_auto",
+            "chat",
+        ],
         summary: "Web search, research, and browser automation are primarily chat-native workflows rather than settings-first flows.",
         sections: &[
             BundledHelpSection {
@@ -1753,6 +1976,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Integrations and channels such as Google Workspace, Gmail, Calendar, GitHub, Notion, Twilio, Moltbook, webhooks, plugins, custom APIs, MCP servers, and others depending on configuration.",
                     "Research, browser automation, and documents through web search, deeper source-backed research, website interaction, document inspection, summarization, and grounded answers from indexed content.",
                     "App building and deployment with managed apps, tunnel exposure, restore state, and app status tracking.",
+                    "ArkReflect retrospectives that turn selected days, weeks, and months into local clustered recaps across chat, ArkOrbit, apps, goals, watchers, memory, usage, and background systems.",
                     "ArkEvolve and self-learning through learned memory, learned procedures, background learning, candidate review, replay gates, canary rollout, and impact tracking. This improves retrieval context, prompts, routing, and policy state; it is not silent base-model weight retraining by default.",
                     "Operational power features including swarm agents, execution supervision, traces, analytics, ArkPulse, plugins, custom APIs, webhooks, and extension packs.",
                 ],
@@ -1787,6 +2011,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Settings > Integrations > Prebuilt Connectors for external services.",
                     "ArkMemory for structured memory, provenance, review, and reusable knowledge items.",
                     "Library > Documents for uploaded files and indexed documents.",
+                    "ArkReflect for day/week/month personal recaps, semantic clusters, and background-agent activity summaries.",
                     "ArkEvolve for learning history, impact, canary tests, review, and self-evolve controls.",
                     "ArkSentinel > Background learning for live reflection, consolidation, pattern induction, and candidate generation status.",
                     "Tasks / Watchers / Goals / Apps / Trace / Analytics / ArkPulse for deeper operational workflows.",

@@ -14,7 +14,7 @@ use axum::{
         Html, IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{any, delete, get, post},
+    routing::{any, delete, get, post, put},
 };
 use chrono::{Datelike, Timelike};
 use futures::{SinkExt, StreamExt};
@@ -2265,7 +2265,8 @@ pub async fn serve(
         )
         .route(
             "/api/arkorbit/orbits/{id}/widgets/{widget_id}",
-            delete(arkorbit_control::delete_orbit_widget_endpoint),
+            put(arkorbit_control::update_orbit_widget_endpoint)
+                .delete(arkorbit_control::delete_orbit_widget_endpoint),
         )
         .route(
             "/api/arkorbit/orbits/{id}/fetch",

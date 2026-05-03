@@ -36,7 +36,18 @@ export type OrbitFileEntry = {
   bytes: number;
 };
 
-export type OrbitChatHistoryMessage = {
+export type OrbitChatUsage = {
+  model?: string;
+  input_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
+  cost_usd?: number;
+  estimated?: boolean;
+  duration_ms?: number;
+  time_to_first_token_ms?: number;
+};
+
+export type OrbitChatHistoryMessage = OrbitChatUsage & {
   id: string;
   role: "user" | "assistant" | string;
   content: string;

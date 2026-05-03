@@ -52,7 +52,5 @@ where
 
 #[macro_export]
 macro_rules! spawn_logged {
-    ($task_name:expr, $future:expr) => {{
-        $crate::core::spawn::spawn_logged($task_name, $future)
-    }};
+    ($task_name:expr, $future:expr) => {{ $crate::core::spawn::spawn_logged($task_name, $future) }};
 }

@@ -24,6 +24,7 @@
   Build agents from structured prompts, tools, and integrations. Deploy them as live apps, scheduled automations, conditional watchers, or chat sessions.<br>
   Monitor every step through ArkSentinel with action traces, failure classification, and drift detection. Secure every capability boundary with intent classification, output guards, approval gates, and per-action authorization.<br>
   Self-evolve prompts, classifiers, routing policies, and specialist behavior from your own usage.<br>
+  Review your day, week, or month through ArkReflect: a local visual panorama of where chat, ArkOrbit, apps, goals, watchers, memory, background agents, usage, and learned workflows clustered.<br>
   Chat, memory, devices, integrations, and reviewable actions, all in one place, all on your machine, private by default.<br>
   <code>~3.1GB full Docker image &middot; ~0.45GB idle containers measured &middot; AES-256-GCM encrypted &middot; model-agnostic</code>
 </p>
@@ -95,7 +96,7 @@ Your data stays with you. Your secrets are encrypted. You keep the final say on 
 | **Integration layer** | Gmail, Calendar, Telegram, WhatsApp, Slack, webhooks, APIs, MCP servers, and custom packs |
 | **Device layer** | Companion device pairing, scoped grants, and high-risk command approvals |
 | **Safety layer** | Sandboxing, secrets, policy checks, action review, and trace history |
-| **Evolution layer** | ArkMemory, ArkSentinel, ArkEvolve, and ArkPulse working together |
+| **Evolution layer** | ArkMemory, ArkReflect, ArkSentinel, ArkEvolve, and ArkPulse working together |
 
 ---
 
@@ -111,7 +112,7 @@ Mission Control | Chat | Approvals | Settings
         |
         v
 AI OS Subsystems
-ArkMemory | ArkSentinel | ArkEvolve | ArkPulse
+ArkMemory | ArkReflect | ArkSentinel | ArkEvolve | ArkPulse
 Tasks | Watchers | Apps | Skills | Agents
         |
         v
@@ -134,6 +135,7 @@ ArkCore is the operating layer inside AgentArk that keeps memory, follow-up work
 | System | What it does |
 |:--|:--|
 | **ArkMemory** | Reviews current memory, staged changes, provenance, health, and checks. It reconciles session evidence into durable memory with source attribution, review, rollback, and retention-managed audit history. |
+| **ArkReflect** | Turns selected days, weeks, or months into a visual retrospective with semantic clusters, narrative summary, source coverage, working-style rhythm, background-agent activity, and examples. It reads cached derived work units by default and refreshes in background so the UI and API do not block on heavy clustering. Its optional Daily Digest is off by default, runs only after quiet windows, and sends nothing when the day had no meaningful activity. |
 | **ArkSentinel** | Spots follow-ups, routine work, and unattended issues, then suggests or handles the next step when policy allows it. |
 | **ArkEvolve** | Gives plain-language status for what AgentArk learned, what improved, what is still being tested, and what needs review before promotion. |
 | **ArkPulse** | Runs system health checks across runtime, config, integrations, security posture, storage, and automation reliability, then surfaces actionable findings. |
@@ -198,6 +200,8 @@ docker compose -f docker-compose.yml -f docker-compose.lowmem.yml up -d
 
 The bundled Docker runtime includes Lightpanda for fast free-content fetching and the ArkEvolve GEPA optimizer runtime with DSPy. GEPA uses the same active model configured in AgentArk's Models settings; there is no separate GEPA key, model, button, or `.env` setup. ArkEvolve runs this optimizer automatically only after AgentArk is quiet, enough completed work exists, and the daily cost guardrail allows it. The UI surfaces this as Background improvement status, queue, evidence, and latest result.
 
+For operator inspection, GEPA reads recent evidence from `experience_runs`. Its config, scheduler state, budget ledger, and latest result live in `kv_store` under `gepa_optimizer_config_v1`, `gepa_optimizer_auto_state_v1`, `gepa_optimizer_budget_ledger_v1`, and `gepa_optimizer_last_result_v1`. Queue/run artifacts are file-backed under `/app/.agentark/self_evolve/gepa/{pending,running,completed,failed,runs}`.
+
 ### Runtime footprint
 
 These numbers are for the supported Docker Compose install. They were measured from a local `agentark:dev` source build on April 18, 2026; exact values vary by platform, Docker cache state, enabled runtime features, model/provider choice, and active jobs.
@@ -205,7 +209,7 @@ These numbers are for the supported Docker Compose install. They were measured f
 | Item | Current expectation |
 |:--|:--|
 | Full AgentArk Docker image | `agentark:dev` measured at **3.07 GB**. Published full-runtime linux/amd64 images should be in the same range; run `docker image ls agentark:dev` or `docker image ls ghcr.io/agentark-ai/agentark` for the exact local size. |
-| Bundled ArkEvolve GEPA runtime | Adds the small `/app/tools` optimizer code plus a Python venv with DSPy and model-client dependencies. Expect roughly **120-250 MB** additional uncompressed image size, varying with Python dependency versions. |
+| Bundled ArkEvolve GEPA runtime | Adds the small `/app/bridges/gepa_optimizer` bridge plus a Python venv with DSPy and model-client dependencies. Expect roughly **120-250 MB** additional uncompressed image size, varying with Python dependency versions. |
 | AgentArk process startup | **5-10 ms measured** for the Rust binary command startup inside the rebuilt container. This excludes Docker Compose dependency ordering and Postgres health checks. |
 | Full local rebuild | About **12 minutes** on the measured Docker Desktop build with warm dependency caches. The Rust release binary compile dominated the build at **11m 38s**; frontend production build was about **11s**. Clean Docker/Cargo/npm caches can be longer. |
 | Docker stack ready after image exists | **47.3 seconds measured** from stopped containers to all services healthy with `docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --wait` on Docker Desktop using the local `agentark:dev` image. This includes Postgres, workspace, executor, control, dependency ordering, and healthcheck intervals. Clean pulls/builds are not included. |
@@ -445,6 +449,7 @@ You choose the trade-off at runtime. The core stays the same.
 | **Self-Evolve Engine** | Prompt evolution, policy tuning, strategy learning, and routing benchmarks |
 | **Self-Tune** | Learns your style from local history, tracks tool success rates, adjusts autonomy |
 | **ArkMemory** | Current memory, provenance, review, rollback, and three-tier memory across episodic conversations, semantic facts, and procedural actions |
+| **ArkReflect** | Local day/week/month panorama showing where work clustered across chat, ArkOrbit, apps, goals, watchers, memory, Sentinel, ArkPulse, ArkEvolve, usage, and learned workflows |
 | **Live App Deployment** | Deploy static or dynamic apps from chat - Node, Python, HTML, and more |
 | **Goal Autopilot** | Goal → plan → scheduled execution → recurring progress reports |
 | **Predictive Nudges** | Early warnings for missed deadlines, overdue pressure, recommended next actions |
@@ -589,6 +594,27 @@ Full details: [SECURITY.md](SECURITY.md) and [VERIFY.md](VERIFY.md)
 
 Full interactive API docs available at **http://localhost:8990/docs#/** after starting AgentArk.
 
+### ArkReflect queries
+
+ArkReflect is cached-read by default. Normal reads should use `GET /reflect`; heavy source scans, embedding, and refresh work are queued separately so the web UI and backend do not hang while a retrospective is prepared.
+
+```bash
+# Read the cached weekly reflection for an explicit UTC range.
+curl "http://localhost:8990/reflect?period=weekly&from=2026-05-01T00:00:00Z&to=2026-05-08T00:00:00Z"
+
+# Queue a guarded background refresh for that same range.
+curl -X POST "http://localhost:8990/reflect/refresh?period=weekly&from=2026-05-01T00:00:00Z&to=2026-05-08T00:00:00Z"
+
+# Shortcut: read cached data and request a refresh in the same call.
+curl "http://localhost:8990/reflect?period=monthly&from=2026-05-01T00:00:00Z&to=2026-06-01T00:00:00Z&refresh=1"
+```
+
+Supported `period` values are `daily`, `weekly`, and `monthly`. `from` and `to` are RFC3339 timestamps; omit them to use the default window for the selected period. Responses include `clusters`, `source_counts`, `baseline_source_counts`, `embedding_status`, `refresh_status`, `cache_status`, `related_history`, and `unclustered_units`.
+
+ArkReflect does not store raw per-message chat embeddings. It creates retention-managed `semantic_work_units` from derived summaries and source metadata, embeds those work units, then clusters and compares them across time windows.
+
+ArkReflect Daily Digest can be enabled in Settings. When enabled, AgentArk prepares a short LLM-written recap after a quiet end-of-day window, stores it in the notification feed, and attempts the selected notification channel. If the structured activity gate finds nothing meaningful, no notification is sent.
+
 ---
 
 ## Troubleshooting
@@ -681,10 +707,11 @@ For documentation generators such as DeepWiki, these are the main product concep
 
 | Area | Start here | Notes |
 |:--|:--|:--|
-| Product shell | `frontend/src/App.tsx`, `frontend/src/components/NativeWorkspace.tsx`, `frontend/src/styles.css` | Navigation, responsive shell, Mission Control, Chat, ArkMemory, ArkSentinel, ArkEvolve, ArkPulse, and settings surfaces |
-| API surface | `src/channels/http.rs`, `src/channels/http/*` | HTTP routes, settings, integrations, companion devices, model control, webhooks, ArkPulse, ArkSentinel, and ArkMemory panels |
+| Product shell | `frontend/src/App.tsx`, `frontend/src/components/NativeWorkspace.tsx`, `frontend/src/styles.css` | Navigation, responsive shell, Mission Control, Chat, ArkMemory, ArkReflect, ArkSentinel, ArkEvolve, ArkPulse, and settings surfaces |
+| API surface | `src/channels/http.rs`, `src/channels/http/*` | HTTP routes, settings, integrations, companion devices, model control, webhooks, ArkReflect, ArkPulse, ArkSentinel, and ArkMemory panels |
 | Agent runtime | `src/core/agent.rs`, `src/core/agent/*`, `src/runtime/mod.rs` | Tool planning, execution loop, approvals, sandboxing, task routing, generated apps, action traces, and response delivery |
 | Memory and learning | `src/core/learning.rs`, `src/core/memory_dedup.rs`, `src/storage/entities/experience_item.rs` | User facts, preferences, ArkMemory views, semantic deduplication, provenance, review, rollback, and consolidation |
+| ArkReflect | `src/channels/http/reflect_control.rs`, `src/storage/entities/semantic_work_unit.rs`, `frontend/src/components/pages/ArkReflectPage.tsx` | Cached local retrospectives, derived semantic work units, day/week/month clustering, source coverage, related-history lookup, and Panorama UI |
 | ArkSentinel | `src/sentinel.rs`, `src/channels/http/sentinel_panel.rs`, `src/core/autonomy.rs` | Follow-up scanning, routine detection, health findings, proposals, scheduled work, and automation nudges |
 | ArkEvolve | `src/core/self_evolve/*`, `src/core/agent/tool_execution.rs` | Prompt, policy, classifier, and specialist evolution with canaries, replay evaluation, promotion gates, and rollback |
 | ArkPulse | `src/sentinel.rs`, `src/core/observability.rs`, `src/core/release_updates.rs` | Runtime health checks, remediation hints, operational findings, update status, and system readiness surfaces |
@@ -697,6 +724,7 @@ Key flows worth documenting:
 - Chat request -> plan/tool loop -> trace -> response -> memory and automation updates.
 - Memory capture -> semantic deduplication -> review and provenance -> rollback when needed.
 - Background session, task, or watcher -> ArkSentinel follow-up -> approval or scheduled action.
+- ArkReflect refresh -> bounded source scan -> derived semantic work units -> cached clusters and visual recap.
 - Integration install or delete -> config, secrets, files, and audit cleanup.
 - App generation and deployment -> sandbox/runtime -> private or public access -> ArkPulse health checks.
 - ArkEvolve review candidate -> past-example test -> approval or rejection -> apply or leave unchanged.

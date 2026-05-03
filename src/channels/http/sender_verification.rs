@@ -443,8 +443,8 @@ pub(super) async fn revoke_sender(
 mod tests {
     use super::*;
     use crate::core::Agent;
-    use axum::body::{Body, to_bytes};
-    use axum::http::{Request, header};
+    use axum::body::{to_bytes, Body};
+    use axum::http::{header, Request};
     use axum::routing::{get, post};
     use serde_json::Value;
     use std::collections::HashMap;
@@ -501,6 +501,9 @@ mod tests {
                 whatsapp_bridge: Arc::new(RwLock::new(WhatsAppBridgeState::new())),
                 security_events,
                 app_registry,
+                app_publish_locks: Arc::new(parking_lot::Mutex::new(
+                    std::collections::HashSet::new(),
+                )),
                 executor_client: None,
                 workspace_client: None,
                 application_registry: applications::ApplicationLauncherRegistry::default(),

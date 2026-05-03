@@ -129,6 +129,7 @@ const REQUIRED_CATEGORIES: &[&str] = &[
     "browser",
     "deep_research",
     "arksystem_inspect",
+    "product_help",
     "integration_install",
     "skill_import",
     "swarm",
@@ -214,12 +215,14 @@ fn every_goal_has_a_capability_target_or_any_of() {
             assert!(
                 has_target || has_any_of,
                 "entry {} goal[{}] has neither capability_target nor capability_target_any_of",
-                entry.id, i
+                entry.id,
+                i
             );
             assert!(
                 !(has_target && has_any_of),
                 "entry {} goal[{}] sets both capability_target and capability_target_any_of; pick one",
-                entry.id, i
+                entry.id,
+                i
             );
         }
     }
@@ -244,12 +247,16 @@ fn depends_on_references_are_valid_positional_ids() {
                 assert!(
                     index < goal_count,
                     "entry {} goal[{}] depends on {} but only {} goals are defined",
-                    entry.id, i, dep, goal_count
+                    entry.id,
+                    i,
+                    dep,
+                    goal_count
                 );
                 assert!(
                     index != i,
                     "entry {} goal[{}] depends on itself",
-                    entry.id, i
+                    entry.id,
+                    i
                 );
             }
         }
@@ -265,12 +272,16 @@ fn object_refs_use_known_kinds_and_resolution_families() {
                 assert!(
                     VALID_OBJECT_KINDS.contains(&object_ref.kind.as_str()),
                     "entry {} goal[{}] object_ref.kind={} is not a known ObjectKind",
-                    entry.id, i, object_ref.kind
+                    entry.id,
+                    i,
+                    object_ref.kind
                 );
                 assert!(
                     VALID_RESOLUTION_FAMILIES.contains(&object_ref.resolution_family.as_str()),
                     "entry {} goal[{}] object_ref.resolution_family={} is not a known resolution family",
-                    entry.id, i, object_ref.resolution_family
+                    entry.id,
+                    i,
+                    object_ref.resolution_family
                 );
             }
         }
@@ -286,7 +297,9 @@ fn side_effects_use_known_variants() {
                 assert!(
                     VALID_SIDE_EFFECTS.contains(&side_effect.as_str()),
                     "entry {} goal[{}] side_effect={} is not a known StepSideEffect variant",
-                    entry.id, i, side_effect
+                    entry.id,
+                    i,
+                    side_effect
                 );
             }
         }

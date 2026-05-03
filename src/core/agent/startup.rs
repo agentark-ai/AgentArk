@@ -1,5 +1,8 @@
 use super::*;
 
+static PRODUCT_HELP_SYNC_LOCK: std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<()>>> =
+    std::sync::OnceLock::new();
+
 impl Agent {
     pub async fn snapshot(shared: &Arc<RwLock<Self>>) -> Self {
         shared.read().await.clone()
@@ -273,6 +276,7 @@ impl Agent {
 
         // Wire storage into runtime for expense + entity operations
         runtime.set_storage(storage.clone());
+        runtime.set_embedding_client(embedding_client.clone());
 
         // Wire active user identity (DID) for per-user features such as ArkOrbit.
         runtime.set_current_user_id(identity.did());
@@ -721,6 +725,18 @@ impl Agent {
         };
 
         agent.spawn_gepa_idle_worker();
+        {
+            let agent_for_memory_backfill = agent.clone();
+            crate::spawn_logged!(
+                "src/core/agent/startup.rs:memory_capture_backfill",
+                async move {
+                    agent_for_memory_backfill
+                        .backfill_recent_user_memory_capture_candidates()
+                        .await;
+                    agent_for_memory_backfill.kick_deferred_user_memory_capture_processing();
+                }
+            );
+        }
 
         {
             let agent_for_approval_repair = agent.clone();
@@ -992,8 +1008,13 @@ impl Agent {
     }
 
     pub async fn sync_bundled_product_help(&self) -> Result<usize> {
+        let sync_lock = PRODUCT_HELP_SYNC_LOCK
+            .get_or_init(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _sync_guard = sync_lock.lock().await;
         let actions = self.load_action_catalog_actions().await?;
         let items = crate::core::product_help::build_seed_knowledge_items(&actions);
+        let documents = crate::core::product_help::build_seed_product_help_documents(&actions);
 
         self.storage
             .delete_knowledge_items_by_source(crate::core::product_help::CURATED_SOURCE)
@@ -1016,6 +1037,75 @@ impl Agent {
                 .await?;
             inserted += 1;
         }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut document_rows = Vec::with_capacity(documents.len());
+        let mut embedded_chunks = 0usize;
+        let mut missing_embeddings = 0usize;
+        for document in documents {
+            let doc = crate::storage::entities::document::Model {
+                id: document.id.clone(),
+                filename: document.filename.clone(),
+                content_type: document.content_type.to_string(),
+                project_id: None,
+                chunk_count: document.chunks.len().min(i32::MAX as usize) as i32,
+                file_size: document.content.len().min(i64::MAX as usize) as i64,
+                created_at: now.clone(),
+            };
+            let mut chunks = document
+                .chunks
+                .iter()
+                .enumerate()
+                .map(|(index, content)| crate::storage::entities::document_chunk::Model {
+                    id: format!("{}:chunk:{}", document.id, index),
+                    document_id: document.id.clone(),
+                    chunk_index: index.min(i32::MAX as usize) as i32,
+                    content: content.clone(),
+                    embedding: None,
+                })
+                .collect::<Vec<_>>();
+            match crate::core::document_search::embed_document_chunks(
+                self.embedding_client.as_deref(),
+                &document.filename,
+                document.content_type,
+                None,
+                &mut chunks,
+            )
+            .await
+            {
+                Ok(count) => {
+                    embedded_chunks += count;
+                    missing_embeddings += chunks.len().saturating_sub(count);
+                }
+                Err(error) => {
+                    missing_embeddings += chunks.len();
+                    tracing::warn!(
+                        title = document.title.as_str(),
+                        "Product-help document embedding failed: {}",
+                        error
+                    );
+                }
+            }
+            document_rows.push((doc, chunks));
+        }
+        let document_count = document_rows.len();
+        let chunk_count = document_rows
+            .iter()
+            .map(|(_, chunks)| chunks.len())
+            .sum::<usize>();
+        self.storage
+            .replace_documents_by_id_prefix(
+                crate::core::product_help::DOCUMENT_ID_PREFIX,
+                &document_rows,
+            )
+            .await?;
+        tracing::info!(
+            "Synced product-help document index docs={} chunks={} embedded={} missing_embeddings={}",
+            document_count,
+            chunk_count,
+            embedded_chunks,
+            missing_embeddings
+        );
 
         Ok(inserted)
     }

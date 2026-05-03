@@ -10,6 +10,7 @@ pub(super) const DAILY_BRIEF_ENABLED_KEY: &str = "daily_brief_enabled";
 pub(super) const DAILY_BRIEF_TIME_KEY: &str = "daily_brief_time";
 pub(super) const DAILY_BRIEF_CHANNEL_KEY: &str = "daily_brief_channel";
 pub(super) const DEFAULT_DAILY_BRIEF_TIME: &str = "09:00";
+pub(super) const ARKREFLECT_DAILY_DIGEST_ENABLED_KEY: &str = "arkreflect_daily_digest_enabled_v1";
 pub(super) const PUBLIC_SELECTED_APP_KEY: &str = "public_selected_app_id";
 pub(super) const ROUTING_POLICY_LINEAGE_REL_PATH: &str =
     ".agentark/self_evolve/routing_policy_lineage.jsonl";

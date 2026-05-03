@@ -1051,6 +1051,36 @@
         "turn_confidence_min": 0.40
       },
       "notes": "When a dedicated Places integration is authorized, the step resolver prefers it. When not, the auth filter removes Places actions; web_search/research remains available and is used as a natural fallback. Either resolution is acceptable; what must not happen is failure or fabrication."
+    },
+    {
+      "id": "product_help_arkevolve_explanation",
+      "category": "product_help",
+      "prompts": {
+        "canonical": "What is ArkEvolve?",
+        "paraphrases": [
+          "explain the AgentArk self-learning and evolution page",
+          "what does the background learning area in AgentArk do?",
+          "tell me how AgentArk's canary learning and review surface works",
+          "what is the product feature for learned heuristics, replay gates, and evolution review?"
+        ]
+      },
+      "expected": {
+        "goal_count": 1,
+        "goals": [
+          {
+            "capability_target": "product_help_search",
+            "embedding_similarity_min": 0.50,
+            "object_ref": null,
+            "side_effect": "read",
+            "hints": {"product_help_expected": true},
+            "depends_on": []
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.50
+      },
+      "notes": "Product concepts must route to bundled product help, not public web search or general world knowledge. This entry protects the ArkEvolve failure where search interpreted the term as an external game."
     }
   ]
 }

@@ -3286,12 +3286,32 @@ pub(super) fn spawn_chat_stream_response(
                         .min(u64::MAX as u128) as u64
                 }
                 .max(1);
+                let wall_duration_ms = stream_started_at
+                    .elapsed()
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64;
                 let trace_total_tokens =
                     trace_metric_snapshot["total_tokens"].as_i64().unwrap_or(0);
+                let trace_input_tokens =
+                    trace_metric_snapshot["input_tokens"].as_i64().unwrap_or(0);
+                let trace_output_tokens =
+                    trace_metric_snapshot["output_tokens"].as_i64().unwrap_or(0);
+                let effective_input_tokens = if trace_input_tokens > 0 {
+                    trace_input_tokens
+                } else {
+                    processed.input_tokens
+                };
+                let effective_output_tokens = if trace_output_tokens > 0 {
+                    trace_output_tokens
+                } else {
+                    processed.output_tokens
+                };
                 let effective_total_tokens = if trace_total_tokens > 0 {
                     trace_total_tokens
-                } else {
+                } else if processed.total_tokens > 0 {
                     processed.total_tokens
+                } else {
+                    effective_input_tokens.saturating_add(effective_output_tokens)
                 };
                 let effective_run_id = stream_request_id.clone();
                 let persist_run_storage = run_storage.clone();
@@ -3310,10 +3330,11 @@ pub(super) fn spawn_chat_stream_response(
                     "run_id": effective_run_id,
                     "run_status": processed.run_status,
                     "trace_id": processed.trace_id,
-                    "input_tokens": trace_metric_snapshot["input_tokens"],
-                    "output_tokens": trace_metric_snapshot["output_tokens"],
+                    "input_tokens": effective_input_tokens,
+                    "output_tokens": effective_output_tokens,
                     "total_tokens": effective_total_tokens,
-                    "duration_ms": trace_metric_snapshot["duration_ms"],
+                    "duration_ms": wall_duration_ms,
+                    "trace_duration_ms": trace_metric_snapshot["duration_ms"],
                     "time_to_first_token_ms": first_content_ms,
                     "degradation": processed.degradation,
                     "attempted_models": processed.attempted_models,
@@ -3352,6 +3373,7 @@ pub(super) fn spawn_chat_stream_response(
                         "output_tokens": content["output_tokens"],
                         "total_tokens": content["total_tokens"],
                         "duration_ms": content["duration_ms"],
+                        "trace_duration_ms": content["trace_duration_ms"],
                         "time_to_first_token_ms": content["time_to_first_token_ms"],
                         "degradation": content["degradation"],
                         "attempted_models": content["attempted_models"],

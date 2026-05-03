@@ -49,11 +49,7 @@ fn jaccard_similarity(left: &HashSet<String>, right: &HashSet<String>) -> f32 {
     }
     let overlap = left.intersection(right).count() as f32;
     let union = left.union(right).count() as f32;
-    if union <= 0.0 {
-        0.0
-    } else {
-        overlap / union
-    }
+    if union <= 0.0 { 0.0 } else { overlap / union }
 }
 
 fn token_similarity(left: &str, right: &str) -> f32 {

@@ -15,13 +15,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::storage::Storage;
 
 use super::prompt_evolution::{
-    ExternalPromptCandidate, PROMPT_BUNDLE_PROFILE_KEY, PromptBundleProfile,
-    embedded_prompt_benchmark_profile_json, parse_prompt_bundle_profile,
+    embedded_prompt_benchmark_profile_json, parse_prompt_bundle_profile, ExternalPromptCandidate,
+    PromptBundleProfile, PROMPT_BUNDLE_PROFILE_KEY,
 };
 use super::specialist_prompt_evolution::{
-    ExternalSpecialistPromptCandidate, SPECIALIST_PROMPT_BUNDLE_PROFILE_KEY,
-    SpecialistPromptBundleProfile, embedded_specialist_prompt_benchmark_profile_json,
-    parse_specialist_prompt_bundle_profile,
+    embedded_specialist_prompt_benchmark_profile_json, parse_specialist_prompt_bundle_profile,
+    ExternalSpecialistPromptCandidate, SpecialistPromptBundleProfile,
+    SPECIALIST_PROMPT_BUNDLE_PROFILE_KEY,
 };
 
 const GEPA_ROOT_REL: &str = ".agentark/self_evolve/gepa";
@@ -320,7 +320,11 @@ pub fn gepa_venv_python(project_root: &Path) -> PathBuf {
 
 fn bundled_gepa_python() -> Option<PathBuf> {
     let path = PathBuf::from("/opt/agentark-gepa/bin/python");
-    if path.exists() { Some(path) } else { None }
+    if path.exists() {
+        Some(path)
+    } else {
+        None
+    }
 }
 
 pub async fn load_gepa_optimizer_config(storage: &Storage) -> GepaOptimizerConfig {
@@ -445,7 +449,7 @@ pub async fn ensure_gepa_optimizer_environment(project_root: &Path) -> Result<Pa
     if command_runs(&python_path, &["-c", "import dspy"]).await {
         return Ok(python_path);
     }
-    let requirements = project_root.join("tools/gepa_optimizer/requirements.txt");
+    let requirements = project_root.join("bridges/gepa_optimizer/requirements.txt");
     if !requirements.exists() {
         anyhow::bail!(
             "GEPA requirements file is missing at {}",
@@ -877,7 +881,7 @@ pub async fn run_python_optimizer(
     let mut command = tokio::process::Command::new(&runtime.python_path);
     command
         .arg("-m")
-        .arg("tools.gepa_optimizer")
+        .arg("bridges.gepa_optimizer")
         .arg("run")
         .arg("--export")
         .arg(export_path)
@@ -1603,7 +1607,11 @@ trait IfEmpty {
 
 impl IfEmpty for str {
     fn if_empty<'a>(&'a self, fallback: &'a str) -> &'a str {
-        if self.is_empty() { fallback } else { self }
+        if self.is_empty() {
+            fallback
+        } else {
+            self
+        }
     }
 }
 

@@ -3,7 +3,7 @@
 //! Orbits are folders under `<DATA_DIR>/arkorbit/L2/orbits/<id>/`. No
 //! ArkOrbit database tables are created or queried in this redesign.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use chrono::Utc;
 use std::path::Path;
 use std::sync::Arc;
@@ -12,8 +12,7 @@ use uuid::Uuid;
 use crate::storage::Storage;
 
 use super::models::{
-    Orbit, OrbitChatMessage, OrbitChatTranscriptSummary, OrbitFileEntry, OrbitManifest,
-    OrbitUpdate,
+    Orbit, OrbitChatMessage, OrbitChatTranscriptSummary, OrbitFileEntry, OrbitManifest, OrbitUpdate,
 };
 use super::store::{LayeredStore, ResolvedModule};
 
@@ -200,7 +199,10 @@ impl ArkOrbitService {
     }
 
     fn messages_path(&self, orbit_id: &str) -> Result<std::path::PathBuf> {
-        Ok(self.store.ensure_orbit_dir(orbit_id)?.join("messages.jsonl"))
+        Ok(self
+            .store
+            .ensure_orbit_dir(orbit_id)?
+            .join("messages.jsonl"))
     }
 
     fn chat_history_dir(&self, orbit_id: &str) -> Result<std::path::PathBuf> {
@@ -257,9 +259,17 @@ impl ArkOrbitService {
         let title = messages
             .iter()
             .find(|message| message.role == "user" && !message.content.trim().is_empty())
-            .or_else(|| messages.iter().find(|message| !message.content.trim().is_empty()))
+            .or_else(|| {
+                messages
+                    .iter()
+                    .find(|message| !message.content.trim().is_empty())
+            })
             .map(|message| {
-                let mut text = message.content.split_whitespace().collect::<Vec<_>>().join(" ");
+                let mut text = message
+                    .content
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 if text.len() > 64 {
                     text.truncate(61);
                     text.push_str("...");
@@ -297,8 +307,7 @@ impl ArkOrbitService {
         LayeredStore::validate_orbit_id(orbit_id)?;
         let mut summaries = Vec::new();
         let current = self.read_orbit_chat_messages(orbit_id, usize::MAX)?;
-        if let Some(summary) =
-            Self::summarize_chat_transcript("current".to_string(), true, current)
+        if let Some(summary) = Self::summarize_chat_transcript("current".to_string(), true, current)
         {
             summaries.push(summary);
         }
@@ -354,10 +363,7 @@ impl ArkOrbitService {
         Ok(messages.into_iter().skip(keep_from).collect())
     }
 
-    pub fn reset_orbit_chat(
-        &self,
-        orbit_id: &str,
-    ) -> Result<Option<OrbitChatTranscriptSummary>> {
+    pub fn reset_orbit_chat(&self, orbit_id: &str) -> Result<Option<OrbitChatTranscriptSummary>> {
         LayeredStore::validate_orbit_id(orbit_id)?;
         let path = self.messages_path(orbit_id)?;
         let messages = Self::read_chat_messages_from_path(&path)?;

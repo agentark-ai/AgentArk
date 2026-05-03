@@ -14,6 +14,10 @@ use crate::storage::{
     experience_item, experience_run, learning_candidate, procedural_pattern, Storage,
 };
 
+use super::routing_canonical_evolution::{
+    parse_routing_canonical_candidate, ROUTING_CANONICAL_CANDIDATE_TYPE,
+};
+
 const DEFAULT_MIN_EVIDENCE_SAMPLES: usize = 2;
 const DEFAULT_MIN_CONFIDENCE: f64 = 0.35;
 const DEFAULT_MIN_SUPPORT_SCORE: f64 = 0.50;
@@ -80,8 +84,12 @@ struct TurnUsageEvidence {
 
 impl TurnUsageEvidence {
     fn add(&mut self, value: &Value) {
-        let input_tokens = json_i64_field(value, "input_tokens").unwrap_or_default().max(0);
-        let output_tokens = json_i64_field(value, "output_tokens").unwrap_or_default().max(0);
+        let input_tokens = json_i64_field(value, "input_tokens")
+            .unwrap_or_default()
+            .max(0);
+        let output_tokens = json_i64_field(value, "output_tokens")
+            .unwrap_or_default()
+            .max(0);
         let total_tokens = json_i64_field(value, "total_tokens")
             .unwrap_or_else(|| input_tokens.saturating_add(output_tokens))
             .max(0);
@@ -342,6 +350,9 @@ fn evaluate_candidate_with_evidence(
         "turn_decision" | "turn_routing_policy" | "routing_policy" => {
             evaluate_turn_decision_candidate(candidate, evidence, confidence)
         }
+        ROUTING_CANONICAL_CANDIDATE_TYPE => {
+            evaluate_routing_canonical_candidate(candidate, evidence, confidence)
+        }
         other => gate_result(
             candidate,
             evidence,
@@ -354,6 +365,24 @@ fn evaluate_candidate_with_evidence(
             ),
         ),
     }
+}
+
+fn evaluate_routing_canonical_candidate(
+    candidate: &learning_candidate::Model,
+    evidence: EvidenceBundle,
+    confidence: f64,
+) -> CandidateReplayGateResult {
+    if let Err(error) = parse_routing_canonical_candidate(candidate) {
+        return gate_result(
+            candidate,
+            evidence,
+            confidence,
+            "blocked",
+            false,
+            format!("routing canonical candidate payload is invalid: {error}"),
+        );
+    }
+    evaluate_turn_decision_candidate(candidate, evidence, confidence)
 }
 
 fn evaluate_turn_decision_candidate(
@@ -963,6 +992,30 @@ mod tests {
             .signals
             .iter()
             .any(|signal| signal.contains("turn decision evidence")));
+    }
+
+    #[test]
+    fn routing_canonical_candidate_uses_turn_decision_replay_gate() {
+        let mut evidence = EvidenceBundle::default();
+        evidence.add_run(turn_decision_run("run-1"));
+        evidence.add_run(turn_decision_run("run-2"));
+        let result = evaluate_candidate_with_evidence(
+            &candidate(
+                super::ROUTING_CANONICAL_CANDIDATE_TYPE,
+                0.9,
+                serde_json::json!({
+                    "add": [{
+                        "category": "durable_work",
+                        "concept": "background_monitoring_goal",
+                        "text": "The user wants durable background monitoring that persists independently of the current response and reports only when its condition is met."
+                    }],
+                    "evidence_summary": "Replay evidence showed durable monitoring was misrouted."
+                }),
+            ),
+            evidence,
+        );
+        assert!(result.allow_approval);
+        assert_eq!(result.status, "passed");
     }
 
     #[test]

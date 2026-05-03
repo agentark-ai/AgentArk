@@ -7175,6 +7175,12 @@ impl Storage {
 
     // ==================== Documents ====================
 
+    fn user_visible_document_filter() -> SimpleExpr {
+        document::Column::Id
+            .starts_with(crate::core::product_help::DOCUMENT_ID_PREFIX.to_string())
+            .not()
+    }
+
     /// Insert a document and all chunks atomically so partial uploads do not leak
     /// into the searchable document library.
     pub async fn insert_document_with_chunks(
@@ -7213,6 +7219,64 @@ impl Storage {
         Ok(())
     }
 
+    /// Replace a deterministic internal document set and its chunks atomically.
+    pub async fn replace_documents_by_id_prefix(
+        &self,
+        id_prefix: &str,
+        documents: &[(document::Model, Vec<document_chunk::Model>)],
+    ) -> Result<()> {
+        let id_prefix = id_prefix.trim();
+        if id_prefix.is_empty() {
+            anyhow::bail!("document id prefix cannot be empty");
+        }
+
+        let txn = self.db.begin().await?;
+        let pattern = format!("{id_prefix}%");
+        let delete_chunks_sql = format!(
+            "DELETE FROM document_chunks WHERE document_id LIKE {}",
+            sql_string_literal(&pattern)
+        );
+        txn.execute(Statement::from_string(DbBackend::Postgres, delete_chunks_sql))
+            .await?;
+        let delete_docs_sql = format!(
+            "DELETE FROM documents WHERE id LIKE {}",
+            sql_string_literal(&pattern)
+        );
+        txn.execute(Statement::from_string(DbBackend::Postgres, delete_docs_sql))
+            .await?;
+
+        for (doc, chunks) in documents {
+            let filename = encrypt_storage_string(&doc.filename)?;
+            document::ActiveModel {
+                id: Set(doc.id.clone()),
+                filename: Set(filename),
+                content_type: Set(doc.content_type.clone()),
+                project_id: Set(doc.project_id.clone()),
+                chunk_count: Set(doc.chunk_count),
+                file_size: Set(doc.file_size),
+                created_at: Set(doc.created_at.clone()),
+            }
+            .insert(&txn)
+            .await?;
+
+            for chunk in chunks {
+                let content = encrypt_storage_string(&chunk.content)?;
+                document_chunk::ActiveModel {
+                    id: Set(chunk.id.clone()),
+                    document_id: Set(chunk.document_id.clone()),
+                    chunk_index: Set(chunk.chunk_index),
+                    content: Set(content),
+                    embedding: Set(chunk.embedding.clone()),
+                }
+                .insert(&txn)
+                .await?;
+            }
+        }
+
+        txn.commit().await?;
+        Ok(())
+    }
+
     /// List documents (paginated)
     pub async fn list_documents(
         &self,
@@ -7221,6 +7285,7 @@ impl Storage {
         project_id: Option<&str>,
     ) -> Result<Vec<document::Model>> {
         let mut query = document::Entity::find().order_by_desc(document::Column::CreatedAt);
+        query = query.filter(Self::user_visible_document_filter());
         if let Some(pid) = project_id {
             query = query.filter(document::Column::ProjectId.eq(pid));
         }
@@ -7237,7 +7302,7 @@ impl Storage {
 
     /// Count documents
     pub async fn count_documents(&self, project_id: Option<&str>) -> Result<u64> {
-        let mut query = document::Entity::find();
+        let mut query = document::Entity::find().filter(Self::user_visible_document_filter());
         if let Some(pid) = project_id {
             query = query.filter(document::Column::ProjectId.eq(pid));
         }
@@ -7255,6 +7320,7 @@ impl Storage {
         project_id: Option<&str>,
     ) -> Result<Vec<document::Model>> {
         let mut query = document::Entity::find().order_by_desc(document::Column::CreatedAt);
+        query = query.filter(Self::user_visible_document_filter());
         if let Some(pid) = project_id {
             query = query.filter(
                 Condition::any()
@@ -7264,6 +7330,28 @@ impl Storage {
         }
         let mut docs = query
             .limit(Self::MAX_DOCUMENTS_FOR_SEARCH)
+            .all(&self.db)
+            .await?;
+        for doc in &mut docs {
+            doc.filename = decrypt_storage_string(&doc.filename);
+        }
+        Ok(docs)
+    }
+
+    /// List deterministic internal documents by id prefix for scoped retrieval.
+    pub async fn list_documents_by_id_prefix(
+        &self,
+        id_prefix: &str,
+        limit: u64,
+    ) -> Result<Vec<document::Model>> {
+        let id_prefix = id_prefix.trim();
+        if id_prefix.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut docs = document::Entity::find()
+            .filter(document::Column::Id.starts_with(id_prefix.to_string()))
+            .order_by_desc(document::Column::CreatedAt)
+            .limit(Self::db_limit(limit))
             .all(&self.db)
             .await?;
         for doc in &mut docs {

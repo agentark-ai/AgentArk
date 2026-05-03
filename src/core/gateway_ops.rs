@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     core::{
-        browser_profiles::BrowserProfileControlPlane, gateway,
-        model_failover::ModelFailoverControlPlane, nodes::NodeControlPlane, Agent, AgentConfig,
+        Agent, AgentConfig, browser_profiles::BrowserProfileControlPlane, gateway,
+        model_failover::ModelFailoverControlPlane, nodes::NodeControlPlane,
     },
     sentinel::{self, DoctorFinding, PulseEvent},
 };

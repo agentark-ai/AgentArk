@@ -440,6 +440,7 @@ pub(super) struct SettingsResponse {
     pub daily_brief_enabled: bool,
     pub daily_brief_time: String,
     pub daily_brief_channel: String,
+    pub arkreflect_daily_digest_enabled: bool,
     // Primary LLM (legacy)
     pub llm_provider: String,
     pub llm_model: String,
@@ -690,6 +691,8 @@ pub(super) struct SettingsUpdate {
     #[serde(default)]
     pub daily_brief_time: Option<String>,
     pub daily_brief_channel: Option<String>,
+    #[serde(default)]
+    pub arkreflect_daily_digest_enabled: Option<bool>,
     /// Model pool routing behavior (if false, always use primary)
     #[serde(default)]
     pub smart_routing: Option<bool>,

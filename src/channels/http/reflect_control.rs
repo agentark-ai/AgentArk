@@ -5,11 +5,12 @@ use super::*;
 
 use crate::core::arkorbit::{ArkOrbitService, Orbit, OrbitChatMessage, OrbitChatTranscriptSummary};
 use crate::core::{EmbeddingClient, TaskStatus};
+use crate::storage::Storage;
 use crate::storage::entities::{
     arkpulse_event, conversation, experience_item, llm_usage, message, procedural_pattern,
     semantic_work_unit, task,
 };
-use crate::storage::Storage;
+use chrono::{TimeZone, Timelike};
 use sea_orm::entity::prelude::PgVector;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -55,6 +56,11 @@ const REFLECT_RELATED_HISTORY_LIMIT: u64 = 8;
 const REFLECT_RELATED_HISTORY_DISPLAY_LIMIT: usize = 3;
 const REFLECT_RELATED_HISTORY_MAX_DISTANCE: f64 = 0.32;
 const REFLECT_BASELINE_LOOKBACK_DAYS: i64 = 183;
+const REFLECT_DAILY_DIGEST_STATUS_KEY: &str = "arkreflect_daily_digest_status_v1";
+const REFLECT_DAILY_DIGEST_LEASE_KEY: &str = "arkreflect_daily_digest_lease_v1";
+const REFLECT_DAILY_DIGEST_LEASE_TTL_SECS: i64 = 180;
+const REFLECT_DAILY_DIGEST_TIMEOUT: Duration = Duration::from_secs(35);
+const REFLECT_DAILY_DIGEST_NOT_BEFORE_LOCAL_HOUR: u32 = 20;
 
 static REFLECT_REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static REFLECT_IDLE_LOOP_STARTED: AtomicBool = AtomicBool::new(false);
@@ -179,7 +185,7 @@ struct ReflectClusterResponse {
     units: Vec<ReflectUnitResponse>,
 }
 
-#[derive(Debug, Default, Clone, serde::Serialize)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 struct ReflectSourceCounts {
     main_chat: usize,
     orbit_chat: usize,
@@ -245,6 +251,54 @@ struct ReflectCacheStatus {
     detail: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ReflectDigestDeliveryAttempt {
+    channel: String,
+    success: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ReflectDailyDigestStatus {
+    enabled: bool,
+    status: String,
+    target_date: String,
+    today_date: String,
+    meaningful: bool,
+    unit_count: usize,
+    cluster_count: usize,
+    source_counts: ReflectSourceCounts,
+    summary: Option<String>,
+    detail: String,
+    last_checked_at: Option<String>,
+    last_sent_at: Option<String>,
+    last_skipped_at: Option<String>,
+    last_error: Option<String>,
+    delivery_attempts: Vec<ReflectDigestDeliveryAttempt>,
+}
+
+impl ReflectDailyDigestStatus {
+    fn disabled(today_date: String) -> Self {
+        Self {
+            enabled: false,
+            status: "disabled".to_string(),
+            target_date: today_date.clone(),
+            today_date,
+            meaningful: false,
+            unit_count: 0,
+            cluster_count: 0,
+            source_counts: ReflectSourceCounts::default(),
+            summary: None,
+            detail: "Daily ArkReflect digest delivery is off.".to_string(),
+            last_checked_at: None,
+            last_sent_at: None,
+            last_skipped_at: None,
+            last_error: None,
+            delivery_attempts: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, serde::Serialize)]
 struct ReflectResponse {
     period: ReflectPeriod,
@@ -256,6 +310,7 @@ struct ReflectResponse {
     embedding_status: ReflectEmbeddingStatus,
     refresh_status: ReflectRefreshStatus,
     cache_status: ReflectCacheStatus,
+    daily_digest_status: ReflectDailyDigestStatus,
     clusters: Vec<ReflectClusterResponse>,
     unclustered_units: Vec<ReflectUnitResponse>,
 }
@@ -323,6 +378,73 @@ fn parse_time(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(value)
         .ok()
         .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+fn reflect_timezone_from_profile(profile: &UserProfile) -> Option<chrono_tz::Tz> {
+    profile
+        .timezone
+        .as_deref()
+        .and_then(|value| value.parse::<chrono_tz::Tz>().ok())
+}
+
+fn reflect_local_date(
+    at: chrono::DateTime<chrono::Utc>,
+    tz: Option<chrono_tz::Tz>,
+) -> chrono::NaiveDate {
+    match tz {
+        Some(tz) => at.with_timezone(&tz).date_naive(),
+        None => at.date_naive(),
+    }
+}
+
+fn reflect_local_hour(at: chrono::DateTime<chrono::Utc>, tz: Option<chrono_tz::Tz>) -> u32 {
+    match tz {
+        Some(tz) => at.with_timezone(&tz).hour(),
+        None => at.hour(),
+    }
+}
+
+fn reflect_local_midnight_utc(
+    date: chrono::NaiveDate,
+    tz: Option<chrono_tz::Tz>,
+) -> chrono::DateTime<chrono::Utc> {
+    let naive = date
+        .and_hms_opt(0, 0, 0)
+        .unwrap_or_else(|| chrono::Utc::now().naive_utc());
+    match tz {
+        Some(tz) => match tz.from_local_datetime(&naive) {
+            chrono::LocalResult::Single(value) => value.with_timezone(&chrono::Utc),
+            chrono::LocalResult::Ambiguous(first, _) => first.with_timezone(&chrono::Utc),
+            chrono::LocalResult::None => chrono::Utc.from_utc_datetime(&naive),
+        },
+        None => chrono::Utc.from_utc_datetime(&naive),
+    }
+}
+
+fn reflect_daily_window_for_date(
+    date: chrono::NaiveDate,
+    tz: Option<chrono_tz::Tz>,
+) -> (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) {
+    let from = reflect_local_midnight_utc(date, tz);
+    let next_date = date
+        .succ_opt()
+        .unwrap_or_else(|| date + chrono::Duration::days(1));
+    let to = reflect_local_midnight_utc(next_date, tz);
+    (from, to)
+}
+
+fn reflect_digest_target_date(
+    now: chrono::DateTime<chrono::Utc>,
+    tz: Option<chrono_tz::Tz>,
+) -> chrono::NaiveDate {
+    let today = reflect_local_date(now, tz);
+    if reflect_local_hour(now, tz) >= REFLECT_DAILY_DIGEST_NOT_BEFORE_LOCAL_HOUR {
+        today
+    } else {
+        today
+            .pred_opt()
+            .unwrap_or_else(|| today - chrono::Duration::days(1))
+    }
 }
 
 fn query_time(
@@ -434,6 +556,57 @@ fn source_counts_from_units(units: &[semantic_work_unit::Model]) -> ReflectSourc
         increment_source_count(&mut counts, &unit.source_kind);
     }
     counts
+}
+
+fn total_source_count(counts: &ReflectSourceCounts) -> usize {
+    counts.main_chat
+        + counts.orbit_chat
+        + counts.memory
+        + counts.procedures
+        + counts.apps
+        + counts.goals
+        + counts.watchers
+        + counts.sentinel
+        + counts.arkpulse
+        + counts.arkevolve
+        + counts.usage
+}
+
+fn meaningful_source_count(counts: &ReflectSourceCounts) -> usize {
+    total_source_count(counts).saturating_sub(counts.usage)
+}
+
+fn background_source_count(counts: &ReflectSourceCounts) -> usize {
+    counts.memory
+        + counts.procedures
+        + counts.apps
+        + counts.goals
+        + counts.watchers
+        + counts.sentinel
+        + counts.arkpulse
+        + counts.arkevolve
+}
+
+fn reflect_activity_is_meaningful(
+    counts: &ReflectSourceCounts,
+    units: &[semantic_work_unit::Model],
+    clusters: &[ReflectClusterResponse],
+) -> bool {
+    if background_source_count(counts) > 0 {
+        return true;
+    }
+    if meaningful_source_count(counts) >= 2 {
+        return true;
+    }
+    if clusters.len() >= 2 {
+        return true;
+    }
+    let conversational_messages: i32 = units
+        .iter()
+        .filter(|unit| matches!(unit.source_kind.as_str(), "conversation" | "orbit_chat"))
+        .map(|unit| unit.message_count.max(0))
+        .sum();
+    conversational_messages >= 4
 }
 
 fn unit_to_response(unit: &semantic_work_unit::Model) -> ReflectUnitResponse {
@@ -2723,6 +2896,91 @@ fn cache_status_for_units(
     }
 }
 
+fn reflect_bool_pref(raw: Option<Vec<u8>>) -> bool {
+    raw.and_then(|bytes| String::from_utf8(bytes).ok())
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+async fn arkreflect_daily_digest_enabled(storage: &Storage) -> bool {
+    let raw = tokio::time::timeout(
+        REFLECT_DB_TIMEOUT,
+        storage.get(super::autonomy_support::ARKREFLECT_DAILY_DIGEST_ENABLED_KEY),
+    )
+    .await
+    .ok()
+    .and_then(|result| result.ok())
+    .flatten();
+    reflect_bool_pref(raw)
+}
+
+async fn load_daily_digest_status(
+    storage: &Storage,
+    enabled: bool,
+    today_date: chrono::NaiveDate,
+) -> ReflectDailyDigestStatus {
+    let today_key = today_date.format("%Y-%m-%d").to_string();
+    if !enabled {
+        return ReflectDailyDigestStatus::disabled(today_key);
+    }
+    tokio::time::timeout(
+        REFLECT_DB_TIMEOUT,
+        storage.get(REFLECT_DAILY_DIGEST_STATUS_KEY),
+    )
+    .await
+    .ok()
+    .and_then(|result| result.ok())
+    .flatten()
+    .and_then(|bytes| serde_json::from_slice::<ReflectDailyDigestStatus>(&bytes).ok())
+    .map(|mut status| {
+        status.enabled = true;
+        status.today_date = today_key.clone();
+        status
+    })
+    .unwrap_or_else(|| ReflectDailyDigestStatus {
+        enabled: true,
+        status: "waiting".to_string(),
+        target_date: today_key.clone(),
+        today_date: today_key,
+        meaningful: false,
+        unit_count: 0,
+        cluster_count: 0,
+        source_counts: ReflectSourceCounts::default(),
+        summary: None,
+        detail: "Waiting for the next quiet window to prepare today's ArkReflect digest."
+            .to_string(),
+        last_checked_at: None,
+        last_sent_at: None,
+        last_skipped_at: None,
+        last_error: None,
+        delivery_attempts: Vec::new(),
+    })
+}
+
+async fn save_daily_digest_status(storage: &Storage, status: &ReflectDailyDigestStatus) {
+    match serde_json::to_vec(status) {
+        Ok(bytes) => {
+            if let Err(error) = tokio::time::timeout(
+                REFLECT_DB_TIMEOUT,
+                storage.set(REFLECT_DAILY_DIGEST_STATUS_KEY, &bytes),
+            )
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("daily digest status save timed out")))
+            {
+                tracing::debug!(target: "arkreflect", error = %error, "failed to save daily digest status");
+            }
+        }
+        Err(error) => {
+            tracing::debug!(target: "arkreflect", error = %error, "failed to serialize daily digest status");
+        }
+    }
+}
+
 async fn baseline_source_counts(
     storage: &Storage,
     from: chrono::DateTime<chrono::Utc>,
@@ -2745,6 +3003,346 @@ async fn baseline_source_counts(
     .unwrap_or_default()
 }
 
+fn reflect_digest_source_lines(counts: &ReflectSourceCounts) -> Vec<String> {
+    [
+        ("chat", counts.main_chat),
+        ("ArkOrbit", counts.orbit_chat),
+        ("memory", counts.memory),
+        ("learned workflows", counts.procedures),
+        ("apps", counts.apps),
+        ("goals", counts.goals),
+        ("watchers", counts.watchers),
+        ("Sentinel", counts.sentinel),
+        ("ArkPulse", counts.arkpulse),
+        ("ArkEvolve", counts.arkevolve),
+        ("usage", counts.usage),
+    ]
+    .into_iter()
+    .filter(|(_, count)| *count > 0)
+    .map(|(label, count)| format!("{} {}", count, label))
+    .collect()
+}
+
+fn fallback_daily_digest_summary(
+    date_key: &str,
+    counts: &ReflectSourceCounts,
+    clusters: &[ReflectClusterResponse],
+    units: &[semantic_work_unit::Model],
+) -> String {
+    let mut lines = Vec::new();
+    let focus = clusters
+        .iter()
+        .take(3)
+        .map(|cluster| cluster.label.trim())
+        .filter(|label| !label.is_empty())
+        .collect::<Vec<_>>();
+    if focus.is_empty() {
+        lines.push(format!(
+            "ArkReflect found meaningful activity on {}.",
+            date_key
+        ));
+    } else {
+        lines.push(format!("Today centered on {}.", focus.join(", ")));
+    }
+
+    let source_lines = reflect_digest_source_lines(counts);
+    if !source_lines.is_empty() {
+        lines.push(format!("Sources represented: {}.", source_lines.join(", ")));
+    }
+
+    let background = background_source_count(counts);
+    if background > 0 {
+        lines.push(format!(
+            "AgentArk recorded {} background or durable work signal{} across memory, apps, goals, watchers, Sentinel, Pulse, or Evolve.",
+            background,
+            if background == 1 { "" } else { "s" }
+        ));
+    }
+
+    let examples = units
+        .iter()
+        .take(2)
+        .map(|unit| unit.title.trim())
+        .filter(|title| !title.is_empty())
+        .collect::<Vec<_>>();
+    if !examples.is_empty() {
+        lines.push(format!("Examples: {}.", examples.join("; ")));
+    }
+
+    lines
+        .into_iter()
+        .map(|line| format!("- {}", line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn generate_daily_digest_summary(
+    state: &AppState,
+    date_key: &str,
+    counts: &ReflectSourceCounts,
+    clusters: &[ReflectClusterResponse],
+    units: &[semantic_work_unit::Model],
+) -> String {
+    let fallback = fallback_daily_digest_summary(date_key, counts, clusters, units);
+    let cluster_context = clusters
+        .iter()
+        .take(6)
+        .map(|cluster| {
+            serde_json::json!({
+                "label": cluster.label,
+                "summary": cluster.plain_summary,
+                "unit_count": cluster.unit_count,
+                "message_count": cluster.message_count,
+                "source_mix": cluster.source_mix,
+            })
+        })
+        .collect::<Vec<_>>();
+    let example_context = units
+        .iter()
+        .take(8)
+        .map(|unit| {
+            serde_json::json!({
+                "source": source_label(&unit.source_kind, &unit.channel),
+                "title": truncate_chars(&unit.title, 120),
+                "summary": truncate_chars(&unit.summary, 220),
+                "occurred_at": unit.occurred_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    let context = serde_json::json!({
+        "date": date_key,
+        "source_counts": counts,
+        "total_units": units.len(),
+        "meaningful_units": meaningful_source_count(counts),
+        "background_units": background_source_count(counts),
+        "clusters": cluster_context,
+        "examples": example_context,
+    });
+    let system_prompt = "You write ArkReflect daily digests for a personal AI Agent OS. Use only the structured facts provided. Do not invent work, outcomes, sources, dates, costs, or failures. Write for a novice user in plain language. Keep it concise: 3-5 bullets, no heading, no empty-day language, no generic encouragement.";
+    let user_message = format!(
+        "Structured ArkReflect daily context:\n{}\n\nWrite the user-readable digest.",
+        serde_json::to_string_pretty(&context).unwrap_or_else(|_| "{}".to_string())
+    );
+    let llm = {
+        let agent = state.agent.read().await;
+        agent.llm.clone()
+    };
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        llm.chat_with_system(system_prompt, &user_message),
+    )
+    .await
+    {
+        Ok(Ok(response)) => {
+            let content = response.content.trim();
+            if content.chars().count() >= 24 {
+                truncate_chars(content, 1800)
+            } else {
+                fallback
+            }
+        }
+        Ok(Err(error)) => {
+            tracing::debug!(target: "arkreflect", error = %error, "daily digest LLM summary failed");
+            fallback
+        }
+        Err(_) => {
+            tracing::debug!(target: "arkreflect", "daily digest LLM summary timed out");
+            fallback
+        }
+    }
+}
+
+async fn maybe_prepare_daily_digest(state: AppState) {
+    let (storage, profile_arc) = {
+        let agent = state.agent.read().await;
+        (agent.storage.clone(), agent.user_profile.clone())
+    };
+    let enabled = arkreflect_daily_digest_enabled(&storage).await;
+    let profile = profile_arc.read().await.clone();
+    let tz = reflect_timezone_from_profile(&profile);
+    let now = chrono::Utc::now();
+    let today = reflect_local_date(now, tz);
+    let today_key = today.format("%Y-%m-%d").to_string();
+    if !enabled {
+        let status = ReflectDailyDigestStatus::disabled(today_key);
+        save_daily_digest_status(&storage, &status).await;
+        return;
+    }
+
+    let target_date = reflect_digest_target_date(now, tz);
+    let target_key = target_date.format("%Y-%m-%d").to_string();
+    let previous = load_daily_digest_status(&storage, true, today).await;
+    if previous.target_date == target_key && previous.status == "sent" {
+        return;
+    }
+
+    let lease_owner = format!(
+        "arkreflect-digest:{}:{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    );
+    let lease_guard = match tokio::time::timeout(
+        REFLECT_DB_TIMEOUT,
+        storage.acquire_kv_lease_guard(
+            REFLECT_DAILY_DIGEST_LEASE_KEY,
+            &lease_owner,
+            REFLECT_DAILY_DIGEST_LEASE_TTL_SECS,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(Some(guard))) => guard,
+        Ok(Ok(None)) => return,
+        Ok(Err(error)) => {
+            tracing::debug!(target: "arkreflect", error = %error, "failed to acquire daily digest lease");
+            return;
+        }
+        Err(_) => return,
+    };
+
+    let (from, to) = reflect_daily_window_for_date(target_date, tz);
+    let from_s = from.to_rfc3339();
+    let to_s = to.to_rfc3339();
+    let units = tokio::time::timeout(
+        REFLECT_DB_TIMEOUT,
+        storage.list_semantic_work_units_between(&from_s, &to_s, REFLECT_MAX_UNITS),
+    )
+    .await
+    .ok()
+    .and_then(|result| result.ok())
+    .unwrap_or_default();
+    let refresh_status = current_refresh_status().await;
+    let cache_status = cache_status_for_units(&units, &refresh_status);
+    let was_preparing = previous.target_date == target_key && previous.status == "preparing";
+    if (units.is_empty() || cache_status.stale) && !was_preparing {
+        let _ = spawn_reflect_refresh(
+            state.clone(),
+            ReflectRefreshRequest {
+                period: ReflectPeriod::Daily,
+                from,
+                to,
+            },
+            "daily_digest",
+            true,
+        )
+        .await;
+        let status = ReflectDailyDigestStatus {
+            enabled: true,
+            status: "preparing".to_string(),
+            target_date: target_key,
+            today_date: today_key,
+            meaningful: false,
+            unit_count: units.len(),
+            cluster_count: 0,
+            source_counts: source_counts_from_units(&units),
+            summary: None,
+            detail: "Preparing the daily ArkReflect recap in the background.".to_string(),
+            last_checked_at: Some(now.to_rfc3339()),
+            last_sent_at: previous.last_sent_at,
+            last_skipped_at: previous.last_skipped_at,
+            last_error: None,
+            delivery_attempts: Vec::new(),
+        };
+        save_daily_digest_status(&storage, &status).await;
+        let _ = storage
+            .release_kv_lease_guard(REFLECT_DAILY_DIGEST_LEASE_KEY, &lease_guard)
+            .await;
+        return;
+    }
+
+    let counts = source_counts_from_units(&units);
+    let (clusters, _, _) = build_clusters_bounded(units.clone()).await;
+    let meaningful = reflect_activity_is_meaningful(&counts, &units, &clusters);
+    if !meaningful {
+        let status = ReflectDailyDigestStatus {
+            enabled: true,
+            status: "skipped_quiet".to_string(),
+            target_date: target_key,
+            today_date: today_key,
+            meaningful: false,
+            unit_count: units.len(),
+            cluster_count: clusters.len(),
+            source_counts: counts,
+            summary: None,
+            detail:
+                "No meaningful ArkReflect activity was found for this day, so no digest was sent."
+                    .to_string(),
+            last_checked_at: Some(now.to_rfc3339()),
+            last_sent_at: previous.last_sent_at,
+            last_skipped_at: Some(now.to_rfc3339()),
+            last_error: None,
+            delivery_attempts: Vec::new(),
+        };
+        save_daily_digest_status(&storage, &status).await;
+        let _ = storage
+            .release_kv_lease_guard(REFLECT_DAILY_DIGEST_LEASE_KEY, &lease_guard)
+            .await;
+        return;
+    }
+
+    let summary =
+        generate_daily_digest_summary(&state, &target_key, &counts, &clusters, &units).await;
+    let (in_app, push_attempts) = {
+        let agent = state.agent.read().await;
+        let in_app = agent
+            .emit_notification_with_status(
+                "ArkReflect Daily Digest",
+                &summary,
+                "info",
+                "arkreflect",
+            )
+            .await;
+        let push_attempts = agent.notify_preferred_channel_reported(&summary).await;
+        (in_app, push_attempts)
+    };
+    let mut delivery_attempts = vec![ReflectDigestDeliveryAttempt {
+        channel: in_app.channel,
+        success: in_app.success,
+        error: in_app.error,
+    }];
+    delivery_attempts.extend(push_attempts.into_iter().map(|attempt| {
+        ReflectDigestDeliveryAttempt {
+            channel: attempt.channel,
+            success: attempt.success,
+            error: attempt.error,
+        }
+    }));
+    let sent_ok = delivery_attempts.iter().any(|attempt| attempt.success);
+    let status = ReflectDailyDigestStatus {
+        enabled: true,
+        status: if sent_ok { "sent" } else { "delivery_failed" }.to_string(),
+        target_date: target_key,
+        today_date: today_key,
+        meaningful: true,
+        unit_count: units.len(),
+        cluster_count: clusters.len(),
+        source_counts: counts,
+        summary: Some(summary),
+        detail: if sent_ok {
+            "Daily ArkReflect digest was prepared and delivered.".to_string()
+        } else {
+            "Daily ArkReflect digest was prepared, but delivery failed.".to_string()
+        },
+        last_checked_at: Some(now.to_rfc3339()),
+        last_sent_at: if sent_ok {
+            Some(now.to_rfc3339())
+        } else {
+            previous.last_sent_at
+        },
+        last_skipped_at: previous.last_skipped_at,
+        last_error: if sent_ok {
+            None
+        } else {
+            Some("No notification channel accepted the daily digest.".to_string())
+        },
+        delivery_attempts,
+    };
+    save_daily_digest_status(&storage, &status).await;
+    let _ = storage
+        .release_kv_lease_guard(REFLECT_DAILY_DIGEST_LEASE_KEY, &lease_guard)
+        .await;
+}
+
 async fn reflect_idle_loop(state: AppState) {
     let mut interval = tokio::time::interval(REFLECT_IDLE_INTERVAL);
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -2752,6 +3350,15 @@ async fn reflect_idle_loop(state: AppState) {
         interval.tick().await;
         if !reflect_server_is_idle(&state).await {
             continue;
+        }
+        if tokio::time::timeout(
+            REFLECT_DAILY_DIGEST_TIMEOUT,
+            maybe_prepare_daily_digest(state.clone()),
+        )
+        .await
+        .is_err()
+        {
+            tracing::debug!(target: "arkreflect", "daily digest background pass timed out");
         }
         let now = chrono::Utc::now();
         let request = ReflectRefreshRequest {
@@ -2792,10 +3399,15 @@ pub(super) async fn ark_reflect_endpoint(
     let from_s = request.from.to_rfc3339();
     let to_s = request.to.to_rfc3339();
 
-    let storage = {
+    let (storage, profile_arc) = {
         let agent = state.agent.read().await;
-        agent.storage.clone()
+        (agent.storage.clone(), agent.user_profile.clone())
     };
+    let profile = profile_arc.read().await.clone();
+    let tz = reflect_timezone_from_profile(&profile);
+    let today_date = reflect_local_date(chrono::Utc::now(), tz);
+    let digest_enabled = arkreflect_daily_digest_enabled(&storage).await;
+    let daily_digest_status = load_daily_digest_status(&storage, digest_enabled, today_date).await;
     let units = match tokio::time::timeout(
         REFLECT_DB_TIMEOUT,
         storage.list_semantic_work_units_between(&from_s, &to_s, REFLECT_MAX_UNITS),
@@ -2854,6 +3466,7 @@ pub(super) async fn ark_reflect_endpoint(
             embedding_status,
             refresh_status,
             cache_status,
+            daily_digest_status,
             clusters,
             unclustered_units,
         }),
